@@ -1,0 +1,5 @@
+# croft: the database, its state, secrets and installed packages stay out of git
+warehouse*.duckdb*
+.croft/
+.env
+node_modules/

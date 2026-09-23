@@ -239,7 +239,7 @@ describe("help and version", () => {
 
   test("help --json lists every registered command", async () => {
     const env = envelope((await run(["help", "--json"])).stdout);
-    expect(env.data.commands.map((c: { name: string }) => c.name)).toEqual(["docs", "help", "version"]);
+    expect(env.data.commands.map((c: { name: string }) => c.name)).toEqual(COMMANDS.map((c) => c.name).sort());
     expect(env.data.globalOptions.map((o: { flag: string }) => o.flag)).toEqual(["--json", "--help", "--version"]);
   });
 
