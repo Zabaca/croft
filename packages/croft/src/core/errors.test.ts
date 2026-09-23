@@ -10,6 +10,14 @@ describe("error registry", () => {
     }
   });
 
+  test("exits DESIGN pins down outside the registry's categories", () => {
+    // §8 "Backfills": a --from that cannot apply is a usage error, not a failed asset.
+    expect(CODES.BACKFILL_WOULD_DUPLICATE.exit).toBe(EXIT.INVALID);
+    expect(CODES.BACKFILL_UNSUPPORTED.exit).toBe(EXIT.INVALID);
+    expect(exitCodeFor([problem("BACKFILL_UNSUPPORTED", { message: "x", hint: "y" })])).toBe(EXIT.INVALID);
+    expect(exitCodeFor([problem("BACKFILL_WOULD_DUPLICATE", { message: "x", hint: "y" }), problem("HTTP_ERROR", { message: "x", hint: "y" })])).toBe(EXIT.FAILED);
+  });
+
   test("CroftError carries a full problem", () => {
     const e = new CroftError("SHRINK_GUARD", { message: "would remove 265 of 265 rows", hint: "find out why" });
     expect(e.problem).toMatchObject({ severity: "error", code: "SHRINK_GUARD", docs: "croft docs SHRINK_GUARD" });

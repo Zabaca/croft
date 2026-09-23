@@ -223,6 +223,54 @@ describe("usage errors", () => {
     expect(docs.message).toBe('croft docs takes at most 1 argument; "b" is extra');
   });
 
+  test("a string option takes a value that starts with a dash (-90d, -5) unless it is one of the command's flags", async () => {
+    const values = async (argv: string[]) => envelope((await run(["--json", ...argv], { commands: ALL })).stdout);
+    expect((await values(["opts", "--rows", "-5", "a"])).data).toEqual({ values: { rows: "-5", json: true }, positionals: ["a"] });
+    expect((await values(["opts", "--rows=-5"])).data.values).toEqual({ rows: "-5", json: true });
+    expect((await values(["opts", "--rows", "-"])).data.values).toEqual({ rows: "-", json: true });
+    // A known flag is not swallowed as the value, and -- still ends the options.
+    expect((await values(["opts", "--rows", "--list"])).problems[0].message).toBe("--rows needs a value");
+    expect((await values(["opts", "--rows", "-h"])).command).toBe("help");
+    expect((await values(["opts", "--", "--rows", "-5"])).data).toEqual({ values: { json: true }, positionals: ["--rows", "-5"] });
+    // An unknown dashed word after a boolean stays an unknown option.
+    expect((await values(["opts", "--list", "-5"])).problems[0].message).toBe("croft opts has no option -5");
+  });
+
+  test("croft run x --from -90d and --from=-90d both parse (DESIGN §8)", async () => {
+    const spec = COMMANDS.find((c) => c.name === "run")!;
+    const echo: Command = { ...spec, load: undefined, run: async (ctx) => ({ data: { values: ctx.values, positionals: ctx.positionals }, problems: [], next: [] }) };
+    for (const argv of [["run", "x", "--from", "-90d"], ["run", "x", "--from=-90d"], ["run", "--from", "-12h", "x"]]) {
+      const env = envelope((await run([...argv, "--json"], { commands: [echo] })).stdout);
+      expect(env.ok).toBe(true);
+      expect(env.data.values.from).toBe(argv.includes("-12h") ? "-12h" : "-90d");
+      expect(env.data.positionals).toEqual(["x"]);
+    }
+    const missing = envelope((await run(["run", "x", "--from", "--foreground", "--json"], { commands: [echo] })).stdout);
+    expect(missing.problems[0]).toMatchObject({ code: "USAGE_ERROR", message: "--from needs a value" });
+  });
+
+  test("hidden options parse but stay out of help and did-you-mean", async () => {
+    const hidden = testCommand("hid", async (ctx) => ({ data: ctx.values, problems: [], next: [] }), {
+      options: {
+        rows: { type: "string", description: "rows", value: "N" },
+        "confirm-token": { type: "string", hidden: true, description: "set by croft confirm" },
+      },
+    });
+    const cmds = [...COMMANDS, hidden];
+    expect(envelope((await run(["hid", "--confirm-token", "c_123456", "--json"], { commands: cmds })).stdout).data)
+      .toEqual({ "confirm-token": "c_123456", json: true });
+    const help = envelope((await run(["help", "hid", "--json"], { commands: cmds })).stdout);
+    expect(help.data.command.options.map((o: { flag: string }) => o.flag)).toEqual(["--rows"]);
+    const typo = envelope((await run(["hid", "--confirm-tokn", "x", "--json"], { commands: cmds })).stdout).problems[0];
+    expect(typo.hint).toBe("croft hid --help lists its options");
+    expect(typo.details).toEqual({ option: "--confirm-tokn" });
+    // The real commands: run's --run-id, --detached and --confirm-token are hidden.
+    const runHelp = envelope((await run(["help", "run", "--json"])).stdout).data.command.options.map((o: { flag: string }) => o.flag);
+    expect(runHelp).toContain("--from");
+    for (const f of ["--run-id", "--detached", "--confirm-token"]) expect(runHelp).not.toContain(f);
+    expect((await run(["help", "run"])).stdout).not.toContain("confirm-token");
+  });
+
   test("options and positionals reach the command; global flags work anywhere", async () => {
     const env = envelope((await run(["--json", "opts", "--rows", "5", "a", "--list", "--", "--json"], { commands: ALL })).stdout);
     expect(env.data).toEqual({ values: { rows: "5", list: true, json: true }, positionals: ["a", "--json"] });

@@ -24,6 +24,9 @@ export interface OptionSpec {
   multiple?: boolean;
   description: string;
   value?: string;                    // placeholder in help, e.g. "N" for --rows N
+  /** Set by croft itself (a detached run's --run-id, croft confirm's --confirm-token): parsed like any
+   *  option, but left out of help and never suggested by did-you-mean. */
+  hidden?: boolean;
 }
 
 export type OptionValues = Record<string, string | boolean | (string | boolean)[] | undefined>;

@@ -486,6 +486,91 @@ describe("lock conflicts", () => {
   });
 });
 
+describe("aborting a wait (Ctrl-C)", () => {
+  test("a signal ends a lock wait at once with its CroftError reason (INTERRUPTED), and the intent goes", async () => {
+    const p = project();
+    const release = join(p.root, "release");
+    const child = spawnWriter(p, "r_hold", 0, release);
+    await child.waitFor("acquired");
+    const w = wh(p, { waits: { offTtyMs: 60_000 } });
+    const ac = new AbortController();
+    const reason = new CroftError("INTERRUPTED", { message: "the run was stopped by SIGINT", hint: "run again" });
+    const pending = rejection(w.write("blocked", async () => {
+      throw new Error("the body must not run");
+    }, { runId: "r_parent", signal: ac.signal }));
+    await sleep(150);
+    expect(heldCount(p.stateDir)).toBe(1); // waiting, with its intent announced
+    const aborted = Date.now();
+    ac.abort(reason);
+    expect(await pending).toBe(reason);
+    expect(Date.now() - aborted).toBeLessThan(500);
+    expect(heldCount(p.stateDir)).toBe(0);
+    expect(liveIntents(p.stateDir).map((i) => i.runId)).toEqual(["r_hold"]);
+
+    // A read's wait ends the same way; a reason that is not a CroftError becomes INTERRUPTED.
+    const ac2 = new AbortController();
+    const read = rejection(w.read(async () => {}, { purpose: "state", signal: ac2.signal }));
+    await sleep(100);
+    ac2.abort();
+    const e = await read;
+    expect(e.code).toBe("INTERRUPTED");
+    expect(e.message).toBe("interrupted while waiting for the warehouse");
+
+    // An already-aborted signal never waits; without one, the same warehouse still gets in later.
+    expect(await rejection(w.read(async () => {}, { purpose: "x", signal: ac.signal }))).toBe(reason);
+    writeFileSync(release, "");
+    await child.waitFor("released");
+    expect(await w.read((db) => db.all("SELECT who FROM log"), { purpose: "after" })).toEqual([{ who: "r_hold" }]);
+  });
+
+  test("a lease sharing another's open is not failed by that lease's abort", async () => {
+    const p = project();
+    const release = join(p.root, "release");
+    const child = spawnWriter(p, "r_hold", 0, release);
+    await child.waitFor("acquired");
+    const w = wh(p, { waits: { offTtyMs: 60_000 } });
+    const ac = new AbortController();
+    const first = rejection(w.read(async () => {}, { purpose: "aborted", signal: ac.signal }));
+    await sleep(50);
+    const second = w.read((db) => db.all("SELECT count(*)::INT AS n FROM log"), { purpose: "patient", waitMs: 20_000 });
+    await sleep(50);
+    ac.abort();
+    expect((await first).code).toBe("INTERRUPTED");
+    writeFileSync(release, "");
+    expect(await second).toEqual([{ n: 1 }]);
+  });
+
+  test("a write queued behind this process's own write gives up at once and never runs", async () => {
+    const w = wh(project());
+    const ac = new AbortController();
+    let ran = false;
+    let finish!: () => void;
+    const holding = w.write("first", () => new Promise<void>((r) => (finish = r)), { runId: "r" });
+    await sleep(50);
+    const queued = rejection(w.write("second", async () => {
+      ran = true;
+    }, { runId: "r", signal: ac.signal }));
+    ac.abort();
+    expect((await queued).code).toBe("INTERRUPTED");
+    finish();
+    await holding;
+    await w.write("third", async () => {}, { runId: "r" });
+    expect(ran).toBe(false);
+  });
+
+  test("an abort after the lease has the file does not cut it: the body decides", async () => {
+    const w = wh(project());
+    const ac = new AbortController();
+    const out = await w.write("running", async (tx) => {
+      ac.abort();
+      await tx.exec("CREATE TABLE t AS SELECT 1 AS a");
+      return "committed";
+    }, { runId: "r", signal: ac.signal });
+    expect(out).toBe("committed");
+    expect(await w.read((db) => db.all("SELECT a FROM t"), { purpose: "check" })).toEqual([{ a: 1 }]);
+  });
+});
+
 describe("handoff with an intent-honoring reader", () => {
   test("a child-process writer takes the file from a read-only holder", async () => {
     const p = project();

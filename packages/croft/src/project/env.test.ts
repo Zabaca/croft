@@ -248,4 +248,15 @@ describe("redactData (query rows and other command data)", () => {
     expect(env.secret("SHELL_PIN", ["SHELL_PIN"])).toBe("4242");
     expect(env.redactData("pin 4242")).toBe("pin [redacted:SHELL_PIN]");
   });
+
+  test("declare() registers a declared name's shell value without handing it out", () => {
+    const env = new ProjectEnv({ root: null, fileValues: new Map([["FROM_FILE", "file-value-9"]]),
+      shell: { SHELL_PIN: "4242", OTHER: "not-a-secret", FROM_FILE: "" } });
+    expect(env.redactData("pin 4242")).toBe("pin 4242");
+    env.declare(["SHELL_PIN", "FROM_FILE", "UNSET"]);
+    expect(env.redactData("pin 4242, other not-a-secret")).toBe("pin [redacted:SHELL_PIN], other not-a-secret");
+    expect(env.redact("got 4242")).toBe("got [redacted:SHELL_PIN]");
+    // An empty shell value does not win over .env, so the .env value is the one hidden.
+    expect(env.redactData("f file-value-9")).toBe("f [redacted:FROM_FILE]");
+  });
 });

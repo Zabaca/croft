@@ -12,6 +12,7 @@
 // configs without failing on one broken file, the read-only warehouse, and value capping with redaction.
 import { readFileSync } from "node:fs";
 import { CroftError } from "../../core/errors.ts";
+import { CHECKS_ENFORCED, CHECKS_NOT_ENFORCED } from "../../core/phase.ts";
 import type { AssetKind, CursorType, Incremental, LockHolder, Problem, WriteMode } from "../../core/types.ts";
 import { hasState } from "../../db/state.ts";
 import { type DuckWarehouse, type LeaseSql, openWarehouse } from "../../db/warehouse.ts";
@@ -136,10 +137,8 @@ export async function declareProjectSecrets(ctx: Ctx, project: Project, configs?
   const list = configs ?? await loadConfigs(project, (await discoverAssets(project.root, { assetsDir: project.paths.assetsDir })).assets,
     { importTimeoutMs: 5000 });
   const names = [...new Set(list.flatMap((c) => c.secrets))];
+  // declare() also registers a declared secret that is set in the shell rather than .env.
   ctx.env.declare(names);
-  // A declared secret set in the shell rather than .env is only known to the redactor once it was handed out;
-  // look each one up through secret() so its value is hidden too (nothing is printed).
-  for (const name of names) if (ctx.env.lookup(name)?.source === "env") ctx.env.secret(name, [name]);
   return [...list];
 }
 
@@ -489,6 +488,8 @@ export interface DescribeData {
   inputsSeen: WarehouseAsset["inputsSeen"];
   builtWithCodeHash: string | null;
   checks: { check: string; blocking: boolean; implied: boolean }[];
+  /** false in phase 1: the checks above are listed, not run (core/phase.ts). */
+  checksEnforced: boolean;
   recentWrites: RecentWrite[];
   recentRuns: { runId: string; status: string; at: string; durationMs: number | null; code: string | null }[];
   samples: Row[];
@@ -597,6 +598,7 @@ export const describe: CommandImpl<DescribeData> = {
       inputsSeen: wh?.inputsSeen ?? {},
       builtWithCodeHash: wh?.state?.codeHash ?? cat?.codeHash ?? null,
       checks: checksOf(config, behavior.key),
+      checksEnforced: CHECKS_ENFORCED,
       recentWrites: wh?.recentWrites ?? [],
       recentRuns: steps.map((s) => ({
         runId: s.runId, status: effectiveStatus(s, dead), at: zoned(s.finishedAt ?? s.startedAt, tz)!,
@@ -679,7 +681,10 @@ export function formatDescribe(d: DescribeData, tz: string, bold: (s: string) =>
   for (const [input, s] of Object.entries(d.inputsSeen)) {
     lines.push(`${label("Input")} ${input}: ${s.pendingRows === null ? "?" : formatCount(s.pendingRows)} new rows since ${s.seenLoadedAt ?? "never"}`);
   }
-  if (d.checks.length) lines.push(`${label("Checks")} ${d.checks.map((c) => (c.blocking ? c.check : `warn ${c.check}`)).join(" · ")}`);
+  if (d.checks.length) {
+    lines.push(`${label("Checks")} ${d.checks.map((c) => (c.blocking ? c.check : `warn ${c.check}`)).join(" · ")}`);
+    if (d.checksEnforced === false) lines.push(`${" ".repeat(11)}${CHECKS_NOT_ENFORCED}`);
+  }
   if (d.recentRuns.length) {
     lines.push(`${label("Recent")} ${d.recentRuns.map((r) => `${r.runId} ${r.status}${r.code ? ` ${r.code}` : ""}${r.durationMs !== null ? ` ${formatDuration(r.durationMs)}` : ""}`).join(" · ")}`);
   }

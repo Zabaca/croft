@@ -205,13 +205,17 @@ export class ProjectEnv {
     }));
   }
 
-  /** Mark names as declared secrets (an asset's `secrets` list): redactData() then always hides their values.
-   *  secret() declares the calling asset's list; commands that show data should declare the project's. */
+  /** Mark names as declared secrets (an asset's `secrets` list): redactData() then always hides their values,
+   *  whether they come from .env or the shell (a shell value is registered as secret() would, without being
+   *  handed out). secret() declares the calling asset's list; commands that show data should declare the
+   *  project's. */
   declare(names: Iterable<string>): void {
     for (const name of names) {
       if (this.#declared.has(name)) continue;
       this.#declared.add(name);
       this.#dataPattern = undefined;
+      const found = this.lookup(name);
+      if (found?.source === "env") this.#remember(name, found.value);
     }
   }
 

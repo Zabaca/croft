@@ -49,6 +49,9 @@ export interface StepResult {
   inputs?: { input: string; seenBefore: string | null; seenAfter: string; rows: number }[];
   requests?: number; checks: { check: string; ok: boolean; failing?: number; sample?: Row[] }[];
   trashed?: { path: string; rows: number }; logsCommand: string; durationMs: number; error?: Problem;
+  /** Present when this step created the table ("new table, 31 columns (7 JSON)", §4.2): its columns
+   *  without croft's _loaded_at, and how many of them are JSON. */
+  created?: { columns: number; jsonColumns: number };
 }
 export type Fix =
   | { kind: "edit"; description: string; file: string; line?: number; replace?: { from: string; to: string }; insert?: string }

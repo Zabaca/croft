@@ -45,9 +45,9 @@ const run = lazyCommand({
     follow: { type: "string", value: "<dur>", description: "off a terminal: how long to follow the detached run before returning exit 6 (default 100s)" },
     "no-wait": { type: "boolean", description: "exit 4 at once when an asset or the database is busy, instead of waiting" },
     events: { type: "boolean", description: "NDJSON progress events on stderr" },
-    "run-id": { type: "string", value: "<id>", description: "internal: the run id a detached run was given" },
-    detached: { type: "boolean", description: "internal: marks the detached child of a run" },
-    "confirm-token": { type: "string", value: "<token>", description: "internal: set by croft confirm" },
+    "run-id": { type: "string", value: "<id>", hidden: true, description: "the run id a detached run was given (set by croft)" },
+    detached: { type: "boolean", hidden: true, description: "marks the detached child of a run (set by croft)" },
+    "confirm-token": { type: "string", value: "<token>", hidden: true, description: "the confirmation being carried out (set by croft confirm)" },
   },
 }, async () => (await import("./run.ts")).run);
 

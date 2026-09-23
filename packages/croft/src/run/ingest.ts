@@ -27,7 +27,7 @@ import type { LogWriter } from "../history/logs.ts";
 import type { RunsDb } from "../history/runs-db.ts";
 import { createHttp, displayUrl, excerpt, type HttpClient, type HttpOptions } from "../http/http.ts";
 import { buildTypedBatch } from "../load/cast.ts";
-import type { TypedBatch } from "../load/contract.ts";
+import { RESERVED, type TypedBatch } from "../load/contract.ts";
 import { parseFrom, renderSince } from "../load/cursor.ts";
 import { isReservedColumn, quoteIdent, readTableSchema, tempRef } from "../load/evolve.ts";
 import { buildFileBatch, extractFiles, type FileExtract, type KnownFile, recordFiles } from "../load/files.ts";
@@ -293,12 +293,24 @@ function trackedHttp(http: HttpClient, progress: StepProgress, redact: (text: st
   return {
     get: wrap("GET", (url, init) => http.get(url, init)),
     post: wrap("POST", (url, body, init) => http.post(url, body, init)),
+    // File downloads: counted like any request, but the body (a whole file, maybe binary) is not previewed.
+    getBytes: async (url, init) => {
+      try {
+        const res = await http.getBytes(url, init);
+        progress.request({ status: res.status, label: redact(`GET ${displayUrl(res.url)}`) });
+        return res;
+      } catch (e) {
+        const d = croftError(e)?.problem.details;
+        progress.request({ ...(typeof d?.status === "number" ? { status: d.status } : {}), label: redact(`GET ${String(d?.url ?? url)}`) });
+        throw e;
+      }
+    },
     get requests() { return http.requests; },
     get attempts() { return http.attempts; },
   };
 }
 
-async function readState(warehouse: DuckWarehouse, asset: string, withFiles: boolean): Promise<IngestState> {
+async function readState(warehouse: DuckWarehouse, asset: string, withFiles: boolean, signal: AbortSignal): Promise<IngestState> {
   return warehouse.read(async (db) => {
     const exists = (await readTableSchema(db, asset)) !== null;
     if (!(await hasState(db))) return { exists, cursorValue: null, cursorType: null, rowCount: null, known: [], files: [] };
@@ -314,7 +326,7 @@ async function readState(warehouse: DuckWarehouse, asset: string, withFiles: boo
       exists, cursorValue: a?.cursor_value ?? null, cursorType: (a?.cursor_type as CursorType | null) ?? null,
       rowCount: a?.row_count === null || a?.row_count === undefined ? null : Number(a.row_count), known, files,
     };
-  }, { purpose: `read the state of ${asset}` });
+  }, { purpose: `read the state of ${asset}`, signal });
 }
 
 function toKnown(stored: Awaited<ReturnType<typeof readStoredColumns>>): KnownColumn[] {
@@ -416,6 +428,12 @@ async function readCatalog(tx: Sql, step: PlannedStep, o: { runId: string; keys:
   return entry;
 }
 
+/** StepResult.created for a table this step created: its columns (croft's _loaded_at aside) and JSON ones. */
+export function createdTable(columns: readonly { name: string; type: string }[]): NonNullable<StepResult["created"]> {
+  const own = columns.filter((c) => c.name.toLowerCase() !== RESERVED.loadedAt);
+  return { columns: own.length, jsonColumns: own.filter((c) => c.type.toUpperCase() === "JSON").length };
+}
+
 function emptyRows(total = 0): StepResult["rows"] {
   return { in: 0, added: 0, updated: 0, unchanged: 0, deleted: 0, total };
 }
@@ -439,7 +457,7 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
   const isFile = step.kind === "file";
 
   // 1. State, under a short read lease.
-  const state = await readState(warehouse, asset, isFile);
+  const state = await readState(warehouse, asset, isFile, signal);
   // 2. since.
   const since = sinceFor(i, state);
   if (since.echo) log.write(`--from ${i.from}: ${since.echo}`);
@@ -449,7 +467,7 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
   const http = trackedHttp(createHttp({
     ...i.http, signal, redact: (t) => i.env.redact(t), log: (line) => log.write(line),
   }), progress, (t) => i.env.redact(t));
-  const own = new OwnTableQuery({ warehouse, asset, dir: stageDir, stateDir, timezone: project.timezone });
+  const own = new OwnTableQuery({ warehouse, asset, dir: stageDir, stateDir, timezone: project.timezone, signal });
   let manifest: Awaited<ReturnType<typeof writeStage>> | null = null;
   let files: FileExtract | null = null;
   try {
@@ -546,7 +564,7 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
     } finally {
       runs.clearLockHolder();
     }
-  }, { runId, asset });
+  }, { runId, asset, signal });
 
   let out: { res: WriteResult; catalog: CatalogAsset };
   let trashed: TrashEntry | null = null;
@@ -576,7 +594,7 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
     }
     log.write(`--allow-shrink confirmed: moving the current ${rowsBefore} rows of ${asset} to the trash first`);
     try {
-      trashed = await trashTable(warehouse, asset, `run --allow-shrink (${runId})`, { runId });
+      trashed = await trashTable(warehouse, asset, `run --allow-shrink (${runId})`, { runId, signal });
     } catch (te) {
       // A busy database is worth a retry (the grant holds for this run); anything else stops here.
       const busy = croftError(te);
@@ -597,6 +615,7 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
     ...base, status: "ok", requests: progress.requests, rows: r.rows, schemaChanges: r.schemaChanges,
     ...(r.cursor ? { cursor: r.cursor } : {}),
     ...(trashed ? { trashed: { path: trashed.path, rows: trashed.rows } } : {}),
+    ...(r.created ? { created: createdTable(out.catalog.columns) } : {}),
     durationMs: Date.now() - started,
   };
   return { result, warnings, problems: [], catalog: out.catalog };

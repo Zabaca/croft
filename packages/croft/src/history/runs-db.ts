@@ -263,6 +263,12 @@ export class RunsDb {
     return res.changes === 1;
   }
 
+  /** A running run's latest progress as its summary ({progress}), for status and context; finishRun replaces
+   *  it with the result. Does nothing once the run has ended. */
+  setRunProgress(id: string, progress: unknown): void {
+    this.sqlite.query("UPDATE runs SET summary = ? WHERE id = ? AND status = 'running'").run(JSON.stringify({ progress }), id);
+  }
+
   /** running → crashed. Returns false when the run was not running. */
   markCrashed(id: string): boolean {
     const res = this.sqlite

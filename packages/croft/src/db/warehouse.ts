@@ -9,6 +9,9 @@
 //   holder) or DB_HELD_BY_OTHER_PROGRAM, naming the holder from DuckDB's lock error.
 // - write() wraps BEGIN/COMMIT/ROLLBACK; every statement goes through prepare(), one per call, and the
 //   transaction's TxGuard throws DDL_AFTER_DML at an ALTER that follows DML on the same table.
+// - An optional AbortSignal ends a wait at once (Ctrl-C during a lock wait of up to 10 min): the lock wait,
+//   and a write queued behind another write of this process. It never cuts a lease that already holds the
+//   file; the body decides what an abort means there (run/ingest.ts refuses further statements).
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
@@ -55,10 +58,41 @@ export interface WarehouseOptions {
   register?: boolean;                    // set globalThis[Symbol.for("croft.warehouse")]; default true
 }
 
-export interface WriteOptions { waitMs?: number; runId: string; asset?: string; transaction?: boolean }
-export interface ReadOptions { waitMs?: number; purpose: string }
+export interface WriteOptions {
+  waitMs?: number;
+  runId: string;
+  asset?: string;
+  transaction?: boolean;
+  /** Ends the wait for the file (and for this process's earlier writes) at once: the signal's CroftError
+   *  reason (a run's INTERRUPTED or TIMEOUT), else INTERRUPTED. */
+  signal?: AbortSignal;
+}
+export interface ReadOptions { waitMs?: number; purpose: string; signal?: AbortSignal }
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+/** A wait that ends early, without error, when the signal aborts; the caller checks the signal next. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
+/** Errors thrown because a lease's own signal ended its wait for the file (see ensureOpen). */
+const abortedWaits = new WeakSet<object>();
+
+/** What an aborted wait throws: the signal's reason when it is a CroftError, else INTERRUPTED. */
+export function waitAborted(signal: AbortSignal, what = "waiting for the warehouse"): CroftError {
+  const r = signal.reason as { name?: unknown; problem?: unknown } | undefined;
+  const err = r instanceof CroftError ? r : r && r.name === "CroftError" && r.problem ? (r as CroftError)
+    : new CroftError("INTERRUPTED", { message: `interrupted while ${what}`, hint: "nothing was written; run it again" });
+  abortedWaits.add(err);
+  return err;
+}
 
 /** Jittered exponential backoff: 25 ms doubling to 1 s, each delay drawn from [half, full]. */
 export function backoffMs(attempt: number): number {
@@ -134,6 +168,16 @@ export class LeaseSql implements Sql {
 
 interface Described { holder: LockHolder; croft: boolean }
 
+/** `p`, or a rejection as soon as `signal` aborts (p keeps running; its outcome is then ignored). */
+function untilAborted<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(waitAborted(signal));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(waitAborted(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
 // One warehouse per canonical path per process.
 const byPath = new Map<string, DuckWarehouse>();
 const GLOBAL_KEY = Symbol.for("croft.warehouse");
@@ -178,7 +222,7 @@ export class DuckWarehouse implements Warehouse {
   }
 
   read<T>(fn: (db: LeaseSql) => Promise<T>, o?: ReadOptions): Promise<T> {
-    return this.lease("read", o?.waitMs, (conn) => fn(new LeaseSql(conn, this.renderCtx(), null)));
+    return this.lease("read", o?.waitMs, (conn) => fn(new LeaseSql(conn, this.renderCtx(), null)), undefined, o?.signal);
   }
 
   write<T>(label: string, fn: (tx: LeaseSql) => Promise<T>, o?: WriteOptions): Promise<T> {
@@ -186,8 +230,11 @@ export class DuckWarehouse implements Warehouse {
       return Promise.reject(new CroftError("INTERNAL_ERROR", { message: `write "${label}" in a read-only process`, hint: "report this croft bug" }));
     }
     // In-process write mutex: one write step at a time, in arrival order.
-    const run = async () =>
-      this.lease("write", o?.waitMs, async (conn) => {
+    const signal = o?.signal;
+    let started = false;
+    const run = async () => {
+      started = true;
+      return this.lease("write", o?.waitMs, async (conn) => {
         if (o?.transaction === false) return fn(new LeaseSql(conn, this.renderCtx(), null));
         // DuckDB names a file database after its stem, so `warehouse.t` means main.t in warehouse.duckdb.
         const tx = new LeaseSql(conn, this.renderCtx(), new TxGuard({ database: basename(this.path, extname(this.path)) }));
@@ -202,10 +249,21 @@ export class DuckWarehouse implements Warehouse {
           } catch {} // already rolled back by a failed COMMIT
           throw e;
         }
-      }, o?.runId);
+      }, o?.runId, signal);
+    };
     const next = this.writeChain.then(run, run);
     this.writeChain = next.catch(() => {});
-    return next;
+    if (!signal) return next;
+    // Queued behind another write: an abort ends the wait now, and the queued lease then refuses to start.
+    // Once it has started, the lease itself (lock wait) or its body decides.
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = () => {
+        if (!started) reject(waitAborted(signal, `waiting for another write of this process (${label})`));
+      };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+      next.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+    });
   }
 
   /**
@@ -250,13 +308,15 @@ export class DuckWarehouse implements Warehouse {
     return kind === "write" ? w.ttyWriteMs : w.ttyReadMs;
   }
 
-  private async lease<T>(kind: "read" | "write", waitMs: number | undefined, body: (conn: DuckDBConnection) => Promise<T>, runId?: string): Promise<T> {
+  private async lease<T>(kind: "read" | "write", waitMs: number | undefined, body: (conn: DuckDBConnection) => Promise<T>,
+    runId?: string, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) throw waitAborted(signal);
     this.leases++;
     if (this.closeTimer) clearTimeout(this.closeTimer);
     this.closeTimer = null;
     let conn: DuckDBConnection | undefined;
     try {
-      const instance = await this.ensureOpen(kind, waitMs ?? this.waitCap(kind), runId);
+      const instance = await this.ensureOpen(kind, waitMs ?? this.waitCap(kind), runId, signal);
       conn = await connect(instance, this.spec, this.path);
       this.conns.add(conn);
       if (!this.formatChecked) {
@@ -274,17 +334,33 @@ export class DuckWarehouse implements Warehouse {
     }
   }
 
-  private ensureOpen(kind: "read" | "write", waitMs: number, runId?: string): Promise<DuckDBInstance> {
-    if (this.instance) return Promise.resolve(this.instance);
-    this.opening ??= this.open(kind, waitMs, runId).finally(() => (this.opening = null));
-    return this.opening;
+  /**
+   * The open instance, opening it if needed. One open runs at a time: the lease that starts it waits with
+   * its own signal; others wait for that open, each giving up at once when its own signal aborts. When the
+   * opener's signal ended the shared open, a lease whose signal did not abort starts a new one.
+   */
+  private async ensureOpen(kind: "read" | "write", waitMs: number, runId?: string, signal?: AbortSignal): Promise<DuckDBInstance> {
+    for (;;) {
+      if (signal?.aborted) throw waitAborted(signal);
+      if (this.instance) return this.instance;
+      if (!this.opening) {
+        this.opening = this.open(kind, waitMs, runId, signal).finally(() => (this.opening = null));
+        return this.opening;
+      }
+      try {
+        return await (signal ? untilAborted(this.opening, signal) : this.opening);
+      } catch (e) {
+        if (e && typeof e === "object" && abortedWaits.has(e) && !signal?.aborted) continue;
+        throw e;
+      }
+    }
   }
 
   private get usesIntent(): boolean {
     return this.mode === "read_write" && this.o.writeIntent !== false;
   }
 
-  private async open(kind: "read" | "write", waitMs: number, runId?: string): Promise<DuckDBInstance> {
+  private async open(kind: "read" | "write", waitMs: number, runId?: string, signal?: AbortSignal): Promise<DuckDBInstance> {
     if (this.mode === "read_only" && !existsSync(this.path)) {
       throw new CroftError("DB_NOT_FOUND", {
         message: `the warehouse ${this.path} does not exist yet`,
@@ -310,6 +386,11 @@ export class DuckWarehouse implements Warehouse {
     let foreignSince = 0;
     let withdrawnAt: number | null = null;
     for (let attempt = 0; ; attempt++) {
+      if (signal?.aborted) {
+        this.waitingOn = null;
+        this.dropIntent();
+        throw waitAborted(signal);
+      }
       try {
         const { instance } = await openInstance(this.path, this.mode);
         if (this.intentHeld) intents.resume(this.stateDir); // announce again before anything else happens
@@ -356,7 +437,7 @@ export class DuckWarehouse implements Warehouse {
           this.dropIntent();
           throw this.busyError(holder, croft, waited, kind);
         }
-        await sleep(Math.max(1, Math.min(backoffMs(attempt), deadline - Date.now())));
+        await sleep(Math.max(1, Math.min(backoffMs(attempt), deadline - Date.now())), signal);
       }
     }
   }

@@ -13,6 +13,7 @@ import { Confirmations } from "../../safety/confirm.ts";
 import { DEFAULT_FOLLOW_MS, followRun, parseWait, pickRunId, spawnDetachedRun } from "../../run/detach.ts";
 import { loadErrors, planRun } from "../../run/plan.ts";
 import { checkRunFlags, executeRun, type RunData, type RunEvent, type RunSummary } from "../../run/runner.ts";
+import { CHECKS_ENFORCED, CHECKS_NOT_ENFORCED } from "../../core/phase.ts";
 import type { CommandImpl, CommandResult, Ctx } from "../command.ts";
 import { formatCount, formatDuration } from "../render.ts";
 
@@ -58,7 +59,7 @@ async function askYesNo(question: string): Promise<boolean> {
 
 export function toResult(s: RunSummary): CommandResult<RunData> {
   return {
-    data: s.data, problems: s.problems, next: s.next, exit: s.exit, ok: s.ok,
+    data: { ...s.data, checksEnforced: CHECKS_ENFORCED }, problems: s.problems, next: s.next, exit: s.exit, ok: s.ok,
     ...(s.confirmation ? { confirmation: s.confirmation } : {}),
   };
 }
@@ -189,6 +190,7 @@ function stepLines(s: StepResult): string[] {
   else first.push(`${plural(r.in, "row")} (${formatDuration(s.durationMs)})`);
   const added = s.schemaChanges.filter((c) => c.kind === "add_column").length;
   const widened = s.schemaChanges.filter((c) => c.kind === "widen").length;
+  if (s.created) first.push(`new table, ${plural(s.created.columns, "column")}${s.created.jsonColumns ? ` (${formatCount(s.created.jsonColumns)} JSON)` : ""}`);
   if (added) first.push(`+${plural(added, "column")}`);
   if (widened) first.push(`${plural(widened, "column")} widened`);
   const second = [`added ${formatCount(r.added)}`, `updated ${formatCount(r.updated)}`, `unchanged ${formatCount(r.unchanged)}`];
@@ -217,6 +219,7 @@ export function formatRun(d: RunData, ctx?: Pick<Ctx, "render">): string {
   const updated = d.steps.filter((s) => s.status === "ok" && s.rows.added + s.rows.updated + s.rows.deleted > 0).length;
   const failed = d.steps.filter((s) => s.status === "failed").length;
   lines.push(`${d.status === "interrupted" ? "interrupted" : "done"} ${formatDuration(took)} · ${formatCount(updated)} updated · ${formatCount(failed)} failed`);
+  if (d.checksEnforced === false && d.steps.length) lines.push(CHECKS_NOT_ENFORCED);
   return lines.join("\n");
 }
 

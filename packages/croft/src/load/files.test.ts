@@ -834,12 +834,25 @@ describe("URLs", () => {
     expect(calls).toEqual(["https://example.invalid/data.csv {}"]);
     expect(ex.files[0]).toMatchObject({ etag: '"e"', size: 5, status: "new" });
 
-    // ctx.http itself (createHttp) has no getBytes: extraction falls back to fetch.
-    const srv = server({ body: () => "id\n7\n" });
+    // ctx.http itself (createHttp) has getBytes: downloads go through it (its retries, redaction and
+    // counters), and non-UTF-8 bytes arrive intact.
+    const latin = new Uint8Array(readFileSync(join(FIXTURES, "latin1.csv")));
+    const srv = server({ body: () => latin });
     const real = createHttp({ signal: new AbortController().signal });
     const ex2 = await extract(p, { file: `${srv.url}d.csv` }, { http: real });
-    expect(ex2.files[0]!.size).toBe(5);
-    expect(real.requests).toBe(0);
+    expect(ex2.files[0]!.sha256).toBe(new Bun.CryptoHasher("sha256").update(latin).digest("hex"));
+    expect(codes(ex2)).toEqual(["CSV_ENCODING_GUESSED"]);
+    expect(real.requests).toBe(1);
+
+    // An abort while ctx.http waits out a Retry-After is INTERRUPTED, as with extraction's own fetch.
+    const slow = Bun.serve({ port: 0, fetch: () => new Response("busy", { status: 503, headers: { "retry-after": "5" } }) });
+    cleanups.push(() => slow.stop(true));
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 50);
+    const started = Date.now();
+    const e2 = await failure(extract(p, { file: `${slow.url.href}x.csv` }, { signal: ac.signal, http: createHttp({ signal: ac.signal }) }));
+    expect(e2.code).toBe("INTERRUPTED");
+    expect(Date.now() - started).toBeLessThan(2000);
   });
 });
 
