@@ -437,6 +437,81 @@ describe("project checks", () => {
     expect(problems.find((p) => p.code === "ENV_FILE_IGNORED")!.file).toBe(".env.local");
   });
 
+  describe("declared secrets (§2: SECRET_MISSING)", () => {
+    // charges names its secret in a literal; gh builds its list at import time, so only importing finds GH_TOKEN.
+    // Neither asset's rows() may run: it would write a file into the project.
+    const CHARGES = `import { ingest } from "@zabaca/croft";
+export default ingest({ secrets: ["STRIPE_KEY"], key: "id", async *rows() { await Bun.write("ran-charges", "x"); yield []; } });
+`;
+    const GH = `import { ingest } from "@zabaca/croft";
+const names = ["GH" + "_TOKEN", "STRIPE_KEY"];
+export default ingest({ secrets: names, key: "id", async *rows() { await Bun.write("ran-gh", "x"); yield []; } });
+`;
+    async function withSecrets(): Promise<string> {
+      const root = await project();
+      mkdirSync(join(root, "node_modules", "@zabaca"), { recursive: true });
+      symlinkSync(SELF_ROOT, join(root, "node_modules", "@zabaca", "croft"));
+      writeFileSync(join(root, "assets", "charges.ts"), CHARGES);
+      writeFileSync(join(root, "assets", "gh.ts"), GH);
+      return root;
+    }
+
+    test("each missing one is a warning naming the assets that use it, with the .env fix; nothing runs or is written", async () => {
+      const root = await withSecrets();
+      const before = tree(root);
+      const { data, problems } = await runDoctor(root, deps());
+      const missing = problems.filter((p) => p.code === "SECRET_MISSING");
+      expect(missing.map((p) => p.details?.name)).toEqual(["GH_TOKEN", "STRIPE_KEY"]);
+      for (const p of missing) {
+        expect(p.severity).toBe("warning");
+        expect(p.hint).toBe(`add ${p.details!.name}=... to .env (or run \`croft secrets set ${p.details!.name}\` in your terminal)`);
+        expect(p.fix).toMatchObject({ kind: "manual", requiresHuman: true });
+        expect(p.fix!.description).toContain(".env");
+      }
+      expect(missing[1]!.details).toEqual({ name: "STRIPE_KEY", usedBy: ["charges", "gh"] });
+      const lines = data.checks.filter((c) => c.id === "secrets");
+      expect(lines.map((c) => [c.status, c.code, c.text])).toEqual([
+        ["warn", "SECRET_MISSING", "GH_TOKEN (used by gh)"],
+        ["warn", "SECRET_MISSING", "STRIPE_KEY (used by charges, gh)"],
+      ]);
+      expect(lines.every((c) => c.section === "project")).toBe(true);
+      expect(data.summary.warnings).toBe(2);
+      expect(data.summary.errors).toBe(0);
+      expect(tree(root)).toEqual(before);
+      // The §2 layout: the code and the names on the check line, the fix under it.
+      const human = formatDoctor(data, problems);
+      expect(human).toContain("  warn  SECRET_MISSING STRIPE_KEY (used by charges, gh)\n        fix: add STRIPE_KEY=... to .env (or run `croft secrets set STRIPE_KEY` in your terminal)");
+    });
+
+    test("set in .env or in the environment: one ok line, no problem", async () => {
+      const root = await withSecrets();
+      writeFileSync(join(root, ".env"), "STRIPE_KEY=sk_test_123\n");
+      const { data, problems } = await runDoctor(root, deps({ env: { GH_TOKEN: "ghp_abc" } }));
+      expect(problems.filter((p) => p.code === "SECRET_MISSING")).toEqual([]);
+      expect(data.checks.filter((c) => c.id === "secrets").map((c) => [c.status, c.text])).toEqual([["ok", "secrets: GH_TOKEN, STRIPE_KEY set"]]);
+      // An empty value is not set.
+      const empty = await runDoctor(root, deps({ env: { GH_TOKEN: "" } }));
+      expect(empty.problems.filter((p) => p.code === "SECRET_MISSING").map((p) => p.details?.name)).toEqual(["GH_TOKEN"]);
+    });
+
+    test("an asset that does not import still has its literal secrets checked; no declared secrets means no line", async () => {
+      const root = await project();
+      writeFileSync(join(root, "assets", "charges.ts"), CHARGES.replace("async *rows", "broken syntax ( async *rows"));
+      const { data, problems } = await runDoctor(root, deps());
+      expect(problems.filter((p) => p.code === "SECRET_MISSING").map((p) => p.details?.name)).toEqual(["STRIPE_KEY"]);
+      const plain = await project();
+      expect((await runDoctor(plain, deps())).data.checks.some((c) => c.id === "secrets")).toBe(false);
+      expect(data.checks.filter((c) => c.id === "secrets")).toHaveLength(1);
+    });
+
+    test("not checked when the DuckDB binding does not load (finding the assets needs it)", async () => {
+      const root = await withSecrets();
+      const { data, problems } = await runDoctor(root, deps({ probeDuckdb: () => ({ ok: false, code: "ERR_DLOPEN_FAILED", message: "dlopen failed" }) }));
+      expect(problems.some((p) => p.code === "SECRET_MISSING")).toBe(false);
+      expect(data.checks.filter((c) => c.id === "secrets").map((c) => c.status)).toEqual(["info"]);
+    });
+  });
+
   test("CLAUDE_FILES_OUTDATED: old stamp, missing skill, edited block; fixed by croft init --claude", async () => {
     const root = await project();
     writeFileSync(join(root, SKILL_PATH), skillMd("0.0.1"));

@@ -184,14 +184,20 @@ export default ingest({
 });
 
 describe("edges: reported bugs", () => {
-  // BUG (reported): the zero-asset path (§3b: `croft query "from 'files/sales/*.csv'"` to look at a file without
-  // making an asset) fails with DB_NOT_FOUND in a project that has not run anything yet, and its fix is a bare
-  // `croft run` (which fetches every ingest). A file query needs no warehouse. Flip to test() once fixed.
-  bugTest("the zero-asset path works in a fresh project, before any run", async () => {
+  // Fixed: the zero-asset path (§3b: `croft query "from 'files/sales/*.csv'"` to look at a file without making an
+  // asset) used to fail with DB_NOT_FOUND in a project that had not run anything, with a bare `croft run` (which
+  // fetches every ingest) as its fix. With no warehouse, query now runs on a sandboxed in-memory DuckDB and
+  // creates nothing; a table named before its first run is DB_NOT_FOUND with the run that builds that asset.
+  test("the zero-asset path works in a fresh project, before any run", async () => {
     const { project: p } = await initProject();
     const r = await p.json(["query", "select count(*) n from 'files/example_sales.csv'"]);
     expect(r.code, show(r)).toBe(0);
     expect(r.json.data.rows[0].n).toBe(120);
+    expect(p.exists("warehouse.duckdb")).toBe(false);
+    const table = await p.json(["query", "select count(*) n from example_sales"]);
+    expect(table.code, show(table)).toBe(2);
+    expect(findProblem(table.json, "DB_NOT_FOUND"), show(table)).toMatchObject({ fix: { command: "croft run example_sales" } });
+    expect(p.exists("warehouse.duckdb")).toBe(false);
   }, 60_000);
 
   // Fixed: `croft run order` with assets/order.ts present said "there is no asset named order" (and listed the

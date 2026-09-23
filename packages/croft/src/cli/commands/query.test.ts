@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { cleanup as cleanupChildren, spawnHolder } from "../../read/testkit.ts";
 import { CHARGES_TS, cleanup, cli, ISSUES_SEED, ISSUES_TS, makeProject, seed, shape } from "./inspect-testkit.ts";
@@ -241,11 +242,48 @@ describe("croft query: usage and state", () => {
     expect((await cli(["query", "a", "b", "--json"], { cwd: p.root })).json.problems[0].code).toBe("USAGE_ERROR");
   });
 
-  test("before the first run the warehouse does not exist: DB_NOT_FOUND", async () => {
+  test("before the first run, files/ can be queried (the zero-asset path) and nothing is created", async () => {
+    const p = makeProject({ files: { "assets/github_issues.ts": ISSUES_TS, "files/sales/a.csv": "order_id,amount\n1,10\n2,20\n", "files/sales/b.csv": "order_id,amount\n3,30\n" } });
+    const r = await cli(["query", "select count(*) AS n, sum(amount::INTEGER) AS total from 'files/sales/*.csv'", "--json"], { cwd: p.root });
+    expect(r.exit).toBe(0);
+    expect(r.json).toMatchObject({ ok: true, problems: [] });
+    expect(r.json.data.rows).toEqual([{ n: 3, total: "60" }]);
+    // From a subfolder too, and plain SQL with no table at all.
+    const sub = await cli(["query", "select * from read_csv('files/sales/a.csv') order by order_id", "--json"], { cwd: join(p.root, "assets") });
+    expect(sub.exit).toBe(0);
+    expect(sub.json.data.rowCount).toBe(2);
+    expect((await cli(["query", "select 1 AS one", "--json"], { cwd: p.root })).json.data.rows).toEqual([{ one: 1 }]);
+    // A read-only command never creates the warehouse (or anything in the state folder).
+    expect(existsSync(p.database)).toBe(false);
+    expect(readdirSync(p.stateDir)).toEqual([]);
+  });
+
+  test("before the first run the sandbox still holds: only files/ is reachable", async () => {
+    const p = makeProject({ files: { "assets/github_issues.ts": ISSUES_TS, ".env": "X=secretvalue\n" } });
+    for (const sql of ["select * from read_csv('/etc/hosts')", "select * from read_text('.env')", "select * from read_text('croft.json')", "select * from '../x.csv'"]) {
+      const r = await cli(["query", sql, "--json"], { cwd: p.root });
+      expect(r.exit).toBe(2);
+      expect(r.json.problems[0].code).toBe("QUERY_PATH_DENIED");
+    }
+    const write = await cli(["query", "create table t as select 1", "--json"], { cwd: p.root });
+    expect(write.exit).toBe(2);
+    expect(write.json.problems[0].code).toBe("QUERY_NOT_SELECT");
+    expect(existsSync(p.database)).toBe(false);
+  });
+
+  test("before the first run, an asset's table is DB_NOT_FOUND with the run that builds it; another name is UNKNOWN_TABLE", async () => {
     const p = makeProject({ files: { "assets/github_issues.ts": ISSUES_TS } });
-    const r = await cli(["query", "select 1", "--json"], { cwd: p.root });
+    const r = await cli(["query", "select count(*) from github_issues", "--json"], { cwd: p.root });
     expect(r.exit).toBe(2);
-    expect(r.json.problems[0]).toMatchObject({ code: "DB_NOT_FOUND", fix: { kind: "command", command: "croft run" } });
+    expect(r.json.problems[0]).toMatchObject({
+      code: "DB_NOT_FOUND", fix: { kind: "command", command: "croft run github_issues" }, details: { table: "github_issues", asset: "github_issues" },
+    });
+    expect(r.json.problems[0].message).toContain("github_issues");
+    const other = await cli(["query", "select * from github_isues", "--json"], { cwd: p.root });
+    expect(other.exit).toBe(2);
+    expect(other.json.problems[0]).toMatchObject({ code: "UNKNOWN_TABLE", details: { table: "github_isues" } });
+    expect(other.json.problems[0].hint).toContain("github_issues");
+    expect(existsSync(p.database)).toBe(false);
   });
 
   test("outside a project: PROJECT_NOT_FOUND", async () => {

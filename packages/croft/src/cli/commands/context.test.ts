@@ -208,6 +208,8 @@ describe("croft context: human output", () => {
     expect(r.stdout).toContain("Recent schema changes (7 days)");
     expect(r.stdout).toContain("  github_issues + updated_at TIMESTAMPTZ 60 min ago");
     expect(r.stdout).toContain("taxi_zones · ingest · assets/taxi_zones.ts · 265 rows · crashed (croft logs taxi_zones --failed) · 2 files gone");
+    // A running step with the progress the run engine reports (§4.3 running[]: phase, rowsFetched).
+    expect(r.stdout).toContain("Running\n  r_0922_1157_live sales since 4 min ago · extract · 61,200 rows fetched");
     expect(r.stdout.split("\n")).toContain("checks: not enforced until phase 2");
   });
 });

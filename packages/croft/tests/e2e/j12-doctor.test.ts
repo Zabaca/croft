@@ -2,7 +2,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { readdirSync } from "node:fs";
 import { stripeAsset } from "./fixtures.ts";
-import { bugTest, cleanupAll, croftIn, initProject, type Project, show, tempDir } from "./harness.ts";
+import { cleanupAll, croftIn, initProject, type Project, show, tempDir } from "./harness.ts";
 
 afterAll(cleanupAll);
 
@@ -60,10 +60,9 @@ test("journey 12: doctor --json on a fresh project, after a run, and outside any
   withMissingSecret = p;
 }, 120_000);
 
-// BUG (reported): DESIGN §2's install-time table and its sample output have doctor report a declared secret that
-// is missing ("warn SECRET_MISSING STRIPE_KEY (used by stripe_charges)", with the .env fix). doctor has no such
-// check yet, although `croft secrets` already finds declared secrets. Flip to test() once fixed.
-bugTest("journey 12b: doctor warns SECRET_MISSING for a declared secret that is not set", async () => {
+// Fixed: DESIGN §2's install-time table and its sample output have doctor report a declared secret that is
+// missing ("warn SECRET_MISSING STRIPE_KEY (used by stripe_charges)", with the .env fix); doctor had no such check.
+test("journey 12b: doctor warns SECRET_MISSING for a declared secret that is not set", async () => {
   expect(withMissingSecret).toBeDefined();
   const r = await withMissingSecret!.json(["doctor"]);
   expect(r.code, show(r)).toBe(0);
@@ -71,4 +70,14 @@ bugTest("journey 12b: doctor warns SECRET_MISSING for a declared secret that is 
   expect(missing, show(r)).toBeDefined();
   expect(missing.severity).toBe("warning");
   expect(`${missing.hint} ${missing.fix?.description ?? ""}`).toContain(".env");
+  expect(missing.details).toEqual({ name: "STRIPE_KEY", usedBy: ["stripe_charges"] });
+  expect(r.json.data.summary).toMatchObject({ errors: 0, warnings: 1 });
+  // The human form is the §2 sample: the code and the name under Project, the fix on the next line.
+  const human = await withMissingSecret!.croft(["doctor"]);
+  expect(human.code, show(human)).toBe(0);
+  expect(human.stdout).toContain("  warn  SECRET_MISSING STRIPE_KEY (used by stripe_charges)\n        fix: add STRIPE_KEY=... to .env");
+  // Set in .env, the warning goes.
+  withMissingSecret!.write(".env", "STRIPE_KEY=sk_test_123\n");
+  const set = await withMissingSecret!.json(["doctor"]);
+  expect(set.json.problems.some((x: { code: string }) => x.code === "SECRET_MISSING"), show(set)).toBe(false);
 }, 60_000);
