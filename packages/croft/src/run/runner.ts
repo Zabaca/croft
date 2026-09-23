@@ -6,7 +6,8 @@
 //   asset leases    all or nothing, so two runs never touch one asset (history/leases.ts)
 //   steps           up to `concurrency` extractions at once; writes queue behind the warehouse's in-process
 //                   write mutex, so one write step commits at a time
-//   retries         2 by default, after 30 s and 2 min, for retryable errors only
+//   retries         2 by default, after 30 s and 2 min (or the server's longer Retry-After, up to 5 min), for
+//                   retryable errors only
 //   no progress     no row yielded and no request completed for `timeout` (10 min) → TIMEOUT
 //   signals         the caller's AbortSignal (SIGINT/SIGTERM): the step is interrupted, its transaction
 //                   discarded, the run marked interrupted, exit 130
@@ -25,18 +26,31 @@ import { Confirmations } from "../safety/confirm.ts";
 import { openWarehouse, type DuckWarehouse } from "../db/warehouse.ts";
 import { allCatalog, getCatalog } from "../history/catalog.ts";
 import { acquire, release } from "../history/leases.ts";
-import { logDir, logPath, openLog } from "../history/logs.ts";
+import { logDir, logPath, NOT_STARTED_RECORD, openLog, writeRunRecord } from "../history/logs.ts";
 import { reconcile } from "../history/reconcile.ts";
 import { RunsDb, type RunStatus, type RunTrigger } from "../history/runs-db.ts";
 import type { HttpOptions } from "../http/http.ts";
 import { redactProblem } from "../cli/render.ts";
+import { now as clockNow } from "../core/time.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { loadProject, type Project } from "../project/root.ts";
-import { croftError, isRetryable, runIngest, type ShrinkDecider, SHRINK_ACTION, StepProgress, type ProgressSnapshot } from "./ingest.ts";
+import {
+  croftError, fromSince, isRetryable, type ProgressSnapshot, runIngest, savedCursors, type ShrinkDecider, SHRINK_ACTION, StepProgress,
+} from "./ingest.ts";
 import { backfillUnsupported, isGlob, loadErrors, planRun, type PlannedStep, type RunPlan } from "./plan.ts";
 
 /** Delays before retries 1 and 2 (§8 "Retries"). */
 export const RETRY_DELAYS_MS: readonly number[] = [30_000, 120_000];
+/** The longest a run waits for a server's Retry-After before the next attempt; a longer one ends the step with
+ *  nextRetryAt (like ctx.http's maxRetryAfterMs inside one attempt). */
+export const RETRY_WAIT_LIMIT_MS = 300_000;
+
+/** The wait a failed request's server asked for (HTTP_ERROR details.retryAfterMs), or null. */
+export function retryAfterOf(p: Problem): number | null {
+  const v = p.code === "HTTP_ERROR" ? p.details?.retryAfterMs : undefined;
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+}
+
 /** Lease waits: off a TTY every wait is capped at 90 s (§5 "Default waits"); on a TTY a run waits 10 min. */
 export const LEASE_WAIT_MS = { offTty: 90_000, tty: 600_000 } as const;
 
@@ -91,6 +105,8 @@ export interface RunnerOptions {
   /** Aborted by SIGINT/SIGTERM (the command wires them); its reason should be an INTERRUPTED CroftError. */
   signal?: AbortSignal;
   retryDelaysMs?: readonly number[];
+  /** Overrides RETRY_WAIT_LIMIT_MS (tests). */
+  retryWaitLimitMs?: number;
   concurrency?: number;
   /** Overrides every asset's no-progress timeout (tests). */
   timeoutMs?: number;
@@ -106,11 +122,23 @@ export function shrinkCommand(asset: string): string {
   return `croft run ${asset} --allow-shrink`;
 }
 
-/** Flag rules that need the plan: destructive flags take exactly one exact name (§6 "Guards aimed at agents"). */
+/**
+ * Flag rules that need the plan: destructive flags take exactly one exact name (§6 "Guards aimed at agents"),
+ * and --from on an asset named exactly must apply to it (§8: BACKFILL_UNSUPPORTED). Called before the run
+ * exists, by the detached parent too, so such a refusal is never a run or a failed step.
+ */
 export function checkRunFlags(plan: RunPlan, o: Pick<RunnerOptions, "selectors" | "from" | "allowShrink" | "confirmToken">): void {
   const usage = (message: string, hint: string) => new CroftError("USAGE_ERROR", { message, hint });
   if (o.confirmToken !== undefined && !o.allowShrink) {
     throw usage("--confirm-token goes with --allow-shrink", "croft confirm <token> runs the confirmed command for you");
+  }
+  if (o.from !== undefined && !o.allowShrink) {
+    for (const s of plan.steps) {
+      // A broken asset fails its own step; its planned kind says nothing about --from.
+      if (!o.selectors.includes(s.asset) || loadErrors(s).length > 0) continue;
+      const unsupported = backfillUnsupported(s);
+      if (unsupported) throw unsupported;
+    }
   }
   if (!o.allowShrink) return;
   if (o.from !== undefined) throw usage("--allow-shrink and --from do not go together", "--from backfills merge ingests; the shrink guard applies to replace ingests");
@@ -236,6 +264,42 @@ function cursorTypes(runs: RunsDb): Record<string, CursorType> {
   return out;
 }
 
+/**
+ * --from against the saved cursors, before the run exists (§8). An asset named exactly that --from cannot
+ * apply to refuses the whole command (BACKFILL_WOULD_DUPLICATE, or USAGE_ERROR for a --from that does not
+ * parse); in a bare run or a glob such an asset is skipped instead. Returns why each skipped asset is skipped.
+ */
+async function checkFrom(plan: RunPlan, o: RunnerOptions, warehouse: DuckWarehouse): Promise<Map<string, string>> {
+  const skips = new Map<string, string>();
+  if (o.from === undefined) return skips;
+  const candidates = plan.steps.filter((s) => s.action === "fetch" && loadErrors(s).length === 0);
+  const saved = await savedCursors(warehouse, candidates.filter((s) => !backfillUnsupported(s)).map((s) => s.asset), o.signal);
+  const now = (o.now ?? clockNow)();
+  for (const s of candidates) {
+    try {
+      fromSince(s, o.from, saved.get(s.asset) ?? { value: null, type: null }, { timezone: o.project.timezone, now });
+    } catch (e) {
+      const err = croftError(e);
+      if (!err || !err.code.startsWith("BACKFILL_") || o.selectors.includes(s.asset)) throw e;
+      skips.set(s.asset, err.code === "BACKFILL_UNSUPPORTED" ? FROM_ONLY_MERGE : err.problem.message);
+    }
+  }
+  return skips;
+}
+
+const FROM_ONLY_MERGE = "--from applies to merge ingests";
+
+/** A detached child that fails before it records its run leaves the problem for its parent and `croft wait`. */
+function recordNotStarted(o: RunnerOptions, e: unknown): void {
+  if (!o.runId) return;
+  try {
+    const p = (croftError(e) ?? internal(e)).problem;
+    writeRunRecord(o.project.paths.stateDir, o.runId, NOT_STARTED_RECORD, redactValue(jsonSafe({ ...p, runId: o.runId }), o.env));
+  } catch {
+    // The parent still reports the child's exit and output.
+  }
+}
+
 function interruptedError(message = "the run was interrupted"): CroftError {
   return new CroftError("INTERRUPTED", { message, hint: "steps that had not committed saved nothing; run again to finish" });
 }
@@ -248,7 +312,12 @@ function nextSteps(steps: StepResult[], problems: Problem[]): Next[] {
     if (s.status !== "failed" || !s.error) continue;
     if (s.error.code === "INTERRUPTED") continue;
     next.push({ command: `croft logs ${s.asset} --failed`, reason: `see why ${s.asset} failed` });
-    if (isRetryable(s.error)) next.push({ command: `croft run ${s.asset}`, reason: "the error is temporary; run it again later" });
+    if (isRetryable(s.error)) {
+      next.push({
+        command: `croft run ${s.asset}`,
+        reason: s.nextRetryAt ? `the API asks to wait; run it again after ${s.nextRetryAt}` : "the error is temporary; run it again later",
+      });
+    }
   }
   const ok = steps.find((s) => s.status === "ok" && s.rows.total > 0);
   if (ok && next.length === 0) next.push({ command: `croft query "from ${ok.asset} limit 5"`, reason: `look at ${ok.asset}` });
@@ -267,28 +336,39 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
   const runs = RunsDb.open(paths.stateDir);
   let warehouse: DuckWarehouse | undefined;
   try {
-    const plan = o.plan ?? await planRun({ root: project.root, timezone: project.timezone, selectors: o.selectors, cursorTypes: cursorTypes(runs) });
-    checkRunFlags(plan, o);
-    // Every declared secret is hidden in data, not only the ones this run reads.
-    for (const s of plan.steps) if (s.spec) env.declare(s.spec.secrets);
     const interactive = o.interactive === true;
-    // No file-ingest directories in the sandbox: extractFiles snapshots every file into the state folder, and
-    // the write reads only those snapshots (a `file: "*.csv"` ingest would otherwise open the whole root).
-    warehouse = openWarehouse({
-      path: paths.database, mode: "read_write", timezone: project.timezone, root: project.root, stateDir: paths.stateDir,
-      isTTY: interactive, ...(o.runId ? { runId: o.runId } : {}),
-      // --no-wait: a held database file is exit 4 at once, like a held asset.
-      ...(o.noWait ? { waits: { offTtyMs: 0, ttyReadMs: 0, ttyWriteMs: 0 } } : {}),
-      lookupHolder: (pid) => {
-        const h = runs.getLockHolder();
-        return h && h.pid === pid ? h : null;
-      },
-      // Fairness (§5 "Leases"): a writer that sees waiters yields between its write steps (ingest.ts).
-      onWait: () => runs.registerWaiter(`croft run${o.runId ? ` ${o.runId}` : ""}`),
-    });
-    const rec = await reconcile({ db: runs, warehouse });
-    for (const dir of rec.stagingDirs) rmSync(dir, { recursive: true, force: true });
-    pruneStaging(paths.stateDir, runs);
+    // Everything that can refuse the command happens before the run exists: a refusal is never a run or a
+    // failed step. A detached child records it for its parent and `croft wait` (recordNotStarted).
+    let plan: RunPlan;
+    let rec: Awaited<ReturnType<typeof reconcile>>;
+    let fromSkips: Map<string, string>;
+    try {
+      plan = o.plan ?? await planRun({ root: project.root, timezone: project.timezone, selectors: o.selectors, cursorTypes: cursorTypes(runs) });
+      checkRunFlags(plan, o);
+      // Every declared secret is hidden in data, not only the ones this run reads.
+      for (const s of plan.steps) if (s.spec) env.declare(s.spec.secrets);
+      // No file-ingest directories in the sandbox: extractFiles snapshots every file into the state folder, and
+      // the write reads only those snapshots (a `file: "*.csv"` ingest would otherwise open the whole root).
+      warehouse = openWarehouse({
+        path: paths.database, mode: "read_write", timezone: project.timezone, root: project.root, stateDir: paths.stateDir,
+        isTTY: interactive, ...(o.runId ? { runId: o.runId } : {}),
+        // --no-wait: a held database file is exit 4 at once, like a held asset.
+        ...(o.noWait ? { waits: { offTtyMs: 0, ttyReadMs: 0, ttyWriteMs: 0 } } : {}),
+        lookupHolder: (pid) => {
+          const h = runs.getLockHolder();
+          return h && h.pid === pid ? h : null;
+        },
+        // Fairness (§5 "Leases"): a writer that sees waiters yields between its write steps (ingest.ts).
+        onWait: () => runs.registerWaiter(`croft run${o.runId ? ` ${o.runId}` : ""}`),
+      });
+      rec = await reconcile({ db: runs, warehouse });
+      for (const dir of rec.stagingDirs) rmSync(dir, { recursive: true, force: true });
+      pruneStaging(paths.stateDir, runs);
+      fromSkips = await checkFrom(plan, o, warehouse);
+    } catch (e) {
+      recordNotStarted(o, e);
+      throw e;
+    }
 
     const run = runs.createRun({
       ...(o.runId ? { id: o.runId } : {}), trigger: o.trigger ?? "manual", human: o.human ?? true, argv: [...o.argv], timeZone: project.timezone,
@@ -304,7 +384,7 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
     const problems: Problem[] = [...rec.problems, ...plan.problems];
     const results = new Map<string, StepResult>();
     let confirmation: Confirmation | undefined;
-    const runnable = plan.steps.filter((s) => s.action === "fetch" && loadErrors(s).length === 0);
+    const runnable = plan.steps.filter((s) => s.action === "fetch" && loadErrors(s).length === 0 && !fromSkips.has(s.asset));
     const finish = (): RunOutcome => {
       const steps = plan.steps.map((s) => results.get(s.asset)).filter((r): r is StepResult => r !== undefined);
       const interrupted = runSignal.aborted && (croftError(runSignal.reason)?.code ?? "INTERRUPTED") === "INTERRUPTED";
@@ -427,7 +507,16 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
             problems.push(a.error);
             return;
           }
-          const delay = delays[Math.min(attempt - 1, delays.length - 1)] ?? 0;
+          // A server's Retry-After (HTTP_ERROR details.retryAfterMs, §3a) is honored: never retry inside its window.
+          // A wait longer than a run holds on for ends the step now, saying when the server allows the next try.
+          const asked = retryAfterOf(a.error);
+          if (asked !== null && asked > (o.retryWaitLimitMs ?? RETRY_WAIT_LIMIT_MS)) {
+            a.result.nextRetryAt = new Date(Date.now() + asked).toISOString();
+            results.set(step.asset, a.result);
+            problems.push(a.error);
+            return;
+          }
+          const delay = Math.max(delays[Math.min(attempt - 1, delays.length - 1)] ?? 0, asked ?? 0);
           const nextRetryAt = new Date(Date.now() + delay).toISOString();
           a.result.nextRetryAt = nextRetryAt;
           results.set(step.asset, a.result);
@@ -441,7 +530,7 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
         }
       };
 
-      await pool(plan.steps.filter((s) => s.action === "fetch"), Math.max(1, o.concurrency ?? project.config.concurrency), async (step) => {
+      await pool(plan.steps.filter((s) => s.action === "fetch" && !fromSkips.has(s.asset)), Math.max(1, o.concurrency ?? project.config.concurrency), async (step) => {
         const errors = loadErrors(step);
         if (errors.length > 0) {
           const first = errors[0]!;
@@ -466,20 +555,12 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
         problems.push(...step.problems.filter((p) => p.severity !== "error").map((p) => ({ ...p, runId })));
         await runStep(step);
       });
+      // Transforms (phase 1), and with --from the assets it does not apply to in a bare run or a glob (an asset
+      // named exactly was refused before the run started).
       for (const s of plan.steps) {
-        if (s.action !== "skip") continue;
-        const unsupported = o.from !== undefined && o.selectors.includes(s.asset) ? backfillUnsupported(s) : null;
-        if (unsupported) {
-          // Named with --from: say why --from cannot apply, as for a replace ingest.
-          const p = { ...unsupported.problem, runId };
-          problems.push(p);
-          results.set(s.asset, {
-            asset: s.asset, status: "failed", reason: s.reason, behavior: s.behavior, attempt: 0, maxAttempts: 0,
-            rows: emptyRows(getCatalog(runs, s.asset)?.rows ?? 0), schemaChanges: [], checks: [], logsCommand: `croft logs ${s.asset}`, durationMs: 0, error: p,
-          });
-          continue;
-        }
-        const skippedBecause = o.from !== undefined ? "--from applies to merge ingests" : s.reason;
+        const fromSkip = fromSkips.get(s.asset);
+        if (s.action !== "skip" && fromSkip === undefined) continue;
+        const skippedBecause = fromSkip ?? (o.from !== undefined ? FROM_ONLY_MERGE : s.reason);
         results.set(s.asset, {
           asset: s.asset, status: "skipped", reason: s.reason, skippedBecause, behavior: s.behavior, attempt: 0, maxAttempts: 0,
           rows: emptyRows(getCatalog(runs, s.asset)?.rows ?? 0), schemaChanges: [], checks: [], logsCommand: `croft logs ${s.asset}`, durationMs: 0,

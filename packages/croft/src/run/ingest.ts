@@ -356,13 +356,35 @@ async function readState(warehouse: DuckWarehouse, asset: string, withFiles: boo
   }, { purpose: `read the state of ${asset}`, signal });
 }
 
+/** Saved cursors of these assets, under one short read lease (the --from check before a run starts). */
+export async function savedCursors(warehouse: DuckWarehouse, assets: readonly string[], signal?: AbortSignal): Promise<Map<string, SavedCursor>> {
+  const out = new Map<string, SavedCursor>();
+  if (assets.length === 0) return out;
+  await warehouse.read(async (db) => {
+    if (!(await hasState(db))) return;
+    const rows = await db.all<{ name: string; cursor_value: string | null; cursor_type: string | null }>(
+      `SELECT name, cursor_value, cursor_type FROM _croft.assets WHERE name IN (${assets.map((_, n) => `$${n + 1}`).join(", ")})`, [...assets]);
+    for (const r of rows) out.set(r.name, { value: r.cursor_value, type: r.cursor_type as CursorType | null });
+  }, { purpose: "read saved cursors for --from", ...(signal ? { signal } : {}) });
+  return out;
+}
+
 function toKnown(stored: Awaited<ReturnType<typeof readStoredColumns>>): KnownColumn[] {
   return stored.map((c) => ({
     name: c.name, type: c.type, sourceName: c.source_name, format: c.format, pinned: c.pinned, pending: c.pending, kinds: c.kinds,
   }));
 }
 
-interface Since { value?: string | number; echo?: string }
+interface Since {
+  value?: string | number;
+  echo?: string;
+  /** --from after the saved cursor (merge ingests): the write keeps the cursor here, so the rows between it and
+   *  --from are fetched by the next run instead of skipped (§8). */
+  holdCursor?: string;
+}
+
+/** A saved cursor, as _croft.assets has it. */
+export interface SavedCursor { value: string | null; type: CursorType | null }
 
 /** The cursor type for converting --from before the first load fixed it: a pin, else the unit, else a timestamp. */
 function guessCursorType(step: PlannedStep, field: string, unit: "s" | "ms" | undefined): CursorType {
@@ -381,26 +403,50 @@ function compareCursor(a: string | number, b: string, type: CursorType): number 
   return x < b ? -1 : x > b ? 1 : 0;
 }
 
+/**
+ * What `--from` means for one step (§8 "Backfills"), given its saved cursor. Throws what makes it refuse:
+ * BACKFILL_UNSUPPORTED (not a cursor ingest), BACKFILL_WOULD_DUPLICATE (an append ingest with a saved position:
+ * a --from at or before it stores rows twice, one after it skips the rows in between), or USAGE_ERROR (a
+ * --from that does not parse). A merge ingest's --from after its saved cursor holds the cursor where it is.
+ * The runner calls this before the run starts, so a refusal is never a failed step.
+ */
+export function fromSince(step: PlannedStep, from: string, saved: SavedCursor, o: { timezone: string; now: Date }): Since {
+  const unsupported = backfillUnsupported(step);
+  if (unsupported) throw unsupported;
+  const inc = step.incremental;
+  if (inc.kind !== "cursor") return {};
+  const type = saved.type ?? guessCursorType(step, inc.field, inc.unit);
+  const conv = parseFrom(from, {
+    type, ...(inc.unit ? { unit: inc.unit } : {}), timezone: o.timezone, now: o.now, template: saved.value, asset: step.asset,
+  });
+  const echo = `since: ${conv.since}${conv.instant && String(conv.since) !== conv.instant ? ` (${conv.instant})` : ""}`;
+  if (saved.value === null) return { value: conv.since, echo };
+  const after = compareCursor(conv.since, saved.value, type) > 0;
+  if (step.write === "append") {
+    throw after ? backfillWouldSkip(step, conv.since, saved.value) : backfillWouldDuplicate(step, conv.since, saved.value);
+  }
+  return { value: conv.since, echo, ...(after ? { holdCursor: saved.value } : {}) };
+}
+
+/** BACKFILL_WOULD_DUPLICATE for an append ingest's --from after its saved cursor: moving the cursor past the
+ *  rows in between would lose them, and keeping it would append the rows after --from a second time. */
+export function backfillWouldSkip(step: PlannedStep, since: string | number, saved: string): CroftError {
+  return new CroftError("BACKFILL_WOULD_DUPLICATE", {
+    asset: step.asset, file: step.file,
+    message: `${step.asset} appends rows; --from ${since} is after its saved position ${saved}, so the rows in between would never be fetched, and keeping the saved position would store the rows after ${since} twice`,
+    hint: `run it without --from, which continues from the saved position (croft run ${step.asset}); to re-read a window, add a key so re-read rows replace their old versions`,
+    fix: { kind: "command", description: "continue from the saved position", command: `croft run ${step.asset}` },
+    details: { since, saved },
+  });
+}
+
 function sinceFor(i: IngestInput, state: IngestState): Since {
   const { step } = i;
   const inc = step.incremental;
   if (i.from !== undefined) {
-    const unsupported = backfillUnsupported(step);
-    if (unsupported) throw unsupported;
+    return fromSince(step, i.from, { value: state.cursorValue, type: state.cursorType }, { timezone: i.project.timezone, now: (i.now ?? clockNow)() });
   }
   if (inc.kind !== "cursor") return {};
-  if (i.from !== undefined) {
-    const type = state.cursorType ?? guessCursorType(step, inc.field, inc.unit);
-    const conv = parseFrom(i.from, {
-      type, ...(inc.unit ? { unit: inc.unit } : {}), timezone: i.project.timezone, now: (i.now ?? clockNow)(),
-      template: state.cursorValue, asset: step.asset,
-    });
-    if (step.write === "append" && state.cursorValue !== null && compareCursor(conv.since, state.cursorValue, type) <= 0) {
-      throw backfillWouldDuplicate(step, conv.since, state.cursorValue);
-    }
-    const echo = `since: ${conv.since}${conv.instant && String(conv.since) !== conv.instant ? ` (${conv.instant})` : ""}`;
-    return { value: conv.since, echo };
-  }
   if (state.cursorValue === null || state.cursorType === null) return {};
   return {
     value: renderSince(state.cursorValue, {
@@ -496,7 +542,10 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
   const state = await readState(warehouse, asset, isFile, signal);
   // 2. since.
   const since = sinceFor(i, state);
-  if (since.echo) log.write(`--from ${i.from}: ${since.echo}`);
+  const held = since.holdCursor !== undefined
+    ? `the saved position stays at ${since.holdCursor} (--from is after it), so the next run also fetches the rows in between`
+    : undefined;
+  if (since.echo) log.write(`--from ${i.from}: ${since.echo}${held ? `; ${held}` : ""}`);
   else if (since.value !== undefined) log.write(`since: ${since.value}`);
 
   // 3. Extract, with no database lock.
@@ -546,7 +595,7 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
 
   const warnings: Problem[] = [...(files?.warnings ?? [])];
   const base = {
-    asset, reason: [step.reason, since.echo].filter(Boolean).join("; "), behavior: step.behavior,
+    asset, reason: [step.reason, since.echo, held].filter(Boolean).join("; "), behavior: step.behavior,
     attempt: i.attempt, maxAttempts: i.maxAttempts, schemaChanges: [] as SchemaChange[], checks: [],
     logsCommand: `croft logs ${asset}`, requests: progress.requests,
   };
@@ -592,6 +641,13 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
         attempt: i.attempt, extract: progress.extractInfo(), ...(i.checks ? { checks: i.checks } : {}),
         ...(i.now ? { now: i.now() } : {}),
       });
+      // writeBatch saved greatest(saved, loaded). After a --from beyond the saved cursor that would jump over the
+      // rows in between, so the cursor goes back to where it was, in the same transaction (§8).
+      if (since.holdCursor !== undefined && res.cursor && res.cursor.after !== since.holdCursor) {
+        await tx.exec(`UPDATE _croft.assets SET cursor_value = $1 WHERE name = $2`, [since.holdCursor, asset]);
+        await tx.exec(`UPDATE _croft.writes SET cursor_after = $1 WHERE asset = $2 AND loaded_at = $3::TIMESTAMPTZ`, [since.holdCursor, asset, res.loadedAt]);
+        res.cursor = { ...res.cursor, after: since.holdCursor };
+      }
       if (files) await recordFiles(tx, asset, files, res.loadedAt);
       // Read-only, but inside the transaction: a failed statement would abort it, so these stay simple.
       const keys = await jsonKeys(tx, batch, previous);
