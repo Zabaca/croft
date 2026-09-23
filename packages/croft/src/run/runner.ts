@@ -31,6 +31,7 @@ import { reconcile } from "../history/reconcile.ts";
 import { RunsDb, type RunStatus, type RunTrigger } from "../history/runs-db.ts";
 import type { HttpOptions } from "../http/http.ts";
 import { redactProblem } from "../cli/render.ts";
+import { setOutputRedactor } from "../core/output.ts";
 import { now as clockNow } from "../core/time.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { loadProject, type Project } from "../project/root.ts";
@@ -332,6 +333,8 @@ function nextSteps(steps: StepResult[], problems: Problem[]): Next[] {
 export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
   const { project, env } = o;
   const paths = project.paths;
+  // Asset output that escapes its step's scope reaches stderr redacted with this project's .env (core/output.ts).
+  setOutputRedactor((t) => env.redact(t));
   mkdirSync(paths.stateDir, { recursive: true });
   const runs = RunsDb.open(paths.stateDir);
   let warehouse: DuckWarehouse | undefined;
@@ -440,6 +443,8 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
         const asset = step.asset;
         const log = openLog(paths.stateDir, runId, asset, { redact: (t) => env.redact(t) });
         runs.startStep({ runId, asset, attempt, reason: step.reason, ...(step.codeHash ? { codeHash: step.codeHash } : {}), logPath: logPath(paths.stateDir, runId, asset) });
+        // What the asset's top-level code printed when the plan imported it (core/output.ts).
+        if (attempt === 1) for (const line of step.output ?? []) log.write(line);
         log.write(`${new Date().toISOString()} ${asset} attempt ${attempt} of ${maxAttempts} (run ${runId}): ${step.behavior}`);
         events.emit({ type: "step", runId, asset, attempt, status: "running" });
         const progress = new StepProgress(asset, (p) => {
@@ -534,7 +539,17 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
         const errors = loadErrors(step);
         if (errors.length > 0) {
           const first = errors[0]!;
-          runs.startStep({ runId, asset: step.asset, attempt: 1, reason: step.reason, ...(step.codeHash ? { codeHash: step.codeHash } : {}) });
+          // An asset that printed while it failed to load keeps that output, with the error, in its step log.
+          const loadLog = step.output?.length ? openLog(paths.stateDir, runId, step.asset, { redact: (t) => env.redact(t) }) : null;
+          if (loadLog) {
+            for (const line of step.output!) loadLog.write(line);
+            loadLog.write(`${first.code}: ${first.message}${first.hint ? `\nhint: ${first.hint}` : ""}`);
+            loadLog.close();
+          }
+          runs.startStep({
+            runId, asset: step.asset, attempt: 1, reason: step.reason, ...(step.codeHash ? { codeHash: step.codeHash } : {}),
+            ...(loadLog ? { logPath: loadLog.path } : {}),
+          });
           runs.finishStep(runId, step.asset, 1, { status: "failed", error: redactValue(jsonSafe(first), env) });
           results.set(step.asset, {
             asset: step.asset, status: "failed", reason: step.reason, behavior: step.behavior, attempt: 1, maxAttempts: 1,

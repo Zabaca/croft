@@ -215,6 +215,7 @@ Each problem appears inline under its check, with its code in front and its fix 
 - `new` (kept free for post-v1 incremental SQL, §3d), `croft` and names starting with `_` are reserved.
 - DuckDB's 75 reserved keywords (`order`, `end`, `limit`, `window`, `group`, …), and 30 of its 35 `type_function` keywords (`left`, `join`, `like`, `is`, …), are rejected with `NAME_RESERVED` and a suggested plural ("rename to orders"), because `FROM order` is a parser error in every downstream asset [V].
 - A `.ts` file and a `.sql` file with the same name is `NAME_CONFLICT`.
+- `croft run` naming such a file (`croft run order` with `assets/order.ts`) reports that file's own problem (`NAME_RESERVED` with the rename), not "there is no asset named order"; a glob that matches it reports it alongside the assets it runs.
 
 ```
 my-data/
@@ -889,11 +890,16 @@ No process ever owns the database for writing, and there is no write daemon. Fiv
 2. **Detached runs.** Off a TTY, `croft run` always executes in a detached child process (`detached` + `unref`; a child outlived its parent and was reparented [V]). The invoking process follows the child's events for `--follow` (default 100 s) and prints the result if the run finished. Otherwise it returns exit 6 with the run id.
    - This keeps every run from being killed by Claude Code's shell timeout (120 s by default, 600 s at most). A killed run would lose all extraction work.
    - On a TTY, runs stay in the foreground, and `--foreground` forces that off a TTY too.
+   - The run folder `<state>/logs/<run>/` holds, besides the step logs, files whose names start with `_` (which no asset name can): `_process.log` (the child's own stdout and stderr), `_process.json` (the spawn handshake: the child's pid, start time and boot id, written by the parent), and `_not_started.json` (the problem of a child that refused to start, such as a `--from` that cannot apply, §8).
+   - `croft wait` for a child that died before it recorded its run (kill -9, OOM, a reboot during a slow import) reports it `crashed` (exit 1, `RUN_CRASHED`) from the handshake, never "still running" forever.
+   - A live run writes its progress `{asset, phase, rowsFetched, requests, elapsedMs}` to `runs.summary.progress` at most every 500 ms (and what changed inside a window at its end), which `status` and `context` show as `running[]`; the finished run's result replaces it.
 3. **The per-user scheduler job** (§8). Every minute it starts the project-pinned `croft tick` for each registered project that has scheduling on, and that tick spawns `croft run --due` for due work.
 4. **`croft serve`** (optional), a long-running *read* server with the scheduler built in (§5, "Server mode"). It answers app queries over HTTP and steps aside whenever a run writes. It spawns a fresh `croft tick` subprocess every minute and never ticks in-process. An in-process tick would keep stale `lib/` code, because a cache-busted `import()` does not re-import dependencies [V], and it would risk a second database instance in one process.
 5. **Subprocesses spawned by a tick** (`croft run --due`), which do the scheduled work.
 
 Each command imports asset files fresh, so edits are always picked up. Each TS file is imported in isolation, so one broken file fails only its own asset.
+
+**Asset console output.** Asset code runs in croft's own process, so its `console.*` (and direct `process.stdout`/`process.stderr` writes) would otherwise land on croft's stdout, breaking the one `--json` envelope and printing secrets unredacted. Inside a run, top-level output of an asset (collected while it is imported) and everything `rows()` and `map()` print, however deep their async work goes (an `AsyncLocalStorage` scope per step), go to that step's log, redacted like every log, which `croft logs` shows. Commands that only import assets (`query`, `describe`, `context`, `secrets`) print top-level output on stderr, prefixed with the file and redacted. Output that escapes any scope goes to stderr, redacted; never to stdout.
 
 **Signals.** SIGINT and SIGTERM abort the run's `AbortSignal`. The in-flight step is recorded as `interrupted` (its transaction, if any, is discarded), and the process exits 130.
 
@@ -1144,7 +1150,9 @@ CREATE TABLE catalog  (asset TEXT PRIMARY KEY, json TEXT, source TEXT, refreshed
   1. Runs marked `running` whose PID is dead become `crashed`.
   2. Their steps are matched against `_croft.writes` by run id, asset and attempt under a short read lease. A row without an attempt, written before format 2, counts when its `loaded_at` is at or after the step's `started_at`. A commit that landed just before the crash becomes `ok (recovered)`, because DuckDB is authoritative; chunks committed by an earlier failed attempt of the same step do not count. A step with no commit becomes `crashed` (`RUN_CRASHED`).
   3. Their leases are released, and their staging is scheduled for deletion. Write intents of dead processes are deleted.
+  4. A recovered step's catalog mirror entry (rows, columns, cursor) is re-read from `_croft.*` under the same read lease, so `status` and `context` show what committed rather than the previous load.
 - Cursors move only on commit, so a crash means extraction is redone, never skipped: at-least-once extraction, exactly-once visibility.
+- A process whose boot id cannot be read (a `PATH` without `/usr/sbin`, where macOS keeps `sysctl`; croft calls `/usr/sbin/sysctl` and `/bin/ps` by absolute path) records `unknown`. An empty or unknown boot id, on either side, is unknown, never dead: the PID and start time decide. Reading it as dead once made every writing command mark live runs crashed, take their leases and delete their staging.
 - Durability across power loss relies on DuckDB's WAL fsync [U].
 
 ### Server mode, apps and GUIs
@@ -1582,7 +1590,7 @@ The tick skips anything **held**:
 - **Downstream follows automatically.** Transforms have no schedule and update in the same run as their inputs.
 - **Missed times run once.** After a laptop sleeps through 8 hourly fires, the ingest runs once on wake. Its cursor fetches everything since, so no data is skipped.
 - **Overlaps skip.** An asset still leased by the previous tick is skipped and stays due.
-- **Retries.** TS assets get 2 retries (after 30 s and 2 min) on retryable errors: network errors, 429/5xx after `http`'s own retries, and `DB_BUSY`. SQL and deterministic errors (`TYPE_CONFLICT`, `CHECK_FAILED`, SQL errors) are not retried.
+- **Retries.** TS assets get 2 retries (after 30 s and 2 min) on retryable errors: network errors, 429/5xx after `http`'s own retries, and `DB_BUSY`. SQL and deterministic errors (`TYPE_CONFLICT`, `CHECK_FAILED`, SQL errors) are not retried. A server's `Retry-After` (`HTTP_ERROR` `details.retryAfterMs`, §3a) is honored: the next attempt waits `max(delay, retryAfterMs)`. A wait longer than a run holds on for (5 minutes, like `maxRetryAfterMs`) ends the step at once, with `nextRetryAt` set to when the server allows the next try, rather than retrying inside the server's backoff window.
 - **Timeout** means "no progress": no row yielded and no request completed for 10 minutes. `timeout: "30m"` changes it. Chunked TS transforms (§3e) can run for hours as long as they progress.
 - **Failures** show in `status`. By default, a failed *scheduled* run also raises a desktop notification (`osascript` on macOS, `notify-send` on Linux). `"notify": {"desktop": false, "webhook": "https://hooks.slack.com/…"}` in `croft.json` changes this. A webhook receives the failure envelope.
 
@@ -1615,13 +1623,17 @@ A backfill is a flag, and it is defined per asset type:
 
 | Asset | `croft run x --from <when>` |
 |---|---|
-| merge ingest (key + incremental) | fetches from `<when>` and upserts. The saved cursor stays `greatest(saved, loaded)`, so the schedule never rewinds. |
-| append ingest (`write: "append"`) | `BACKFILL_WOULD_DUPLICATE` (exit 2) unless `<when>` is after the saved cursor. Fix: add a key. |
+| merge ingest (key + incremental) | fetches from `<when>` and upserts. The saved cursor stays `greatest(saved, loaded)`, so the schedule never rewinds. When `<when>` is *after* the saved cursor, the cursor stays where it was, so the next run fetches the rows in between instead of skipping them (the step's reason says so). |
+| append ingest (`write: "append"`) | `BACKFILL_WOULD_DUPLICATE` (exit 2) once it has a saved cursor: a `<when>` at or before it would store rows twice, and one after it would skip the rows in between (keeping the cursor instead would store the rows after `<when>` twice). Before its first load `--from` works. Fix: add a key. |
 | replace ingest | `BACKFILL_UNSUPPORTED`: "replace ingests always fetch everything: `croft run x`" |
 | file ingest | `BACKFILL_UNSUPPORTED`: "changed files reload automatically; `croft run x --rebuild` reloads all files" |
 | SQL / TS transform | `BACKFILL_UNSUPPORTED`: "use `croft run x --rebuild`" |
 
 `<when>` accepts `2026-06-24`, a full ISO timestamp, or a relative value (`-90d`, `-12h`, `today`). croft converts it to the cursor's type and echoes the conversion: `since: 1782284400 (2026-06-24T00:00:00-07:00)`. `run --dry-run --from -90d` shows the same without fetching.
+
+A `--from` that cannot apply is refused before the run starts: no run is recorded and no step fails. An asset named exactly refuses the whole command (exit 2, the error above); in a bare `croft run --from …` or a glob, the assets it does not apply to are skipped with the reason. Refusals that need only the plan (`BACKFILL_UNSUPPORTED`) come from the invoking process; those that need the saved cursor (`BACKFILL_WOULD_DUPLICATE`) come from the detached child before it records the run, and the parent prints them as its own result.
+
+Why the cursor holds: a `--from` later than the saved cursor used to save `greatest(saved, loaded)` like any run, which jumped the schedule over `[saved, <when>)`. Nothing ever fetched those rows again, and `--from` needs no confirmation (§6), so `croft run x --from today` lost data silently. Holding the cursor costs one wider fetch on the next run; merge makes the re-read rows a no-op.
 
 The same flag fills a new field for old rows of a merge ingest: `croft run stripe_charges --from 2024-01-01`.
 
@@ -2391,6 +2403,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 **D44. Backfills. (new)**
 - Choice: `--from` on merge ingests only, with a per-type matrix of explicit errors elsewhere; relative dates; conversion to the cursor type.
 - Reason: `--from` on append or replace ingests duplicated or truncated data silently.
+- Build (2026-09-23): a `--from` after the saved cursor jumped the cursor over the rows in between (`greatest(saved, loaded)`), so they were never fetched. Options: refuse it (a new `BACKFILL_GAP`), or keep the cursor. Choice: keep the cursor for merge ingests, where the re-read rows of the next run are a no-op, so the request still does what it says and nothing is lost; refuse it for append ingests (`BACKFILL_WOULD_DUPLICATE`), where keeping the cursor would store the later rows twice and moving it would skip the gap. Every `--from` refusal now happens before the run starts, so it is exit 2 with nothing recorded, never a failed step.
 
 **D45. Dependency extraction. (new, rev)**
 - Options: AST `BASE_TABLE` nodes only; the optimized plan; AST plus the unoptimized bound plan.

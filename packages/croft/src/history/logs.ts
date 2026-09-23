@@ -95,6 +95,10 @@ export class LogWriter {
     closeSync(this.fd);
     this.fd = null;
   }
+
+  get closed(): boolean {
+    return this.fd === null;
+  }
 }
 
 export function openLog(stateDir: string, runId: string, asset: string, o: LogWriterOptions = {}): LogWriter {

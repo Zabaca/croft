@@ -8,6 +8,7 @@
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { CroftError, isCode } from "../core/errors.ts";
+import { captureImport, collectingSink } from "../core/output.ts";
 import type { CursorType, Incremental, Problem, Reason, WriteMode } from "../core/types.ts";
 import type { FileIngest } from "../types.ts";
 import { type DiscoveredAsset, discoverAssets } from "../project/discover.ts";
@@ -41,6 +42,8 @@ export interface PlannedStep {
   behaviorHash: string;
   retries: number;
   timeoutMs: number;
+  /** What the asset's top-level code printed while it was imported (unredacted; the step log redacts it). */
+  output?: string[];
 }
 
 export interface RunPlan {
@@ -222,16 +225,19 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
       continue;
     }
     const cursorType = i.cursorTypes?.[name];
-    const loaded = await loadTsAsset(a, { root: i.root, timezone: i.timezone }, {
+    // Top-level console output of the asset is kept for its step log, never printed (core/output.ts).
+    const sink = collectingSink();
+    const loaded = await captureImport(sink, () => loadTsAsset(a, { root: i.root, timezone: i.timezone }, {
       ...(cursorType ? { cursorType } : {}),
       ...(i.importTimeoutMs !== undefined ? { importTimeoutMs: i.importTimeoutMs } : {}),
-    });
+    }));
+    const output = sink.lines.length ? { output: sink.lines } : {};
     const spec = loaded.spec;
     if (!loaded.ok || !spec) {
       // A broken asset fails its own step; the rest of the run goes ahead.
       steps.push({
         ...baseStep(a), kind: "rows", action: "fetch", reasons: ["requested"], reason: "requested",
-        problems: loaded.problems, loaded, ...(loaded.codeHash ? { codeHash: loaded.codeHash } : {}),
+        problems: loaded.problems, loaded, ...(loaded.codeHash ? { codeHash: loaded.codeHash } : {}), ...output,
       });
       continue;
     }
@@ -241,7 +247,7 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
       behavior: behaviorLabel(write, spec.key), words: behaviorWords(write, spec.key, spec.incremental),
       behaviorHash: behaviorHash(write, spec.key, spec.incremental),
       retries: spec.retries ?? DEFAULT_RETRIES, timeoutMs: spec.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      problems: loaded.problems, ...(loaded.codeHash ? { codeHash: loaded.codeHash } : {}),
+      problems: loaded.problems, ...(loaded.codeHash ? { codeHash: loaded.codeHash } : {}), ...output,
     };
     if (spec.role === "transform") {
       steps.push({ ...common, kind: "transform", action: "skip", reasons: ["requested"], reason: TRANSFORM_NOTE });

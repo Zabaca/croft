@@ -16,6 +16,7 @@
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { CODES, CroftError, isCode, problem } from "../core/errors.ts";
+import { captureOutput, type OutputSink, writeStderr } from "../core/output.ts";
 import type { Confirmation, CursorType, Impact, Problem, SchemaChange, Sql, StepResult } from "../core/types.ts";
 import { now as clockNow } from "../core/time.ts";
 import type { FileIngest, IngestContext, Row, RowSource, RowsIngest } from "../types.ts";
@@ -555,13 +556,20 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
   const own = new OwnTableQuery({ warehouse, asset, dir: stageDir, stateDir, timezone: project.timezone, signal });
   let manifest: Awaited<ReturnType<typeof writeStage>> | null = null;
   let files: FileExtract | null = null;
+  // rows() and map() print to the step log (redacted), never to croft's stdout (core/output.ts); a callback
+  // that outlives the step goes to stderr, redacted.
+  const output: OutputSink = { write: (text) => (log.closed ? writeStderr(i.env.redact(text)) : log.write(text)) };
   try {
-    if (isFile) {
-      files = await extractFiles({
-        asset, config: config as FileIngest, root: project.root, stateDir, runId, known: state.files, http, signal,
-        log: (...args: unknown[]) => log.log(...args),
-      });
-    } else {
+    ({ manifest, files } = await captureOutput(output, async (): Promise<{ manifest: typeof manifest; files: typeof files }> => {
+      if (isFile) {
+        return {
+          manifest: null,
+          files: await extractFiles({
+            asset, config: config as FileIngest, root: project.root, stateDir, runId, known: state.files, http, signal,
+            log: (...args: unknown[]) => log.log(...args),
+          }),
+        };
+      }
       const ctx: IngestContext = Object.freeze({
         asset, runId, preview: false, signal, http,
         ...(since.value !== undefined ? { since: since.value } : {}),
@@ -575,12 +583,15 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
       } catch (e) {
         throw codeError(e, step, project.root);
       }
-      manifest = await writeStage({
-        dir: stageDir, asset, runId, source: counted(source, progress) as RowSource,
-        knownColumns: state.known.map((c) => ({ name: c.name, sourceName: c.sourceName ?? null })),
-        signal, ...(since.value !== undefined ? { sinceUsed: since.value } : {}),
-      });
-    }
+      return {
+        files: null,
+        manifest: await writeStage({
+          dir: stageDir, asset, runId, source: counted(source, progress) as RowSource,
+          knownColumns: state.known.map((c) => ({ name: c.name, sourceName: c.sourceName ?? null })),
+          signal, ...(since.value !== undefined ? { sinceUsed: since.value } : {}),
+        }),
+      };
+    }));
   } catch (e) {
     if (signal.aborted) throw abortReason(signal, asset);
     const err = codeError(e, step, project.root);
