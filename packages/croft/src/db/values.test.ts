@@ -3,8 +3,9 @@ import { mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DuckDBConnection } from "@duckdb/node-api";
+import { formatInstant as formatZoned, offsetSeconds, parseInstant } from "../core/time.ts";
 import { openMemory } from "./connect.ts";
-import { formatDate, formatInstant, offsetSeconds, renderRows, resultColumns, type RenderContext } from "./values.ts";
+import { formatDate, formatInstant, renderRows, resultColumns, type RenderContext } from "./values.ts";
 
 const LA = "America/Los_Angeles";
 const dbs: { close(): void }[] = [];
@@ -89,7 +90,18 @@ describe("json mode (§4.3)", () => {
       DATE '2026-03-01' c, '{"k":[1,2,{"z":null}],"big":9007199254740993}'::JSON d, 'infinity'::TIMESTAMP e,
       '-infinity'::DATE f, DATE '0044-03-15' g, TIME '12:34:56.5' h`, json);
     expect(r).toEqual({ a: "2026-03-01T23:30:00.123456", b: "2026-03-01T23:30:00", c: "2026-03-01",
-      d: { k: [1, 2, { z: null }], big: 9007199254740992 }, e: "infinity", f: "-infinity", g: "0044-03-15", h: "12:34:56.500" });
+      d: { k: [1, 2, { z: null }], big: "9007199254740993" }, e: "infinity", f: "-infinity", g: "0044-03-15", h: "12:34:56.500" });
+  });
+
+  test("JSON columns parse losslessly: unsafe integers are strings, out-of-range numbers keep their text", async () => {
+    // Snowflake ids nested in API payloads must not be rounded, and 1e400 must not become Infinity (written as null).
+    const [r] = await rows(`SELECT '{"id": 1234567890123456789, "n": [9007199254740993, -9007199254740993, 3], "big": 1e400,
+      "neg": -1e400, "f": 1.5, "e": 1e20, "safe": 9007199254740991}'::JSON j, 1234567890123456789::BIGINT b`, json);
+    expect(r!.j).toEqual({ id: "1234567890123456789", n: ["9007199254740993", "-9007199254740993", 3], big: "1e400", neg: "-1e400",
+      f: 1.5, e: 1e20, safe: 9007199254740991 });
+    // The same value as a column and inside JSON renders the same way, and the row survives JSON unchanged.
+    expect((r!.j as { id: string }).id).toBe(r!.b as string);
+    expect(JSON.parse(JSON.stringify(r))).toEqual(r!);
   });
 
   test("nested values render recursively", async () => {
@@ -129,6 +141,12 @@ describe("ts mode (§3e)", () => {
     expect(r).toEqual({ a: 42, b: 9007199254740993n, c: 5n, d: 170141183460469231731687303715884105727n, e: 12n, f: 1.5, g: 7 });
   });
 
+  test("DECIMAL wider than 15 digits is an exact string; narrower is a number; DECIMAL(38,0) stays bigint", async () => {
+    const [r] = await rows(`SELECT 123456789012345678.12::DECIMAL(20,2) a, -123456789012345678.12::DECIMAL(20,2) b,
+      1.5::DECIMAL(15,2) c, 1234567890123456::DECIMAL(16,0) d, 12::DECIMAL(38,0) e, 0.001::DECIMAL(18,3) f`, ts);
+    expect(r).toEqual({ a: "123456789012345678.12", b: "-123456789012345678.12", c: 1.5, d: "1234567890123456", e: 12n, f: "0.001" });
+  });
+
   test("JSON is parsed, keeping unsafe integers exact", async () => {
     const [r] = await rows(`SELECT '{"big":9007199254740993,"small":3,"f":1.5}'::JSON j`, ts);
     expect(r!.j).toEqual({ big: 9007199254740993n, small: 3, f: 1.5 });
@@ -165,15 +183,47 @@ test("offsets match DuckDB's ICU for random instants in several zones", async ()
 });
 
 test("offsetSeconds and formatDate edge cases", () => {
-  expect(offsetSeconds(LA, Date.UTC(2024, 0, 1))).toBe(-8 * 3600);
-  expect(offsetSeconds(LA, Date.UTC(2024, 6, 1))).toBe(-7 * 3600);
+  expect(offsetSeconds(Date.UTC(2024, 0, 1), LA)).toBe(-8 * 3600);
+  expect(offsetSeconds(Date.UTC(2024, 6, 1), LA)).toBe(-7 * 3600);
   // Years 0–99 must not be read as 1900–1999.
-  expect(offsetSeconds("Asia/Kolkata", Date.parse("0050-06-01T00:00:00Z"))).toBe(offsetSeconds("Asia/Kolkata", Date.parse("0051-06-01T00:00:00Z")));
-  // Before standard time, Los Angeles used local mean time, an offset with seconds.
-  expect(formatInstant(BigInt(Date.parse("1850-01-01T00:00:00Z")) * 1000n, { mode: "json", timezone: LA })).toBe("1849-12-31T16:07:02-07:52:58");
+  expect(offsetSeconds(Date.parse("0050-06-01T00:00:00Z"), "Asia/Kolkata")).toBe(offsetSeconds(Date.parse("0051-06-01T00:00:00Z"), "Asia/Kolkata"));
+  // Before standard time, Los Angeles used local mean time (-07:52:58). ISO/RFC 3339 offsets have no seconds, so
+  // the offset is rounded to -07:53 and the wall clock shifted with it: the string still names the exact instant.
+  const lmt = BigInt(Date.parse("1850-01-01T00:00:00Z")) * 1000n;
+  expect(offsetSeconds(Date.parse("1850-01-01T00:00:00Z"), LA)).toBe(-(7 * 3600 + 52 * 60 + 58));
+  expect(formatInstant(lmt, { mode: "json", timezone: LA })).toBe("1849-12-31T16:07:00-07:53");
+  expect(Date.parse(formatInstant(lmt, { mode: "json", timezone: LA }))).toBe(Date.parse("1850-01-01T00:00:00Z"));
   expect(formatDate(0)).toBe("1970-01-01");
   expect(formatDate(-1)).toBe("1969-12-31");
   expect(formatDate(19783)).toBe("2024-03-01");
   expect(formatDate(2932897)).toBe("+010000-01-01");
   expect(formatDate(-719529)).toBe("-000001-12-31");
+});
+
+test("one timestamp renderer: json TIMESTAMPTZ is core/time's formatInstant, always ±HH:MM, and parses back exactly", async () => {
+  for (const tz of [LA, "Africa/Monrovia", "Asia/Kolkata", "Europe/Dublin", "UTC"]) {
+    const c = await conn(tz);
+    // 1800..2100 with random microseconds: covers local mean time (offsets with seconds) and modern rules.
+    const reader = await c.runAndReadAll(`SELECT t, epoch_us(t)::BIGINT us FROM (SELECT make_timestamptz(
+      ((random() * 9.5e9) - 5.4e9)::BIGINT * 1000000 + (random() * 999999)::BIGINT) t FROM range(300))`);
+    const rendered = renderRows(reader, { mode: "json", timezone: tz });
+    (reader.getRowsJS() as [unknown, bigint][]).forEach(([, us], i) => {
+      const s = rendered[i]!.t as string;
+      expect(s).toMatch(/[+-]\d{2}:\d{2}$/);
+      expect(s).toBe(formatZoned(us, tz));
+      expect(parseInstant(s)).toBe(us);
+    });
+  }
+});
+
+test("a column or struct field named __proto__ is an ordinary key", async () => {
+  for (const ctx of [json, ts]) {
+    const [r] = await rows(`SELECT 1 AS "__proto__", 2 AS b, {'__proto__': {'a': 5}, 'x': 6} s`, ctx);
+    expect(Object.getPrototypeOf(r)).toBe(Object.prototype);
+    expect(Object.keys(r!)).toEqual(["__proto__", "b", "s"]);
+    expect(Object.getOwnPropertyDescriptor(r, "__proto__")?.value).toBe(1);
+    expect(Object.getPrototypeOf(r!.s)).toBe(Object.prototype);
+    expect(Object.keys(r!.s as object)).toEqual(["__proto__", "x"]);
+    expect(JSON.stringify(r)).toBe('{"__proto__":1,"b":2,"s":{"__proto__":{"a":5},"x":6}}');
+  }
 });

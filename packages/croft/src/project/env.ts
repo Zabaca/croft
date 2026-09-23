@@ -1,7 +1,7 @@
 // Secrets from <root>/.env (DESIGN.md §9.8). Bun's own .env loading is off (`bun --no-env-file`):
 // it depends on the working directory and silently prefers .env.local. croft parses .env itself,
 // the shell environment wins over it, only declared names reach asset code, and every .env value
-// is redacted from output.
+// is redacted from messages and logs. Command data (query rows) is redacted more narrowly: see redactsInData.
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CroftError, problem } from "../core/errors.ts";
@@ -98,6 +98,19 @@ export interface SecretStatus { name: string; status: "set" | "missing"; source:
 // Template names that document variables rather than hold them; warning about them would be noise.
 const TEMPLATES = new Set([".env.example", ".env.sample", ".env.template", ".env.dist"]);
 const MIN_REDACT = 4;
+const MIN_DATA_REDACT = 8;
+
+/** Whether a value is redacted inside command data (query rows, samples): a declared secret always (4+
+ *  characters, as everywhere), any other .env value only when it looks like a credential, i.e. 8+ characters
+ *  and not only letters or only digits. PORT=5432, LOG_LEVEL=info or NODE_ENV=production would otherwise
+ *  rewrite ordinary values an agent reasons from; they are still redacted from messages and logs. */
+export function redactsInData(value: string, declared: boolean): boolean {
+  if (value.length < MIN_REDACT) return false;
+  if (declared) return true;
+  return value.length >= MIN_DATA_REDACT && !/^\p{L}+$/u.test(value) && !/^\d+$/.test(value);
+}
+
+type Pattern = { re: RegExp; names: Map<string, string> };
 
 /** The project's secrets: <root>/.env overlaid by the shell environment. Values are held in private
  *  fields so logging or serializing this object never prints them. */
@@ -108,7 +121,9 @@ export class ProjectEnv {
   readonly #file: Map<string, string>;
   readonly #shell: Record<string, string | undefined>;
   readonly #extra = new Map<string, string>();           // shell values handed out by secret()
-  #pattern: { re: RegExp; names: Map<string, string> } | null = null;
+  readonly #declared = new Set<string>();                // names assets list in `secrets`
+  #pattern: Pattern | null = null;
+  #dataPattern: Pattern | null | undefined;
 
   constructor(opts: { root: string | null; fileValues?: Map<string, string>; shell?: Record<string, string | undefined>;
     ignoredFiles?: string[]; issues?: DotenvIssue[] }) {
@@ -158,6 +173,7 @@ export class ProjectEnv {
         details: { name, declared: [...declared] },
       });
     }
+    this.declare(declared);
     const found = this.lookup(name);
     if (!found) throw missingSecret(name, asset);
     if (found.source === "env") this.#remember(name, found.value);
@@ -189,12 +205,32 @@ export class ProjectEnv {
     }));
   }
 
+  /** Mark names as declared secrets (an asset's `secrets` list): redactData() then always hides their values.
+   *  secret() declares the calling asset's list; commands that show data should declare the project's. */
+  declare(names: Iterable<string>): void {
+    for (const name of names) {
+      if (this.#declared.has(name)) continue;
+      this.#declared.add(name);
+      this.#dataPattern = undefined;
+    }
+  }
+
   /** Replace every .env value (and every shell value handed out by secret()) of 4+ characters
-   *  with [redacted:NAME]. Longer values are replaced first so overlapping values stay hidden. */
+   *  with [redacted:NAME]. Longer values are replaced first so overlapping values stay hidden.
+   *  For free text: messages, hints, logs. */
   redact(text: string): string {
-    const pattern = this.#compile();
-    if (!pattern || !text) return text;
-    return text.replace(pattern.re, (match) => `[redacted:${pattern.names.get(match)}]`);
+    return replaceWith(this.#compile(), text);
+  }
+
+  /** Redaction for command data (query rows, samples): see redactsInData. Shell values handed out by
+   *  secret() count as declared. */
+  redactData(text: string): string {
+    if (this.#dataPattern === undefined) {
+      const entries = [...this.#file].filter(([name, value]) => redactsInData(value, this.#declared.has(name)));
+      for (const [name, value] of this.#extra) if (redactsInData(value, true)) entries.push([name, value]);
+      this.#dataPattern = buildPattern(entries);
+    }
+    return replaceWith(this.#dataPattern, text);
   }
 
   /** Redact every string inside a JSON-like value; keys are kept. */
@@ -219,22 +255,29 @@ export class ProjectEnv {
     if (this.#extra.get(name) === value) return;
     this.#extra.set(name, value);
     this.#pattern = null;
+    this.#dataPattern = undefined;
   }
 
-  #compile(): { re: RegExp; names: Map<string, string> } | null {
-    if (this.#pattern) return this.#pattern;
-    const names = new Map<string, string>();
-    const add = (name: string, value: string) => {
-      if (value.length < MIN_REDACT) return;
-      for (const form of new Set([value, encodeURIComponent(value)])) if (!names.has(form)) names.set(form, name);
-    };
-    for (const [name, value] of this.#file) add(name, value);
-    for (const [name, value] of this.#extra) add(name, value);
-    if (names.size === 0) return null;
-    const alternatives = [...names.keys()].sort((a, b) => b.length - a.length).map(escapeRegExp);
-    this.#pattern = { re: new RegExp(alternatives.join("|"), "g"), names };
+  #compile(): Pattern | null {
+    this.#pattern ??= buildPattern([...this.#file, ...this.#extra].filter(([, value]) => value.length >= MIN_REDACT));
     return this.#pattern;
   }
+}
+
+/** One regular expression over the values and their URL-encoded forms, longest first. */
+function buildPattern(entries: Iterable<[string, string]>): Pattern | null {
+  const names = new Map<string, string>();
+  for (const [name, value] of entries) {
+    for (const form of new Set([value, encodeURIComponent(value)])) if (!names.has(form)) names.set(form, name);
+  }
+  if (names.size === 0) return null;
+  const alternatives = [...names.keys()].sort((a, b) => b.length - a.length).map(escapeRegExp);
+  return { re: new RegExp(alternatives.join("|"), "g"), names };
+}
+
+function replaceWith(pattern: Pattern | null, text: string): string {
+  if (!pattern || !text) return text;
+  return text.replace(pattern.re, (match) => `[redacted:${pattern.names.get(match)}]`);
 }
 
 export function missingSecret(name: string, asset?: string): CroftError {

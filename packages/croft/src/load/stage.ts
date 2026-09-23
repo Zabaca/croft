@@ -313,17 +313,12 @@ export class ColumnNamer {
     const next = `${base}_${n}`;
     this.claim(next, raw);
     this.byRaw.set(raw, next);
-    this.warnings.push({
-      // No dedicated code is registered for a renamed collision; it is reported like a duplicate output
-      // column, as a warning.
-      ...problem("DUPLICATE_OUTPUT_COLUMN", {
-        message: `fields ${JSON.stringify(this.owner.get(col.toLowerCase()) ?? col)} and ${JSON.stringify(raw)} both clean to column ${col}; ${JSON.stringify(raw)} is stored as ${next}`,
-        hint: `rename one of them in rows() or map(), e.g. { ...row, ${jsKey(next)}: row[${JSON.stringify(raw)}] }`,
-        details: { column: col, field: raw, storedAs: next },
-        ...(this.asset ? { asset: this.asset } : {}),
-      }),
-      severity: "warning",
-    });
+    this.warnings.push(problem("COLUMN_NAME_COLLISION", {
+      message: `fields ${JSON.stringify(this.owner.get(col.toLowerCase()) ?? col)} and ${JSON.stringify(raw)} both clean to column ${col}; ${JSON.stringify(raw)} is stored as ${next}`,
+      hint: `rename one of them in rows() or map(), e.g. { ...row, ${jsKey(next)}: row[${JSON.stringify(raw)}] }`,
+      details: { column: col, field: raw, storedAs: next },
+      ...(this.asset ? { asset: this.asset } : {}),
+    }));
     return next;
   }
 }

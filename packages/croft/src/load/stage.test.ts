@@ -158,8 +158,9 @@ describe("column names (§7)", () => {
     const n = new ColumnNamer([], "a");
     expect(n.resolveRow(["Id", "id", "ID"])).toEqual(["Id", "id_2", "ID_3"]);
     expect(n.resolveRow(["id"])).toEqual(["id_2"]); // stable for the rest of the batch
-    expect(n.warnings.map((w) => [w.code, w.severity])).toEqual([["DUPLICATE_OUTPUT_COLUMN", "warning"], ["DUPLICATE_OUTPUT_COLUMN", "warning"]]);
+    expect(n.warnings.map((w) => [w.code, w.severity])).toEqual([["COLUMN_NAME_COLLISION", "warning"], ["COLUMN_NAME_COLLISION", "warning"]]);
     expect(n.warnings[0]!.message).toContain(`"id" is stored as id_2`);
+    expect(n.warnings[0]!.docs).toBe("croft docs COLUMN_NAME_COLLISION");
   });
 
   test("Amount ($) and Amount in one row: the owner of the stored column keeps it", () => {

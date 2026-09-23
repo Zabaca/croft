@@ -261,8 +261,9 @@ function jsonPage(): string {
     "  confirmation: {token, expiresAt, command, impact}. Ask the user before running croft confirm.",
     "- Timestamps are ISO-8601 with the project offset (2026-09-21T22:00:00-07:00), so they agree with ::DATE",
     "  in SQL. Durations are milliseconds.",
-    "- HUGEINT, DECIMAL and integers beyond ±2^53 are strings.",
-    "- Every value found in .env is replaced with [redacted:NAME].",
+    "- HUGEINT, DECIMAL and integers beyond ±2^53 are strings, inside JSON columns too.",
+    "- Every value found in .env is replaced with [redacted:NAME] in messages. In data (query rows) only declared",
+    "  secrets and credential-looking values are replaced, and data then carries redactedValues: true.",
     "- Outside a project, database is \"\" and timezone is this machine's zone.",
   ].join("\n");
 }
@@ -278,7 +279,10 @@ function secretsPage(): string {
     "  (.env.example, .env.sample and .env.template are templates and are not reported.)",
     "- An asset lists the names it needs in secrets: [\"STRIPE_KEY\"] and reads them with ctx.secret(\"STRIPE_KEY\").",
     "  Other names are refused, and a missing value is SECRET_MISSING. Values never go into process.env.",
-    "- Every .env value of 4 or more characters is replaced with [redacted:NAME] in all croft output and logs.",
+    "- Every .env value of 4 or more characters is replaced with [redacted:NAME] in croft's messages and logs.",
+    "  In command data (query rows, samples) only declared secrets and values that look like credentials",
+    "  (8+ characters, not only letters or only digits) are replaced, so PORT=5432 or LOG_LEVEL=info do not",
+    "  rewrite ordinary values; data that had a value replaced carries redactedValues: true.",
     "- croft secrets --json lists each declared name as set or missing, where it came from, and which assets",
     "  use it, without printing values.",
     "",

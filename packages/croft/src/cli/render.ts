@@ -37,15 +37,28 @@ export function buildEnvelope<T>(init: EnvelopeInit<T>): Envelope<T> {
   return env;
 }
 
-type Redact = (text: string) => string;
+export type Redact = (text: string) => string;
+/** Output redaction: the function redacts free text (messages, hints, logs). `data`, when present, redacts
+ *  command data (query rows, samples) under the narrower data policy (ProjectEnv.redactData), because an agent
+ *  reasons from those values: declared secrets always, other .env values only when they look like credentials. */
+export type Redactor = Redact & { readonly data?: Redact };
 
 /** Redact every free-text string in an envelope. Structural fields (severity, code, docs, fix.kind,
  *  the envelope header, confirmation token) are croft's own constants and are left alone, so a .env
- *  value like "info" or "true" can never break the contract. */
-export function redactEnvelope<T>(env: Envelope<T>, redact: Redact): Envelope<T> {
+ *  value like "info" or "true" can never break the contract. When a string in `data` changed, an object
+ *  `data` gets `redactedValues: true`, so the reader knows values were altered. */
+export function redactEnvelope<T>(env: Envelope<T>, redact: Redactor): Envelope<T> {
+  const dataRedact = redact.data ?? redact;
+  let redactedValues = false;
+  let data = redactStrings(env.data, (text) => {
+    const r = dataRedact(text);
+    if (r !== text) redactedValues = true;
+    return r;
+  });
+  if (redactedValues && isPlainObject(data)) data = { ...data, redactedValues: true } as T;
   const out: Envelope<T> = {
     ...env,
-    data: redactStrings(env.data, redact),
+    data,
     problems: env.problems.map((p) => redactProblem(p, redact)),
     next: env.next.map((n) => ({ command: redact(n.command), reason: redact(n.reason) })),
   };
@@ -76,14 +89,24 @@ export function redactStrings<T>(value: T, redact: Redact): T {
   const walk = (v: unknown): unknown => {
     if (typeof v === "string") return redact(v);
     if (Array.isArray(v)) return v.map(walk);
-    if (v && typeof v === "object" && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null)) {
+    if (isPlainObject(v)) {
       const o: Record<string, unknown> = {};
-      for (const [k, x] of Object.entries(v)) o[k] = walk(x);
+      for (const [k, x] of Object.entries(v)) {
+        // `o[k] = …` with k "__proto__" (a column name, a JSON key) would replace the prototype instead.
+        if (k === "__proto__") Object.defineProperty(o, k, { value: walk(x), enumerable: true, writable: true, configurable: true });
+        else o[k] = walk(x);
+      }
       return o;
     }
     return v;
   };
   return walk(value) as T;
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  if (!v || typeof v !== "object") return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
 }
 
 /** One line of JSON. bigints become numbers when safe and strings otherwise (§4.3). */
@@ -170,10 +193,12 @@ export class Render {
     if (text) this.#stderr(line(text));
   }
 
-  /** The one envelope of a JSON-mode invocation. The caller redacts it first. */
+  /** The one envelope of a JSON-mode invocation. The caller redacts it first. Serialized before it counts:
+   *  an envelope that cannot be serialized writes nothing, so the caller can still report the failure. */
   envelope(env: Envelope<unknown>): void {
+    const text = toJsonLine(env);
     if (this.#envelopes++ > 0) throw new Error("croft bug: a second envelope was written to stdout");
-    this.#stdout(toJsonLine(env));
+    this.#stdout(text);
   }
 }
 

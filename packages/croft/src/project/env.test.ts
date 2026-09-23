@@ -212,5 +212,40 @@ describe("redact", () => {
     expect(empty.redact("anything")).toBe("anything");
     const obj = { a: "b" };
     expect(empty.redactDeep(obj)).toBe(obj);
+    expect(empty.redactData("anything")).toBe("anything");
+  });
+});
+
+describe("redactData (query rows and other command data)", () => {
+  const values = new Map([
+    ["PORT", "5432"], ["LOG_LEVEL", "info"], ["NODE_ENV", "production"], ["STRIPE_KEY", "sk_live_abc123"],
+    ["ACCOUNT", "1234567890"], ["DB_PASS", "hunter2x"], ["PIN", "hunter"], ["API_URL", "https://api.example.test/v1"],
+  ]);
+
+  test("only credential-looking values: 8+ characters, not only letters, not only digits", () => {
+    const env = new ProjectEnv({ root: null, fileValues: values });
+    const row = "customer info: production order #5432 acct 1234567890 key sk_live_abc123 pass hunter2x via https://api.example.test/v1";
+    expect(env.redactData(row)).toBe(
+      "customer info: production order #5432 acct 1234567890 key [redacted:STRIPE_KEY] pass [redacted:DB_PASS] via [redacted:API_URL]");
+    // Free text (messages, logs) still hides every .env value of 4+ characters.
+    expect(env.redact("customer info: production order #5432")).toBe("customer [redacted:LOG_LEVEL]: [redacted:NODE_ENV] order #[redacted:PORT]");
+  });
+
+  test("declared secrets are always redacted from data", () => {
+    const env = new ProjectEnv({ root: null, fileValues: values });
+    expect(env.redactData("pin hunter, account 1234567890")).toBe("pin hunter, account 1234567890");
+    env.declare(["PIN"]);
+    expect(env.redactData("pin hunter, account 1234567890")).toBe("pin [redacted:PIN], account 1234567890");
+    // secret() declares the asset's whole secrets list.
+    expect(env.secret("PORT", ["PORT", "ACCOUNT"])).toBe("5432");
+    expect(env.redactData("pin hunter, account 1234567890, port 5432")).toBe("pin [redacted:PIN], account [redacted:ACCOUNT], port [redacted:PORT]");
+    // URL-encoded forms are caught in data too.
+    expect(env.redactData("u=https%3A%2F%2Fapi.example.test%2Fv1")).toBe("u=[redacted:API_URL]");
+  });
+
+  test("shell values handed out by secret() count as declared", () => {
+    const env = new ProjectEnv({ root: null, shell: { SHELL_PIN: "4242" } });
+    expect(env.secret("SHELL_PIN", ["SHELL_PIN"])).toBe("4242");
+    expect(env.redactData("pin 4242")).toBe("pin [redacted:SHELL_PIN]");
   });
 });

@@ -5,11 +5,14 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, s
 import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { CODES } from "../../core/errors.ts";
+import { offsetSeconds } from "../../core/time.ts";
 import { CROFT_VERSION, SKILL_PATH, skillMd } from "../../agent/templates.ts";
 import { initProject } from "../../project/init.ts";
 import { SELF_ROOT } from "../launcher.ts";
 import { main } from "../main.ts";
-import { BUN_TESTED, type DoctorCheck, type DoctorDeps, type DuckdbProbe, formatBytes, formatDoctor, probeDuckdb, runDoctor } from "./doctor.ts";
+import {
+  BUN_TESTED, type DoctorCheck, type DoctorDeps, type DuckdbProbe, duckdbOffsets, formatBytes, formatDoctor, probeDuckdb, runDoctor,
+} from "./doctor.ts";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "doctor-")));
 const children: ChildProcess[] = [];
@@ -20,11 +23,11 @@ afterAll(() => {
 let n = 0;
 
 /** A fresh project made by croft init (so its Claude files are current). */
-async function project(o: { app?: boolean } = {}): Promise<string> {
+async function project(o: { app?: boolean; timezone?: string } = {}): Promise<string> {
   const dir = join(base, `p${n++}`);
   mkdirSync(dir, { recursive: true });
   if (o.app) writeFileSync(join(dir, "package.json"), "{}");
-  const r = await initProject({ target: dir, install: false, timezone: "Asia/Tokyo", synced: () => null });
+  const r = await initProject({ target: dir, install: false, timezone: o.timezone ?? "Asia/Tokyo", synced: () => null });
   return r.root;
 }
 
@@ -482,5 +485,88 @@ describe("human output", () => {
     expect(out.split("\n")[0]).toBe("Environment");
     expect(out).toContain("\nProject\n");
     expect(out).toContain("  ok    storage: local disk (not a synced or network folder)");
+  });
+});
+
+describe("TZDATA_MISMATCH: Bun's Intl and DuckDB's ICU agree on the project zone for the next 2 years", () => {
+  const LA = "America/Los_Angeles";
+  const NOW = "2026-09-23T00:00:00Z";
+  const intl = (tz: string, instants: readonly number[]) => instants.map((t) => offsetSeconds(t, tz));
+
+  test("agreement is silent", async () => {
+    const root = await project({ timezone: LA });
+    const asked: number[][] = [];
+    const { data, problems } = await runDoctor(root, deps({
+      env: { CROFT_NOW: NOW }, duckdbOffsets: async (tz, instants) => { asked.push([...instants]); return intl(tz, instants); },
+    }));
+    expect(data.checks.find((c) => c.id === "tzdata")).toBeUndefined();
+    expect(problems.filter((p) => p.code === "TZDATA_MISMATCH")).toEqual([]);
+    // Sampled at least monthly across two years, and densely around LA's four DST transitions in that span.
+    const coarse = asked[0]!;
+    expect(coarse[0]).toBe(Date.parse(NOW));
+    expect(coarse.at(-1)! - coarse[0]!).toBeGreaterThanOrEqual(730 * 86_400_000);
+    expect(Math.max(...coarse.slice(1).map((t, i) => t - coarse[i]!))).toBeLessThanOrEqual(31 * 86_400_000);
+    const fine = asked[1]!;
+    expect(fine).toContain(Date.parse("2026-11-01T09:00:00Z"));                  // fall back at 02:00 PDT
+    expect(fine).toContain(Date.parse("2027-03-14T10:00:00Z"));                  // spring forward at 02:00 PST
+  });
+
+  test("a different offset, or a different switch time, is a warning with where it happens", async () => {
+    const root = await project({ timezone: LA });
+    // DuckDB's data (simulated) springs forward an hour later in 2027 and ignores DST from 2028.
+    const skewed = async (tz: string, instants: readonly number[]) => instants.map((t) => {
+      if (t >= Date.parse("2028-01-01T00:00:00Z")) return -8 * 3600;
+      if (t >= Date.parse("2027-03-14T10:00:00Z") && t < Date.parse("2027-03-14T11:00:00Z")) return -8 * 3600;
+      return offsetSeconds(t, tz);
+    });
+    const { data, problems } = await runDoctor(root, deps({ env: { CROFT_NOW: NOW }, duckdbOffsets: skewed }));
+    const p = problems.find((x) => x.code === "TZDATA_MISMATCH")!;
+    expect(p.severity).toBe("warning");
+    expect(p.message).toContain("America/Los_Angeles");
+    expect(p.message).toContain("2027-03-14T10:00:00Z (Bun -07:00, DuckDB -08:00)");
+    expect(p.hint).toContain("::DATE");
+    expect(p.details).toMatchObject({ timezone: LA, first: { at: "2027-03-14T10:00:00Z", bun: "-07:00", duckdb: "-08:00" } });
+    expect(p.details!.mismatches).toBeGreaterThan(4);
+    expect(check(data.checks, "tzdata")).toMatchObject({ section: "environment", status: "warn", code: "TZDATA_MISMATCH" });
+    expect(data.summary.warnings).toBeGreaterThanOrEqual(1);
+  });
+
+  test("a zone DuckDB does not know is reported; a failing comparison is only info", async () => {
+    const root = await project({ timezone: LA });
+    const unknown = await runDoctor(root, deps({ env: { CROFT_NOW: NOW }, duckdbOffsets: async () => null }));
+    expect(unknown.problems.find((x) => x.code === "TZDATA_MISMATCH")!.message).toContain("DuckDB's time zone data does not know America/Los_Angeles");
+    const broken = await runDoctor(root, deps({ env: { CROFT_NOW: NOW }, duckdbOffsets: async () => { throw new Error("boom"); } }));
+    expect(check(broken.data.checks, "tzdata")).toMatchObject({ status: "info" });
+    expect(broken.problems.filter((x) => x.code === "TZDATA_MISMATCH")).toEqual([]);
+  });
+
+  test("not compared when the DuckDB binding does not load", async () => {
+    const root = await project({ timezone: LA });
+    let called = false;
+    const { data } = await runDoctor(root, deps({
+      probeDuckdb: () => ({ ok: false, code: "MODULE_NOT_FOUND", message: "Cannot find module 'x'" }),
+      duckdbOffsets: async () => { called = true; return []; },
+    }));
+    expect(called).toBe(false);
+    expect(data.checks.find((c) => c.id === "tzdata")).toBeUndefined();
+  });
+
+  test("the real DuckDB: offsets through SET TimeZone, null for an unknown zone", async () => {
+    const winter = Date.parse("2027-01-15T12:00:00Z");
+    const summer = Date.parse("2027-07-15T12:00:00Z");
+    expect(await duckdbOffsets(LA, [winter, summer])).toEqual([-8 * 3600, -7 * 3600]);
+    expect(await duckdbOffsets("Asia/Kolkata", [winter])).toEqual([19800]);
+    expect(await duckdbOffsets("Nowhere/Nope", [winter])).toBeNull();
+  });
+
+  test("the real DuckDB for Africa/Casablanca: the verdict matches a direct comparison", async () => {
+    // Casablanca's rules are where Bun's and DuckDB's bundled data have drifted apart before.
+    const tz = "Africa/Casablanca";
+    const root = await project({ timezone: tz });
+    const monthly = Array.from({ length: 25 }, (_, i) => Date.UTC(2026, 8 + i, 23));
+    const duck = (await duckdbOffsets(tz, monthly))!;
+    const differs = monthly.some((t, i) => duck[i] !== offsetSeconds(t, tz));
+    const { problems } = await runDoctor(root, deps({ env: { CROFT_NOW: NOW } }));
+    if (differs) expect(problems.map((p) => p.code)).toContain("TZDATA_MISMATCH");
   });
 });

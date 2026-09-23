@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { tmpdir } from "node:os";
 import { problem } from "../core/errors.ts";
 import type { Problem } from "../core/types.ts";
+import type { Command } from "./command.ts";
+import { main } from "./main.ts";
 import {
   buildEnvelope, cellText, formatCount, formatDuration, formatNext, formatProblem, problemSummary, redactEnvelope,
-  Render, table, tableFromObjects, toJsonLine, truncate, useColor,
+  redactStrings, Render, table, tableFromObjects, toJsonLine, truncate, useColor,
 } from "./render.ts";
 import { CROFT_VERSION } from "./version.ts";
 
@@ -64,9 +67,35 @@ describe("envelope", () => {
       fix: { kind: "command", description: "d", command: "croft preview [redacted:KEY]" },
     });
     expect(Object.keys(env.problems[0]!).slice(0, 5)).toEqual(["severity", "code", "message", "hint", "docs"]);
-    expect(env.data).toEqual({ rows: [{ v: "[redacted:KEY]" }], n: 5 });
+    expect(env.data as unknown).toEqual({ rows: [{ v: "[redacted:KEY]" }], n: 5, redactedValues: true });
     expect(env.next).toEqual([{ command: "croft x [redacted:KEY]", reason: "[redacted:X]" }]);
     expect(env.command).toBe("validate");
+  });
+
+  test("data uses the redactor's narrower data policy and says when it changed a value", () => {
+    // PORT=5432, LOG_LEVEL=info, NODE_ENV=production are redacted from messages but not from query rows.
+    const text = (s: string) => s.replace(/production|info|5432|sk_live_abc123/g, (m) => `[redacted:${m === "sk_live_abc123" ? "KEY" : "ENV"}]`);
+    const redact = Object.assign(text, { data: (s: string) => s.replace(/sk_live_abc123/g, "[redacted:KEY]") });
+    const note = "customer info: production order #5432";
+    const env = redactEnvelope(buildEnvelope({
+      command: "query", data: { rows: [{ note, key: "sk_live_abc123" }], rowCount: 1 },
+      problems: [problem("QUERY_FAILED", { message: `bad value "${note}"`, hint: "h" })], ...META, durationMs: 1,
+    }), redact);
+    expect(env.data as unknown).toEqual({ rows: [{ note, key: "[redacted:KEY]" }], rowCount: 1, redactedValues: true });
+    expect(env.problems[0]!.message).toBe('bad value "customer [redacted:ENV]: [redacted:ENV] order #[redacted:ENV]"');
+    // Nothing redacted in data: no flag.
+    const clean = redactEnvelope(buildEnvelope({ command: "query", data: { rows: [{ note }] }, ...META, durationMs: 1 }), redact);
+    expect(clean.data).toEqual({ rows: [{ note }] });
+    // Data that is not an object cannot carry the flag but is still redacted.
+    expect(redactEnvelope(buildEnvelope({ command: "x", data: ["sk_live_abc123"], ...META, durationMs: 1 }), redact).data)
+      .toEqual(["[redacted:KEY]"]);
+  });
+
+  test("redactStrings keeps a __proto__ key as a key", () => {
+    const v = JSON.parse('{"__proto__": {"x": "secret1"}, "a": ["secret1"]}');
+    const out = redactStrings(v, (s) => s.replace("secret1", "[redacted:S]"));
+    expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+    expect(JSON.stringify(out)).toBe('{"__proto__":{"x":"[redacted:S]"},"a":["[redacted:S]"]}');
   });
 });
 
@@ -87,6 +116,27 @@ describe("Render", () => {
     expect(JSON.parse(out[0]!).data).toBe(1);
     expect(err).toEqual(["human text\n", "fetching…\n"]);
     expect(() => r.envelope(buildEnvelope({ command: "x", data: 2, ...META, durationMs: 0 }))).toThrow(/second envelope/);
+  });
+
+  test("an envelope that fails to serialize does not use up the one envelope", () => {
+    const { r, out } = capture(true);
+    class Opaque { toJSON(): never { throw new Error("cannot serialize"); } }
+    expect(() => r.envelope(buildEnvelope({ command: "x", data: { v: new Opaque() }, ...META, durationMs: 0 }))).toThrow("cannot serialize");
+    expect(out).toEqual([]);
+    r.envelope(buildEnvelope({ command: "x", data: null, ok: false, ...META, durationMs: 0 }));
+    expect(out).toHaveLength(1);
+  });
+
+  test("main: unserializable data still prints exactly one envelope (INTERNAL_ERROR)", async () => {
+    class Opaque { toJSON(): never { throw new Error("cannot serialize"); } }
+    const cmd: Command = { name: "opaque", summary: "s", usage: "croft opaque", options: {}, run: async () => ({ data: { v: new Opaque() }, problems: [], next: [] }) };
+    const out: string[] = [];
+    const exit = await main(["opaque", "--json"], {
+      cwd: tmpdir(), env: {}, commands: [cmd], stdinTTY: false, stdoutTTY: false, stderrTTY: false, stdout: (t) => out.push(t), stderr: () => {},
+    });
+    expect(exit).toBe(1);
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0]!)).toMatchObject({ ok: false, command: "opaque", problems: [{ code: "INTERNAL_ERROR" }] });
   });
 
   test("human mode: out goes to stdout, redacted", () => {

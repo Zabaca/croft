@@ -293,13 +293,14 @@ describe("context", () => {
 });
 
 describe("redaction", () => {
-  test("every .env value is redacted from JSON output; structural fields are not", async () => {
+  test("every .env value is redacted from JSON messages; data keeps ordinary values and says what it hid", async () => {
     const root = dir({ "croft.json": PROJECT, ".env": "TOKEN=supersecret123\nLEVEL=info\n" });
     const r = await run(["leak", "--json"], { cwd: root, commands: ALL });
     expect(r.stdout).not.toContain("supersecret123");
     expect(r.stderr).not.toContain("supersecret123");
     const env = envelope(r.stdout);
-    expect(env.data).toEqual({ token: "[redacted:TOKEN]", level: "[redacted:LEVEL]" });
+    // In data (what an agent reasons from) only credential-looking values are replaced: LEVEL=info stays readable.
+    expect(env.data).toEqual({ token: "[redacted:TOKEN]", level: "info", redactedValues: true });
     expect(env.problems[0]).toMatchObject({
       severity: "info", code: "INPUT_NOT_BUILT", message: "saw [redacted:TOKEN] at [redacted:LEVEL] level",
     });

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { CroftError } from "./errors.ts";
 import {
-  checkTimeZone, formatInstant, formatOffset, now, offsetMinutes, parseInstant, toEpochMicros, zonedParts,
+  checkTimeZone, formatInstant, formatNaive, formatOffset, now, offsetMinutes, offsetSeconds, parseInstant, toEpochMicros, zonedParts,
 } from "./time.ts";
 
 const LA = "America/Los_Angeles";
@@ -71,6 +71,26 @@ describe("formatInstant", () => {
     }
   });
 
+  test("offsets are always ±HH:MM, even for historic second offsets, and the string names the exact instant", () => {
+    // Monrovia Mean Time was -00:44:30 until 1972: a half-minute offset rounds away from zero to -00:45.
+    const monrovia = parseInstant("1950-06-01T12:00:00.25Z");
+    expect(offsetSeconds(Date.parse("1950-06-01T12:00:00Z"), "Africa/Monrovia")).toBe(-(44 * 60 + 30));
+    expect(formatInstant(monrovia, "Africa/Monrovia")).toBe("1950-06-01T11:15:00.250-00:45");
+    expect(parseInstant(formatInstant(monrovia, "Africa/Monrovia"))).toBe(monrovia);
+    for (let i = 0; i < 500; i++) {
+      const micros = BigInt(Math.floor((Math.random() * 9.5e9 - 5.4e9) * 1e6));   // 1800..2100
+      const s = formatInstant(micros, LA);
+      expect(s).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3}|\.\d{6})?[+-]\d{2}:\d{2}$/);
+      expect(parseInstant(s)).toBe(micros);
+    }
+  });
+
+  test("instants beyond JS dates render in UTC instead of throwing", () => {
+    const far = 10_000_000_000_000_000_000n;                                           // ~ year 318,857
+    expect(formatInstant(far, LA)).toBe(`${formatNaive(far, false)}+00:00`);
+    expect(formatInstant(-far, LA).endsWith("+00:00")).toBe(true);
+  });
+
   test("rejects naive and invalid inputs", () => {
     expect(() => formatInstant("2026-09-22T05:00:00", LA)).toThrow(RangeError);
     expect(() => formatInstant(new Date("nope"), LA)).toThrow(RangeError);
@@ -108,6 +128,23 @@ describe("offsets and parts", () => {
     expect(formatOffset(-420)).toBe("-07:00");
     expect(formatOffset(345)).toBe("+05:45");
     expect(formatOffset(0)).toBe("+00:00");
+  });
+
+  test("offsetSeconds (cached per UTC day) switches at the exact transition second", () => {
+    const spring = Date.parse("2026-03-08T10:00:00Z");                                 // LA springs forward
+    expect(offsetSeconds(spring - 1000, LA)).toBe(-8 * 3600);
+    expect(offsetSeconds(spring - 1, LA)).toBe(-8 * 3600);
+    expect(offsetSeconds(spring, LA)).toBe(-7 * 3600);
+    expect(offsetSeconds(spring + 999, LA)).toBe(-7 * 3600);
+    // Same answers asked in the other order (the day is cached by now).
+    expect(offsetSeconds(spring, LA)).toBe(-7 * 3600);
+    expect(offsetSeconds(spring - 1000, LA)).toBe(-8 * 3600);
+    // Lord Howe changes by 30 minutes at 15:00 UTC.
+    const lordHowe = Date.parse("2026-04-04T15:00:00Z");
+    expect(offsetSeconds(lordHowe - 1000, "Australia/Lord_Howe")).toBe(11 * 3600);
+    expect(offsetSeconds(lordHowe, "Australia/Lord_Howe")).toBe(10.5 * 3600);
+    expect(offsetMinutes(lordHowe, "Australia/Lord_Howe")).toBe(630);
+    expect(() => offsetSeconds(9e15, LA)).toThrow(RangeError);
   });
 
   test("zonedParts gives the wall clock", () => {
