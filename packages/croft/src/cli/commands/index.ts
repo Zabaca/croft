@@ -34,4 +34,32 @@ const doctor = lazyCommand({
   humanShowsProblems: true,
 }, async () => (await import("./doctor.ts")).doctor);
 
-export const COMMANDS: readonly Command[] = [docs, help, version, init, doctor];
+const run = lazyCommand({
+  name: "run",
+  summary: "update assets: fetch ingests (off a terminal the run detaches; croft wait follows it)",
+  usage: "croft run [selector…] [--from <date|ISO|-90d>] [--allow-shrink] [--foreground] [--follow 100s] [--no-wait] [--events]",
+  options: {
+    from: { type: "string", value: "<when>", description: "backfill a merge ingest from a date, an ISO time or a relative value (-90d, -12h, today)" },
+    "allow-shrink": { type: "boolean", description: "override SHRINK_GUARD for one replace ingest: the current rows go to the trash first, after confirmation" },
+    foreground: { type: "boolean", description: "run in this process even off a terminal (no detaching)" },
+    follow: { type: "string", value: "<dur>", description: "off a terminal: how long to follow the detached run before returning exit 6 (default 100s)" },
+    "no-wait": { type: "boolean", description: "exit 4 at once when an asset or the database is busy, instead of waiting" },
+    events: { type: "boolean", description: "NDJSON progress events on stderr" },
+    "run-id": { type: "string", value: "<id>", description: "internal: the run id a detached run was given" },
+    detached: { type: "boolean", description: "internal: marks the detached child of a run" },
+    "confirm-token": { type: "string", value: "<token>", description: "internal: set by croft confirm" },
+  },
+}, async () => (await import("./run.ts")).run);
+
+const wait = lazyCommand({
+  name: "wait",
+  summary: "block until a detached run ends; exit 6 if it is still running",
+  usage: "croft wait <run-id> [--timeout 100s]",
+  options: {
+    timeout: { type: "string", value: "<dur>", description: "how long to wait before returning exit 6 (default 100s)" },
+    events: { type: "boolean", description: "NDJSON progress events on stderr" },
+  },
+  maxPositionals: 1,
+}, async () => (await import("./wait.ts")).wait);
+
+export const COMMANDS: readonly Command[] = [docs, help, version, init, doctor, run, wait];
