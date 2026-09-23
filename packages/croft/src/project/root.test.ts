@@ -1,11 +1,11 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { scanJson } from "./json-locate.ts";
 import {
-  configProblems, findRoot, loadProject, parseConfig, readConfig, relocationDir, syncedLocation, type ConfigIssue,
+  configProblems, findRoot, loadProject, parseConfig, physicalPath, readConfig, relocationDir, syncedLocation, type ConfigIssue,
 } from "./root.ts";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "croft-root-")));
@@ -127,6 +127,110 @@ describe("loadProject", () => {
     ].join("\n"));
     expect(e.problem).toMatchObject({ file: "croft.json", line: 2, column: 3 });
     expect((e.problem.details?.issues as unknown[]).length).toBe(3);
+  });
+});
+
+describe("stateDir and database locations", () => {
+  // stateDir goes into the warehouse sandbox's allowed_directories, and files/ into croft query's, so a
+  // careless location would let SQL read .env, serve.json (the serve token), runs.sqlite or the warehouse.
+  const home = join(base, "home");
+  const bad = (config: Record<string, unknown>): ConfigIssue[] => {
+    const root = project({ ...MIN, ...config });
+    let err: unknown;
+    try {
+      loadProject({ root, home });
+    } catch (e) {
+      err = e;
+    }
+    if (!(err instanceof CroftError)) throw new Error(`accepted ${JSON.stringify(config)}`);
+    expect(err.code).toBe("CONFIG_INVALID");
+    return err.problem.details?.issues as ConfigIssue[];
+  };
+
+  test("stateDir must not be or contain the project folder, home, files/, assets/, lib/ or the database", () => {
+    mkdirSync(home, { recursive: true });
+    for (const [stateDir, what] of [
+      [".", "project folder"],
+      ["./", "project folder"],
+      ["..", "project folder"],
+      ["files/..", "project folder"],
+      ["/", "project folder"],
+      ["~", "home folder"],
+      [home, "home folder"],
+      ["files", "files/"],
+      ["files/state", "files/"],
+      ["assets", "assets/"],
+      ["lib/state", "lib/"],
+      ["warehouse.duckdb", "database"],
+    ] as const) {
+      const [i, ...rest] = bad({ stateDir });
+      expect([stateDir, i!.path, rest.length]).toEqual([stateDir, "stateDir", 0]);
+      expect(i!.message).toContain(what);
+      expect(i!.line).toBeGreaterThan(0);
+    }
+  });
+
+  test("a symlink cannot smuggle stateDir onto the project folder", () => {
+    const root = project(MIN);
+    symlinkSync(root, join(root, "state"));
+    writeFileSync(join(root, "croft.json"), JSON.stringify({ ...MIN, stateDir: "state" }));
+    let err: unknown;
+    try { loadProject({ root, home }); } catch (e) { err = e; }
+    expect((err as CroftError).code).toBe("CONFIG_INVALID");
+    expect((err as CroftError).message).toContain("project folder");
+  });
+
+  test("the database must not sit in files/ or the state folder, or use a reserved name", () => {
+    for (const [config, what] of [
+      [{ database: "files/warehouse.duckdb" }, "files/"],
+      [{ database: ".croft/warehouse.duckdb" }, "state folder"],
+      [{ database: "state/w.duckdb", stateDir: "state" }, "state folder"],
+      [{ database: ".croft/preview.duckdb" }, "state folder"],
+      [{ database: "preview.duckdb" }, "reserved"],
+      [{ database: "warehouse.read.duckdb" }, "reserved"],
+      [{ database: "data/x.read.duckdb" }, "reserved"],
+    ] as const) {
+      const issues = bad(config);
+      expect([JSON.stringify(config), issues.map((i) => i.path)]).toEqual([JSON.stringify(config), [("stateDir" in config ? "stateDir" : "database")]]);
+      expect(issues[0]!.message).toContain(what);
+    }
+  });
+
+  test("ordinary and relocated layouts are fine", () => {
+    for (const config of [
+      {},
+      { stateDir: "state" },
+      { stateDir: ".croft" },
+      { database: "data/warehouse.duckdb" },
+      { database: "~/.local/share/croft/x-1/warehouse.duckdb", stateDir: "~/.local/share/croft/x-1/.croft" },
+    ]) {
+      const root = project({ ...MIN, ...config });
+      expect(loadProject({ root, home }).root).toBe(root);
+    }
+  });
+
+  test("parseConfig without a project root checks only the text", () => {
+    expect(parseConfig(JSON.stringify({ ...MIN, stateDir: "." })).ok).toBe(true);
+  });
+});
+
+describe("physicalPath", () => {
+  test("follows symlinks one component at a time, so .. after a symlink leaves its target", () => {
+    const dir = join(base, `phys${n++}`);
+    mkdirSync(join(dir, "a", "b"), { recursive: true });
+    mkdirSync(join(dir, "other"));
+    writeFileSync(join(dir, "secret"), "s");
+    symlinkSync(join(dir, "a", "b"), join(dir, "other", "link"));
+    // other/link/.. is a/, physically; lexically it would be other/.
+    expect(physicalPath(join(dir, "other")).path).toBe(join(dir, "other"));
+    expect(physicalPath(`${dir}/other/link/../b`)).toEqual({ path: join(dir, "a", "b"), exists: true });
+    expect(physicalPath("link/../../secret", join(dir, "other"))).toEqual({ path: join(dir, "secret"), exists: true });
+    symlinkSync("../secret", join(dir, "a", "rel"));
+    expect(physicalPath(join(dir, "a", "rel"))).toEqual({ path: join(dir, "secret"), exists: true });
+    expect(physicalPath(`${dir}/other/link/missing/x`)).toEqual({ path: join(dir, "a", "b", "missing", "x"), exists: false });
+    expect(physicalPath(`${dir}/secret/x`)).toEqual({ path: join(dir, "secret", "x"), exists: false });
+    symlinkSync(join(dir, "loop"), join(dir, "loop"));
+    expect(() => physicalPath(join(dir, "loop", "x"))).toThrow("too many symbolic links");
   });
 });
 

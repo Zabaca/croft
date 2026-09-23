@@ -98,7 +98,7 @@ describe("direct mode", () => {
     expect(col.code).toBe("UNKNOWN_COLUMN");
     expect(col.message).toContain("creatd_at");
     const conv = await rejection(directQuery(p.project, req("SELECT 'abc'::INTEGER AS x"), FAST));
-    expect(conv.code).toBe("SQL_SYNTAX");
+    expect(conv.code).toBe("QUERY_FAILED");
     expect(conv.problem.details?.duckdbErrorType).toBe("Conversion");
   });
 
