@@ -48,6 +48,8 @@ interface BatchSpec {
   warnings?: Problem[];
   /** Raw text of the cursor per row, when it differs from the typed value's text. */
   raw?: (string | null)[];
+  /** Columns of the TEMP table that are not data columns and get no plan (files.ts's _croft_fallback). */
+  unplanned?: string[];
 }
 
 /** Build a typed batch the way cast.ts leaves it: a TEMP table plus plans. */
@@ -73,7 +75,7 @@ async function makeBatch(tx: Sql, asset: string, spec: BatchSpec): Promise<Typed
     await tx.exec(`INSERT INTO temp.main.${quoteIdent(temp)} VALUES (${values.map((_, j) => `$${j + 1}`).join(", ")})`, values);
   }
   const real = (await readTableSchema(tx, asset)) ?? [];
-  const plans: ColumnPlan[] = names.map((n) => {
+  const plans: ColumnPlan[] = names.filter((n) => !spec.unplanned?.includes(n)).map((n) => {
     const had = real.find((c) => c.name.toLowerCase() === n.toLowerCase());
     const incoming = [...new Set(spec.rows.filter((r) => n in r).map((r) => kindOf(r[n])))];
     return { column: n, sourceName: n, existing: had?.type ?? null, incoming, decision: had ? "keep" : "add", target: spec.columns[n], ...spec.plans?.[n] };
@@ -408,6 +410,44 @@ describe("replace of files", () => {
     expect(r.rows).toEqual({ in: 0, added: 0, updated: 0, unchanged: 0, deleted: 1, total: 1 });
     expect(r.changed).toBe(true);
     expect(await assetRow(w, "sales")).toMatchObject({ last_loaded_at: "2026-09-22T11:00:00.000000Z", row_count: 1 });
+  });
+
+  test("keyed: fallback rows fill only keys a reloaded file dropped, from the most recently loaded file, in full", async () => {
+    const w = warehouse();
+    const merge = { write: "merge" as const, key: ["order_id"] };
+    // b.csv first; then a.csv takes order 2 (loaded later); then c.csv takes it (with a note).
+    await load(w, "sales", { ...sales, rows: [{ order_id: 2, amount: 22, _file: "b.csv" }, { order_id: 3, amount: 30, _file: "b.csv" }] }, { ...merge, now: T0 });
+    await load(w, "sales", { ...sales, rows: [{ order_id: 1, amount: 10, _file: "a.csv" }, { order_id: 2, amount: 20, _file: "a.csv" }] },
+      { ...merge, replaceFiles: ["a.csv"], now: T1 });
+    await load(w, "sales", { columns: { ...sales.columns, note: "VARCHAR" }, rows: [{ order_id: 2, amount: 25, note: "c", _file: "c.csv" }] },
+      { ...merge, replaceFiles: ["c.csv"], now: T2 });
+    await w.write("files", async (tx) => {
+      for (const [path, at] of [["b.csv", T0], ["a.csv", T1], ["c.csv", T2]]) {
+        await tx.exec(`INSERT INTO _croft.files (asset, path, size, mtime, etag, sha256, loaded_at) VALUES ('sales', $1, 1, NULL, NULL, 'x', $2::TIMESTAMPTZ)`, [path, at]);
+      }
+    });
+    // c.csv is re-exported with order 6 only. a.csv and b.csv are read along (fallback rows, in read order): order 2
+    // falls back to a.csv, loaded after b.csv although b.csv is read later; order 1 and 3 are not c.csv's and stay.
+    const fb = { columns: { ...sales.columns, _croft_fallback: "BOOLEAN" }, unplanned: ["_croft_fallback"] };
+    const r = await load(w, "sales", { ...fb, rows: [
+      { order_id: 1, amount: 10, _file: "a.csv", _croft_fallback: true }, { order_id: 2, amount: 20, _file: "a.csv", _croft_fallback: true },
+      { order_id: 2, amount: 22, _file: "b.csv", _croft_fallback: true }, { order_id: 3, amount: 99, _file: "b.csv", _croft_fallback: true },
+      { order_id: 6, amount: 60, _file: "c.csv", _croft_fallback: false },
+    ] }, { ...merge, replaceFiles: ["c.csv"], now: T3 });
+    expect(r.rows).toEqual({ in: 1, added: 1, updated: 1, unchanged: 0, deleted: 0, total: 4 });
+    // The fallback row is a.csv's row in full: note is absent from the batch, yet c.csv's note does not stay.
+    expect(await read(w, `SELECT order_id, amount, note, _file FROM sales ORDER BY order_id`)).toEqual([
+      { order_id: 1, amount: 10, note: null, _file: "a.csv" }, { order_id: 2, amount: 20, note: null, _file: "a.csv" },
+      { order_id: 3, amount: 30, note: null, _file: "b.csv" }, { order_id: 6, amount: 60, note: null, _file: "c.csv" },
+    ]);
+    expect((await writesRows(w, "sales")).at(-1)).toMatchObject({ rows_in: 1, added: 1, updated: 1, deleted: 0 });
+    // Without a key-scoped file reload, fallback rows are never written.
+    const r2 = await load(w, "sales", { ...fb, rows: [
+      { order_id: 7, amount: 70, _file: "a.csv", _croft_fallback: true }, { order_id: 6, amount: 61, _file: "c.csv", _croft_fallback: false },
+    ] }, { ...merge, now: T3 });
+    expect(r2.rows).toEqual({ in: 1, added: 0, updated: 1, unchanged: 0, deleted: 0, total: 4 });
+    expect(await read(w, `SELECT count(*)::INTEGER AS n FROM sales WHERE order_id = 7`)).toEqual([{ n: 0 }]);
+    expect((await read<{ column_name: string }>(w, `DESCRIBE sales`)).map((c) => c.column_name)).not.toContain("_croft_fallback");
   });
 
   test("a reload of a new file with an empty file list deletes nothing", async () => {
