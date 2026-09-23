@@ -160,6 +160,13 @@ describe("first load", () => {
     })]);
   });
 
+  test("_croft.writes records the step attempt, so reconcile() can tell a retry from an earlier attempt", async () => {
+    const w = warehouse();
+    await load(w, "zones", { ...zones, rows: zoneRows(2) }, { key: ["id"], now: T0, runId: "r_a", attempt: 3 });
+    await load(w, "zones", { ...zones, rows: zoneRows(3) }, { key: ["id"], now: T1, runId: "r_b" });
+    expect((await writesRows(w, "zones")).map((x) => [x.run_id, x.attempt])).toEqual([["r_a", 3], ["r_b", null]]);
+  });
+
   test("an empty first batch still creates the table, with only _loaded_at when nothing is known", async () => {
     const w = warehouse();
     const r = await load(w, "empty", { columns: {}, rows: [] }, { now: T0 });

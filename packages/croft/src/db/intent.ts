@@ -23,7 +23,8 @@ export function intentDir(stateDir: string): string {
   return join(stateDir, INTENT_DIR);
 }
 
-// procStart on macOS is `ps -o lstart` text ("Tue Sep 23 07:11:00 2026"); keep file names portable.
+// procStart is digits today (epoch seconds on macOS, clock ticks on Linux), but an intent written by an
+// older croft holds `ps -o lstart` text ("Tue Sep 23 07:11:00 2026"); keep file names portable.
 const safe = (s: string) => s.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_|_$/g, "");
 
 export function intentFileName(id: ProcessIdentity): string {
