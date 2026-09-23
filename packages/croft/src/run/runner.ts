@@ -31,7 +31,7 @@ import { reconcile } from "../history/reconcile.ts";
 import { RunsDb, type RunStatus, type RunTrigger } from "../history/runs-db.ts";
 import type { HttpOptions } from "../http/http.ts";
 import { redactProblem } from "../cli/render.ts";
-import { setOutputRedactor } from "../core/output.ts";
+import { outsideCapture, setOutputRedactor } from "../core/output.ts";
 import { now as clockNow } from "../core/time.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { loadProject, type Project } from "../project/root.ts";
@@ -197,7 +197,10 @@ export class EventLog {
     } catch {
       // Progress must never fail a run.
     }
-    this.onEvent?.(line, full);
+    // Progress is emitted from inside a step's console capture (a request completing in rows()); it is croft's own
+    // output, so the caller writes it outside the capture (core/output.ts).
+    const onEvent = this.onEvent;
+    if (onEvent) outsideCapture(() => onEvent(line, full));
   }
 }
 

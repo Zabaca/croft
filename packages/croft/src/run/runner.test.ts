@@ -650,6 +650,21 @@ describe("leases, timeouts and signals", () => {
     }
   });
 
+  // croft's own progress output is not asset output: --events lines emitted while rows() runs (inside the step's
+  // console capture) still reach stderr, and never the step log.
+  test("--events progress during extraction reaches stderr, not the step log", async () => {
+    api.state.slowPages = 4;
+    api.state.slowDelayMs = 200;
+    const root = makeProject({ "assets/slow.ts": slowPages(api.url) });
+    const r = await cli(root, ["run", "slow", "--foreground", "--json", "--events"]);
+    expect(r.code).toBe(0);
+    const events = r.stderr.trim().split("\n").map((l) => JSON.parse(l) as { type: string; phase?: string });
+    expect(events.some((e) => e.type === "progress" && e.phase === "extract")).toBe(true);
+    const log = readFileSync(logPath(join(root, ".croft"), r.json!.data.runId, "slow"), "utf8");
+    expect(log).not.toContain(`"type":"progress"`);
+    expect(log).toContain("page 4");
+  }, 30_000);
+
   test("an aborted signal interrupts the step: nothing is written, the run is interrupted, exit 130", async () => {
     api.state.slowPages = 50;
     api.state.slowDelayMs = 50;

@@ -8,10 +8,11 @@
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { CroftError, isCode } from "../core/errors.ts";
-import { captureImport, collectingSink } from "../core/output.ts";
+import { captureImport, collectingSink, defaultOutputRedactor } from "../core/output.ts";
 import type { CursorType, Incremental, Problem, Reason, WriteMode } from "../core/types.ts";
 import type { FileIngest } from "../types.ts";
 import { type DiscoveredAsset, discoverAssets } from "../project/discover.ts";
+import { ProjectEnv } from "../project/env.ts";
 import { didYouMean } from "../project/suggest.ts";
 import { type LoadedTsAsset, loadTsAsset, type TsAssetSpec } from "../project/ts-asset.ts";
 
@@ -216,6 +217,8 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
   const discovery = await discoverAssets(i.root);
   const names = discovery.assets.map((a) => a.name);
   const selected = selectAssets(names, i.selectors, discovery.problems);
+  // Asset output that escapes its import (a timer started at top level) reaches stderr redacted (core/output.ts).
+  defaultOutputRedactor(() => (t) => ProjectEnv.load(i.root, {}).redact(t));
   const steps: PlannedStep[] = [];
   const fileDirs = new Set<string>();
   for (const name of selected) {

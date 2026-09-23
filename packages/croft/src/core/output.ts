@@ -26,6 +26,7 @@ export interface OutputSink {
 const scope = new AsyncLocalStorage<OutputSink>();
 const importSinks: OutputSink[] = [];
 let redactFallback: (text: string) => string = (t) => t;
+let redactorSet = false;
 let installed = false;
 
 type Write = typeof process.stdout.write;
@@ -39,6 +40,14 @@ export function currentSink(): OutputSink | undefined {
 /** Redaction for console output that reaches stderr outside any scope (a run sets the project's). */
 export function setOutputRedactor(redact: (text: string) => string): void {
   redactFallback = redact;
+  redactorSet = true;
+}
+
+/** setOutputRedactor unless one is set already; `make` runs only when something is printed. */
+export function defaultOutputRedactor(make: () => (text: string) => string): void {
+  if (redactorSet) return;
+  let r: ((text: string) => string) | undefined;
+  setOutputRedactor((text) => (r ??= make())(text));
 }
 
 /** Write a line to the real stderr, redacted, whatever scope is active (never back into a sink). */
@@ -124,6 +133,21 @@ export function captureOutput<T>(sink: OutputSink, fn: () => T): T {
   return scope.run(sink, fn);
 }
 
+/**
+ * Run croft's own code outside any capture, so what it writes goes where croft sends it: progress events are
+ * emitted from inside a step's scope (a request completing inside rows()), yet belong on stderr (--events), not
+ * in the step log. The scope stays off for async work fn starts; import sinks are hidden only while fn runs.
+ */
+export function outsideCapture<T>(fn: () => T): T {
+  if (!installed) return fn();
+  const hidden = importSinks.splice(0);
+  try {
+    return scope.exit(fn);
+  } finally {
+    importSinks.unshift(...hidden);
+  }
+}
+
 /** Import asset code with its top-level console output going to `sink` until the import settles. */
 export async function captureImport<T>(sink: OutputSink, fn: () => Promise<T>): Promise<T> {
   installOutputGuard();
@@ -144,6 +168,8 @@ export async function guardImport<T>(file: string, redact: () => (text: string) 
   installOutputGuard();
   if (currentSink()) return fn();
   let r: ((text: string) => string) | undefined;
+  // Output that escapes the import (a timer its top-level code started) is redacted the same way.
+  defaultOutputRedactor(() => (r ??= redact()));
   return captureImport({
     write: (text) => {
       r ??= redact();
