@@ -1,7 +1,7 @@
 {
   "name": "croft",
   "private": true,
-  "packageManager": "bun@1.3.4",
+  "packageManager": "bun@1.3.14",
   "workspaces": ["packages/*"],
   "scripts": {
     "build": "turbo run build",
