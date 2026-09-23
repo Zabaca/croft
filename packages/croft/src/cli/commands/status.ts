@@ -12,8 +12,13 @@
 // `status` exits 0 because the command worked; `--check` exits 1 when anything is failed, crashed, held or
 // stale, which makes it a health probe. In JSON, ok always means "the command worked" and data.healthy
 // carries health.
+//
+// The catalog mirror says what was built, not that it is still there: status stats the warehouse file (it
+// never opens it), and when the catalog has entries but the file is gone (deleted, or moved away from the
+// "database" path) it reports DB_NOT_FOUND, is not healthy, and shows what was built as unknown.
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { problem } from "../../core/errors.ts";
 import { formatInstant, parseInstant } from "../../core/time.ts";
 import { recordAlive } from "../../core/proc.ts";
 import type { AssetKind, Problem } from "../../core/types.ts";
@@ -42,7 +47,9 @@ export interface StatusAsset {
   asset: string;
   kind: AssetKind | null;
   file: string | null;
-  status: "ok" | "failed" | "crashed" | "interrupted" | "running" | "skipped" | "never_run" | "no_asset_file";
+  /** "unknown": it was built, but the warehouse file is missing (DB_NOT_FOUND), so its table is gone or elsewhere. */
+  status: "ok" | "failed" | "crashed" | "interrupted" | "running" | "skipped" | "never_run" | "no_asset_file" | "unknown";
+  /** null when never built, or when the warehouse file is missing. */
   rows: number | null;
   lastRun: LastRun | null;
   next: { at: string | null; reason: "manual" | "after inputs" | "none" };
@@ -274,6 +281,31 @@ function serveOf(stateDir: string): { url: string; pid: number } | undefined {
 const FAILED = new Set(["failed", "crashed", "interrupted"]);
 const DAY_MS = 86_400_000;
 
+/** What runs.sqlite knows about the warehouse without opening it: how many runs there were, and how many
+ *  tables the catalog mirror says were built (an entry is written only after a committed write). */
+export interface WarehouseHistory { runs: number; built: number; lastLoadedAt: string | null }
+
+export function warehouseHistory(db: RunsDb | null, catalog: readonly CatalogAsset[] = db ? allCatalog(db) : []): WarehouseHistory {
+  const runs = db ? (db.sqlite.query("SELECT count(*) AS n FROM runs").get() as { n: number }).n : 0;
+  const lastLoadedAt = catalog.map((c) => c.lastLoadedAt).filter((x): x is string => !!x).sort().pop() ?? null;
+  return { runs, built: catalog.length, lastLoadedAt };
+}
+
+/** DB_NOT_FOUND for a warehouse file that is gone although croft built it before (the catalog lists tables).
+ *  null while the file is there, or when nothing was ever built (then a missing file is simply "not yet"). */
+export function missingWarehouse(project: Project, history: WarehouseHistory, tz: string): Problem | null {
+  if (history.built === 0 || existsSync(project.paths.database)) return null;
+  const label = project.databaseLabel;
+  const when = zoned(history.lastLoadedAt, tz);
+  return problem("DB_NOT_FOUND", {
+    message: `${label} is missing: croft built it before (${history.built} table${history.built === 1 ? "" : "s"} recorded in runs.sqlite${when ? `, last written ${when}` : ""}), so it was deleted or moved`,
+    hint: `ask the user where ${label} went and put it back (or point "database" in croft.json at it); running an asset instead starts a new, empty warehouse and refetches everything from the sources`,
+    fix: { kind: "manual", description: `restore ${label}, or ask the user whether to rebuild it from the sources`, requiresHuman: true },
+    effect: "nothing was written",
+    details: { path: project.paths.database, builtTables: history.built, runs: history.runs, lastLoadedAt: when },
+  });
+}
+
 export interface ProjectState {
   data: StatusData;
   problems: Problem[];
@@ -297,6 +329,7 @@ export async function collectStatus(project: Project, now: Date, o: { kinds?: Re
   try {
     const catalog = db ? allCatalog(db) : [];
     const byName = new Map(catalog.map((c) => [c.asset, c]));
+    const missing = missingWarehouse(project, warehouseHistory(db, catalog), tz);
     const { running, dead } = runningEntries(db, tz, project.paths.stateDir);
     const summaryChanges = schemaChangesFromRuns(db, new Date(now.getTime() - 7 * DAY_MS));
     const names = [...new Set([...discovery.assets.map((a) => a.name), ...catalog.map((c) => c.asset)])].sort();
@@ -318,7 +351,7 @@ export async function collectStatus(project: Project, now: Date, o: { kinds?: Re
       else if (stepStatus === "running") status = "running";
       else if (stepStatus && FAILED.has(stepStatus)) status = stepStatus as StatusAsset["status"];
       else if (stepStatus === "skipped") status = "skipped";
-      else if (cat || stepStatus === "ok" || stepStatus === "unchanged") status = "ok";
+      else if (cat || stepStatus === "ok" || stepStatus === "unchanged") status = missing ? "unknown" : "ok";
       else status = "never_run";
       const staleReasons = file && !cat && status !== "running" && !(stepStatus === "ok" || stepStatus === "unchanged") ? ["never_built"] : [];
       // Edited: the file changed after the step that last read it started (only once it has run).
@@ -329,7 +362,7 @@ export async function collectStatus(project: Project, now: Date, o: { kinds?: Re
         } catch {}
       }
       const out: StatusAsset = {
-        asset: name, kind, file: file?.file ?? null, status, rows: cat ? cat.rows : null, lastRun,
+        asset: name, kind, file: file?.file ?? null, status, rows: cat && !missing ? cat.rows : null, lastRun,
         next: nextOf(kind, !!file), stale: staleReasons.length > 0, staleReasons, held: false, edited,
       };
       if (cat?.filesGone?.length) out.filesGone = [...cat.filesGone];
@@ -337,7 +370,7 @@ export async function collectStatus(project: Project, now: Date, o: { kinds?: Re
       if (changed) out.schemaChangedAt = zoned(changed, tz)!;
       return out;
     });
-    const healthy = !assets.some((a) => FAILED.has(a.status) || a.held || a.stale);
+    const healthy = !missing && !assets.some((a) => FAILED.has(a.status) || a.held || a.stale);
     const recentSteps = db
       ? db.listRuns({ since: new Date(now.getTime() - 7 * DAY_MS), limit: 200 }).flatMap((r) => db.stepsFor(r.id))
       : [];
@@ -349,7 +382,8 @@ export async function collectStatus(project: Project, now: Date, o: { kinds?: Re
     };
     const serve = serveOf(project.paths.stateDir);
     if (serve) data.serve = serve;
-    return { data, problems: discovery.problems, discovered: discovery.assets, catalog, recentSteps, dead, summaryChanges };
+    const problems = missing ? [missing, ...discovery.problems] : discovery.problems;
+    return { data, problems, discovered: discovery.assets, catalog, recentSteps, dead, summaryChanges };
   } finally {
     db?.close();
   }
@@ -392,7 +426,10 @@ export function statusText(a: StatusAsset, now: Date): string {
       head = `never run (croft run ${a.asset})`;
       break;
     case "no_asset_file":
-      head = `no asset file (croft delete ${a.asset})`;
+      head = "no asset file (its table is kept)";
+      break;
+    case "unknown":
+      head = "unknown: the warehouse file is missing";
       break;
     case "skipped":
       head = "skipped";
@@ -408,7 +445,7 @@ export function statusText(a: StatusAsset, now: Date): string {
 
 export function formatStatus(d: StatusData, now: Date): string {
   if (d.assets.length === 0) {
-    return ["No assets yet: add one with croft new --list, then croft run.", schedulingLine(d, now)].join("\n");
+    return ["No assets yet: add one to assets/ (croft docs ingest has templates), then croft run <asset>.", schedulingLine(d, now)].join("\n");
   }
   const rows = d.assets.map((a) => [
     a.asset,

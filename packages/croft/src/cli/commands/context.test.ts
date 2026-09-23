@@ -105,6 +105,26 @@ describe("croft context --json", () => {
   });
 });
 
+describe("croft context when the warehouse file is missing", () => {
+  test("DB_NOT_FOUND, and what was built shows as unknown rather than as its old row count", async () => {
+    const p = await scenario({ warehouse: false });
+    const r = await cli(["context", "--json"], { cwd: p.root, env: ENV });
+    expect(r.exit).toBe(0);
+    expect(r.json.problems.map((x: { code: string }) => x.code)).toEqual(["DB_NOT_FOUND"]);
+    expect(r.json.problems[0].message).toContain("warehouse.duckdb is missing: croft built it before");
+    const a = byAsset(r.json.data);
+    expect(a.github_issues).toMatchObject({ status: "unknown", rows: null });
+    expect(a.old_orders).toMatchObject({ status: "no_asset_file", rows: null });
+    expect(a.stripe_charges).toMatchObject({ status: "failed", rows: null });
+
+    const human = await cli(["context"], { cwd: p.root, env: ENV });
+    const line = human.stdout.split("\n").find((l) => l.startsWith("github_issues "))!;
+    expect(line).toContain("rows unknown");
+    expect(line).toContain("unknown: the warehouse file is missing");
+    expect(line).not.toContain("18,556");
+  });
+});
+
 describe("croft context never waits on DuckDB", () => {
   test("while another process holds the warehouse write lock it answers at once, schema changes from the runs", async () => {
     const p = await scenario();

@@ -456,11 +456,11 @@ async function checkServe(r: Report, d: DoctorDeps, project: Project): Promise<v
   const file = join(project.paths.stateDir, "serve.json");
   const s = servePid(project.paths.stateDir);
   if (!s) {
-    r.add("environment", "serve", "info", "croft serve is not running (apps read the file directly)", undefined, { running: false });
+    r.add("environment", "serve", "info", "no read server running (apps read the warehouse file directly)", undefined, { running: false });
     return;
   }
   if (!s.alive) {
-    r.add("environment", "serve", "info", `croft serve is not running (serve.json is left from pid ${s.pid})`, undefined, { running: false, stalePid: s.pid });
+    r.add("environment", "serve", "info", `no read server running (serve.json is left from pid ${s.pid})`, undefined, { running: false, stalePid: s.pid });
     return;
   }
   const shownFile = inside(project.root, file) ? relative(project.root, file) : file;
@@ -478,8 +478,8 @@ async function checkServe(r: Report, d: DoctorDeps, project: Project): Promise<v
   if (!health) {
     const p = problem("SERVE_UNAVAILABLE", {
       message: `croft serve (pid ${s.pid}) is running but does not answer on ${s.url ?? "its recorded address"}`,
-      hint: "stop it and start croft serve again in your terminal",
-      fix: { kind: "manual", description: `stop croft serve (pid ${s.pid}) and start it again`, requiresHuman: true },
+      hint: `ask the user to stop process ${s.pid}: it recorded serve.json but does not answer, and apps read the warehouse file directly once it is gone`,
+      fix: { kind: "manual", description: `stop the server process that does not answer (pid ${s.pid})`, requiresHuman: true },
       retryable: true,
       details: { pid: s.pid, url: s.url },
     });
@@ -599,7 +599,8 @@ function assetSummary(assetsDir: string): string {
     for (const f of new Bun.Glob("**/*.{ts,sql}").scanSync({ cwd: assetsDir, onlyFiles: true })) if (!f.split("/").some((s) => s.startsWith("."))) n++;
   } catch { /* no assets/ yet */ }
   // HOOK(validate): once discovery and validation exist, report "N assets · E errors, W warnings" here.
-  return `${n} asset file${n === 1 ? "" : "s"} (details: croft validate)`;
+  // Until then croft context lists each asset file's problems without running anything.
+  return `${n} asset file${n === 1 ? "" : "s"} (details: croft context)`;
 }
 
 function checkStorage(r: Report, d: DoctorDeps, project: Project): void {

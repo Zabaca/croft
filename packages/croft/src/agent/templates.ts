@@ -1,11 +1,14 @@
 // What `croft init` writes (DESIGN.md §2 "croft init in an empty folder", §9 "Claude Code integration").
 // Text files live next to this module so they can be read and reviewed as they ship: skill.md and
-// claude-md.md are the §9 texts verbatim, project/ holds the scaffold. Files whose names would change
+// claude-md.md are the §9 texts cut to what this build ships (core/phase.ts; SKILL.md's "This version"
+// section is rendered from that manifest, and agent/contract.test.ts checks that every command and flag
+// the texts name exists), and project/ holds the scaffold. Files whose names would change
 // behavior inside this repository are stored under neutral names and renamed on write: a real
 // .gitignore would apply to croft's own source tree (and npm drops .gitignore files when packing), and
 // a real CLAUDE.md or .claude/skills/ folder would be loaded by Claude Code sessions working on croft.
 import { readFileSync } from "node:fs";
 import pkg from "../../package.json" with { type: "json" };
+import { versionNotes } from "../core/phase.ts";
 
 export const CROFT_PACKAGE = "@zabaca/croft";
 export const CROFT_VERSION: string = pkg.version;
@@ -23,9 +26,10 @@ function read(rel: string): string {
   return readFileSync(new URL(rel, import.meta.url), "utf8");
 }
 
-/** SKILL.md stamped with the croft version that wrote it (CLAUDE_FILES_OUTDATED compares the stamp). */
+/** SKILL.md stamped with the croft version that wrote it (CLAUDE_FILES_OUTDATED compares the stamp), with
+ *  its "This version" section rendered from the phase manifest. */
 export function skillMd(version: string = CROFT_VERSION): string {
-  return read("./skill.md").replace("{{version}}", version);
+  return read("./skill.md").replace("{{version}}", version).replace("{{phase}}", versionNotes(version));
 }
 
 /** The version stamped into a SKILL.md (`<!-- croft 0.1.0 -->`), or null when there is none. */

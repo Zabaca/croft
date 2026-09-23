@@ -17,15 +17,75 @@ function designBlock(marker: string): string {
   return DESIGN.slice(open, DESIGN.indexOf("\n```\n", open) + 1);
 }
 
-describe("the Claude files are DESIGN.md §9 verbatim", () => {
+// DESIGN.md §9 holds the v1 texts, for all five phases. This build ships phase 1, so its texts leave out or
+// reword every line that sends the agent to a command, flag or feature phase 1 lacks (agent/contract.test.ts
+// checks the commands and flags). Every other §9 line ships word for word, and each line that does not is
+// listed here with the reason, so no rule of §9 disappears unnoticed. Match: the start of the §9 line.
+const CUT_FROM_CLAUDE_MD: [string, string][] = [
+  ["Loop: edit → `croft validate --json`", "validate and preview are phase 2: the loop is edit → run → query/describe/logs"],
+];
+const CUT_FROM_SKILL: [string, string][] = [
+  ["  source, writing SQL or TypeScript transforms, adding checks, scheduling,", "description: transforms, checks, schedules are phases 2-3"],
+  ["  renaming, or answering", "description: rename is phase 4"],
+  ["`croft docs <ERROR_CODE>`, `croft docs --list`, `croft new --list`.", "new is phase 5: croft help <command> instead"],
+  ["croft context --json        # assets, columns, behavior, schedules, running, held,", "no schedules or holds in phase 1"],
+  ["croft status                # failed, stale, held, edited, orphaned", "phase 1 words: never run, no asset file"],
+  ["1. New asset: `croft new api|file|sql|transform <name>`", "new is phase 5: templates are in croft docs ingest"],
+  ["2. `croft validate --json` after EVERY edit", "validate is phase 2: croft run reports each asset's problems"],
+  ["3. `croft preview <name>`", "preview is phase 2"],
+  ["4. `croft run <name>`; then verify with", "reworded as steps 2-4 of the phase-1 loop"],
+  ["- SQL assets: `-- name: value` header lines", "SQL assets are built from phase 2 (This version says so)"],
+  ["  SQL transforms are always rebuilt in full", "SQL transforms and schedules: phases 2-3"],
+  ["- SQL assets read assets, never files", "kept as: to use a file, make a file ingest (no croft new file)"],
+  ["- TS transforms that call an API or LLM per row", "TS transforms are phase 2"],
+  ["- Apps read with `import { query } from \"@zabaca/croft/read\"`. It talks to `croft serve`", "serve is phase 3: direct reads only"],
+  ["- `croft serve` runs until stopped", "serve is phase 3"],
+  ["- For a GUI (DuckDB UI, DBeaver), set \"readCopy\": true", "readCopy is phase 3: merged into the Apps line (never open the file)"],
+  ["  (`croft new api x --pagination cursor`).", "new is phase 5: the cursor template in croft docs ingest"],
+  ["- `croft confirm <token>` (every destructive action ends here: rebuild of an ingest", "phase 1's one confirmation is --allow-shrink"],
+  ["  --allow-shrink, delete, restore, lossy pin changes,", "second line of the confirm rule"],
+  ["- Renaming or deleting files in assets/ (use `croft rename`); `croft schedule", "rename is phase 4, schedule phase 3"],
+  ["- `croft serve` (it runs scheduled work unattended", "serve is phase 3"],
+  ["- Deleting .croft/ or warehouse*.duckdb, or `git clean -X` (the trash and backups live", "no pre-upgrade backups until phase 4"],
+  ["- Failed run: croft status --json → croft logs <asset> --failed → fix → croft validate", "without validate and preview"],
+  ["  → croft run <asset> → croft status.", "second line of the failed-run recipe"],
+  ["- Held asset:", "holds come with the scheduler (phase 3)"],
+  ["- Backfill: croft run <asset> --dry-run --from -90d", "run --dry-run is phase 2: croft describe shows the cursor, then --from"],
+  ["- Rename: croft rename", "rename is phase 4"],
+  ["- Wrong number: croft describe <asset> --json → croft preview <asset> --rebuild", "preview --rebuild is phase 2"],
+  ["  with the same filter; `croft docs internals`", "second line of the wrong-number recipe"],
+];
+
+/** The §9 lines missing from `shipped`, each matched to exactly one entry of `cuts` (and each entry used). */
+function checkCuts(design: string, shipped: string, cuts: [string, string][]): void {
+  const lines = new Set(shipped.split("\n"));
+  const missing = design.split("\n").filter((l) => !lines.has(l));
+  const unexplained = missing.filter((l) => cuts.filter(([start]) => l.startsWith(start)).length !== 1);
+  expect(unexplained).toEqual([]);
+  const unused = cuts.filter(([start]) => missing.filter((l) => l.startsWith(start)).length !== 1).map(([start]) => start);
+  expect(unused).toEqual([]);
+}
+
+describe("the Claude files are DESIGN.md §9, cut to what this build ships", () => {
   test("CLAUDE.md managed block", () => {
-    expect(claudeBlock("project")).toBe(designBlock("**1. The `CLAUDE.md` managed block:**"));
+    checkCuts(designBlock("**1. The `CLAUDE.md` managed block:**"), claudeBlock("project"), CUT_FROM_CLAUDE_MD);
+    expect(claudeBlock("project").split("\n")).toHaveLength(designBlock("**1. The `CLAUDE.md` managed block:**").split("\n").length);
   });
 
   test("SKILL.md, stamped with the version", () => {
-    expect(skillMd("0.1.0")).toBe(designBlock("**2. `.claude/skills/croft/SKILL.md`:**"));
+    checkCuts(designBlock("**2. `.claude/skills/croft/SKILL.md`:**"), skillMd("0.1.0"), CUT_FROM_SKILL);
     expect(skillMd()).toContain(`<!-- croft ${CROFT_VERSION} -->`);
     expect(skillMd()).not.toContain("{{version}}");
+    expect(skillMd()).not.toContain("{{phase}}");
+  });
+
+  test("the app block differs from the project block only where the project lives in data/", () => {
+    const project = claudeBlock("project").split("\n");
+    const app = claudeBlock("app").split("\n");
+    for (const line of ["<!-- croft:start (managed by `croft init --claude`) -->", project.find((l) => l.startsWith("Loop:"))!,
+      "Ask the user before any command in the skill's \"Ask the user first\" list, including every `croft confirm`."]) {
+      expect(app).toContain(line);
+    }
   });
 
   test("skill front matter names the skill croft", () => {

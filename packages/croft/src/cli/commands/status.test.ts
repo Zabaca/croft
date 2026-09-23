@@ -16,11 +16,13 @@ afterAll(async () => {
 const ENV = { CROFT_NOW: NOW };
 const BEFORE_RUNS = new Date("2026-09-22T18:00:00Z");
 
-/** The busy scenario, with asset files last edited before every run. */
-function scenario() {
+/** The busy scenario, with asset files last edited before every run, and a warehouse file: status never opens
+ *  it, only checks that it is there (without it the catalog's tables are gone, DB_NOT_FOUND). */
+function scenario(o: { warehouse?: boolean } = {}) {
   const p = makeProject({ files: SCENARIO_FILES });
   for (const f of Object.keys(SCENARIO_FILES)) utimesSync(join(p.root, f), BEFORE_RUNS, BEFORE_RUNS);
   busyScenario(p.stateDir);
+  if (o.warehouse !== false) writeFileSync(p.database, "");
   return p;
 }
 
@@ -144,6 +146,7 @@ describe("croft status --json", () => {
     const db = runsDb(good.stateDir);
     putCatalog(db, ISSUES_CATALOG);
     db.close();
+    writeFileSync(good.database, "");
     const r = await cli(["status", "--check", "--json"], { cwd: good.root, env: ENV });
     expect(r.exit).toBe(0);
     expect(r.json.data.healthy).toBe(true);
@@ -179,7 +182,7 @@ describe("croft status: human output", () => {
     expect(row("sales")).toBe("sales | — | 4 min ago | manual | running (r_0922_1157_live)");
     expect(row("taxi_zones")).toBe("taxi_zones | 265 | 4 min ago | manual | crashed (croft logs taxi_zones --failed) · 2 files gone");
     expect(row("open_issues")).toBe("open_issues | — | — | after inputs | never run (croft run open_issues)");
-    expect(row("old_orders")).toBe("old_orders | 120 | 5 min ago | — | no asset file (croft delete old_orders)");
+    expect(row("old_orders")).toBe("old_orders | 120 | 5 min ago | — | no asset file (its table is kept)");
     expect(lines).toContain(`running  r_0922_1157_live  sales  pid ${process.pid}  since 4 min  extract  61,200 rows fetched`);
     expect(lines.at(-3)).toBe("Scheduling off · 1 running");
     expect(r.stdout).toContain("next: croft logs stripe_charges --failed");
@@ -193,9 +196,53 @@ describe("croft status: human output", () => {
   });
 });
 
+describe("croft status when the warehouse file is missing", () => {
+  // The catalog mirror in runs.sqlite says what was built; the warehouse file says whether it is still there.
+  // status stats the file (it never opens it), so a deleted or moved warehouse is not reported as healthy.
+  test("a catalog without its warehouse file: DB_NOT_FOUND, not healthy, the rows unknown", async () => {
+    const p = scenario({ warehouse: false });
+    const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+    expect(r.exit).toBe(0);
+    expect(r.json.ok).toBe(true);
+    const d = r.json.data;
+    expect(d.healthy).toBe(false);
+    const problem = r.json.problems.find((x: { code: string }) => x.code === "DB_NOT_FOUND");
+    expect(problem).toMatchObject({ severity: "error", fix: { kind: "manual", requiresHuman: true }, details: { path: p.database } });
+    expect(problem.message).toContain("warehouse.duckdb is missing");
+    expect(problem.message).toContain("built it before");
+    expect(problem.message).not.toContain("nothing has run");
+    const a = byAsset(d);
+    // What was built is unknown now; what failed, is running or never ran is still true.
+    expect(a.github_issues).toMatchObject({ status: "unknown", rows: null, lastRun: { runId: "r_0922_1155_ok01", status: "ok" } });
+    expect(a.old_orders).toMatchObject({ status: "no_asset_file", rows: null });
+    expect(a.stripe_charges).toMatchObject({ status: "failed", rows: null });
+    expect(a.taxi_zones).toMatchObject({ status: "crashed", rows: null });
+    expect(a.sales).toMatchObject({ status: "running" });
+    expect(a.open_issues).toMatchObject({ status: "never_run" });
+    expect((await cli(["status", "--check", "--json"], { cwd: p.root, env: ENV })).exit).toBe(1);
+  });
+
+  test("human output says the rows are unknown and why", async () => {
+    const p = scenario({ warehouse: false });
+    const r = await cli(["status"], { cwd: p.root, env: ENV });
+    const lines = r.stdout.trimEnd().split("\n");
+    const row = (name: string) => lines.find((l) => l.startsWith(`${name} `))!.replace(/ {2,}/g, " | ");
+    expect(row("github_issues")).toBe("github_issues | — | 5 min ago | manual | unknown: the warehouse file is missing · schema changed 5 min ago");
+    expect(r.stdout).toContain("DB_NOT_FOUND");
+  });
+
+  test("before anything was built there is nothing to miss", async () => {
+    const p = makeProject({ files: SCENARIO_FILES });
+    const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+    expect(r.json.problems).toEqual([]);
+    expect(r.json.data.healthy).toBe(false);                       // never built: stale, as before
+    expect(r.json.data.assets.map((a: { status: string }) => a.status)).toEqual(Array(5).fill("never_run"));
+  });
+});
+
 describe("croft status never waits on DuckDB", () => {
   test("it answers while another process holds the warehouse write lock", async () => {
-    const p = scenario();
+    const p = scenario({ warehouse: false });
     await seed(p.database, ISSUES_SEED);
     const holder = spawnHolder(p.database, 20_000);
     await holder.waitFor("held");

@@ -863,7 +863,7 @@ describe("fairness and empty projects", () => {
   test("a project without assets runs nothing and points at the templates", async () => {
     const root = makeProject({});
     const out = await runIn(root, []);
-    expect(out).toMatchObject({ exit: 0, data: { status: "succeeded", steps: [] }, next: [{ command: "croft new --list" }] });
+    expect(out).toMatchObject({ exit: 0, data: { status: "succeeded", steps: [] }, next: [{ command: "croft docs ingest" }] });
   });
 });
 
