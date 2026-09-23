@@ -1,0 +1,9 @@
+{
+  "name": "cloudflare-api",
+  "kind": "library",
+  "description": "The Cloudflare API root, its response envelope, and the one rule for reading a credential — so the modules that call it do not each carry a copy that drifts",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {},
+  "secrets": [],
+  "instructions": "The library every Cloudflare REST module imports as `../cloudflare-api` — `cloudflare-access`, `cloudflare-email`, `cloudflare-tunnel`, `cloudflare-token`, `cloudflare-zone` and `r2`. It exists because the same envelope-unwrapping had reached four copies in the contributing repo before anybody counted — `success`, `errors`, `result` is not hard, and that is exactly why it gets rewritten slightly differently every time."
+}

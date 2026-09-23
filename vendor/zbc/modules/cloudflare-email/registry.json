@@ -1,0 +1,13 @@
+{
+  "name": "cloudflare-email",
+  "modules": ["cloudflare-api"],
+  "description": "Cloudflare Email Service (beta): outbound sending + inbound routing for a domain, via the REST API",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": ["CLOUDFLARE_API_TOKEN"],
+  "signupUrl": "https://dash.cloudflare.com",
+  "tokenUrl": "https://dash.cloudflare.com/profile/api-tokens",
+  "instructions": "Reads the Cloudflare API through `../cloudflare-api`. Reuses CLOUDFLARE_API_TOKEN from secrets.yaml, but the token needs extra scopes: Zone > Email Routing Rules: Edit, Zone > Zone Settings: Edit (the routing enable/settings/DNS endpoints require it), Zone > DNS: Edit, Account > Email Sending: Edit, and Account > Email Routing Addresses: Edit. Email Sending requires a Workers Paid plan (API error 10105 = not entitled). Caveats: the service is in public beta with unpublished rate limits (pilot before high-volume use); outbound messages are capped at 5 MiB total; onboarding adds an SPF record, so if the domain already has one you must merge them manually (two SPF records break SPF); 'forward' destinations require a manual email-click verification — apply sends the verification email, then fails with instructions until you click it and re-run."
+}

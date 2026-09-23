@@ -1,0 +1,10 @@
+{
+  "name": "host-symlink",
+  "description": "Converge a symlink on the host running apply — one link, read back after writing, refusing to replace a regular file",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": [],
+  "instructions": "Host-converging module: apply writes the link on the machine running apply. Both `path` and `target` must be absolute — a link stores its target verbatim and resolves it against the LINK's directory, not the cwd. Use this rather than host-file when the declared content must stay editable in the repo: there is one copy, so editing the target needs no apply. It REFUSES to replace a regular file at `path` (that is somebody else's file), and refuses a target that is not there (a dangling link reads as success to anything checking existence). No `destroy` on purpose: removal is `rm <path>` plus deleting the instance file, deliberately by hand."
+}

@@ -1,0 +1,11 @@
+{
+  "name": "host-dir",
+  "modules": ["host-exec"],
+  "description": "Converge a directory on the host running apply — mode enforced past the umask, owner set through `sudo chown`, and every state the path can be found in told apart rather than assumed",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": [],
+  "instructions": "Host-converging module: apply creates the directory on the machine running apply. Reaches the machine through `../host-exec`, installed with it. `path` must be absolute and holds only [A-Za-z0-9/._-], because it is interpolated into `stat` and `chown`. `mode` is a four-digit octal string ('0755', not '755') and is chmod'ed after creation, since mkdir's mode argument is masked by the umask. Setting `owner` needs passwordless sudo for chown. No `destroy` on purpose: removing a declared directory would delete its contents, which is a human act."
+}

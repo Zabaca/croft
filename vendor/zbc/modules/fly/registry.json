@@ -1,0 +1,12 @@
+{
+  "name": "fly",
+  "description": "Fly.io deploy module — for payloads that need raw inbound TCP, which Cloudflare Workers/Containers cannot serve (ADR-0006)",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": ["FLY_API_TOKEN"],
+  "signupUrl": "https://fly.io/app/sign-up",
+  "tokenUrl": "https://fly.io/user/personal_access_tokens",
+  "instructions": "Requires flyctl on PATH (`brew install flyctl`). Add FLY_API_TOKEN to packages/infra/environments/<env>/secrets.yaml — mint a PERSONAL ACCESS TOKEN, not a deploy token: a deploy token is app-scoped and cannot create apps or allocate IPs. IMPORTANT: Fly tokens start `FlyV1 fm2_…` and contain a literal space; do not strip whitespace when handling the value or you get a bare 401. The app topology (processes, services, ports, handlers, VM size, autostop/autostart) lives in the package's own fly.toml, which is the source of truth; this module only orchestrates create + IPs + build + deploy. Set `ipv4: \"dedicated\"` for ANY service port that is not 80/443 — shared IPv4 covers 80/443 only, it bills $2/mo, and without it a raw-TCP service is silently unreachable. Dedicated IPv6 is free but may be unroutable from some networks, so it is not a substitute. For per-PR preview apps set `appName` (e.g. `myapp-pr-${process.env.PR_NUMBER}`) in config, plus `ephemeral: true` on the INSTANCE (a sibling of `name`/`config`, not a config field) — the engine then destroys and recreates the app on every apply. `flySecrets` entries are a plain name (from secrets.yaml), `{ name, value }`, or `{ name, from, output }` to pull from an imported instance's outputs; they are staged with `fly secrets set --stage` so the deploy that follows picks them up as one deployment. Set `localBuild: true` to build with the local Docker daemon instead of Fly's remote builder."
+}

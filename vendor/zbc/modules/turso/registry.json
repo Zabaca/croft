@@ -1,0 +1,17 @@
+{
+  "name": "turso",
+  "description": "Turso database module",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0",
+    "@tursodatabase/api": "^2.0.0"
+  },
+  "optionalDependencies": {
+    "@libsql/client": "^0.14.0",
+    "drizzle-orm": "^0.36.0"
+  },
+  "secrets": ["TURSO_API_TOKEN"],
+  "signupUrl": "https://turso.tech",
+  "tokenUrl": "https://app.turso.tech/account/api-tokens",
+  "instructions": "Add TURSO_API_TOKEN to packages/infra/environments/<env>/secrets.yaml. Optional deps (@libsql/client, drizzle-orm) only needed if using migrationsDir."
+}

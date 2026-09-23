@@ -1,0 +1,10 @@
+{
+  "name": "host-file",
+  "description": "Converge a file on the host running apply — inline content or a SOPS secret value, mode enforced, `changed` output for sequencing restarts",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": [],
+  "instructions": "Host-converging module: apply writes the file on the machine running apply. Exactly one of `content` (inline) or `secretKey` (a key in environments/<env>/secrets.yaml) supplies the bytes; only rewrites on difference, so downstream instances can key restarts off outputs.changed."
+}

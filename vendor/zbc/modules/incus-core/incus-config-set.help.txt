@@ -1,0 +1,29 @@
+Description:
+  Set instance or server configuration keys
+
+  For backward compatibility, a single configuration key may still be set with:
+      incus config set [<remote>:][<instance>] <key> <value>
+
+Usage:
+  incus config set [<remote>:][<instance>] <key>=<value>... [flags]
+
+Examples:
+  incus config set [<remote>:]<instance> limits.cpu=2
+      Will set a CPU limit of "2" for the instance.
+
+  incus config set core.https_address=[::]:8443
+      Will have the server listen on IPv4 and IPv6 port 8443.
+
+Flags:
+  -p, --property   Set the key as an instance property
+      --target     Cluster member name
+
+Global Flags:
+      --debug          Show all debug messages
+      --force-local    Force using the local unix socket
+  -h, --help           Print help
+      --project        Override the source project
+  -q, --quiet          Don't show progress information
+      --sub-commands   Use with help or --help to view sub-commands
+  -v, --verbose        Show all information messages
+      --version        Print version number

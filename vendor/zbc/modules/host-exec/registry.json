@@ -1,0 +1,9 @@
+{
+  "name": "host-exec",
+  "kind": "library",
+  "description": "The seam every host-converging module reaches the machine through — one `exec`, substitutable in a test with `withExec`, so an `apply` that shells out can be exercised instead of merely parsed",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {},
+  "secrets": [],
+  "instructions": "The seam every host-converging module reaches the machine through, plus the `withExec` a test wraps an apply in. `host-dir` (and, in the contributing repo, a dozen others) import it as `../host-exec`; `zbc add` brings it along with them, in either mode."
+}

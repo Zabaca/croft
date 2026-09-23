@@ -1,0 +1,14 @@
+{
+  "name": "vm",
+  "modules": [
+    "host-exec",
+    "incus-core"
+  ],
+  "description": "An incus guest — system container or KVM virtual machine — plus the cloud-init user-data that makes it reachable over SSH, and only the irreducibly one-shot part of that",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": [],
+  "instructions": "Host-converging module: apply talks to an incus daemon through `../incus-core`, which shells out through `../host-exec`. Needs incus installed and the invoking user able to `sudo incus`. Declares creation and the config a running guest can be converged to; what happens *inside* the guest is `vm-provision`'s. `target: { remote, project }` sends the same declaration at a remote daemon over mTLS — absent means the local one, so an existing declaration keeps its meaning."
+}

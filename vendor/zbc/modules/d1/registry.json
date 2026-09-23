@@ -1,0 +1,13 @@
+{
+  "name": "d1",
+  "modules": ["cloudflare-api"],
+  "description": "Cloudflare D1 database, provisioned via the REST API. Pair with the cloudflare module's bindings to fill in database_id at deploy time.",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": ["CLOUDFLARE_API_TOKEN"],
+  "signupUrl": "https://dash.cloudflare.com/sign-up",
+  "tokenUrl": "https://dash.cloudflare.com/profile/api-tokens",
+  "instructions": "Reads the Cloudflare API through `../cloudflare-api`; CLOUDFLARE_API_TOKEN needs the Account → D1: Edit scope.\n\nInstance example:\n\n  // packages/infra/environments/production/app-db.ts\n  import { d1Module } from '../../modules/d1'\n  export default d1Module.instance({\n    name: 'app-db',\n    config: {\n      accountId: '<account id>',\n      databaseName: 'myproject-production',\n      statements: ['CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY)'],\n    },\n  })\n\nWire it into a Worker via the cloudflare module — the binding must ALREADY be declared in that package's wrangler.jsonc (placeholder database_id and all); zbc only supplies the id:\n\n  imports: [appDb],\n  config: { ..., bindings: [{ type: 'd1_databases', binding: 'DB', field: 'database_id', from: 'app-db', output: 'databaseId' }] }\n\n`statements` are replayed on every apply, so each must be idempotent (`CREATE TABLE IF NOT EXISTS`). Use `additiveColumns` for `ALTER TABLE … ADD COLUMN`, which SQLite cannot spell idempotently — an already-present column is treated as success."
+}

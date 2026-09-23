@@ -1,0 +1,11 @@
+{
+  "name": "cloudflare-zone",
+  "modules": ["cloudflare-api"],
+  "description": "A DNS zone's records and settings — authoritative but delete-gated over records, forward-only over settings",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": [],
+  "instructions": "Reads the Cloudflare API through `../cloudflare-api`; needs a token with DNS write on the zone, plus Zone Settings Edit if the instance declares `settings`. Authoritative over the record types it declares: a record present in Cloudflare and absent here is reported, and deleting it takes an explicit opt-in, because a zone is the one place where converging by deletion can take a domain off the internet between two applies. The `settings` key converges zone-level settings (`always_use_https`, `ssl`, `min_tls_version`, `automatic_https_rewrites`) forward-only: what is declared is converged, what is not declared is never read or touched."
+}

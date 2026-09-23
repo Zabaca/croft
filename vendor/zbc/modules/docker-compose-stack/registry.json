@@ -1,0 +1,10 @@
+{
+  "name": "docker-compose-stack",
+  "description": "Converge a docker compose project on the host running apply — `docker compose up -d` in a directory (idempotent), running-container count as output",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": [],
+  "instructions": "Host-converging module: apply runs `docker compose up -d` in `dir` on the machine running apply (Docker + compose plugin required). The compose file itself is yours to manage — import a host-file instance for the stack's .env to sequence secret materialization before up."
+}
