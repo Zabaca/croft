@@ -125,7 +125,7 @@ test("journey 8c: status lists a gone file once a later run also loads a changed
 // BUG (reported): status never sets schemaChangedAt ("schema changed today", §4.2/§4.3/§7): status.ts reads
 // runs.summary.steps[].schemaChanges, but the run engine stores the whole envelope result, so the steps are at
 // runs.summary.data.steps. context (which reads the warehouse) does list the change. Flip to test() once fixed.
-bugTest("journey 8d: status says the schema changed after a column was added", async () => {
+test("journey 8d: status says the schema changed after a column was added", async () => {
   expect(shared).toBeDefined();
   const st = await shared!.json(["status"]);
   const sa = st.json.data.assets.find((a: { asset: string }) => a.asset === "sales");
