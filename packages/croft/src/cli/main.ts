@@ -11,6 +11,7 @@ import type { Command, CommandResult, OptionSpec } from "./command.ts";
 import { COMMANDS } from "./commands/index.ts";
 import { GLOBAL_OPTIONS } from "./commands/help.ts";
 import { CliContext } from "./context.ts";
+import { launch } from "./launcher.ts";
 import { buildEnvelope, formatNext, formatProblem, formatProblems, redactEnvelope, redactProblem, Render, toJsonLine } from "./render.ts";
 import { BUN_FLOOR, versionAtLeast } from "./version.ts";
 
@@ -269,5 +270,6 @@ export function trimStack(stack: string | undefined, max = 8): string[] {
 
 if (import.meta.main) {
   // exitCode, not process.exit(): exit() cuts piped stdout off at 64 KB in Bun.
-  process.exitCode = await main(process.argv.slice(2));
+  // The launcher decides first: inside a project it may hand the invocation to the pinned copy (§2).
+  process.exitCode = await launch({ main: (argv) => main(argv), commandNames: COMMANDS.map((c) => c.name) });
 }

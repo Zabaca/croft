@@ -1,0 +1,121 @@
+order_id,order_date,customer,region,product,quantity,unit_price,amount
+1001,2026-01-02,Willow Yoga,East,Espresso cups (set of 4),6,22.00,132.00
+1002,2026-01-02,Cedar Books,East,Tea sampler,2,14.25,28.50
+1003,2026-01-02,Maple Bakery,North,Tote bag,6,7.50,45.00
+1004,2026-01-02,Riverbend Gym,South,Ceramic mug,1,9.00,9.00
+1005,2026-01-02,Riverbend Gym,South,Coffee beans 1kg,6,18.50,111.00
+1006,2026-01-03,Cedar Books,East,Ceramic mug,5,9.00,45.00
+1007,2026-01-04,Orchid Florist,South,Tea sampler,4,14.25,57.00
+1008,2026-01-04,Orchid Florist,South,Tea sampler,3,14.25,42.75
+1009,2026-01-05,Pine Street Deli,North,Water bottle,3,12.00,36.00
+1010,2026-01-07,Summit Outfitters,West,Coffee beans 1kg,2,18.50,37.00
+1011,2026-01-08,Bluebird Cafe,West,Gift card,2,25.00,50.00
+1012,2026-01-10,Cedar Books,East,Water bottle,5,12.00,60.00
+1013,2026-01-12,Juniper Studio,West,Water bottle,1,12.00,12.00
+1014,2026-01-13,Summit Outfitters,West,Tea sampler,2,14.25,28.50
+1015,2026-01-14,Orchid Florist,South,Espresso cups (set of 4),2,22.00,44.00
+1016,2026-01-14,Willow Yoga,East,Ceramic mug,1,9.00,9.00
+1017,2026-01-16,Juniper Studio,West,Espresso cups (set of 4),5,22.00,110.00
+1018,2026-01-18,Pine Street Deli,North,Coffee beans 1kg,3,18.50,55.50
+1019,2026-01-19,Cedar Books,East,Tea sampler,2,14.25,28.50
+1020,2026-01-19,Maple Bakery,North,Water bottle,4,12.00,48.00
+1021,2026-01-21,Juniper Studio,West,Ceramic mug,6,9.00,54.00
+1022,2026-01-22,Bluebird Cafe,West,Ceramic mug,5,9.00,45.00
+1023,2026-01-22,Bluebird Cafe,West,Gift card,1,25.00,25.00
+1024,2026-01-24,Willow Yoga,East,Notebook,6,4.75,28.50
+1025,2026-01-24,Harbor Hardware,East,Espresso cups (set of 4),4,22.00,88.00
+1026,2026-01-26,Willow Yoga,East,Espresso cups (set of 4),3,22.00,66.00
+1027,2026-01-26,Orchid Florist,South,Water bottle,1,12.00,12.00
+1028,2026-01-28,Maple Bakery,North,Ceramic mug,3,9.00,27.00
+1029,2026-01-28,Juniper Studio,West,Coffee beans 1kg,5,18.50,92.50
+1030,2026-01-29,Bluebird Cafe,West,Notebook,3,4.75,14.25
+1031,2026-01-29,Summit Outfitters,West,Notebook,1,4.75,4.75
+1032,2026-01-31,Orchid Florist,South,Tea sampler,6,14.25,85.50
+1033,2026-01-31,Riverbend Gym,South,Espresso cups (set of 4),2,22.00,44.00
+1034,2026-02-01,Maple Bakery,North,Water bottle,5,12.00,60.00
+1035,2026-02-03,Cedar Books,East,Ceramic mug,3,9.00,27.00
+1036,2026-02-05,Bluebird Cafe,West,Ceramic mug,5,9.00,45.00
+1037,2026-02-06,Harbor Hardware,East,Ceramic mug,4,9.00,36.00
+1038,2026-02-08,Summit Outfitters,West,Tea sampler,1,14.25,14.25
+1039,2026-02-09,Riverbend Gym,South,Gift card,5,25.00,125.00
+1040,2026-02-10,Riverbend Gym,South,Notebook,4,4.75,19.00
+1041,2026-02-12,Maple Bakery,North,Water bottle,4,12.00,48.00
+1042,2026-02-13,Orchid Florist,South,Notebook,3,4.75,14.25
+1043,2026-02-15,Willow Yoga,East,Gift card,5,25.00,125.00
+1044,2026-02-15,Pine Street Deli,North,Espresso cups (set of 4),3,22.00,66.00
+1045,2026-02-16,Bluebird Cafe,West,Notebook,4,4.75,19.00
+1046,2026-02-16,Bluebird Cafe,West,Espresso cups (set of 4),3,22.00,66.00
+1047,2026-02-17,Orchid Florist,South,Gift card,6,25.00,150.00
+1048,2026-02-19,Cedar Books,East,Gift card,1,25.00,25.00
+1049,2026-02-19,Orchid Florist,South,Gift card,1,25.00,25.00
+1050,2026-02-19,Willow Yoga,East,Gift card,5,25.00,125.00
+1051,2026-02-21,Cedar Books,East,Ceramic mug,2,9.00,18.00
+1052,2026-02-22,Willow Yoga,East,Notebook,1,4.75,4.75
+1053,2026-02-23,Harbor Hardware,East,Coffee beans 1kg,1,18.50,18.50
+1054,2026-02-23,Pine Street Deli,North,Tote bag,1,7.50,7.50
+1055,2026-02-25,Cedar Books,East,Tote bag,6,7.50,45.00
+1056,2026-02-25,Willow Yoga,East,Ceramic mug,2,9.00,18.00
+1057,2026-02-25,Riverbend Gym,South,Tea sampler,4,14.25,57.00
+1058,2026-02-25,Willow Yoga,East,Coffee beans 1kg,4,18.50,74.00
+1059,2026-02-26,Harbor Hardware,East,Coffee beans 1kg,5,18.50,92.50
+1060,2026-02-26,Riverbend Gym,South,Gift card,2,25.00,50.00
+1061,2026-02-26,Harbor Hardware,East,Tea sampler,3,14.25,42.75
+1062,2026-02-27,Orchid Florist,South,Tea sampler,2,14.25,28.50
+1063,2026-02-27,Willow Yoga,East,Coffee beans 1kg,6,18.50,111.00
+1064,2026-02-27,Cedar Books,East,Gift card,5,25.00,125.00
+1065,2026-03-01,Juniper Studio,West,Espresso cups (set of 4),4,22.00,88.00
+1066,2026-03-01,Harbor Hardware,East,Espresso cups (set of 4),6,22.00,132.00
+1067,2026-03-01,Harbor Hardware,East,Tea sampler,1,14.25,14.25
+1068,2026-03-02,Cedar Books,East,Water bottle,6,12.00,72.00
+1069,2026-03-03,Bluebird Cafe,West,Notebook,2,4.75,9.50
+1070,2026-03-05,Cedar Books,East,Gift card,5,25.00,125.00
+1071,2026-03-05,Maple Bakery,North,Coffee beans 1kg,4,18.50,74.00
+1072,2026-03-05,Bluebird Cafe,West,Tote bag,3,7.50,22.50
+1073,2026-03-05,Orchid Florist,South,Notebook,1,4.75,4.75
+1074,2026-03-06,Juniper Studio,West,Espresso cups (set of 4),6,22.00,132.00
+1075,2026-03-06,Summit Outfitters,West,Notebook,6,4.75,28.50
+1076,2026-03-06,Bluebird Cafe,West,Tote bag,4,7.50,30.00
+1077,2026-03-08,Willow Yoga,East,Ceramic mug,3,9.00,27.00
+1078,2026-03-10,Bluebird Cafe,West,Espresso cups (set of 4),4,22.00,88.00
+1079,2026-03-10,Willow Yoga,East,Notebook,1,4.75,4.75
+1080,2026-03-10,Harbor Hardware,East,Tote bag,4,7.50,30.00
+1081,2026-03-10,Pine Street Deli,North,Coffee beans 1kg,4,18.50,74.00
+1082,2026-03-10,Harbor Hardware,East,Ceramic mug,5,9.00,45.00
+1083,2026-03-12,Harbor Hardware,East,Gift card,4,25.00,100.00
+1084,2026-03-12,Summit Outfitters,West,Coffee beans 1kg,4,18.50,74.00
+1085,2026-03-14,Harbor Hardware,East,Notebook,5,4.75,23.75
+1086,2026-03-15,Harbor Hardware,East,Water bottle,4,12.00,48.00
+1087,2026-03-16,Harbor Hardware,East,Tote bag,3,7.50,22.50
+1088,2026-03-16,Juniper Studio,West,Water bottle,3,12.00,36.00
+1089,2026-03-16,Maple Bakery,North,Espresso cups (set of 4),5,22.00,110.00
+1090,2026-03-17,Willow Yoga,East,Gift card,1,25.00,25.00
+1091,2026-03-18,Maple Bakery,North,Coffee beans 1kg,3,18.50,55.50
+1092,2026-03-18,Orchid Florist,South,Tote bag,4,7.50,30.00
+1093,2026-03-18,Willow Yoga,East,Tote bag,6,7.50,45.00
+1094,2026-03-18,Maple Bakery,North,Ceramic mug,3,9.00,27.00
+1095,2026-03-18,Cedar Books,East,Ceramic mug,5,9.00,45.00
+1096,2026-03-20,Cedar Books,East,Espresso cups (set of 4),5,22.00,110.00
+1097,2026-03-20,Cedar Books,East,Tote bag,5,7.50,37.50
+1098,2026-03-21,Pine Street Deli,North,Gift card,2,25.00,50.00
+1099,2026-03-23,Summit Outfitters,West,Tea sampler,1,14.25,14.25
+1100,2026-03-23,Cedar Books,East,Gift card,3,25.00,75.00
+1101,2026-03-25,Summit Outfitters,West,Gift card,1,25.00,25.00
+1102,2026-03-26,Harbor Hardware,East,Tea sampler,2,14.25,28.50
+1103,2026-03-26,Willow Yoga,East,Coffee beans 1kg,3,18.50,55.50
+1104,2026-03-27,Bluebird Cafe,West,Coffee beans 1kg,4,18.50,74.00
+1105,2026-03-27,Cedar Books,East,Tea sampler,3,14.25,42.75
+1106,2026-03-29,Willow Yoga,East,Tote bag,2,7.50,15.00
+1107,2026-03-31,Willow Yoga,East,Coffee beans 1kg,2,18.50,37.00
+1108,2026-04-01,Juniper Studio,West,Ceramic mug,5,9.00,45.00
+1109,2026-04-01,Cedar Books,East,Notebook,4,4.75,19.00
+1110,2026-04-02,Harbor Hardware,East,Notebook,4,4.75,19.00
+1111,2026-04-04,Orchid Florist,South,Tea sampler,5,14.25,71.25
+1112,2026-04-04,Juniper Studio,West,Water bottle,1,12.00,12.00
+1113,2026-04-06,Pine Street Deli,North,Tote bag,4,7.50,30.00
+1114,2026-04-06,Orchid Florist,South,Gift card,3,25.00,75.00
+1115,2026-04-08,Orchid Florist,South,Notebook,1,4.75,4.75
+1116,2026-04-09,Harbor Hardware,East,Espresso cups (set of 4),3,22.00,66.00
+1117,2026-04-09,Pine Street Deli,North,Water bottle,6,12.00,72.00
+1118,2026-04-09,Orchid Florist,South,Ceramic mug,4,9.00,36.00
+1119,2026-04-10,Riverbend Gym,South,Ceramic mug,6,9.00,54.00
+1120,2026-04-12,Summit Outfitters,West,Coffee beans 1kg,2,18.50,37.00
