@@ -73,6 +73,8 @@ export const CODES = {
   LARGE_REPROCESS: { category: "run", severity: "error", exit: 1 },
   INTERNAL_ERROR: { category: "run", severity: "error", exit: 1 },
   RUN_CRASHED: { category: "run", severity: "error", exit: 1 },
+  FILE_NOT_FOUND: { category: "run", severity: "error", exit: 1 },
+  FILE_UNREADABLE: { category: "run", severity: "error", exit: 1 },
   DB_BUSY: { category: "coordination", severity: "error", exit: 4 },
   DB_HELD_BY_OTHER_PROGRAM: { category: "coordination", severity: "error", exit: 4 },
   ASSET_BUSY: { category: "coordination", severity: "error", exit: 4 },
