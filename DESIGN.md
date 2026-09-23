@@ -1,6 +1,6 @@
 # croft: design v1
 
-> **Status.** Final design for v1, dated 2026-09-22. It was produced by a design panel: four independent drafts (simplicity, AI operator, correctness and builder lenses), a synthesis, and three adversarial reviews (a non-data-engineer walking real journeys, Claude Code operating the tool, and a technical review backed by spikes). Claims are marked **[V]** when verified by a spike on Bun 1.3.14 with `@duckdb/node-api` 1.5.5-r.5 (DuckDB 1.5.5) on macOS arm64, and **[U]** when relied on but unverified. Appendix B lists the spikes. The working name during design was "tsdb"; the product is named **croft** (D52). On 2026-09-23 the document was brought in line with the code shipped so far (`packages/croft/src`), which is the source of truth where the two differ; decisions the build refined carry a **Build:** note (§13).
+> **Status.** Final design for v1, dated 2026-09-22. It was produced by a design panel: four independent drafts (simplicity, AI operator, correctness and builder lenses), a synthesis, and three adversarial reviews (a non-data-engineer walking real journeys, Claude Code operating the tool, and a technical review backed by spikes). Claims are marked **[V]** when verified by a spike on Bun 1.3.14 with `@duckdb/node-api` 1.5.5-r.5 (DuckDB 1.5.5) on macOS arm64, and **[U]** when relied on but unverified. Appendix B lists the spikes. The working name during design was "tsdb"; the product is named **croft** (D52). **Phase 1 is implemented** (§11) in `packages/croft`, with about 1,600 tests, including an end-to-end suite that drives the real CLI through user journeys (`tests/e2e`). On 2026-09-23 the document was brought in line with that code (`packages/croft/src`), which is the source of truth where the two differ; decisions the build refined carry a **Build:** note, and decisions it changed have their own entries from D54 on (§13).
 
 ## Thesis
 
@@ -180,7 +180,7 @@ The bin is `bin/croft.mjs`, a small plain-JavaScript entry. Its `#!/bin/sh` firs
 | Network filesystem, or a 9p/WSL drive | `statfs` magic number, `/mnt/<drive>` under WSL | `init` relocates automatically; `doctor` reports `SERVE_UNSAFE_FILESYSTEM` (an error) with the manual move |
 | Project not writable | `doctor`: test write to the state folder; `init`: a failed write | `PROJECT_NOT_WRITABLE`: make the folder writable, or create the project elsewhere |
 | Bun's and DuckDB's tzdata disagree for the project zone | compare offsets every 12 h over the next 2 years, and every 15 min across transitions | `TZDATA_MISMATCH` (a warning): the first mismatching instant with both offsets; take days from SQL until Bun and croft are upgraded. Also raised when DuckDB does not know the zone |
-| Referenced secret missing | declared `secrets` vs environment and `.env` | `SECRET_MISSING`: "add NAME=… to .env (or `croft secrets set NAME`)" |
+| Referenced secret missing | declared `secrets` vs environment and `.env`; the names come from importing the asset configs, as `croft secrets` does. Finding the assets needs DuckDB, so without a loadable binding the check is skipped with an info line | `SECRET_MISSING`: "add NAME=… to .env (or `croft secrets set NAME`)". A warning in `doctor`; it is an error only when an asset that needs the secret runs |
 | Claude files older than the CLI | version stamp in SKILL.md | `CLAUDE_FILES_OUTDATED`: `croft init --claude` |
 | Scheduler not ticking | heartbeat older than 3 min | `SCHEDULER_STALE`, with the tail of the tick log and a likely cause (§8) |
 
@@ -215,7 +215,7 @@ Each problem appears inline under its check, with its code in front and its fix 
 - `new` (kept free for post-v1 incremental SQL, §3d), `croft` and names starting with `_` are reserved.
 - DuckDB's 75 reserved keywords (`order`, `end`, `limit`, `window`, `group`, …), and 30 of its 35 `type_function` keywords (`left`, `join`, `like`, `is`, …), are rejected with `NAME_RESERVED` and a suggested plural ("rename to orders"), because `FROM order` is a parser error in every downstream asset [V].
 - A `.ts` file and a `.sql` file with the same name is `NAME_CONFLICT`.
-- `croft run` naming such a file (`croft run order` with `assets/order.ts`) reports that file's own problem (`NAME_RESERVED` with the rename), not "there is no asset named order"; a glob that matches it reports it alongside the assets it runs.
+- `croft run` naming such a file (`croft run order` with `assets/order.ts`) reports that file's own problem (`NAME_RESERVED` with the rename, or `NAME_CONFLICT`), not "there is no asset named order"; a glob that matches it reports it alongside the assets it runs.
 
 ```
 my-data/
@@ -343,7 +343,8 @@ The skill states the rules in plain words (§9):
 - It exposes `res.next` from the `Link` header.
 - It drops `null`/`undefined` query values, so `since` can be passed unconditionally.
 - It redacts `.env` values from every URL, log line and error (§9.6).
-- `res.json()` is **lossless**. Integers beyond 2^53 become `bigint` via the `JSON.parse` reviver's `context.source`. croft's NDJSON writer turns them back into exact digits with `JSON.rawJSON`, so `12345678901234567890` reaches DuckDB intact [V]. Both APIs exist on Bun 1.3.0 through 1.4.2 [V]. Plain `JSON.parse` would give `12345678901234567000` [V].
+- `res.json()` is **lossless**. Integers beyond 2^53 become `bigint` via the `JSON.parse` reviver's `context.source`. croft's NDJSON writer turns them back into exact digits with `JSON.rawJSON`, so `12345678901234567890` reaches DuckDB intact [V]. Both APIs exist on Bun 1.3.0 through 1.4.2 [V]. Plain `JSON.parse` would give `12345678901234567000` [V]. A number beyond DOUBLE's range (`1e400`), which `JSON.parse` turns into `Infinity`, comes back as `JSON.rawJSON(<its source text>)` (§7, "Nested data").
+- croft's own `HttpClient` also has `getBytes()`, which keeps the body as raw bytes for file downloads (text would corrupt Parquet, gzip and latin-1 files). It follows the same retry, `Retry-After`, timeout, redaction and `HTTP_ERROR` rules, and a 304 counts as success. It is not part of the public `Http` type; file ingests download through it with a 10-minute per-request timeout (§3b).
 
 ### (b) File ingests
 
@@ -377,20 +378,22 @@ export default ingest({
 How file ingests work:
 
 - **Format.** It comes from the extension (`.csv`, `.tsv`, `.json`, `.ndjson`/`.jsonl`, `.parquet`), from `Content-Type` for URLs, or from `format:`.
-- **URLs** download into `.croft/staging/` with `fetch` and a conditional GET (ETag / Last-Modified). An unchanged file is a no-op.
+- **URLs** download into `.croft/staging/` through `ctx.http`'s `getBytes()` (§3a), with a conditional GET (ETag / Last-Modified) and a 10-minute per-request timeout. An unchanged file is a no-op.
+- **Snapshots.** Every file a load reads is first copied (a copy-on-write clone where the file system has one) into the run's staging folder, so the recorded sha256 is exactly what was loaded even if the user edits the file mid-run, and the write step reads only inside the state folder (§5, "Sandboxing").
 - **Globs** are read with `union_by_name = true`, so a column that appears only in later files (a `coupon` column added in March) is kept, not dropped. Without it, DuckDB silently dropped such a column [V].
 - **Tracking files.** Every file ingest adds a `_file` column. With `incremental: true`, `_croft.files` records path, size, mtime and sha256.
-  - A changed file is reloaded in one transaction as a diff limited to that file's rows: with a key, one MERGE ending in `WHEN NOT MATCHED BY SOURCE AND _file IN (…) THEN DELETE`; without one, the content diff of §5 inside those files. The result equals deleting the file's rows and inserting them again, but unchanged rows keep their `_loaded_at` and the counts are exact.
-  - Rows of a deleted file are kept, and `status` says "2 files gone".
+  - A changed file is reloaded in one transaction as a diff limited to that file's rows. Without a key, that is the content diff of §5 inside those files. Unchanged rows keep their `_loaded_at`, and the counts are exact.
+  - **With a key, a key's row belongs to the latest file that provided it** (its `_file`); files loaded together provide their keys in read order (D58). A changed file is reloaded as one MERGE limited to the rows it owns. Because exports overlap, the reload also reads the asset's other present files: a key the changed file dropped falls back to the most recently loaded file that still has it (that file's row, in full), and only a key no present file has is deleted. New files take over the keys they contain; re-exporting an older file makes it the latest provider of its keys again.
+  - Rows of a deleted file are kept, and `status` says "2 files gone". A deleted file cannot be read, so it cannot hold a key another file dropped; its own rows stay.
   - A keyless incremental file ingest that loads identical rows from different files gets `DUPLICATE_ROWS_ACROSS_FILES`, with the fix "add a key".
 - **`map(row)`** is an optional per-row hook for cleaning values. It gives file ingests the same "clean it in code" fix that API ingests have.
 - **CSV and TSV** are read with `all_varchar = true` and typed by croft's rules (§7), never by DuckDB's sniffer. The sniffer read `01/02/2024` as 2024-02-01, but read the same file month-first when one `03/25/2024` row was present [V].
-- **Header detection.** DuckDB can only guess the header when some column is not text. A header-less export of names and cities silently lost its first data row [V]. So when `csv.header` is not declared and every sniffed column is text, the first load fails with `CSV_HEADER_AMBIGUOUS`. The error shows the first two lines and offers `csv: { header: true | false }`. Preview and the first run always print the header they used.
+- **Header detection.** DuckDB can only guess the header when some column is not text. A header-less export of names and cities silently lost its first data row [V]. So when `csv.header` is not declared and every sniffed column is text, the first load fails with `CSV_HEADER_AMBIGUOUS`. The error shows the first two lines and offers `csv: { header: true | false }`. Preview and the first run always print the header they used: a CSV ingest's first load carries `StepResult.csvHeader` (`{header, from: declared|sniffed|known, columns}`, where `known` means the cells match the stored columns), and the run prints `CSV header: first line (detected): a, b, …` or `CSV header: none (…); the first line is data, columns named …`.
 - **Encoding.** croft reads CSV as UTF-8. If DuckDB reports invalid UTF-8, croft retries as `latin-1` and warns `CSV_ENCODING_GUESSED` [V]. `csv: { encoding: "latin-1" }` makes the choice explicit.
 - **JSON and NDJSON** go through the same pipeline as API rows.
 - **Parquet** keeps the file's types, except that nested types become `JSON` (§7).
 
-**Zero-asset path.** To look at a file without making an asset, run `croft query "from 'files/sales/*.csv'"` [V].
+**Zero-asset path.** To look at a file without making an asset, run `croft query "from 'files/sales/*.csv'"` [V]. Paths are relative to the project folder, wherever croft was started. It works before anything has run: with no warehouse yet, `croft query` runs on a private in-memory DuckDB with the same sandbox (`files/` only), so file reads work and no database is created. A table named there is `DB_NOT_FOUND` when it is an asset (fix: `croft run <asset>`), and `UNKNOWN_TABLE` otherwise.
 
 ### (c) SQL transform
 
@@ -612,6 +615,7 @@ Cross-asset checks that need their own query (for example "every open issue has 
   | 130 | interrupted |
 
 - **Selectors** are asset names or globs (`'github_*'`). Destructive commands accept exact names only.
+- **Values that start with `-`.** `--from -90d` works as written, with the space: a string option takes the next argument as its value even when it starts with `-`, unless that argument is one of the command's own flags. `--from=<value>` is needed only when the value is itself a flag name. (`node:util` `parseArgs` alone refuses `--from -90d` as ambiguous.)
 - **Timestamps** in JSON are ISO-8601 *with the project offset* (for example `2026-09-21T22:00:00-07:00`), so they agree with `::DATE` in SQL. Offsets are always `±HH:MM` (§7, "Time zones"). The envelope carries `timezone`.
 
 ### 4.1 Commands (20)
@@ -654,6 +658,8 @@ Cross-asset checks that need their own query (for example "every open issue has 
 - `--no-wait`: exit 4 at once instead of waiting for a lock.
 - `--events`: NDJSON progress on stderr.
 - `--due`: only scheduled work that is due; used by the scheduler.
+
+`--run-id` and `--detached` are hidden options (`OptionSpec.hidden`) that the parent passes to its detached child (§5). They are parsed, but never shown in help or suggested by did-you-mean. **No option carries a confirmation token:** a destructive action runs only through `croft confirm <token>` (§6, D56).
 
 **Bare `croft run`** fetches every ingest and updates every transform that is stale. It is the obvious "run my pipeline". Incremental ingests make it cheap. The skill tells agents to name assets when working on one of them.
 
@@ -851,13 +857,16 @@ Turn off: croft schedule off
 **Data shapes** are frozen by golden tests and published as JSON Schemas. `croft serve` returns the same envelopes over HTTP (§5).
 
 - **`query`:** `{columns: [{name, type}], rows, rowCount, truncatedRows, truncatedValues}`. HUGEINT, DECIMAL and integers beyond ±2^53 are strings, inside JSON columns too. A number in a JSON column that DOUBLE cannot hold (`1e400`) keeps its source text. `--limit N` and `--full-values` lift the caps.
-- **`run` / `wait`:** `{runId, status: running|succeeded|failed|crashed|interrupted, progress?: {asset, phase: extract|write|checks, rowsFetched, requests, elapsedMs}, steps: StepResult[]}`. A StepResult has:
+- **`run` / `wait`:** `{runId, status: running|succeeded|failed|crashed|interrupted, progress?: {asset, phase: extract|write|checks, rowsFetched, requests, elapsedMs}, steps: StepResult[], checksEnforced}`. A StepResult has:
   - `asset`, `status` (`ok`|`failed`|`skipped`|`unchanged`), `reason`, `skippedBecause?`
   - `behavior`, `attempt`, `maxAttempts`, `nextRetryAt?`
   - `rows: {in, added, updated, unchanged, deleted, total}`
   - `schemaChanges[]`, `cursor?: {before, after, sinceUsed}`
   - `inputs?: [{input, seenBefore, seenAfter, rows}]`
   - `requests?`, `checks[]`, `trashed?: {path, rows}`, `logsCommand`, `durationMs`, `error?`
+  - `created?: {columns, jsonColumns}` when the step created the table (the source of "new table, 31 columns (7 JSON)" in §4.2), and `csvHeader?` on a CSV ingest's first load (§3b)
+- **Phase-1 honesty.** Checks are declared, listed and passed to the write, but nothing evaluates them until phase 2. So `run` and `wait` data carry `checksEnforced: false`, `describe` data has `checksEnforced` after `checks`, and `context` data has it after `assets`; human output says `checks: not enforced until phase 2`. All of it is removed when phase 2 runs checks (`core/phase.ts`).
+- **`confirm`:** `{token, command, result, outcome: used|not_needed|unused|running, note?}`. `result` is the confirmed command's own `data` (`null` in human mode, where its output passes through as is), and its problems, `next`, confirmation and exit carry over to the envelope. `outcome` says what became of the token (§6).
 - **`status`:** `{healthy, running: [{runId, asset, pid, since, phase, rowsFetched}], assets: [{asset, kind, rows, lastRun: {runId, at, status, code}, next: {at, reason}, stale, staleReasons[], held, edited, filesGone?, schemaChangedAt?}], scheduling: {state: "on"|"off"|"paused", via: "os-job"|"serve"|null, lastTickAt}, serve?: {url, pid}}`.
 - **`describe`:** `{asset, kind, file, behavior: {words, write, key, incremental: {kind, field, cursorValue, cursorType, unit, lookback}}, reads, readBy, columns: [{name, type, pinned, pending, sourceName, format, addedAt, jsonKeys, kinds}], inputsSeen: {input: {seenLoadedAt, inputLastLoadedAt, pendingRows}}, builtWithCodeHash, checks, recentWrites, samples}`.
 - **`validate`:** `{order, assets: [{name, kind, inputs, outputColumns: [{name, type}] | null, behavior, codeChanged}]}`. `outputColumns` comes from `prepare()`.
@@ -865,7 +874,7 @@ Turn off: croft schedule off
 - **Error `details`:**
   - `HTTP_ERROR`: `{method, url (redacted), status, attempts, retryAfterMs, requestIndex, rowsBeforeError}`
   - `TIMEOUT`: `{phase, rowsSoFar, lastRequest}`
-  - `TYPE_CONFLICT`: `{column, existingType, incomingKinds, badRows, samples, readBy}`
+  - `TYPE_CONFLICT`: `{column, existingType, incomingKinds, badRows, samples, readBy}`, plus, where they apply, `sourceName`, `storedType` (the same as `existingType`), `incomingType` (the type the incoming values would get in a new column), `incoming` (the same as `incomingKinds`), `conflictKinds` (the kinds that do not fit), `format` (file ingests) and `fixes` (every fix, in order; `fix` is the first). The duplicate names are kept for readers of the earlier ones.
   - `CHECK_FAILED`: `{check, failing, sample}`
   - `QUERY_FAILED`: `{duckdb, duckdbErrorType}`. `QUERY_FAILED` is any error DuckDB raised while binding or running a user query (Binder, Catalog, Conversion, Invalid Input, Out of Range, IO, …), and `duckdbErrorType` names the kind. `SQL_SYNTAX` is only for parser errors, and a missing table or column is still `UNKNOWN_TABLE` or `UNKNOWN_COLUMN`.
   - `ASSET_CODE_ERROR` raised through `fail()`: `{requestedCode}` (§10, "Public types")
@@ -935,16 +944,16 @@ The rules that follow from these:
 - `query`, `describe`, `preview`, `doctor`, `tick` and `croft serve` use read-only, and never create an intent. `doctor` does not open the file at all while a live intent exists (§2).
 
 - **Lock conflicts** are retried with jittered backoff (25 ms up to 1 s). After 2 s the holder is printed. It is one of: croft's own run, from `runs.sqlite` (for example "croft run r_…, writing daily_revenue, 8 s"); `croft serve`, recognized by the PID in `serve.json` ("croft serve pid 4121 has not stepped aside"); or a foreign program (`DB_HELD_BY_OTHER_PROGRAM`).
-- **Default waits.** Off a TTY every wait is capped at 90 s, then exit 4 with the holder, so a wait never outlives the agent's shell. On a TTY: 60 s for `query`/`preview`/`describe` and 10 min for run writes. Scheduled writes wait 30 min. `--no-wait` exits 4 at once.
+- **Default waits.** Off a TTY every wait is capped at 90 s, then exit 4 with the holder, so a wait never outlives the agent's shell. On a TTY: 60 s for `query`/`preview`/`describe` and 10 min for run writes. Scheduled writes wait 30 min. `--no-wait` exits 4 at once. Ctrl-C (the run's `AbortSignal`) ends a lock wait, or a write queued behind this process's own write, at once with `INTERRUPTED` (exit 130). A lease that already holds the file is never cut; the ingest body refuses further statements instead.
 - **Fairness.** A writer that sees registered waiters yields for 200 ms between write steps.
 - **Asset leases** in `runs.sqlite` guarantee that only one run touches an asset at a time. A manual `croft run x` while the scheduler runs `x` waits for the lease, or exits 4 with `ASSET_BUSY` naming the run. A tick skips leased assets, and they stay due. A lease records the PID, the process start time and the boot id (`kern.boottime` or `/proc/sys/kernel/random/boot_id`). It counts as dead when the boot id differs or the start time does not match, because PIDs are reused after a reboot and a PID check alone could leave an asset busy forever.
 
 **One connection factory.** Every connection croft opens goes through a single factory. This covers the warehouse, the preview database, a TS transform's private in-memory database, and `@zabaca/croft/read`. The factory sets the project time zone and applies the sandbox. `TimeZone` is a per-connection setting [V], and a connection that skipped it would put rows into different days.
 
-**Sandboxing every DuckDB instance.** Every instance is created with `autoinstall_known_extensions = false`, `autoload_known_extensions = false` and `allow_community_extensions = false` [V]. Otherwise DuckDB would download and load native extensions from the network on demand, and croft promises never to install anything. The first connection to a fresh instance runs `SET GLOBAL TimeZone` (and, for `croft serve`, `memory_limit` and `threads`), then the statements below. `lock_configuration` is instance-wide and refuses every later `SET`, a per-session `SET TimeZone` included, so the zone is set globally before locking and every later connection inherits it [V]. Later connections check that the instance carries the same sandbox. `allowed_directories` cannot be passed as an instance option ("Failed to set config"), so these have to be `SET` statements [V]. `croft query` instances allow only `files/`, and a project path outside it gets `QUERY_PATH_DENIED`.
+**Sandboxing every DuckDB instance.** Every instance is created with `autoinstall_known_extensions = false`, `autoload_known_extensions = false` and `allow_community_extensions = false` [V]. Otherwise DuckDB would download and load native extensions from the network on demand, and croft promises never to install anything. The first connection to a fresh instance runs `SET GLOBAL TimeZone` (and, for `croft serve`, `memory_limit` and `threads`), then the statements below. `lock_configuration` is instance-wide and refuses every later `SET`, a per-session `SET TimeZone` included, so the zone is set globally before locking and every later connection inherits it [V]. Later connections check that the instance carries the same sandbox. `allowed_directories` cannot be passed as an instance option ("Failed to set config"), so these have to be `SET` statements [V]. `croft query` instances allow only `files/`, and a project path outside it gets `QUERY_PATH_DENIED`. The run's warehouse instance allows only `files/` and the state folder, not the directories of declared file ingests: files are loaded from their snapshots under the state folder (§3b), so a `file: "*.csv"` ingest never opens the whole project folder to SQL.
 
 ```sql
-SET allowed_directories = ['<project>/files', '<project>/.croft', <directories of declared file ingests>];
+SET allowed_directories = ['<project>/files', '<project>/.croft'];
 SET enable_external_access = false;
 SET lock_configuration = true;
 ```
@@ -1020,7 +1029,9 @@ Paths are checked just before DuckDB opens them, not atomically. A macro or view
                 merge:   MERGE … WHEN MATCHED AND <row differs> THEN UPDATE SET <batch columns>
                          WHEN NOT MATCHED THEN INSERT
                 file reload: the replace diff limited to the reloaded files' rows (… WHEN NOT
-                         MATCHED BY SOURCE AND _file IN (…) THEN DELETE)
+                         MATCHED BY SOURCE AND _file IN (…) THEN DELETE); with a key, a row whose
+                         key the reloaded file dropped is first replaced by the row of the most
+                         recently loaded other file that still has it (§3b, D58)
                 Written rows get one _loaded_at stamp; unchanged rows keep theirs.
    j  checks    blocking checks; any failure → ROLLBACK
    k  state     cursor = greatest(saved, typed max) as original text; _croft.assets/columns/files/writes
@@ -1120,6 +1131,8 @@ CREATE TABLE confirmations (token TEXT PRIMARY KEY, command TEXT, impact TEXT, i
 CREATE TABLE catalog  (asset TEXT PRIMARY KEY, json TEXT, source TEXT, refreshed_at TEXT);
                        -- mirror of _croft.* (source: run | preview | pins); DuckDB wins
 ```
+
+While a run works, `runs.summary` holds `{progress: {asset, phase, rowsFetched, requests, elapsedMs}}`, written at most every 500 ms (§5, "Processes"). When the run ends it holds the whole command result, `{data: {runId, status, steps}, problems, next, confirmation?, exit, ok}`, redacted, so a detached run's parent and `croft wait` print exactly what an in-process run prints.
 
 ### Versions, staleness and atomicity
 
@@ -1295,7 +1308,7 @@ Otherwise the asset is skipped with `SCHEDULE_HELD`, and `status` shows it plain
 
 ### Nothing implicit destroys ingested data
 
-- **Deleting an asset file** leaves its table in place, shown as "no asset file".
+- **Deleting an asset file** leaves its table in place, shown as "no asset file". `describe` reports such an orphan table as the warning `ORPHAN_TABLE`, with a manual `requiresHuman` fix (put the file back, or ask the user whether the table should go). `croft delete` never appears in its `next[]`, because deleting is destructive (§4.3).
 - **Renaming a file outside croft** creates a new, never-built asset whose code hash matches the orphan's. `validate` reports `ASSET_RENAMED`, with the fix `croft rename <old> <new>`, which adopts the orphan's table and state instead of refetching history.
 - **Columns** are never removed automatically.
 - **Types** widen only when the widening is proven lossless (§7).
@@ -1332,6 +1345,15 @@ These do **not** need confirmation, because they are recomputable or reversible:
 
 - **On a TTY,** croft prints the impact and asks `Proceed? [y/N]`.
 - **Off a TTY,** it exits 5 with `confirmation: {token, expiresAt, command, impact: {asset, rows, bytes, trashPath, downstream[]}}`. The action runs only through `croft confirm <token>`. That command recomputes the impact and fails with `CONFIRMATION_STALE` if it changed, for example because the scheduler added rows in the meantime.
+- **`croft confirm` checks the token before running anything.** A used or expired token is `CONFIRMATION_STALE`, and an unknown one is `USAGE_ERROR`; the stored command does not run at all.
+- **Only `croft confirm` carries a token** (D56). No command takes a token as a flag. `confirm` runs the stored command again in its own process and passes the token in-process. When that run detaches (off a TTY, §5), the child receives the token through a one-time grant: `confirm` writes `confirm-grant.json` next to the run's logs, holding the token and the hash of a random secret, and passes the secret in `CROFT_CONFIRM_GRANT` to that `--detached` child only. The child removes the grant as it redeems it; every other croft process ignores the variable and never passes it on. A hand-made `--detached` run with a value typed into the variable matches no grant and is refused (`USAGE_ERROR`).
+- **What becomes of the token** is `data.outcome` (§4.3):
+  - `used`: the command reached its confirmation and spent the token, whether it then acted or found the impact stale;
+  - `not_needed`: nothing destructive was left to do (the source recovered, say), so it ran as a plain command. `confirm` passes its envelope through with a `note`, and the token is spent anyway, so it can never run the command a second time;
+  - `unused`: the command failed before the confirmation point; the token stays valid until it expires;
+  - `running`: a detached run is still going (exit 6); it spends the token when it reaches it or ends.
+
+  A destructive step that ran without spending the token would be croft's bug, reported as `INTERNAL_ERROR`.
 - Tokens are single-use and expire after 15 minutes. Destructive commands never appear in `next`.
 - Because every destructive path funnels into one command prefix, one Claude Code permission rule gates them all: `"ask": ["Bash(croft confirm:*)"]`. `croft docs claude-permissions` prints it. The skill's rule is: never run `croft confirm` without the user's explicit yes in this conversation.
 
@@ -1463,6 +1485,8 @@ Nested values are stored raw and exact. The table's schema therefore never chang
 - `json_each(labels)` for one row per element.
 
 `describe` lists the keys seen inside each JSON column, so JSON stays discoverable. The skill recommends a SQL asset that extracts typed columns once, when heavy analysis needs them.
+
+**Numbers beyond DOUBLE.** `res.json()` returns a number DOUBLE cannot hold (`1e400`) as `JSON.rawJSON(<its source text>)` instead of `Infinity` (§3a). Inside a JSON column it stays a JSON number with its own source text. As a column's own value no numeric type can hold it, so it is staged as text: a VARCHAR column (`MIXED_TYPES` when it sits next to numbers), or a `TYPE_CONFLICT` in an existing numeric column.
 
 **Rejected alternatives:**
 
@@ -1633,7 +1657,7 @@ A backfill is a flag, and it is defined per asset type:
 
 A `--from` that cannot apply is refused before the run starts: no run is recorded and no step fails. An asset named exactly refuses the whole command (exit 2, the error above); in a bare `croft run --from …` or a glob, the assets it does not apply to are skipped with the reason. Refusals that need only the plan (`BACKFILL_UNSUPPORTED`) come from the invoking process; those that need the saved cursor (`BACKFILL_WOULD_DUPLICATE`) come from the detached child before it records the run, and the parent prints them as its own result.
 
-Why the cursor holds: a `--from` later than the saved cursor used to save `greatest(saved, loaded)` like any run, which jumped the schedule over `[saved, <when>)`. Nothing ever fetched those rows again, and `--from` needs no confirmation (§6), so `croft run x --from today` lost data silently. Holding the cursor costs one wider fetch on the next run; merge makes the re-read rows a no-op.
+Why the cursor holds (D57): a `--from` later than the saved cursor used to save `greatest(saved, loaded)` like any run, which jumped the schedule over `[saved, <when>)`. Nothing ever fetched those rows again, and `--from` needs no confirmation (§6), so `croft run x --from today` lost data silently. Holding the cursor costs one wider fetch on the next run; merge makes the re-read rows a no-op.
 
 The same flag fills a new field for old rows of a merge ingest: `croft run stripe_charges --from 2024-01-01`.
 
@@ -1780,7 +1804,7 @@ A test fails if any thrown code is unregistered or has no fix template and docs 
 - Values cut to 80 characters.
 - Logs default to the last 200 lines.
 - `context` capped at 20 KB.
-- `.env` values redacted (D54). Every `.env` value of 4 or more characters is redacted from messages, hints and logs. In command data (query rows, samples), declared secrets are always redacted, and any other `.env` value only when it looks like a credential: 8 or more characters, and not only letters or only digits. Otherwise `PORT=5432` or `LOG_LEVEL=info` would rewrite ordinary values the agent reasons from. `data` then carries `redactedValues: true` (§4.3).
+- `.env` values redacted (D54). Every `.env` value of 4 or more characters is redacted from messages, hints and logs. In command data (query rows, samples), declared secrets are always redacted, and any other `.env` value only when it looks like a credential: 8 or more characters, and not only letters or only digits. Otherwise `PORT=5432` or `LOG_LEVEL=info` would rewrite ordinary values the agent reasons from. `data` then carries `redactedValues: true` (§4.3). A declared secret set in the shell instead of `.env` is covered too: declaring the project's secret names (`ProjectEnv.declare()`) registers their shell values, so redaction hides them even when no `secret()` call handed them out.
 
 **7. What `init` deliberately does not write.** It does not write `.claude/settings.json`. Permission rules and hooks change what Claude Code may do without asking, so they stay the user's decision (D27).
 
@@ -1827,7 +1851,8 @@ src/
                        (BUN_FLOOR, BUN_TESTED), detach.ts (non-TTY detach + follow), commands/index.ts (registry),
                        commands/*.ts
   core/                errors.ts (CroftError, code registry, fix templates, exit codes), types.ts,
-                       time.ts (formatInstant, the one timestamp renderer), proc.ts (pid + start time + boot id)
+                       time.ts (formatInstant, the one timestamp renderer), proc.ts (pid + start time + boot id),
+                       output.ts (asset console output → step log or stderr), phase.ts (checksEnforced, phase 1)
   read/                run.ts (routing: url, serve.json, direct), http.ts (loopback over node:net, else fetch),
                        server.ts, direct.ts (lazy chunk; shared instance, intent wait), locate.ts, select.ts
   project/             root.ts (croft.json, .env, relocation), init.ts (empty folder, existing repo → data/),
@@ -1858,8 +1883,9 @@ src/
   schedule/            phrase.ts (English → cron), cron.ts (DST-defined matcher), register.ts (launchd, crontab),
                        tick.ts (per-user registry, per-project plan-and-spawn, singleton, heartbeats), notify.ts
   history/             runs-db.ts (bun:sqlite), reconcile.ts, logs.ts
-  safety/              trash.ts (ATTACH-based trash/restore), confirm.ts (tokens, impact hash), guards.ts (shrink,
-                       config change, pin change, hold), rename.ts, delete.ts, oob.ts (out-of-band detection)
+  safety/              trash.ts (ATTACH-based trash/restore), confirm.ts (tokens, impact hash, detached-run grants),
+                       guards.ts (shrink, config change, pin change, hold), rename.ts, delete.ts, oob.ts (out-of-band
+                       detection)
   agent/               templates/* (api by pagination, file, sql, transform), skill.md, claude-md.md,
                        docs/*.md (one page per topic and per error code; embedded; served by `croft docs`)
 ```
@@ -2021,6 +2047,8 @@ export interface StepResult {
   inputs?: { input: string; seenBefore: string | null; seenAfter: string; rows: number }[];
   requests?: number; checks: { check: string; ok: boolean; failing?: number; sample?: Row[] }[];
   trashed?: { path: string; rows: number }; logsCommand: string; durationMs: number; error?: Problem;
+  created?: { columns: number; jsonColumns: number };                // this step created the table (§4.2)
+  csvHeader?: { header: boolean; from: "declared" | "sniffed" | "known"; columns: string[] };   // first CSV load
 }
 export type Fix =
   | { kind: "edit"; description: string; file: string; line?: number; replace?: { from: string; to: string }; insert?: string }
@@ -2070,7 +2098,7 @@ export interface Warehouse {
    - The sandbox: `COPY TO` the warehouse, `DETACH`/`ATTACH`, reading outside allowed directories, and re-enabling settings, all refused.
    - The single-instance registry.
    - One scenario test per silent-loss hazard: implicit rounding, dropped struct field, MERGE duplicates, sniffer date flip, union-by-name column drop, JSON kind change.
-3. **End-to-end fixture projects** driven by spawning the real CLI. A `Bun.serve` mock API covers:
+3. **End-to-end fixture projects** driven by spawning the real CLI (phase 1 ships 14 such journeys in `tests/e2e`). A `Bun.serve` mock API covers:
    - ascending keyset, newest-first `starting_after`, and Link pagination;
    - epoch cursors;
    - 429 with `Retry-After`, and flaky 500s;
@@ -2240,6 +2268,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Options: a trailing `--yes`; a human-only `approve`; `croft confirm <token>`.
 - Choice: tokens. Off a TTY, a destructive command exits 5 with its impact and a token, and `croft confirm` recomputes the impact before acting. On a TTY, a y/N prompt.
 - Reason: consent is tied to the impact that was shown, stale impacts are refused, and one Claude Code prefix rule (`Bash(croft confirm:*)`) gates every destructive path. A trailing flag cannot be targeted reliably.
+- Build: revised by D56. Only `croft confirm` carries a token: no command takes one as a flag, and a detached confirmed run gets it through a one-time grant.
 
 **D11. Trash format.**
 - Options: Parquet; `ALTER … SET SCHEMA` (not implemented [V]); a file clone; an attached `.duckdb` per trashed item.
@@ -2374,7 +2403,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Options: DELETE + INSERT; a diff (MERGE with `NOT MATCHED BY SOURCE THEN DELETE`).
 - Choice: a diff.
 - Reason: restamping every row on every replace would wake, and bill, every downstream incremental transform [V].
-- Build: a keyless diff pairs rows by exact equality plus an occurrence index instead of a stored row hash, so a hash collision cannot pair two different rows. File reloads are the same diff limited to the reloaded files' rows. `last_loaded_at` moves only when rows changed (§5).
+- Build: a keyless diff pairs rows by exact equality plus an occurrence index instead of a stored row hash, so a hash collision cannot pair two different rows. File reloads are the same diff limited to the reloaded files' rows; with a key, a row is deleted only when no present file still has its key (D58). `last_loaded_at` moves only when rows changed (§5).
 
 **D39. TypeScript transforms. (new)**
 - Choice: the template is keyed and incremental; rows are Proxy-guarded; there is a cost guard.
@@ -2403,7 +2432,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 **D44. Backfills. (new)**
 - Choice: `--from` on merge ingests only, with a per-type matrix of explicit errors elsewhere; relative dates; conversion to the cursor type.
 - Reason: `--from` on append or replace ingests duplicated or truncated data silently.
-- Build (2026-09-23): a `--from` after the saved cursor jumped the cursor over the rows in between (`greatest(saved, loaded)`), so they were never fetched. Options: refuse it (a new `BACKFILL_GAP`), or keep the cursor. Choice: keep the cursor for merge ingests, where the re-read rows of the next run are a no-op, so the request still does what it says and nothing is lost; refuse it for append ingests (`BACKFILL_WOULD_DUPLICATE`), where keeping the cursor would store the later rows twice and moving it would skip the gap. Every `--from` refusal now happens before the run starts, so it is exit 2 with nothing recorded, never a failed step.
+- Build (2026-09-23): revised by D57. A `--from` after the saved cursor jumped the cursor over the rows in between, so they were never fetched. Merge ingests now keep the saved cursor in that case, append ingests with a saved cursor refuse `--from` either way (`BACKFILL_WOULD_DUPLICATE`), and every `--from` refusal happens before the run starts.
 
 **D45. Dependency extraction. (new, rev)**
 - Options: AST `BASE_TABLE` nodes only; the optimized plan; AST plus the unoptimized bound plan.
@@ -2465,6 +2494,22 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Choice: `node:net` (`node:tls` for https) for loopback hosts, including `0.0.0.0` and `::`; `fetch` for every other host.
 - Reason: D53 promises that `HTTP_PROXY` never sees the serve token. Under Bun 1.3.14 every `node:http` variant (the default agent, `agent: false`, a new `Agent`, `createConnection`) and `fetch` sent a `127.0.0.1` request through `HTTP_PROXY`/`http_proxy` [V]. A plain TCP socket cannot be proxied. Other hosts keep `fetch`, so a hosted app keeps the egress proxy its platform configures.
 
+**D56. Who carries out a confirmation. (new, 2026-09-23; revises D10)**
+- Options: `croft confirm` re-runs the stored command with a hidden `--confirm-token` flag (the first build); `croft confirm` hands the token to the command in its own process, and a detached run gets it through a one-time grant.
+- Choice: the second. No command takes a token as a flag. `croft confirm` refuses an unknown token (`USAGE_ERROR`) or a used or expired one (`CONFIRMATION_STALE`) before anything runs, then runs the stored command in-process and passes the token there. When the run detaches, `confirm` writes a grant next to the run's logs (the token and the hash of a random secret) and passes the secret in `CROFT_CONFIRM_GRANT` to that `--detached` child only, which redeems it once. `data.outcome` (`used`, `not_needed`, `unused`, `running`) says what became of the token; a command that no longer needs its confirmation runs as a plain command and spends the token anyway (§6).
+- Reason: with a token flag, `croft run x --allow-shrink --confirm-token c_…` carried out the destructive action without the `croft confirm` prefix, so the one `ask` rule that D10 relies on no longer gated every destructive path. An environment variable alone could be typed in the same way; a secret whose hash croft wrote for that run id cannot. Spending the token on `not_needed` keeps a token from ever running its command twice, and leaving it valid on `unused` keeps a transient failure from burning the user's consent.
+
+**D57. `--from` later than the saved cursor. (new, 2026-09-23; revises D44)**
+- Options: save `greatest(saved, loaded)` as for any run (the first build); refuse such a `--from` with a new `BACKFILL_GAP`; keep the saved cursor.
+- Choice: keep the saved cursor for merge ingests, and say so in the step's reason. Refuse `--from` for append ingests once they have a saved cursor, whether it is before or after it (`BACKFILL_WOULD_DUPLICATE`, exit 2). Every `--from` refusal happens before the run starts: nothing is recorded and no step fails. An asset named exactly refuses the whole command, while a bare `croft run --from …` or a glob skips the assets it does not apply to, with the reason (§8).
+- Reason: the first build jumped the schedule over `[saved, <when>)`, and nothing ever fetched those rows. `--from` needs no confirmation (§6), so `croft run x --from today` lost data silently. Refusing would turn a natural "re-read from here" into an error; holding the cursor does what was asked and costs one wider fetch on the next run, whose re-read rows the merge makes a no-op. An append ingest has no such way out: holding the cursor would store the rows after `<when>` twice, and moving it would skip the gap.
+
+**D58. Overlapping file exports. (new, 2026-09-23)**
+- Options: a reloaded file deletes the rows of every key it no longer has (the first build, `WHEN NOT MATCHED BY SOURCE AND _file IN (…) THEN DELETE`); latest-loaded ownership; "the export that sorts last wins".
+- Choice: latest-loaded ownership. A key's row belongs to the latest file that provided it, and files loaded together provide their keys in read order. A changed file's reload also reads the asset's other present files, so a key it dropped falls back to the most recently loaded file that still has it, and only a key no present file has is deleted. New files take over the keys they contain, and re-exporting an older file makes it the latest provider of its keys again (§3b).
+- Reason: the first build deleted a row that an unchanged, overlapping export still had, and no later run brought it back, which broke the "exports overlap; the key removes repeats" promise of the `sales.ts` example. Latest-loaded needs no naming convention for exports.
+- Open: "the export that sorts last wins" is the alternative. It is rebuild-invariant (a full reload gives the same table as the incremental history, which latest-loaded does not promise), and it would keep a re-exported January file from overriding February's rows. It needs export names that sort by date.
+
 ---
 
 ## Open questions for the user
@@ -2476,7 +2521,9 @@ Decided on 2026-09-22:
 - **Scope:** v1 is all 5 phases, about 14.5 engineer-weeks (13.5 before D53 added `croft serve`).
 - **App access:** `croft serve` (server mode) instead of a default read copy; the read copy is opt-in, for GUIs (D53).
 
-No open questions remain.
+Open since the build (2026-09-23):
+
+- **Overlapping file exports:** the latest-loaded file owns a key (D58, shipped), or the export that sorts last wins (rebuild-invariant, and a re-exported old file would not override newer rows).
 
 ---
 
