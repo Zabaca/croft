@@ -131,7 +131,7 @@ export function shrinkCommand(asset: string): string {
 export function checkRunFlags(plan: RunPlan, o: Pick<RunnerOptions, "selectors" | "from" | "allowShrink" | "confirmToken">): void {
   const usage = (message: string, hint: string) => new CroftError("USAGE_ERROR", { message, hint });
   if (o.confirmToken !== undefined && !o.allowShrink) {
-    throw usage("--confirm-token goes with --allow-shrink", "croft confirm <token> runs the confirmed command for you");
+    throw usage("a confirmation applies only to --allow-shrink", "croft confirm <token> runs the confirmed command for you");
   }
   if (o.from !== undefined && !o.allowShrink) {
     for (const s of plan.steps) {

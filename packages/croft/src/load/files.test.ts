@@ -541,6 +541,9 @@ describe("CSV", () => {
     expect(e.message).toContain("column day is DATE (format %m/%d/%Y)");
     expect(e.message).toContain(`"25/03/2026"`);
     expect(e.problem.details).toMatchObject({ column: "day", format: "%m/%d/%Y", badRows: 1 });
+    // §4.3's TYPE_CONFLICT fields, for file ingests too.
+    for (const k of ["column", "existingType", "incomingKinds", "badRows", "samples", "readBy"]) expect(e.problem.details).toHaveProperty(k);
+    expect(e.problem.details).toMatchObject({ existingType: "DATE", readBy: [] });
     expect(e.problem.fix!.description).toContain("map");
     expect(await q(p, `SELECT count(*)::INTEGER AS n FROM days`)).toEqual([{ n: 1 }]);
     expect(await q(p, `SELECT path FROM _croft.files ORDER BY path`)).toEqual([{ path: "files/a.csv" }]);
@@ -559,6 +562,7 @@ describe("CSV", () => {
     expect(e.code).toBe("TYPE_CONFLICT");
     expect(e.message).toContain("column qty is BIGINT");
     expect(e.problem.details!.samples).toEqual([{ row: 1, value: "five" }]);
+    expect(e.problem.details).toMatchObject({ column: "qty", existingType: "BIGINT", incomingKinds: ["integer", "string"], badRows: 1, readBy: [] });
 
     const m = project({ asset: "m" });
     m.put("files/m.csv", 'id,price\n1,"$1,000.10"\n');
@@ -657,6 +661,147 @@ describe("changed and deleted files", () => {
     const r = await run(p, cfg);
     expect(r.result!.rows).toMatchObject({ in: 1, added: 0, updated: 1, deleted: 1, total: 4 });
     expect(await q(p, `SELECT order_id, coupon FROM sales WHERE _file = 'files/sales/2026-02.csv'`)).toEqual([{ order_id: 1004, coupon: "SUMMER" }]);
+  });
+
+  describe("keyed, overlapping exports (§3b sales.ts: a key's row comes from the latest file that provided it)", () => {
+    const JAN = "files/sales/2026-01.csv", FEB = "files/sales/2026-02.csv";
+    const cfg = { file: "files/sales/*.csv", incremental: true, key: "order_id" };
+    const table = (p: Project) => q(p, `SELECT order_id AS id, amount, _file FROM sales ORDER BY order_id`);
+    const stamps = async (p: Project) =>
+      Object.fromEntries((await q<{ id: number; s: string }>(p, `SELECT order_id AS id, _loaded_at::VARCHAR AS s FROM sales`)).map((r) => [r.id, r.s]));
+    async function overlapping(): Promise<Project> {
+      const p = project();
+      p.put(JAN, "order_id,amount\n1,10\n2,20\n3,30\n");
+      p.put(FEB, "order_id,amount\n3,33\n4,40\n");
+      expect((await run(p, cfg)).result!.rows).toMatchObject({ in: 5, added: 4, total: 4 });
+      // Loaded together, the later file provides the shared key.
+      expect(await table(p)).toEqual([
+        { id: 1, amount: 10, _file: JAN }, { id: 2, amount: 20, _file: JAN }, { id: 3, amount: 33, _file: FEB }, { id: 4, amount: 40, _file: FEB },
+      ]);
+      return p;
+    }
+
+    test("a key the changed file dropped is kept when another file still has it, and is that file's row now", async () => {
+      const p = await overlapping();
+      const before = await stamps(p);
+      // February is re-exported without order 3; January still has it.
+      p.put(FEB, "order_id,amount\n4,40\n");
+      const r = await run(p, cfg);
+      expect(r.extract.load).toEqual([FEB]);
+      expect(r.batch!.replaceFiles).toEqual([FEB]);
+      expect(r.result!.rows).toEqual({ in: 1, added: 0, updated: 1, unchanged: 1, deleted: 0, total: 4 });
+      expect(await table(p)).toEqual([
+        { id: 1, amount: 10, _file: JAN }, { id: 2, amount: 20, _file: JAN }, { id: 3, amount: 30, _file: JAN }, { id: 4, amount: 40, _file: FEB },
+      ]);
+      const after = await stamps(p);
+      expect([after[1], after[2], after[4]]).toEqual([before[1], before[2], before[4]]); // untouched
+      expect(after[3]).not.toBe(before[3]!);
+      // January was read, not reloaded: its record keeps its load time. Nothing is left to do.
+      const files = await q<{ path: string; t: string }>(p, `SELECT path, loaded_at::VARCHAR AS t FROM _croft.files ORDER BY path`);
+      expect(files[0]!.t).toBe(before[1]!);
+      expect((await run(p, cfg)).extract.unchanged).toBe(true);
+
+      // January drops order 3 as well: no file has it any more, so it is deleted.
+      p.put(JAN, "order_id,amount\n1,10\n2,20\n");
+      const r2 = await run(p, cfg);
+      expect(r2.result!.rows).toEqual({ in: 2, added: 0, updated: 0, unchanged: 2, deleted: 1, total: 3 });
+      expect((await table(p)).map((x) => x.id)).toEqual([1, 2, 4]);
+    });
+
+    test("a changed file provides its keys again; an unchanged file still holding a dropped key wins it back", async () => {
+      const p = await overlapping();
+      // January is re-exported with order 1 corrected: it is now the latest file to provide orders 1-3.
+      p.put(JAN, "order_id,amount\n1,11\n2,20\n3,30\n");
+      const r = await run(p, cfg);
+      expect(r.result!.rows).toEqual({ in: 3, added: 0, updated: 2, unchanged: 1, deleted: 0, total: 4 });
+      expect(await table(p)).toEqual([
+        { id: 1, amount: 11, _file: JAN }, { id: 2, amount: 20, _file: JAN }, { id: 3, amount: 30, _file: JAN }, { id: 4, amount: 40, _file: FEB },
+      ]);
+      // January drops order 3, which February still has: February's row comes back, nothing is deleted.
+      p.put(JAN, "order_id,amount\n1,11\n2,20\n");
+      const r2 = await run(p, cfg);
+      expect(r2.result!.rows).toEqual({ in: 2, added: 0, updated: 1, unchanged: 2, deleted: 0, total: 4 });
+      expect((await table(p))[2]).toEqual({ id: 3, amount: 33, _file: FEB });
+    });
+
+    test("a dropped key falls back to the most recently loaded file that still has it", async () => {
+      const p = project({ asset: "s" });
+      const c = { file: "files/s/*.csv", incremental: true, key: "id" };
+      const rows = () => q(p, `SELECT id, v, _file FROM s ORDER BY id`);
+      p.put("files/s/b.csv", "id,v\n1,b\n");
+      await run(p, c);
+      p.put("files/s/a.csv", "id,v\n1,a\n"); // loaded later, so it provides id 1 although its name sorts first
+      await run(p, c);
+      expect(await rows()).toEqual([{ id: 1, v: "a", _file: "files/s/a.csv" }]);
+      p.put("files/s/c.csv", "id,v\n1,c\n2,c\n");
+      await run(p, c);
+      expect(await rows()).toEqual([{ id: 1, v: "c", _file: "files/s/c.csv" }, { id: 2, v: "c", _file: "files/s/c.csv" }]);
+      p.put("files/s/c.csv", "id,v\n2,c\n");
+      const r = await run(p, c);
+      expect(r.result!.rows).toMatchObject({ in: 1, updated: 1, deleted: 0, total: 2 });
+      expect(await rows()).toEqual([{ id: 1, v: "a", _file: "files/s/a.csv" }, { id: 2, v: "c", _file: "files/s/c.csv" }]);
+    });
+
+    test("the fallback row is the other file's row in full, and map() and JSON files take the same path", async () => {
+      const p = project({ asset: "j" });
+      const c = { file: "files/j/*.ndjson", incremental: true, key: "id", map: (row: Record<string, unknown>) => ({ ...row, v: String(row.v).toUpperCase() }) };
+      p.put("files/j/1.ndjson", `{"id":1,"v":"one"}\n`);
+      p.put("files/j/2.ndjson", `{"id":1,"v":"uno","extra":"x"}\n{"id":2,"v":"two"}\n`);
+      await run(p, c);
+      expect(await q(p, `SELECT id, v, extra, _file FROM j ORDER BY id`)).toEqual([
+        { id: 1, v: "UNO", extra: "x", _file: "files/j/2.ndjson" }, { id: 2, v: "TWO", extra: null, _file: "files/j/2.ndjson" },
+      ]);
+      p.put("files/j/2.ndjson", `{"id":2,"v":"two"}\n`);
+      const r = await run(p, c);
+      expect(r.result!.rows).toMatchObject({ in: 1, updated: 1, deleted: 0, total: 2 });
+      // extra is absent from the whole batch, yet the fallback row does not keep February's value: it is file 1's row.
+      expect(await q(p, `SELECT id, v, extra, _file FROM j ORDER BY id`)).toEqual([
+        { id: 1, v: "ONE", extra: null, _file: "files/j/1.ndjson" }, { id: 2, v: "TWO", extra: null, _file: "files/j/2.ndjson" },
+      ]);
+    });
+
+    test("a new file alone never reads the others, and a gone file's rows stay", async () => {
+      const p = await overlapping();
+      p.put("files/sales/2026-03.csv", "order_id,amount\n4,44\n5,50\n");
+      const r = await run(p, cfg);
+      expect(r.batch!.rows).toBe(2); // only the new file was read
+      expect(r.result!.rows).toEqual({ in: 2, added: 1, updated: 1, unchanged: 0, deleted: 0, total: 5 });
+      // February is deleted and January changes: the other present file is read, the gone one cannot be.
+      p.remove(FEB);
+      p.put(JAN, "order_id,amount\n1,10\n3,31\n");
+      const r2 = await run(p, cfg);
+      expect(r2.extract.gone).toEqual([FEB]);
+      expect(r2.result!.rows).toEqual({ in: 2, added: 0, updated: 1, unchanged: 1, deleted: 1, total: 4 });
+      expect(await table(p)).toEqual([
+        { id: 1, amount: 10, _file: JAN }, { id: 3, amount: 31, _file: JAN },
+        { id: 4, amount: 44, _file: "files/sales/2026-03.csv" }, { id: 5, amount: 50, _file: "files/sales/2026-03.csv" },
+      ]);
+    });
+
+    test("a file read for fallback rows is read as before (latin-1) and does not repeat its warnings", async () => {
+      const p = project({ asset: "people" });
+      const c = { file: "files/p/*.csv", incremental: true, key: "id" };
+      p.put("files/p/a.csv", { fixture: "latin1.csv" }); // ids 1 and 2, latin-1
+      p.put("files/p/b.csv", "id,name,city\n2,Zoe,Koeln\n3,Ann,Oslo\n");
+      expect(codes((await run(p, c)).extract)).toEqual(["CSV_ENCODING_GUESSED"]);
+      p.put("files/p/b.csv", "id,name,city\n3,Ann,Oslo\n");
+      const r = await run(p, c);
+      expect(r.extract.context).toEqual(["files/p/a.csv"]);
+      expect(codes(r.extract)).toEqual([]);
+      expect(await q(p, `SELECT id, name, _file FROM people ORDER BY id`)).toEqual([
+        { id: 1, name: "José", _file: "files/p/a.csv" }, { id: 2, name: "Zoë", _file: "files/p/a.csv" }, { id: 3, name: "Ann", _file: "files/p/b.csv" },
+      ]);
+    });
+
+    test("a gone file cannot hold a dropped key (it is no longer read), but its own rows stay", async () => {
+      const p = await overlapping();
+      p.remove(JAN);
+      p.put(FEB, "order_id,amount\n4,40\n");
+      const r = await run(p, cfg);
+      // Order 3 was February's; January (gone) cannot be read, so it is deleted; January's own rows stay.
+      expect(r.result!.rows).toEqual({ in: 1, added: 0, updated: 0, unchanged: 1, deleted: 1, total: 3 });
+      expect(await table(p)).toEqual([{ id: 1, amount: 10, _file: JAN }, { id: 2, amount: 20, _file: JAN }, { id: 4, amount: 40, _file: FEB }]);
+    });
   });
 
   test("a deleted file keeps its rows (incremental) and is reported gone on every run", async () => {
@@ -771,6 +916,50 @@ describe("URLs", () => {
     // --rebuild asks unconditionally.
     await extract(p, cfg, { rebuild: true });
     expect(srv.seen.at(-1)).toEqual({ inm: null, ims: null });
+  });
+
+  test("keyed overlapping URLs: an unchanged one is fetched again for fallback rows, and reloaded if it did change", async () => {
+    const bodies: Record<string, string> = { "/a.csv": "id,v\n1,a\n2,a\n", "/b.csv": "id,v\n2,b\n3,b\n" };
+    const etags: Record<string, string> = { "/a.csv": '"a1"', "/b.csv": '"b1"' };
+    const seen: string[] = [];
+    const s = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const path = new URL(req.url).pathname;
+        seen.push(`${path} ${req.headers.get("if-none-match") ?? "-"}`);
+        if (req.headers.get("if-none-match") === etags[path]) return new Response(null, { status: 304, headers: { etag: etags[path]! } });
+        return new Response(bodies[path], { headers: { "content-type": "text/csv", etag: etags[path]! } });
+      },
+    });
+    cleanups.push(() => s.stop(true));
+    const A = `${s.url.href}a.csv`, B = `${s.url.href}b.csv`;
+    const p = project({ asset: "u" });
+    const cfg = { file: [A, B], incremental: true, key: "id" };
+    await run(p, cfg);
+    expect(await q(p, `SELECT id, v FROM u ORDER BY id`)).toEqual([{ id: 1, v: "a" }, { id: 2, v: "b" }, { id: 3, v: "b" }]);
+
+    // b drops id 2; a answers 304 but is fetched again for it.
+    bodies["/b.csv"] = "id,v\n3,b\n";
+    etags["/b.csv"] = '"b2"';
+    seen.length = 0;
+    const r = await run(p, cfg);
+    expect(seen).toEqual([`/a.csv "a1"`, `/b.csv "b1"`, "/a.csv -"]);
+    expect(r.extract).toMatchObject({ load: [B], context: [A] });
+    expect(r.result!.rows).toMatchObject({ in: 1, updated: 1, deleted: 0, total: 3 });
+    expect(await q(p, `SELECT id, v, _file FROM u ORDER BY id`)).toEqual([{ id: 1, v: "a", _file: A }, { id: 2, v: "a", _file: A }, { id: 3, v: "b", _file: B }]);
+
+    // a changes behind an unchanged ETag: the conditional GET says 304, the fallback read sees new content, so a is
+    // reloaded (and recorded) like any changed file rather than recorded without its rows.
+    bodies["/a.csv"] = "id,v\n1,a\n2,a\n4,a\n";
+    bodies["/b.csv"] = "id,v\n3,bb\n";
+    etags["/b.csv"] = '"b3"';
+    const r2 = await run(p, cfg);
+    expect(r2.extract.load).toEqual([A, B]);
+    expect(r2.extract.context).toBeUndefined();
+    expect(r2.result!.rows).toMatchObject({ in: 4, added: 1, updated: 1, total: 4 });
+    expect((await q<{ id: number }>(p, `SELECT id FROM u ORDER BY id`)).map((x) => x.id)).toEqual([1, 2, 3, 4]);
+    const sha = new Bun.CryptoHasher("sha256").update(bodies["/a.csv"]!).digest("hex");
+    expect(await q(p, `SELECT sha256 FROM _croft.files WHERE path = $1`, [A])).toEqual([{ sha256: sha }]);
   });
 
   test("an extension-less URL takes its format from Content-Type; bytes arrive intact (Parquet, latin-1)", async () => {

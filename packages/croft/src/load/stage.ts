@@ -8,6 +8,9 @@
 //   bigint is written as exact digits via JSON.rawJSON and Date as an ISO instant. The serializer is
 //   hand-written rather than JSON.stringify over a sorted copy, because JS objects list integer-like keys
 //   ("10", "9") before others whatever the insertion order.
+// - Numbers beyond DOUBLE (1e400) keep their source text: parseJsonLossless (and ctx.http's res.json()) hand
+//   them over as JSON.rawJSON, which stays a JSON number with its own text inside a JSON value (DuckDB's
+//   JSON keeps it [V]) and is staged as text when it is a column's value, since no numeric column holds it.
 // - Loud failures instead of silent JSON.stringify losses: Map/Set become {}, NaN/±Infinity become null,
 //   functions and symbols vanish. Those throw UNSERIALIZABLE_VALUE with the row and field, and a row that
 //   is not an object throws ROW_NOT_OBJECT.
@@ -44,7 +47,9 @@ const FLUSH_BYTES = 1 << 20;
 
 /**
  * JSON.parse that keeps integers beyond ±2^53 exact as bigint, via the reviver's `context.source` [V].
- * Plain JSON.parse turns 12345678901234567890 into 12345678901234567000.
+ * Plain JSON.parse turns 12345678901234567890 into 12345678901234567000. A number beyond DOUBLE's range (1e400),
+ * which JSON.parse turns into ±Infinity, comes back as JSON.rawJSON(source text): JSON.isRawJSON tells it apart,
+ * `.rawJSON` is the text, JSON.stringify writes it back exactly, and staging keeps it (§4.3).
  */
 export function parseJsonLossless(text: string): unknown {
   return JSON.parse(text, losslessReviver as (this: unknown, key: string, value: unknown) => unknown);
@@ -52,16 +57,23 @@ export function parseJsonLossless(text: string): unknown {
 
 /** The reviver behind parseJsonLossless, for callers that parse JSON themselves. */
 export function losslessReviver(_key: string, value: unknown, context?: { source?: string }): unknown {
-  if (typeof value === "number" && Number.isInteger(value) && !Number.isSafeInteger(value)) {
+  if (typeof value === "number" && !Number.isSafeInteger(value)) {
     const src = context?.source;
-    if (src !== undefined && /^-?\d+$/.test(src)) return BigInt(src);
+    if (src === undefined) return value;
+    if (Number.isInteger(value) && /^-?\d+$/.test(src)) return BigInt(src);
+    // JSON has no Infinity literal, so a non-finite parse is a number literal too large for a double.
+    if (!Number.isFinite(value)) return rawJSON(src);
   }
   return value;
 }
 
-// JSON.rawJSON (Bun, Node 21+) makes JSON.stringify emit a bigint's digits exactly [V]; TypeScript's lib does
-// not declare it yet.
+// JSON.rawJSON / JSON.isRawJSON (Bun, Node 21+) make JSON.stringify emit a text exactly: a bigint's digits,
+// a number beyond DOUBLE [V]. TypeScript's lib does not declare them yet.
 const rawJSON = (JSON as unknown as { rawJSON(text: string): unknown }).rawJSON;
+const isRawJSON = (JSON as unknown as { isRawJSON(v: unknown): boolean }).isRawJSON;
+
+/** Number text a double cannot hold: finite digits that parse to ±Infinity (1e400). */
+const beyondDouble = (text: string): boolean => /^-?\d/.test(text) && !Number.isFinite(Number(text));
 
 /** A value JSON cannot carry exactly. `path` is a JSONPath-like location inside the field. */
 export class UnserializableError extends Error {
@@ -123,6 +135,8 @@ function ser(v: unknown, st: SerState): string {
   }
   if (v === null) return "null";
   const obj = v as object;
+  // JSON.rawJSON (a number beyond DOUBLE from parseJsonLossless, or the asset's own): its text, exactly.
+  if (isRawJSON(obj)) return (obj as { rawJSON: string }).rawJSON;
   if (Array.isArray(obj)) return enter(st, obj, serArray);
   const proto = Object.getPrototypeOf(obj);
   // Plain objects (the common case) skip the checks for built-ins below.
@@ -426,9 +440,17 @@ export async function writeStage(o: StageOptions): Promise<StageManifestFile> {
     let line = `{"${RESERVED.seq}":${seq}`;
     for (let i = 0; i < keys.length; i++) {
       const field = keys[i]!;
+      const value = row[field];
       let text: string;
+      // A number beyond DOUBLE as a column value: no numeric column can hold it, so it is staged as its exact
+      // text (a text column, MIXED_TYPES next to numbers; TYPE_CONFLICT in a numeric one). Inside a JSON value
+      // canonicalJson keeps it a JSON number with its own text.
+      if (isRawJSON(value) && beyondDouble((value as { rawJSON: string }).rawJSON)) {
+        line += `,${JSON.stringify(names[i])}:${JSON.stringify((value as { rawJSON: string }).rawJSON)}`;
+        continue;
+      }
       try {
-        text = canonicalJson(row[field], {
+        text = canonicalJson(value, {
           onUnsafeInteger: (path, value) => {
             const col = names[i]!;
             const u = unsafe.get(col);
@@ -593,7 +615,10 @@ function unserializableHint(type: string): string {
   if (type === "Map") return "convert it with Object.fromEntries(map)";
   if (type === "Set") return "convert it with [...set]";
   if (/Array$|ArrayBuffer|DataView/.test(type)) return "convert binary data to a string (e.g. base64) or an array of numbers";
-  if (/NaN|Infinity/.test(type)) return "JSON has no NaN or Infinity; yield null (or a string) for such values";
+  if (/NaN|Infinity/.test(type)) {
+    return "JSON has no NaN or Infinity; yield null (or a string) for such values. A number too large for a double (1e400) " +
+      "becomes Infinity under JSON.parse or fetch's res.json(); ctx.http's res.json() keeps its text";
+  }
   if (type === "function" || type === "symbol") return "yield plain data: strings, numbers, booleans, null, arrays and objects";
   if (type.startsWith("Promise")) return "await the value before yielding the row";
   if (type === "Invalid Date") return "the Date is invalid; yield null or a valid date";

@@ -27,6 +27,12 @@
 // relative to the project root with `/` separators, an absolute path for a file outside the root, or its URL.
 // The snapshot a load reads is FileStatus.local.
 //
+// Overlapping files. With a key, a changed file is reloaded as a MERGE limited to the rows it owns (`_file`), and a
+// key's row belongs to the latest file that provided it. A key the changed file dropped may still be in another
+// file (exports overlap, §3b), so such a reload also reads the other present, unchanged files (FileExtract.context)
+// and marks their rows FALLBACK: write.ts gives the key to one of them instead of deleting it. New files alone
+// need no such read (they own no rows yet).
+//
 // Gone files. _croft.files has no "gone" marker, so none is invented: a file that disappeared keeps its row, and
 // extractFiles reports it on every run (status "gone", FileExtract.gone) by comparing _croft.files with what
 // exists. Its rows stay in the table (§6). A non-incremental ingest is a replace of the whole table, which removes
@@ -54,6 +60,7 @@ import { classify, classifyCsv, ident, sqlString, stageRaw } from "./classify.ts
 import { RESERVED, type TypedBatch } from "./contract.ts";
 import { currentDatabase, normalizeType, readTableSchema, tableRef, tempRef } from "./evolve.ts";
 import { ColumnNamer, cleanColumnName, type KnownName, parseJsonLossless, readStageManifest, STAGE_FILE, writeStage } from "./stage.ts";
+import { FALLBACK } from "./write.ts";
 import {
   type ColumnDecision, csvColumnType, csvValueKinds, type CsvStats, decimalParts, describeKinds, evolve, type IncomingColumn, jsKey,
   type KindCounts, type KnownColumn, type NewType, normalizePins, type Pin, typeFamily,
@@ -129,6 +136,10 @@ export interface FileExtract {
   stageDir: string;
   /** Paths whose rows this load writes (new and changed files; every file for a non-incremental ingest). */
   load: string[];
+  /** Unchanged files read along with a changed one by a keyed incremental ingest, so that a key the changed file
+   *  dropped falls back to a file that still has it instead of being deleted (write.ts "Overlapping files").
+   *  Their rows are marked FALLBACK in the batch; they are not reloaded and keep their _croft.files record. */
+  context?: string[];
   /** Paths that disappeared since the last load. Their rows are kept; status reports them. */
   gone: string[];
   /** True when nothing changed (all files unchanged, or URL answered 304): the runner skips the write. */
@@ -277,7 +288,12 @@ export async function extractFiles(input: ExtractFilesInput): Promise<FileExtrac
   const gone: FileStatus[] = input.known.filter((k) => !presentIds.has(k.path)).map((k) => ({ ...k, status: "gone" as const }));
   const changed = present.filter((p) => p.status !== "unchanged");
   const unchanged = incremental ? changed.length === 0 : changed.length === 0 && gone.length === 0;
-  const load = unchanged ? [] : incremental ? changed : present;
+  let load = unchanged ? [] : incremental ? changed : present;
+  // A keyed incremental reload of a changed file also reads the other present files: with overlapping exports,
+  // a key the changed file dropped may still be in one of them (write.ts "Overlapping files"). New files alone
+  // own no rows yet, so they need none; a preview writes nothing.
+  let context = incremental && key.length > 0 && input.previewRows === undefined && load.some((p) => p.status === "changed")
+    ? present.filter((p) => p.status === "unchanged") : [];
 
   // 3. One format for the whole asset.
   const formats = new Set<FileFormat>();
@@ -307,8 +323,8 @@ export async function extractFiles(input: ExtractFilesInput): Promise<FileExtrac
   const format: FileFormat = [...formats][0] ?? config.format ?? "csv";
 
   const result = (files: FileStatus[], staged: boolean, columnTypes?: Record<string, string>): FileExtract => ({
-    asset, format, files, stageDir, load: load.map((p) => p.path), gone: gone.map((g) => g.path), unchanged, warnings,
-    incremental, key, staged, ...(columnTypes ? { columnTypes } : {}),
+    asset, format, files, stageDir, load: load.map((p) => p.path), ...(context.length ? { context: context.map((p) => p.path) } : {}),
+    gone: gone.map((g) => g.path), unchanged, warnings, incremental, key, staged, ...(columnTypes ? { columnTypes } : {}),
     ...(input.previewRows !== undefined ? { previewRows: input.previewRows } : {}),
   });
   const publicStatus = (p: Present): FileStatus => {
@@ -321,11 +337,13 @@ export async function extractFiles(input: ExtractFilesInput): Promise<FileExtrac
   }
 
   // 4. Snapshots: what is hashed and recorded is exactly what is loaded.
-  for (const p of load) {
+  for (const p of present.filter((x) => load.includes(x) || context.includes(x))) {
     abort();
     if (p.url) {
-      // A 304 in a non-incremental load whose other files changed: the whole set is re-read, so fetch it again.
+      // A 304 in a non-incremental load whose other files changed, or a fallback read: the file is re-read, so
+      // fetch it again.
       if (!p.local) Object.assign(p, await fetchUrl({ url: p.url, known: knownBy.get(p.path), conditional: false, http: input.http, signal, asset, runId, snapPath, log, rebuild: true, keepStatus: p.status }));
+      if (p.status === "unchanged" && knownBy.get(p.path)?.sha256 !== p.sha256) p.status = "changed";
       continue;
     }
     const local = snapPath(basename(p.abs!));
@@ -339,6 +357,14 @@ export async function extractFiles(input: ExtractFilesInput): Promise<FileExtrac
       if (p.status === "unchanged") p.status = "changed";
     }
   }
+  // A file read for fallback rows that turned out to have changed is reloaded like any changed file; otherwise
+  // recordFiles would record its new sha256 without its rows being loaded.
+  if (context.some((p) => p.status !== "unchanged")) {
+    load = present.filter((p) => load.includes(p) || (context.includes(p) && p.status !== "unchanged"));
+    context = context.filter((p) => p.status === "unchanged");
+  }
+  const read = present.filter((p) => load.includes(p) || context.includes(p));
+  const contextPaths = new Set(context.map((p) => p.path));
 
   const map = typeof config.map === "function" ? config.map : undefined;
   const staged = format === "json" || format === "ndjson" || map !== undefined;
@@ -348,18 +374,21 @@ export async function extractFiles(input: ExtractFilesInput): Promise<FileExtrac
   let columnTypes: Record<string, string> | undefined;
   try {
     let db: Sql | null = null;
-    if (needsDb && load.length > 0) {
+    if (needsDb && read.length > 0) {
       mem = await openMemory({ timezone: input.timezone ?? "UTC", stateDir });
       db = new LeaseSql(await mem.connect(), { mode: "ts", timezone: input.timezone ?? "UTC" }, null);
     }
 
     // 5. CSV: encoding and dialect per file.
     if ((format === "csv" || format === "tsv") && db) {
-      await decideDialects(db, load, { asset, runId, format, csv: config.csv, knownColumns: input.knownColumns ?? [], warnings, abort });
+      // Findings about a file read only for fallback rows were reported when it was loaded.
+      const found: Problem[] = [];
+      await decideDialects(db, read, { asset, runId, format, csv: config.csv, knownColumns: input.knownColumns ?? [], warnings: found, abort });
+      warnings.push(...found.filter((w) => !contextPaths.has(String(w.details?.file ?? ""))));
     }
     // Parquet: a corrupt file fails here, before the write lease, with its name.
     if (format === "parquet" && db) {
-      for (const p of load) {
+      for (const p of read) {
         if (!p.local || p.size === 0) continue;
         try {
           await db.all(`DESCRIBE SELECT * FROM read_parquet(${sqlString(p.local)})`);
@@ -372,7 +401,7 @@ export async function extractFiles(input: ExtractFilesInput): Promise<FileExtrac
     // 6. Rows JavaScript must see: JSON files, and every format when map() cleans rows.
     if (staged) {
       columnTypes = format === "parquet" ? {} : undefined;
-      const source = stagedRows({ load, format, map, db, asset, runId, abort, columnTypes });
+      const source = stagedRows({ load: read, format, map, db, asset, runId, abort, columnTypes });
       await writeStage({
         dir: stageDir, asset, runId, source, knownColumns: input.knownColumns ?? [], signal,
         ...(input.previewRows !== undefined ? { maxRows: input.previewRows } : {}),
@@ -381,7 +410,9 @@ export async function extractFiles(input: ExtractFilesInput): Promise<FileExtrac
   } finally {
     mem?.close();
   }
-  log(`${asset}: loading ${load.length} file${load.length === 1 ? "" : "s"} (${format})${gone.length ? `; ${gone.length} gone` : ""}`);
+  log(`${asset}: loading ${load.length} file${load.length === 1 ? "" : "s"} (${format})` +
+    `${context.length ? `; reading ${context.length} unchanged file${context.length === 1 ? "" : "s"} for keys a changed file dropped` : ""}` +
+    `${gone.length ? `; ${gone.length} gone` : ""}`);
   return result([...present.map(publicStatus), ...gone], staged, columnTypes);
 }
 
@@ -1103,6 +1134,13 @@ export async function buildFileBatch(tx: Sql, input: BuildFileBatchInput): Promi
   const warnings = [...extract.warnings, ...batch.warnings];
   const dup = await duplicateRows(tx, extract, batch);
   if (dup) warnings.push(dup);
+  if (extract.context?.length) {
+    // Rows of files read only so a key a changed file dropped can fall back to them (write.ts FALLBACK).
+    const temp = tempRef(batch.temp);
+    await tx.exec(`ALTER TABLE ${temp} ADD COLUMN ${ident(FALLBACK)} BOOLEAN`);
+    await tx.exec(`UPDATE ${temp} SET ${ident(FALLBACK)} = list_contains(CAST($1::JSON AS VARCHAR[]), ${ident(RESERVED.file)})`,
+      [JSON.stringify(extract.context)]);
+  }
   return { ...batch, warnings, formats, ...(replaceFiles ? { replaceFiles } : {}) };
 }
 
@@ -1132,8 +1170,9 @@ interface RawCol {
   unsafeIntegers?: number;
 }
 
+/** The files the write step reads, in read order: the loaded ones and those read for fallback rows. */
 function loadedFiles(extract: FileExtract): FileStatus[] {
-  const want = new Set(extract.load);
+  const want = new Set([...extract.load, ...(extract.context ?? [])]);
   return extract.files.filter((f) => want.has(f.path) && f.status !== "gone");
 }
 
@@ -1535,9 +1574,12 @@ function fileTypeConflict(asset: string, d: ColumnDecision, readBy: string[] | u
     hint: "the load was rolled back; fix it in order: clean the value in map(), pin a type with a format, or pin VARCHAR",
     effect: "nothing was written; downstream assets keep their current data",
     asset, fix: fixes[0],
+    // §4.3's fields first (column, existingType, incomingKinds, badRows, samples, readBy); storedType, incoming
+    // and conflictKinds are kept for readers of the earlier names.
     details: {
-      column: d.column, sourceName: d.sourceName, storedType: stored, incoming: d.incoming, conflictKinds: d.conflictKinds ?? [],
-      format: d.format ?? null, badRows: d.badRows ?? null, samples: d.sampleRows ?? d.samples, readBy: readBy ?? [], fixes,
+      column: d.column, existingType: stored, incomingKinds: d.incoming, badRows: d.badRows ?? null, samples: d.sampleRows ?? d.samples,
+      readBy: readBy ?? [], sourceName: d.sourceName, storedType: stored, incoming: d.incoming, conflictKinds: d.conflictKinds ?? [],
+      format: d.format ?? null, fixes,
     },
   });
 }

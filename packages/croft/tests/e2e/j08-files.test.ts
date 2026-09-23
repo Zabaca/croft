@@ -94,6 +94,38 @@ test("journey 8: file glob, incremental: new file only, extra column added, chan
   expect((await p.rows("select count(*) n from sales where _file = 'files/sales/2026-02.csv'"))[0]!.n).toBe(3);
 }, 120_000);
 
+// §3b's sales.ts expects exports to overlap ("the key removes repeats"). A key's row comes from the latest file
+// that provided it, and a changed file that drops a key never deletes a row another file still has.
+test("journey 8f: overlapping exports: a key another export still has survives a re-export without it", async () => {
+  const { project: p } = await initProject();
+  p.write("assets/sales.ts", SALES);
+  p.write("files/sales/2026-01.csv", "order_id,order_date,email,amount\n1,2026-01-03,a@x.com,10.00\n2,2026-01-04,b@x.com,20.00\n3,2026-01-31,c@x.com,30.00\n");
+  p.write("files/sales/2026-02.csv", "order_id,order_date,email,amount\n3,2026-01-31,c@x.com,33.00\n4,2026-02-01,d@x.com,40.00\n");
+  const first = await p.json(["run", "sales"]);
+  expect(first.code, show(first)).toBe(0);
+  expect(first.json.data.steps[0].rows).toMatchObject({ in: 5, added: 4, total: 4 });
+  const table = () => p.rows("select order_id, amount, _file from sales order by order_id");
+  expect((await table())[2]).toEqual({ order_id: 3, amount: 33, _file: "files/sales/2026-02.csv" });
+
+  // February is re-exported without order 3; January still has it, so the row stays (January's now).
+  p.write("files/sales/2026-02.csv", "order_id,order_date,email,amount\n4,2026-02-01,d@x.com,40.00\n");
+  const second = await p.json(["run", "sales"]);
+  expect(second.code, show(second)).toBe(0);
+  expect(second.json.data.steps[0].rows).toEqual({ in: 1, added: 0, updated: 1, unchanged: 1, deleted: 0, total: 4 });
+  expect((await table()).map((r) => [r.order_id, r.amount, r._file])).toEqual([
+    [1, 10, "files/sales/2026-01.csv"], [2, 20, "files/sales/2026-01.csv"], [3, 30, "files/sales/2026-01.csv"], [4, 40, "files/sales/2026-02.csv"],
+  ]);
+  const third = await p.json(["run", "sales"]);
+  expect(third.json.data.steps[0].status, show(third)).toBe("unchanged");
+
+  // January drops order 3 too: no export has it any more, so it is deleted.
+  p.write("files/sales/2026-01.csv", "order_id,order_date,email,amount\n1,2026-01-03,a@x.com,10.00\n2,2026-01-04,b@x.com,20.00\n");
+  const fourth = await p.json(["run", "sales"]);
+  expect(fourth.code, show(fourth)).toBe(0);
+  expect(fourth.json.data.steps[0].rows).toMatchObject({ in: 2, deleted: 1, total: 3 });
+  expect((await table()).map((r) => r.order_id)).toEqual([1, 2, 4]);
+}, 120_000);
+
 // Fixed: when the only change is a deleted file, the step is "unchanged", and it now still records the gone files
 // in the catalog mirror, which `status` reads; DESIGN §3b says rows of a deleted file are kept "and status says
 // '2 files gone'".
@@ -136,7 +168,7 @@ test("journey 8d: status says the schema changed after a column was added", asyn
 
 // BUG (reported): §3b "Preview and the first run always print the header they used" (header detection is
 // what saves a header-less export from losing its first row); the first run's output never mentions it.
-bugTest("journey 8e: the first run of a CSV ingest prints the header it used", async () => {
+test("journey 8e: the first run of a CSV ingest prints the header it used", async () => {
   const { project: p } = await initProject();
   const human = await p.croft(["run", "example_sales"]);
   expect(human.code, show(human)).toBe(0);

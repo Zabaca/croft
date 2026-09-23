@@ -9,7 +9,8 @@
 //   the runner can tell Ctrl-C and its own timeout apart from an HTTP failure.
 // - HTTP_ERROR carries {method, url (redacted), status, attempts, retryAfterMs, requestIndex} and the
 //   first 500 bytes of the body. Every URL, body and message that leaves this module is redacted.
-// - res.next comes from the Link header; res.json() is lossless (unsafe integers become bigint).
+// - res.next comes from the Link header; res.json() is lossless (unsafe integers become bigint, and a number
+//   beyond DOUBLE such as 1e400 becomes JSON.rawJSON of its text instead of Infinity).
 // - getBytes() (croft's own, for file downloads) keeps the body as raw bytes; everything above applies.
 import { CroftError } from "../core/errors.ts";
 import type { Http, HttpInit, HttpResponse } from "../types.ts";
@@ -293,14 +294,19 @@ type Reviver = (this: unknown, key: string, value: unknown, context?: { source?:
 const losslessReviver: Reviver = (_key, value, context) => {
   // context.source is the literal text of a primitive. Only integer literals become bigint: 1e20 and
   // 1.5 are floats by the source's own choice and stay numbers.
-  if (typeof value === "number" && !Number.isSafeInteger(value) && context?.source !== undefined && /^-?\d+$/.test(context.source)) {
-    return BigInt(context.source);
+  if (typeof value === "number" && !Number.isSafeInteger(value) && context?.source !== undefined) {
+    if (/^-?\d+$/.test(context.source)) return BigInt(context.source);
+    // JSON has no Infinity literal: a non-finite parse is a number too large for a double (1e400). Its text is
+    // kept as JSON.rawJSON, which JSON.stringify and croft's staging write back exactly (§4.3).
+    if (!Number.isFinite(value)) return rawJson(context.source);
   }
   return value;
 };
 
 /** JSON.parse that keeps integers outside ±(2^53 − 1) exact, as bigint. Plain JSON.parse would turn
- *  12345678901234567890 into 12345678901234567000 [verified]. */
+ *  12345678901234567890 into 12345678901234567000 [verified]. A number beyond DOUBLE's range (1e400), which
+ *  JSON.parse turns into ±Infinity, comes back as JSON.rawJSON(its source text): JSON.isRawJSON(v) tells it
+ *  apart and `v.rawJSON` is the text. */
 export function parseJsonLossless(text: string): unknown {
   return JSON.parse(text, losslessReviver as (key: string, value: unknown) => unknown);
 }

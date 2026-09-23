@@ -266,7 +266,7 @@ describe("--allow-shrink through the CLI", () => {
       // The run record keeps the user's own arguments, never the hidden ones; it ran in a detached child.
       const r = db.listRuns()[0]!;
       expect(r).toMatchObject({ trigger: "confirm", argv: ["run", "zones", "--allow-shrink", "--json"] });
-      expect(existsSync(join(root, ".croft", "logs", r.id, "process.log"))).toBe(true);   // a detached child's output
+      expect(existsSync(join(root, ".croft", "logs", r.id, "_process.log"))).toBe(true);   // a detached child's output
       expect(existsSync(join(root, ".croft", "logs", r.id, "confirm-grant.json"))).toBe(false);   // redeemed once
     });
   }, 60_000);

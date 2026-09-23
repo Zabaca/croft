@@ -234,6 +234,13 @@ function stepLines(s: StepResult): string[] {
   if (s.cursor?.after !== undefined && s.cursor.after !== s.cursor.before) second.push(`since → ${s.cursor.after}`);
   if (s.trashed) second.push(`previous ${plural(s.trashed.rows, "row")} in the trash`);
   const lines = [head("ok", first.join(" · ")), `${pad}${second.join(" · ")}`];
+  if (s.csvHeader) {
+    const how = { declared: "as declared", sniffed: "detected", known: "matches the stored columns" }[s.csvHeader.from];
+    const shown = s.csvHeader.columns.slice(0, 6).join(", ") + (s.csvHeader.columns.length > 6 ? ", …" : "");
+    lines.push(s.csvHeader.header
+      ? `${pad}CSV header: first line (${how}): ${shown}`
+      : `${pad}CSV header: none (${how}); the first line is data, columns named ${shown}`);
+  }
   if (s.reason && s.reason !== "requested") lines.push(`${pad}${s.reason.replace(/^requested; /, "")}`);
   return lines;
 }

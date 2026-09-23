@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { formatInstant, parseInstant } from "../../core/time.ts";
-import { isAlive } from "../../core/proc.ts";
+import { recordAlive } from "../../core/proc.ts";
 import type { AssetKind, Problem } from "../../core/types.ts";
 import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
 import { logDir, tail } from "../../history/logs.ts";
@@ -107,8 +107,8 @@ export function ago(iso: string | null | undefined, now: Date): string {
 }
 
 export function runAlive(r: RunRecord): boolean {
-  if (r.pid === null || !r.procStart || !r.bootId) return false;
-  return isAlive({ pid: r.pid, procStart: r.procStart, bootId: r.bootId });
+  // A missing boot id is unknown, not dead (core/proc.ts recordAlive).
+  return recordAlive({ pid: r.pid, procStart: r.procStart, bootId: r.bootId });
 }
 
 /** What the run engine reports about a step while it works: the §4.3 ProgressSnapshot fields status shows. */
@@ -259,7 +259,7 @@ function serveOf(stateDir: string): { url: string; pid: number } | undefined {
   const rec = readServeRecord(stateDir);
   if (!rec) return undefined;
   let alive: boolean;
-  if (rec.procStart && rec.bootId) alive = isAlive({ pid: rec.pid, procStart: rec.procStart, bootId: rec.bootId });
+  if (rec.procStart) alive = recordAlive({ pid: rec.pid, procStart: rec.procStart, bootId: rec.bootId ?? null });
   else {
     try {
       process.kill(rec.pid, 0);

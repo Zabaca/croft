@@ -45,6 +45,18 @@ describe("lossless JSON (ctx.http)", () => {
     expect(String((JSON.parse(text) as { id: number }).id)).toBe("12345678901234567000");
     expect(canonicalJson(parseJsonLossless(text))).toBe(text);
   });
+
+  test("a number beyond DOUBLE (1e400) keeps its source text as JSON.rawJSON instead of becoming Infinity", () => {
+    const v = parseJsonLossless(`{"huge":1e400,"neg":-2.5E+999,"max":1.7976931348623157e308,"list":[1e400]}`) as Record<string, unknown>;
+    const isRaw = (JSON as unknown as { isRawJSON(x: unknown): boolean }).isRawJSON;
+    expect(isRaw(v.huge)).toBe(true);
+    expect((v.huge as { rawJSON: string }).rawJSON).toBe("1e400");
+    expect((v.neg as { rawJSON: string }).rawJSON).toBe("-2.5E+999");
+    expect(v.max).toBe(Number.MAX_VALUE);
+    expect(((v.list as unknown[])[0] as { rawJSON: string }).rawJSON).toBe("1e400");
+    // Inside a value it stays a JSON number with its own text; canonical order still applies.
+    expect(canonicalJson(v)).toBe(`{"huge":1e400,"list":[1e400],"max":1.7976931348623157e+308,"neg":-2.5E+999}`);
+  });
 });
 
 describe("canonicalJson", () => {
@@ -229,6 +241,14 @@ describe("writeStage", () => {
   test("bigint reaches the file as exact digits", async () => {
     const m = await stage([{ id: 12345678901234567890n, neg: -9223372036854775809n }]);
     expect(readFileSync(m.parts[0]!.path, "utf8")).toBe(`{"_croft_seq":1,"id":12345678901234567890,"neg":-9223372036854775809}\n`);
+  });
+
+  test("a number beyond DOUBLE from res.json() stages as its source text: a JSON number inside a value, text as a column", async () => {
+    const rows = parseJsonLossless(`[{"id":1,"payload":{"k":1,"huge":1e400}},{"id":2,"top":-1e400}]`) as unknown[];
+    const m = await stage([rows]);
+    expect(readFileSync(m.parts[0]!.path, "utf8")).toBe(
+      `{"_croft_seq":1,"id":1,"payload":{"huge":1e400,"k":1}}\n{"_croft_seq":2,"id":2,"top":"-1e400"}\n`);
+    expect(m.warnings).toEqual([]);
   });
 
   test("cleaned and case-resolved names reach the file; source names are kept in the manifest", async () => {

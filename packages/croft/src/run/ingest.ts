@@ -511,6 +511,14 @@ async function refreshFilesGone(i: IngestInput, gone: string[]): Promise<Catalog
   return next ?? undefined;
 }
 
+/** StepResult.csvHeader on a CSV ingest's first load: the header decision of its first loaded file. */
+function csvHeaderOf(files: FileExtract, columns: readonly { name: string }[]): Pick<StepResult, "csvHeader"> {
+  const d = files.files.find((f) => f.csv)?.csv;
+  if (!d) return {};
+  const names = columns.map((c) => c.name).filter((n) => !n.startsWith("_"));
+  return { csvHeader: { header: d.header, from: d.headerFrom, columns: names } };
+}
+
 /** StepResult.created for a table this step created: its columns (croft's _loaded_at aside) and JSON ones. */
 export function createdTable(columns: readonly { name: string; type: string }[]): NonNullable<StepResult["created"]> {
   const own = columns.filter((c) => c.name.toLowerCase() !== RESERVED.loadedAt);
@@ -720,6 +728,7 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
     ...(r.cursor ? { cursor: r.cursor } : {}),
     ...(trashed ? { trashed: { path: trashed.path, rows: trashed.rows } } : {}),
     ...(r.created ? { created: createdTable(out.catalog.columns) } : {}),
+    ...(r.created && files ? csvHeaderOf(files, out.catalog.columns) : {}),
     durationMs: Date.now() - started,
   };
   return { result, warnings, problems: [], catalog: out.catalog };

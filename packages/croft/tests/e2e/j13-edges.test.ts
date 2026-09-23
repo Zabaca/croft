@@ -214,10 +214,9 @@ export default ingest({ key: "id", async *rows({ http }) { yield (await http.get
     expect(findProblem(r.json, "NAME_RESERVED"), show(r)).toBeDefined();
   }, 60_000);
 
-  // BUG (reported): §4.3 says a number in a JSON column that DOUBLE cannot hold (1e400) keeps its source text,
-  // but res.json() turns it into Infinity and staging then fails the whole load with UNSERIALIZABLE_VALUE, whose
-  // hint blames the asset code ("yield null (or a string)") for valid JSON the API sent. Flip to test() once fixed.
-  bugTest("an API number beyond DOUBLE inside a JSON column keeps its source text", async () => {
+  // §4.3: a number in a JSON column that DOUBLE cannot hold (1e400) keeps its source text. res.json() hands it
+  // over as JSON.rawJSON (not Infinity), and staging writes that text back.
+  test("an API number beyond DOUBLE inside a JSON column keeps its source text", async () => {
     api.route("/huge", () => rawJson(`[{"id": 1, "payload": {"k": 1, "huge": 1e400}}]`));
     const { project: p } = await initProject();
     p.write("assets/huge.ts", `import { ingest } from "@zabaca/croft";
@@ -227,5 +226,7 @@ export default ingest({ key: "id", async *rows({ http }) { yield (await http.get
     expect(r.code, show(r)).toBe(0);
     const q = await p.json(["query", "select payload from huge"]);
     expect(q.stdout).toContain("1e400");
+    // Still a JSON number inside the column, with its own text.
+    expect(await p.rows("select payload::VARCHAR AS p, json_type(payload, '$.huge') AS t from huge")).toEqual([{ p: `{"huge":1e400,"k":1}`, t: "DOUBLE" }]);
   }, 60_000);
 });

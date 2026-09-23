@@ -138,7 +138,10 @@ function conflict(plan: ColumnPlan, message: string, details: Record<string, unk
   return new CroftError("TYPE_CONFLICT", {
     message,
     hint: "clean the value in rows() or map(), or pin a type in `columns`",
-    details: { column: plan.column, existing: plan.existing, incoming: plan.incoming, badRows: plan.badRows, samples: plan.samples, ...details },
+    details: {
+      column: plan.column, existingType: plan.existing, incomingKinds: plan.incoming, badRows: plan.badRows, samples: plan.samples,
+      existing: plan.existing, incoming: plan.incoming, ...details,
+    },
   });
 }
 

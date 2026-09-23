@@ -14,13 +14,24 @@
 //                NOT MATCHED BY SOURCE THEN DELETE; keyless: a multiset diff on the row's content
 //                append:  INSERT BY NAME
 //                merge:   MERGE with an unchanged-row skip; columns absent from the batch keep their values
-//                replaceFiles: the same diff, restricted to the rows of the reloaded files
+//                replaceFiles: the same diff, restricted to the rows of the reloaded files; with a key, see
+//                "Overlapping files" below
 //   checks       caller's blocking checks; a throw rolls the whole transaction back
 //   state        cursor, _croft.assets, _croft.columns, _croft.writes (with the step attempt) in the same transaction
 //
 // Changed rows get one stamp, greatest(now, last stamp + 1 µs), so _loaded_at is strictly increasing per
 // table even when the clock steps back; unchanged rows keep theirs, so downstream work wakes only for real
 // changes.
+//
+// Overlapping files (keyed incremental file ingests, DESIGN.md §3b sales.ts: "exports overlap; the key removes
+// repeats"). A key's row comes from the latest file that provided it: a file provides its keys when it is
+// loaded, and files loaded together provide them in read order (the batch dedupe keeps the last). So `_file`
+// names the file a row belongs to, and a reload of changed files (replaceFiles) may only delete a row that
+// belongs to a reloaded file AND whose key none of the files still has. files.ts therefore reads the asset's
+// other, unchanged files along with a changed one and marks their rows in the FALLBACK column. Those rows are
+// never loaded on their own: one of them is used only for a key whose row belongs to a reloaded file that no
+// longer has it, taken from the most recently loaded such file (_croft.files.loaded_at, then read order), and
+// it replaces the row in full (it is that file's row now). Only a key no file has any more is deleted.
 import { CroftError, problem } from "../core/errors.ts";
 import type { AssetKind, ColumnPlan, CursorType, Problem, SchemaChange, Sql, StepResult, ValueKind } from "../core/types.ts";
 import { type InstantInput, now as clockNow, toEpochMicros } from "../core/time.ts";
@@ -31,6 +42,13 @@ import { RESERVED, type TypedBatch, type WriteTarget } from "./contract.ts";
 import { detectSinceIgnored, nextCursor, resolveCursorType } from "./cursor.ts";
 import { currentDatabase, evolveTable, isReservedColumn, quoteIdent, quoteLiteral, type RealColumn, readTableSchema, tableRef,
   tempRef } from "./evolve.ts";
+
+/**
+ * BOOLEAN column files.ts adds to a typed batch that carries rows of unchanged files ("Overlapping files" above).
+ * It has no ColumnPlan, so it never reaches the table; a row with it true is a fallback candidate, never loaded
+ * on its own, and is not counted in rows.in.
+ */
+export const FALLBACK = "_croft_fallback";
 
 export interface CheckContext {
   asset: string;
@@ -147,6 +165,9 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
   const present = new Set<string>();
   for (const p of batch.columns) if (p.incoming.length > 0 && inBatch(p.column)) present.add(lower(p.column));
   if (inBatch(RESERVED.file)) present.add(RESERVED.file);
+  // Rows this write loads: fallback rows (FALLBACK) only stand in for keys a reloaded file dropped.
+  const fallbackCol = inBatch(FALLBACK)?.name;
+  const rowsIn = fallbackCol ? await countLoaded(tx, batch.temp, fallbackCol) : batch.rows;
 
   if (target.key.length > 0 && batch.rows > 0) await assertKeys(tx, asset, batch.temp, target.key, batchCols);
   if (target.write === "merge" && target.key.length === 0) {
@@ -154,8 +175,8 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
   }
 
   // Drift that needs the table as it was.
-  if (before.exists && before.rowCount > 0 && batch.rows >= 100) {
-    warnings.push(...(await stoppedArriving(tx, ref, asset, before, present, batch.rows, input.readBy ?? {})));
+  if (before.exists && before.rowCount > 0 && rowsIn >= 100) {
+    warnings.push(...(await stoppedArriving(tx, ref, asset, before, present, rowsIn, input.readBy ?? {})));
   }
   warnings.push(...jsonKindChanges(asset, batch.columns, stored, before.columns));
 
@@ -173,7 +194,10 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
   const n = ++tempSeq;
   const src = `__croft_w${n}_src`;
   const cursorCol = batch.cursor ? dataCols.find((c) => sameName(c.name, batch.cursor!.field)) : undefined;
-  const srcRows = await buildSource(tx, { asset, src, temp: batch.temp, dataCols, batchCols, key: target.key, cursorCol: cursorCol?.name });
+  const { rows: srcRows, fallbacks } = await buildSource(tx, {
+    asset, src, temp: batch.temp, dataCols, batchCols, key: target.key, cursorCol: cursorCol?.name, fallbackCol, ref,
+    replaceFiles: target.replaceFiles,
+  });
 
   // 3i: a replace ingest may not lose more than half its rows.
   if (kind === "ingest" && target.write === "replace" && !target.replaceFiles) {
@@ -183,10 +207,10 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
 
   const stampUs = await nextStamp(tx, asset, state, before, input.now);
   const stamp = isoMicros(stampUs);
-  const counts = await apply(tx, { ref, src, n, dataCols, present, target, srcRows, rowsBefore: before.rowCount, stamp });
+  const counts = await apply(tx, { ref, src, n, dataCols, present, target, srcRows, fallbacks, rowsBefore: before.rowCount, stamp });
 
   const after = await tableStats(tx, asset, db);
-  const rows = { in: batch.rows, ...counts, total: after.rowCount };
+  const rows = { in: rowsIn, ...counts, total: after.rowCount };
   if (input.checks) {
     const extra = await input.checks(tx, { asset, table: ref, batch: src, loadedAt: stamp, rows });
     if (extra) warnings.push(...extra);
@@ -235,7 +259,7 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
     `INSERT INTO _croft.writes (asset, loaded_at, run_id, mode, rows_in, added, updated, unchanged, deleted, cursor_before, cursor_after,
        since_used, inputs, schema_changes, code_hash, attempt)
      VALUES ($1, $2::TIMESTAMPTZ, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::JSON, $14::JSON, $15, $16::INTEGER)`,
-    [asset, stamp, target.runId, target.write, batch.rows, counts.added, counts.updated, counts.unchanged, counts.deleted,
+    [asset, stamp, target.runId, target.write, rowsIn, counts.added, counts.updated, counts.unchanged, counts.deleted,
       state?.cursor_value ?? null, cursorValue, input.sinceUsed === undefined ? null : String(input.sinceUsed),
       input.inputs === undefined ? null : json(input.inputs), json(evo.changes), input.codeHash ?? null, input.attempt ?? null],
   );
@@ -334,10 +358,26 @@ function losslessCast(from: string, to: string): boolean {
 
 interface SourceInput {
   asset: string; src: string; temp: string; dataCols: RealColumn[]; batchCols: RealColumn[]; key: string[]; cursorCol?: string;
+  /** The batch's FALLBACK column, when it has one. */
+  fallbackCol?: string;
+  /** The asset's table, and the files being reloaded (WriteTarget.replaceFiles). */
+  ref: string;
+  replaceFiles?: string[];
 }
 
-/** The batch as a TEMP table with exactly the table's data columns (absent ones NULL), deduplicated by key. */
-async function buildSource(tx: Sql, o: SourceInput): Promise<number> {
+/** Rows of the batch this write loads (FALLBACK rows excluded). */
+async function countLoaded(tx: Sql, temp: string, fallbackCol: string): Promise<number> {
+  const [row] = await tx.all<{ n: number | bigint }>(
+    `SELECT count(*) FILTER (WHERE NOT coalesce(${quoteIdent(fallbackCol)}, false)) AS n FROM ${tempRef(temp)}`);
+  return Number(row!.n);
+}
+
+/**
+ * The batch as a TEMP table with exactly the table's data columns (absent ones NULL), deduplicated by key.
+ * FALLBACK rows are left out, except, for a keyed file reload, one per key whose row belongs to a reloaded file
+ * that no longer has it ("Overlapping files" above); those carry FALLBACK = true in the source.
+ */
+async function buildSource(tx: Sql, o: SourceInput): Promise<{ rows: number; fallbacks: number }> {
   const b = (name: string) => o.batchCols.find((c) => sameName(c.name, name));
   const exprs: string[] = [];
   for (const col of o.dataCols) {
@@ -359,15 +399,38 @@ async function buildSource(tx: Sql, o: SourceInput): Promise<number> {
     }
   }
   exprs.push(`b.${quoteIdent(RESERVED.seq)} AS ${quoteIdent(RESERVED.seq)}`);
-  let sql = `SELECT ${exprs.join(", ")} FROM ${tempRef(o.temp)} AS b`;
+  const fb = o.fallbackCol ? `coalesce(b.${quoteIdent(o.fallbackCol)}, false)` : null;
+  const aligned = (where: string | null) => `SELECT ${exprs.join(", ")} FROM ${tempRef(o.temp)} AS b${where ? ` WHERE ${where}` : ""}`;
+  let sql = aligned(fb ? `NOT ${fb}` : null);
   // An empty batch may lack the key columns altogether (and so may the table); there is nothing to dedupe.
-  if (o.key.length && o.key.every((k) => o.dataCols.some((c) => sameName(c.name, k)))) {
+  const keyed = o.key.length > 0 && o.key.every((k) => o.dataCols.some((c) => sameName(c.name, k)));
+  if (keyed) {
     const order = [o.cursorCol ? `${quoteIdent(o.cursorCol)} DESC NULLS LAST` : null, `${quoteIdent(RESERVED.seq)} DESC`].filter(Boolean).join(", ");
     sql = `SELECT * FROM (${sql}) QUALIFY row_number() OVER (PARTITION BY ${o.key.map(quoteIdent).join(", ")} ORDER BY ${order}) = 1`;
   }
-  await tx.exec(`CREATE OR REPLACE TEMP TABLE ${quoteIdent(o.src)} AS ${sql}`);
+  const fileCol = o.dataCols.find((c) => sameName(c.name, RESERVED.file))?.name;
+  const withFallback = Boolean(fb && keyed && fileCol && o.replaceFiles?.length);
+  const flag = quoteIdent(FALLBACK);
+  await tx.exec(`CREATE OR REPLACE TEMP TABLE ${quoteIdent(o.src)} AS ${withFallback ? `SELECT *, false AS ${flag} FROM (${sql})` : sql}`);
+  let fallbacks = 0;
+  if (withFallback) {
+    const on = (l: string, r: string) => o.key.map((k) => `${l}.${quoteIdent(k)} = ${r}.${quoteIdent(k)}`).join(" AND ");
+    const file = quoteIdent(fileCol!);
+    // One candidate per key whose row belongs to a reloaded file and that no loaded row has: the most recently
+    // loaded file that has it, then the last in read order.
+    const [row] = await tx.all<{ Count: number | bigint }>(
+      `INSERT INTO ${tempRef(o.src)} BY NAME
+       SELECT * EXCLUDE (__croft_at), true AS ${flag} FROM (
+         SELECT a.*, f.loaded_at AS __croft_at FROM (${aligned(fb)}) AS a
+         LEFT JOIN _croft.files AS f ON f.asset = $1 AND f.path = a.${file}
+         WHERE EXISTS (SELECT 1 FROM ${o.ref} AS t WHERE ${on("t", "a")} AND t.${file} IN (${o.replaceFiles!.map(quoteLiteral).join(", ")}))
+           AND NOT EXISTS (SELECT 1 FROM ${tempRef(o.src)} AS s WHERE ${on("s", "a")})
+         QUALIFY row_number() OVER (PARTITION BY ${o.key.map((k) => `a.${quoteIdent(k)}`).join(", ")}
+           ORDER BY f.loaded_at DESC NULLS LAST, a.${quoteIdent(RESERVED.seq)} DESC) = 1)`, [o.asset]);
+    fallbacks = Number(row?.Count ?? 0);
+  }
   const [row] = await tx.all<{ n: number | bigint }>(`SELECT count(*) AS n FROM ${tempRef(o.src)}`);
-  return Number(row!.n);
+  return { rows: Number(row!.n), fallbacks };
 }
 
 /** greatest(now, last stamp + 1 µs) over every stamp croft knows for the table: last_loaded_at, the newest
@@ -383,7 +446,8 @@ async function nextStamp(tx: Sql, asset: string, state: AssetState | null, befor
 
 interface ApplyInput {
   ref: string; src: string; n: number; dataCols: RealColumn[]; present: Set<string>; target: WriteTarget;
-  srcRows: number; rowsBefore: number; stamp: string;
+  /** Rows in src, and how many of them are fallback rows (keyed file reloads only). */
+  srcRows: number; fallbacks: number; rowsBefore: number; stamp: string;
 }
 type Counts = { added: number; updated: number; unchanged: number; deleted: number };
 
@@ -425,7 +489,8 @@ async function emptyBatch(tx: Sql, o: ApplyInput): Promise<Counts> {
 }
 
 /** MERGE by key. replace: every column is compared and set (absent → NULL) and unmatched table rows are
- *  deleted; merge: only columns present in the batch are compared and set. */
+ *  deleted; merge: only columns present in the batch are compared and set. A fallback row (keyed file reload)
+ *  always matches a row of a reloaded file and replaces it in full: the row is that other file's now. */
 async function mergeByKey(tx: Sql, o: ApplyInput): Promise<Counts> {
   const { target } = o;
   const isKey = (name: string) => target.key.some((k) => sameName(k, name));
@@ -433,12 +498,16 @@ async function mergeByKey(tx: Sql, o: ApplyInput): Promise<Counts> {
   const stampCol = quoteIdent(RESERVED.loadedAt);
   const on = target.key.map((k) => `t.${quoteIdent(k)} = s.${quoteIdent(k)}`).join(" AND ");
   const clauses: string[] = [];
+  const setOf = (list: RealColumn[]) => list.map((c) => `${quoteIdent(c.name)} = s.${quoteIdent(c.name)}`).join(", ");
+  if (o.fallbacks > 0) {
+    // The first WHEN whose condition holds applies [V]. Its _file always differs (a reloaded file's row).
+    clauses.push(`WHEN MATCHED AND s.${quoteIdent(FALLBACK)} THEN UPDATE SET ${setOf(o.dataCols.filter((c) => !isKey(c.name)))}, ${stampCol} = $1::TIMESTAMPTZ`);
+  }
   if (valueCols.length) {
     const differs = valueCols.map((c) => `t.${quoteIdent(c.name)} IS DISTINCT FROM s.${quoteIdent(c.name)}`).join(" OR ");
-    const set = valueCols.map((c) => `${quoteIdent(c.name)} = s.${quoteIdent(c.name)}`).join(", ");
-    clauses.push(`WHEN MATCHED AND (${differs}) THEN UPDATE SET ${set}, ${stampCol} = $1::TIMESTAMPTZ`);
+    clauses.push(`WHEN MATCHED AND (${differs}) THEN UPDATE SET ${setOf(valueCols)}, ${stampCol} = $1::TIMESTAMPTZ`);
   }
-  clauses.push(`WHEN NOT MATCHED THEN INSERT (${cols(o.dataCols)}, ${stampCol}) VALUES (${cols(o.dataCols, "s.")}, $1::TIMESTAMPTZ)`);
+  clauses.push(`WHEN NOT MATCHED${o.fallbacks > 0 ? ` AND NOT s.${quoteIdent(FALLBACK)}` : ""} THEN INSERT (${cols(o.dataCols)}, ${stampCol}) VALUES (${cols(o.dataCols, "s.")}, $1::TIMESTAMPTZ)`);
   const scope = fileScope(target, "t.");
   if (scope) clauses.push(`WHEN NOT MATCHED BY SOURCE AND ${scope} THEN DELETE`);
   else if (target.write === "replace") clauses.push(`WHEN NOT MATCHED BY SOURCE THEN DELETE`);

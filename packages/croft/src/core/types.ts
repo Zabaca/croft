@@ -52,6 +52,9 @@ export interface StepResult {
   /** Present when this step created the table ("new table, 31 columns (7 JSON)", §4.2): its columns
    *  without croft's _loaded_at, and how many of them are JSON. */
   created?: { columns: number; jsonColumns: number };
+  /** CSV/TSV ingests on their first load: how the header was decided (§3b "the first run prints the header it
+   *  used"), so a header-less export that lost its first row is noticed at once. */
+  csvHeader?: { header: boolean; from: "declared" | "sniffed" | "known"; columns: string[] };
 }
 export type Fix =
   | { kind: "edit"; description: string; file: string; line?: number; replace?: { from: string; to: string }; insert?: string }
