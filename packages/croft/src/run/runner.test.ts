@@ -374,6 +374,17 @@ export default ingest({
     const later = await runIn(root, ["events"], { from: "9" });
     expect(later.exit).toBe(0);
   });
+
+  test("a transform named with --from is BACKFILL_UNSUPPORTED; in a bare run it is skipped", async () => {
+    api.state.issues = [{ id: 1, title: "a", updated_at: "2026-09-01T10:00:00Z" }];
+    const root = makeProject({ "assets/report.sql": "select 1 as x\n", "assets/issues.ts": keysetIssues(api.url) });
+    const named = await runIn(root, ["report"], { from: "-7d" });
+    expect(named.exit).toBe(1);
+    expect(named.data.steps[0]!.error).toMatchObject({ code: "BACKFILL_UNSUPPORTED", hint: "transforms rebuild from their inputs: croft run report --rebuild" });
+    const bare = await runIn(root, [], { from: "-7d" });
+    expect(bare.exit).toBe(0);
+    expect(bare.data.steps.find((s) => s.asset === "report")).toMatchObject({ status: "skipped", skippedBecause: "--from applies to merge ingests" });
+  });
 });
 
 describe("ctx.query over the asset's own table", () => {

@@ -33,7 +33,7 @@ import { redactProblem } from "../cli/render.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { loadProject, type Project } from "../project/root.ts";
 import { croftError, isRetryable, runIngest, type ShrinkDecider, SHRINK_ACTION, StepProgress, type ProgressSnapshot } from "./ingest.ts";
-import { isGlob, loadErrors, planRun, type PlannedStep, type RunPlan } from "./plan.ts";
+import { backfillUnsupported, isGlob, loadErrors, planRun, type PlannedStep, type RunPlan } from "./plan.ts";
 
 /** Delays before retries 1 and 2 (§8 "Retries"). */
 export const RETRY_DELAYS_MS: readonly number[] = [30_000, 120_000];
@@ -451,7 +451,18 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
       });
       for (const s of plan.steps) {
         if (s.action !== "skip") continue;
-        const skippedBecause = o.from !== undefined && s.kind !== "rows" ? "--from applies to merge ingests" : s.reason;
+        const unsupported = o.from !== undefined && o.selectors.includes(s.asset) ? backfillUnsupported(s) : null;
+        if (unsupported) {
+          // Named with --from: say why --from cannot apply, as for a replace ingest.
+          const p = { ...unsupported.problem, runId };
+          problems.push(p);
+          results.set(s.asset, {
+            asset: s.asset, status: "failed", reason: s.reason, behavior: s.behavior, attempt: 0, maxAttempts: 0,
+            rows: emptyRows(getCatalog(runs, s.asset)?.rows ?? 0), schemaChanges: [], checks: [], logsCommand: `croft logs ${s.asset}`, durationMs: 0, error: p,
+          });
+          continue;
+        }
+        const skippedBecause = o.from !== undefined ? "--from applies to merge ingests" : s.reason;
         results.set(s.asset, {
           asset: s.asset, status: "skipped", reason: s.reason, skippedBecause, behavior: s.behavior, attempt: 0, maxAttempts: 0,
           rows: emptyRows(getCatalog(runs, s.asset)?.rows ?? 0), schemaChanges: [], checks: [], logsCommand: `croft logs ${s.asset}`, durationMs: 0,
@@ -516,9 +527,17 @@ function dedupe(problems: Problem[]): Problem[] {
 
 /** --allow-shrink: a token off a TTY, a y/N question on one, or the confirmed token from `croft confirm`. */
 function shrinkDecider(o: RunnerOptions, runs: RunsDb): ShrinkDecider {
+  // A grant holds for the whole run: a retry after a busy database must not spend the token twice or ask twice.
+  // The asset lease keeps other croft runs off the table meanwhile.
+  const granted = new Map<string, number>();
   return async (req) => {
+    if (granted.get(req.asset) === req.rowsBefore) return { kind: "granted" };
     const command = shrinkCommand(req.asset);
     const confirmations = new Confirmations(runs);
+    const grant = () => {
+      granted.set(req.asset, req.rowsBefore);
+      return { kind: "granted" as const };
+    };
     if (o.confirmToken !== undefined) {
       await confirmations.consume(o.confirmToken, (stored) => {
         if (stored.command !== command) {
@@ -529,7 +548,7 @@ function shrinkDecider(o: RunnerOptions, runs: RunsDb): ShrinkDecider {
         }
         return req.impact;
       });
-      return { kind: "granted" };
+      return grant();
     }
     if (o.interactive && o.prompt) {
       const question = [
@@ -537,7 +556,7 @@ function shrinkDecider(o: RunnerOptions, runs: RunsDb): ShrinkDecider {
         `  first: the current ${req.rowsBefore} rows go to the trash (.croft/trash/${req.asset}/)`,
         "Proceed? [y/N] ",
       ].join("\n");
-      return (await o.prompt(question)) ? { kind: "granted" } : { kind: "declined" };
+      return (await o.prompt(question)) ? grant() : { kind: "declined" };
     }
     return { kind: "pending", confirmation: confirmations.create({ command, impact: req.impact }) };
   };

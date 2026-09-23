@@ -9,7 +9,7 @@ import { RunsDb } from "../../history/runs-db.ts";
 import { initProject } from "../../project/init.ts";
 import { eventsPath, runExample } from "../../run/runner.ts";
 import { listTrash } from "../../safety/trash.ts";
-import { cleanupProjects, cli, cliEnv, makeProject, mockApi, PKG, simpleGet, slowPages, startCli, until } from "../../run/testkit.ts";
+import { cleanupProjects, cli, cliEnv, keysetIssues, makeProject, mockApi, PKG, simpleGet, slowPages, startCli, until } from "../../run/testkit.ts";
 import { main } from "../main.ts";
 import { formatRun, progressLine, userArgs } from "./run.ts";
 
@@ -188,6 +188,45 @@ describe("signals and crashes", () => {
   }, 30_000);
 });
 
+describe("more crash points (CROFT_FAULT)", () => {
+  test("after_stage: extraction done, nothing written; the next run deletes the dead run's staging", async () => {
+    api.state.zones = [{ zone: 1 }, { zone: 2 }];
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    const killed = await cli(root, ["run", "zones", "--foreground", "--json"], cliEnv({ CROFT_FAULT: "after_stage" }));
+    expect(killed.signal).toBe("SIGKILL");
+    const deadId = withRuns(root, (db) => db.listRuns()[0]!.id);
+    expect(existsSync(join(root, ".croft", "staging", deadId, "zones", "manifest.json"))).toBe(true);
+    expect(existsSync(join(root, "warehouse.duckdb")) ? await count(root, "duckdb_tables() where table_name = 'zones'") : 0).toBe(0);
+    expect((await cli(root, ["run", "zones", "--foreground", "--json"])).code).toBe(0);
+    expect(existsSync(join(root, ".croft", "staging", deadId))).toBe(false);
+    withRuns(root, (db) => expect(db.getRun(deadId)!.status).toBe("crashed"));
+    expect(await count(root, "zones")).toBe(2);
+  }, 30_000);
+
+  test("between_trash_and_drop: the trash committed, the table did not change; a new confirmation finishes the job", async () => {
+    api.state.zones = Array.from({ length: 4 }, (_, i) => ({ zone: i + 1 }));
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    await cli(root, ["run", "zones", "--foreground", "--json"]);
+    api.state.zones = [];
+    const asked = await cli(root, ["run", "zones", "--allow-shrink", "--foreground", "--json"]);
+    const token = asked.json!.confirmation.token as string;
+    const killed = await cli(root, ["run", "zones", "--allow-shrink", "--confirm-token", token, "--foreground", "--json"], cliEnv({ CROFT_FAULT: "between_trash_and_drop" }));
+    expect(killed.signal).toBe("SIGKILL");
+    expect(listTrash(join(root, ".croft"), "zones")).toHaveLength(1);
+    expect(await count(root, "zones")).toBe(4);
+    // The spent token is stale; a new one (same impact) goes through.
+    const stale = await cli(root, ["run", "zones", "--allow-shrink", "--confirm-token", token, "--foreground", "--json"]);
+    expect(stale.code).toBe(5);
+    expect(stale.json!.data.steps[0].error.code).toBe("CONFIRMATION_STALE");
+    const again = await cli(root, ["run", "zones", "--allow-shrink", "--foreground", "--json"]);
+    const done = await cli(root, ["run", "zones", "--allow-shrink", "--confirm-token", again.json!.confirmation.token, "--foreground", "--json"]);
+    expect(done.code).toBe(0);
+    expect(await count(root, "zones")).toBe(0);
+    expect(listTrash(join(root, ".croft"), "zones")).toHaveLength(2);
+    withRuns(root, (db) => expect(db.listRuns()[0]!.trigger).toBe("confirm"));
+  }, 60_000);
+});
+
 describe("--allow-shrink through the CLI", () => {
   test("exit 5 with a confirmation; the hidden --confirm-token run (as croft confirm does it) trashes, then writes", async () => {
     api.state.zones = Array.from({ length: 4 }, (_, i) => ({ zone: i + 1 }));
@@ -244,6 +283,15 @@ describe("in-process command", () => {
     expect(existsSync(join(root, ".croft", "logs"))).toBe(true);
     const runId = withRuns(root, (db) => db.listRuns()[0]!);
     expect(runId.pid).toBe(process.pid);
+  });
+
+  test("--from=-90d reaches the engine and the since conversion is echoed in the step", async () => {
+    api.state.issues = [{ id: 1, title: "a", updated_at: "2026-09-01T10:00:00Z" }];
+    const root = makeProject({ "assets/issues.ts": keysetIssues(api.url) });
+    const r = await inProcess(root, ["run", "issues", "--from=-90d", "--foreground", "--json"]);
+    expect(r.exit).toBe(0);
+    expect(r.json.data.steps[0].reason).toMatch(/^requested; since: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}-0[78]:00\)$/);
+    expect(api.state.log[0]!.query.since).toBeDefined();
   });
 
   test("progressLine", () => {

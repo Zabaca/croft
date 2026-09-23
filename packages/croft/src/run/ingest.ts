@@ -574,6 +574,9 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
     try {
       trashed = await trashTable(warehouse, asset, `run --allow-shrink (${runId})`, { runId });
     } catch (te) {
+      // A busy database is worth a retry (the grant holds for this run); anything else stops here.
+      const busy = croftError(te);
+      if (busy && (busy.code === "DB_BUSY" || busy.code === "DB_HELD_BY_OTHER_PROGRAM")) throw busy;
       throw trashFailed(asset, te);
     }
     fault("between_trash_and_drop", i.fault);
@@ -600,9 +603,9 @@ export function confirmationProblem(c: Confirmation, rowsBefore: number, rowsAft
   return problem("CONFIRMATION_REQUIRED", {
     asset: c.impact.asset,
     message: `needs confirmation: ${c.impact.asset} would go from ${rowsBefore} rows to ${rowsAfter} (${SHRINK_ACTION})`,
-    hint: `first the current ${rowsBefore} rows go to the trash; show the user this impact and ask before confirming`,
+    hint: `first the current ${rowsBefore} rows go to the trash (croft restore ${c.impact.asset}); ask the user, and only if they agree: croft confirm ${c.token} (valid 15 min)`,
     effect: "nothing was changed",
-    fix: { kind: "manual", requiresHuman: true, description: `ask the user; only after an explicit yes: croft confirm ${c.token} (valid 15 min)` },
+    fix: { kind: "manual", requiresHuman: true, description: `show the user this impact; only after an explicit yes: croft confirm ${c.token}` },
     details: { token: c.token, expiresAt: c.expiresAt, rowsBefore, rowsAfter, trashPath: c.impact.trashPath ?? null },
   });
 }

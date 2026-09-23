@@ -135,7 +135,7 @@ export const run: CommandImpl<RunData> = {
     try {
       const delays = retryDelays(ctx.processEnv);
       const out = await executeRun({
-        project, env: ctx.env, selectors, argv, trigger: "manual", human: true, interactive,
+        project, env: ctx.env, selectors, argv, trigger: confirmToken !== undefined ? "confirm" : "manual", human: true, interactive,
         ...(runIdFlag ? { runId: runIdFlag } : {}), ...(from !== undefined ? { from } : {}), allowShrink,
         ...(confirmToken !== undefined ? { confirmToken } : {}),
         ...(interactive && !ctx.json ? { prompt: askYesNo } : {}),
