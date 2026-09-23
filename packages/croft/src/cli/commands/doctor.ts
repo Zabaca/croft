@@ -148,10 +148,9 @@ export async function runDoctor(cwd: string, d: DoctorDeps): Promise<{ data: Doc
     checkStorage(r, d, project);
     checkWritable(r, project);
   }
-  if (root) {
-    checkEnvFiles(r, root);
-    checkClaudeFiles(r, root);
-  }
+  if (root) checkEnvFiles(r, root);
+  if (project) await checkSecrets(r, d, project, probe.ok);
+  if (root) checkClaudeFiles(r, root);
   if (d.wsl) {
     r.add("environment", "wsl", "info", "WSL stops its VM when no terminal is open, so scheduled runs pause until one is");
   }
@@ -678,6 +677,52 @@ function checkEnvFiles(r: Report, root: string): void {
   if (!env.problems().length && !env.issues.length) {
     r.add("project", "env", "ok", existsSync(join(root, ".env")) ? "secrets: .env (read by croft; Bun's .env loading is off)" : "secrets: no .env yet");
   }
+}
+
+/**
+ * Declared secrets against the environment and .env (§2 "Referenced secret missing"): one SECRET_MISSING
+ * warning per declared name that is set in neither, naming the assets that use it, with the .env fix. The
+ * names come from the asset configs as `croft secrets` reads them: each TS asset is imported in isolation,
+ * which runs nothing past its top level (never rows() or run()); a file that does not import still has the
+ * names its text lists. Finding the assets needs DuckDB (asset names are checked against its keywords), so
+ * with a binding that does not load the check is skipped, and loaded only after the binding check passed.
+ */
+async function checkSecrets(r: Report, d: DoctorDeps, project: Project, bindingOk: boolean): Promise<void> {
+  if (!bindingOk) {
+    r.add("project", "secrets", "info", "declared secrets not checked (finding the assets needs the DuckDB binding)");
+    return;
+  }
+  let declared: Record<string, string[]>;
+  try {
+    const { discoverAssets } = await import("../../project/discover.ts");
+    const { loadConfigs, secretsByAsset } = await import("./describe.ts");
+    const { assets } = await discoverAssets(project.root, { assetsDir: project.paths.assetsDir });
+    declared = secretsByAsset(await loadConfigs(project, assets.filter((a) => a.kind === "ts"), { importTimeoutMs: 5000 }));
+  } catch (e) {
+    r.add("project", "secrets", "info", `declared secrets not checked: ${String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 200)}`);
+    return;
+  }
+  let env: ProjectEnv;
+  try {
+    env = ProjectEnv.load(project.root, d.env);
+  } catch {
+    return;                          // .env cannot be read: checkEnvFiles already says so
+  }
+  const list = env.listSecrets(declared);
+  if (list.length === 0) return;
+  const missing = list.filter((s) => s.status === "missing");
+  for (const s of missing) {
+    const p = problem("SECRET_MISSING", {
+      message: `secret ${s.name} is not set (used by ${s.usedBy.join(", ")})`,
+      hint: `add ${s.name}=... to .env (or run \`croft secrets set ${s.name}\` in your terminal)`,
+      fix: { kind: "manual", description: `ask the user to add ${s.name}=... to .env`, requiresHuman: true },
+      details: { name: s.name, usedBy: s.usedBy },
+    });
+    // A warning here: nothing fails until an asset that needs the secret runs (where it is an error).
+    p.severity = "warning";
+    r.add("project", "secrets", "warn", `${s.name} (used by ${s.usedBy.join(", ")})`, p, { name: s.name, usedBy: s.usedBy });
+  }
+  if (missing.length === 0) r.add("project", "secrets", "ok", `secrets: ${list.map((s) => s.name).join(", ")} set`);
 }
 
 /** CLAUDE.md's managed block and SKILL.md's version stamp against this croft (CLAUDE_FILES_OUTDATED). */

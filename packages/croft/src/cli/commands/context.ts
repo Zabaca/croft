@@ -268,7 +268,10 @@ export function formatContext(d: ContextData, now: Date): string {
   if (d.omitted?.length) lines.push("", `(${d.omitted.length} more assets not shown: ${d.omitted.join(", ")}; croft context --asset <name>)`);
   if (d.running.length) {
     lines.push("", "Running");
-    for (const r of d.running) lines.push(`  ${r.runId}${r.asset ? ` ${r.asset}` : ""} since ${ago(r.since, now)}`);
+    for (const r of d.running) {
+      const progress = [r.phase, r.rowsFetched !== null ? `${formatCount(r.rowsFetched)} rows fetched` : null].filter(Boolean);
+      lines.push(`  ${r.runId}${r.asset ? ` ${r.asset}` : ""} since ${ago(r.since, now)}${progress.map((x) => ` · ${x}`).join("")}`);
+    }
   }
   if (d.recentFailures.length) {
     lines.push("", "Recent failures (7 days)");

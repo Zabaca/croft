@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { putCatalog } from "../../history/catalog.ts";
 import { cleanup as cleanupChildren, spawnHolder, writeServeJson } from "../../read/testkit.ts";
@@ -68,6 +68,67 @@ describe("croft status --json", () => {
     const p = scenario();
     const d = (await cli(["status", "--json"], { cwd: p.root, env: ENV })).json.data;
     expect(d.running).toEqual([{ runId: "r_0922_1157_live", asset: "sales", pid: process.pid, since: "2026-09-22T11:56:00-07:00", phase: "extract", rowsFetched: 61200 }]);
+  });
+
+  const INGEST = `import { ingest } from "@zabaca/croft";\nexport default ingest({ async *rows() { yield []; } });\n`;
+  const PARALLEL = { "assets/a.ts": INGEST, "assets/b.ts": INGEST, "assets/c.ts": INGEST };
+  /** A live run of this process with a, b and c extracting side by side. */
+  function parallelRun(o: { progress?: unknown; events?: string[] }) {
+    const p = makeProject({ files: PARALLEL });
+    const db = runsDb(p.stateDir);
+    try {
+      const run = db.createRun({ id: "r_0922_1200_para", trigger: "manual", human: true, argv: ["run"] });
+      for (const asset of ["a", "b", "c"]) db.startStep({ runId: run.id, asset, attempt: 1, reason: "requested" });
+      if (o.progress !== undefined) db.setRunProgress(run.id, o.progress);
+    } finally {
+      db.close();
+    }
+    if (o.events) {
+      mkdirSync(join(p.stateDir, "logs", "r_0922_1200_para"), { recursive: true });
+      writeFileSync(join(p.stateDir, "logs", "r_0922_1200_para", "events.ndjson"), o.events.map((l) => `${l}\n`).join(""));
+    }
+    return p;
+  }
+  const progressEvent = (asset: string, phase: string, rowsFetched: number) =>
+    JSON.stringify({ type: "progress", runId: "r_0922_1200_para", asset, phase, rowsFetched, requests: 1, elapsedMs: 10, at: "2026-09-22T19:00:00.000Z" });
+  const running = async (root: string) => {
+    const d = (await cli(["status", "--json"], { cwd: root })).json.data;
+    return (d.running as { asset: string; phase: unknown; rowsFetched: unknown }[])
+      .map(({ asset, phase, rowsFetched }) => ({ asset, phase, rowsFetched })).sort((x, y) => x.asset.localeCompare(y.asset));
+  };
+
+  test("steps extracting side by side each show their own progress: runs.summary has the newest, events.ndjson the others", async () => {
+    const p = parallelRun({
+      progress: { asset: "b", phase: "write", rowsFetched: 900, requests: 9, elapsedMs: 5000 },
+      events: [
+        JSON.stringify({ type: "step", runId: "r_0922_1200_para", asset: "a", attempt: 1, status: "running" }),
+        progressEvent("a", "extract", 10),
+        progressEvent("b", "extract", 850),
+        progressEvent("a", "extract", 40),
+        progressEvent("b", "write", 900),
+      ],
+    });
+    expect(await running(p.root)).toEqual([
+      { asset: "a", phase: "extract", rowsFetched: 40 },
+      { asset: "b", phase: "write", rowsFetched: 900 },
+      { asset: "c", phase: null, rowsFetched: null },
+    ]);
+  });
+
+  test("progress that is absent or unreadable is null, never an error", async () => {
+    expect(await running(parallelRun({}).root)).toEqual([
+      { asset: "a", phase: null, rowsFetched: null }, { asset: "b", phase: null, rowsFetched: null }, { asset: "c", phase: null, rowsFetched: null },
+    ]);
+    const odd = parallelRun({
+      progress: { asset: "a", phase: 7, rowsFetched: "12" },
+      events: ["not json", JSON.stringify({ type: "progress", asset: "b" }), JSON.stringify({ type: "progress", asset: "c", phase: "extract", rowsFetched: -1 }), "{\"type\":\"progress\",\"asset\":"],
+    });
+    expect(await running(odd.root)).toEqual([
+      { asset: "a", phase: null, rowsFetched: null }, { asset: "b", phase: null, rowsFetched: null }, { asset: "c", phase: "extract", rowsFetched: null },
+    ]);
+    // Only the phase is known: the human line says what it knows.
+    const human = await cli(["status"], { cwd: odd.root });
+    expect(human.stdout).toMatch(/running {2}r_0922_1200_para {2}c {2}pid \d+ {2}since .+ {2}extract$/m);
   });
 
   test("--check exits 1 when unhealthy and 0 when healthy; ok stays true", async () => {

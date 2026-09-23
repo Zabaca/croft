@@ -8,22 +8,29 @@
 // - Paths in the SQL are relative to the project folder, wherever croft was started, so the zero-asset read
 //   `croft query "from 'files/sales/*.csv'"` works from any subfolder. Anything outside files/ is
 //   QUERY_PATH_DENIED.
+// - Before anything has run there is no warehouse, and a read-only command never creates it: the query runs
+//   on a private in-memory DuckDB with the same `query` sandbox, so the zero-asset path works in a fresh
+//   project. A table named there is DB_NOT_FOUND with the run that builds it (UNKNOWN_TABLE for other names).
 // - Rows are capped at 50 and values at 80 characters (--limit N and --full-values lift the caps), and the
 //   result is streamed: rows past the cap are counted in chunks, never converted to JavaScript.
 // - Values are redacted before they are cut (so a cut never leaves half a secret behind), after the
 //   project's declared secrets are declared (ProjectEnv.redactData hides those whatever they look like).
 //
 // --preview (the preview database) arrives with croft preview in phase 2.
-import { DuckDBResultReader } from "@duckdb/node-api";
+import { type DuckDBConnection, DuckDBInstance, DuckDBResultReader } from "@duckdb/node-api";
+import { existsSync } from "node:fs";
 import { CroftError } from "../../core/errors.ts";
+import { connect, instanceConfig } from "../../db/connect.ts";
 import type { ColumnInfo } from "../../db/values.ts";
 import { renderValue, resultColumns } from "../../db/values.ts";
+import type { Project } from "../../project/root.ts";
+import { didYouMean } from "../../project/suggest.ts";
 import { mapQueryError } from "../../read/select.ts";
 import { assertOneSelect } from "../../sql/gate.ts";
 import type { Row } from "../../types.ts";
 import type { CommandImpl } from "../command.ts";
 import { formatCount, formatDuration, table } from "../render.ts";
-import { capValue, declareProjectSecrets, readOnlyWarehouse } from "./describe.ts";
+import { type AssetConfig, capValue, declareProjectSecrets, readOnlyWarehouse } from "./describe.ts";
 
 export interface QueryData {
   columns: ColumnInfo[];
@@ -87,53 +94,13 @@ export const query: CommandImpl<QueryData> = {
     const full = ctx.values["full-values"] === true;
     const project = ctx.project;
     // Declared secrets first: their values are redacted from the rows whatever they look like.
-    await declareProjectSecrets(ctx, project);
+    const configs = await declareProjectSecrets(ctx, project);
 
-    const tz = project.timezone;
-    const warehouse = readOnlyWarehouse(ctx, project);
-    const raw = await warehouse.read((db) => inDirectory(project.root, async (): Promise<Raw> => {
-      const conn = db.connection;
-      await assertOneSelect(conn, sql, { profile: "query", protect: [project.paths.stateDir] });
-      let stmt;
-      try {
-        stmt = await conn.prepare(sql);
-      } catch (e) {
-        throw mapQueryError(e, "query");
-      }
-      try {
-        const result = await stmt.stream();
-        const reader = new DuckDBResultReader(result);
-        await reader.readUntil(limit);
-        const columns = resultColumns(reader);
-        const names = reader.deduplicatedColumnNames();
-        const types = reader.columnTypes();
-        const shown = Math.min(limit, reader.currentRowCount);
-        const rows: Row[] = [];
-        for (let r = 0; r < shown; r++) {
-          const row: Row = {};
-          for (let c = 0; c < names.length; c++) {
-            const v = renderValue(reader.value(c, r), types[c]!, { mode: "json", timezone: tz });
-            if (names[c] === "__proto__") Object.defineProperty(row, "__proto__", { value: v, enumerable: true, writable: true, configurable: true });
-            else row[names[c]!] = v;
-          }
-          rows.push(row);
-        }
-        // Count what is left without converting it: chunk by chunk, each dropped as soon as it is counted.
-        let rowCount = reader.currentRowCount;
-        if (!reader.done) {
-          for (;;) {
-            const chunk = await result.fetchChunk();
-            if (!chunk || chunk.rowCount === 0) break;
-            rowCount += chunk.rowCount;
-          }
-        }
-        return { columns, rows, rowCount };
-      } catch (e) {
-        throw mapQueryError(e, "query");
-      } finally {
-        stmt.destroySync();
-      }
-    }), { purpose: "croft query" });
+    const run = (conn: DuckDBConnection) => inDirectory(project.root, () => selectRows(conn, sql, limit, project.timezone, project.paths.stateDir));
+    // No warehouse yet (nothing has run): an in-memory DuckDB, never a new warehouse file.
+    const raw = existsSync(project.paths.database)
+      ? await readOnlyWarehouse(ctx, project).read((db) => run(db.connection), { purpose: "croft query" })
+      : await withoutWarehouse(project, configs, run);
 
     const redact = (s: string) => ctx.env.redactData(s);
     let truncatedValues = 0;
@@ -162,6 +129,101 @@ export const query: CommandImpl<QueryData> = {
     return formatQuery(result.data, performance.now() - ctx.startedAt);
   },
 };
+
+/** Gate, prepare and stream one SELECT: at most `limit` rows are converted, the rest counted chunk by chunk. */
+async function selectRows(conn: DuckDBConnection, sql: string, limit: number, tz: string, stateDir: string): Promise<Raw> {
+  await assertOneSelect(conn, sql, { profile: "query", protect: [stateDir] });
+  let stmt;
+  try {
+    stmt = await conn.prepare(sql);
+  } catch (e) {
+    throw mapQueryError(e, "query");
+  }
+  try {
+    const result = await stmt.stream();
+    const reader = new DuckDBResultReader(result);
+    await reader.readUntil(limit);
+    const columns = resultColumns(reader);
+    const names = reader.deduplicatedColumnNames();
+    const types = reader.columnTypes();
+    const shown = Math.min(limit, reader.currentRowCount);
+    const rows: Row[] = [];
+    for (let r = 0; r < shown; r++) {
+      const row: Row = {};
+      for (let c = 0; c < names.length; c++) {
+        const v = renderValue(reader.value(c, r), types[c]!, { mode: "json", timezone: tz });
+        if (names[c] === "__proto__") Object.defineProperty(row, "__proto__", { value: v, enumerable: true, writable: true, configurable: true });
+        else row[names[c]!] = v;
+      }
+      rows.push(row);
+    }
+    // Count what is left without converting it: chunk by chunk, each dropped as soon as it is counted.
+    let rowCount = reader.currentRowCount;
+    if (!reader.done) {
+      for (;;) {
+        const chunk = await result.fetchChunk();
+        if (!chunk || chunk.rowCount === 0) break;
+        rowCount += chunk.rowCount;
+      }
+    }
+    return { columns, rows, rowCount };
+  } catch (e) {
+    throw mapQueryError(e, "query");
+  } finally {
+    stmt.destroySync();
+  }
+}
+
+/** connect.ts keeps its sandbox bookkeeping per instance key. Each in-memory instance here is fresh, so it is
+ *  configured on its first connection, and one key serves every such query of a process. */
+const MEMORY_KEY = ":memory:croft-query";
+
+/**
+ * A query in a project that has no warehouse yet (nothing has run). It runs on a private in-memory DuckDB
+ * with the instance options and the `query` sandbox of every croft connection (files/ only, no extension
+ * loading, configuration locked), so `croft query "from 'files/x.csv'"` needs no run and creates no file.
+ */
+async function withoutWarehouse(project: Project, configs: readonly AssetConfig[], run: (conn: DuckDBConnection) => Promise<Raw>): Promise<Raw> {
+  const instance = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
+  let conn: DuckDBConnection | undefined;
+  try {
+    conn = await connect(instance, { profile: "query", timezone: project.timezone, root: project.root }, MEMORY_KEY);
+    return await run(conn);
+  } catch (e) {
+    throw notBuiltYet(e, project, configs);
+  } finally {
+    conn?.disconnectSync();
+    instance.closeSync();
+  }
+}
+
+/** A table named before the first run cannot exist yet. An asset's name is DB_NOT_FOUND with the run that
+ *  builds that one asset (not a bare `croft run`, which would fetch every ingest); another name stays
+ *  UNKNOWN_TABLE, with the closest asset name when there is one. */
+function notBuiltYet(e: unknown, project: Project, configs: readonly AssetConfig[]): unknown {
+  if (!(e instanceof CroftError) || e.code !== "UNKNOWN_TABLE") return e;
+  const table = /^no table named (\S+)/.exec(e.problem.message)?.[1]?.replace(/^"|"$/g, "");
+  if (!table) return e;
+  const names = configs.map((c) => c.name);
+  const asset = names.find((n) => n === table.toLowerCase());
+  if (asset) {
+    return new CroftError("DB_NOT_FOUND", {
+      message: `${asset} is not built yet: nothing has run in this project, so ${project.databaseLabel} does not exist`,
+      hint: `build it first: croft run ${asset} (files under files/ can be queried already)`,
+      fix: { kind: "command", description: `build ${asset}`, command: `croft run ${asset}` },
+      details: { ...e.problem.details, table, asset },
+    });
+  }
+  const guess = didYouMean(table, names);
+  return new CroftError("UNKNOWN_TABLE", {
+    message: `no table named ${table}: nothing has run in this project yet, so there are no tables`,
+    hint: guess ? `did you mean ${guess}? build it first: croft run ${guess}`
+      : names.length ? `the assets are ${names.join(", ")}; build one with croft run <asset>`
+      : "files under files/ can be queried already; croft new --list shows the assets croft can make",
+    ...(guess ? { fix: { kind: "command" as const, description: `build ${guess}`, command: `croft run ${guess}` } } : {}),
+    details: { ...e.problem.details, table, ...(guess ? { suggestion: guess } : {}) },
+  });
+}
 
 function shellArg(s: string): string {
   return `"${s.replace(/(["\\$`])/g, "\\$1")}"`;

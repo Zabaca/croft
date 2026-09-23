@@ -1,7 +1,8 @@
 // croft status [--check] (DESIGN.md §4.1, §4.2, §4.3 "status"; §5 "How commands behave while a run is
 // writing"): the freshness and health of every asset, and what is running. It never opens the warehouse,
 // so it never waits on DuckDB: it reads the catalog mirror and runs.sqlite (bun:sqlite, WAL, readable
-// while DuckDB is locked) and the asset files on disk. Asset code is not imported either: a TS file's
+// while DuckDB is locked), the asset files on disk, and for a live run's per-step progress the end of its
+// logs/<run>/events.ndjson. Asset code is not imported either: a TS file's
 // kind comes from the catalog, or from a look at its text when it has never run.
 //
 // Phase 1 has no scheduler: `next` is "manual" for ingests and "after inputs" for transforms, nothing is
@@ -17,6 +18,7 @@ import { formatInstant, parseInstant } from "../../core/time.ts";
 import { isAlive } from "../../core/proc.ts";
 import type { AssetKind, Problem } from "../../core/types.ts";
 import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
+import { logDir, tail } from "../../history/logs.ts";
 import { RUNS_DB_FILE, RunsDb, type RunRecord, type StepRecord } from "../../history/runs-db.ts";
 import { discoverAssets, type DiscoveredAsset } from "../../project/discover.ts";
 import type { Project } from "../../project/root.ts";
@@ -109,22 +111,61 @@ export function runAlive(r: RunRecord): boolean {
   return isAlive({ pid: r.pid, procStart: r.procStart, bootId: r.bootId });
 }
 
-/** What a live run reported about itself in runs.summary (the run engine's progress), when it did. */
-function progressOf(r: RunRecord): { asset?: string; phase?: string; rowsFetched?: number } {
-  const s = r.summary as { progress?: unknown } | null;
-  const p = s && typeof s === "object" ? s.progress : null;
+/** What the run engine reports about a step while it works: the §4.3 ProgressSnapshot fields status shows. */
+interface Progress { asset?: string; phase?: string; rowsFetched?: number }
+
+/** The fields of one progress snapshot ({asset, phase, rowsFetched, requests, elapsedMs}) that are usable;
+ *  anything else (absent, another shape, a negative count) is left out, so it shows as null. */
+function readProgress(p: unknown): Progress {
   if (!p || typeof p !== "object") return {};
   const o = p as Record<string, unknown>;
   return {
-    ...(typeof o.asset === "string" ? { asset: o.asset } : {}),
-    ...(typeof o.phase === "string" ? { phase: o.phase } : {}),
-    ...(typeof o.rowsFetched === "number" ? { rowsFetched: o.rowsFetched } : {}),
+    ...(typeof o.asset === "string" && o.asset ? { asset: o.asset } : {}),
+    ...(typeof o.phase === "string" && o.phase ? { phase: o.phase.slice(0, 40) } : {}),
+    ...(typeof o.rowsFetched === "number" && Number.isSafeInteger(o.rowsFetched) && o.rowsFetched >= 0 ? { rowsFetched: o.rowsFetched } : {}),
   };
 }
 
+/** A live run's runs.summary.progress: the newest snapshot of any of its steps (throttled by the run engine). */
+function summaryProgress(r: RunRecord): Progress {
+  const s = r.summary;
+  return s && typeof s === "object" ? readProgress((s as { progress?: unknown }).progress) : {};
+}
+
+/** Lines of events.ndjson read back for progress: at one snapshot per step per second, enough for every step
+ *  of a run with the default concurrency to appear, and still a small read from the end of the file. */
+const EVENT_TAIL_LINES = 2000;
+
+/** The newest progress event of each asset in a live run's events.ndjson (only the tail is read). runs.summary
+ *  holds just the newest snapshot of the whole run, so with steps extracting side by side the others' progress
+ *  is here. Empty when the file is missing or unreadable. */
+function eventProgress(stateDir: string, runId: string): Map<string, Progress> {
+  const out = new Map<string, Progress>();
+  let lines: string[];
+  try {
+    lines = tail(join(logDir(stateDir, runId), "events.ndjson"), EVENT_TAIL_LINES).lines;
+  } catch {
+    return out;
+  }
+  for (const line of lines) {
+    if (!line.includes('"progress"')) continue;
+    try {
+      const e = JSON.parse(line) as { type?: unknown };
+      if (e?.type !== "progress") continue;
+      const p = readProgress(e);
+      if (p.asset) out.set(p.asset, p);
+    } catch {}
+  }
+  return out;
+}
+
 /** Runs still marked running: the live ones as running[] entries (one per running step), and the ids of
- *  those whose process is gone (croft reconcile marks them crashed on the next write). */
-export function runningEntries(db: RunsDb | null, tz: string): { running: RunningEntry[]; dead: Set<string> } {
+ *  those whose process is gone (croft reconcile marks them crashed on the next write).
+ *
+ *  A step's phase and rowsFetched come from runs.summary.progress when that snapshot is the step's, and
+ *  otherwise from the step's newest progress event in the run's events.ndjson (read only when needed, with
+ *  `stateDir`); null when neither says. */
+export function runningEntries(db: RunsDb | null, tz: string, stateDir?: string): { running: RunningEntry[]; dead: Set<string> } {
   const running: RunningEntry[] = [];
   const dead = new Set<string>();
   if (!db) return { running, dead };
@@ -133,17 +174,24 @@ export function runningEntries(db: RunsDb | null, tz: string): { running: Runnin
       dead.add(r.id);
       continue;
     }
-    const progress = progressOf(r);
+    const latest = summaryProgress(r);
+    let events: Map<string, Progress> | null = null;
+    const progressFor = (asset: string): Progress => {
+      const own = latest.asset === asset ? latest : {};
+      if (own.phase !== undefined && own.rowsFetched !== undefined) return own;
+      events ??= stateDir ? eventProgress(stateDir, r.id) : new Map();
+      const logged = events.get(asset) ?? {};
+      return { phase: own.phase ?? logged.phase, rowsFetched: own.rowsFetched ?? logged.rowsFetched };
+    };
     const steps = db.stepsFor(r.id).filter((s) => s.status === "running");
     if (steps.length === 0) {
-      running.push({ runId: r.id, asset: progress.asset ?? null, pid: r.pid, since: zoned(r.startedAt, tz)!, phase: progress.phase ?? null,
-        rowsFetched: progress.rowsFetched ?? null });
+      running.push({ runId: r.id, asset: latest.asset ?? null, pid: r.pid, since: zoned(r.startedAt, tz)!, phase: latest.phase ?? null,
+        rowsFetched: latest.rowsFetched ?? null });
       continue;
     }
     for (const s of steps) {
-      const mine = progress.asset === s.asset;
-      running.push({ runId: r.id, asset: s.asset, pid: r.pid, since: zoned(s.startedAt, tz)!, phase: mine ? progress.phase ?? null : null,
-        rowsFetched: mine ? progress.rowsFetched ?? null : null });
+      const p = progressFor(s.asset);
+      running.push({ runId: r.id, asset: s.asset, pid: r.pid, since: zoned(s.startedAt, tz)!, phase: p.phase ?? null, rowsFetched: p.rowsFetched ?? null });
     }
   }
   return { running, dead };
@@ -249,7 +297,7 @@ export async function collectStatus(project: Project, now: Date, o: { kinds?: Re
   try {
     const catalog = db ? allCatalog(db) : [];
     const byName = new Map(catalog.map((c) => [c.asset, c]));
-    const { running, dead } = runningEntries(db, tz);
+    const { running, dead } = runningEntries(db, tz, project.paths.stateDir);
     const summaryChanges = schemaChangesFromRuns(db, new Date(now.getTime() - 7 * DAY_MS));
     const names = [...new Set([...discovery.assets.map((a) => a.name), ...catalog.map((c) => c.asset)])].sort();
     const files = new Map(discovery.assets.map((a) => [a.name, a]));
