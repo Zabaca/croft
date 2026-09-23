@@ -1,0 +1,13 @@
+{
+  "name": "gcp-service-account",
+  "modules": ["gcp-api"],
+  "description": "Converge one GCP service account and mint a fresh key for this apply — in memory, pruned to maxKeys, with readiness proved before dependents see it",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": ["GCP_SERVICE_ACCOUNT_KEY"],
+  "signupUrl": "https://console.cloud.google.com/",
+  "tokenUrl": "https://console.cloud.google.com/iam-admin/serviceaccounts",
+  "instructions": "Create ONE bootstrap service account in the project with roles/iam.serviceAccountAdmin (plus roles/iam.serviceAccountKeyAdmin), download its JSON key, and put the whole file in secrets.yaml as GCP_SERVICE_ACCOUNT_KEY (an instance administering a second project points `credentialSecret` at that project's key instead). Enable the IAM API (iam.googleapis.com) on the project. Each apply mints a FRESH key for the managed account and prunes its user-managed keys to `maxKeys` oldest-first, so the key the previous apply handed out keeps working while a deploy is in flight. The minted `saKey` never lands on disk — consume it downstream via imports (`{ name, from, output: 'saKey' }`), and give preview its own `serviceAccountId` so a preview rotation cannot invalidate production's credential. This ships the service-account half only: Google Calendar (or any other Google resource) belongs in a module that imports this one."
+}

@@ -1,0 +1,11 @@
+{
+  "name": "remote-provision",
+  "modules": ["provision-core"],
+  "description": "`vm-provision`'s discipline for a machine this repo does not host — the same converge, over SSH",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": [],
+  "instructions": "Converges a remote host over SSH rather than an incus guest, sharing `../provision-core`'s digest and marker logic so the two provisioners cannot disagree about what has already run. Needs an SSH key that reaches the target non-interactively."
+}

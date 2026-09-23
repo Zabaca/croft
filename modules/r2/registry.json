@@ -1,0 +1,9 @@
+{
+  "name": "r2",
+  "modules": ["cloudflare-api"],
+  "description": "Cloudflare R2 bucket, provisioned via the REST API. Pair with the cloudflare module's r2Bindings to wire the bucket into a Worker at deploy time.",
+  "files": [{ "path": "index.ts" }],
+  "secrets": ["CLOUDFLARE_API_TOKEN"],
+  "tokenUrl": "https://dash.cloudflare.com/profile/api-tokens",
+  "instructions": "Reads the Cloudflare API through `../cloudflare-api`; CLOUDFLARE_API_TOKEN needs the Account → Workers R2 Storage: Edit scope.\n\nInstance example:\n\n  // packages/infra/environments/production/inbox-raw.ts\n  import { r2Module } from '../../modules/r2'\n  export default r2Module.instance({\n    name: 'inbox-raw',\n    config: { accountId: '<account id>', bucketName: 'myproject-inbox-raw' },\n  })\n\nWire it into a Worker via the cloudflare module:\n\n  imports: [inboxRaw],\n  config: { ..., r2Bindings: [{ binding: 'RAW', from: 'inbox-raw', output: 'bucketName' }] }"
+}

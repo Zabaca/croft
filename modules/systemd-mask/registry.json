@@ -1,0 +1,10 @@
+{
+  "name": "systemd-mask",
+  "description": "Mask a user systemd unit — the symlink to /dev/null that makes a unit unstartable, plus the daemon-reload and reset-failed that make it take effect now",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": [],
+  "instructions": "Host-converging module: apply masks the unit for the user running apply (~/.config/systemd/user), needs loginctl lingering the same way systemd-unit does, and runs `systemctl --user daemon-reload` so the mask applies before the next login. `reason` is required and must be at least 30 characters: a masked unit is invisible until somebody wonders why a thing will not start, so the answer has to be in the declaration. An empty regular file at the unit path is NOT a mask — it is a unit with no ExecStart, which systemd will try to start and fail — and this module tells those apart. No `destroy` on purpose: unmasking is `systemctl --user unmask <unit>` plus deleting the instance file, so that re-arming a unit is never automatic."
+}

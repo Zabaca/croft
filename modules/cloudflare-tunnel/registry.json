@@ -1,0 +1,11 @@
+{
+  "name": "cloudflare-tunnel",
+  "modules": ["cloudflare-api"],
+  "description": "A remotely-managed Cloudflare tunnel, its ingress rules, the DNS records pointing at it, and the token `cloudflared` dials out with",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": [],
+  "instructions": "Reads the Cloudflare API through `../cloudflare-api`; needs a token with Tunnel and DNS write. It refuses to adopt a locally-managed tunnel, because that kind ignores the configuration API while returning success — the resulting drift is invisible from the dashboard and from an apply alike. The connector token is an output; write it to disk with a file-converging module rather than pasting it into a unit."
+}

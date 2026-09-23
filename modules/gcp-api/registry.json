@@ -1,0 +1,9 @@
+{
+  "name": "gcp-api",
+  "kind": "library",
+  "description": "The Google REST root, the RS256 JWT bearer grant and the error shape — so the modules that call Google do not each hand-roll the same sixty lines",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {},
+  "secrets": [],
+  "instructions": "The library every Google module imports as `../gcp-api`. It speaks raw REST and signs its own bearer assertion rather than pulling in `googleapis` or shelling out to `gcloud`: the grant is twenty lines, and a CI runner has neither the SDK nor the binary. Two consumers had already written it twice, identically."
+}

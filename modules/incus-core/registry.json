@@ -1,0 +1,22 @@
+{
+  "name": "incus-core",
+  "kind": "library",
+  "modules": ["host-exec"],
+  "description": "The `sudo incus` invocation and the JSON read every incus-touching module shares — one place where the decision to reach the daemon as root lives, plus the transcript of `incus config set --help` two renderers are anchored to",
+  "files": [
+    {
+      "path": "index.ts"
+    },
+    {
+      "path": "config-set-help.ts"
+    },
+    {
+      "path": "incus-config-set.help.txt"
+    }
+  ],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": [],
+  "instructions": "The library `vm`, `vm-provision` and any other daemon-facing module import as `../incus-core`; it reaches the machine through `../host-exec`, which `zbc add` installs with it. `config-set-help.ts` and the `.txt` beside it are test support: `incus config set --help` captured verbatim from incus 6.0.0, so a module's rendered argv can be checked against the binary rather than against a literal a renderer's author wrote."
+}

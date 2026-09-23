@@ -1,0 +1,10 @@
+{
+  "name": "systemd-unit",
+  "description": "Converge a systemd unit (service or timer) on the host running apply — user scope (~/.config/systemd/user, linger ensured) or system scope (/etc/systemd/system via sudo)",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": [],
+  "instructions": "Host-converging module: apply runs on the machine the unit should live on. scope=user needs loginctl lingering (apply ensures it); scope=system needs passwordless sudo for systemctl and writes to /etc/systemd/system. Restarts the unit when content changes."
+}

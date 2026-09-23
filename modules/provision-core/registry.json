@@ -1,0 +1,9 @@
+{
+  "name": "provision-core",
+  "kind": "library",
+  "description": "The digest-and-marker logic behind a provisioner: what has already run inside a guest, recorded so a second apply is a no-op rather than a re-run",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {},
+  "secrets": [],
+  "instructions": "The library `vm-provision` and `remote-provision` import as `../provision-core`. Pure — no exec, no filesystem — so it needs nothing installed and nothing substituted in a test."
+}

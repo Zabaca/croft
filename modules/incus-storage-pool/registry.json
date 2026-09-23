@@ -1,0 +1,14 @@
+{
+  "name": "incus-storage-pool",
+  "description": "An incus storage pool, so the `dir` default — no reflinks, no quotas — is a choice a declaration records rather than an accident of whatever the daemon had",
+  "files": [
+    {
+      "path": "index.ts"
+    }
+  ],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": [],
+  "instructions": "Host-converging module: creates a storage pool on the local incus daemon and installs the apt package that makes incus advertise the driver. `dir | btrfs | zfs | lvm`. `dir` writes guest disks straight onto the host filesystem: fastest for VM images, and it can express neither a copy-on-write clone nor a per-guest quota. Needs incus and passwordless sudo."
+}

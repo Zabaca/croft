@@ -1,0 +1,15 @@
+{
+  "name": "vm-provision",
+  "modules": [
+    "host-exec",
+    "incus-core",
+    "provision-core"
+  ],
+  "description": "The inside of an incus guest, converged repeatedly over `incus exec` — packages, files, units — with a digest so a second apply changes nothing",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": [],
+  "instructions": "Host-converging module: reaches the guest through `../incus-core` (and so `../host-exec`), and records what it has already run through `../provision-core`. Import the `vm` instance it provisions so a targeted apply converges them in order; it inherits that vm's `target`, so a remote guest is provisioned the same way a local one is."
+}

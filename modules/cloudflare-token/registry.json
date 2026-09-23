@@ -1,0 +1,13 @@
+{
+  "name": "cloudflare-token",
+  "modules": ["cloudflare-api"],
+  "description": "Mint scoped Cloudflare API tokens from one root credential (account-owned tokens API); R2 S3 credentials derived for free",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": ["CLOUDFLARE_ROOT_TOKEN"],
+  "signupUrl": "https://dash.cloudflare.com/sign-up",
+  "tokenUrl": "https://dash.cloudflare.com/?to=/:account/api-tokens",
+  "instructions": "Reads the Cloudflare API through `../cloudflare-api`. Create ONE account-owned root token in the dashboard (Manage Account → API Tokens) with 'Account API Tokens Write' — plus 'Zone Read' if instances use `zones` — and put it in secrets.yaml as CLOUDFLARE_ROOT_TOKEN. An instance minting into a SECOND Cloudflare account (a client's, say) sets `rootTokenSecret` to the key holding that account's root instead; omitting it keeps CLOUDFLARE_ROOT_TOKEN. Instances mint per-purpose tokens by permission-group NAME (as listed by GET /accounts/{id}/tokens/permission_groups). The minted value is ROLLED on every apply and exists only in memory: consume it downstream via imports (`{ name, from, output: 'tokenValue' }`), never store it, and never hand it to a human for local use (mint them a separate named token instead). Tokens with R2 permissions also emit s3AccessKeyId/s3SecretAccessKey (access key = token id, secret = sha256 of the value)."
+}
