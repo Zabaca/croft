@@ -14,9 +14,15 @@ export const RESERVED = { loadedAt: "_loaded_at", file: "_file", seq: "_croft_se
 export interface TypedBatch {
   /** TEMP table in the current write transaction. Holds one column per ColumnPlan.column
    *  (already cast to plan.target, or to the existing type), plus RESERVED.seq (BIGINT, yield
-   *  order) and, for file ingests, RESERVED.file. */
+   *  order), for file ingests RESERVED.file, and for cursor ingests the cursor's original text
+   *  (BatchCursor.rawTextColumn, "_croft_cursor_text"). SQL and TS transforms that reuse
+   *  writeBatch must also provide RESERVED.seq, e.g. row_number() OVER (). */
   temp: string;
-  /** One entry per column seen in the batch or known from earlier loads. */
+  /** One entry per column seen in the batch or known from earlier loads. cast.ts returns the richer
+   *  ColumnDecision (present, pinned, pending, format, ...), which write.ts uses for _croft.columns.
+   *  `incoming: []` means the field was absent from every row of the batch (a merge keeps stored
+   *  values); `["null"]` means present but NULL. Each TEMP column's type equals
+   *  `plan.target ?? plan.existing`; write.ts refuses lossy mismatches. */
   columns: ColumnPlan[];
   /** Row count of `temp`. */
   rows: number;

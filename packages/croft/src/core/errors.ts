@@ -47,6 +47,7 @@ export const CODES = {
   QUERY_NOT_SELECT: { category: "project", severity: "error", exit: 2 },
   USAGE_ERROR: { category: "project", severity: "error", exit: 2 },
   PROJECT_NOT_FOUND: { category: "project", severity: "error", exit: 2 },
+  QUERY_FAILED: { category: "project", severity: "error", exit: 2 },
   CONFIG_INVALID: { category: "project", severity: "error", exit: 2 },
   DB_NOT_FOUND: { category: "project", severity: "error", exit: 2 },
   HTTP_ERROR: { category: "run", severity: "error", exit: 1 },
@@ -77,6 +78,7 @@ export const CODES = {
   ASSET_BUSY: { category: "coordination", severity: "error", exit: 4 },
   SCHEDULE_HELD: { category: "coordination", severity: "error", exit: 4 },
   SERVE_UNAVAILABLE: { category: "coordination", severity: "error", exit: 4 },
+  SERVE_UNAUTHORIZED: { category: "coordination", severity: "error", exit: 2 },
   SERVE_UNSAFE_FILESYSTEM: { category: "coordination", severity: "error", exit: 4 },
   QUERY_TOO_MANY_ROWS: { category: "coordination", severity: "error", exit: 2 },
   CONFIRMATION_REQUIRED: { category: "safety", severity: "error", exit: 5 },
@@ -89,6 +91,9 @@ export const CODES = {
   DB_NEWER_FORMAT: { category: "environment", severity: "error", exit: 2 },
   CLAUDE_FILES_OUTDATED: { category: "environment", severity: "warning", exit: 0 },
   SCHEDULER_STALE: { category: "environment", severity: "warning", exit: 0 },
+  PROJECT_NOT_WRITABLE: { category: "environment", severity: "error", exit: 2 },
+  DB_UNREADABLE: { category: "environment", severity: "error", exit: 2 },
+  INSTALL_FAILED: { category: "environment", severity: "error", exit: 2 },
   ENV_FILE_IGNORED: { category: "warning", severity: "warning", exit: 0 },
   TABLE_MODIFIED_OUTSIDE_CROFT: { category: "warning", severity: "warning", exit: 0 },
   VOLATILE_SQL: { category: "warning", severity: "warning", exit: 0 },
@@ -111,6 +116,10 @@ export const CODES = {
   ORPHAN_TABLE: { category: "warning", severity: "warning", exit: 0 },
   OUT_OF_BAND_CHANGE: { category: "warning", severity: "warning", exit: 0 },
   ENV_FILE_INVALID: { category: "warning", severity: "warning", exit: 0 },
+  COLUMN_NAME_COLLISION: { category: "warning", severity: "warning", exit: 0 },
+  BUN_UNTESTED: { category: "warning", severity: "warning", exit: 0 },
+  DB_ON_SYNCED_FOLDER: { category: "warning", severity: "warning", exit: 0 },
+  TZDATA_MISMATCH: { category: "warning", severity: "warning", exit: 0 },
 } as const satisfies Record<string, CodeInfo>;
 
 export type Code = keyof typeof CODES;
