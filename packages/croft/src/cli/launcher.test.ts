@@ -1,12 +1,12 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { binOf, declaresCroft, launch, LAUNCH_ENV, launcherEnv, type LaunchPlan, OUTSIDE_PROJECT, planLaunch, type PlanInput, scanCommand, SELF_ROOT } from "./launcher.ts";
+import { binOf, bunInstall, declaresCroft, launch, LAUNCH_ENV, launcherEnv, type LaunchPlan, OUTSIDE_PROJECT, planLaunch, type PlanInput, scanCommand, SELF_ROOT } from "./launcher.ts";
 import { CROFT_VERSION } from "./version.ts";
 
-const MAIN = fileURLToPath(new URL("./main.ts", import.meta.url));
+const BIN = fileURLToPath(new URL("../../bin/croft.mjs", import.meta.url));
 const base = realpathSync(mkdtempSync(join(tmpdir(), "launcher-")));
 afterAll(() => rmSync(base, { recursive: true, force: true }));
 let n = 0;
@@ -117,9 +117,9 @@ describe("planLaunch", () => {
     // Pinned, but node_modules exists without croft, or the install failed: refuse, do not retry.
     const partial = dir({ "croft.json": CONFIG, "package.json": PINNING, "node_modules/.keep": "" });
     const refused = planLaunch(input(partial, ["run"]));
-    expect(refused).toMatchObject({ kind: "refuse", exit: 2, problem: { code: "DUCKDB_BINDING_MISSING", fix: { command: `cd ${partial} && bun install` } } });
+    expect(refused).toMatchObject({ kind: "refuse", exit: 2, problem: { code: "INSTALL_FAILED", fix: { command: `cd ${partial} && bun install` }, details: { root: partial, install: "not_run" } } });
     const failed = planLaunch(input(clone, ["run"], { installFailed: { exit: 1 } }));
-    expect(failed).toMatchObject({ kind: "refuse", problem: { code: "DUCKDB_BINDING_MISSING" } });
+    expect(failed).toMatchObject({ kind: "refuse", problem: { code: "INSTALL_FAILED", details: { install: "failed", exit: 1 } } });
     expect((failed as Extract<LaunchPlan, { kind: "refuse" }>).problem.message).toContain("bun install exited with 1");
   });
 
@@ -169,7 +169,7 @@ describe("launch", () => {
     expect(exit).toBe(4);
     expect(ranHere).toBe(false);
     const self = realpathSync(SELF_ROOT);
-    expect(delegated[0]!.plan).toEqual({ kind: "delegate", root: cwd, copy: self, bin: join(self, "src", "cli", "main.ts") });
+    expect(delegated[0]!.plan).toEqual({ kind: "delegate", root: cwd, copy: self, bin: join(self, "bin", "croft.mjs") });
     expect(delegated[0]!.env).toEqual({ PATH: "/bin", CROFT_DELEGATED_TO: self });
 
     // In that child (or when the shell holds the same value) the keys are only dropped from the environment.
@@ -211,8 +211,27 @@ describe("launch", () => {
     });
     expect(installs).toBe(1);
     expect(exit).toBe(2);
-    expect(JSON.parse(out[0]!).problems[0].code).toBe("DUCKDB_BINDING_MISSING");
+    expect(JSON.parse(out[0]!).problems[0].code).toBe("INSTALL_FAILED");
   });
+
+  test("bun install gets the launcher's environment without what Bun loaded from .env", async () => {
+    const root = dir({ "croft.json": CONFIG, "package.json": PINNING, ".env": "SECRET_X=from-dotenv\n" });
+    const seen: Record<string, string>[] = [];
+    await launch({
+      main: async () => 0, commandNames: names, argv: ["run"], cwd: root, env: { PATH: "/bin", SECRET_X: "from-dotenv", SHELL_Z: "kept" },
+      stdout: () => {}, stderr: () => {}, install: (_root, env) => { seen.push(env); return 1; },
+    });
+    expect(seen).toEqual([{ PATH: "/bin", SHELL_Z: "kept" }]);
+  });
+
+  test("the real install passes that environment to the child", () => {
+    // A root postinstall script records what it sees (Bun runs the root package's own scripts).
+    const root = dir({ "package.json": JSON.stringify({ private: true, scripts: { postinstall: `bun -e "require('fs').writeFileSync('seen', process.env.CROFT_TEST_MARK ?? 'none')"` } }) });
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
+    expect(bunInstall(root, { ...env, CROFT_TEST_MARK: "given" })).toBe(0);
+    expect(readFileSync(join(root, "seen"), "utf8")).toBe("given");
+  }, 30_000);
 });
 
 describe("launcherEnv", () => {
@@ -232,8 +251,8 @@ describe("launcherEnv", () => {
   });
 });
 
-test("the launcher, init and doctor load without DuckDB, so a broken binding cannot stop them", () => {
-  const files = ["./launcher.ts", "./commands/init.ts", "./commands/doctor.ts"].map((f) => fileURLToPath(new URL(f, import.meta.url)));
+test("the launcher, main, the registry, init and doctor load without DuckDB, so a broken binding cannot stop them", () => {
+  const files = ["./launcher.ts", "./main.ts", "./commands/index.ts", "./commands/init.ts", "./commands/doctor.ts"].map((f) => fileURLToPath(new URL(f, import.meta.url)));
   const script = `for (const f of ${JSON.stringify(files)}) await import(f);
     const keys = Object.keys(require.cache);
     console.log(JSON.stringify({ modules: keys.length, duckdb: keys.filter((k) => k.includes("@duckdb")) }));`;
@@ -248,7 +267,7 @@ describe("the real bin delegates to the project's pinned copy", () => {
     const base: Record<string, string> = {};
     for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !k.startsWith("CROFT_")) base[k] = v;
     // Started like the global shim (`#!/usr/bin/env bun`): without --no-env-file, so Bun loads cwd/.env.
-    const r = Bun.spawnSync([process.execPath, MAIN, ...args], { cwd, env: { ...base, ...env }, stdout: "pipe", stderr: "pipe" });
+    const r = Bun.spawnSync([process.execPath, BIN, ...args], { cwd, env: { ...base, ...env }, stdout: "pipe", stderr: "pipe" });
     const line = r.stdout.toString().split("\n").find((l) => l.includes("PINNED-COPY"));
     return { exit: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString(), marker: line ? JSON.parse(line) : null };
   }

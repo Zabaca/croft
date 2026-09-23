@@ -10,8 +10,9 @@ import { CROFT_VERSION, SKILL_PATH, skillMd } from "../../agent/templates.ts";
 import { initProject } from "../../project/init.ts";
 import { SELF_ROOT } from "../launcher.ts";
 import { main } from "../main.ts";
+import { BUN_TESTED } from "../version.ts";
 import {
-  BUN_TESTED, type DoctorCheck, type DoctorDeps, type DuckdbProbe, duckdbOffsets, formatBytes, formatDoctor, probeDuckdb, runDoctor,
+  type DoctorCheck, type DoctorDeps, type DuckdbProbe, duckdbOffsets, formatBytes, formatDoctor, probeDuckdb, runDoctor,
 } from "./doctor.ts";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "doctor-")));
@@ -131,9 +132,10 @@ describe("environment checks", () => {
     expect(check(old.data.checks, "bun")).toMatchObject({ status: "error", code: "BUN_TOO_OLD" });
     expect(old.problems[0]!.fix).toMatchObject({ kind: "command", command: "bun upgrade" });
     const newer = await runDoctor(dir, deps({ bunVersion: "9.0.0" }));
-    expect(check(newer.data.checks, "bun")).toMatchObject({ status: "warn", details: { tested: BUN_TESTED } });
+    expect(check(newer.data.checks, "bun")).toMatchObject({ status: "warn", code: "BUN_UNTESTED", details: { tested: BUN_TESTED } });
     expect(check(newer.data.checks, "bun").text).toContain(`newer than the newest Bun croft ${CROFT_VERSION} was tested on`);
-    expect(newer.problems).toEqual([]);
+    expect(newer.problems).toHaveLength(1);
+    expect(newer.problems[0]).toMatchObject({ severity: "warning", code: "BUN_UNTESTED", details: { bun: "9.0.0", tested: BUN_TESTED } });
     const tested = await runDoctor(dir, deps({ bunVersion: BUN_TESTED }));
     expect(check(tested.data.checks, "bun").status).toBe("ok");
   });
@@ -190,6 +192,17 @@ describe("environment checks", () => {
     expect(nowhere).toMatchObject({ ok: false });
   });
 
+  test("the probe child gets the environment doctor was given, not the one Bun started with", () => {
+    // BUN_OPTIONS reaches the child only through the env passed to it; this one makes @duckdb/* unloadable.
+    const preload = join(base, "block-duckdb.js");
+    writeFileSync(preload, `Bun.plugin({ name: "block", setup(b) { b.onResolve({ filter: /^@duckdb\\// }, () => { throw new Error("blocked through env"); }); } });\n`);
+    const env = { ...process.env, BUN_OPTIONS: `--preload ${preload}` };
+    const blocked = probeDuckdb(SELF_ROOT, env);
+    expect(blocked).toMatchObject({ ok: false });
+    expect(JSON.stringify(blocked)).toContain("blocked through env");
+    expect(probeDuckdb(SELF_ROOT, { ...process.env, BUN_OPTIONS: undefined })).toMatchObject({ ok: true });
+  });
+
   test("croft pinning", async () => {
     const dir = await project();
     const declared = await runDoctor(dir, deps());
@@ -237,9 +250,11 @@ describe("warehouse checks", () => {
     const broken = await project();
     writeFileSync(join(broken, "warehouse.duckdb"), "this is not a duckdb file at all, just text".repeat(200));
     const { data, problems } = await runDoctor(broken, deps());
-    expect(check(data.checks, "warehouse").status).toBe("error");
+    expect(check(data.checks, "warehouse")).toMatchObject({ status: "error", code: "DB_UNREADABLE" });
     expect(check(data.checks, "warehouse").text).toContain("cannot be opened");
-    expect(problems).toEqual([]);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toMatchObject({ severity: "error", code: "DB_UNREADABLE", details: { path: join(broken, "warehouse.duckdb") } });
+    expect(problems[0]!.message).toContain("warehouse.duckdb cannot be opened as a DuckDB database");
   });
 
   test("the binding does not load: the file is described but not opened", async () => {
@@ -359,13 +374,25 @@ describe("croft serve detection", () => {
 });
 
 describe("project checks", () => {
-  test("a database in a synced folder: SERVE_UNSAFE_FILESYSTEM with the relocation fix", async () => {
+  test("a database in a synced folder: DB_ON_SYNCED_FOLDER with the relocation fix", async () => {
     const root = await project();
     const { data, problems } = await runDoctor(root, deps({ synced: (p) => (p.startsWith(root) ? "iCloud Drive" : null) }));
-    expect(check(data.checks, "storage")).toMatchObject({ status: "error", code: "SERVE_UNSAFE_FILESYSTEM" });
-    const p = problems.find((x) => x.code === "SERVE_UNSAFE_FILESYSTEM")!;
+    expect(check(data.checks, "storage")).toMatchObject({ status: "warn", code: "DB_ON_SYNCED_FOLDER" });
+    expect(problems.map((x) => x.code)).toEqual(["DB_ON_SYNCED_FOLDER"]);
+    const p = problems[0]!;
+    expect(p.severity).toBe("warning");
     expect(p.fix).toMatchObject({ kind: "manual", requiresHuman: true });
     expect(p.hint).toContain(`"database": "~/.local/share/croft/`);
+  });
+
+  test("a database on a network filesystem or a WSL drive: SERVE_UNSAFE_FILESYSTEM", async () => {
+    const root = await project();
+    for (const why of ["a network filesystem (nfs)", "a network filesystem (9p)", "a Windows drive under WSL (/mnt/<drive>)"]) {
+      const { data, problems } = await runDoctor(root, deps({ synced: (p) => (p.startsWith(root) ? why : null) }));
+      expect(check(data.checks, "storage")).toMatchObject({ status: "error", code: "SERVE_UNSAFE_FILESYSTEM" });
+      expect(problems.map((x) => x.code)).toEqual(["SERVE_UNSAFE_FILESYSTEM"]);
+      expect(problems[0]!.message).toContain(why);
+    }
   });
 
   test("a relocated project in a synced folder is fine", async () => {
@@ -385,8 +412,9 @@ describe("project checks", () => {
     chmodSync(join(root, ".croft"), 0o500);
     try {
       const { data, problems } = await runDoctor(root, deps());
-      expect(check(data.checks, "writable")).toMatchObject({ status: "error", code: "REQUIRES_HUMAN" });
-      expect(problems.find((p) => p.code === "REQUIRES_HUMAN")!.details).toMatchObject({ check: "project_writable" });
+      expect(check(data.checks, "writable")).toMatchObject({ status: "error", code: "PROJECT_NOT_WRITABLE" });
+      expect(problems.map((p) => p.code)).toEqual(["PROJECT_NOT_WRITABLE"]);
+      expect(problems[0]!.details).toMatchObject({ dir: join(root, ".croft"), error: "EACCES" });
     } finally {
       chmodSync(join(root, ".croft"), 0o700);
     }
@@ -475,6 +503,47 @@ describe("human output", () => {
 
   test("formatBytes", () => {
     expect([0, 1023, 1024, 1536, 412 * 1024 * 1024, 5 * 1024 ** 3].map(formatBytes)).toEqual(["0 B", "1023 B", "1 KB", "1.5 KB", "412 MB", "5 GB"]);
+  });
+
+  test("each problem is shown under its check, with its fix, and nowhere else (§2)", () => {
+    const text = formatDoctor({
+      checks: [
+        { id: "bun", section: "environment", status: "ok", text: "bun 1.3.14 (darwin-arm64), needs >= 1.3.14" },
+        { id: "claude", section: "project", status: "warn", text: "CLAUDE_FILES_OUTDATED SKILL.md is old", code: "CLAUDE_FILES_OUTDATED" },
+        { id: "writable", section: "project", status: "error", text: ".croft/ is not writable (EACCES)", code: "PROJECT_NOT_WRITABLE" },
+      ],
+      summary: { ok: 1, info: 0, warnings: 1, errors: 1 },
+      project: null,
+    }, [
+      { severity: "warning", code: "CLAUDE_FILES_OUTDATED", message: "m", hint: "run croft init --claude", docs: "croft docs CLAUDE_FILES_OUTDATED",
+        fix: { kind: "command", description: "refresh", command: "croft init --claude" } },
+      { severity: "error", code: "PROJECT_NOT_WRITABLE", message: "m", hint: "make /p/.croft writable for your user", docs: "croft docs PROJECT_NOT_WRITABLE",
+        fix: { kind: "manual", description: "make /p/.croft writable for your user", requiresHuman: true } },
+    ]);
+    expect(text).toBe([
+      "Environment",
+      "  ok    bun 1.3.14 (darwin-arm64), needs >= 1.3.14",
+      "Project",
+      "  warn  CLAUDE_FILES_OUTDATED SKILL.md is old",
+      "        fix: croft init --claude",
+      "  error PROJECT_NOT_WRITABLE .croft/ is not writable (EACCES)",
+      "        fix: make /p/.croft writable for your user",
+      "1 error, 1 warning",
+    ].join("\n"));
+  });
+
+  test("croft doctor prints problems inline, not again after the summary", async () => {
+    const root = await project();
+    writeFileSync(join(root, ".env"), "GOOD=1\nnot a pair\n");
+    let out = "";
+    const exit = await main(["doctor"], { cwd: root, env: {}, stdout: (t) => { out += t; }, stderr: () => {}, stdoutTTY: false });
+    expect(exit).toBe(0);
+    expect(out).toContain("  warn  ENV_FILE_INVALID .env: line 2");
+    expect(out).toContain("        fix: fix that line of .env (KEY=value)\n");
+    expect(out.match(/ENV_FILE_INVALID/g)).toHaveLength(1);
+    // The summary is the last line: no problem block is appended after it (the pinned croft is not installed
+    // in this fixture, which is the other warning).
+    expect(out.trimEnd().split("\n").at(-1)).toBe("2 warnings");
   });
 
   test("the real command prints sections and exits 0 on a healthy project", async () => {

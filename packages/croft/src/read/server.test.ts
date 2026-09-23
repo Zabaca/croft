@@ -70,11 +70,11 @@ describe("the /query request", () => {
 });
 
 describe("tokens", () => {
-  test("a wrong token is SERVE_UNAVAILABLE (unauthorized), not retried, and never echoed", async () => {
+  test("a wrong token is SERVE_UNAUTHORIZED, not retried, and never echoed", async () => {
     const m = mock({ token: "right" });
     const e = await rejection(serverQuery(target(m.url, "wrong-token-value"), req(), T()));
-    expect(e.code).toBe("SERVE_UNAVAILABLE");
-    expect(e.problem.details).toMatchObject({ reason: "unauthorized", status: 401, tokenSource: "option" });
+    expect(e.code).toBe("SERVE_UNAUTHORIZED");
+    expect(e.problem.details).toMatchObject({ status: 401, tokenSource: "option" });
     expect(e.problem.retryable).toBe(false);
     expect(JSON.stringify(e.problem)).not.toContain("wrong-token-value");
     expect(m.seen).toHaveLength(1);
@@ -83,6 +83,7 @@ describe("tokens", () => {
   test("no token at all says so", async () => {
     const m = mock({ token: "right" });
     const e = await rejection(serverQuery(target(m.url, null), req(), T()));
+    expect(e.code).toBe("SERVE_UNAUTHORIZED");
     expect(e.message).toContain("requires a token");
     expect(m.seen[0]!.headers.authorization).toBeUndefined();
   });
@@ -91,6 +92,10 @@ describe("tokens", () => {
     const p = problem("SERVE_UNSAFE_FILESYSTEM", { message: "nope", hint: "h" });
     const m = mock({ answer: () => Response.json(envelope([], { ok: false, problems: [p] }), { status: 401 }) });
     expect((await rejection(serverQuery(target(m.url), req(), T()))).code).toBe("SERVE_UNSAFE_FILESYSTEM");
+    // Including the server's own SERVE_UNAUTHORIZED.
+    const u = problem("SERVE_UNAUTHORIZED", { message: "croft serve rejected the token", hint: "h" });
+    const m2 = mock({ answer: () => Response.json(envelope([], { ok: false, problems: [u] }), { status: 401 }) });
+    expect((await rejection(serverQuery(target(m2.url), req(), T()))).problem).toMatchObject({ code: "SERVE_UNAUTHORIZED", message: "croft serve rejected the token" });
   });
 });
 

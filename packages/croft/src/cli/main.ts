@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 // The croft CLI (DESIGN.md §4). One invocation: find the command, parse its flags with
-// node:util parseArgs, run it, and print either one --json envelope or human text. A CroftError
-// becomes its problem and exit code; anything else is INTERNAL_ERROR with a trimmed stack.
+// node:util parseArgs, load its module (the registry is lazy), run it, and print either one --json
+// envelope or human text. A CroftError becomes its problem and exit code; a module that cannot load
+// the DuckDB binding is DUCKDB_BINDING_MISSING/LOAD; anything else is INTERNAL_ERROR with a trimmed
+// stack. The package's bin is bin/croft.mjs, which checks for Bun and then calls cli().
 import { parseArgs, type ParseArgsConfig } from "node:util";
 import { fileURLToPath } from "node:url";
 import { CODES, CroftError, EXIT, exitCodeFor, problem } from "../core/errors.ts";
@@ -98,9 +100,11 @@ export async function main(argv: readonly string[], io: MainIO = {}): Promise<nu
     ctx.argv = rest;
     ctx.values = parsed.values;
     ctx.positionals = parsed.positionals;
+    // A lazily registered command's module is imported only now, once its flags are known to be good.
+    if (cmd.load) cmd = await cmd.load();
     result = await cmd.run(ctx);
   } catch (e) {
-    failure = toFailure(e);
+    failure = toFailure(bindingFailure(e, cmd?.name ?? name) ?? e);
   }
 
   try {
@@ -146,15 +150,18 @@ function emit(ctx: CliContext, render: Render, name: string, cmd: Command | unde
   }
   const shown: CommandResult = { ...result, data: envelope.data, problems: envelope.problems, next: envelope.next };
   let text: string | undefined;
+  // A command that shows its problems in its own layout (doctor, §2) does not get them appended again.
+  let problemsShown = false;
   try {
     text = cmd?.human ? cmd.human(shown, ctx) : defaultHuman(envelope.data);
+    problemsShown = !!(cmd?.human && cmd.humanShowsProblems);
   } catch (e) {
     // A formatter bug must not hide the result: report it and fall back to JSON of the data.
     printFailure(render, redactProblem(internalProblem(e), redact));
     text = defaultHuman(envelope.data);
   }
   if (text) render.outRaw(text);
-  if (envelope.problems.length) render.outRaw(formatProblems(envelope.problems, render.color));
+  if (envelope.problems.length && !problemsShown) render.outRaw(formatProblems(envelope.problems, render.color));
   if (envelope.next.length) render.outRaw(formatNext(envelope.next, render.color));
   return exit;
 }
@@ -245,6 +252,31 @@ function toFailure(e: unknown): { problem: Problem; exit: number } {
   return { problem: internalProblem(e), exit: CODES.INTERNAL_ERROR.exit };
 }
 
+/** A command whose module (or a module it imports while running) could not load the DuckDB binding:
+ *  a missing platform package, one built for another machine, or a system library it needs. The
+ *  command cannot run here, and croft doctor explains why; everything else still works. Other errors,
+ *  including DuckDB's own errors once it has loaded, are left alone (null). */
+export function bindingFailure(e: unknown, command: string): CroftError | null {
+  // Not only Errors: a failed import in Bun throws a ResolveMessage, which is not one [V].
+  if (e instanceof CroftError || typeof e !== "object" || e === null) return null;
+  const { message, name, code: rawCode } = e as { message?: unknown; name?: unknown; code?: unknown };
+  if (typeof message !== "string") return null;
+  const code = typeof rawCode === "string" ? rawCode : "";
+  const text = message;
+  const loadFailed = /MODULE_NOT_FOUND|ERR_DLOPEN_FAILED/.test(code) || name === "ResolveMessage"
+    || /Cannot find (module|package)|dlopen|cannot open shared object|GLIBC_[\d.]+'? not found|incompatible architecture|wrong ELF class|invalid ELF header|Exec format error|not a mach-o/i.test(text);
+  if (!loadFailed || !/@duckdb\/|duckdb\.node|libduckdb/.test(text)) return null;
+  const glibc = /GLIBC_(\d+\.\d+)'? not found/.exec(text)?.[1];
+  return new CroftError(glibc ? "DUCKDB_BINDING_LOAD" : "DUCKDB_BINDING_MISSING", {
+    message: `croft ${command} needs DuckDB, whose binding does not load here: ${text.split("\n")[0]!.slice(0, 300)}`,
+    hint: glibc
+      ? `the DuckDB binding needs glibc ${glibc} or newer; croft doctor says more`
+      : "run croft doctor: it names the binding that is missing or built for another machine, and the command that reinstalls it",
+    fix: { kind: "command", description: "find out why the DuckDB binding does not load, and how to fix it", command: "croft doctor" },
+    details: { command, error: text.slice(0, 500), ...(code ? { errorCode: code } : {}) },
+  });
+}
+
 const SRC_DIR = fileURLToPath(new URL("../", import.meta.url));
 
 /** An unexpected exception: croft's bug, not the user's. Keep the message and a short stack. */
@@ -268,8 +300,13 @@ export function trimStack(stack: string | undefined, max = 8): string[] {
     .slice(0, max);
 }
 
+/** The croft bin (bin/croft.mjs): the launcher decides first, since inside a project it may hand the
+ *  invocation to the pinned copy (§2); otherwise this copy runs it. Returns the exit code. */
+export function cli(): Promise<number> {
+  return launch({ main: (argv) => main(argv), commandNames: COMMANDS.map((c) => c.name) });
+}
+
 if (import.meta.main) {
   // exitCode, not process.exit(): exit() cuts piped stdout off at 64 KB in Bun.
-  // The launcher decides first: inside a project it may hand the invocation to the pinned copy (§2).
-  process.exitCode = await launch({ main: (argv) => main(argv), commandNames: COMMANDS.map((c) => c.name) });
+  process.exitCode = await cli();
 }

@@ -1,5 +1,7 @@
-// The command contract. Each file in cli/commands/ exports one Command; main.ts parses flags,
-// builds the Ctx, runs it and renders the result as an envelope (--json) or as human text.
+// The command contract. Each file in cli/commands/ exports one command: a CommandImpl (run, human) that
+// cli/commands/index.ts registers lazily with its spec, or, for the few tiny ones, a whole Command.
+// main.ts parses flags, loads and runs the command, and renders the result as an envelope (--json) or
+// as human text.
 import type { Confirmation, Problem } from "../core/types.ts";
 import type { ProjectEnv } from "../project/env.ts";
 import type { Project } from "../project/root.ts";
@@ -26,16 +28,44 @@ export interface OptionSpec {
 
 export type OptionValues = Record<string, string | boolean | (string | boolean)[] | undefined>;
 
-export interface Command<T = unknown> {
+/** What help, did-you-mean and flag parsing need to know about a command, without loading its module. */
+export interface CommandSpec {
   name: string;
   summary: string;                   // one line for `croft help`
   usage: string;                     // e.g. "croft docs [topic|ERROR_CODE] | croft docs --list"
   options: Record<string, OptionSpec>;
   maxPositionals?: number;           // default: unlimited
+  /** human() prints every problem itself, next to what it is about (doctor puts each under its section,
+   *  §2), so main.ts does not append the standard problem blocks. Next lines are still appended. */
+  humanShowsProblems?: boolean;
+}
+
+export interface Command<T = unknown> extends CommandSpec {
   run(ctx: Ctx): Promise<CommandResult<T>>;
-  /** Human output built from the (already redacted) result. Problems and next lines are printed
-   *  after it by main.ts. Without it, data is printed as indented JSON. */
+  /** Human output built from the (already redacted) result. Problems (unless humanShowsProblems) and
+   *  next lines are printed after it by main.ts. Without it, data is printed as indented JSON. */
   human?(result: CommandResult<T>, ctx: Ctx): string | undefined;
+  /** Set on registry entries made by lazyCommand(): imports the module that implements the command.
+   *  main.ts calls it only for the command it runs, after parsing flags. */
+  load?(): Promise<Command<T>>;
+}
+
+/** What a lazily registered command's module exports: the spec lives in the registry. */
+export type CommandImpl<T = unknown> = Pick<Command<T>, "run" | "human">;
+
+/**
+ * A registry entry that imports its module only when the command runs. A module that cannot load (a
+ * missing or foreign-arch DuckDB binding, say) then fails that one command, while help, docs, doctor,
+ * init and the launcher keep working. `spec` is the only description of the command: the module
+ * supplies run() and human().
+ */
+export function lazyCommand<T>(spec: CommandSpec, load: () => Promise<CommandImpl<T>>): Command<T> {
+  let loading: Promise<Command<T>> | undefined;
+  const once = () => (loading ??= load().then(
+    (impl) => ({ ...spec, run: impl.run.bind(impl), ...(impl.human ? { human: impl.human.bind(impl) } : {}) }),
+    (e: unknown) => { loading = undefined; throw e; },
+  ));
+  return { ...spec, load: once, run: async (ctx) => (await once()).run(ctx) };
 }
 
 export interface Ctx {

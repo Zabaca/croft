@@ -4,7 +4,10 @@
 //
 // DuckDB is never imported statically here. The binding is checked in a child process first (a missing
 // or foreign-arch binding must be reported, not crash doctor), and only then is db/warehouse.ts imported
-// to look at the warehouse read-only.
+// to look at the warehouse read-only; if that import still fails, the warehouse check says so.
+//
+// Human output shows each problem under its check, with its fix, as in the §2 example
+// (humanShowsProblems in the registry), rather than main.ts appending the standard blocks.
 import { accessSync, constants as fsConstants, existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
@@ -16,14 +19,10 @@ import { CLAUDE_MD, claudeBlock, findBlock, SKILL_PATH, skillStamp } from "../..
 import { ProjectEnv } from "../../project/env.ts";
 import { appRootOf, relocationPlan } from "../../project/init.ts";
 import { configProblems, findRoot, loadProject, syncedLocation, type ConfigIssue, type Project } from "../../project/root.ts";
-import type { Command } from "../command.ts";
+import type { CommandImpl } from "../command.ts";
 import { LAUNCH_ENV, SELF_ROOT } from "../launcher.ts";
-import { formatCount } from "../render.ts";
-import { BUN_FLOOR, CROFT_VERSION, versionAtLeast } from "../version.ts";
-
-/** The newest Bun this croft version was tested on in CI (DESIGN.md §2 "Dependencies"). A newer Bun is a
- *  warning, not an error: parse behavior has changed between Bun versions before [V]. */
-export const BUN_TESTED = "1.4.2";
+import { formatCount, formatProblem } from "../render.ts";
+import { BUN_FLOOR, BUN_TESTED, CROFT_VERSION, versionAtLeast } from "../version.ts";
 
 export type Section = "environment" | "project" | "scheduling";
 export type CheckStatus = "ok" | "warn" | "error" | "info";
@@ -73,28 +72,24 @@ export function defaultDeps(env: Record<string, string | undefined>): DoctorDeps
     env,
     home: homedir(),
     wsl: process.platform === "linux" && isWsl(env),
-    probeDuckdb,
+    probeDuckdb: (croftRoot) => probeDuckdb(croftRoot, env),
     duckdbOffsets,
-    rosetta,
+    rosetta: () => rosetta(env),
     synced: (p) => syncedLocation(p),
     lockWaitMs: 150,
     healthTimeoutMs: 300,
   };
 }
 
-export const doctor: Command<DoctorData> = {
-  name: "doctor",
-  summary: "check the environment and the project: Bun, DuckDB, the warehouse, storage, Claude files",
-  usage: "croft doctor",
-  options: {},
-  maxPositionals: 0,
+/** croft doctor. Its spec (name, usage, humanShowsProblems) is in commands/index.ts. */
+export const doctor: CommandImpl<DoctorData> = {
   async run(ctx) {
     const { data, problems } = await runDoctor(ctx.cwd, defaultDeps(ctx.processEnv));
     const errors = data.checks.filter((c) => c.status === "error").length;
     return { data, problems, next: nextFor(problems), ...(errors > 0 && !problems.some((p) => p.severity === "error") ? { exit: 1, ok: false } : {}) };
   },
   human(result) {
-    return formatDoctor(result.data);
+    return formatDoctor(result.data, result.problems);
   },
 };
 
@@ -191,9 +186,14 @@ function checkBun(r: Report, d: DoctorDeps): void {
     });
     r.add("environment", "bun", "error", `bun ${d.bunVersion} (${where}), needs >= ${BUN_FLOOR}`, p);
   } else if (!versionAtLeast(BUN_TESTED, d.bunVersion)) {
-    // No registered code says "newer than tested"; the check carries the warning on its own.
+    const p = problem("BUN_UNTESTED", {
+      message: `Bun ${d.bunVersion} is newer than the newest Bun croft ${CROFT_VERSION} was tested on (${BUN_TESTED})`,
+      hint: `croft usually works on a newer Bun; if something breaks, try Bun ${BUN_TESTED} (curl -fsSL https://bun.sh/install | bash -s bun-v${BUN_TESTED}) or a newer croft`,
+      fix: { kind: "manual", description: `if croft misbehaves, install Bun ${BUN_TESTED} or upgrade croft`, requiresHuman: true },
+      details: { bun: d.bunVersion, tested: BUN_TESTED },
+    });
     r.add("environment", "bun", "warn", `bun ${d.bunVersion} (${where}) is newer than the newest Bun croft ${CROFT_VERSION} was tested on (${BUN_TESTED}); if something breaks, try Bun ${BUN_TESTED}`,
-      undefined, { tested: BUN_TESTED });
+      p, { tested: BUN_TESTED });
   } else {
     r.add("environment", "bun", "ok", `bun ${d.bunVersion} (${where}), needs >= ${BUN_FLOOR}`);
   }
@@ -229,7 +229,7 @@ function checkCroft(r: Report, d: DoctorDeps, root: string | null): void {
 
 /** Load the binding in a child process and report its version and built-in extensions. `--no-install`
  *  stops Bun from fetching a missing package on import, which it otherwise does outside node_modules [V]. */
-export function probeDuckdb(croftRoot: string): DuckdbProbe {
+export function probeDuckdb(croftRoot: string, env: Record<string, string | undefined> = process.env): DuckdbProbe {
   const script = `
 const say = (o) => process.stdout.write(JSON.stringify(o));
 try {
@@ -247,7 +247,7 @@ try {
   let r;
   try {
     r = Bun.spawnSync([process.execPath, "--no-env-file", "--no-install", "-e", script], {
-      cwd: realpathSafe(croftRoot), stdout: "pipe", stderr: "pipe", timeout: 15_000,
+      cwd: realpathSafe(croftRoot), env: childEnv(env), stdout: "pipe", stderr: "pipe", timeout: 15_000,
     });
   } catch (e) {
     return { ok: false, message: `cannot run the DuckDB check from ${croftRoot}: ${(e as Error).message}` };
@@ -263,10 +263,18 @@ try {
 }
 
 /** x64 Bun translated by Rosetta on an Apple Silicon Mac. */
-function rosetta(): boolean {
+function rosetta(env: Record<string, string | undefined>): boolean {
   if (process.platform !== "darwin" || process.arch !== "x64") return false;
-  const r = Bun.spawnSync(["sysctl", "-n", "sysctl.proc_translated"], { stdout: "pipe", stderr: "ignore" });
+  const r = Bun.spawnSync(["sysctl", "-n", "sysctl.proc_translated"], { env: childEnv(env), stdout: "pipe", stderr: "ignore" });
   return r.stdout.toString().trim() === "1";
+}
+
+/** The environment a child gets. Always passed explicitly: without it Bun hands children the environment
+ *  it started with, including values it loaded from .env that croft has since removed [V]. */
+export function childEnv(env: Record<string, string | undefined>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) if (v !== undefined) out[k] = v;
+  return out;
 }
 
 export function checkDuckdb(r: Report, d: DoctorDeps, probe: DuckdbProbe, root: string | null): void {
@@ -350,8 +358,24 @@ async function checkWarehouse(r: Report, d: DoctorDeps, project: Project, bindin
       { ...details, heldBy: { pid: writer.pid, program: "croft", runId: writer.runId, since: writer.since } });
     return;
   }
-  const { openWarehouse } = await import("../../db/warehouse.ts");
-  const { readMeta } = await import("../../db/state.ts");
+  let openWarehouse: typeof import("../../db/warehouse.ts").openWarehouse;
+  let readMeta: typeof import("../../db/state.ts").readMeta;
+  try {
+    ({ openWarehouse } = await import("../../db/warehouse.ts"));
+    ({ readMeta } = await import("../../db/state.ts"));
+  } catch (e) {
+    // The child-process probe loaded the binding, but this process cannot: report it, do not crash.
+    const msg = (e as Error).message ?? String(e);
+    const reinstall = `cd ${shellQuote(project.root)} && rm -rf node_modules && bun install`;
+    const p = problem("DUCKDB_BINDING_LOAD", {
+      message: `the DuckDB binding loads in a separate process but not in croft doctor's own: ${msg.split("\n")[0]!.slice(0, 300)}`,
+      hint: `run ${reinstall}, then croft doctor again`,
+      fix: { kind: "command", description: "reinstall the dependencies", command: reinstall },
+      details: { error: msg.slice(0, 500) },
+    });
+    r.add("environment", "warehouse", "error", `${parts.join(" · ")} · not opened: ${p.message}`, p, details);
+    return;
+  }
   const w = openWarehouse({
     path, mode: "read_only", profile: "query", timezone: project.timezone, root: project.root, stateDir: project.paths.stateDir,
     isTTY: false, register: false, lingerMs: 0, noticeAfterMs: Number.MAX_SAFE_INTEGER,
@@ -379,8 +403,14 @@ async function checkWarehouse(r: Report, d: DoctorDeps, project: Project, bindin
         });
         r.add("environment", "warehouse", "error", `${parts.join(" · ")} · ${p.message}`, p, details);
       } else {
-        // No registered code fits "the file is not a readable DuckDB database"; the check carries it.
-        r.add("environment", "warehouse", "error", `${parts.join(" · ")} · cannot be opened: ${msg.split("\n")[0]!.slice(0, 200)}`, undefined,
+        const first = msg.split("\n")[0]!.slice(0, 200);
+        const p = problem("DB_UNREADABLE", {
+          message: `${label} cannot be opened as a DuckDB database: ${first}`,
+          hint: `check that ${path} is this project's DuckDB file and that it is readable; if it is damaged, restore it from a backup`,
+          fix: { kind: "manual", description: `check or restore ${path}`, requiresHuman: true },
+          details: { path, error: msg.slice(0, 500) },
+        });
+        r.add("environment", "warehouse", "error", `${parts.join(" · ")} · cannot be opened: ${first}`, p,
           { ...details, error: msg.slice(0, 500) });
       }
       return;
@@ -578,17 +608,23 @@ function checkStorage(r: Report, d: DoctorDeps, project: Project): void {
   const dbWhy = d.synced(database);
   const stateWhy = d.synced(stateDir);
   if (dbWhy || stateWhy) {
-    const plan = relocationPlan(project.root, dbWhy ?? stateWhy!, d.home);
-    const p = problem("SERVE_UNSAFE_FILESYSTEM", {
-      message: `${dbWhy ? "the database" : ".croft/"} is in ${dbWhy ?? stateWhy}; file sync and network filesystems can corrupt a DuckDB file mid-write and break its locks`,
+    const why = dbWhy ?? stateWhy!;
+    const plan = relocationPlan(project.root, why, d.home);
+    // A mount whose locks cannot be trusted (a network filesystem, 9p such as WSL's drives) is an error
+    // (§5 "Same kernel only"); a sync folder is a warning, with the move that fixes it.
+    const unsafe = unsafeMount(why);
+    const p = problem(unsafe ? "SERVE_UNSAFE_FILESYSTEM" : "DB_ON_SYNCED_FOLDER", {
+      message: unsafe
+        ? `${dbWhy ? "the database" : ".croft/"} is on ${why}, where DuckDB's file lock does not hold and writes can be lost`
+        : `${dbWhy ? "the database" : ".croft/"} is in ${why}; file sync can corrupt a DuckDB file mid-write and break its locks`,
       hint: `move ${dbWhy ? database : stateDir} to ${plan.dir} and set "database": "${plan.database}" and "stateDir": "${plan.stateDir}" in croft.json`,
       fix: {
         kind: "manual", requiresHuman: true,
         description: `with no croft command running, move the database and .croft/ to ${plan.dir}, then set "database": "${plan.database}" and "stateDir": "${plan.stateDir}" in croft.json`,
       },
-      details: { reason: dbWhy ?? stateWhy, relocateTo: plan.dir },
+      details: { reason: why, relocateTo: plan.dir },
     });
-    r.add("project", "storage", "error", `storage: ${p.message}`, p);
+    r.add("project", "storage", unsafe ? "error" : "warn", `storage: ${p.message}`, p);
     return;
   }
   const rootWhy = d.synced(project.root);
@@ -613,12 +649,11 @@ function checkWritable(r: Report, project: Project): void {
   } catch (e) {
     try { unlinkSync(probe); } catch { /* never created */ }
     const code = (e as NodeJS.ErrnoException).code ?? "error";
-    // No registered code names "folder not writable"; REQUIRES_HUMAN is the closest (a permission fix).
-    const p = problem("REQUIRES_HUMAN", {
+    const p = problem("PROJECT_NOT_WRITABLE", {
       message: `croft cannot write to ${dir} (${code}); runs, logs and the trash live there`,
       hint: `make ${dir} writable for your user (for example: chmod u+w ${shellQuote(dir)}), or check that the disk is not full or read-only`,
       fix: { kind: "manual", description: `make ${dir} writable for your user`, requiresHuman: true },
-      details: { check: "project_writable", dir, error: code },
+      details: { dir, error: code },
     });
     r.add("project", "writable", "error", `${shown}/ is not writable (${code})`, p, { dir });
   }
@@ -693,24 +728,48 @@ function checkClaudeFiles(r: Report, root: string): void {
 const LABEL: Record<CheckStatus, string> = { ok: "ok", warn: "warn", error: "error", info: "info" };
 const TITLES: Record<Section, string> = { environment: "Environment", project: "Project", scheduling: "Scheduling" };
 
-export function formatDoctor(data: DoctorData): string {
+/** The §2 layout: each check under its section; a check that reported a problem shows the problem's code
+ *  in front and its hint or fix below. A problem that matches no check is printed after the checks. */
+export function formatDoctor(data: DoctorData, problems: readonly Problem[] = []): string {
   const lines: string[] = [];
+  // Checks and their problems were recorded together, in the same order: match them up by code.
+  const pending = [...problems];
+  const take = (code: string | undefined) => {
+    const i = code === undefined ? -1 : pending.findIndex((p) => p.code === code);
+    return i < 0 ? undefined : pending.splice(i, 1)[0];
+  };
   for (const section of ["environment", "project", "scheduling"] as Section[]) {
     const checks = data.checks.filter((c) => c.section === section);
     if (!checks.length) continue;
     lines.push(TITLES[section]);
     for (const c of checks) {
-      const [first, ...rest] = c.text.split("\n");
-      lines.push(`  ${LABEL[c.status].padEnd(5)} ${first}`);
+      const [first = "", ...rest] = c.text.split("\n");
+      const code = c.code && !first.startsWith(c.code) ? `${c.code} ` : "";
+      lines.push(`  ${LABEL[c.status].padEnd(5)} ${code}${first}`);
       for (const l of rest) lines.push(`        ${l}`);
+      const p = take(c.code);
+      if (p) for (const l of fixLines(p)) lines.push(`        ${l}`);
     }
   }
+  lines.push(...pending.map((p) => formatProblem(p)));
   const { errors, warnings } = data.summary;
   const parts = [];
   if (errors) parts.push(`${errors} ${errors === 1 ? "error" : "errors"}`);
   if (warnings) parts.push(`${warnings} ${warnings === 1 ? "warning" : "warnings"}`);
   lines.push(parts.length ? parts.join(", ") : "no problems found");
   return lines.join("\n");
+}
+
+/** A problem's hint, fix and effect lines as formatProblem prints them, without its head line: the
+ *  check's text already says what is wrong. */
+function fixLines(p: Problem): string[] {
+  const { file: _file, asset: _asset, ...rest } = p;
+  return formatProblem({ ...rest, message: "" }).split("\n").slice(1).map((l) => l.trim()).filter(Boolean);
+}
+
+/** Storage whose file locks cannot be trusted at all, as opposed to a sync folder (see syncedLocation). */
+function unsafeMount(why: string): boolean {
+  return why.startsWith("a network filesystem") || why.includes("WSL");
 }
 
 // ---------------------------------------------------------------------------------------------

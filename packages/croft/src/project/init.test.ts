@@ -1,12 +1,12 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CroftError } from "../core/errors.ts";
 import { isValidTimeZone } from "../core/time.ts";
 import { claudeBlock, CROFT_VERSION, SKILL_PATH, skillMd, skillStamp } from "../agent/templates.ts";
-import { appInstructions, appRootOf, detectTimeZone, initProject, relocationPlan, type InitOptions } from "./init.ts";
+import { appInstructions, appRootOf, bunInstall, detectTimeZone, initProject, relocationPlan, type InitOptions } from "./init.ts";
 import { loadProject, relocationDir } from "./root.ts";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "croft-init-")));
@@ -347,6 +347,36 @@ describe("install and the example hook", () => {
     expect(ran).toBe(false);
     expect(r.example).toEqual({ ran: false, reason: "dependencies are not installed" });
   });
+
+  test("bun install runs with the environment it is given, not the one Bun started with", () => {
+    // A root postinstall script records what it sees (Bun runs the root package's own scripts).
+    const root = fresh({ "package.json": JSON.stringify({ private: true, scripts: { postinstall: `bun -e "require('fs').writeFileSync('seen', process.env.CROFT_TEST_MARK ?? 'none')"` } }) });
+    const r = bunInstall(root, { ...process.env, CROFT_TEST_MARK: "given" });
+    expect(r).toMatchObject({ ran: true, ok: true, command: "bun install" });
+    expect(read(join(root, "seen"))).toBe("given");
+  }, 30_000);
+
+  test("initProject hands its env to bun install", async () => {
+    const target = fresh();
+    // An unreachable registry fails at once, and only if the child got this env.
+    const r = await initProject(opts(target, { install: true, env: { ...process.env, BUN_CONFIG_REGISTRY: "http://127.0.0.1:9/" } }));
+    expect(r.install).toMatchObject({ ran: true, ok: false });
+    expect((r.install as { output?: string }).output).toContain("ConnectionRefused");
+  }, 30_000);
+});
+
+test("a folder croft cannot write to is PROJECT_NOT_WRITABLE, not a crash", async () => {
+  if (process.getuid?.() === 0) return;                           // root can write anywhere
+  const parent = fresh();
+  chmodSync(parent, 0o500);
+  try {
+    const e = await initProject(opts(join(parent, "p"))).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(CroftError);
+    expect((e as CroftError).problem).toMatchObject({ code: "PROJECT_NOT_WRITABLE", details: { error: "EACCES" } });
+    expect((e as CroftError).problem.message).toContain(join(parent, "p"));
+  } finally {
+    chmodSync(parent, 0o700);
+  }
 });
 
 test("a new project type-checks with its own tsconfig against the installed croft", async () => {

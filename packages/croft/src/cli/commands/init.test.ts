@@ -100,6 +100,27 @@ describe("croft init (command)", () => {
     expect(r2.stdout).toContain("  CLAUDE.md: added the croft block (points Claude Code at data/)");
   });
 
+  test("a failed bun install is INSTALL_FAILED (exit 2); the project is still created", async () => {
+    const cwd = fresh();
+    // An unreachable registry makes bun install fail at once, provided init hands bun install this env.
+    const env = { ...process.env, BUN_CONFIG_REGISTRY: "http://127.0.0.1:9/" };
+    const r = await croft(["init", "p", "--json"], { cwd, env });
+    expect(r.exit).toBe(2);
+    expect(r.env.ok).toBe(false);
+    expect(r.env.data.install).toMatchObject({ ran: true, ok: false, command: "bun install" });
+    expect(r.env.problems).toHaveLength(1);
+    expect(r.env.problems[0]).toMatchObject({
+      severity: "error", code: "INSTALL_FAILED",
+      fix: { kind: "command", command: "cd p && bun install" }, details: { root: join(cwd, "p") },
+    });
+    expect(r.env.problems[0].details.output).toContain("ConnectionRefused");
+    expect(existsSync(join(cwd, "p", "croft.json"))).toBe(true);
+
+    const human = await croft(["init", "q"], { cwd, env });
+    expect(human.exit).toBe(2);
+    expect(human.stdout).toContain("error INSTALL_FAILED  bun install failed in q");
+  }, 30_000);
+
   test("an unknown flag is a usage error with a suggestion", async () => {
     const r = await croft(["init", "--no-instal", "--json"], { cwd: fresh() });
     expect(r.exit).toBe(2);
