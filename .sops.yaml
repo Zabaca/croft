@@ -1,11 +1,27 @@
-# Add your age public keys below as recipients. Run `age-keygen` to generate
-# a keypair if you don't have one. The private key stays on your machine; the
-# public key goes here.
+# age public keys that may decrypt this project's secrets. Private keys stay on
+# each holder's machine (macOS: ~/Library/Application Support/sops/age/keys.txt,
+# Linux: ~/.config/sops/age/keys.txt); only the public half belongs here.
 #
-# CI: store the CI private key as a GitHub Actions secret (SOPS_AGE_KEY) and
-# add the matching public key to the recipients list below.
+# Recipients, in order. Attribution is written down because an age public key
+# carries no identity of its own:
 #
-# After editing, run: sops updatekeys packages/infra/environments/<env>/secrets.yaml
+#   age1dhsl...  james_mbp. Verified 2026-09-22: it is the public half of the
+#                only identity in this MacBook's sops keys.txt.
+#   age1cq0k...  james_studio. Confirmed as James's Mac Studio key by James on
+#                2026-09-22. leeandco/.sops.yaml attributes it to Khoa's laptop;
+#                that note conflicts with this one and should be corrected.
+#   age1llqq...  james_ryzen9_a. The ryzen-9 keys.txt holds two identities;
+#   age1ar5d...  james_ryzen9_b. Both are labeled James's in
+#                claude-mitm-proxy/.sops.yaml. Not verified from this machine.
+#
+# CI has no key yet. When it gets one, store the private key as the GitHub
+# Actions secret SOPS_AGE_KEY and add its public key below.
+#
+# Adding a key does not re-encrypt existing files. After editing, run:
+#   sops updatekeys packages/infra/environments/<env>/secrets.yaml
 creation_rules:
   - age: >-
-      # add public keys here, comma-separated
+      age1dhslnakk54dn5vd7q7hjuemrchwxtka0ux8nkvm4psp9u3g9hsxsjzvsdz,
+      age1cq0k9s88fmx7kkaqqvuf290lelyt8gkeglwvsd2r3ezuqyla7aps7x4q2j,
+      age1llqq3jcd8kk0w92x9mgwdswymtjd967ydghvdvqr2djxwakmgydquytfdw,
+      age1ar5d2qsnz5tjmm9xx0h5wl2n7m6f3l4mr3fhm400zulggmh6xsjst65ygm
