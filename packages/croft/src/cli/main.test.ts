@@ -234,7 +234,8 @@ describe("help and version", () => {
     const r = await run([]);
     expect(r.exit).toBe(0);
     expect(r.stdout).toContain("Usage: croft <command> [options]");
-    expect(r.stdout).toContain("  docs      offline docs");
+    // The column width follows the longest registered command name.
+    expect(r.stdout).toMatch(/^  docs +offline docs/m);
   });
 
   test("help --json lists every registered command", async () => {
