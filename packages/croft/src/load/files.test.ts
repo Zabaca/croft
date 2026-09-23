@@ -462,6 +462,40 @@ describe("CSV", () => {
     expect((await failure(extract(s, { file: "files/*.csv" }))).code).toBe("CSV_HEADER_AMBIGUOUS");
   });
 
+  // §3b: CSV_HEADER_AMBIGUOUS is a first-load error. After it, the stored columns are the header decision: named
+  // columns mean the files have a header line, column0, column1, ... mean they do not.
+  test("once the asset has loaded, later all-text files reuse the stored header decision; a header-only file is empty", async () => {
+    const p = project({ asset: "people" });
+    p.put("files/a.csv", "code,name,qty\nA1,Alice,3\n");
+    await run(p, { file: "files/*.csv", incremental: true });
+    // Every column is text and "nickname" is new, so the line is not all known names: still a header.
+    p.put("files/b.csv", "code,nickname\nB2,Bobby\n");
+    const b = await run(p, { file: "files/*.csv", incremental: true });
+    expect(b.extract.files.find((f) => f.path === "files/b.csv")!.csv).toMatchObject({ header: true, headerFrom: "known" });
+    expect(await q(p, `SELECT code, name, nickname FROM people ORDER BY code`)).toEqual([
+      { code: "A1", name: "Alice", nickname: null }, { code: "B2", name: null, nickname: "Bobby" },
+    ]);
+    // A day with no rows: the export holds only its header line.
+    p.put("files/c.csv", "code,name,qty\n");
+    const c = await run(p, { file: "files/*.csv", incremental: true });
+    expect(c.extract.load).toEqual(["files/c.csv"]);
+    expect(c.result!.rows).toMatchObject({ in: 0, added: 0, total: 2 });
+
+    // No header line (column0, column1): a later all-text file is data, even with more fields than before.
+    const n = project({ asset: "names" });
+    n.put("files/a.csv", { fixture: "names-no-header.csv" });
+    await run(n, { file: "files/*.csv", incremental: true, csv: { header: false } });
+    n.put("files/b.csv", "Dan,Oslo,Norway\n");
+    const nb = await run(n, { file: "files/*.csv", incremental: true });
+    expect(nb.extract.files.find((f) => f.path === "files/b.csv")!.csv).toMatchObject({ header: false, headerFrom: "known" });
+    expect(await q(n, `SELECT column0, column1, column2 FROM names WHERE column0 = 'Dan'`)).toEqual([{ column0: "Dan", column1: "Oslo", column2: "Norway" }]);
+
+    // Before any load there is no decision to reuse.
+    const f = project({ asset: "fresh" });
+    f.put("files/a.csv", "code,nickname\n");
+    expect((await failure(run(f, { file: "files/*.csv", incremental: true }))).code).toBe("CSV_HEADER_AMBIGUOUS");
+  });
+
   test("lines the sniffer would skip before the header need csv.skip", async () => {
     const p = project({ asset: "export" });
     p.put("files/export.csv", "exported by shop\n\nid,name\n1,x\n2,y\n");

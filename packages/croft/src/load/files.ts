@@ -58,7 +58,7 @@ import type { FileFormat, FileIngest, Http, HttpInit, HttpResponse, Row } from "
 import { buildTypedBatch, castExpr, lossExpr, realColumns, typedTableName, type TypedBatchResult } from "./cast.ts";
 import { classify, classifyCsv, ident, sqlString, stageRaw } from "./classify.ts";
 import { RESERVED, type TypedBatch } from "./contract.ts";
-import { currentDatabase, normalizeType, readTableSchema, tableRef, tempRef } from "./evolve.ts";
+import { currentDatabase, isReservedColumn, normalizeType, readTableSchema, tableRef, tempRef } from "./evolve.ts";
 import { ColumnNamer, cleanColumnName, type KnownName, parseJsonLossless, readStageManifest, STAGE_FILE, writeStage } from "./stage.ts";
 import { FALLBACK } from "./write.ts";
 import {
@@ -706,8 +706,10 @@ interface DialectContext {
  * Encoding, delimiter, quote, escape, skip and header for every CSV file to load. The header rule (§3b): DuckDB
  * can only tell a header from data when some column is not text, so when csv.header is undeclared and every
  * column sniffs as VARCHAR, the first line must match stored column names (or the header of another file in this
- * load); otherwise CSV_HEADER_AMBIGUOUS. Lines the sniffer would skip before the header are never dropped
- * silently: that is CSV_HEADER_AMBIGUOUS too, unless csv.skip says how many.
+ * load), or an earlier load of the asset must have settled the question (its stored columns, reused for every later
+ * file, so a header-only export is an empty file); otherwise, on the first load only, CSV_HEADER_AMBIGUOUS. Lines
+ * the sniffer would skip before the header are never dropped silently: that is CSV_HEADER_AMBIGUOUS too, unless
+ * csv.skip says how many.
  */
 async function decideDialects(db: Sql, load: Present[], c: DialectContext): Promise<void> {
   const cfg = c.csv ?? {};
@@ -724,6 +726,11 @@ async function decideDialects(db: Sql, load: Present[], c: DialectContext): Prom
     headerNames.add(k.name.toLowerCase());
     if (k.sourceName) headerNames.add(k.sourceName.toLowerCase());
   }
+  // The header decision of the asset's earlier loads, from its stored columns: named columns mean its files have a
+  // header line, column0, column1, ... (header: false) mean they do not. null before the first load, the only one
+  // that can be CSV_HEADER_AMBIGUOUS (§3b).
+  const stored = c.knownColumns.filter((k) => !isReservedColumn(k.name));
+  const storedHeader: boolean | null = stored.length === 0 ? null : !stored.every((k) => /^column\d+$/i.test(k.name));
 
   for (const p of load) {
     c.abort();
@@ -807,9 +814,10 @@ async function decideDialects(db: Sql, load: Present[], c: DialectContext): Prom
       d.headerFrom = "known";
       continue;
     }
-    const knownNames = c.knownColumns.map((k) => k.name);
-    if (knownNames.length > 0 && knownNames.every((n) => /^column\d+$/i.test(n)) && cells.length <= knownNames.length) {
-      d.header = false; // an earlier load of this asset declared or proved there is no header
+    if (storedHeader !== null) {
+      // An earlier load of this asset settled it: a new column's name or a header-only export (no rows that day)
+      // is no reason to ask again.
+      d.header = storedHeader;
       d.headerFrom = "known";
       continue;
     }

@@ -789,6 +789,21 @@ export function validateDefinition(value: unknown, o: ValidateOptions): Validati
       `${o.name} is incremental but has no key; ${what}, and without a key every re-read row would be stored twice`,
       'add key: "id" (the column that identifies a record), or write: "append" for append-only sources such as event logs');
   }
+  // §6: allowShrink: true is a standing decision made in code: its shrinks need no confirmation (the current rows
+  // still go to the trash first, run/ingest.ts). A warning at load reaches every run. Only replace ingests have a
+  // shrink guard, so on a merge or append ingest the key does nothing, which the warning says instead.
+  if (role === "ingest" && allowShrink) {
+    const write = common.write ?? (!isIncremental ? "replace" : common.key.length > 0 ? "merge" : "append");
+    if (write === "replace") {
+      c.add("SHRINK_GUARD_DISABLED", "allowShrink",
+        `${o.name} turns the shrink guard off (allowShrink: true): a source that suddenly returns few or no rows empties the table without asking; the current rows still go to the trash first`,
+        `remove allowShrink unless this source really shrinks by more than half; for a one-off, croft run ${o.name} --allow-shrink asks first`);
+    } else {
+      c.add("SHRINK_GUARD_DISABLED", "allowShrink",
+        `allowShrink does nothing here: ${o.name} ${write === "merge" ? "merges rows by key" : "appends rows"}, and only replace ingests have a shrink guard`,
+        "remove allowShrink");
+    }
+  }
   if (role === "transform" && !isIncremental && o.usesHttp) {
     const via = o.requests && o.requests.length > 0 ? o.requests.join(", ") : "ctx.http";
     c.add("TRANSFORM_MAKES_REQUESTS", "rows",

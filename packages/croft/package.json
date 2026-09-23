@@ -9,12 +9,14 @@
     ".": "./src/index.ts",
     "./read": { "types": "./dist/read.d.ts", "default": "./dist/read.js" }
   },
-  "files": ["bin", "src", "dist", "croft.schema.json", "!src/**/*.test.ts"],
+  "files": ["bin", "src", "dist", "croft.schema.json", "!src/**/*.test.ts", "!src/**/testkit.ts", "!src/**/*-testkit.ts", "!src/**/fixtures"],
   "engines": { "bun": ">=1.3.14" },
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit -p .",
-    "build:read": "bun scripts/build-read.ts"
+    "build": "bun scripts/build-read.ts",
+    "build:read": "bun scripts/build-read.ts",
+    "prepack": "bun scripts/build-read.ts"
   },
   "dependencies": {
     "@duckdb/node-api": "1.5.5-r.5"

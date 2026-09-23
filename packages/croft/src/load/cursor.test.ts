@@ -192,6 +192,29 @@ describe("parseFrom", () => {
     expect(thrown(() => from("2026-06-24", "integer")).code).toBe("CURSOR_TYPE_MISMATCH");
   });
 
+  // A text cursor is compared as text: croft cannot turn -90d, today or a date into "v0005", so those are refused
+  // instead of reaching rows() as the literal since "-90d". A value written like the saved cursor is taken as is.
+  test("a string cursor refuses relative values and dates it cannot compare, and takes a value in its own form", () => {
+    for (const bad of ["-90d", "-12h", "today", "TODAY", "2026-09-01", "2026-09-01T10:00:00Z"]) {
+      const e = thrown(() => parseFrom(bad, { type: "string", now, timezone: LA, template: "v0005", asset: "vers", field: "ver" }));
+      expect(e.code).toBe("CURSOR_TYPE_MISMATCH");
+      expect(e.problem.asset).toBe("vers");
+      expect(e.message).toContain(`--from ${bad}`);
+      expect(e.message).toContain("text");
+      expect(e.problem.hint).toContain('"v0005"');
+      expect(e.problem.details).toMatchObject({ from: bad, type: "string", saved: "v0005", field: "ver" });
+    }
+    expect(from("v0006", "string", { template: "v0005" })).toEqual({ since: "v0006" });
+    expect(from("  v0003 ", "string", { template: "v0005" })).toEqual({ since: "v0003" });
+    // Relative values mean nothing to text, even before the first load.
+    for (const bad of ["-90d", "today"]) expect(thrown(() => from(bad, "string")).code).toBe("CURSOR_TYPE_MISMATCH");
+    // A text cursor that holds ISO dates (a VARCHAR pin) takes a date in the same form, but not a timestamp.
+    expect(from("2026-09-01", "string", { template: "2026-08-30" })).toEqual({ since: "2026-09-01" });
+    expect(from("2026-09-01T10:00:00Z", "string", { template: "2026-08-30T00:00:00Z" })).toEqual({ since: "2026-09-01T10:00:00Z" });
+    expect(thrown(() => from("2026-09-01", "string", { template: "2026-08-30T00:00:00Z" })).code).toBe("CURSOR_TYPE_MISMATCH");
+    expect(thrown(() => from("v0006", "string", { template: "2026-08-30" })).code).toBe("CURSOR_TYPE_MISMATCH");
+  });
+
   test("anything else is a usage error that lists the accepted forms", () => {
     for (const bad of ["", "yesterday-ish", "2026-13-01", "-90", "+90d", "2026-02-30"]) {
       const e = thrown(() => from(bad, "timestamp"));
