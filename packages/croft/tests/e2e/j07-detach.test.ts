@@ -3,7 +3,7 @@
 // returns 0 with the result; `croft logs <run-id>` shows the asset's console output.
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { slowAsset } from "./fixtures.ts";
-import { alive, bugTest, cleanupAll, initProject, json, type MockApi, mockApi, RUN_ID, show, until } from "./harness.ts";
+import { alive, cleanupAll, initProject, json, type MockApi, mockApi, RUN_ID, show, until } from "./harness.ts";
 
 let api: MockApi;
 beforeAll(() => {
@@ -73,10 +73,10 @@ test("journey 7: detached run → exit 6 within --follow → croft wait 0 → cr
   expect(entry).toMatchObject({ status: "succeeded", argv: ["run", "slow_api", "--json", "--follow", "1s"] });
 }, 120_000);
 
-// BUG (reported): §4.3 status.running[] carries {phase, rowsFetched}; status reads them from runs.summary.progress,
-// but the run engine never writes progress there (only to events.ndjson), so both are always null while a run is
-// going (croft wait does show progress). Same for context.running. Flip to test() once fixed.
-bugTest("journey 7b: status shows a running run's phase and rows fetched", async () => {
+// Fixed: §4.3 status.running[] carries {phase, rowsFetched}, which status reads from runs.summary.progress. The
+// run engine now writes it while a step works (at most every 500 ms, and what changed inside a window at its
+// end), so rows fetched in the first second no longer read as 0. Same for context.running.
+test("journey 7b: status shows a running run's phase and rows fetched", async () => {
   api.route("/slow2", async (_req, url) => {
     const page = Number(url.searchParams.get("page") ?? 1);
     await Bun.sleep(300);

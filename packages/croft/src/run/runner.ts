@@ -364,7 +364,8 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
         events.emit({ type: "step", runId, asset, attempt, status: "running" });
         const progress = new StepProgress(asset, (p) => {
           events.emit({ type: "progress", runId, ...p });
-          // status and context read a live run's phase and rows from runs.summary (throttled to 1/s by StepProgress).
+          // status and context read a live run's {asset, phase, rowsFetched, requests, elapsedMs} from
+          // runs.summary.progress; StepProgress reports at most every 500 ms, and a change inside a window at its end.
           try {
             runs.setRunProgress(runId, p);
           } catch {
@@ -404,6 +405,7 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
           return { ok: false as const, result, error: p };
         } finally {
           clearInterval(watchdog);
+          progress.close();
           log.close();
         }
       };

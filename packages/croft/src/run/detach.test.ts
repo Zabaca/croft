@@ -227,12 +227,28 @@ describe("step helpers", () => {
     p.addRows(3);
     p.request({ status: 200, body: "[]", label: "GET x" });
     expect(seen).toEqual(["extract:2"]);
-    await Bun.sleep(60);
+    // What changed inside the window is reported when it ends.
+    await Bun.sleep(80);
+    expect(seen).toEqual(["extract:2", "extract:5"]);
     p.addRows(1);
     p.setPhase("write");
-    expect(seen).toEqual(["extract:2", "extract:6", "write:6"]);
+    expect(seen).toEqual(["extract:2", "extract:5", "write:6"]);
+    await Bun.sleep(80);
+    expect(seen).toEqual(["extract:2", "extract:5", "write:6"]);   // the forced report replaced the pending one
     expect(p.paused).toBe(true);
     expect(p.extractInfo()).toEqual({ requests: 1, lastStatus: 200, bodyPreview: "[]" });
+  });
+
+  test("StepProgress reports at most every 500 ms by default, and nothing after close()", async () => {
+    const seen: number[] = [];
+    const p = new StepProgress("a", (s) => seen.push(s.rowsFetched));
+    p.addRows(1);
+    p.addRows(1);
+    expect(seen).toEqual([1]);
+    p.close();
+    await Bun.sleep(600);
+    p.addRows(1);
+    expect(seen).toEqual([1]);
   });
 
   test("jsonSafe turns bigint into numbers or exact text", () => {

@@ -2,7 +2,7 @@
 // shrink guard, big integers, type drift, cursors, --from, ctx.query, the catalog mirror and leases.
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DuckDBInstance } from "@duckdb/node-api";
 import { closeAllWarehouses } from "../db/warehouse.ts";
@@ -495,6 +495,32 @@ describe("leases, timeouts and signals", () => {
     }
   });
 
+  // §4.3 status.running[] {phase, rowsFetched}: rows fetched inside a throttle window reach runs.summary at its
+  // end, so a run that fetched pages for less than a second does not show rowsFetched 0 all along.
+  test("runs.summary.progress counts the rows fetched so far while the step extracts", async () => {
+    api.state.slowPages = 6;
+    api.state.slowDelayMs = 150;
+    const root = makeProject({ "assets/slow.ts": slowPages(api.url) });
+    let done = false;
+    const running = runIn(root, ["slow"]).finally(() => {
+      done = true;
+    });
+    const db = runsDb(root);
+    try {
+      let seen: Record<string, unknown> | undefined;
+      while (!done && !seen) {
+        const p = (db.runningRuns()[0]?.summary as { progress?: Record<string, unknown> } | null)?.progress;
+        if (p?.phase === "extract" && Number(p.rowsFetched) > 0) seen = p;
+        else await new Promise((res) => setTimeout(res, 20));
+      }
+      expect(seen).toMatchObject({ asset: "slow", phase: "extract" });
+      expect(Object.keys(seen!).sort()).toEqual(["asset", "elapsedMs", "phase", "requests", "rowsFetched"]);
+      expect((await running).exit).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
   test("an aborted signal interrupts the step: nothing is written, the run is interrupted, exit 130", async () => {
     api.state.slowPages = 50;
     api.state.slowDelayMs = 50;
@@ -579,6 +605,30 @@ describe("file ingests through the engine", () => {
     expect(await rows(root, "select sum(amount)::INT AS total from sales")).toEqual([{ total: 12 }]);
     // Nothing changed: the next run skips the write.
     expect((await runIn(root, ["sales"])).data.steps[0]!.status).toBe("unchanged");
+  });
+
+  // §3b: rows of a deleted file are kept "and status says '1 file gone'". status reads the catalog mirror, so an
+  // unchanged step (the only change was the deletion) must still record which files are gone.
+  test("a deletion alone leaves the step unchanged, and the catalog mirror lists the gone file", async () => {
+    const root = makeProject({
+      "files/sales/a.csv": "order_id,amount\n1,5\n",
+      "files/sales/b.csv": "order_id,amount\n2,7\n",
+      "assets/sales.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ file: "files/sales/*.csv", key: "order_id", incremental: true });\n`,
+    });
+    expect((await runIn(root, ["sales"])).exit).toBe(0);
+    rmSync(join(root, "files/sales/b.csv"));
+    const gone = await runIn(root, ["sales"]);
+    expect(gone.data.steps[0]).toMatchObject({ status: "unchanged", rows: { total: 2 } });
+    const db = runsDb(root);
+    try {
+      expect(getCatalog(db, "sales")).toMatchObject({ rows: 2, filesGone: ["files/sales/b.csv"] });
+      // The file comes back unchanged: nothing is gone any more.
+      writeFileSync(join(root, "files/sales/b.csv"), "order_id,amount\n2,7\n");
+      expect((await runIn(root, ["sales"])).data.steps[0]!.status).toBe("unchanged");
+      expect(getCatalog(db, "sales")!.filesGone).toBeUndefined();
+    } finally {
+      db.close();
+    }
   });
 });
 

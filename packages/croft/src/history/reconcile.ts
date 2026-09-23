@@ -2,13 +2,15 @@
 // here. Runs whose process died become `crashed`; DuckDB, which is authoritative, says which of
 // their steps committed before the crash; their leases are released; their staging is handed back
 // for deletion; write intents of dead processes are deleted. Cursors move only on commit, so a lost
-// step is simply extracted again next run.
+// step is simply extracted again next run. A recovered step's catalog mirror entry is refreshed from
+// the warehouse, so status and context show what committed.
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { CroftError, problem } from "../core/errors.ts";
 import { recordAlive } from "../core/proc.ts";
 import type { Problem, Sql, Warehouse } from "../core/types.ts";
 import { purgeDead } from "../db/intent.ts";
+import { baseFrom, type CatalogAsset, getCatalog, putCatalog, readCatalogEntry } from "./catalog.ts";
 import { reclaimDead, release } from "./leases.ts";
 import type { RunRecord, RunsDb, StepRecord } from "./runs-db.ts";
 
@@ -142,13 +144,18 @@ export async function reconcile(o: ReconcileOptions): Promise<ReconcileResult> {
   } catch {}
 
   // 2. Steps left running by ended runs (these and any a busy warehouse left unresolved before)
-  //    are matched against _croft.writes (run id, asset and attempt) under a short read lease.
+  //    are matched against _croft.writes (run id, asset and attempt) under a short read lease. The same lease
+  //    reads those assets' catalog entries, so a recovered step's mirror shows what committed.
   const dangling = db.danglingSteps();
   if (dangling.length === 0) return out;
   let writes: CommitRow[];
+  let entries: Map<string, CatalogAsset>;
   try {
     const runIds = [...new Set(dangling.map((s) => s.runId))];
-    writes = await o.warehouse.read((sql) => writesOf(sql, runIds), { purpose: "reconcile", waitMs: o.waitMs ?? DEFAULT_WAIT_MS });
+    ({ writes, entries } = await o.warehouse.read(async (sql) => {
+      const w = await writesOf(sql, runIds);
+      return { writes: w, entries: await catalogEntries(sql, db, dangling, w) };
+    }, { purpose: "reconcile", waitMs: o.waitMs ?? DEFAULT_WAIT_MS }));
   } catch (e) {
     out.unresolved = dangling.map(({ runId, asset, attempt }) => ({ runId, asset, attempt }));
     out.problems.push(asWarning(e, dangling.length));
@@ -161,9 +168,33 @@ export async function reconcile(o: ReconcileOptions): Promise<ReconcileResult> {
       const reason = s.reason ? `${s.reason} (recovered)` : "recovered";
       if (db.finishStep(s.runId, s.asset, s.attempt, { status: "ok", reason, rows: { in: c.rowsIn, added: c.added, updated: c.updated } })) {
         out.recovered.push({ ...ref, commits: c.commits });
+        const entry = entries.get(s.asset);
+        if (entry) putCatalog(db, entry, "run");
       }
     } else if (db.finishStep(s.runId, s.asset, s.attempt, { status: "crashed", error: lostProblem(s, db.getRun(s.runId)) })) {
       out.lost.push(ref);
+    }
+  }
+  return out;
+}
+
+/**
+ * Catalog entries, as the warehouse has them, of the assets whose dangling steps committed. The definition's
+ * side (behavior words, the cursor field) comes from the previous entry; the step's run becomes lastRunId
+ * unless a later run already wrote the asset. A read that fails leaves the mirror as it was: it is a mirror,
+ * and the asset's next run refreshes it anyway.
+ */
+async function catalogEntries(sql: Sql, db: RunsDb, dangling: StepRecord[], writes: CommitRow[]): Promise<Map<string, CatalogAsset>> {
+  const out = new Map<string, CatalogAsset>();
+  for (const s of dangling) {
+    if (out.has(s.asset) || !commitOf(writes, s)) continue;
+    try {
+      const prev = getCatalog(db, s.asset);
+      const newer = prev?.lastRunId && prev.lastRunId !== s.runId && (db.getRun(prev.lastRunId)?.startedAt ?? "") > (db.getRun(s.runId)?.startedAt ?? "");
+      const entry = await readCatalogEntry(sql, baseFrom(prev, s.asset, newer ? prev!.lastRunId : s.runId));
+      if (entry) out.set(s.asset, entry);
+    } catch {
+      // Keep the mirror as it is.
     }
   }
   return out;
