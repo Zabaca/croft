@@ -542,7 +542,7 @@ export default ingest({
     api.state.zones = [{ zone: 1 }];
     const root = makeProject({ "assets/report.sql": "select 1 as x\n", "assets/issues.ts": keysetIssues(api.url), "assets/zones.ts": simpleGet(api.url, "/zones") });
     await expect(runIn(root, ["report"], { from: "-7d" })).rejects.toMatchObject({
-      code: "BACKFILL_UNSUPPORTED", problem: { hint: "transforms rebuild from their inputs: croft run report --rebuild" },
+      code: "BACKFILL_UNSUPPORTED", problem: { hint: "transforms are rebuilt from their inputs; there is nothing to backfill: croft run report" },
     });
     // A bare run (or a glob) runs --from where it applies and skips the rest; nothing fails.
     const bare = await runIn(root, [], { from: "-7d" });

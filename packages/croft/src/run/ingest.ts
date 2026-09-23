@@ -768,7 +768,7 @@ export function confirmationProblem(c: Confirmation, rowsBefore: number, rowsAft
   return problem("CONFIRMATION_REQUIRED", {
     asset: c.impact.asset,
     message: `needs confirmation: ${c.impact.asset} would go from ${rowsBefore} rows to ${rowsAfter} (${SHRINK_ACTION})`,
-    hint: `first the current ${rowsBefore} rows go to the trash (croft restore ${c.impact.asset}); ask the user, and only if they agree: croft confirm ${c.token} (valid 15 min)`,
+    hint: `first the current ${rowsBefore} rows go to the trash (.croft/trash/${c.impact.asset}/); ask the user, and only if they agree: croft confirm ${c.token} (valid 15 min)`,
     effect: "nothing was changed",
     fix: { kind: "manual", requiresHuman: true, description: `show the user this impact; only after an explicit yes: croft confirm ${c.token}` },
     details: { token: c.token, expiresAt: c.expiresAt, rowsBefore, rowsAfter, trashPath: c.impact.trashPath ?? null },

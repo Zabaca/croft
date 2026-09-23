@@ -530,7 +530,7 @@ export class DuckWarehouse implements Warehouse {
       const who = `${holder.program ?? "another program"}${holder.pid !== null ? ` (PID ${holder.pid})` : ""}`;
       return new CroftError("DB_HELD_BY_OTHER_PROGRAM", {
         message: `the warehouse is held by ${who}; waited ${secs} s`,
-        hint: `close ${who}; apps should query through \`croft serve\`; for GUIs, turn on readCopy and open warehouse.read.duckdb`,
+        hint: `close ${who}, then retry; apps should open the file only per query (@zabaca/croft/read does)`,
         retryable: true,
         details,
       });

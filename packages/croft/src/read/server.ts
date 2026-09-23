@@ -76,7 +76,7 @@ export async function serverQuery(target: ServerTarget, req: SelectRequest, t: S
     if (/[\x00-\x1f\x7f]/.test(target.token)) {
       throw new CroftError("USAGE_ERROR", {
         message: `the croft serve token from ${target.tokenSource} contains a control character`,
-        hint: "use the token exactly as croft serve wrote it to .croft/serve.json",
+        hint: "use the token exactly as written in .croft/serve.json",
       });
     }
     headers.Authorization = `Bearer ${target.token}`;
@@ -143,7 +143,7 @@ function rowsFrom(target: ServerTarget, reply: HttpReply, envelope: Record<strin
   if (reply.status < 200 || reply.status >= 300 || !envelope) {
     throw new CroftError("SERVE_UNAVAILABLE", {
       message: `croft serve at ${target.url.origin} answered ${reply.status} without a query envelope`,
-      hint: "check that the URL points at croft serve (it prints its URL when it starts)",
+      hint: "check that { url } / CROFT_URL points at a croft read server",
       retryable: reply.status >= 500,
       details: { url: target.url.origin, status: reply.status, body: reply.body.slice(0, 200) },
     });
@@ -152,7 +152,7 @@ function rowsFrom(target: ServerTarget, reply: HttpReply, envelope: Record<strin
   if (envelope.ok === false || !data || !Array.isArray(data.rows)) {
     throw new CroftError("INTERNAL_ERROR", {
       message: `croft serve at ${target.url.origin} sent a query envelope without rows`,
-      hint: "use the same croft version for the app and for croft serve",
+      hint: "use the same croft version for the app and the server",
       details: { url: target.url.origin, status: reply.status, ok: envelope.ok ?? null, croftVersion: envelope.croftVersion ?? null },
     });
   }
@@ -201,7 +201,7 @@ export function fromProblem(p: Record<string, unknown>, status: number): CroftEr
   return new CroftError("INTERNAL_ERROR", {
     ...init,
     message: `${code || "error"} from croft serve: ${init.message}`,
-    hint: init.hint || "use the same croft version for the app and for croft serve",
+    hint: init.hint || "use the same croft version for the app and the server",
     details: { ...init.details, remoteCode: code || null, status },
   });
 }
@@ -212,7 +212,7 @@ function unavailable(target: ServerTarget, message: string, start: number, detai
     message: message + explicit,
     hint: details.reason === "busy"
       ? "a run is writing; retry shortly, or pass a larger { timeoutMs } to query()"
-      : "start croft serve in the project folder, or check { url } / CROFT_URL",
+      : "check { url } / CROFT_URL and that the server is running",
     retryable: true,
     details: { url: target.url.origin, waitedMs: Date.now() - start, ...details },
   });
@@ -225,7 +225,7 @@ function unauthorized(target: ServerTarget, status: number): CroftError {
   return new CroftError("SERVE_UNAUTHORIZED", {
     message,
     hint: "pass { token }, or set CROFT_SERVE_TOKEN to the token in the project's .croft/serve.json (or the server's CROFT_SERVE_TOKEN)",
-    fix: { kind: "manual", description: "give query() the token croft serve uses" },
+    fix: { kind: "manual", description: "give query() the server's token" },
     retryable: false,
     details: { url: target.url.origin, status, tokenSource: target.tokenSource },
   });

@@ -146,7 +146,7 @@ describe("the --from matrix (§8)", () => {
     expect(backfillUnsupported(step({ write: "append" }))).toBeNull();
     expect(backfillUnsupported(step({ write: "replace", incremental: none }))?.problem.hint).toBe("replace ingests always fetch everything: croft run x");
     expect(backfillUnsupported(step({ kind: "file" }))?.problem.hint).toContain("changed files reload automatically");
-    expect(backfillUnsupported(step({ kind: "sql" }))?.problem.hint).toContain("croft run x --rebuild");
+    expect(backfillUnsupported(step({ kind: "sql" }))?.problem.hint).toContain("nothing to backfill: croft run x");
     expect(backfillUnsupported(step({ kind: "transform" }))?.code).toBe("BACKFILL_UNSUPPORTED");
   });
 });

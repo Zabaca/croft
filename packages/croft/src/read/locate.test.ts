@@ -62,7 +62,6 @@ describe("findProject", () => {
     const e = thrown(() => findProject({}, {}, "/"));
     expect(e.code).toBe("PROJECT_NOT_FOUND");
     expect(e.problem.hint).toContain("CROFT_PROJECT");
-    expect(e.problem.hint).toContain("CROFT_URL");
     const e2 = thrown(() => findProject({}, { CROFT_PROJECT: nowhere }, p.root));
     expect(e2.code).toBe("PROJECT_NOT_FOUND");
     expect(e2.message).toContain("CROFT_PROJECT");

@@ -438,7 +438,7 @@ describe("lock conflicts", () => {
     const e = await pending;
     expect(e.code).toBe("DB_HELD_BY_OTHER_PROGRAM");
     expect(e.message).toContain(`(PID ${foreign.proc.pid})`);
-    expect(e.problem.hint).toContain("croft serve");
+    expect(e.problem.hint).toContain("then retry");
     expect(heldCount(p.stateDir)).toBe(0);
     foreign.proc.kill("SIGKILL");
     await foreign.exited;

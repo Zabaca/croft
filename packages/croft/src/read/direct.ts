@@ -223,7 +223,7 @@ function busy(project: Project, c: LockConflict, waitedMs: number): CroftError {
   if (intent) {
     return new CroftError("DB_BUSY", {
       message: `the warehouse is busy: croft ${intent.runId ? `run ${intent.runId}` : `(pid ${c.pid})`} is writing; waited ${secs} s`,
-      hint: "retry shortly; for apps that must not wait, run `croft serve` and query through it",
+      hint: "retry shortly; croft holds the file only while a write step runs",
       retryable: true,
       details,
     });
@@ -231,7 +231,7 @@ function busy(project: Project, c: LockConflict, waitedMs: number): CroftError {
   if (c.pid !== null && servePid(project.paths.stateDir) === c.pid) {
     return new CroftError("DB_BUSY", {
       message: `the warehouse is held by croft serve (pid ${c.pid}); waited ${secs} s`,
-      hint: "query through croft serve (set CROFT_URL, or keep serve.json in the state folder), or stop it",
+      hint: "query through that server (set CROFT_URL), or stop it and retry",
       retryable: true,
       details: { ...details, holder: { ...holder, program: "croft serve" } },
     });
@@ -239,7 +239,7 @@ function busy(project: Project, c: LockConflict, waitedMs: number): CroftError {
   const who = `${c.program ?? "another program"}${c.pid !== null ? ` (PID ${c.pid})` : ""}`;
   return new CroftError("DB_HELD_BY_OTHER_PROGRAM", {
     message: `the warehouse is held by ${who}; waited ${secs} s`,
-    hint: `close ${who}; apps should query through \`croft serve\`; for GUIs, turn on readCopy and open warehouse.read.duckdb`,
+    hint: `close ${who}, then retry; apps should open the file only per query (@zabaca/croft/read does)`,
     retryable: true,
     details,
   });

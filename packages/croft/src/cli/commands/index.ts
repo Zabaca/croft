@@ -110,7 +110,7 @@ const query = lazyCommand({
   options: {
     limit: { type: "string", value: "N", description: "rows to show (default 50)" },
     "full-values": { type: "boolean", description: "show whole values instead of cutting them at 80 characters" },
-    preview: { type: "boolean", description: "query the preview database (comes with croft preview)" },
+    preview: { type: "boolean", description: "query the preview database (a later croft version; refused in this one)" },
   },
   maxPositionals: 1,
 }, async () => (await import("./query.ts")).query);

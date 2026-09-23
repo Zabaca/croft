@@ -197,7 +197,7 @@ export function behaviorOf(c: AssetConfig | null, cat: CatalogAsset | null): Beh
   if (cat?.behavior) return { words: cat.behavior, write, key, incremental };
   const by = key.length ? key.join(", ") : "row content";
   let words: string;
-  if (kind === null) words = "unknown until the asset file loads (croft validate shows why)";
+  if (kind === null) words = "unknown until the asset file loads (croft run <asset> shows why)";
   else if (kind === "sql") words = `rebuilt in full when an input or its SQL changes; rows matched by ${by}`;
   else if (inc.kind === "cursor") {
     // Without the asset file (a warehouse-only table) the field's name is not known.

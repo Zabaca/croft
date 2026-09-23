@@ -212,7 +212,7 @@ describe("lock conflicts", () => {
     expect(e.code).toBe("DB_HELD_BY_OTHER_PROGRAM");
     expect(e.message).toContain(`PID ${holder.pid}`);
     expect(e.problem.details?.holder).toMatchObject({ pid: holder.pid });
-    expect(e.problem.hint).toContain("croft serve");
+    expect(e.problem.hint).toContain("then retry");
     expect(isOpen(p.database)).toBe(false);
   });
 

@@ -114,7 +114,7 @@ export function selectAssets(names: readonly string[], selectors: readonly strin
         if (broken[0]) throw discoveryError(broken[0]);
         throw new CroftError("USAGE_ERROR", {
           message: `no asset matches ${JSON.stringify(sel)}`,
-          hint: names.length ? `assets are named after their files in assets/: ${names.slice(0, 20).join(", ")}` : "assets/ has no assets yet; croft new --list shows templates",
+          hint: names.length ? `assets are named after their files in assets/: ${names.slice(0, 20).join(", ")}` : "assets/ has no assets yet; croft docs ingest shows templates",
           details: { selector: sel },
         });
       }
@@ -126,7 +126,7 @@ export function selectAssets(names: readonly string[], selectors: readonly strin
       const guess = didYouMean(sel, names);
       throw new CroftError("USAGE_ERROR", {
         message: `there is no asset named ${JSON.stringify(sel)}`,
-        hint: guess ? `did you mean ${guess}?` : names.length ? `assets are named after their files in assets/: ${names.slice(0, 20).join(", ")}` : "assets/ has no assets yet; croft new --list shows templates",
+        hint: guess ? `did you mean ${guess}?` : names.length ? `assets are named after their files in assets/: ${names.slice(0, 20).join(", ")}` : "assets/ has no assets yet; croft docs ingest shows templates",
         ...(guess ? { fix: { kind: "command" as const, description: `run ${guess}`, command: `croft run ${guess}` } } : {}),
         details: { selector: sel, ...(guess ? { suggestion: guess } : {}) },
       });
@@ -283,14 +283,14 @@ export function backfillUnsupported(step: PlannedStep): CroftError | null {
   if (step.kind === "sql" || step.kind === "transform") {
     return new CroftError("BACKFILL_UNSUPPORTED", {
       ...at, message: `${step.asset} is a transform; --from applies to merge ingests`,
-      hint: `transforms rebuild from their inputs: croft run ${step.asset} --rebuild`,
-      fix: { kind: "command", description: "rebuild the transform", command: `croft run ${step.asset} --rebuild` },
+      hint: `transforms are rebuilt from their inputs; there is nothing to backfill: croft run ${step.asset}`,
+      fix: { kind: "command", description: "run the transform", command: `croft run ${step.asset}` },
     });
   }
   if (step.kind === "file") {
     return new CroftError("BACKFILL_UNSUPPORTED", {
       ...at, message: `${step.asset} is a file ingest; --from applies to merge ingests`,
-      hint: `changed files reload automatically; croft run ${step.asset} --rebuild reloads all files`,
+      hint: `changed files reload automatically on the next run; there is nothing to backfill: croft run ${step.asset}`,
     });
   }
   if (step.incremental.kind !== "cursor" || step.write === "replace") {

@@ -57,26 +57,7 @@ async function allDocs(): Promise<{ name: string; page: string }[]> {
 // Suggested rewording: croft serve → "a later croft version's read server" (or drop it; apps read the file
 // directly); croft new --list → croft docs ingest; croft restore → "the trash in .croft/trash/"; and
 // croft run X --rebuild → a text without the flag (this version has no rebuild).
-const ELSEWHERE: { file: string; text: string }[] = [
-  { file: "cli/commands/index.ts", text: "(comes with croft preview)" },                   // query --preview's help
-  { file: "db/warehouse.ts", text: "apps should query through `croft serve`" },
-  { file: "read/direct.ts", text: "run `croft serve` and query through it" },
-  { file: "read/direct.ts", text: "query through croft serve (set CROFT_URL" },
-  { file: "read/direct.ts", text: "apps should query through `croft serve`" },
-  { file: "read/locate.ts", text: "to use a croft serve instead, set CROFT_URL" },
-  { file: "read/locate.ts", text: "or where croft serve listens" },
-  { file: "read/locate.ts", text: "use the URL croft serve printed" },
-  { file: "read/server.ts", text: "as croft serve wrote it" },
-  { file: "read/server.ts", text: "points at croft serve" },
-  { file: "read/server.ts", text: "for the app and for croft serve" },
-  { file: "read/server.ts", text: "start croft serve in the project folder" },
-  { file: "read/server.ts", text: "the token croft serve uses" },
-  { file: "run/ingest.ts", text: "(croft restore X)" },                                   // the --allow-shrink confirmation
-  { file: "run/plan.ts", text: "croft new --list shows templates" },                        // unknown asset, no assets
-  { file: "run/plan.ts", text: "croft run X --rebuild" },                                   // BACKFILL_UNSUPPORTED
-  { file: "safety/guards.ts", text: "--rebuild" },                                          // OUT_OF_BAND_CHANGE
-  { file: "safety/guards.ts", text: "croft run X --rebuild" },                              // TABLE_MODIFIED_OUTSIDE_CROFT
-];
+const ELSEWHERE: { file: string; text: string }[] = [];
 
 describe("the phase manifest matches the registry", () => {
   test("the registry has exactly this phase's commands", () => {

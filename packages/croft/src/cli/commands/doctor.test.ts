@@ -294,7 +294,7 @@ describe("warehouse checks", () => {
     const w = check(data.checks, "warehouse");
     expect(w).toMatchObject({ status: "error", code: "DB_HELD_BY_OTHER_PROGRAM", details: { heldBy: { pid: holder.pid } } });
     expect(w.text).toContain(`(PID ${holder.pid})`);
-    expect(problems.find((p) => p.code === "DB_HELD_BY_OTHER_PROGRAM")!.hint).toContain("croft serve");
+    expect(problems.find((p) => p.code === "DB_HELD_BY_OTHER_PROGRAM")!.hint).toContain("then retry");
   }, 20_000);
 
   test("a croft process holding the file without an intent (a race) is busy, not a foreign program", async () => {

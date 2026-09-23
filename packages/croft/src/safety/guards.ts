@@ -134,7 +134,7 @@ export async function detectOutOfBand(sql: Sql, asset: string, stats?: TableStat
     problem: problem("OUT_OF_BAND_CHANGE", {
       asset,
       message: `${asset} was changed outside croft: croft left ${expectedRows} rows (newest _loaded_at ${expected.maxLoadedAt ?? "none"}); ${now}`,
-      hint: "croft keeps the table as it is now and rebuilds what reads it; to refetch it from the source: croft run " + asset + " --rebuild",
+      hint: "croft keeps the table as it is now and continues from it; ask the user before changing it by hand again",
       effect: "assets that read it are rebuilt on their next run",
       details: { expected, actual },
     }),
@@ -202,7 +202,7 @@ export function compareSchema(asset: string, real: RealColumn[] | null, stored: 
   return problem("TABLE_MODIFIED_OUTSIDE_CROFT", {
     asset,
     message: `${asset}'s columns were changed outside croft: ${parts.join("; ")}`,
-    hint: `croft continues with the table as it is; if the change was a mistake, rebuild it: croft run ${asset} --rebuild`,
+    hint: `croft continues with the table as it is; tell the user what changed outside croft`,
     details: { exists: real !== null, added: d.added, dropped: d.dropped, retyped: d.retyped },
   });
 }

@@ -39,8 +39,8 @@ export function findProject(o: { project?: string }, env: Env, cwd: string): Pro
     if (e instanceof CroftError && e.code === "PROJECT_NOT_FOUND") {
       throw new CroftError("PROJECT_NOT_FOUND", {
         message: `no croft project found from ${cwd}: no croft.json there, in its parent folders or in ${join(cwd, "data")}`,
-        hint: "pass query(sql, params, { project: \"/path/to/data\" }) or set CROFT_PROJECT; to use a croft serve instead, set CROFT_URL",
-        fix: { kind: "manual", description: "tell query() where the croft project is, or where croft serve listens" },
+        hint: "pass query(sql, params, { project: \"/path/to/data\" }) or set CROFT_PROJECT",
+        fix: { kind: "manual", description: "tell query() where the croft project is" },
         details: { cwd },
       });
     }
@@ -125,7 +125,7 @@ export function explicitUrl(o: { url?: string }, env: Env): { url: URL; source: 
   if (!url) {
     throw new CroftError("USAGE_ERROR", {
       message: `${source === "option" ? "{ url }" : "CROFT_URL"} must be the http(s) address of croft serve, like http://127.0.0.1:7447; found ${JSON.stringify(text)}`,
-      hint: "use the URL croft serve printed when it started",
+      hint: "use the server's http(s) address, like http://127.0.0.1:7447",
     });
   }
   return { url, source };
