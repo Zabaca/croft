@@ -174,7 +174,7 @@ async function applySandbox(conn: DuckDBConnection, spec: SandboxSpec, key: stri
   try {
     await conn.run(`SET GLOBAL TimeZone = ${sqlString(spec.timezone)}`);
   } catch (e) {
-    throw new CroftError("USAGE_ERROR", {
+    throw new CroftError("CONFIG_INVALID", {
       message: `unknown time zone ${JSON.stringify(spec.timezone)} in croft.json`,
       hint: "use an IANA name such as America/Los_Angeles or UTC",
       details: { duckdb: (e as Error).message },

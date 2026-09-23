@@ -47,6 +47,8 @@ export const CODES = {
   QUERY_NOT_SELECT: { category: "project", severity: "error", exit: 2 },
   USAGE_ERROR: { category: "project", severity: "error", exit: 2 },
   PROJECT_NOT_FOUND: { category: "project", severity: "error", exit: 2 },
+  CONFIG_INVALID: { category: "project", severity: "error", exit: 2 },
+  DB_NOT_FOUND: { category: "project", severity: "error", exit: 2 },
   HTTP_ERROR: { category: "run", severity: "error", exit: 1 },
   ASSET_CODE_ERROR: { category: "run", severity: "error", exit: 1 },
   ROW_NOT_OBJECT: { category: "run", severity: "error", exit: 1 },
@@ -69,6 +71,7 @@ export const CODES = {
   BACKFILL_WOULD_DUPLICATE: { category: "run", severity: "error", exit: 1 },
   LARGE_REPROCESS: { category: "run", severity: "error", exit: 1 },
   INTERNAL_ERROR: { category: "run", severity: "error", exit: 1 },
+  RUN_CRASHED: { category: "run", severity: "error", exit: 1 },
   DB_BUSY: { category: "coordination", severity: "error", exit: 4 },
   DB_HELD_BY_OTHER_PROGRAM: { category: "coordination", severity: "error", exit: 4 },
   ASSET_BUSY: { category: "coordination", severity: "error", exit: 4 },
@@ -107,6 +110,7 @@ export const CODES = {
   EDITED_SINCE_LAST_RUN: { category: "warning", severity: "warning", exit: 0 },
   ORPHAN_TABLE: { category: "warning", severity: "warning", exit: 0 },
   OUT_OF_BAND_CHANGE: { category: "warning", severity: "warning", exit: 0 },
+  ENV_FILE_INVALID: { category: "warning", severity: "warning", exit: 0 },
 } as const satisfies Record<string, CodeInfo>;
 
 export type Code = keyof typeof CODES;

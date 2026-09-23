@@ -19,3 +19,9 @@ test("an exited child is dead", async () => {
   await new Promise((r) => child.on("exit", r));
   expect(isAlive(id)).toBe(false);
 });
+
+test("an unknown start time falls back to PID existence", () => {
+  const me = currentIdentity();
+  expect(isAlive({ ...me, procStart: "unknown" })).toBe(true);
+  expect(isAlive({ pid: 2 ** 22 + 12345, procStart: "unknown", bootId: me.bootId })).toBe(false);
+});

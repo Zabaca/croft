@@ -285,7 +285,7 @@ export class DuckWarehouse implements Warehouse {
 
   private async open(kind: "read" | "write", waitMs: number, runId?: string): Promise<DuckDBInstance> {
     if (this.mode === "read_only" && !existsSync(this.path)) {
-      throw new CroftError("USAGE_ERROR", {
+      throw new CroftError("DB_NOT_FOUND", {
         message: `the warehouse ${this.path} does not exist yet`,
         hint: "run an asset first: croft run",
         fix: { kind: "command", description: "build the assets", command: "croft run" },

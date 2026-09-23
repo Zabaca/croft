@@ -220,9 +220,9 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined): 
   return { ok: true, config: { database, timezone, readCopy, notify: { desktop, webhook }, concurrency, serve, stateDir } };
 }
 
-/** One USAGE_ERROR problem per issue (for `doctor` and `validate`, which report all of them). */
+/** One CONFIG_INVALID problem per issue (for `doctor` and `validate`, which report all of them). */
 export function configProblems(issues: ConfigIssue[], file = CONFIG_FILE): Problem[] {
-  return issues.map((i) => problem("USAGE_ERROR", {
+  return issues.map((i) => problem("CONFIG_INVALID", {
     message: i.message, hint: i.hint, file,
     ...(i.line !== undefined ? { line: i.line, column: i.column } : {}),
     fix: i.fix ?? { kind: "manual", description: i.hint },
@@ -230,7 +230,7 @@ export function configProblems(issues: ConfigIssue[], file = CONFIG_FILE): Probl
   }));
 }
 
-/** Read and validate <root>/croft.json. Throws USAGE_ERROR listing every issue. */
+/** Read and validate <root>/croft.json. Throws CONFIG_INVALID listing every issue. */
 export function readConfig(root: string): CroftConfig {
   const file = join(root, CONFIG_FILE);
   let text: string;
@@ -252,7 +252,7 @@ function configError(issues: ConfigIssue[]): CroftError {
   const first = issues[0]!;
   const message = issues.length === 1 ? first.message
     : `croft.json has ${issues.length} problems:\n${issues.map((i) => `${i.line ? `line ${i.line}: ` : ""}${i.message}`).join("\n")}`;
-  return new CroftError("USAGE_ERROR", {
+  return new CroftError("CONFIG_INVALID", {
     message,
     hint: issues.length === 1 ? first.hint : `${first.hint} (and fix the other ${issues.length - 1}; croft docs config lists every key)`,
     file: CONFIG_FILE,
@@ -310,7 +310,7 @@ export function resolvePaths(root: string, config: CroftConfig, home = homedir()
   };
 }
 
-/** Find, read and validate the project. Throws PROJECT_NOT_FOUND or USAGE_ERROR. */
+/** Find, read and validate the project. Throws PROJECT_NOT_FOUND or CONFIG_INVALID. */
 export function loadProject(opts: { cwd?: string; root?: string; home?: string } = {}): Project {
   const cwd = resolve(opts.cwd ?? process.cwd());
   const root = opts.root ? resolve(opts.root) : findRoot(cwd);

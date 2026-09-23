@@ -24,33 +24,58 @@ export function bootId(): string {
   return cachedBootId;
 }
 
-/** Start time of a process, or null when no such process exists. */
+/** Start time recorded when it could not be read even though the process exists. */
+export const UNKNOWN_START = "unknown";
+
+/** Whether a PID exists at all (EPERM means it exists but belongs to someone else). */
+function pidExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Start time of a process, or null when no such process exists. When the start time cannot be
+ * read but the PID exists (ps missing or sandboxed), returns UNKNOWN_START instead of null, so a
+ * live holder is never mistaken for a dead one.
+ */
 export function procStart(pid: number): string | null {
   if (process.platform === "linux") {
     try {
       const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
       // Field 22 (starttime) comes after the parenthesized command name, which may contain spaces.
       const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-      return fields[19] ?? null;
+      return fields[19] ?? (pidExists(pid) ? UNKNOWN_START : null);
     } catch {
-      return null;
+      return pidExists(pid) ? UNKNOWN_START : null;
     }
   }
   const out = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
   const text = (out.stdout ?? "").trim();
-  return out.status === 0 && text ? text : null;
+  if (out.status === 0 && text) return text;
+  // ps exits 1 with no output for a missing PID; anything else (spawn failure) is inconclusive.
+  if (!out.error && out.status === 1 && !pidExists(pid)) return null;
+  return pidExists(pid) ? UNKNOWN_START : null;
 }
 
 let self: ProcessIdentity | undefined;
 
 export function currentIdentity(): ProcessIdentity {
-  self ??= { pid: process.pid, procStart: procStart(process.pid) ?? "unknown", bootId: bootId() };
+  self ??= { pid: process.pid, procStart: procStart(process.pid) ?? UNKNOWN_START, bootId: bootId() };
   return self;
 }
 
-/** True only when the same process (same boot, same start time) is still running. */
+/**
+ * True only when the same process (same boot, same start time) is still running. When either
+ * start time is unknown, falls back to "the PID exists in this boot" and errs on the side of alive.
+ */
 export function isAlive(id: ProcessIdentity): boolean {
   if (id.bootId !== bootId()) return false;
   const start = procStart(id.pid);
-  return start !== null && start === id.procStart;
+  if (start === null) return false;
+  if (start === UNKNOWN_START || id.procStart === UNKNOWN_START) return true;
+  return start === id.procStart;
 }

@@ -72,7 +72,7 @@ async function commitsFor(sql: Sql, runIds: string[]): Promise<Map<string, Commi
 const key = (runId: string, asset: string) => `${runId}\u0000${asset}`;
 
 function lostProblem(s: StepRecord, run: RunRecord | null): Problem {
-  return problem("INTERRUPTED", {
+  return problem("RUN_CRASHED", {
     message: `the process running ${s.asset} (pid ${run?.pid ?? "?"}) died before its write committed; nothing from this step was saved`,
     hint: `croft run ${s.asset} fetches it again; cursors move only on commit, so no data is skipped`,
     asset: s.asset, runId: s.runId, retryable: true,
