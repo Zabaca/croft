@@ -198,7 +198,7 @@ Scheduling
 - Subfolders are for organization only.
 - Every table lives in DuckDB's `main` schema, so SQL always says `FROM github_issues`.
 - `new` (kept free for post-v1 incremental SQL, §3d), `croft` and names starting with `_` are reserved.
-- DuckDB's 75 reserved keywords (`order`, `end`, `limit`, `window`, `group`, …) are rejected with `NAME_RESERVED` and a suggested plural ("rename to orders"), because `FROM order` is a parser error in every downstream asset [V].
+- DuckDB's 75 reserved keywords (`order`, `end`, `limit`, `window`, `group`, …), and 30 of its 35 `type_function` keywords (`left`, `join`, `like`, `is`, …), are rejected with `NAME_RESERVED` and a suggested plural ("rename to orders"), because `FROM order` is a parser error in every downstream asset [V].
 - A `.ts` file and a `.sql` file with the same name is `NAME_CONFLICT`.
 
 ```
@@ -946,7 +946,9 @@ A second rule covers the rest. **All user-authored SQL must be exactly one SELEC
                 top-level keys, row counts and unsafe-integer warnings.
                 manifest.json is written last. Up to 4 extractions run concurrently ("concurrency").
 3  write lease  write intent created, RW open, in-process write mutex, BEGIN
-   a  stage     CREATE TEMP TABLE raw AS SELECT * FROM read_json(parts, columns = {every key: 'JSON'});
+   a  stage     CREATE TEMP VIEW raw AS SELECT * FROM read_json(parts, columns = {every key: 'JSON'})
+                (a view, not a table: inside the write transaction DuckDB scanned a table created by
+                the same transaction about 4.5× slower, 1247 ms vs 417 ms for 1M × 5 [V]);
                 every row carries a _croft_seq in yield order; the real table schema is read from
                 duckdb_columns(), and a mismatch with _croft.columns is TABLE_MODIFIED_OUTSIDE_CROFT
    b  classify  per column: counts by json_type + string sub-kinds (ISO instant / naive / date) (§7)
@@ -1364,11 +1366,11 @@ This runs inside the load transaction and is recorded in `_croft.writes.schema_c
 
 So after every cast, a **round-trip loss check** counts rows where the raw value is not NULL and either the typed value is NULL or it differs from the raw value when compared canonically:
 
-- Numbers compare as `TRY_CAST(text AS DECIMAL(38,18)) IS DISTINCT FROM typed::DECIMAL(38,18)`. This catches `1.7` → 2 and `19.999` → `DECIMAL(18,2)`.
+- Numbers are compared by casting the typed value back to VARCHAR, which gives the shortest round-trip form for DOUBLE, and comparing both sides in an exact canonical "digits × 10^exponent" form. Integer text in a DOUBLE column is compared exactly as HUGEINT. This catches `1.7` → 2 and `19.999` → `DECIMAL(18,2)`. An earlier `TRY_CAST(text AS DECIMAL(38,18))` formula gave 11,218 false losses among 40,011 random doubles, because DuckDB casts DOUBLE to DECIMAL from the binary value (4.35 → 4.349999999999999488) [V].
 - Timestamps compare as epoch instants.
 - Any loss fails the load. For a pinned DECIMAL, the failure is `PIN_ROUNDED`, with a count.
 
-**Money on JSON sources.** A `DECIMAL` pin with more than 15 significant digits on a JSON or API source is `DECIMAL_PRECISION_UNSUPPORTED`, because the digits beyond double precision are already gone. The fix is to yield such values as strings. CSV sources are unaffected, because `all_varchar` keeps the text.
+**Money on JSON sources.** `DECIMAL_PRECISION_UNSUPPORTED` is raised only when *fractional JSON numbers* arrive under a `DECIMAL` pin with precision above 15, because the digits beyond double precision are already gone. Strings and integers are exact, so the fix is to yield such values as strings. The common money pin `DECIMAL(18,2)` still works for ordinary amounts. CSV sources are unaffected, because `all_varchar` keeps the text.
 
 **`TYPE_CONFLICT`** names the column, both types, the count of bad rows, 5 sample values and the downstream assets that read the column. Its fixes, in order:
 
@@ -1540,7 +1542,7 @@ The tick skips anything **held**:
   - It ignores whitespace, comments and keyword or identifier case, and it detects real changes [V].
   - It avoids the `json_deserialize_sql` round trip and its uint64 `query_location` precision trap [V].
 - **Full-refresh TS transforms** are rebuilt.
-  - The fingerprint hashes the `Bun.build` output of the file with `packages: "external"` and `minify: {whitespace: true, syntax: true, identifiers: false}`, plus the versions of imported packages and the project time zone.
+  - The fingerprint hashes the `Bun.build` output of the file with `packages: "external"` and `minify: {whitespace: true, syntax: true, identifiers: false}`, plus the versions of imported packages (except croft itself, so an upgrade does not mark every asset edited and hold it from the scheduler) and the project time zone. Bun names a default export after its file, so that identifier is replaced with a fixed name; a renamed file keeps its hash, which `ASSET_RENAMED` relies on.
   - This covers edits in `lib/`, ignores comments and formatting, and costs under 1.2 ms per asset [V].
   - Identifier minification must stay off: with it on, a comment-only edit changed the hash [V].
 - **Incremental TS transforms** apply new code to new rows only, because they may call paid services. `status` says: "issue_triage edited since last run; 18,556 rows were built by older code; to redo them: `croft run issue_triage --rebuild`" (trash plus confirmation).
@@ -1559,7 +1561,7 @@ A backfill is a flag, and it is defined per asset type:
 | file ingest | `BACKFILL_UNSUPPORTED`: "changed files reload automatically; `croft run x --rebuild` reloads all files" |
 | SQL / TS transform | `BACKFILL_UNSUPPORTED`: "use `croft run x --rebuild`" |
 
-`<when>` accepts `2026-06-24`, a full ISO timestamp, or a relative value (`-90d`, `-12h`, `today`). croft converts it to the cursor's type and echoes the conversion: `since: 1750748400 (2026-06-24T00:00:00-07:00)`. `run --dry-run --from -90d` shows the same without fetching.
+`<when>` accepts `2026-06-24`, a full ISO timestamp, or a relative value (`-90d`, `-12h`, `today`). croft converts it to the cursor's type and echoes the conversion: `since: 1782284400 (2026-06-24T00:00:00-07:00)`. `run --dry-run --from -90d` shows the same without fetching.
 
 The same flag fills a new field for old rows of a merge ingest: `croft run stripe_charges --from 2024-01-01`.
 
