@@ -316,6 +316,69 @@ describe("the shrink guard and --allow-shrink", () => {
     await expect(runIn(root, ["z*"], { allowShrink: true })).rejects.toMatchObject({ code: "USAGE_ERROR" });
     await expect(runIn(root, ["issues"], { allowShrink: true })).rejects.toMatchObject({ code: "USAGE_ERROR" });
   });
+
+  // §6: `allowShrink: true` is the user's standing decision, made in code: a shrink needs no confirmation, but every
+  // run says the guard is off (SHRINK_GUARD_DISABLED), and the current rows still go to the trash first.
+  test("allowShrink: true in the asset shrinks without a confirmation, trashing first, and warns on every run", async () => {
+    api.state.zones = zones;
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones", "\n  allowShrink: true,") });
+    const first = await runIn(root, ["zones"]);
+    expect(first.exit).toBe(0);
+    const off = first.problems.filter((p) => p.code === "SHRINK_GUARD_DISABLED");
+    expect(off).toHaveLength(1);
+    expect(off[0]).toMatchObject({ severity: "warning", asset: "zones", file: "assets/zones.ts", line: 3, fix: { kind: "edit", line: 3 } });
+    expect(first.data.steps[0]!.trashed).toBeUndefined();
+
+    api.state.zones = zones.slice(0, 1);
+    const shrunk = await runIn(root, ["zones"]);
+    expect(shrunk.exit).toBe(0);
+    expect(shrunk.confirmation).toBeUndefined();
+    expect(shrunk.problems.map((p) => p.code)).not.toContain("SHRINK_GUARD");
+    expect(shrunk.problems.map((p) => p.code)).not.toContain("CONFIRMATION_REQUIRED");
+    const step = shrunk.data.steps[0]!;
+    expect(step).toMatchObject({ status: "ok", attempt: 1, rows: { total: 1, deleted: 5 }, trashed: { rows: 6 } });
+    const warned = shrunk.problems.filter((p) => p.code === "SHRINK_GUARD_DISABLED");
+    expect(warned.map((p) => p.severity)).toEqual(["warning", "warning"]);
+    const shrink = warned.find((p) => p.details?.rowsBefore !== undefined)!;
+    expect(shrink.details).toMatchObject({ rowsBefore: 6, rowsAfter: 1, trashPath: step.trashed!.path });
+    expect(shrink.message).toContain("the previous 6 rows went to the trash first");
+    const trash = listTrash(join(root, ".croft"), "zones");
+    expect(trash).toHaveLength(1);
+    expect(trash[0]).toMatchObject({ asset: "zones", rows: 6, path: step.trashed!.path, reason: `allowShrink: true (${shrunk.data.runId})` });
+    expect(await rows(root, "select count(*)::INT n from zones")).toEqual([{ n: 1 }]);
+    const log = readFileSync(logPath(join(root, ".croft"), shrunk.data.runId, "zones"), "utf8");
+    expect(log).toContain("allowShrink: true: moving the current 6 rows of zones to the trash first");
+    // The trashed version holds the rows the shrink removed.
+    const t = await DuckDBInstance.create(trash[0]!.path, { access_mode: "READ_ONLY" });
+    const c = await t.connect();
+    try {
+      expect((await c.runAndReadAll("select count(*)::INT n from zones")).getRowObjectsJS()).toEqual([{ n: 6 }]);
+    } finally {
+      c.disconnectSync();
+      t.closeSync();
+    }
+
+    // --allow-shrink on top of it asks nothing either: the code already says yes.
+    api.state.zones = [];
+    const flagged = await runIn(root, ["zones"], { allowShrink: true });
+    expect(flagged.exit).toBe(0);
+    expect(flagged.confirmation).toBeUndefined();
+    expect(flagged.data.steps[0]!.trashed?.rows).toBe(1);
+    expect(listTrash(join(root, ".croft"), "zones")).toHaveLength(2);
+  });
+
+  test("without allowShrink, and with allowShrink: false, the guard holds", async () => {
+    api.state.zones = zones;
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones", "\n  allowShrink: false,") });
+    const first = await runIn(root, ["zones"]);
+    expect(first.problems.map((p) => p.code)).not.toContain("SHRINK_GUARD_DISABLED");
+    api.state.zones = [];
+    const out = await runIn(root, ["zones"]);
+    expect(out.exit).toBe(1);
+    expect(out.data.steps[0]!.error?.code).toBe("SHRINK_GUARD");
+    expect(listTrash(join(root, ".croft"))).toEqual([]);
+    expect(await rows(root, "select count(*)::INT n from zones")).toEqual([{ n: 6 }]);
+  });
 });
 
 describe("types across runs", () => {
@@ -399,6 +462,41 @@ export default ingest({
     const want = Math.floor(now.getTime() / 1000) - 90 * 86400;
     expect(api.state.log[0]!.query.since).toBe(String(want));
     expect(back.data.steps[0]!.reason).toContain(`since: ${want} (`);
+  });
+
+  // A text cursor ("v0005") is compared as text: -90d, today or a date would reach rows() as the literal since
+  // "-90d", a filter the API cannot use. They are refused before the run; a value in the cursor's own form is not.
+  test("a string cursor refuses relative values and dates before the run, and passes a value in its own form as is", async () => {
+    api.state.raw = `[{"id": 1, "ver": "v0005"}]`;
+    const root = makeProject({ "assets/vers.ts": `import { ingest } from "@zabaca/croft";
+export default ingest({
+  key: "id",
+  incremental: "ver",
+  async *rows({ since, http }) {
+    yield (await http.get("${api.url}/raw", { query: { since } })).json<Record<string, unknown>[]>();
+  },
+});
+` });
+    expect((await runIn(root, ["vers"])).exit).toBe(0);
+    const recorded = () => {
+      const db = runsDb(root);
+      try {
+        return db.listRuns().length;
+      } finally {
+        db.close();
+      }
+    };
+    for (const from of ["-90d", "today", "2026-09-01"]) {
+      const e = await runIn(root, ["vers"], { from }).catch((x: unknown) => x);
+      expect(e).toMatchObject({ code: "CURSOR_TYPE_MISMATCH", exit: 2, problem: { asset: "vers", details: { from, saved: "v0005", field: "ver" } } });
+      expect((e as { problem: { hint: string } }).problem.hint).toContain('"v0005"');
+    }
+    expect(recorded()).toBe(1);
+    api.state.log.length = 0;
+    const ok = await runIn(root, ["vers"], { from: "v0003" });
+    expect(ok.exit).toBe(0);
+    expect(api.state.log[0]!.query.since).toBe("v0003");
+    expect(ok.data.steps[0]!.reason).toContain("since: v0003");
   });
 
   test("the --from matrix: replace and file ingests are BACKFILL_UNSUPPORTED; append before the cursor would duplicate", async () => {
@@ -773,6 +871,46 @@ describe("file ingests through the engine", () => {
     } finally {
       db.close();
     }
+  });
+
+  // §3b: CSV_HEADER_AMBIGUOUS is a first-load error. Once the asset has loaded, its stored columns settle the header
+  // question, so a day with no orders (an export holding only the header line) is an empty file, not a failure.
+  test("after the first load a header-only CSV is an empty file, and later all-text files reuse the header decision", async () => {
+    const root = makeProject({
+      "files/sales/2026-09-01.csv": "order_id,amount,customer\nA1,10,ann\nA2,20,bob\n",
+      "assets/sales.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ file: "files/sales/*.csv", incremental: true, key: "order_id" });\n`,
+    });
+    const first = await runIn(root, ["sales"]);
+    expect(first.exit).toBe(0);
+    expect(first.data.steps[0]!.csvHeader).toMatchObject({ header: true, from: "sniffed" });
+
+    writeFileSync(join(root, "files/sales/2026-09-02.csv"), "order_id,amount,customer\n");
+    const empty = await runIn(root, ["sales"]);
+    expect(empty.problems.filter((p) => p.severity === "error")).toEqual([]);
+    expect(empty.exit).toBe(0);
+    expect(empty.data.steps[0]).toMatchObject({ status: "ok", rows: { in: 0, added: 0, total: 2 } });
+    // Recorded like any loaded file: the next run has nothing to do.
+    expect((await runIn(root, ["sales"])).data.steps[0]!.status).toBe("unchanged");
+
+    // Every column of this export reads as text and its first line is not all known names (a new column):
+    // the stored decision (a header line) holds, and the new column arrives.
+    writeFileSync(join(root, "files/sales/2026-09-03.csv"), "order_id,customer,note\nA3,cat,gift\n");
+    const later = await runIn(root, ["sales"]);
+    expect(later.problems.filter((p) => p.severity === "error")).toEqual([]);
+    expect(later.data.steps[0]).toMatchObject({ status: "ok", rows: { added: 1, total: 3 } });
+    expect(await rows(root, "select order_id, customer, note from sales order by order_id")).toEqual([
+      { order_id: "A1", customer: "ann", note: null }, { order_id: "A2", customer: "bob", note: null }, { order_id: "A3", customer: "cat", note: "gift" },
+    ]);
+  });
+
+  test("the first load of a header-only or all-text CSV is still CSV_HEADER_AMBIGUOUS", async () => {
+    const root = makeProject({
+      "files/names.csv": "name,city\n",
+      "assets/names.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ file: "files/*.csv" });\n`,
+    });
+    const out = await runIn(root, ["names"]);
+    expect(out.exit).toBe(1);
+    expect(out.data.steps[0]!.error?.code).toBe("CSV_HEADER_AMBIGUOUS");
   });
 });
 

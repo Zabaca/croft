@@ -9,7 +9,8 @@
 // - `since` = saved − lookback, rendered in the saved value's own form: a timestamp keeps its offset (or its
 //   lack of one), separator and fractional precision; an epoch cursor gets a number. Rounding always goes
 //   down (earlier), so a lookback never shrinks the re-read window.
-// - `--from` values (2026-06-24, full ISO, -90d, -12h, today) are converted to the cursor's type.
+// - `--from` values (2026-06-24, full ISO, -90d, -12h, today) are converted to the cursor's type. A text cursor
+//   converts nothing: it takes a value written like its saved one and refuses relative values and dates.
 import { CroftError, problem } from "../core/errors.ts";
 import type { CursorType, Problem, Sql } from "../core/types.ts";
 import { formatInstant, now as clockNow, offsetMinutes } from "../core/time.ts";
@@ -305,6 +306,8 @@ export interface FromOptions {
   /** The saved cursor, whose form (offset, separator, precision) a timestamp result copies. */
   template?: string | null;
   asset?: string;
+  /** The cursor field, for messages. */
+  field?: string;
 }
 
 export interface FromResult {
@@ -343,11 +346,39 @@ function usage(input: string, why: string): CroftError {
   });
 }
 
+/**
+ * `--from` on a text cursor. Text compares as text, so croft converts nothing: a value written like the saved
+ * cursor ("v0006" for "v0005") is passed to rows() as is. A relative value (-90d) or `today` means nothing as text,
+ * and a date or timestamp is refused unless the saved cursor is one too, in the same form (a VARCHAR pin on a date
+ * field): otherwise the API would get "-90d" or "2026-09-01" as a filter it cannot use (CURSOR_TYPE_MISMATCH).
+ * Before the first load there is no saved value to compare with, so only relative values and `today` are refused.
+ */
+function stringFrom(s: string, o: FromOptions): FromResult {
+  const saved = o.template ?? null;
+  const name = o.field ? `cursor ${o.field}` : "this cursor";
+  const details = { from: s, type: "string" as const, saved, field: o.field ?? null };
+  const like = saved !== null ? `the saved cursor "${saved}"` : `the values of ${o.field ?? "the cursor field"}`;
+  const refuse = (why: string) =>
+    mismatch(`--from ${s}: ${name} holds text${saved !== null ? ` ("${saved}")` : ""}, ${why}`,
+      `pass --from a value written like ${like}; a text cursor is compared as text, so croft cannot convert a date or a relative time into it`,
+      details, o.asset);
+  if (/^today$/i.test(s) || RELATIVE.test(s)) throw refuse(`and a relative time (${s}) cannot be turned into text`);
+  if (saved === null) return { since: s };
+  const value = parseIsoForm(s);
+  const form = parseIsoForm(saved);
+  if (value && !form) throw refuse(`not dates, so ${s} cannot be compared with it`);
+  if (!value && form) throw refuse(`written as ${form.hasTime ? "a timestamp" : "a date"}, and ${s} is not one`);
+  if (value && form && value.hasTime !== form.hasTime) {
+    throw refuse(`written as ${form.hasTime ? "a timestamp" : "a date"}, and ${s} is ${value.hasTime ? "a timestamp" : "a date"}; as text they do not compare`);
+  }
+  return { since: s };
+}
+
 /** Convert a `--from` value to the cursor's type. */
 export function parseFrom(input: string, o: FromOptions): FromResult {
   const s = input.trim();
   if (!s) throw usage(input, "it is empty");
-  if (o.type === "string") return { since: s };
+  if (o.type === "string") return stringFrom(s, o);
   if (o.type === "integer" && /^\d+$/.test(s)) return { since: toNumberOrText(BigInt(s)) };
   if (o.type === "integer" && !o.unit) {
     throw mismatch(`--from ${s}: this cursor holds plain integers, so it takes a number, not a date`,

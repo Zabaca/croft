@@ -438,7 +438,8 @@ describe("validateDefinition: ingests", () => {
       secrets: ["STRIPE_KEY"], checks: ["amount >= 0"], warnings: ["min_rows(1)"], columns: { amount: "DECIMAL(18,2)", day: { type: "DATE", format: "%d/%m/%Y" } },
       retries: 3, timeout: "15m", allowShrink: true, description: "charges",
     }), O);
-    expect(a.problems).toEqual([]);
+    // allowShrink on a merge ingest does nothing, which the warning says (see "validateDefinition: allowShrink").
+    expect(codes(a.problems)).toEqual(["SHRINK_GUARD_DISABLED"]);
     expect(a.spec).toEqual({
       role: "ingest", source: "rows", key: ["id"], incremental: { kind: "cursor", field: "created", unit: "s", lookbackMs: 30 * 86_400_000 },
       schedule: "every hour", secrets: ["STRIPE_KEY"], inputs: [], checks: ["amount >= 0"], warnings: ["min_rows(1)"],
@@ -569,6 +570,36 @@ describe("validateDefinition: common keys", () => {
   test("secrets hint for a single string", () => {
     expect(one(api({ secrets: "GITHUB_TOKEN" })).hint).toBe('secrets: ["GITHUB_TOKEN"]');
     expect(one(api({ checks: "unique(id)" })).hint).toBe('checks: ["unique(id)"]');
+  });
+});
+
+// §6: `allowShrink: true` produces SHRINK_GUARD_DISABLED. It is a warning at load, so every run of the asset
+// carries it (the runner reports a step's load warnings), and the spec keeps allowShrink for the write.
+describe("validateDefinition: allowShrink", () => {
+  test("a replace ingest that turns the shrink guard off gets SHRINK_GUARD_DISABLED at the key", () => {
+    const source = 'import { ingest } from "@zabaca/croft";\nexport default ingest({\n  allowShrink: true,\n  async *rows() {},\n});\n';
+    const w = one(api({ allowShrink: true }), { source });
+    expect(w).toMatchObject({
+      code: "SHRINK_GUARD_DISABLED", severity: "warning", asset: "things", file: "assets/things.ts", line: 3,
+      fix: { kind: "edit", file: "assets/things.ts", line: 3 }, details: { key: "allowShrink" },
+    });
+    expect(w.message).toBe("things turns the shrink guard off (allowShrink: true): a source that suddenly returns few or no rows empties the table without asking; the current rows still go to the trash first");
+    expect(w.hint).toBe("remove allowShrink unless this source really shrinks by more than half; for a one-off, croft run things --allow-shrink asks first");
+    // A warning does not withhold the spec.
+    expect(validateDefinition(api({ allowShrink: true }), O).spec).toMatchObject({ allowShrink: true });
+    expect(one(files({ allowShrink: true })).code).toBe("SHRINK_GUARD_DISABLED");
+    expect(problemsOf(api({ allowShrink: false }))).toEqual([]);
+    expect(validateDefinition(api({ allowShrink: false }), O).spec).toMatchObject({ allowShrink: false });
+  });
+
+  test("on a merge or append ingest allowShrink does nothing, and the warning says so", () => {
+    const m = one(api({ key: "id", incremental: "updated_at", allowShrink: true }));
+    expect(m).toMatchObject({ code: "SHRINK_GUARD_DISABLED", severity: "warning" });
+    expect(m.message).toBe("allowShrink does nothing here: things merges rows by key, and only replace ingests have a shrink guard");
+    expect(m.hint).toBe("remove allowShrink");
+    expect(one(api({ incremental: "seq", write: "append", allowShrink: true })).message)
+      .toBe("allowShrink does nothing here: things appends rows, and only replace ingests have a shrink guard");
+    expect(one(files({ incremental: true, allowShrink: true })).message).toContain("things appends rows");
   });
 });
 

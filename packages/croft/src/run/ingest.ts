@@ -10,7 +10,8 @@
 //
 // File ingests use load/files.ts for the extract and the typed batch, and the same writeBatch.
 // A SHRINK_GUARD with --allow-shrink asks the caller's decider: granted → the table goes to the trash (its own
-// commit), then the write runs again with the guard off; pending → a confirmation token, nothing written.
+// commit), then the write runs again with the guard off; pending → a confirmation token, nothing written. An asset
+// with allowShrink: true skips the question (the user decided in code) but not the trash.
 // CROFT_FAULT=after_stage|before_commit|after_commit_before_sqlite|between_trash_and_drop kills the process at
 // that point (crash tests, DESIGN.md §10 "Crash tests").
 import { rmSync } from "node:fs";
@@ -407,8 +408,10 @@ function compareCursor(a: string | number, b: string, type: CursorType): number 
 /**
  * What `--from` means for one step (§8 "Backfills"), given its saved cursor. Throws what makes it refuse:
  * BACKFILL_UNSUPPORTED (not a cursor ingest), BACKFILL_WOULD_DUPLICATE (an append ingest with a saved position:
- * a --from at or before it stores rows twice, one after it skips the rows in between), or USAGE_ERROR (a
- * --from that does not parse). A merge ingest's --from after its saved cursor holds the cursor where it is.
+ * a --from at or before it stores rows twice, one after it skips the rows in between), USAGE_ERROR (a --from that
+ * does not parse), or CURSOR_TYPE_MISMATCH (a --from the cursor's type cannot take: a date for plain integers,
+ * a relative value or a date for a text cursor that does not hold dates, cursor.ts). A merge ingest's --from
+ * after its saved cursor holds the cursor where it is.
  * The runner calls this before the run starts, so a refusal is never a failed step.
  */
 export function fromSince(step: PlannedStep, from: string, saved: SavedCursor, o: { timezone: string; now: Date }): Since {
@@ -418,7 +421,7 @@ export function fromSince(step: PlannedStep, from: string, saved: SavedCursor, o
   if (inc.kind !== "cursor") return {};
   const type = saved.type ?? guessCursorType(step, inc.field, inc.unit);
   const conv = parseFrom(from, {
-    type, ...(inc.unit ? { unit: inc.unit } : {}), timezone: o.timezone, now: o.now, template: saved.value, asset: step.asset,
+    type, ...(inc.unit ? { unit: inc.unit } : {}), timezone: o.timezone, now: o.now, template: saved.value, asset: step.asset, field: inc.field,
   });
   const echo = `since: ${conv.since}${conv.instant && String(conv.since) !== conv.instant ? ` (${conv.instant})` : ""}`;
   if (saved.value === null) return { value: conv.since, echo };
@@ -575,6 +578,9 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
           files: await extractFiles({
             asset, config: config as FileIngest, root: project.root, stateDir, runId, known: state.files, http, signal,
             log: (...args: unknown[]) => log.log(...args),
+            // The stored columns are the asset's header decision for later CSV files (§3b), and the stored
+            // spellings for staged rows.
+            knownColumns: state.known.map((c) => ({ name: c.name, sourceName: c.sourceName ?? null })),
           }),
         };
       }
@@ -680,33 +686,44 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
 
   let out: { res: WriteResult; catalog: CatalogAsset };
   let trashed: TrashEntry | null = null;
+  // allowShrink: true in the asset (§6) is the user's decision, made in code: a shrink needs no confirmation (the
+  // load warning SHRINK_GUARD_DISABLED reports it on every run), but the table still goes to the trash first, so
+  // the rows a shrink removes stay recoverable. It wins over --allow-shrink, which would only ask again.
+  const standing = spec.allowShrink === true;
   try {
     out = await write(false);
   } catch (e) {
     const err = croftError(e);
-    if (!err || err.code !== "SHRINK_GUARD" || !i.shrink) throw e;
+    if (!err || err.code !== "SHRINK_GUARD" || (!standing && !i.shrink)) throw e;
     const rowsBefore = Number(err.problem.details?.rowsBefore ?? 0);
     const rowsAfter = Number(err.problem.details?.rowsAfter ?? 0);
-    const decision = await i.shrink({ asset, rowsBefore, rowsAfter, impact: shrinkImpact(stateDir, asset, rowsBefore), error: err });
-    if (decision.kind === "declined") throw err;
-    if (decision.kind === "pending") {
-      rmSync(stageDir, { recursive: true, force: true });
-      const c = decision.confirmation;
-      log.write(`needs confirmation ${c.token}: ${asset} would go from ${rowsBefore} rows to ${rowsAfter}`);
-      return {
-        result: {
-          ...base, status: "skipped", reason: "needs confirmation", requests: progress.requests,
-          skippedBecause: `${asset} would go from ${rowsBefore} rows to ${rowsAfter}; confirmation ${c.token} is waiting for a human`,
-          rows: { ...emptyRows(rowsBefore), in: rowsAfter }, durationMs: Date.now() - started,
-        },
-        warnings,
-        problems: [confirmationProblem(c, rowsBefore, rowsAfter)],
-        confirmation: c,
-      };
+    let why: string;
+    if (standing) {
+      log.write(`allowShrink: true: moving the current ${rowsBefore} rows of ${asset} to the trash first; it will have ${rowsAfter}`);
+      why = `allowShrink: true (${runId})`;
+    } else {
+      const decision = await i.shrink!({ asset, rowsBefore, rowsAfter, impact: shrinkImpact(stateDir, asset, rowsBefore), error: err });
+      if (decision.kind === "declined") throw err;
+      if (decision.kind === "pending") {
+        rmSync(stageDir, { recursive: true, force: true });
+        const c = decision.confirmation;
+        log.write(`needs confirmation ${c.token}: ${asset} would go from ${rowsBefore} rows to ${rowsAfter}`);
+        return {
+          result: {
+            ...base, status: "skipped", reason: "needs confirmation", requests: progress.requests,
+            skippedBecause: `${asset} would go from ${rowsBefore} rows to ${rowsAfter}; confirmation ${c.token} is waiting for a human`,
+            rows: { ...emptyRows(rowsBefore), in: rowsAfter }, durationMs: Date.now() - started,
+          },
+          warnings,
+          problems: [confirmationProblem(c, rowsBefore, rowsAfter)],
+          confirmation: c,
+        };
+      }
+      log.write(`--allow-shrink confirmed: moving the current ${rowsBefore} rows of ${asset} to the trash first`);
+      why = `run --allow-shrink (${runId})`;
     }
-    log.write(`--allow-shrink confirmed: moving the current ${rowsBefore} rows of ${asset} to the trash first`);
     try {
-      trashed = await trashTable(warehouse, asset, `run --allow-shrink (${runId})`, { runId, signal });
+      trashed = await trashTable(warehouse, asset, why, { runId, signal });
     } catch (te) {
       // A busy database is worth a retry (the grant holds for this run); anything else stops here.
       const busy = croftError(te);
@@ -721,7 +738,10 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
   putCatalog(runs, out.catalog, "run");
   rmSync(stageDir, { recursive: true, force: true });
   const r = out.res;
-  warnings.push(...r.warnings.map((w) => ({ ...w, asset: w.asset ?? asset, runId })));
+  warnings.push(...r.warnings.map((w) => {
+    const x = { ...w, asset: w.asset ?? asset, runId };
+    return trashed && w.code === "SHRINK_GUARD_DISABLED" ? shrankIntoTrash(x, trashed) : x;
+  }));
   log.write(`wrote ${asset}: ${r.rows.added} added, ${r.rows.updated} updated, ${r.rows.unchanged} unchanged, ${r.rows.deleted} deleted; ${r.rows.total} rows`);
   const result: StepResult = {
     ...base, status: "ok", requests: progress.requests, rows: r.rows, schemaChanges: r.schemaChanges,
@@ -732,6 +752,15 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
     durationMs: Date.now() - started,
   };
   return { result, warnings, problems: [], catalog: out.catalog };
+}
+
+/** The write's SHRINK_GUARD_DISABLED after a shrink, with where the rows it removed went. */
+function shrankIntoTrash(w: Problem, t: TrashEntry): Problem {
+  return {
+    ...w,
+    message: `${w.message}; the previous ${t.rows} rows went to the trash first: ${t.path}`,
+    details: { ...w.details, trashPath: t.path, trashedRows: t.rows },
+  };
 }
 
 /** CONFIRMATION_REQUIRED for a pending --allow-shrink: nothing was written. */
