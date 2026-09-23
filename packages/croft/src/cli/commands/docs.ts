@@ -5,6 +5,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { CODES, CroftError, EXIT, isCode, type Category, type Code } from "../../core/errors.ts";
+import { laterConfigKey } from "../../core/phase.ts";
 import { CONFIG_KEYS } from "../../project/root.ts";
 import { didYouMean } from "../../project/suggest.ts";
 import type { Command } from "../command.ts";
@@ -27,11 +28,11 @@ export const EXIT_MEANINGS: Record<number, string> = {
 export const CATEGORIES: Record<Category, { meaning: string; todo: string }> = {
   project: {
     meaning: "the project has a mistake in an asset file, croft.json or the command line",
-    todo: "Fix the file or command the problem names (apply its fix when there is one), then run croft validate --json.",
+    todo: "Fix the file or command the problem names (apply its fix when there is one), then run the command again. croft context --json lists the problems of every asset file without running anything.",
   },
   run: {
     meaning: "a step failed while it ran",
-    todo: "The problem's effect says what was and was not written. Read croft logs <asset> --failed, fix the cause, then croft preview <asset> and croft run <asset>.",
+    todo: "The problem's effect says what was and was not written. Read croft logs <asset> --failed, fix the cause, then croft run <asset> again.",
   },
   coordination: {
     meaning: "another process holds the database or the asset",
@@ -189,17 +190,24 @@ export function generatedCodePage(code: Code): string {
 }
 
 function configPage(): string {
-  const rows = CONFIG_KEYS.map((k) => [k.key, k.type, k.default, k.description]);
+  // Keys a later phase's feature reads are accepted and validated now, and said to do nothing yet
+  // (core/phase.ts), rather than described as if the feature were here.
+  const now = CONFIG_KEYS.filter((k) => !laterConfigKey(k.key));
+  const later = CONFIG_KEYS.flatMap((k) => {
+    const l = laterConfigKey(k.key);
+    return l ? [[k.key, k.type, k.default, `not used by this version (for ${l.feature}, in a later version)`]] : [];
+  });
   return [
     "# croft.json",
     "",
     "Project settings, read without running any code. Unknown keys are errors (with a did-you-mean).",
     "",
-    table(["KEY", "TYPE", "DEFAULT", "MEANING"], rows, { limit: Infinity, maxWidth: 120 }).text,
+    table(["KEY", "TYPE", "DEFAULT", "MEANING"], [...now.map((k) => [k.key, k.type, k.default, k.description]), ...later],
+      { limit: Infinity, maxWidth: 140 }).text,
     "",
     "Example:",
     '  {"$schema": "./node_modules/@zabaca/croft/croft.schema.json", "database": "warehouse.duckdb",',
-    '   "timezone": "America/Los_Angeles", "serve": {"port": 7447}}',
+    '   "timezone": "America/Los_Angeles"}',
     "",
     "When the project sits in a synced folder (iCloud ~/Documents or ~/Desktop, Dropbox, OneDrive, network",
     "drives, WSL /mnt/<drive>), croft moves the database and .croft/ to ~/.local/share/croft/<project>-<hash>/",

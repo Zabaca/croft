@@ -3,7 +3,8 @@
 // with JSON keys, checks, status, last run), what is running, recent failures and recent schema changes.
 //
 // It never waits on DuckDB (§5): asset facts come from the catalog mirror in runs.sqlite, and runs from
-// runs.sqlite. Schema changes of the last 7 days come from _croft.writes when the warehouse can be opened at
+// runs.sqlite. When the catalog lists tables but the warehouse file is gone, the problems carry DB_NOT_FOUND
+// and those assets show rows: null and status "unknown" (collectStatus in status.ts). Schema changes of the last 7 days come from _croft.writes when the warehouse can be opened at
 // once (no write intent announced and no lock held), and otherwise from what runs recorded in their
 // summaries. Asset files are imported (as validate does) for descriptions, checks and declared secrets.
 //
@@ -256,7 +257,8 @@ export function formatContext(d: ContextData, now: Date): string {
       ...(a.filesGone ? { filesGone: a.filesGone } : {}), ...(a.schemaChangedAt ? { schemaChangedAt: a.schemaChangedAt } : {}),
     };
     lines.push("");
-    lines.push(`${a.asset} · ${a.kind ?? "unknown kind"} · ${a.file ?? "(no asset file)"} · ${a.rows === null ? "not built" : `${formatCount(a.rows)} rows`} · ${statusText(status, now)}`);
+    const rows = a.rows !== null ? `${formatCount(a.rows)} rows` : a.status === "unknown" || a.lastLoadedAt ? "rows unknown" : "not built";
+    lines.push(`${a.asset} · ${a.kind ?? "unknown kind"} · ${a.file ?? "(no asset file)"} · ${rows} · ${statusText(status, now)}`);
     if (a.description) lines.push(`  ${a.description}`);
     lines.push(`  behavior  ${a.behavior}`);
     if (a.cursor) lines.push(`  cursor    ${a.cursor.field} = ${a.cursor.value ?? "(nothing saved yet)"}`);

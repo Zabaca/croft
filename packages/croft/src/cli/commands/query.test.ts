@@ -2,7 +2,8 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { cleanup as cleanupChildren, spawnHolder } from "../../read/testkit.ts";
-import { CHARGES_TS, cleanup, cli, ISSUES_SEED, ISSUES_TS, makeProject, seed, shape } from "./inspect-testkit.ts";
+import { putCatalog } from "../../history/catalog.ts";
+import { CHARGES_TS, cleanup, cli, DEAD, ISSUES_CATALOG, ISSUES_SEED, ISSUES_TS, makeProject, runsDb, seed, shape } from "./inspect-testkit.ts";
 import { parseLimit } from "./query.ts";
 
 afterAll(async () => {
@@ -284,6 +285,40 @@ describe("croft query: usage and state", () => {
     expect(other.json.problems[0]).toMatchObject({ code: "UNKNOWN_TABLE", details: { table: "github_isues" } });
     expect(other.json.problems[0].hint).toContain("github_issues");
     expect(existsSync(p.database)).toBe(false);
+  });
+
+  test("a warehouse that was built before and is now missing says so, not that nothing has run", async () => {
+    // The warehouse file was deleted or moved after runs had built it: runs.sqlite still lists the run and the
+    // table. The problem must not tell the agent a fresh project story ("nothing has run").
+    const p = makeProject({ files: { "assets/github_issues.ts": ISSUES_TS } });
+    const db = runsDb(p.stateDir);
+    const run = db.createRun({ id: "r_0922_1155_ok01", trigger: "manual", human: true, argv: ["run", "github_issues"], identity: DEAD });
+    db.finishRun(run.id, "succeeded");
+    putCatalog(db, ISSUES_CATALOG);
+    db.close();
+    const r = await cli(["query", "select count(*) from github_issues", "--json"], { cwd: p.root });
+    expect(r.exit).toBe(2);
+    const problem = r.json.problems[0];
+    expect(problem).toMatchObject({ code: "DB_NOT_FOUND", fix: { kind: "manual", requiresHuman: true }, details: { table: "github_issues", asset: "github_issues" } });
+    expect(problem.message).toContain("warehouse.duckdb is missing");
+    expect(problem.message).toContain("built it before");
+    expect(problem.message).not.toContain("nothing has run");
+    const other = await cli(["query", "select * from github_isues", "--json"], { cwd: p.root });
+    expect(other.json.problems[0].code).toBe("UNKNOWN_TABLE");
+    expect(other.json.problems[0].message).not.toContain("nothing has run");
+    expect(other.json.problems[0].message).toContain("warehouse.duckdb is missing");
+    expect(existsSync(p.database)).toBe(false);
+  });
+
+  test("runs that built no table yet: not built, and no claim that nothing has run", async () => {
+    const p = makeProject({ files: { "assets/github_issues.ts": ISSUES_TS } });
+    const db = runsDb(p.stateDir);
+    const run = db.createRun({ id: "r_0922_1155_bad1", trigger: "manual", human: true, argv: ["run", "github_issues"], identity: DEAD });
+    db.finishRun(run.id, "failed");
+    db.close();
+    const r = await cli(["query", "select count(*) from github_issues", "--json"], { cwd: p.root });
+    expect(r.json.problems[0]).toMatchObject({ code: "DB_NOT_FOUND", fix: { kind: "command", command: "croft run github_issues" } });
+    expect(r.json.problems[0].message).toBe("github_issues is not built yet: no run has written a table, so warehouse.duckdb does not exist");
   });
 
   test("outside a project: PROJECT_NOT_FOUND", async () => {

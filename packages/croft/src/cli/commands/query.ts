@@ -11,6 +11,9 @@
 // - Before anything has run there is no warehouse, and a read-only command never creates it: the query runs
 //   on a private in-memory DuckDB with the same `query` sandbox, so the zero-asset path works in a fresh
 //   project. A table named there is DB_NOT_FOUND with the run that builds it (UNKNOWN_TABLE for other names).
+//   The wording follows runs.sqlite: "nothing has run" only when no run is recorded; "no run has written a
+//   table" when runs failed before writing; and when the catalog lists tables, the warehouse file is missing
+//   although croft built it before (deleted or moved), which needs the user rather than a new run.
 // - Rows are capped at 50 and values at 80 characters (--limit N and --full-values lift the caps), and the
 //   result is streamed: rows past the cap are counted in chunks, never converted to JavaScript.
 // - Values are redacted before they are cut (so a cut never leaves half a secret behind), after the
@@ -31,6 +34,7 @@ import type { Row } from "../../types.ts";
 import type { CommandImpl } from "../command.ts";
 import { formatCount, formatDuration, table } from "../render.ts";
 import { type AssetConfig, capValue, declareProjectSecrets, readOnlyWarehouse } from "./describe.ts";
+import { missingWarehouse, openRunsDb, type WarehouseHistory, warehouseHistory } from "./status.ts";
 
 export interface QueryData {
   columns: ColumnInfo[];
@@ -77,8 +81,8 @@ export const query: CommandImpl<QueryData> = {
   async run(ctx) {
     if (ctx.values.preview === true) {
       throw new CroftError("USAGE_ERROR", {
-        message: "croft query --preview reads the preview database, which comes with croft preview in a later version",
-        hint: "query the live tables without --preview; this version has no croft preview yet",
+        message: "croft query --preview reads the preview database, which a later version of croft adds",
+        hint: "query the live tables without --preview; this version has no preview database",
         fix: { kind: "manual", description: "drop --preview and query the live warehouse" },
       });
     }
@@ -197,18 +201,49 @@ async function withoutWarehouse(project: Project, configs: readonly AssetConfig[
   }
 }
 
-/** A table named before the first run cannot exist yet. An asset's name is DB_NOT_FOUND with the run that
- *  builds that one asset (not a bare `croft run`, which would fetch every ingest); another name stays
- *  UNKNOWN_TABLE, with the closest asset name when there is one. */
+/** What runs.sqlite says about a warehouse file that is not there (it is read, never created). */
+function historyOf(project: Project): WarehouseHistory {
+  const db = openRunsDb(project.paths.stateDir);
+  try {
+    return warehouseHistory(db);
+  } finally {
+    db?.close();
+  }
+}
+
+/** A table named while there is no warehouse file. An asset's name is DB_NOT_FOUND; another name stays
+ *  UNKNOWN_TABLE, with the closest asset name when there is one. How they are worded follows runs.sqlite:
+ *  - nothing ran, or runs wrote no table yet: the fix is the run that builds that one asset (not a bare
+ *    `croft run`, which would fetch every ingest);
+ *  - the catalog lists tables: the file was built before and is missing now (deleted or moved), which is the
+ *    user's to resolve; a run would start a new, empty warehouse (status and context say the same). */
 function notBuiltYet(e: unknown, project: Project, configs: readonly AssetConfig[]): unknown {
   if (!(e instanceof CroftError) || e.code !== "UNKNOWN_TABLE") return e;
   const table = /^no table named (\S+)/.exec(e.problem.message)?.[1]?.replace(/^"|"$/g, "");
   if (!table) return e;
   const names = configs.map((c) => c.name);
   const asset = names.find((n) => n === table.toLowerCase());
+  const history = historyOf(project);
+  const missing = missingWarehouse(project, history, project.timezone);
+  const label = project.databaseLabel;
+  if (missing) {
+    const base = { ...missing.details, ...e.problem.details, table };
+    if (asset) {
+      return new CroftError("DB_NOT_FOUND", {
+        message: `${asset} cannot be read: ${missing.message}`, hint: missing.hint,
+        ...(missing.fix ? { fix: missing.fix } : {}), ...(missing.effect ? { effect: missing.effect } : {}), details: { ...base, asset },
+      });
+    }
+    return new CroftError("UNKNOWN_TABLE", {
+      message: `no table named ${table}, and no tables at all: ${missing.message}`,
+      hint: missing.hint,
+      details: base,
+    });
+  }
+  const why = history.runs > 0 ? "no run has written a table" : "nothing has run in this project";
   if (asset) {
     return new CroftError("DB_NOT_FOUND", {
-      message: `${asset} is not built yet: nothing has run in this project, so ${project.databaseLabel} does not exist`,
+      message: `${asset} is not built yet: ${why}, so ${label} does not exist`,
       hint: `build it first: croft run ${asset} (files under files/ can be queried already)`,
       fix: { kind: "command", description: `build ${asset}`, command: `croft run ${asset}` },
       details: { ...e.problem.details, table, asset },
@@ -216,10 +251,10 @@ function notBuiltYet(e: unknown, project: Project, configs: readonly AssetConfig
   }
   const guess = didYouMean(table, names);
   return new CroftError("UNKNOWN_TABLE", {
-    message: `no table named ${table}: nothing has run in this project yet, so there are no tables`,
+    message: `no table named ${table}: ${why} yet, so there are no tables`,
     hint: guess ? `did you mean ${guess}? build it first: croft run ${guess}`
       : names.length ? `the assets are ${names.join(", ")}; build one with croft run <asset>`
-      : "files under files/ can be queried already; croft new --list shows the assets croft can make",
+      : "files under files/ can be queried already; croft docs ingest shows how to make an asset",
     ...(guess ? { fix: { kind: "command" as const, description: `build ${guess}`, command: `croft run ${guess}` } } : {}),
     details: { ...e.problem.details, table, ...(guess ? { suggestion: guess } : {}) },
   });

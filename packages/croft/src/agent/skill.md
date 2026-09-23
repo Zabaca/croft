@@ -1,68 +1,65 @@
 ---
 name: croft
 description: Build and operate this project's data pipelines with the croft CLI (DuckDB). Use when adding a data
-  source, writing SQL or TypeScript transforms, adding checks, scheduling, debugging a failed run, backfilling,
-  renaming, or answering a question from project data.
+  source, loading an API or files, debugging a failed run, backfilling, or answering a question from project data.
 ---
 <!-- croft {{version}} -->
 croft is not dbt, dlt, SQLMesh or Dagster; do not assume their behavior. Ask the CLI: `croft docs <topic>`,
-`croft docs <ERROR_CODE>`, `croft docs --list`, `croft new --list`. Every command takes `--json` →
+`croft docs <ERROR_CODE>`, `croft docs --list`, `croft help <command>`. Every command takes `--json` →
 {ok, data, problems[], next[], confirmation?}.
 
+## This version
+{{phase}}
+
 ## Orient
-croft context --json        # assets, columns, behavior, schedules, running, held, recent failures and schema changes
-croft status                # failed, stale, held, edited, orphaned
+croft context --json        # assets, columns, behavior, running, recent failures and schema changes, asset problems
+croft status                # failed, never run, edited since its last run, no asset file
 
 ## Loop (always)
-1. New asset: `croft new api|file|sql|transform <name>`; edit the template, don't invent APIs.
-2. `croft validate --json` after EVERY edit; apply each problem's `fix`.
-3. `croft preview <name>`: read columns, checks, diff and samples.
-4. `croft run <name>`; then verify with `croft query "..."` (one SELECT, 50-row cap).
+1. New asset: start from the closest template in `croft docs ingest` (API or file); don't invent APIs.
+2. `croft run <name>`; apply each problem's `fix` and run it again. A broken asset file fails only its own step.
+3. Verify with `croft query "..."` (one SELECT, 50-row cap) and `croft describe <name>` (behavior, columns, cursor, samples).
+4. When a step fails: `croft logs <name> --failed`, fix the cause, `croft run <name>`.
 
 ## Conventions
 - One file in assets/ = one table with that name; SQL says `FROM github_issues`. Shared code goes in lib/.
-- SQL assets: `-- name: value` header lines (description, key, check, warn), then ONE SELECT (a trailing `;` is fine).
-  SQL transforms are always rebuilt in full; there is no incremental SQL. Only ingests have schedules.
-- SQL assets read assets, never files: to use a file, make a file ingest (`croft new file x`).
+- To use a file, make a file ingest (`file: "files/x.csv"`); `croft query "from 'files/x.csv'"` looks at one first.
 - PIVOT needs an IN list: `PIVOT t ON cat IN ('a', 'b') USING sum(x)`, or use `sum(x) FILTER (WHERE cat = 'a')`.
 - Avoid now()/current_date in assets (values freeze until the next rebuild); compute ages at query time.
 - Set `key` whenever records have an id. Incremental API ingests need a key.
-- TS transforms that call an API or LLM per row: keep `incremental: true` + `newRows()` (the template default).
 - Use `ctx.http` and `res.json()` (lossless numbers), never raw fetch + JSON.parse for API data.
 - Nested fields are JSON: `col->>'field'`, `col->>'$[*].name'`, `json_each(col)`. `croft describe` lists keys.
 - Columns named like SQL keywords must be quoted: `"order"`.
-- Apps read with `import { query } from "@zabaca/croft/read"`. It talks to `croft serve` when one is running (found via CROFT_URL or .croft/serve.json), otherwise opens the file briefly. Never open the .duckdb files directly.
-- `croft serve` runs until stopped: ask the user to start it in their own terminal instead of running it in your shell.
-- For a GUI (DuckDB UI, DBeaver), set "readCopy": true in croft.json and open warehouse.read.duckdb, never warehouse.duckdb.
+- Apps read with `import { query } from "@zabaca/croft/read"` (it opens the file briefly per query). Never open the .duckdb files directly, in code or in a GUI (DuckDB UI, DBeaver): a program holding warehouse.duckdb blocks every run.
 
 ## APIs
 - Keyset paging (re-query with since = newest value seen) ONLY if the API sorts ascending by that field.
   Newest-first APIs (Stripe, most list endpoints): filter by since and follow the API's own cursor
-  (`croft new api x --pagination cursor`).
+  (the cursor template in `croft docs ingest`).
 - Records that change after creation (payments, refunds, orders, tickets) need an updated-since field or a
   lookback: incremental: { field: "created", unit: "s", lookback: "30 days" }. Epoch cursors need `unit`.
 
 ## Ask the user first (show the printed impact; wait for an explicit yes in this conversation)
-- `croft confirm <token>` (every destructive action ends here: rebuild of an ingest or incremental TS transform,
-  --allow-shrink, delete, restore, lossy pin changes, key conversion, large paid reprocessing).
+- `croft confirm <token>` (every destructive action ends here; in this version that is `--allow-shrink`, which
+  moves a replace ingest's current rows to the trash before it writes fewer).
 - Adding `allowShrink: true`; changing key/write/incremental of an ingest that has data.
-- Renaming or deleting files in assets/ (use `croft rename`); `croft schedule on|off|pause`.
-- `croft serve` (it runs scheduled work unattended, and a `--host` other than 127.0.0.1 exposes data beyond this machine).
-- Deleting .croft/ or warehouse*.duckdb, or `git clean -X` (the trash and backups live in .croft/).
+- Renaming or deleting files in assets/ (the table stays under the old name; this version cannot rename or drop it).
+- Deleting .croft/ or warehouse*.duckdb, or `git clean -X` (the trash lives in .croft/).
 - Weakening or deleting a failing check.
 
 ## Recipes
-- Failed run: croft status --json → croft logs <asset> --failed → fix → croft validate --json → croft preview <asset>
-  → croft run <asset> → croft status.
-- Held asset: it was edited and not run by hand; run it by hand once (croft run <asset>) after checking the preview.
-- Backfill: croft run <asset> --dry-run --from -90d, then the same without --dry-run. Merge ingests only.
-- Rename: croft rename <old> <new>; fix every reference it lists; validate; preview; run.
-- Wrong number: croft describe <asset> --json → croft preview <asset> --rebuild (drift) → query the upstream
-  with the same filter; `croft docs internals` shows how _croft.writes maps rows to runs.
+- Failed run: croft status --json → croft logs <asset> --failed → fix → croft run <asset> → croft status.
+- Backfill (merge ingests: key + incremental): check the cursor with croft describe <asset>, then
+  croft run <asset> --from -90d (or a date: --from 2026-06-24; a text cursor takes a value in its own format).
+  The saved cursor never moves back.
+- Wrong number: croft describe <asset> --json → query the upstream with the same filter; `croft docs internals`
+  shows how _croft.writes maps rows to runs.
 - API changed: new fields appear automatically; fill them for old rows with --from (merge ingests).
   TYPE_CONFLICT: clean the value in rows()/map() first; a pin can rewrite stored values.
 - Missing secret: ask the user to add NAME=... to .env (or run `croft secrets set NAME` in their terminal);
   check with `croft secrets --json`. Never read .env.
+- Warehouse file missing (DB_NOT_FOUND in status): ask the user where it went before running anything; a run
+  builds a new, empty one and refetches from the sources.
 
 ## Output
 - JSON timestamps carry the project offset; ::DATE uses the croft.json timezone.

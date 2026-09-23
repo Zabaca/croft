@@ -8,6 +8,7 @@ import { CODES } from "../../core/errors.ts";
 import { offsetSeconds } from "../../core/time.ts";
 import { CROFT_VERSION, SKILL_PATH, skillMd } from "../../agent/templates.ts";
 import { initProject } from "../../project/init.ts";
+import { scan } from "../../agent/contract-testkit.ts";
 import { SELF_ROOT } from "../launcher.ts";
 import { main } from "../main.ts";
 import { BUN_TESTED } from "../version.ts";
@@ -225,6 +226,16 @@ describe("environment checks", () => {
   test("WSL gets a note about the VM stopping", async () => {
     const { data } = await runDoctor(await project(), deps({ wsl: true }));
     expect(check(data.checks, "wsl")).toMatchObject({ section: "environment", status: "info" });
+  });
+});
+
+describe("doctor names only commands this version has", () => {
+  test("the config line points at croft context for asset details, and no line or fix names a later command", async () => {
+    const root = await project();
+    const { data, problems } = await runDoctor(root, deps());
+    expect(check(data.checks, "config").text).toMatch(/1 asset file \(details: croft context\)$/);
+    const texts = [...data.checks.map((c) => c.text), ...problems.flatMap((p) => [p.hint, p.fix?.description ?? "", p.fix?.kind === "command" ? p.fix.command : ""])];
+    expect(texts.flatMap((t) => scan("croft doctor", t))).toEqual([]);
   });
 });
 
