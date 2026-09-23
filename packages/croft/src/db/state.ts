@@ -4,8 +4,9 @@ import pkg from "../../package.json" with { type: "json" };
 import { CroftError } from "../core/errors.ts";
 import type { Sql } from "../core/types.ts";
 
-/** Version of the _croft schema. A database with a larger number was written by a newer croft. */
-export const FORMAT_VERSION = 1;
+/** Version of the _croft schema. A database with a larger number was written by a newer croft.
+ *  2: _croft.writes.attempt (the step attempt that committed, so reconcile() can tell retries apart). */
+export const FORMAT_VERSION = 2;
 export const CROFT_VERSION: string = pkg.version;
 
 // Exactly the DDL of DESIGN.md §5, made idempotent. Each entry is one statement (the Sql wrapper
@@ -28,7 +29,13 @@ export const STATE_DDL: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS _croft.writes (asset VARCHAR, loaded_at TIMESTAMPTZ, run_id VARCHAR, mode VARCHAR,
     rows_in BIGINT, added BIGINT, updated BIGINT, unchanged BIGINT, deleted BIGINT,
     cursor_before VARCHAR, cursor_after VARCHAR, since_used VARCHAR, inputs JSON,
-    schema_changes JSON, code_hash VARCHAR, PRIMARY KEY (asset, loaded_at))`,
+    schema_changes JSON, code_hash VARCHAR, attempt INTEGER, PRIMARY KEY (asset, loaded_at))`,
+];
+
+/** Columns added after format 1, for databases created before them. STATE_DDL already has them, last, so a
+ *  migrated table has the same column order as a new one. */
+export const STATE_COLUMNS_ADDED: readonly { table: string; column: string; ddl: string }[] = [
+  { table: "writes", column: "attempt", ddl: `ALTER TABLE _croft.writes ADD COLUMN attempt INTEGER` },
 ];
 
 export const STATE_TABLES = ["meta", "assets", "columns", "inputs", "files", "writes"] as const;
@@ -70,14 +77,19 @@ export async function checkFormat(db: Sql): Promise<Meta> {
 }
 
 /**
- * Create the _croft schema and tables when missing and record format_version, duckdb_version and
- * croft_version. Idempotent; run it inside a write lease. DDL runs before the meta upsert (DML), so it
- * respects the DDL-before-DML rule even when called twice in one transaction.
+ * Create the _croft schema and tables when missing, add the columns a format-1 database lacks, and record
+ * format_version, duckdb_version and croft_version. Idempotent; run it inside a write lease. DDL runs before
+ * the meta upsert (DML), and an ALTER runs only while its column is missing, so it respects the DDL-before-DML
+ * rule even when called twice in one transaction around writes to _croft.
  */
 export async function ensureState(tx: Sql, o: { croftVersion?: string } = {}): Promise<Meta> {
   const before = await readMeta(tx);
   assertFormat(before);
   for (const ddl of STATE_DDL) await tx.exec(ddl);
+  const have = new Set((await tx.all<{ t: string; c: string }>(
+    `SELECT table_name t, column_name c FROM duckdb_columns() WHERE database_name = current_database() AND schema_name = '_croft'`,
+  )).map((r) => `${r.t}.${r.c}`));
+  for (const add of STATE_COLUMNS_ADDED) if (!have.has(`${add.table}.${add.column}`)) await tx.exec(add.ddl);
   const [{ v } = { v: "" }] = await tx.all<{ v: string }>(`SELECT version() v`);
   const want: Meta = {
     format_version: String(Math.max(FORMAT_VERSION, Number(before.format_version ?? 0))),

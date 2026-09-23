@@ -30,8 +30,17 @@ const EXPECTED: Record<string, [string, string][]> = {
   writes: [["asset", "VARCHAR"], ["loaded_at", "TIMESTAMP WITH TIME ZONE"], ["run_id", "VARCHAR"], ["mode", "VARCHAR"],
     ["rows_in", "BIGINT"], ["added", "BIGINT"], ["updated", "BIGINT"], ["unchanged", "BIGINT"], ["deleted", "BIGINT"],
     ["cursor_before", "VARCHAR"], ["cursor_after", "VARCHAR"], ["since_used", "VARCHAR"], ["inputs", "JSON"],
-    ["schema_changes", "JSON"], ["code_hash", "VARCHAR"]],
+    ["schema_changes", "JSON"], ["code_hash", "VARCHAR"], ["attempt", "INTEGER"]],
 };
+// The format-1 schema (croft before _croft.writes.attempt), for the migration test.
+const FORMAT_1_DDL = [
+  `CREATE SCHEMA _croft`,
+  `CREATE TABLE _croft.meta (key VARCHAR PRIMARY KEY, value VARCHAR)`,
+  `CREATE TABLE _croft.writes (asset VARCHAR, loaded_at TIMESTAMPTZ, run_id VARCHAR, mode VARCHAR,
+    rows_in BIGINT, added BIGINT, updated BIGINT, unchanged BIGINT, deleted BIGINT,
+    cursor_before VARCHAR, cursor_after VARCHAR, since_used VARCHAR, inputs JSON,
+    schema_changes JSON, code_hash VARCHAR, PRIMARY KEY (asset, loaded_at))`,
+];
 const PRIMARY_KEYS: Record<string, string[]> = {
   meta: ["key"], assets: ["name"], columns: ["asset", "name"], inputs: ["asset", "input"], files: ["asset", "path"], writes: ["asset", "loaded_at"],
 };
@@ -91,6 +100,33 @@ describe("ensureState", () => {
       expect((caught as CroftError).code).toBe("DB_NEWER_FORMAT");
       expect((caught as CroftError).exit).toBe(2);
     }
+  });
+
+  test("format 2: _croft.writes records the step attempt", () => {
+    expect(FORMAT_VERSION).toBe(2);
+  });
+
+  test("migrates a format-1 database: adds _croft.writes.attempt, keeps its rows, records format 2", async () => {
+    const w = warehouse();
+    await w.write("v1", async (tx) => {
+      for (const ddl of FORMAT_1_DDL) await tx.exec(ddl);
+      await tx.exec(`INSERT INTO _croft.meta VALUES ('format_version', '1')`);
+      await tx.exec(`INSERT INTO _croft.writes (asset, loaded_at, run_id, rows_in) VALUES ('orders', '2026-09-22T10:00:00Z', 'r_old', 5)`);
+    }, { runId: "r" });
+    // Twice in one transaction, around a write to _croft.writes: the second call must not ALTER it again.
+    const meta = await w.write("state", async (tx) => {
+      await ensureState(tx);
+      await tx.exec(`INSERT INTO _croft.writes (asset, loaded_at, run_id, rows_in, attempt) VALUES ('orders', '2026-09-22T11:00:00Z', 'r_new', 7, 2)`);
+      return ensureState(tx);
+    }, { runId: "r" });
+    expect(meta.format_version).toBe("2");
+    expect(await w.read((db) => readMeta(db), { purpose: "t" })).toMatchObject({ format_version: "2" });
+    const cols = await w.read((db) => db.all<{ c: string; ty: string }>(
+      `SELECT column_name c, data_type ty FROM duckdb_columns() WHERE schema_name = '_croft' AND table_name = 'writes' ORDER BY column_index`), { purpose: "t" });
+    expect(cols.map((r) => [r.c, r.ty])).toEqual(EXPECTED.writes!);
+    expect(await w.read((db) => db.all(`SELECT run_id, rows_in, attempt FROM _croft.writes ORDER BY loaded_at`), { purpose: "t" })).toEqual([
+      { run_id: "r_old", rows_in: 5, attempt: null }, { run_id: "r_new", rows_in: 7, attempt: 2 },
+    ]);
   });
 
   test("checkFormat on a database without state is a no-op", async () => {

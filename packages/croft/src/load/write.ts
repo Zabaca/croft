@@ -16,7 +16,7 @@
 //                merge:   MERGE with an unchanged-row skip; columns absent from the batch keep their values
 //                replaceFiles: the same diff, restricted to the rows of the reloaded files
 //   checks       caller's blocking checks; a throw rolls the whole transaction back
-//   state        cursor, _croft.assets, _croft.columns, _croft.writes in the same transaction
+//   state        cursor, _croft.assets, _croft.columns, _croft.writes (with the step attempt) in the same transaction
 //
 // Changed rows get one stamp, greatest(now, last stamp + 1 µs), so _loaded_at is strictly increasing per
 // table even when the clock steps back; unchanged rows keep theirs, so downstream work wakes only for real
@@ -60,6 +60,9 @@ export interface WriteBatchInput {
   sinceUsed?: string | number;
   /** _croft.writes.inputs (TS transforms). */
   inputs?: unknown;
+  /** The step attempt this write belongs to (runs.sqlite steps.attempt), for _croft.writes.attempt. reconcile()
+   *  counts a crashed step's commits by it, so chunks an earlier failed attempt committed are not its own. */
+  attempt?: number;
   /** Downstream assets per column, listed by COLUMN_STOPPED_ARRIVING. */
   readBy?: Record<string, string[]>;
   /** What extraction saw, for SHRINK_GUARD details. */
@@ -230,11 +233,11 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
   await writeColumns(tx, { asset, columns: evo.columns, plans: batch.columns, stored, present, pins: input.pins, formats: input.formats, stamp });
   await tx.exec(
     `INSERT INTO _croft.writes (asset, loaded_at, run_id, mode, rows_in, added, updated, unchanged, deleted, cursor_before, cursor_after,
-       since_used, inputs, schema_changes, code_hash)
-     VALUES ($1, $2::TIMESTAMPTZ, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::JSON, $14::JSON, $15)`,
+       since_used, inputs, schema_changes, code_hash, attempt)
+     VALUES ($1, $2::TIMESTAMPTZ, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::JSON, $14::JSON, $15, $16::INTEGER)`,
     [asset, stamp, target.runId, target.write, batch.rows, counts.added, counts.updated, counts.unchanged, counts.deleted,
       state?.cursor_value ?? null, cursorValue, input.sinceUsed === undefined ? null : String(input.sinceUsed),
-      input.inputs === undefined ? null : json(input.inputs), json(evo.changes), input.codeHash ?? null],
+      input.inputs === undefined ? null : json(input.inputs), json(evo.changes), input.codeHash ?? null, input.attempt ?? null],
   );
   for (const t of [src, `__croft_w${n}_old`, `__croft_w${n}_new`, `__croft_w${n}_pair`]) await tx.exec(`DROP TABLE IF EXISTS ${tempRef(t)}`);
 
