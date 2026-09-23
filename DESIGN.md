@@ -89,7 +89,7 @@ A user learns **seven concepts**.
 
 ```sh
 curl -fsSL https://bun.sh/install | bash   # only if `bun --version` fails or is older than 1.3.14
-bun add -g croft                            # installs the `croft` launcher into ~/.bun/bin
+bun add -g @zabaca/croft                   # installs the `croft` launcher into ~/.bun/bin
 croft init my-data                          # scaffolds, runs bun install, runs the offline example
 cd my-data
 croft query "from example_sales limit 5"
@@ -106,19 +106,19 @@ Claude Code: CLAUDE.md and .claude/skills/croft/SKILL.md are ready.
 
 **The launcher.** The global `croft` is only a launcher:
 
-- It walks up from the current directory to the nearest `croft.json`, changes into the project root, and execs that project's pinned copy in `node_modules/croft` with `bun --no-env-file`. That way the global and project versions can never disagree, and Bun's automatic `.env` loading (which depends on the working directory and also reads `.env.local`) is switched off [V]. croft reads `<root>/.env` itself (§9).
+- It walks up from the current directory to the nearest `croft.json`, changes into the project root, and execs that project's pinned copy in `node_modules/@zabaca/croft` with `bun --no-env-file`. That way the global and project versions can never disagree, and Bun's automatic `.env` loading (which depends on the working directory and also reads `.env.local`) is switched off [V]. croft reads `<root>/.env` itself (§9).
 - If `node_modules` is missing (for example after `git clone`), it runs `bun install` first.
 - Outside a project, only `init`, `doctor`, `docs` and `--version` work.
 - If `~/.bun/bin` is not on `PATH`, `bunx croft …` inside the project resolves the same local binary.
 
-The CLI ships TypeScript source with a `#!/usr/bin/env bun` bin, so it has no build step. The one exception is `croft/read`, the helper apps import (§5). It ships as prebuilt JavaScript plus `.d.ts`, because Node refuses to strip types from files under `node_modules` (`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`) [V]. The built `read.js` ran under Node 24.3 and 24.20 [V].
+The CLI ships TypeScript source with a `#!/usr/bin/env bun` bin, so it has no build step. The one exception is `@zabaca/croft/read`, the helper apps import (§5). It ships as prebuilt JavaScript plus `.d.ts`, because Node refuses to strip types from files under `node_modules` (`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`) [V]. The built `read.js` ran under Node 24.3 and 24.20 [V].
 
 **`croft init` in an empty folder** generates:
 
 | File | Contents |
 |---|---|
-| `croft.json` | `{"$schema": "./node_modules/croft/croft.schema.json", "database": "warehouse.duckdb", "timezone": "America/Los_Angeles"}`. The timezone is detected at init, so "daily at 06:00" keeps its meaning on a UTC server. Optional keys: `readCopy` (default `true`), `notify`, `concurrency`. |
-| `package.json` | `{"private": true, "type": "module", "dependencies": {"croft": "0.1.0"}, "devDependencies": {"@types/bun": "1.3.14", "typescript": "5.9.2"}}`, with exact pins |
+| `croft.json` | `{"$schema": "./node_modules/@zabaca/croft/croft.schema.json", "database": "warehouse.duckdb", "timezone": "America/Los_Angeles"}`. The timezone is detected at init, so "daily at 06:00" keeps its meaning on a UTC server. Optional keys: `serve` (`{"port": 7447, "host": "127.0.0.1"}`), `readCopy` (default `false`), `notify` (desktop on by default), `concurrency`. |
+| `package.json` | `{"private": true, "type": "module", "dependencies": {"@zabaca/croft": "0.1.0"}, "devDependencies": {"@types/bun": "1.3.14", "typescript": "5.9.2"}}`, with exact pins |
 | `tsconfig.json` | strict, `moduleResolution: "bundler"`, `types: ["bun"]`, includes `assets` and `lib`. Editors and Claude get type errors. |
 | `.env` / `.env.example` | `# Secrets for your assets, e.g. GITHUB_TOKEN=...`. `.env` is git-ignored. |
 | `.gitignore` | `warehouse*.duckdb*`, `.croft/`, `.env`, `node_modules/` |
@@ -131,13 +131,13 @@ The CLI ships TypeScript source with a `#!/usr/bin/env bun` bin, so it has no bu
 
 - It creates the project in a `data/` subfolder with its own `package.json`, `tsconfig.json` and `.gitignore`.
 - It adds `"data"` to the root `tsconfig.json` `exclude` list, so `next build` does not type-check assets without Bun types. It shows this edit as a diff and applies it only with confirmation on a TTY; otherwise it prints it.
-- It appends a root `CLAUDE.md` block that points at `data/`. The block says: "read croft data only with `import { query } from "croft/read"`; never open the .duckdb file directly".
-- It prints the one app-side step: `bun add croft` (or npm/pnpm) in the app, plus `serverExternalPackages: ['@duckdb/node-api']` for Next.js.
+- It appends a root `CLAUDE.md` block that points at `data/`. The block says: "read croft data only with `import { query } from "@zabaca/croft/read"`; never open the .duckdb file directly".
+- It prints the one app-side step: `bun add @zabaca/croft` (or npm/pnpm) in the app, plus `serverExternalPackages: ['@duckdb/node-api']` for Next.js.
 
 **Runtime files.** croft creates these at runtime. The user never edits them:
 
-- `warehouse.duckdb`, and `warehouse.read.duckdb`, the read copy for apps and GUIs (§5).
-- `.croft/`, containing `runs.sqlite`, `staging/`, `logs/`, `trash/`, `backups/` and `preview.duckdb`.
+- `warehouse.duckdb`, and, only when `readCopy` is on, `warehouse.read.duckdb`, a copy for GUIs and notebooks (§5).
+- `.croft/`, the state folder. It holds `runs.sqlite`, `staging/`, `logs/`, `trash/`, `backups/`, `preview.duckdb`, `preview/` (input snapshots) and `types/`. It also holds `serve.json` while `croft serve` runs, and `write-intent.d/` while a writer holds or waits for the file.
 
 **Synced and network folders.** On many Macs, `~/Documents` and `~/Desktop` are synced to iCloud by default. File sync can corrupt a DuckDB file mid-write and breaks its locks. The same applies to Dropbox, OneDrive, network filesystems and WSL's `/mnt/<drive>` (drvfs/9p). When `init` or `doctor` detects such a location (by path prefix plus `statfs`), croft moves the database and `.croft/` to `~/.local/share/croft/<project>-<hash>/`. It records that path in `croft.json` and says so in plain words. Asset files stay in the project folder.
 
@@ -164,7 +164,7 @@ The CLI ships TypeScript source with a `#!/usr/bin/env bun` bin, so it has no bu
 | Native binding missing (optional deps skipped, `node_modules` copied from another OS, x64 Bun under Rosetta) | `import("@duckdb/node-api")` in a subprocess fails, or binding arch ≠ `process.arch` | `DUCKDB_BINDING_MISSING`: `rm -rf node_modules && bun install`, or "install the arm64 build of Bun" |
 | Binding fails to load (old glibc) | dlopen error text | `DUCKDB_BINDING_LOAD`: required glibc version |
 | Database written by a newer DuckDB/croft | `_croft.meta.format_version` | `DB_NEWER_FORMAT`: refuses to open rather than risk a downgrade |
-| Database held by another program (DuckDB CLI/UI, DBeaver, the user's app) | parse DuckDB's lock error `…held in <path> (PID n)` [V] | `DB_HELD_BY_OTHER_PROGRAM`: "close /opt/homebrew/bin/duckdb (PID 812); point GUIs at warehouse.read.duckdb instead" |
+| Database held by another program (DuckDB CLI/UI, DBeaver, the user's app) | parse DuckDB's lock error `…held in <path> (PID n)` [V] | `DB_HELD_BY_OTHER_PROGRAM`: "close /opt/homebrew/bin/duckdb (PID 812); apps should query through `croft serve`; for GUIs, turn on `readCopy` and open warehouse.read.duckdb" |
 | Synced, network or WSL-drvfs storage | path prefix + `statfs` | database relocated automatically (above); `doctor` shows where |
 | Project not writable | test write to `.croft/` | plain explanation |
 | Referenced secret missing | declared `secrets` vs environment and `.env` | `SECRET_MISSING`: "add NAME=… to .env (or `croft secrets set NAME`)" |
@@ -177,14 +177,14 @@ Environment
   ok    bun 1.3.14 (darwin-arm64), needs >= 1.3.14
   ok    croft 0.1.0 (project-pinned; launcher 0.1.0)
   ok    duckdb 1.5.5 binding darwin-arm64 · json, parquet, icu built in
-  ok    warehouse.duckdb 412 MB · writable · not locked · format written by duckdb 1.5.5
-  ok    read copy warehouse.read.duckdb refreshed 5 min ago · APFS clone (instant)
+  ok    warehouse.duckdb 412 MB · writable · held read-only by croft serve (steps aside for writes) · duckdb 1.5.5
+  ok    croft serve on 127.0.0.1:7447 (pid 4121) · token in .croft/serve.json · 1,204 queries today
 Project
   ok    6 assets · 0 errors, 1 warning (details: croft validate)
   warn  SECRET_MISSING STRIPE_KEY (used by stripe_charges)
         fix: add STRIPE_KEY=... to .env (or run `croft secrets set STRIPE_KEY` in your terminal)
 Scheduling
-  off   turn on with: croft schedule on
+  ok    on · ticks from croft serve (pid 4121) · last tick 12 s ago
 1 warning
 ```
 
@@ -197,7 +197,7 @@ Scheduling
 - An asset's name is its file's base name. It must match `[a-z][a-z0-9_]*` and be unique across `assets/**`.
 - Subfolders are for organization only.
 - Every table lives in DuckDB's `main` schema, so SQL always says `FROM github_issues`.
-- `new`, `croft` and names starting with `_` are reserved.
+- `new` (kept free for post-v1 incremental SQL, §3d), `croft` and names starting with `_` are reserved.
 - DuckDB's 75 reserved keywords (`order`, `end`, `limit`, `window`, `group`, …) are rejected with `NAME_RESERVED` and a suggested plural ("rename to orders"), because `FROM order` is a parser error in every downstream asset [V].
 - A `.ts` file and a `.sql` file with the same name is `NAME_CONFLICT`.
 
@@ -222,7 +222,7 @@ my-data/
 
 ```ts
 // assets/github_issues.ts
-import { ingest, fail } from "croft";
+import { ingest, fail } from "@zabaca/croft";
 
 type Issue = { id: number; updated_at: string };
 
@@ -257,7 +257,7 @@ export default ingest({
 
 ```ts
 // assets/stripe_charges.ts
-import { ingest } from "croft";
+import { ingest } from "@zabaca/croft";
 
 type Charge = { id: string; created: number };
 type Page = { data: Charge[]; has_more: boolean };
@@ -331,7 +331,7 @@ The skill states the rules in plain words (§9):
 
 ```ts
 // assets/taxi_zones.ts: a CSV from a URL, refreshed monthly
-import { ingest } from "croft";
+import { ingest } from "@zabaca/croft";
 
 export default ingest({
   description: "NYC taxi zone lookup",
@@ -344,7 +344,7 @@ export default ingest({
 
 ```ts
 // assets/sales.ts: every CSV dropped into files/sales/ is loaded once; changed files are reloaded
-import { ingest } from "croft";
+import { ingest } from "@zabaca/croft";
 
 export default ingest({
   description: "Daily order exports from the shop",
@@ -459,7 +459,7 @@ Rebuilds do not wake downstream incremental work unnecessarily. The rebuilt resu
 
 ```ts
 // assets/issue_triage.ts
-import { transform } from "croft";
+import { transform } from "@zabaca/croft";
 import { triage } from "../lib/triage.ts";
 
 type Issue = { id: number; title: string; body: string | null; labels: { name: string }[] };
@@ -596,7 +596,7 @@ Cross-asset checks that need their own query (for example "every open issue has 
 - **Selectors** are asset names or globs (`'github_*'`). Destructive commands accept exact names only.
 - **Timestamps** in JSON are ISO-8601 *with the project offset* (for example `2026-09-21T22:00:00-07:00`), so they agree with `::DATE` in SQL. The envelope carries `timezone`.
 
-### 4.1 Commands (19)
+### 4.1 Commands (20)
 
 | Group | Command | Purpose |
 |---|---|---|
@@ -618,7 +618,10 @@ Cross-asset checks that need their own query (for example "every open issue has 
 | Maintain | `rename <old> <new>` | rename an asset: file, table and state together; lists references to update |
 | | `delete <asset> [--where "<expr>"]` | move a whole table, or matching rows, to the trash (needs confirmation) |
 | | `restore [asset] [--at <time>]` | list the trash, or bring a version back (needs confirmation) |
-| Schedule | `schedule on\|off\|status\|pause [--for 2h]\|start` | turn scheduled runs on or off; `start` runs the per-minute tick in the foreground (servers, containers, WSL) |
+| Schedule | `schedule on\|off\|status\|pause [--for 2h]` | turn scheduled runs on or off; ticks come from the per-user OS job, or from `croft serve` while it runs (`on --no-os-job` for servers) (§8) |
+| Serve | `serve [--host h] [--port 7447]` | optional read server for apps over HTTP, with the scheduler built in; steps aside for every write (§5) |
+
+`croft tick` also exists as an internal command, run every minute by the per-user OS job and by `croft serve` (§8). It is not counted above and is not meant to be run by hand.
 
 **`run` flags:**
 
@@ -798,6 +801,13 @@ TABLE        TRASHED            ROWS   SIZE    WHY
 taxi_zones   2026-09-22 11:40   265    18 KB   run --allow-shrink (r_0922_1140_a1b2)
 old_orders   2026-09-20 09:02   120    9 KB    delete
 
+$ croft serve
+croft serve · http://127.0.0.1:7447 · database warehouse.duckdb (read-only, steps aside for writes)
+token: .croft/serve.json (hosted apps: set CROFT_SERVE_TOKEN)
+scheduler: on, ticking every minute (github_issues next 11:00, stripe_charges next 11:00)
+apps: import from "@zabaca/croft/read" in this project, or set CROFT_URL + CROFT_SERVE_TOKEN
+^C to stop
+
 $ croft schedule on
 Scheduling is on for ~/my-data (one job per user; checked every minute; survives restarts).
 Waiting for the first tick… ok (after 38 s)
@@ -819,7 +829,7 @@ Turn off: croft schedule off
   - `{kind: "manual", description, requiresHuman?}`
 - `next` is `[{command, reason}]`. **A destructive command never appears in `next`.** It appears only as `confirmation: {token, expiresAt, command, impact}`.
 
-**Data shapes** are frozen by golden tests and published as JSON Schemas:
+**Data shapes** are frozen by golden tests and published as JSON Schemas. `croft serve` returns the same envelopes over HTTP (§5).
 
 - **`query`:** `{columns: [{name, type}], rows, rowCount, truncatedRows, truncatedValues}`. HUGEINT, DECIMAL and integers beyond ±2^53 are strings. `--limit N` and `--full-values` lift the caps.
 - **`run` / `wait`:** `{runId, status: running|succeeded|failed|crashed|interrupted, progress?: {asset, phase: extract|write|checks, rowsFetched, requests, elapsedMs}, steps: StepResult[]}`. A StepResult has:
@@ -829,7 +839,7 @@ Turn off: croft schedule off
   - `schemaChanges[]`, `cursor?: {before, after, sinceUsed}`
   - `inputs?: [{input, seenBefore, seenAfter, rows}]`
   - `requests?`, `checks[]`, `trashed?: {path, rows}`, `logsCommand`, `durationMs`, `error?`
-- **`status`:** `{healthy, running: [{runId, asset, pid, since, phase, rowsFetched}], assets: [{asset, kind, rows, lastRun: {runId, at, status, code}, next: {at, reason}, stale, staleReasons[], held, edited, filesGone?, schemaChangedAt?}]}`.
+- **`status`:** `{healthy, running: [{runId, asset, pid, since, phase, rowsFetched}], assets: [{asset, kind, rows, lastRun: {runId, at, status, code}, next: {at, reason}, stale, staleReasons[], held, edited, filesGone?, schemaChangedAt?}], scheduling: {state: "on"|"off"|"paused", via: "os-job"|"serve"|null, lastTickAt}, serve?: {url, pid}}`.
 - **`describe`:** `{asset, kind, file, behavior: {words, write, key, incremental: {kind, field, cursorValue, cursorType, unit, lookback}}, reads, readBy, columns: [{name, type, pinned, pending, sourceName, format, addedAt, jsonKeys, kinds}], inputsSeen: {input: {seenLoadedAt, inputLastLoadedAt, pendingRows}}, builtWithCodeHash, checks, recentWrites, samples}`.
 - **`validate`:** `{order, assets: [{name, kind, inputs, outputColumns: [{name, type}] | null, behavior, codeChanged}]}`. `outputColumns` comes from `prepare()`.
 - **`context`:** `{project, assets: [compact describe], running, held, recentFailures, recentSchemaChanges: [{asset, at, runId, kind, column, from, to, readBy}]}`, capped at 20 KB with `truncated: true`.
@@ -847,14 +857,15 @@ Turn off: croft schedule off
 
 ### Processes
 
-There is no daemon, socket or server. Four kinds of process exist:
+No process ever owns the database for writing, and there is no write daemon. Five kinds of process exist:
 
 1. **Short-lived CLI invocations.**
 2. **Detached runs.** Off a TTY, `croft run` always executes in a detached child process (`detached` + `unref`; a child outlived its parent and was reparented [V]). The invoking process follows the child's events for `--follow` (default 100 s) and prints the result if the run finished. Otherwise it returns exit 6 with the run id.
    - This keeps every run from being killed by Claude Code's shell timeout (120 s by default, 600 s at most). A killed run would lose all extraction work.
    - On a TTY, runs stay in the foreground, and `--foreground` forces that off a TTY too.
-3. **The per-user scheduler job** (§8). It starts `croft run --due` for each registered project that has due work.
-4. **`croft schedule start`**, a foreground loop for servers, containers and WSL. It spawns a fresh `croft tick` subprocess every minute and never ticks in-process. An in-process tick would keep stale `lib/` code, because a cache-busted `import()` does not re-import dependencies [V], and it would risk a second database instance in one process.
+3. **The per-user scheduler job** (§8). Every minute it starts the project-pinned `croft tick` for each registered project that has scheduling on, and that tick spawns `croft run --due` for due work.
+4. **`croft serve`** (optional), a long-running *read* server with the scheduler built in (§5, "Server mode"). It answers app queries over HTTP and steps aside whenever a run writes. It spawns a fresh `croft tick` subprocess every minute and never ticks in-process. An in-process tick would keep stale `lib/` code, because a cache-busted `import()` does not re-import dependencies [V], and it would risk a second database instance in one process.
+5. **Subprocesses spawned by a tick** (`croft run --due`), which do the scheduled work.
 
 Each command imports asset files fresh, so edits are always picked up. Each TS file is imported in isolation, so one broken file fails only its own asset.
 
@@ -862,7 +873,7 @@ Each command imports asset files fresh, so edits are always picked up. Each TS f
 
 ### Owning the DuckDB file
 
-**The warehouse file is open only while DuckDB itself is working.** It is never open while user code or the network runs. The measured facts behind this:
+**In every process that runs user code, the warehouse file is open only while DuckDB itself is working.** It is never open while user code or the network runs. The one long-lived holder is `croft serve`, which runs no user code, holds the file read-only, and closes it for every write (Server mode, below). The measured facts behind this:
 
 - Opening, querying and closing a file with 1–2M rows costs 3–6 ms [V].
 - `closeSync()` releases the OS lock at once, and a waiting process got the file about 57 ms later [V].
@@ -881,21 +892,21 @@ The rules that follow from these:
 - `db/warehouse.ts` obtains instances only through `DuckDBInstance.fromCache(path)`, which returns the same instance for the same file, including via realpath and case-variant paths [V]. It always uses one configuration, because a different configuration for a cached path is refused [V].
 - croft never opens the warehouse with `fs` APIs or with a second instance, and never `ATTACH`es it from another database, while it may hold it.
 - File copies of the warehouse (the read copy, pre-upgrade backups) are made by a **child process** while croft holds the write lease. A child's descriptors cannot release the parent's locks.
-- `validate` rejects asset or `lib/` code that imports `@duckdb/node-api` or `croft/read`, with `ASSET_OPENS_DATABASE` and the fix "use `ctx.query()`". Ingests and transforms both have `ctx.query()` for read-only lookups.
-- `croft/read` also refuses to open a second instance: if a croft runtime is loaded in the same process (`globalThis[Symbol.for("croft.warehouse")]`), it runs through the current lease.
+- `validate` rejects asset or `lib/` code that imports `@duckdb/node-api` or `@zabaca/croft/read`, with `ASSET_OPENS_DATABASE` and the fix "use `ctx.query()`". Ingests and transforms both have `ctx.query()` for read-only lookups.
+- `@zabaca/croft/read` also refuses to open a second instance: if a croft runtime is loaded in the same process (`globalThis[Symbol.for("croft.warehouse")]`), it runs through the current lease.
 - A test opens a second read-write instance in the same process and asserts that croft refuses.
 
 **Leases.** `warehouse.read(fn)` and `warehouse.write(label, fn)` open the file on demand and close it 100 ms after the last lease ends. Each process picks one access mode for its whole life, because a cached path cannot be reopened with another configuration:
 
-- Processes that write (`run`, `confirm`, `delete`, `restore`) use read-write, even for their read leases.
-- `query`, `describe` and `preview` use read-only.
+- Processes that write (`run`, `confirm`, `delete`, `restore`, `rename`, and `init` when it runs the example) use read-write, even for their read leases. They always create a write intent first (Server mode, below).
+- `query`, `describe`, `preview`, `doctor`, `tick` and `croft serve` use read-only, and never create an intent.
 
-- **Lock conflicts** are retried with jittered backoff (25 ms up to 1 s). After 2 s the holder is printed: croft's own run, from `runs.sqlite` (for example "croft run r_…, writing daily_revenue, 8 s"), or a foreign program (`DB_HELD_BY_OTHER_PROGRAM`).
+- **Lock conflicts** are retried with jittered backoff (25 ms up to 1 s). After 2 s the holder is printed. It is one of: croft's own run, from `runs.sqlite` (for example "croft run r_…, writing daily_revenue, 8 s"); `croft serve`, recognized by the PID in `serve.json` ("croft serve pid 4121 has not stepped aside"); or a foreign program (`DB_HELD_BY_OTHER_PROGRAM`).
 - **Default waits.** Off a TTY every wait is capped at 90 s, then exit 4 with the holder, so a wait never outlives the agent's shell. On a TTY: 60 s for `query`/`preview`/`describe` and 10 min for run writes. Scheduled writes wait 30 min. `--no-wait` exits 4 at once.
 - **Fairness.** A writer that sees registered waiters yields for 200 ms between write steps.
 - **Asset leases** in `runs.sqlite` guarantee that only one run touches an asset at a time. A manual `croft run x` while the scheduler runs `x` waits for the lease, or exits 4 with `ASSET_BUSY` naming the run. A tick skips leased assets, and they stay due. A lease records the PID, the process start time and the boot id (`kern.boottime` or `/proc/sys/kernel/random/boot_id`). It counts as dead when the boot id differs or the start time does not match, because PIDs are reused after a reboot and a PID check alone could leave an asset busy forever.
 
-**One connection factory.** Every connection croft opens goes through a single factory. This covers the warehouse, the preview database, a TS transform's private in-memory database, and `croft/read`. The factory sets the project time zone and applies the sandbox. `TimeZone` is a per-connection setting [V], and a connection that skipped it would put rows into different days.
+**One connection factory.** Every connection croft opens goes through a single factory. This covers the warehouse, the preview database, a TS transform's private in-memory database, and `@zabaca/croft/read`. The factory sets the project time zone and applies the sandbox. `TimeZone` is a per-connection setting [V], and a connection that skipped it would put rows into different days.
 
 **Sandboxing every DuckDB instance.** Every instance is created with `autoinstall_known_extensions = false`, `autoload_known_extensions = false` and `allow_community_extensions = false` [V]. Otherwise DuckDB would download and load native extensions from the network on demand, and croft promises never to install anything. Right after connecting (and after croft's own `ATTACH`es and `SET TimeZone`), croft runs the statements below. `allowed_directories` cannot be passed as an instance option ("Failed to set config"), so these have to be `SET` statements [V]. `croft query` instances allow only `files/`, and a project path outside it gets `QUERY_PATH_DENIED`.
 
@@ -934,7 +945,7 @@ A second rule covers the rest. **All user-authored SQL must be exactly one SELEC
                 ±Infinity, which JSON.stringify would silently turn into {} or null. JS tracks
                 top-level keys, row counts and unsafe-integer warnings.
                 manifest.json is written last. Up to 4 extractions run concurrently ("concurrency").
-3  write lease  RW open, in-process write mutex, BEGIN
+3  write lease  write intent created, RW open, in-process write mutex, BEGIN
    a  stage     CREATE TEMP TABLE raw AS SELECT * FROM read_json(parts, columns = {every key: 'JSON'});
                 every row carries a _croft_seq in yield order; the real table schema is read from
                 duckdb_columns(), and a mismatch with _croft.columns is TABLE_MODIFIED_OUTSIDE_CROFT
@@ -961,7 +972,8 @@ A second rule covers the rest. **All user-authored SQL must be exactly one SELEC
                 row_count and max(_loaded_at) recorded for out-of-band detection
    COMMIT
 4  after        runs.sqlite step + catalog mirror; release asset lease; delete staging (kept 3 days on
-                failure); warnings evaluated and recorded; read copy refreshed at the end of the run
+                failure); warnings evaluated and recorded; instance closed, then write intent
+                removed; read copy refreshed at the end of the run when `readCopy` is on
 ```
 
 **Replace as a diff.** A replace without a key matches rows by a hash of all non-reserved columns, with multiplicity. A replace keeps `_loaded_at` on unchanged rows, so a taxi-zones refresh that changes 2 of 265 rows wakes downstream work for 2 rows, not 265. `MERGE … WHEN NOT MATCHED BY SOURCE THEN DELETE` produced the expected `UPDATE`/`DELETE`/`INSERT` actions and kept the stamp of the unchanged row [V].
@@ -996,8 +1008,9 @@ This is how "never spend the user's API money implicitly" is enforced rather tha
 |---|---|---|
 | `status`, `logs`, `context`, `docs`, `validate`, `run --dry-run` | `runs.sqlite` + files (+ an in-memory DuckDB for binding) | never waits |
 | `query`, `preview`, `describe` samples | a read-only lease | waits only for the current *write step* (usually seconds), printing the holder |
-| `run`, `delete`, `restore`, `confirm` | asset leases + write leases per step | extraction proceeds in parallel; writes queue behind the current step |
+| `run`, `delete`, `restore`, `confirm`, `rename` | asset leases + write leases per step, each behind a write intent | extraction proceeds in parallel; writes queue behind the current step |
 | scheduler tick | asset leases | skips leased assets; due work stays due |
+| `croft serve` queries | its own read-only instance | closed while `write-intent.d/` holds a live entry; queries wait up to 10 s, then `503` (or read-copy answers marked `stale`) |
 
 ### Where state lives
 
@@ -1080,27 +1093,88 @@ CREATE TABLE catalog  (asset TEXT PRIMARY KEY, json TEXT, source TEXT, refreshed
 - Cursors move only on commit, so a crash means extraction is redone, never skipped: at-least-once extraction, exactly-once visibility.
 - Durability across power loss relies on DuckDB's WAL fsync [U].
 
-### The user's own app, GUIs and the read copy
+### Server mode, apps and GUIs
 
-An app or GUI that keeps the live file open blocks every croft write, and even well-behaved open-per-query readers delay writers. Two overlapping readers delayed a writer by 2.4 s [V]. So by default croft maintains **`warehouse.read.duckdb`**, a consistent copy refreshed at the end of every run that changed data:
+An app or GUI that keeps the live file open blocks every croft write. Even well-behaved open-per-query readers delay writers: two overlapping app readers held a writer off for 2.4 s [V]. croft solves this with one cooperative reader rather than many independent ones.
+
+**`croft serve`** is an optional long-running process:
+
+- **Reads over HTTP.** It answers queries over HTTP (`Bun.serve`) against the live file, so there is no copy, no doubled disk and no stale data.
+- **Runs no user code.** Every write stays in a short-lived `croft run` process with freshly imported code, so D1's reasons still hold: no stale asset code, no crash of user code taking the server down, and no inter-process write protocol.
+- **Runs the scheduler.** While scheduling is on for the project, it spawns a fresh `croft tick` subprocess every minute. That makes it the one command to keep running on a server, in a container or on WSL. There, `croft schedule on --no-os-job` switches scheduling on without installing an OS job. `croft schedule off` and `pause` stop its ticks too, because `croft tick` itself exits at once when scheduling is off or paused (§8). On a laptop, the per-user OS job (§8) still works without it.
+
+**Write intents.** Before a process opens the warehouse read-write, `db/warehouse.ts` creates its own intent file: `<state>/write-intent.d/<pid>-<procStart>.json`, holding `{pid, procStart, bootId, runId, since}`. It is written to a temp name with `O_EXCL`, then renamed. The rules:
+
+- Every read-write open goes through `db/warehouse.ts`, so no command can skip the intent. That covers `run`, `confirm`, `delete`, `restore`, `rename`, `init` when it runs the example, and migrations.
+- The intent is removed only *after* `closeSync()` of that instance returns (after the 100 ms linger). Leases inside that window reuse it, and an in-process reference count covers concurrent leases.
+- The server stays closed while the directory holds any **live** entry. One shared file was wrong: when two writers overlapped, the first to finish deleted it, the server reopened within 14–38 ms, and the second writer gave up after 6 s, in 3 of 3 runs. With one file per writer, the second writer got in after 505–615 ms [V].
+- **Liveness** uses the same check as asset leases: the boot id and the process start time must match, not only the PID, because PIDs are reused after a reboot. One function in `intent.ts` implements it for the server, `doctor` and `@zabaca/croft/read`. The Node build reads `/proc/<pid>/stat` on Linux and `ps -o lstart= -p <pid>` on macOS. The server's poll and `reconcile()` delete dead intents.
+- **Foreign holders.** A writer whose lock error names a non-croft holder (the DuckDB UI or DBeaver) withdraws its intent until that holder is gone. The server keeps serving meanwhile.
+
+**Handing the file over.** The server polls the intent directory every 50 ms. `fs.watch` only shortens the delay and is never relied on, because on macOS it merges and drops events [V]. When a live intent appears, the server:
+
+1. stops admitting new queries into DuckDB (they wait in the HTTP layer);
+2. lets in-flight queries finish, and after 2 s calls `connection.interrupt()` on each query still running, repeating every 20 ms until that query's promise has settled (the client gets `503` with `Retry-After`);
+3. only then destroys prepared statements and result readers and disconnects **every** connection, idle ones included (no connection pool survives a handoff);
+4. calls `closeSync()` on the instance.
+
+The lock is released only when the instance *and all its connections* are closed. In spikes, the lock stayed held in three cases [V]:
+
+- an instance closed with an idle connection still open;
+- a connection disconnected while its interrupted query had not yet settled; that query's promise never settled;
+- a partly read stream.
+
+In the documented order, the writer got the file about 20 ms after the interrupt. Results are therefore fully materialized, within limits, before a response is written. They are never streamed from DuckDB to a slow HTTP client.
+
+When the directory is empty again, the server reopens, which takes 3–6 ms. A reopened read-only instance sees every commit made in between, including one that was only in the WAL because its writer was killed after COMMIT [V]. Queries that arrive during a write step wait for it, up to 10 s, and otherwise get `503` with `Retry-After`.
+
+With `readCopy` on, the server instead answers from `warehouse.read.duckdb` while an intent is live, marking the envelope `stale: true, asOf`. In a spike with short queries, one writer and one connection per query, a writer got the file in 10–23 ms across 5 writes while the server answered 2,226 queries in 6 s [V].
+
+**Query limits.** Every query passes the same one-SELECT gate as `croft query`, on a sandboxed read-only connection. Then:
+
+- **Tables only.** Serve connections use `allowed_directories = []`, and the gate rejects `glob`, `read_*`, `duckdb_settings` and `duckdb_databases`, so HTTP clients can read tables but no files and no paths (`QUERY_PATH_DENIED`).
+- **A deadline** (`serve.queryTimeoutMs`, default 30000), enforced with repeated `interrupt()`.
+- **Concurrency:** at most `serve.maxConcurrent` queries (default 4, below the worker-thread count) run in DuckDB at once. The rest queue, and the queue wait counts toward the 10 s wait.
+- **Memory:** the instance sets `memory_limit` (default 25% of RAM) and `threads`.
+- **No silent truncation.** Values are never truncated over HTTP. A result larger than `limit` (default 10,000 rows) or `serve.maxBytes` fails with `QUERY_TOO_MANY_ROWS`; it is never a partial result.
+
+**Security.**
+
+- **A token is always required.** On first start `croft serve` generates a random token into `<state>/serve.json` (mode 0600, git-ignored), along with its URL and PID. `CROFT_SERVE_TOKEN` in `.env` overrides it, and hosted apps use that. Tokens are compared with `crypto.timingSafeEqual`.
+- **Request checks.** The server rejects a request whose `Host` is not the bound address, `localhost` or `127.0.0.1` (DNS rebinding). It rejects one whose `Origin` is not in `serve.allowOrigins` (browser pages), and a `/query` without `Content-Type: application/json`.
+- **Binding.** It listens on `127.0.0.1` by default. `::` and `0.0.0.0` bind every interface. Anything but loopback must sit behind HTTPS (a reverse proxy or tunnel), which the startup banner states. The printed URL uses the address actually bound.
+
+**Same kernel only.** Every croft process that touches a project must run on the same kernel, because DuckDB's lock is a POSIX `fcntl` lock. Inside a container, run `croft run` in the same container (for example `docker exec`). `doctor` and `serve` refuse a database on virtiofs, grpcfuse, fakeowner or 9p mounts with `SERVE_UNSAFE_FILESYSTEM`, as they already do for network filesystems [U].
+
+**The HTTP API** returns the same envelopes as the CLI's `--json`:
+
+| Endpoint | Returns |
+|---|---|
+| `POST /query` with `{sql, params?, limit?}` | the `query` envelope (§4.3), untruncated values, `stale`/`asOf` when served from the read copy |
+| `GET /status` | the `status` envelope |
+| `GET /health` | `{ok, pid, version, database, writeIntent: {pid, runId, since} \| null, queriesToday}` |
+
+**`import { query } from "@zabaca/croft/read"`** is how apps read data. It ships as prebuilt JavaScript and works in Bun and Node [V].
+
+- **Finding the project.** It uses a `{ project }` option, then `CROFT_PROJECT`, then walks up from the current directory (including `./data/croft.json`). It resolves the state folder from `croft.json`, which records a relocated `.croft/` (§2).
+- **Server mode.** With a `{ url }` option or `CROFT_URL`, it always uses HTTP. The token comes from the `token` option, `CROFT_SERVE_TOKEN`, or the local `serve.json`.
+  - This is the path for production apps, including an app hosted elsewhere (Vercel, Fly) that calls a `croft serve` on a machine the user runs.
+  - An explicit URL never falls back to the file. If the server is unreachable, or still answers `503` after `timeoutMs` (default 10 s), `query()` throws `SERVE_UNAVAILABLE`.
+  - For loopback URLs it bypasses environment proxies, so `HTTP_PROXY` never sees the token.
+- **Local server.** With no URL but a live server recorded in `serve.json`, it uses that server. A recorded server that does not answer is treated as absent.
+- **Direct mode.** Otherwise it opens the live file read-only per query and closes it. It first checks the state folder's `write-intent.d/`, and while any live intent exists it waits up to 2 s so the writer can get in; without this, overlapping readers starved a writer [V]. After that it retries on lock conflicts for up to 5 s. If a croft runtime is loaded in the same process, it uses that runtime's lease instead (§5).
+- **Same results in both modes.** Both return rows with the §4.3 value rendering: strings for HUGEINT, DECIMAL and integers beyond ±2^53, and ISO strings with the project offset for timestamps. `query()` throws if an envelope reports any truncation. A golden test runs the same query in both modes.
+- It sets the project time zone on its connection and uses no Bun-only APIs.
+
+**The read copy is opt-in** (`"readCopy": true`), for tools that need a file: the DuckDB UI, DBeaver and notebooks. When it is on, `warehouse.read.duckdb` is refreshed at the end of every run that changed data:
 
 1. Under the write lease, run `CHECKPOINT`. A copy taken without it missed committed rows still in the WAL (1,000 of 1,500) [V].
 2. A child process clones the file to a temporary name (`cp -c` on macOS, `cp --reflink=auto` on Linux). A child is used because the owning process must not open the file (above).
 3. Atomically rename it into place.
 
-On APFS the clone takes 0.1–0.2 ms [V]. Elsewhere it is a full copy; Linux reflink is [U]. `doctor` prints the measured cost and suggests `"readCopy": false` when it exceeds about 5 s per run.
+On APFS the clone takes 0.1–0.2 ms [V]. Elsewhere it is a full copy, and Linux reflink is [U]. The read copy is POSIX-only in v1.
 
-**`import { query } from "croft/read"`** is how apps read data. It ships as prebuilt JavaScript and works in Bun and Node [V].
-
-- It finds the project from a `{ project }` option, then the `CROFT_PROJECT` environment variable, then by walking up from the current directory (including `./data/croft.json`). If none is found, it fails with a clear message.
-- It opens the **read copy** read-only per query and closes it. It checks inode and mtime, so it never serves a stale handle after a refresh.
-- It sets the project time zone from `croft.json` on its connection, and it uses no Bun-only APIs.
-- It never touches the live file unless `readCopy` is off. In that case it first checks `.croft/write-intent`, which a waiting croft writer creates. While that file is fresh, the reader waits up to 2 s so the writer can get in. Two overlapping app readers otherwise starved a writer for the whole test window [V]. After that it retries on lock conflicts for up to 5 s. The read copy is POSIX-only in v1.
-
-Other readers are covered the same way:
-
-- The `DB_HELD_BY_OTHER_PROGRAM` fix tells users to point the DuckDB UI, DBeaver or notebooks at `warehouse.read.duckdb`.
-- Deploying data together with a hosted app is out of scope for v1, because croft is local-first (§11).
+The `DB_HELD_BY_OTHER_PROGRAM` fix points apps at `croft serve` and GUIs at the read copy. When the holder is `croft serve` itself (its PID is in `serve.json`), the message says "held by croft serve (pid n); stop it to open the file read-write in another program".
 
 ---
 
@@ -1386,7 +1460,7 @@ Naive wall-clock matching would never fire "daily at 02:30" on 2026-03-08 in Los
 
 ### Turning it on
 
-`croft schedule on` makes sure **one per-user OS job** exists and adds the project to a registry, `~/.croft/projects.json`.
+`croft schedule on` makes sure **one per-user OS job** exists and adds the project to a registry, `~/.croft/projects.json`. With `--no-os-job` (servers and containers running `croft serve`), it only records scheduling as on.
 
 **The job:**
 
@@ -1397,11 +1471,12 @@ Naive wall-clock matching would never fire "daily at 02:30" on 2026-03-08 in Los
 
 **Each tick only plans and spawns.** It never does the work itself: launchd runs at most one process per job, so a tick busy with a 40-minute transform would drop every later fire [U]. For every registered project that still exists and has scheduling on, the per-user tick starts the project-pinned `croft tick`, which:
 
-1. exits at once if another tick for the project is alive (a singleton row with PID and process start time), since cron can start overlapping ticks;
-2. records a heartbeat and runs `reconcile()`;
-3. computes due work from the `runs.sqlite` mirror;
-4. spawns one detached `croft run --due` per independent group of due assets (the children take the leases);
-5. exits, usually within a second.
+1. exits at once unless scheduling is on and not paused for this project, so ticks from `croft serve` obey `schedule off|pause` too;
+2. exits at once if another tick for the project is alive (a singleton row with PID and process start time), since cron can start overlapping ticks;
+3. records a heartbeat and runs `reconcile()`, opening the warehouse read-only;
+4. computes due work from the `runs.sqlite` mirror;
+5. spawns one detached `croft run --due` per independent group of due assets (the children take the leases);
+6. exits, usually within a second.
 
 The per-user tick also prunes projects whose folder is gone, so moving or deleting a project cannot leave a job firing forever. It spawns every process with an absolute `process.execPath`, because launchd's `PATH` does not include `~/.bun/bin`.
 
@@ -1411,7 +1486,7 @@ The per-user tick also prunes projects whose folder is gone, so moving or deleti
 - a missing Bun path;
 - on WSL, a VM that sleeps when no terminal is open [U].
 
-`status` and `doctor` show `SCHEDULER_STALE`, with the same diagnosis, whenever the last heartbeat is older than 3 minutes. On servers, in containers and on WSL, `croft schedule start` runs the same per-minute loop in the foreground instead, spawning a fresh `croft tick` each minute. Windows gets no OS registration in v1 (tier 2), so there too the answer is `schedule start`, or a documented Task Scheduler entry.
+`status` and `doctor` show `SCHEDULER_STALE`, with the same diagnosis, whenever the last heartbeat is older than 3 minutes. On servers, in containers and on WSL, `croft serve` runs the same per-minute loop in the foreground instead, spawning a fresh `croft tick` each minute, and also answers app queries (§5). Native Windows is unsupported in v1 (§2).
 
 **The first task of phase 3 is a spike on launchd and crontab registration,** including test fires, wake behavior and privacy protection, and it gates the rest of the phase. None of this could be verified without modifying the host.
 
@@ -1547,7 +1622,9 @@ croft status                # failed, stale, held, edited, orphaned
 - Use `ctx.http` and `res.json()` (lossless numbers), never raw fetch + JSON.parse for API data.
 - Nested fields are JSON: `col->>'field'`, `col->>'$[*].name'`, `json_each(col)`. `croft describe` lists keys.
 - Columns named like SQL keywords must be quoted: `"order"`.
-- Apps read with `import { query } from "croft/read"` (reads warehouse.read.duckdb); never open the .duckdb files.
+- Apps read with `import { query } from "@zabaca/croft/read"`. It talks to `croft serve` when one is running (found via CROFT_URL or .croft/serve.json), otherwise opens the file briefly. Never open the .duckdb files directly.
+- `croft serve` runs until stopped: ask the user to start it in their own terminal instead of running it in your shell.
+- For a GUI (DuckDB UI, DBeaver), set "readCopy": true in croft.json and open warehouse.read.duckdb, never warehouse.duckdb.
 
 ## APIs
 - Keyset paging (re-query with since = newest value seen) ONLY if the API sorts ascending by that field.
@@ -1561,6 +1638,7 @@ croft status                # failed, stale, held, edited, orphaned
   --allow-shrink, delete, restore, lossy pin changes, key conversion, large paid reprocessing).
 - Adding `allowShrink: true`; changing key/write/incremental of an ingest that has data.
 - Renaming or deleting files in assets/ (use `croft rename`); `croft schedule on|off|pause`.
+- `croft serve` (it runs scheduled work unattended, and a `--host` other than 127.0.0.1 exposes data beyond this machine).
 - Deleting .croft/ or warehouse*.duckdb, or `git clean -X` (the trash and backups live in .croft/).
 - Weakening or deleting a failing check.
 
@@ -1608,7 +1686,7 @@ A test fails if any thrown code is unregistered or has no fix template and docs 
 
 - **Project:** `DUPLICATE_OUTPUT_COLUMN`, `DECIMAL_PRECISION_UNSUPPORTED`, `QUERY_PATH_DENIED`, `ASSET_INVALID`, `NAME_INVALID`, `NAME_RESERVED`, `NAME_CONFLICT`, `HEADER_UNKNOWN_KEY`, `SQL_SYNTAX`, `SQL_NOT_SELECT`, `SQL_NOT_ONE_STATEMENT`, `PIVOT_NEEDS_VALUES`, `CATALOG_PREFIX`, `SQL_READS_FILES`, `INPUT_NEEDS_KEY`, `UNKNOWN_TABLE`, `UNKNOWN_COLUMN`, `QUOTE_IDENTIFIER`, `UNDECLARED_INPUT`, `CYCLE`, `SCHEDULE_INVALID`, `CHECK_INVALID`, `SECRET_MISSING`, `INCREMENTAL_WITHOUT_KEY`, `CURSOR_TYPE_MISMATCH`, `ASSET_OPENS_DATABASE`, `ASSET_RENAMED`, `QUERY_NOT_SELECT`.
 - **Run:** `HTTP_ERROR`, `ASSET_CODE_ERROR`, `ROW_NOT_OBJECT`, `UNSERIALIZABLE_VALUE`, `CSV_HEADER_AMBIGUOUS`, `PIN_ROUNDED`, `DDL_AFTER_DML` (an internal invariant), `KEYSET_STUCK`, `TIMEOUT`, `INTERRUPTED`, `TYPE_CONFLICT`, `TYPE_PIN_VIOLATION`, `KEY_NULL`, `CHECK_FAILED`, `SHRINK_GUARD`, `INGEST_CONFIG_CHANGED`, `PIN_CHANGES_DATA`, `UNKNOWN_INPUT_COLUMN`, `BACKFILL_UNSUPPORTED`, `BACKFILL_WOULD_DUPLICATE`, `LARGE_REPROCESS`.
-- **Coordination:** `DB_BUSY`, `DB_HELD_BY_OTHER_PROGRAM`, `ASSET_BUSY`, `SCHEDULE_HELD`.
+- **Coordination:** `DB_BUSY`, `DB_HELD_BY_OTHER_PROGRAM`, `ASSET_BUSY`, `SCHEDULE_HELD`, `SERVE_UNAVAILABLE`, `SERVE_UNSAFE_FILESYSTEM`, `QUERY_TOO_MANY_ROWS`.
 - **Safety:** `CONFIRMATION_REQUIRED`, `CONFIRMATION_STALE`, `REQUIRES_HUMAN`.
 - **Environment:** `BUN_TOO_OLD`, `NEEDS_BUN`, `DUCKDB_BINDING_MISSING`, `DUCKDB_BINDING_LOAD`, `DB_NEWER_FORMAT`, `CLAUDE_FILES_OUTDATED`, `SCHEDULER_STALE`.
 - **Warnings and info:** `ENV_FILE_IGNORED`, `TABLE_MODIFIED_OUTSIDE_CROFT`, `VOLATILE_SQL`, `MIXED_TYPES`, `NULL_ONLY_COLUMN`, `UNSAFE_INTEGER`, `SINCE_IGNORED`, `EMPTY_EXTRACT`, `TYPE_WIDENED`, `COLUMN_STOPPED_ARRIVING`, `JSON_KIND_CHANGED`, `CSV_ENCODING_GUESSED`, `AMBIGUOUS_DATE_FORMAT`, `MIXED_DATE_FORMATS`, `DUPLICATE_ROWS_ACROSS_FILES`, `TRANSFORM_MAKES_REQUESTS`, `SHRINK_GUARD_DISABLED`, `INPUT_NOT_BUILT`, `EDITED_SINCE_LAST_RUN`, `ORPHAN_TABLE`, `OUT_OF_BAND_CHANGE`.
@@ -1652,7 +1730,7 @@ Declaring `secrets` drives `doctor`, `validate`, error messages and what `ctx.se
 
 ## 10. Implementation layout
 
-**One package**, `croft`, with bin `croft` → `src/cli/main.ts`. Its exports:
+**One package**, `@zabaca/croft` on npm, with bin `croft` → `src/cli/main.ts`. The command is plain `croft`, just as `@zabaca/zbc` ships the command `zbc`. Its exports:
 
 - `.` → `src/index.ts`
 - `./read` → `dist/read.js` + `dist/read.d.ts`, built from `src/read.ts` with `bun build --target node` at publish time
@@ -1660,12 +1738,12 @@ Declaring `secrets` drives `doctor`, `validate`, error messages and what `ctx.se
 **Dependencies:**
 
 - **Runtime:** only `@duckdb/node-api`, pinned exactly, because both the storage format and the AST shape depend on its version.
-- **Everything else is a Bun built-in:** `bun:sqlite`, `Bun.Glob`, `Bun.file`/`Bun.write`, `Bun.hash`/`Bun.CryptoHasher`, `Bun.build` (fingerprints), `fetch`, `node:util` `parseArgs`, `node:child_process` (detached runs, notifications), `node:fs` `copyFile` with `COPYFILE_FICLONE` (read copy, trash), and `Bun.serve` (test mocks).
+- **Everything else is a Bun built-in:** `bun:sqlite`, `Bun.Glob`, `Bun.file`/`Bun.write`, `Bun.hash`/`Bun.CryptoHasher`, `Bun.build` (fingerprints), `fetch`, `node:util` `parseArgs`, `node:child_process` (detached runs, notifications, `croft tick` spawns, and the `cp -c`/`cp --reflink=auto` clones behind the read copy and backups), `node:fs` (write-intent files; `watch` only as a latency hint), `node:crypto` `timingSafeEqual` (serve tokens), and `Bun.serve` (`croft serve` and test mocks).
 - **No CLI framework and no schema library.** Validators are hand-written so their errors read well.
 
 ```
 src/
-  index.ts             ingest(), transform(), fail(), public types       read.ts   croft/read (built to dist/)
+  index.ts             ingest(), transform(), fail(), public types       read.ts   @zabaca/croft/read (built to dist/)
   cli/                 main.ts (launcher delegation, parseArgs), render.ts (human/JSON, truncation, offsets),
                        detach.ts (non-TTY detach + follow), commands/*.ts
   core/                errors.ts (CroftError, code registry, fix templates, exit codes), types.ts, time.ts
@@ -1678,7 +1756,9 @@ src/
                        bind.ts (shadow catalog, prepare, error → code mapping), connect.ts (factory: time zone + sandbox)
   db/                  warehouse.ts (fromCache registry, one mode per process, leases with boot id, lock retry,
                        holder lookup), state.ts (_croft DDL + migrations), values.ts (DuckDB → JS, round-trip safe),
-                       readcopy.ts (checkpoint + child-process clone + rename)
+                       readcopy.ts (opt-in: checkpoint + child-process clone + rename), intent.ts (write-intent file)
+  serve/               server.ts (Bun.serve: /query, /status, /health; token auth), handoff.ts (watch write-intent,
+                       close/reopen the read-only instance), loop.ts (spawn croft tick every minute)
   load/                stage.ts (NDJSON parts, canonical + lossless JSON), classify.ts (json_type + regex kinds),
                        types.ts (type rules, name-typed placeholders, CSV money/date formats), cast.ts (whitelist,
                        round-trip loss check), evolve.ts (ALTERs), write.ts (diff-replace, append, merge, dedupe),
@@ -1786,10 +1866,16 @@ export declare function transform(config: TransformConfig): AssetDefinition;
 export declare function fail(code: "KEYSET_STUCK" | (string & {}), message: string): never;
 ```
 
-`croft/read`:
+`@zabaca/croft/read`:
 
 ```ts
-export interface ReadOptions { project?: string; timeoutMs?: number }
+export interface ReadOptions {
+  project?: string;                          // project root; else CROFT_PROJECT, else walk up from cwd
+  url?: string;                              // croft serve URL; else CROFT_URL, else .croft/serve.json, else direct
+  token?: string;                            // else CROFT_SERVE_TOKEN, else the local serve.json
+  limit?: number;                            // max rows; default 10,000; more is QUERY_TOO_MANY_ROWS, never truncation
+  timeoutMs?: number;
+}
 export declare function query<T extends Record<string, unknown> = Record<string, unknown>>(
   sql: string, params?: unknown[], options?: ReadOptions): Promise<T[]>;
 ```
@@ -1902,10 +1988,19 @@ export interface Warehouse {
    - type drift between pages, and big integers.
 
    Every `--json` output is golden-tested against its JSON Schema.
-4. **Concurrency:** a run plus a query; a foreign read-only holder; two runs on one asset; a tick overlapping a manual run; a detached run followed by `wait`.
+4. **Concurrency:**
+   - a run plus a query; a foreign read-only holder; two runs on one asset; a tick overlapping a manual run; a detached run followed by `wait`;
+   - `croft serve` under steady load while runs write. The writer must get the file within 100 ms with no query in flight, and within 2 s + 100 ms with a 60 s query in flight.
+   - two writers, where A removes its intent while B still waits and B must get the file;
+   - 16 concurrent long queries at handoff; an idle connection at handoff (assert zero open connections before `closeSync()`);
+   - a stale intent whose PID was reused; a writer blocked by a foreign holder, which withdraws its intent;
+   - three direct app readers against one writer.
 5. **Crash tests.** `CROFT_FAULT=after_stage|before_commit|after_commit_before_sqlite|between_trash_and_drop` makes the child `SIGKILL` itself. The parent then asserts that data and state agree, the cursor is at most the committed maximum, and the next run succeeds.
 6. **Scheduler tests** with a fake clock (`CROFT_NOW`) and a fake `HOME`. They check plist and crontab generation, registry pruning, heartbeat verification, the tick singleton, holds, stale-transform pickup, and DST golden days (2026-03-08 and 2026-11-01 in several zones). Real OS registration is exercised in a phase-3 spike and in manual release checks, because CI cannot install launchd jobs.
-7. **`croft/read` under Node** (current LTS) in CI, including the Next.js `serverExternalPackages` setup.
+7. **`@zabaca/croft/read` under Node** (current LTS) in CI, in both modes:
+   - HTTP against `croft serve`: token, `503` with `Retry-After`, `SERVE_UNAVAILABLE`, and loopback with `HTTP_PROXY` set;
+   - direct;
+   - a golden test that the same query gives identical rows in both modes, and the Next.js `serverExternalPackages` setup.
 8. **CI matrix.** macOS arm64, Linux x64 glibc and Linux arm64 are tier 1, each on the Bun floor (1.3.14) and `bun@latest`. Alpine and Windows get smoke tests.
 9. **Agent evals** from phase 2 onward. Headless Claude Code sessions run fixture tasks:
    - "add Stripe charges and daily revenue, schedule hourly";
@@ -1928,15 +2023,15 @@ Each item is marked with where it goes instead, if anywhere.
 - **Incremental SQL** (`new.<table>`). It is designed and verified, and it is post-v1 #1.
 - **`--to`/`--step` windowed backfills.** `--from` on merge ingests covers the need.
 - **Schedules on transforms.** Transforms follow their inputs.
-- **Windows scheduler registration.** Windows uses `croft schedule start` or a documented Task Scheduler entry.
+- **Native Windows** (use WSL) and Windows scheduler registration.
 - **File reads inside SQL assets** (`SQL_READS_FILES`). Files come in through file ingests.
 - **Named or virtual environments,** fingerprinted physical tables, plan/apply promotion, `copy` and `--database`.
-- **The daemon,** server mode, remote execution, multiple projects per database.
+- **A write daemon,** remote execution, multiple projects per database. (`croft serve` is in v1, but it only reads and schedules.)
 - **Child tables, native STRUCT typing and flattening** of nested data. JSON columns are used instead.
 - **SQL time windows and partitions** as concepts; view-kind SQL models; SQL macros and templating.
 - **Standalone check files** (`checks/*.sql`). Row rules with subqueries cover most cases.
 - **`query --write`.** `delete --where` and fixing the asset cover the need.
-- **Exports:** `croft export`, and deploying data with a hosted app.
+- **Exports:** `croft export`, and shipping data files to a hosting provider. (A hosted app can already query a `croft serve` the user runs, D53.)
 - **`croft refs`** (column reference search). `rename` lists references, and `validate` plus the Proxy guard catch breakage.
 - **Modeling features:** SCD2 history, delete propagation from sources, column lineage, SQL unit tests with fixtures, and quarantine of bad rows.
 - **Source frameworks:** a declarative REST source DSL, and database sources as a feature. A Postgres ingest via `Bun.sql` is a doc recipe.
@@ -1949,19 +2044,19 @@ Each phase is usable end to end, and each ships `--json`, error codes, docs page
 
 | Phase | Ships | Usable result | Effort |
 |---|---|---|---|
-| **1. Load and look** | launcher; `init` (empty folder and existing repo), relocation off synced folders; `doctor`; `docs`; skill and CLAUDE.md; `ingest()` for rows and files/URLs (`union_by_name`, encoding fallback, `map`); staging, classification, type rules, whitelisted casts, round-trip loss check, evolution (DDL before DML), JSON columns; replace (as a diff), append and merge with dedupe; typed cursors and lookback; the shrink guard with minimal trash and confirmation tokens; connection factory, sandbox and single-SELECT gate; `fromCache` instance registry; leases (with boot id) and lock diagnostics; `reconcile`; `run` (detach off a TTY, `wait`, signals), `query`, `status`, `describe`, `context`, `logs`, `secrets`; read copy (child-process clone) and `croft/read` (built JS) | Claude pulls an API or a folder of CSVs into DuckDB incrementally, answers questions from it, and an app reads it | ~3.5 weeks |
+| **1. Load and look** | launcher; `init` (empty folder and existing repo), relocation off synced folders; `doctor`; `docs`; skill and CLAUDE.md; `ingest()` for rows and files/URLs (`union_by_name`, encoding fallback, `map`); staging, classification, type rules, whitelisted casts, round-trip loss check, evolution (DDL before DML), JSON columns; replace (as a diff), append and merge with dedupe; typed cursors and lookback; the shrink guard with minimal trash and confirmation tokens; connection factory, sandbox and single-SELECT gate; `fromCache` instance registry; leases (with boot id) and lock diagnostics; `reconcile`; `run` (detach off a TTY, `wait`, signals), `query`, `status`, `describe`, `context`, `logs`, `secrets`; `@zabaca/croft/read` (built JS, direct mode with the write-intent handshake) | Claude pulls an API or a folder of CSVs into DuckDB incrementally, answers questions from it, and an app reads it | ~3.5 weeks |
 | **2. Transform and trust** | SQL assets (single-statement check, temp-view wrapper, reserved columns, PIVOT, catalog and file-read errors, `VOLATILE_SQL`); dependencies from AST + unoptimized plan; graph, staleness and fingerprints; bind check (`INPUT_NOT_BUILT`, `NULL_ONLY_COLUMN`, `QUOTE_IDENTIFIER`); TS transforms (full and incremental, ordered Parquet snapshots, round-trip value types, Proxy rows, composite positions, chunked commits, cost guard); checks and warnings in the write transaction; `preview` (snapshots, partial diffs, `--rebuild`); `run --dry-run` | raw → clean → report tables that cannot receive bad data, and per-row LLM transforms that survive failures without re-billing | ~4 weeks |
-| **3. Keep it fresh** | gate: a spike on launchd and crontab registration; schedule phrases and the DST-defined matcher; per-user job, registry and heartbeats; `croft tick` (plan-and-spawn, singleton); holds, `pause`, stale-transform pickup; retries, no-progress timeouts, catch-up once, skip on overlap; desktop and webhook notifications; `schedule start` | hands-off hourly pipeline that survives sleep, crashes and reboots, and never runs half-finished edits | ~2.5 weeks |
+| **3. Keep it fresh** | gate: a spike on launchd and crontab registration; schedule phrases and the DST-defined matcher; per-user job, registry and heartbeats; `croft tick` (plan-and-spawn, singleton); holds, `pause`, stale-transform pickup; retries, no-progress timeouts, catch-up once, skip on overlap; desktop (default on) and webhook notifications; **`croft serve`** (HTTP read API with token auth, write-intent handoff, built-in scheduler loop) and the `@zabaca/croft/read` HTTP client; opt-in read copy | hands-off hourly pipeline that survives sleep, crashes and reboots, never runs half-finished edits, and serves apps (local or hosted) live data | ~3.5 weeks |
 | **4. Grow safely** | monotone partial commits for cursor ingests (resumable first loads); full trash, `restore` and `delete` (whole table and `--where`); `--rebuild` rules; `--from` backfill matrix; `INGEST_CONFIG_CHANGED` and key conversion; `PIN_CHANGES_DATA`; `rename` and `ASSET_RENAMED`; drift warnings; `OUT_OF_BAND_CHANGE`; pre-upgrade backups; `EMPTY_EXTRACT` | long-lived sources and paid transforms change shape without refetching or losing data | ~2 weeks |
 | **5. Agent-grade release** | all templates (every pagination style), a docs page per code, JSON Schemas and golden tests, generated input types (`.croft/types`, so `validate --types` catches renames in TS), agent evals in CI, CI matrix (Bun floor and latest), opt-in hook, npm 0.1 | Claude Code operates a project from a cold start, measured by evals | ~1.5 weeks |
 
-The total is about 13.5 engineer-weeks and roughly 13–15k lines. If that is too long, phases 1 and 2 (about 7.5 weeks) are a coherent first release: load, look, transform and trust, with manual or `schedule start` runs.
+The total is about 14.5 engineer-weeks and roughly 14–16k lines. The user chose to ship all five phases as v1.
 
 **Post-v1 candidates, in order:**
 
 1. Incremental SQL (`new.<table>`), with pre-images of updated and deleted rows.
 2. `croft refs`.
-3. `croft export`, plus a story for hosted apps.
+3. `croft export`.
 4. `partial: true` merges for APIs that send only changed fields.
 5. Opt-in typed nested columns.
 6. SQL time windows.
@@ -1976,7 +2071,10 @@ The total is about 13.5 engineer-weeks and roughly 13–15k lines. If that is to
 
 | Risk | Mitigation |
 |---|---|
-| The user's app or a SQL GUI holds the live file and blocks writes | the read copy is on by default; `croft/read` reads only the copy; lock errors name the program and PID and point GUIs at the copy; `doctor` shows the holder |
+| The user's app or a SQL GUI holds the live file and blocks writes | apps query through `croft serve`, which steps aside for writes in 10–23 ms [V]; the direct `@zabaca/croft/read` fallback honors the write-intent handshake; GUIs use the opt-in read copy; lock errors name the program and PID; `doctor` shows the holder |
+| `croft serve` exposes data beyond the machine, or to browser pages | token always required (generated into `serve.json`); Host and Origin checks against DNS rebinding and cross-origin requests; loopback by default, HTTPS proxy otherwise; tables only, no file access; query deadline, concurrency and memory limits |
+| Apps get `503` during write steps longer than 10 s | most write steps take seconds; turn on `readCopy` for stale-but-available answers (`stale: true`); writers blocked by a foreign holder withdraw their intent |
+| Server handoff bugs lock writers out | intents are per holder with boot-id liveness; every connection is closed before `closeSync()`; handoff tests cover two writers, long and idle connections, and reused PIDs [V] |
 | A long write step blocks other commands | the lock is held per write step only; extraction and TS code run lock-free; `status`/`context`/`validate` never touch DuckDB; off a TTY, waits cap at 90 s and name the holder |
 | The agent's shell timeout kills long runs | off a TTY, runs always detach and return exit 6 with a run id; `wait`; `status.running[]` |
 | AI-edited code runs unattended on real data | the scheduler hold (only code a human has run); per-file import isolation; checks inside the transaction; trash |
@@ -2002,9 +2100,9 @@ The total is about 13.5 engineer-weeks and roughly 13–15k lines. If that is to
 
 Each entry gives the options, the choice and the reason. **(rev)** marks decisions changed or extended after the adversarial reviews.
 
-**D1. Daemon or per-step open.**
+**D1. Daemon or per-step open. (extended by D53)**
 - Options: a `Bun.serve` daemon owning the file; short-lived processes opening the file per step.
-- Choice: per step; there is no daemon.
+- Choice: per step for every write; there is no write daemon. (D53 adds `croft serve`, an optional read-only server that runs no user code and closes the file for every write.)
 - Reason: open plus close costs 3–6 ms [V]. A daemon would run stale code after edits, add an IPC path to debug, and keep the file locked away from users' own tools.
 
 **D2. Table naming.**
@@ -2025,7 +2123,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 **D5. SQL header.**
 - Options: a YAML comment block; `-- name: value` lines.
 - Choice: line comments.
-- Reason: there are only five keys, and repeatable `check` lines read naturally.
+- Reason: there are only four keys (`description`, `key`, `check`, `warn`), and repeatable `check` lines read naturally.
 
 **D6. Write behavior. (rev)**
 - Options: an explicit mode everywhere; inferred from key and incremental.
@@ -2147,9 +2245,9 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Choice: `SHRINK_GUARD` above 50% loss for ingests. Its override is a destructive operation (trash + confirmation), and its fix requires a human.
 - Reason: the override was the one path that wiped irreplaceable data without the trash.
 
-**D32. App access. (rev)**
+**D32. App access. (rev, superseded by D53)**
 - Options: an open-per-query helper on the live file; a read copy.
-- Choice: a read copy by default, and `croft/read` reads only the copy. It ships as built JS.
+- Choice (before D53): a read copy by default, and `@zabaca/croft/read` reads only the copy. It ships as built JS.
 - Reason: readers on the live file delay writers [V]; GUIs left open block everything; Node cannot import TS from `node_modules` [V].
 
 **D33. Long runs. (rev)**
@@ -2188,7 +2286,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Reason: READ_ONLY still allows `COPY TO` over the warehouse [V], and the sandbox alone still allows `DETACH`/`ATTACH` of permitted paths [V].
 
 **D41. Command surface. (new)**
-- Choice: 19 commands. `plan` became `run --dry-run`; `history` became `logs --runs`; `trash` became `restore` with no arguments; `drop` became `delete`. `copy`, `--database`, `query --write` and `--step` are cut; `confirm` and `rename` are added.
+- Choice: 19 commands (20 once D53 added `serve`). `plan` became `run --dry-run`; `history` became `logs --runs`; `trash` became `restore` with no arguments; `drop` became `delete`. `copy`, `--database`, `query --write` and `--step` are cut; `confirm` and `rename` are added.
 - Reason: fewer commands to learn, without losing any agent-facing capability.
 
 **D42. `init` in an existing repo. (new)**
@@ -2216,7 +2314,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 
 **D47. What a tick does. (new)**
 - Options: the tick runs the due work; the tick plans and spawns.
-- Choice: plan and spawn, with a singleton row. `schedule start` spawns a fresh tick process each minute.
+- Choice: plan and spawn, with a singleton row. `croft serve` spawns a fresh tick process each minute.
 - Reason: launchd runs one process per job, so a busy tick drops fires [U]. Cron overlaps ticks. An in-process loop keeps stale `lib/` code [V].
 
 **D48. JavaScript value types for TS code. (new)**
@@ -2238,18 +2336,32 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 
 **D52. Name. (new)**
 - Options: `tsdb` (the working name); `croft`, `rowen`, `rowjar`, `bothy`, `quern` and others from a naming panel. The panel checked each against the npm registry, Homebrew and existing commands.
-- Choice: **croft**, a small plot of land one household works itself.
-- Reason: it matches one folder, one local project that you own and run. It is one syllable and five letters, and it reads cleanly as `croft run`, `import { ingest } from "croft"`, `croft.json`, `.croft/` and the skill name. On 2026-09-22 the npm name, the Homebrew formula and local commands were all free. `tsdb` was taken on npm and read as "time-series database". Known neighbors are small: a PyPI dataset-publishing tool, and a Rust TUI at croft.software. Search needs a qualifier ("croft cli").
+- Choice: **croft**, a small plot of land one household works itself. The command is `croft`, published on npm as **`@zabaca/croft`**.
+- Reason: it matches one folder, one local project that you own and run. It is one syllable and five letters, and it reads cleanly as `croft run`, `croft.json`, `.croft/` and the skill name. The unscoped npm name `croft` was free, but npm refused to publish it: "Package name too similar to existing package cron". A registry lookup alone cannot detect that rule. The `@zabaca` scope follows `@zabaca/zbc` and keeps the command name. The placeholder `@zabaca/croft@0.0.1` was published on 2026-09-22 to hold the name. `tsdb` was taken on npm and read as "time-series database".
+
+**D53. Server mode for app access. (new, 2026-09-22)**
+- Options: a read copy by default (D32); `croft serve` as one cooperative read server; a write daemon that owns the file.
+- Choice: `croft serve`, an optional HTTP read server that steps aside for every write, and runs the scheduler loop. Writers announce themselves with per-holder intent files in `write-intent.d/`, with boot-id liveness; the server closes every connection before releasing the file. It requires a token, checks Host and Origin, and reads tables only. `@zabaca/croft/read` uses it when available and falls back to brief direct reads. The read copy becomes opt-in, for GUIs.
+- Reason:
+  - One cooperative reader removes the lock contention that many app readers cause. A writer got the file in 10–23 ms while the server answered 2,226 queries in 6 s (short queries, one writer) [V].
+  - The review of this change found two handoff bugs, both fixed and verified: a single shared intent file, and connections left open at close.
+  - Apps see live data with no doubled disk.
+  - A hosted app gets a path: HTTP to a server the user runs.
+  - Writes stay in fresh short-lived processes, so D1's reasons against a daemon still apply.
+  - It costs about one more engineer-week, in phase 3.
 
 ---
 
 ## Open questions for the user
 
-Decided on 2026-09-22: the name is **croft** (D52).
+Decided on 2026-09-22:
 
-1. **Desktop notifications** on scheduled failures are proposed as on by default. Keep that default?
-2. **The read copy** doubles disk use on filesystems without copy-on-write clones (most Linux ext4), and costs a full copy after each run that changed data. It is proposed as on by default, with `doctor` suggesting it be turned off when it gets slow. Keep that default?
-3. **Scope.** v1 is about 13.5 engineer-weeks over 5 phases. Should phases 1–2 (load, look, transform and trust; about 7.5 weeks) ship first, with scheduling after?
+- **Name:** croft, published as `@zabaca/croft` (D52).
+- **Desktop notifications** on scheduled failures: on by default.
+- **Scope:** v1 is all 5 phases, about 14.5 engineer-weeks (13.5 before D53 added `croft serve`).
+- **App access:** `croft serve` (server mode) instead of a default read copy; the read copy is opt-in, for GUIs (D53).
+
+No open questions remain.
 
 ---
 
@@ -2257,7 +2369,7 @@ Decided on 2026-09-22: the name is **croft** (D52).
 
 **From the non-data-engineer review:**
 
-- `croft/read` now ships as built JavaScript, because it crashed under Node/Next.js. It locates the project explicitly, and `init` inside an app repo creates `data/` without touching the app's files.
+- `@zabaca/croft/read` now ships as built JavaScript, because it crashed under Node/Next.js. It locates the project explicitly, and `init` inside an app repo creates `data/` without touching the app's files.
 - The Bun floor was raised to 1.3.14 and is enforced, with CI on `bun@latest`. The earlier "1.3 or newer" was false.
 - `SELECT *` over an asset no longer collides with `_loaded_at`: reserved columns are excluded automatically.
 - CSV handling:
@@ -2272,7 +2384,7 @@ Decided on 2026-09-22: the name is **croft** (D52).
 - Scheduling uses one per-user job with a registry and a verified heartbeat, and diagnoses privacy protection, WSL idle, missing Bun and moved projects. `Bun.cron` is no longer used.
 - The Stripe journey is taught correctly: typed epoch cursors with `unit` and `lookback`, newest-first cursor pagination, and a rule for records that change after creation.
 - NULL-only placeholders are typed from the column name, and `NULL_ONLY_COLUMN` maps binder errors to a pin fix.
-- Cut: incremental SQL, `--step`/`--to`, `checks/` files, `copy`/`--database`, `query --write`, `initial`. Merged: `plan`, `history`, `trash` and `drop` into other commands. The result is 19 commands and 7 concepts.
+- Cut: incremental SQL, `--step`/`--to`, `checks/` files, `copy`/`--database`, `query --write`, `initial`. Merged: `plan`, `history`, `trash` and `drop` into other commands. The result is 19 commands (20 after D53 added `serve`) and 7 concepts.
 - Synced and WSL-drvfs folders get automatic database relocation.
 - Secrets: "edit `.env`" is the primary instruction, `--stdin` is supported, and all `.env` values are redacted.
 - `INPUT_NOT_BUILT` handles validation of SQL over never-run ingests.
@@ -2309,21 +2421,21 @@ Decided on 2026-09-22: the name is **croft** (D52).
 - Incremental TS transforms get composite positions, ordered snapshots, chunked commits, staged-chunk reuse and no-progress timeouts (D46).
 - TS values round-trip as ISO strings, and HUGEINT is snapshotted as DECIMAL(38,0) (D48).
 - Every open goes through `DuckDBInstance.fromCache` with one mode per process.
-- The tick plans and spawns, with a singleton. `schedule start` spawns a fresh tick per minute (D47).
+- The tick plans and spawns, with a singleton. `croft serve` spawns a fresh tick per minute (D47).
 - DST fire rules are defined; the time zone is part of every fingerprint; one connection factory sets it.
 - Leases carry process start time and boot id.
 - Stale transforms are picked up by the tick. Deterministic failures wait for the next fire time.
 - The DDL-before-DML invariant is enforced.
-- Estimates are revised to about 13.5 weeks, and the phase-3 OS-registration spike gates scheduling.
+- Estimates are revised to about 13.5 weeks (14.5 after D53), and the phase-3 OS-registration spike gates scheduling.
 
 **From the technical review (storage and ingestion):**
 
 - **A second instance in the same process is invisible to the OS lock** (the blocker). A second read-write instance lost committed data, a second read-only one served stale data, and closing either, or closing any `fs` descriptor on the file, released the first instance's lock [V]. The fixes:
   - every open goes through `fromCache`;
-  - `croft/read` reuses a loaded runtime's lease;
-  - `validate` rejects imports of the binding or `croft/read` in assets and `lib/`;
+  - `@zabaca/croft/read` reuses a loaded runtime's lease;
+  - `validate` rejects imports of the binding or `@zabaca/croft/read` in assets and `lib/`;
   - ingests get `ctx.query()`;
-  - `schedule start` spawns subprocesses;
+  - the foreground scheduler loop (now part of `croft serve`) spawns subprocesses;
   - copies are made by a child process.
 - **Casts** read JSON text, the loss check compares exact decimals, and `PIN_ROUNDED` and `DECIMAL_PRECISION_UNSUPPORTED` were added. The claim that JSON staging keeps fractional text exact was corrected: integers stay exact, fractions become doubles.
 - **DDL before DML** is enforced by the Sql wrapper (`DDL_AFTER_DML`), and restore uses `CREATE OR REPLACE`.
@@ -2333,7 +2445,7 @@ Decided on 2026-09-22: the name is **croft** (D52).
 - **Secrets** are parsed by croft with Bun's loading off, so `.env.local` and the working directory no longer matter.
 - **Query sandbox:** extension autoinstall and autoload are off, allowed directories are narrowed to `files/` for `query`, and `QUERY_PATH_DENIED` was added.
 - **Preview** snapshots its inputs to Parquet instead of attaching the live file.
-- **Readers:** the write-intent handshake stops app readers starving writers when the read copy is off.
+- **Readers:** the write-intent handshake stops direct app readers from starving writers. D53 later extended it to `croft serve`.
 - **Copies:** the read copy uses `CHECKPOINT` plus a child-process clone under the write lease. The pre-upgrade backup includes the WAL and reads the "newer engine" version from `runs.sqlite`.
 - **Cursors:** the "inclusive start" claim was replaced by a 1-second default lookback; lookback renders in the saved value's own form; resumable first loads (monotone partial commits) moved into v1 (D50).
 - **Staging and schema:** `_croft_seq` orders dedupe; per-row absence means NULL (with post-v1 `partial: true`); the real schema is read from `duckdb_columns()`, with `TABLE_MODIFIED_OUTSIDE_CROFT`; Parquet types are normalized.
@@ -2348,7 +2460,7 @@ All spikes ran on macOS arm64 with `@duckdb/node-api` 1.5.5-r.5 (DuckDB 1.5.5), 
 
 | Area | Result |
 |---|---|
-| Runtime | node-api loads under Bun 1.3.0–1.4.2; `JSON.rawJSON` and reviver `context.source` exist on all of them; `Bun.cron` is absent before 1.3.11; `Bun.cron.parse` ignores tz on 1.3.14 and honors it on 1.4.2; the built `croft/read` works on Node 24.3/24.20, while a `.ts` export under `node_modules` fails on Node |
+| Runtime | node-api loads under Bun 1.3.0–1.4.2; `JSON.rawJSON` and reviver `context.source` exist on all of them; `Bun.cron` is absent before 1.3.11; `Bun.cron.parse` ignores tz on 1.3.14 and honors it on 1.4.2; the built `@zabaca/croft/read` works on Node 24.3/24.20, while a `.ts` export under `node_modules` fails on Node |
 | Locking | a second process cannot open a file held read-write, even READ_ONLY; the error names the holder path and PID; open+close is 3–6 ms; lock handoff is about 57 ms; overlapping readers delayed a writer 2.4 s; two instances on one file in one process lost data |
 | Sandbox | a READ_ONLY connection executed `COPY TO` over the warehouse, leaving 4 bytes and an unopenable file; `allowed_directories` + `enable_external_access=false` + `lock_configuration=true` blocked `COPY TO` the warehouse, reads outside allowed dirs, and re-enabling; `DETACH` + read-write `ATTACH` of an already-attached path still worked; `json_serialize_sql` rejects COPY, EXPLAIN ANALYZE and PIVOT, accepts DESCRIBE/SUMMARIZE, and reports 2 statements for `select 1; select 2`; a multi-statement `run()` executed an injected `DROP TABLE` |
 | SQL assets | dependency extraction through CTEs, subqueries, EXISTS, UNION and 3-part names; quoted file paths appear as BASE_TABLE; `query_table()`/`query()` hide their tables; dynamic PIVOT fails to serialize and prepare, while PIVOT with an IN list works; `prepare()` yields output columns; the AST fingerprint (without `query_location`, lowercased names) is stable across formatting and case |
@@ -2370,6 +2482,8 @@ All spikes ran on macOS arm64 with `@duckdb/node-api` 1.5.5-r.5 (DuckDB 1.5.5), 
 | Staging names | `read_json` matched keys case-sensitively (`ID` loaded NULL into `Id`), failed with "Duplicate struct entry name" for `Id` + `id`, and rejected an empty key |
 | CSV header | a header-less all-text CSV lost its first data row, with or without `all_varchar`; numeric files were detected correctly |
 | Secrets | `bun --no-env-file` disables `.env` loading (default loading read `.env` from the working directory) |
+| Server handoff | a read-only server that closed its instance on seeing `.croft/write-intent` let a writer in within 10–23 ms (5 writes) while answering 2,226 queries in 6 s |
+| Serve handoff hazards | an instance closed with an idle connection kept the lock (20 s); disconnecting before an interrupted query settled kept it indefinitely, and the promise never settled; interrupt, then await, then disconnect, then close let a writer in within about 20 ms; one shared intent file locked out a second writer 3 of 3 times, and per-holder files let it in after 505–615 ms; macOS `fs.watch` missed short-lived files (0 of 100 seen at 0–1 ms hold); a reopened read-only instance saw commits, including WAL-only ones after a writer's kill -9 |
 | Throughput | a 200k-row batch merged into a 2M-row, 20-column table in 327 ms including checks |
 | Storage | 30 hourly full rewrites doubled a 9.8 MB file to 19.3 MB; 10% merges stayed at 9.5 MB; the sandbox blocks `read_text('.env')` and https; spilling works under the sandbox; Unicode identifiers work unquoted |
 
