@@ -113,7 +113,7 @@ export function isOpen(database: string): boolean {
 export async function directQuery(project: Project, req: SelectRequest, timings: DirectTimings = DEFAULT_TIMINGS): Promise<Row[]> {
   const inproc = inProcessWarehouse(project.paths.database);
   if (inproc) {
-    return inproc.read((db) => runSelect(db.connection, req, { timezone: project.timezone, profile: "query" }), { purpose: "@zabaca/croft/read" });
+    return inproc.read((db) => runSelect(db.connection, req, { timezone: project.timezone, profile: "query", protect: [project.paths.stateDir] }), { purpose: "@zabaca/croft/read" });
   }
   const path = canonicalPath(project.paths.database);
   const spec: SandboxSpec = { profile: "query", timezone: project.timezone, root: project.root };
@@ -126,7 +126,7 @@ export async function directQuery(project: Project, req: SelectRequest, timings:
       await checkFormat(sqlOn(conn, project.timezone));
       formatChecked.add(path);
     }
-    return await runSelect(conn, req, { timezone: project.timezone, profile: "query" });
+    return await runSelect(conn, req, { timezone: project.timezone, profile: "query", protect: [project.paths.stateDir] });
   } finally {
     conn?.disconnectSync();
     release(path);

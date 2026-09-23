@@ -11,7 +11,7 @@
 //   transaction's TxGuard throws DDL_AFTER_DML at an ALTER that follows DML on the same table.
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, extname, join } from "node:path";
 import { type DuckDBConnection, type DuckDBInstance, type DuckDBResultReader, type DuckDBValue, StatementType,
   blobValue, listValue } from "@duckdb/node-api";
 import { CroftError } from "../core/errors.ts";
@@ -189,7 +189,8 @@ export class DuckWarehouse implements Warehouse {
     const run = async () =>
       this.lease("write", o?.waitMs, async (conn) => {
         if (o?.transaction === false) return fn(new LeaseSql(conn, this.renderCtx(), null));
-        const tx = new LeaseSql(conn, this.renderCtx(), new TxGuard());
+        // DuckDB names a file database after its stem, so `warehouse.t` means main.t in warehouse.duckdb.
+        const tx = new LeaseSql(conn, this.renderCtx(), new TxGuard({ database: basename(this.path, extname(this.path)) }));
         await conn.run("BEGIN TRANSACTION");
         try {
           const result = await fn(tx);

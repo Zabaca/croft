@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import type { DuckDBConnection, DuckDBInstance } from "@duckdb/node-api";
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
@@ -538,5 +538,24 @@ describe("handoff with an intent-honoring reader", () => {
     expect(bReleased).toBeGreaterThan(bAcquired);
     expect(await reader.count()).toBe(3);
     await reader.stop();
+  });
+});
+
+describe("DDL_AFTER_DML with a catalog-qualified name", () => {
+  test("DELETE on warehouse.t then ALTER t is caught at the ALTER", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "croft-catalog-"));
+    const stateDir = join(dir, ".croft");
+    const w = openWarehouse({ path: join(dir, "warehouse.duckdb"), mode: "read_write", timezone: "UTC", root: dir, stateDir, isTTY: false, register: false });
+    try {
+      await w.write("setup", async (tx) => { await tx.exec("CREATE TABLE t (a INTEGER)"); await tx.exec("INSERT INTO t VALUES (1)"); }, { runId: "r_setup" });
+      const err = await w.write("x", async (tx) => {
+        await tx.exec("DELETE FROM warehouse.t WHERE a = 1");
+        await tx.exec("ALTER TABLE t ADD COLUMN b VARCHAR");
+      }, { runId: "r_x" }).then(() => null, (e) => e);
+      expect(err?.code).toBe("DDL_AFTER_DML");
+    } finally {
+      await w.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

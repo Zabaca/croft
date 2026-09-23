@@ -11,7 +11,8 @@
 //   different config for a cached path; ":memory:" is never shared.
 // - A closed and reopened instance comes back unconfigured, so configuration is checked per connection.
 import { DuckDBConnection, DuckDBInstance } from "@duckdb/node-api";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
+import { physicalPath } from "../project/root.ts";
 import { basename, dirname, join, resolve } from "node:path";
 import { CroftError } from "../core/errors.ts";
 
@@ -40,16 +41,34 @@ export function instanceConfig(mode: AccessMode): Record<string, string> {
 }
 
 /**
- * Canonical path for a file that may not exist yet: realpath of the nearest existing ancestor. The native
- * realpath also returns the on-disk case on case-insensitive file systems (APFS), so case variants of a
- * path map to one key, as they do in DuckDB's instance cache.
+ * Canonical path for a file that may not exist yet, found WITHOUT opening the file. Bun's realpath opens
+ * its argument (open + F_GETPATH on macOS), and closing that descriptor releases this process's DuckDB
+ * lock on the warehouse (DESIGN.md §5, hazard 3). So symlinks are resolved with lstat/readlink
+ * (physicalPath), only the parent DIRECTORY goes through the native realpath (a directory descriptor holds
+ * no lock on the file), and the final component's on-disk spelling comes from readdir, so case variants on
+ * a case-insensitive file system (APFS) still map to one key, as they do in DuckDB's instance cache.
  */
 export function canonicalPath(path: string): string {
-  const abs = resolve(path);
-  if (existsSync(abs)) return realpathSync.native(abs);
-  const parent = dirname(abs);
-  if (parent === abs) return abs;
-  return join(canonicalPath(parent), basename(abs));
+  const { path: phys, exists } = physicalPath(resolve(path));
+  const parent = dirname(phys);
+  if (parent === phys) return phys;
+  const base = basename(phys);
+  const realParent = isDirectory(parent) ? realpathSync.native(parent) : canonicalPath(parent);
+  if (!exists) return join(realParent, base);
+  return join(realParent, onDiskName(realParent, base));
+}
+
+function isDirectory(p: string): boolean {
+  try { return lstatSync(p).isDirectory(); } catch { return false; }
+}
+
+/** The directory entry's own spelling of `name` (exact match first, then case- and normalization-insensitive). */
+function onDiskName(dir: string, name: string): string {
+  let entries: string[];
+  try { entries = readdirSync(dir); } catch { return name; }
+  if (entries.includes(name)) return name;
+  const key = (s: string) => s.normalize("NFC").toLowerCase();
+  return entries.find((e) => key(e) === key(name)) ?? name;
 }
 
 /** The directories a profile may touch. DuckDB adds the database's own `<db>.tmp/` spill dir itself. */

@@ -260,3 +260,37 @@ test("lockConflict parses DuckDB's lock error", () => {
   expect(lockConflict(new Error('Conflicting lock is held in /opt/homebrew/bin/duckdb (PID 812)'))).toEqual({ path: null, program: "/opt/homebrew/bin/duckdb", pid: 812 });
   expect(lockConflict(new Error("Catalog Error: nope"))).toBeNull();
 });
+
+// Regression (phase-1 fix wave): Bun's realpath opens its argument, and closing that descriptor released
+// this process's DuckDB lock, letting another process open the warehouse read-write mid-transaction.
+describe("canonicalPath never opens the warehouse file", () => {
+  test("a held write lease stays exclusive after canonicalPath(db)", async () => {
+    const { closeAllWarehouses, openWarehouse } = await import("./warehouse.ts");
+    const { cleanup, makeProject, seed, spawnHolder } = await import("../read/testkit.ts");
+    try {
+      const p = await makeProject({ seed: ["CREATE TABLE t AS SELECT 1 AS a"] });
+      await seed(p.database, ["CHECKPOINT"]);
+      const w = openWarehouse({ path: p.database, mode: "read_write", timezone: "UTC", root: p.root, stateDir: p.stateDir, isTTY: false, register: false });
+      let other = "";
+      try {
+        await w.write("t", async (tx) => {
+          await tx.exec("INSERT INTO t VALUES (5)");
+          canonicalPath(p.database);
+          canonicalPath(p.database.toUpperCase());
+          const holder = spawnHolder(p.database, 0, "INSERT INTO t VALUES (999)");
+          other = await Promise.race([
+            holder.exited.then((c: unknown) => `blocked (exit ${c})`),
+            holder.waitFor("held", 15_000).then(() => "OPENED"),
+          ]);
+          holder.proc.kill("SIGKILL");
+        }, { runId: "r_0101_0000_aaaa" });
+      } finally {
+        await w.close();
+      }
+      expect(other).toStartWith("blocked");
+    } finally {
+      await closeAllWarehouses();
+      cleanup();
+    }
+  }, 30_000);
+});
