@@ -4,10 +4,13 @@ import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmS
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError, problem } from "../core/errors.ts";
-import { bootId } from "../core/proc.ts";
-import { logDir } from "../history/logs.ts";
+import { bootId, currentIdentity, procStart } from "../core/proc.ts";
+import { logDir, processLogPath } from "../history/logs.ts";
 import { RunsDb } from "../history/runs-db.ts";
-import { finishedSteps, followRun, lastProgress, parseWait, runningSummary, spawnDetachedRun, summaryFromRecords } from "./detach.ts";
+import {
+  finishedSteps, followRun, lastProgress, parseWait, readChildRecord, runningSummary, spawnDetachedRun, summaryFromRecords,
+  writeChildRecord,
+} from "./detach.ts";
 import { croftError, isRetryable, StepProgress } from "./ingest.ts";
 import { eventsPath, EventLog, jsonSafe } from "./runner.ts";
 
@@ -91,9 +94,79 @@ describe("followRun", () => {
     const none = await followRun({ stateDir: s, runId: "r_0101_0000_abcd", timeoutMs: 50, pollMs: 10 });
     expect(none).toMatchObject({ kind: "not_started", problem: { code: "USAGE_ERROR" } });
     mkdirSync(logDir(s, "r_0101_0000_efgh"), { recursive: true });
-    writeFileSync(join(logDir(s, "r_0101_0000_efgh"), "process.log"), "");
+    writeFileSync(processLogPath(s, "r_0101_0000_efgh"), "");
     const starting = await followRun({ stateDir: s, runId: "r_0101_0000_efgh", timeoutMs: 50, pollMs: 10 });
     expect(starting).toMatchObject({ kind: "running", summary: { exit: 6 } });
+  });
+
+  test("the child's own output goes to _process.log, which no asset's log can be (names cannot start with _)", () => {
+    const s = stateDir();
+    expect(processLogPath(s, "r_0101_0000_abcd")).toBe(join(logDir(s, "r_0101_0000_abcd"), "_process.log"));
+  });
+
+  test("the parent records the child's pid, start time and boot id at spawn (the handshake)", async () => {
+    const s = stateDir();
+    const script = join(s, "wait.ts");
+    writeFileSync(script, `await Bun.sleep(200);\n`);
+    const spawned = spawnDetachedRun({ root: s, stateDir: s, args: ["x"], runId: "r_0101_0000_hand", env: { PATH: process.env.PATH }, entry: script });
+    expect(spawned.output).toBe(processLogPath(s, "r_0101_0000_hand"));
+    const rec = readChildRecord(s, "r_0101_0000_hand");
+    expect(rec).toMatchObject({ pid: spawned.pid, procStart: procStart(spawned.pid)!, bootId: bootId() });
+    await spawned.exited;
+  });
+
+  // `croft wait` for a run whose detached child died before it created the run record (kill -9, OOM, reboot
+  // during a slow import) used to report "running" forever while status showed nothing running.
+  test("wait: a child that died before recording its run is crashed, not running forever", async () => {
+    const s = stateDir();
+    const child = spawnSync(process.execPath, ["-e", "0"]);
+    writeChildRecord(s, "r_0101_0000_gone", { pid: child.pid!, procStart: "1", bootId: bootId() });
+    writeFileSync(processLogPath(s, "r_0101_0000_gone"), "loading assets…\n");
+    const res = await followRun({ stateDir: s, runId: "r_0101_0000_gone", timeoutMs: 3000, pollMs: 10 });
+    expect(res.kind).toBe("finished");
+    if (res.kind === "finished") {
+      expect(res.summary).toMatchObject({ exit: 1, ok: false, data: { runId: "r_0101_0000_gone", status: "crashed", steps: [] } });
+      expect(res.summary.problems[0]).toMatchObject({ code: "RUN_CRASHED", runId: "r_0101_0000_gone" });
+      expect(res.summary.problems[0]!.message).toContain(`pid ${child.pid}`);
+    }
+  });
+
+  test("wait: a child that is still alive without a run record is still starting", async () => {
+    const s = stateDir();
+    writeChildRecord(s, "r_0101_0000_live", currentIdentity());
+    const res = await followRun({ stateDir: s, runId: "r_0101_0000_live", timeoutMs: 100, pollMs: 10 });
+    expect(res).toMatchObject({ kind: "running", summary: { exit: 6, data: { status: "running" } } });
+  });
+
+  test("a child that refused to start reports its own problem (parent and wait alike)", async () => {
+    const s = stateDir();
+    const p = problem("BACKFILL_WOULD_DUPLICATE", { message: "events appends rows", hint: "add a key", asset: "events" });
+    const script = join(s, "refuse.ts");
+    writeFileSync(script, `
+      import { writeNotStarted } from ${JSON.stringify(join(import.meta.dir, "detach.ts"))};
+      writeNotStarted(${JSON.stringify(s)}, "r_0101_0000_refu", ${JSON.stringify(p)});
+      process.exit(2);
+    `);
+    const spawned = spawnDetachedRun({ root: s, stateDir: s, args: [], runId: "r_0101_0000_refu", env: { PATH: process.env.PATH }, entry: script });
+    const res = await followRun({ stateDir: s, runId: "r_0101_0000_refu", timeoutMs: 10_000, pollMs: 20, spawned });
+    expect(res).toMatchObject({ kind: "not_started", problem: { code: "BACKFILL_WOULD_DUPLICATE", message: "events appends rows", runId: "r_0101_0000_refu" } });
+    const later = await followRun({ stateDir: s, runId: "r_0101_0000_refu", timeoutMs: 3000, pollMs: 10 });
+    expect(later).toMatchObject({ kind: "not_started", problem: { code: "BACKFILL_WOULD_DUPLICATE" } });
+  });
+
+  test("a live run recorded with an empty boot id is followed, not marked crashed", async () => {
+    const s = stateDir();
+    const db = RunsDb.open(s);
+    const run = db.createRun({ trigger: "manual", human: true, argv: ["run"], identity: { ...currentIdentity(), bootId: "" } });
+    db.close();
+    const res = await followRun({ stateDir: s, runId: run.id, timeoutMs: 1500, pollMs: 20 });
+    expect(res.kind).toBe("running");
+    const again = RunsDb.open(s);
+    try {
+      expect(again.getRun(run.id)?.status).toBe("running");
+    } finally {
+      again.close();
+    }
   });
 
   test("a detached child that dies before recording its run is reported with its output", async () => {
@@ -154,12 +227,28 @@ describe("step helpers", () => {
     p.addRows(3);
     p.request({ status: 200, body: "[]", label: "GET x" });
     expect(seen).toEqual(["extract:2"]);
-    await Bun.sleep(60);
+    // What changed inside the window is reported when it ends.
+    await Bun.sleep(80);
+    expect(seen).toEqual(["extract:2", "extract:5"]);
     p.addRows(1);
     p.setPhase("write");
-    expect(seen).toEqual(["extract:2", "extract:6", "write:6"]);
+    expect(seen).toEqual(["extract:2", "extract:5", "write:6"]);
+    await Bun.sleep(80);
+    expect(seen).toEqual(["extract:2", "extract:5", "write:6"]);   // the forced report replaced the pending one
     expect(p.paused).toBe(true);
     expect(p.extractInfo()).toEqual({ requests: 1, lastStatus: 200, bodyPreview: "[]" });
+  });
+
+  test("StepProgress reports at most every 500 ms by default, and nothing after close()", async () => {
+    const seen: number[] = [];
+    const p = new StepProgress("a", (s) => seen.push(s.rowsFetched));
+    p.addRows(1);
+    p.addRows(1);
+    expect(seen).toEqual([1]);
+    p.close();
+    await Bun.sleep(600);
+    p.addRows(1);
+    expect(seen).toEqual([1]);
   });
 
   test("jsonSafe turns bigint into numbers or exact text", () => {

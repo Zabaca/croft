@@ -194,10 +194,10 @@ describe("edges: reported bugs", () => {
     expect(r.json.data.rows[0].n).toBe(120);
   }, 60_000);
 
-  // BUG (reported): `croft run order` with assets/order.ts present says "there is no asset named order" (and lists
-  // the other assets) instead of NAME_RESERVED with the rename fix; only a bare `croft run` or `croft status`
-  // reports the real reason. An agent that just wrote the file is told it does not exist. Flip to test() once fixed.
-  bugTest("running an asset whose file name is reserved reports NAME_RESERVED, not 'no asset named'", async () => {
+  // Fixed: `croft run order` with assets/order.ts present said "there is no asset named order" (and listed the
+  // other assets) instead of NAME_RESERVED with the rename fix, so an agent that had just written the file was
+  // told it did not exist. A selector naming a file discovery refused now reports that file's own problem.
+  test("running an asset whose file name is reserved reports NAME_RESERVED, not 'no asset named'", async () => {
     api.route("/orders", () => json([{ id: 1 }]));
     const { project: p } = await initProject();
     p.write("assets/order.ts", `import { ingest } from "@zabaca/croft";

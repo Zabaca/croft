@@ -16,13 +16,14 @@
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { CODES, CroftError, isCode, problem } from "../core/errors.ts";
+import { captureOutput, type OutputSink, writeStderr } from "../core/output.ts";
 import type { Confirmation, CursorType, Impact, Problem, SchemaChange, Sql, StepResult } from "../core/types.ts";
 import { now as clockNow } from "../core/time.ts";
 import type { FileIngest, IngestContext, Row, RowSource, RowsIngest } from "../types.ts";
 import { canonicalPath } from "../db/connect.ts";
 import { hasState } from "../db/state.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
-import { putCatalog, getCatalog, type CatalogAsset, type CatalogColumn } from "../history/catalog.ts";
+import { type CatalogAsset, type CatalogBase, getCatalog, putCatalog, readCatalogEntry } from "../history/catalog.ts";
 import type { LogWriter } from "../history/logs.ts";
 import type { RunsDb } from "../history/runs-db.ts";
 import { createHttp, displayUrl, excerpt, type HttpClient, type HttpOptions } from "../http/http.ts";
@@ -55,9 +56,14 @@ export interface ProgressSnapshot {
   elapsedMs: number;
 }
 
+/** Progress snapshots (events.ndjson, runs.summary.progress) are reported at most this often per step. */
+export const PROGRESS_THROTTLE_MS = 500;
+
 /**
  * What a step has done so far: rows yielded, requests completed, the phase. The runner's no-progress
- * watchdog reads lastAt; the run's --events and `croft wait` show snapshots.
+ * watchdog reads lastAt; the run's --events, `croft wait`, and `status` (through runs.summary) show snapshots.
+ * Reports are throttled, and a change inside a throttle window is reported at the window's end, so the last
+ * snapshot is never more than one window behind. close() drops a pending report.
  */
 export class StepProgress {
   phase: Phase = "extract";
@@ -71,8 +77,11 @@ export class StepProgress {
   bodyPreview?: string;
   lastRequest?: string;
   #emittedAt = 0;
+  #pending: ReturnType<typeof setTimeout> | null = null;
+  #closed = false;
 
-  constructor(readonly asset: string, private readonly onChange?: (p: ProgressSnapshot) => void, private readonly throttleMs = 1000) {}
+  constructor(readonly asset: string, private readonly onChange?: (p: ProgressSnapshot) => void,
+    private readonly throttleMs = PROGRESS_THROTTLE_MS) {}
 
   touch(): void {
     this.lastAt = Date.now();
@@ -111,11 +120,30 @@ export class StepProgress {
     };
   }
 
+  /** The step ended: no further reports. */
+  close(): void {
+    this.#closed = true;
+    if (this.#pending) clearTimeout(this.#pending);
+    this.#pending = null;
+  }
+
   private emit(force: boolean): void {
-    if (!this.onChange) return;
-    const t = Date.now();
-    if (!force && t - this.#emittedAt < this.throttleMs) return;
-    this.#emittedAt = t;
+    if (!this.onChange || this.#closed) return;
+    const wait = this.throttleMs - (Date.now() - this.#emittedAt);
+    if (!force && wait > 0) {
+      // Report the latest state when the window ends.
+      if (!this.#pending) {
+        this.#pending = setTimeout(() => {
+          this.#pending = null;
+          this.emit(true);
+        }, wait);
+        (this.#pending as { unref?: () => void }).unref?.();
+      }
+      return;
+    }
+    if (this.#pending) clearTimeout(this.#pending);
+    this.#pending = null;
+    this.#emittedAt = Date.now();
     this.onChange(this.snapshot());
   }
 }
@@ -329,13 +357,35 @@ async function readState(warehouse: DuckWarehouse, asset: string, withFiles: boo
   }, { purpose: `read the state of ${asset}`, signal });
 }
 
+/** Saved cursors of these assets, under one short read lease (the --from check before a run starts). */
+export async function savedCursors(warehouse: DuckWarehouse, assets: readonly string[], signal?: AbortSignal): Promise<Map<string, SavedCursor>> {
+  const out = new Map<string, SavedCursor>();
+  if (assets.length === 0) return out;
+  await warehouse.read(async (db) => {
+    if (!(await hasState(db))) return;
+    const rows = await db.all<{ name: string; cursor_value: string | null; cursor_type: string | null }>(
+      `SELECT name, cursor_value, cursor_type FROM _croft.assets WHERE name IN (${assets.map((_, n) => `$${n + 1}`).join(", ")})`, [...assets]);
+    for (const r of rows) out.set(r.name, { value: r.cursor_value, type: r.cursor_type as CursorType | null });
+  }, { purpose: "read saved cursors for --from", ...(signal ? { signal } : {}) });
+  return out;
+}
+
 function toKnown(stored: Awaited<ReturnType<typeof readStoredColumns>>): KnownColumn[] {
   return stored.map((c) => ({
     name: c.name, type: c.type, sourceName: c.source_name, format: c.format, pinned: c.pinned, pending: c.pending, kinds: c.kinds,
   }));
 }
 
-interface Since { value?: string | number; echo?: string }
+interface Since {
+  value?: string | number;
+  echo?: string;
+  /** --from after the saved cursor (merge ingests): the write keeps the cursor here, so the rows between it and
+   *  --from are fetched by the next run instead of skipped (§8). */
+  holdCursor?: string;
+}
+
+/** A saved cursor, as _croft.assets has it. */
+export interface SavedCursor { value: string | null; type: CursorType | null }
 
 /** The cursor type for converting --from before the first load fixed it: a pin, else the unit, else a timestamp. */
 function guessCursorType(step: PlannedStep, field: string, unit: "s" | "ms" | undefined): CursorType {
@@ -354,26 +404,50 @@ function compareCursor(a: string | number, b: string, type: CursorType): number 
   return x < b ? -1 : x > b ? 1 : 0;
 }
 
+/**
+ * What `--from` means for one step (§8 "Backfills"), given its saved cursor. Throws what makes it refuse:
+ * BACKFILL_UNSUPPORTED (not a cursor ingest), BACKFILL_WOULD_DUPLICATE (an append ingest with a saved position:
+ * a --from at or before it stores rows twice, one after it skips the rows in between), or USAGE_ERROR (a
+ * --from that does not parse). A merge ingest's --from after its saved cursor holds the cursor where it is.
+ * The runner calls this before the run starts, so a refusal is never a failed step.
+ */
+export function fromSince(step: PlannedStep, from: string, saved: SavedCursor, o: { timezone: string; now: Date }): Since {
+  const unsupported = backfillUnsupported(step);
+  if (unsupported) throw unsupported;
+  const inc = step.incremental;
+  if (inc.kind !== "cursor") return {};
+  const type = saved.type ?? guessCursorType(step, inc.field, inc.unit);
+  const conv = parseFrom(from, {
+    type, ...(inc.unit ? { unit: inc.unit } : {}), timezone: o.timezone, now: o.now, template: saved.value, asset: step.asset,
+  });
+  const echo = `since: ${conv.since}${conv.instant && String(conv.since) !== conv.instant ? ` (${conv.instant})` : ""}`;
+  if (saved.value === null) return { value: conv.since, echo };
+  const after = compareCursor(conv.since, saved.value, type) > 0;
+  if (step.write === "append") {
+    throw after ? backfillWouldSkip(step, conv.since, saved.value) : backfillWouldDuplicate(step, conv.since, saved.value);
+  }
+  return { value: conv.since, echo, ...(after ? { holdCursor: saved.value } : {}) };
+}
+
+/** BACKFILL_WOULD_DUPLICATE for an append ingest's --from after its saved cursor: moving the cursor past the
+ *  rows in between would lose them, and keeping it would append the rows after --from a second time. */
+export function backfillWouldSkip(step: PlannedStep, since: string | number, saved: string): CroftError {
+  return new CroftError("BACKFILL_WOULD_DUPLICATE", {
+    asset: step.asset, file: step.file,
+    message: `${step.asset} appends rows; --from ${since} is after its saved position ${saved}, so the rows in between would never be fetched, and keeping the saved position would store the rows after ${since} twice`,
+    hint: `run it without --from, which continues from the saved position (croft run ${step.asset}); to re-read a window, add a key so re-read rows replace their old versions`,
+    fix: { kind: "command", description: "continue from the saved position", command: `croft run ${step.asset}` },
+    details: { since, saved },
+  });
+}
+
 function sinceFor(i: IngestInput, state: IngestState): Since {
   const { step } = i;
   const inc = step.incremental;
   if (i.from !== undefined) {
-    const unsupported = backfillUnsupported(step);
-    if (unsupported) throw unsupported;
+    return fromSince(step, i.from, { value: state.cursorValue, type: state.cursorType }, { timezone: i.project.timezone, now: (i.now ?? clockNow)() });
   }
   if (inc.kind !== "cursor") return {};
-  if (i.from !== undefined) {
-    const type = state.cursorType ?? guessCursorType(step, inc.field, inc.unit);
-    const conv = parseFrom(i.from, {
-      type, ...(inc.unit ? { unit: inc.unit } : {}), timezone: i.project.timezone, now: (i.now ?? clockNow)(),
-      template: state.cursorValue, asset: step.asset,
-    });
-    if (step.write === "append" && state.cursorValue !== null && compareCursor(conv.since, state.cursorValue, type) <= 0) {
-      throw backfillWouldDuplicate(step, conv.since, state.cursorValue);
-    }
-    const echo = `since: ${conv.since}${conv.instant && String(conv.since) !== conv.instant ? ` (${conv.instant})` : ""}`;
-    return { value: conv.since, echo };
-  }
   if (state.cursorValue === null || state.cursorType === null) return {};
   return {
     value: renderSince(state.cursorValue, {
@@ -398,34 +472,43 @@ async function jsonKeys(tx: Sql, batch: TypedBatch, previous: CatalogAsset | nul
   return out;
 }
 
+/** The catalog base of a planned ingest: what its definition says. */
+function catalogBase(step: PlannedStep, o: { runId: string | null; keys?: Record<string, string[]>; filesGone?: string[] }): CatalogBase {
+  const inc = step.incremental;
+  return {
+    asset: step.asset, kind: "ingest", behavior: step.words, write: step.write, key: step.key,
+    cursorField: inc.kind === "cursor" ? inc.field : null, unit: inc.kind === "cursor" ? inc.unit ?? null : null,
+    codeHash: step.codeHash ?? null, lastRunId: o.runId, ...(o.keys ? { jsonKeys: o.keys } : {}),
+    ...(o.filesGone?.length ? { filesGone: o.filesGone } : {}),
+  };
+}
+
 /** The catalog mirror entry, read inside the write transaction so it matches what commits. */
 async function readCatalog(tx: Sql, step: PlannedStep, o: { runId: string; keys: Record<string, string[]>; filesGone?: string[] }): Promise<CatalogAsset> {
-  const [a] = await tx.all<Record<string, unknown>>(
-    `SELECT kind, write_mode, key_columns, cursor_value, cursor_type, cursor_unit, epoch_us(last_loaded_at) AS ll,
-       epoch_us(last_replaced_at) AS lr, row_count, code_hash FROM _croft.assets WHERE name = $1`, [step.asset]);
-  const stored = await readStoredColumns(tx, step.asset);
-  const real = (await readTableSchema(tx, step.asset)) ?? [];
-  const columns: CatalogColumn[] = real.map((c) => {
-    const s = stored.find((x) => x.name.toLowerCase() === c.name.toLowerCase());
-    const col: CatalogColumn = {
-      name: c.name, type: c.type, sourceName: s?.source_name ?? null, pinned: s?.pinned === true, pending: s?.pending === true,
-      format: s?.format ?? null,
-    };
-    if (o.keys[c.name]) col.jsonKeys = o.keys[c.name];
-    return col;
-  });
-  const us = (v: unknown) => (v === null || v === undefined ? null : isoMicros(BigInt(v as number | bigint)));
-  const inc = step.incremental;
-  const entry: CatalogAsset = {
-    asset: step.asset, kind: "ingest", behavior: step.words, write: step.write, key: step.key,
-    rows: Number(a?.row_count ?? 0), columns,
-    cursor: inc.kind === "cursor"
-      ? { field: inc.field, value: (a?.cursor_value as string | null) ?? null, type: (a?.cursor_type as CursorType | null) ?? null, unit: (a?.cursor_unit as "s" | "ms" | null) ?? inc.unit ?? null }
-      : null,
-    lastLoadedAt: us(a?.ll), lastReplacedAt: us(a?.lr), lastRunId: o.runId, codeHash: (a?.code_hash as string | null) ?? step.codeHash ?? null,
-  };
-  if (o.filesGone?.length) entry.filesGone = o.filesGone;
+  const entry = await readCatalogEntry(tx, catalogBase(step, o));
+  if (!entry) throw new CroftError("INTERNAL_ERROR", { asset: step.asset, message: `${step.asset} has no _croft record after its write`, hint: "report this croft bug" });
   return entry;
+}
+
+/**
+ * An unchanged file step still has news for the mirror: which files are gone (§3b: status says "1 file gone").
+ * The previous entry gets the current list; without one, the entry is rebuilt from the warehouse.
+ */
+async function refreshFilesGone(i: IngestInput, gone: string[]): Promise<CatalogAsset | undefined> {
+  const { runs, step } = i;
+  const prev = getCatalog(runs, step.asset);
+  let next: CatalogAsset | null;
+  if (prev) {
+    next = { ...prev };
+    if (gone.length) next.filesGone = gone;
+    else delete next.filesGone;
+    if (JSON.stringify(prev.filesGone ?? []) === JSON.stringify(gone)) return prev;
+  } else {
+    next = await i.warehouse.read((sql) => readCatalogEntry(sql, catalogBase(step, { runId: null, filesGone: gone })),
+      { purpose: `read the state of ${step.asset}`, signal: i.signal });
+  }
+  if (next) putCatalog(runs, next, "run");
+  return next ?? undefined;
 }
 
 /** StepResult.created for a table this step created: its columns (croft's _loaded_at aside) and JSON ones. */
@@ -460,7 +543,10 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
   const state = await readState(warehouse, asset, isFile, signal);
   // 2. since.
   const since = sinceFor(i, state);
-  if (since.echo) log.write(`--from ${i.from}: ${since.echo}`);
+  const held = since.holdCursor !== undefined
+    ? `the saved position stays at ${since.holdCursor} (--from is after it), so the next run also fetches the rows in between`
+    : undefined;
+  if (since.echo) log.write(`--from ${i.from}: ${since.echo}${held ? `; ${held}` : ""}`);
   else if (since.value !== undefined) log.write(`since: ${since.value}`);
 
   // 3. Extract, with no database lock.
@@ -470,13 +556,20 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
   const own = new OwnTableQuery({ warehouse, asset, dir: stageDir, stateDir, timezone: project.timezone, signal });
   let manifest: Awaited<ReturnType<typeof writeStage>> | null = null;
   let files: FileExtract | null = null;
+  // rows() and map() print to the step log (redacted), never to croft's stdout (core/output.ts); a callback
+  // that outlives the step goes to stderr, redacted.
+  const output: OutputSink = { write: (text) => (log.closed ? writeStderr(i.env.redact(text)) : log.write(text)) };
   try {
-    if (isFile) {
-      files = await extractFiles({
-        asset, config: config as FileIngest, root: project.root, stateDir, runId, known: state.files, http, signal,
-        log: (...args: unknown[]) => log.log(...args),
-      });
-    } else {
+    ({ manifest, files } = await captureOutput(output, async (): Promise<{ manifest: typeof manifest; files: typeof files }> => {
+      if (isFile) {
+        return {
+          manifest: null,
+          files: await extractFiles({
+            asset, config: config as FileIngest, root: project.root, stateDir, runId, known: state.files, http, signal,
+            log: (...args: unknown[]) => log.log(...args),
+          }),
+        };
+      }
       const ctx: IngestContext = Object.freeze({
         asset, runId, preview: false, signal, http,
         ...(since.value !== undefined ? { since: since.value } : {}),
@@ -490,12 +583,15 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
       } catch (e) {
         throw codeError(e, step, project.root);
       }
-      manifest = await writeStage({
-        dir: stageDir, asset, runId, source: counted(source, progress) as RowSource,
-        knownColumns: state.known.map((c) => ({ name: c.name, sourceName: c.sourceName ?? null })),
-        signal, ...(since.value !== undefined ? { sinceUsed: since.value } : {}),
-      });
-    }
+      return {
+        files: null,
+        manifest: await writeStage({
+          dir: stageDir, asset, runId, source: counted(source, progress) as RowSource,
+          knownColumns: state.known.map((c) => ({ name: c.name, sourceName: c.sourceName ?? null })),
+          signal, ...(since.value !== undefined ? { sinceUsed: since.value } : {}),
+        }),
+      };
+    }));
   } catch (e) {
     if (signal.aborted) throw abortReason(signal, asset);
     const err = codeError(e, step, project.root);
@@ -510,15 +606,16 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
 
   const warnings: Problem[] = [...(files?.warnings ?? [])];
   const base = {
-    asset, reason: [step.reason, since.echo].filter(Boolean).join("; "), behavior: step.behavior,
+    asset, reason: [step.reason, since.echo, held].filter(Boolean).join("; "), behavior: step.behavior,
     attempt: i.attempt, maxAttempts: i.maxAttempts, schemaChanges: [] as SchemaChange[], checks: [],
     logsCommand: `croft logs ${asset}`, requests: progress.requests,
   };
   if (files?.unchanged) {
     rmSync(stageDir, { recursive: true, force: true });
+    const catalog = await refreshFilesGone(i, files.gone);
     return {
       result: { ...base, status: "unchanged", reason: `${base.reason}; files unchanged`, rows: emptyRows(state.rowCount ?? 0), durationMs: Date.now() - started },
-      warnings, problems: [],
+      warnings, problems: [], ...(catalog ? { catalog } : {}),
     };
   }
 
@@ -555,6 +652,13 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
         attempt: i.attempt, extract: progress.extractInfo(), ...(i.checks ? { checks: i.checks } : {}),
         ...(i.now ? { now: i.now() } : {}),
       });
+      // writeBatch saved greatest(saved, loaded). After a --from beyond the saved cursor that would jump over the
+      // rows in between, so the cursor goes back to where it was, in the same transaction (§8).
+      if (since.holdCursor !== undefined && res.cursor && res.cursor.after !== since.holdCursor) {
+        await tx.exec(`UPDATE _croft.assets SET cursor_value = $1 WHERE name = $2`, [since.holdCursor, asset]);
+        await tx.exec(`UPDATE _croft.writes SET cursor_after = $1 WHERE asset = $2 AND loaded_at = $3::TIMESTAMPTZ`, [since.holdCursor, asset, res.loadedAt]);
+        res.cursor = { ...res.cursor, after: since.holdCursor };
+      }
       if (files) await recordFiles(tx, asset, files, res.loadedAt);
       // Read-only, but inside the transaction: a failed statement would abort it, so these stay simple.
       const keys = await jsonKeys(tx, batch, previous);

@@ -3,7 +3,7 @@
 // before the step moves on: a crash loses nothing already logged, and `--follow` in another
 // process sees each line at once. Every line passes through the caller's redact function, which
 // is how `.env` values stay out of logs (§9).
-import { closeSync, fstatSync, mkdirSync, openSync, readSync, statSync, writeSync } from "node:fs";
+import { closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { formatWithOptions } from "node:util";
@@ -30,6 +30,37 @@ export function logDir(stateDir: string, runId: string): string {
 
 export function logPath(stateDir: string, runId: string, asset: string): string {
   return join(logDir(stateDir, runId), `${segment("asset name", asset)}.log`);
+}
+
+// A detached run's folder also holds files that are not step logs. Their names start with "_", which no asset
+// name can (§3 "Layout and naming"), so an asset called `process` cannot share its log with the child's output.
+/** The detached child's own stdout and stderr. */
+export const PROCESS_LOG = "_process.log";
+/** The spawn handshake: the child's pid, start time and boot id, written by the parent right after spawning. */
+export const PROCESS_RECORD = "_process.json";
+/** The problem of a detached child that refused to start (it never created its run record). */
+export const NOT_STARTED_RECORD = "_not_started.json";
+
+export function processLogPath(stateDir: string, runId: string): string {
+  return join(logDir(stateDir, runId), PROCESS_LOG);
+}
+
+/** Write one of a run folder's JSON records (atomically enough for a reader that polls: write, then rename). */
+export function writeRunRecord(stateDir: string, runId: string, name: string, value: unknown): void {
+  const dir = logDir(stateDir, runId);
+  mkdirSync(dir, { recursive: true });
+  const tmp = join(dir, `.${name}.${process.pid}.tmp`);
+  writeFileSync(tmp, `${JSON.stringify(value)}\n`);
+  renameSync(tmp, join(dir, name));
+}
+
+/** A run folder's JSON record, or null when it is missing or unreadable. */
+export function readRunRecord<T>(stateDir: string, runId: string, name: string): T | null {
+  try {
+    return JSON.parse(readFileSync(join(logDir(stateDir, runId), name), "utf8")) as T;
+  } catch {
+    return null;
+  }
 }
 
 export interface LogWriterOptions { redact?: Redact }
@@ -63,6 +94,10 @@ export class LogWriter {
     if (this.fd === null) return;
     closeSync(this.fd);
     this.fd = null;
+  }
+
+  get closed(): boolean {
+    return this.fd === null;
   }
 }
 

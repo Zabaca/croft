@@ -18,9 +18,11 @@ import { builtinModules } from "node:module";
 import { dirname, extname, isAbsolute, join, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { CroftError, problem, type Code, type ProblemInit } from "../core/errors.ts";
+import { guardImport } from "../core/output.ts";
 import type { CursorType, Incremental, Problem, WriteMode } from "../core/types.ts";
 import type { AssetDefinition } from "../types.ts";
 import { NAME_PATTERN, type DiscoveredAsset } from "./discover.ts";
+import { ProjectEnv } from "./env.ts";
 import { didYouMean } from "./suggest.ts";
 
 export interface TsProject {
@@ -130,10 +132,11 @@ export async function loadTsAsset(asset: Pick<DiscoveredAsset, "name" | "file" |
 
   if (graph.opensDatabase.length > 0) return finish();
 
-  // 3. Import in isolation.
+  // 3. Import in isolation. Top-level console output never reaches stdout (core/output.ts): a run keeps it for
+  //    the step log; other commands print it on stderr, redacted.
   let mod: Record<string, unknown>;
   try {
-    mod = await importIsolated(path, o.importTimeoutMs ?? IMPORT_TIMEOUT_MS);
+    mod = await guardImport(file, () => (t) => ProjectEnv.load(root, {}).redact(t), () => importIsolated(path, o.importTimeoutMs ?? IMPORT_TIMEOUT_MS));
   } catch (e) {
     out.problems.push(importProblem(e, name, file, root, o.importTimeoutMs ?? IMPORT_TIMEOUT_MS));
     return finish();

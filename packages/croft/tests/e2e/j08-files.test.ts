@@ -94,10 +94,10 @@ test("journey 8: file glob, incremental: new file only, extra column added, chan
   expect((await p.rows("select count(*) n from sales where _file = 'files/sales/2026-02.csv'"))[0]!.n).toBe(3);
 }, 120_000);
 
-// BUG (reported): when the only change is a deleted file, the step returns "unchanged" before the catalog
-// mirror is refreshed, so `status` (which reads the mirror) never lists the gone file; DESIGN §3b says rows of a
-// deleted file are kept "and status says '2 files gone'". Flip to test() once fixed.
-bugTest("journey 8b: after a file is deleted, status lists it as gone", async () => {
+// Fixed: when the only change is a deleted file, the step is "unchanged", and it now still records the gone files
+// in the catalog mirror, which `status` reads; DESIGN §3b says rows of a deleted file are kept "and status says
+// '2 files gone'".
+test("journey 8b: after a file is deleted, status lists it as gone", async () => {
   expect(shared).toBeDefined();
   const st = await shared!.json(["status"]);
   const sa = st.json.data.assets.find((a: { asset: string }) => a.asset === "sales");

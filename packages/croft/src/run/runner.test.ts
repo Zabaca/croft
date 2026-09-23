@@ -2,7 +2,7 @@
 // shrink guard, big integers, type drift, cursors, --from, ctx.query, the catalog mirror and leases.
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DuckDBInstance } from "@duckdb/node-api";
 import { closeAllWarehouses } from "../db/warehouse.ts";
@@ -11,7 +11,7 @@ import { acquire } from "../history/leases.ts";
 import { logPath } from "../history/logs.ts";
 import { RunsDb } from "../history/runs-db.ts";
 import { listTrash } from "../safety/trash.ts";
-import { cleanupProjects, keysetIssues, linkItems, makeProject, mockApi, runIn, simpleGet, slowPages } from "./testkit.ts";
+import { cleanupProjects, cli, keysetIssues, linkItems, makeProject, mockApi, runIn, simpleGet, slowPages } from "./testkit.ts";
 
 const api = mockApi();
 afterAll(async () => {
@@ -166,6 +166,53 @@ export default ingest({ async *rows() { yield [{ id: 1 }]; throw new TypeError("
     expect(out.data.steps[0]!.error?.code).toBe("ASSET_CODE_ERROR");
     expect(out.data.steps[0]!.error?.message).toContain("boom at page 2");
     expect(out.next).toContainEqual({ command: "croft logs broken --failed", reason: "see why broken failed" });
+  });
+
+  // §3a: a Retry-After longer than ctx.http waits inside a run fails the request with retryAfterMs "so the runner
+  // can schedule the retry": the next attempt waits max(its own delay, retryAfterMs).
+  test("the next attempt waits for the server's Retry-After, not only the fixed delay", async () => {
+    api.state.limited = 1;
+    api.state.retryAfter = "1";
+    try {
+      const root = makeProject({ "assets/limited.ts": simpleGet(api.url, "/limited") });
+      const retries: Record<string, unknown>[] = [];
+      const t0 = Date.now();
+      const out = await runIn(root, ["limited"], {
+        http: { retryBaseMs: 5, maxRetryAfterMs: 100 }, onEvent: (_l, e) => void (e.type === "retry" && retries.push(e)),
+      });
+      expect(out.exit).toBe(0);
+      expect(out.data.steps[0]).toMatchObject({ status: "ok", attempt: 2 });
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(950);
+      expect(retries).toHaveLength(1);
+      const planned = Date.parse(String(retries[0]!.nextRetryAt)) - Date.parse(String(retries[0]!.at));
+      expect(planned).toBeGreaterThanOrEqual(990);
+      expect(planned).toBeLessThan(1500);
+    } finally {
+      api.state.retryAfter = "1";
+      api.state.limited = 0;
+    }
+  });
+
+  test("a Retry-After beyond what a run waits for ends the step now, with nextRetryAt when the server allows", async () => {
+    api.state.limited = 5;
+    api.state.retryAfter = "3600";
+    try {
+      const root = makeProject({ "assets/limited.ts": simpleGet(api.url, "/limited") });
+      const t0 = Date.now();
+      const out = await runIn(root, ["limited"]);
+      expect(Date.now() - t0).toBeLessThan(5000);
+      expect(out.exit).toBe(1);
+      const s = out.data.steps[0]!;
+      expect(s).toMatchObject({ status: "failed", attempt: 1, maxAttempts: 3 });
+      expect(s.error).toMatchObject({ code: "HTTP_ERROR", details: { status: 429, retryAfterMs: 3_600_000 } });
+      const at = Date.parse(s.nextRetryAt!);
+      expect(Math.abs(at - (Date.now() + 3_600_000))).toBeLessThan(10_000);
+      expect(api.state.log.filter((l) => l.path === "/limited")).toHaveLength(1);
+      expect(out.next).toContainEqual({ command: "croft run limited", reason: `the API asks to wait; run it again after ${s.nextRetryAt}` });
+    } finally {
+      api.state.retryAfter = "1";
+      api.state.limited = 0;
+    }
   });
 
   test("retries: 0 in the asset means one attempt only", async () => {
@@ -367,28 +414,110 @@ export default ingest({
 });
 `,
     });
-    const replace = await runIn(root, ["zones"], { from: "2026-01-01" });
-    expect(replace.exit).toBe(2); // §8: a backfill that cannot apply is a usage error
-    expect(replace.data.steps[0]!.error).toMatchObject({ code: "BACKFILL_UNSUPPORTED" });
-    expect(replace.data.steps[0]!.error!.hint).toContain("croft run zones");
-    await runIn(root, ["events"]);
-    const dup = await runIn(root, ["events"], { from: "3" });
-    expect(dup.exit).toBe(2);
-    expect(dup.data.steps[0]!.error?.code).toBe("BACKFILL_WOULD_DUPLICATE");
-    const later = await runIn(root, ["events"], { from: "9" });
-    expect(later.exit).toBe(0);
+    // §8 + a backfill that cannot apply is refused before the run starts (exit 2): no run, no failed step.
+    const runsBefore = () => {
+      const db = runsDb(root);
+      try {
+        return { runs: db.listRuns().length, steps: (db.sqlite.query("select count(*) n from steps").get() as { n: number }).n };
+      } finally {
+        db.close();
+      }
+    };
+    await expect(runIn(root, ["zones"], { from: "2026-01-01" })).rejects.toMatchObject({
+      code: "BACKFILL_UNSUPPORTED", exit: 2, problem: { hint: expect.stringContaining("croft run zones") },
+    });
+    expect(runsBefore()).toEqual({ runs: 0, steps: 0 });
+    // An append ingest with no saved position yet takes --from.
+    expect((await runIn(root, ["events"], { from: "2026-01-01" })).exit).toBe(0);
+    const recorded = runsBefore();
+    // Once it has one, --from at or before it would store rows twice...
+    await expect(runIn(root, ["events"], { from: "3" })).rejects.toMatchObject({ code: "BACKFILL_WOULD_DUPLICATE", exit: 2 });
+    // ...and after it would skip the rows in between (or, keeping the position, store the later rows twice).
+    const later = await runIn(root, ["events"], { from: "9" }).catch((e: unknown) => e);
+    expect(later).toMatchObject({ code: "BACKFILL_WOULD_DUPLICATE", problem: { details: { since: 9, saved: "5" } } });
+    expect((later as Error).message).toContain("after its saved position 5");
+    expect(runsBefore()).toEqual(recorded);
   });
 
-  test("a transform named with --from is BACKFILL_UNSUPPORTED; in a bare run it is skipped", async () => {
+  test("a transform named with --from is BACKFILL_UNSUPPORTED before the run; in a bare run it is skipped", async () => {
     api.state.issues = [{ id: 1, title: "a", updated_at: "2026-09-01T10:00:00Z" }];
-    const root = makeProject({ "assets/report.sql": "select 1 as x\n", "assets/issues.ts": keysetIssues(api.url) });
-    const named = await runIn(root, ["report"], { from: "-7d" });
-    expect(named.exit).toBe(2);
-    expect(named.data.steps[0]!.error).toMatchObject({ code: "BACKFILL_UNSUPPORTED", hint: "transforms rebuild from their inputs: croft run report --rebuild" });
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({ "assets/report.sql": "select 1 as x\n", "assets/issues.ts": keysetIssues(api.url), "assets/zones.ts": simpleGet(api.url, "/zones") });
+    await expect(runIn(root, ["report"], { from: "-7d" })).rejects.toMatchObject({
+      code: "BACKFILL_UNSUPPORTED", problem: { hint: "transforms rebuild from their inputs: croft run report --rebuild" },
+    });
+    // A bare run (or a glob) runs --from where it applies and skips the rest; nothing fails.
     const bare = await runIn(root, [], { from: "-7d" });
     expect(bare.exit).toBe(0);
     expect(bare.data.steps.find((s) => s.asset === "report")).toMatchObject({ status: "skipped", skippedBecause: "--from applies to merge ingests" });
+    expect(bare.data.steps.find((s) => s.asset === "zones")).toMatchObject({ status: "skipped", skippedBecause: "--from applies to merge ingests" });
+    expect(bare.data.steps.find((s) => s.asset === "issues")).toMatchObject({ status: "ok" });
+    expect(bare.problems.filter((p) => p.severity === "error")).toEqual([]);
   });
+
+  // §8: a --from later than the saved cursor must not let the cursor jump over [saved, from): a merge ingest
+  // keeps its saved position, so the next run fetches the rows in between instead of losing them.
+  test("a --from after the saved cursor keeps the cursor, so the rows in between are fetched next time", async () => {
+    api.state.issues = [
+      { id: 1, title: "a", updated_at: "2026-09-01T12:00:00Z" },
+      { id: 2, title: "b", updated_at: "2026-09-02T12:00:00Z" },
+    ];
+    const root = makeProject({ "assets/issues.ts": keysetIssues(api.url) });
+    expect((await runIn(root, ["issues"])).exit).toBe(0);
+    api.state.issues.push(
+      { id: 3, title: "c", updated_at: "2026-09-03T12:00:00Z" },
+      { id: 4, title: "d", updated_at: "2026-09-04T12:00:00Z" },
+      { id: 6, title: "f", updated_at: "2026-09-06T12:00:00Z" },
+    );
+    const from = await runIn(root, ["issues"], { from: "2026-09-05" });
+    expect(from.exit).toBe(0);
+    const s = from.data.steps[0]!;
+    expect(s.rows).toMatchObject({ added: 1, total: 3 });
+    expect(s.cursor).toEqual({ before: "2026-09-02T12:00:00Z", after: "2026-09-02T12:00:00Z", sinceUsed: "2026-09-05T07:00:00Z" });
+    expect(s.reason).toContain("the saved position stays at 2026-09-02T12:00:00Z");
+    const db = runsDb(root);
+    try {
+      expect(getCatalog(db, "issues")!.cursor?.value).toBe("2026-09-02T12:00:00Z");
+    } finally {
+      db.close();
+    }
+    api.state.log.length = 0;
+    const next = await runIn(root, ["issues"]);
+    expect(api.state.log[0]!.query.since).toBe("2026-09-02T11:59:59Z");
+    expect(next.data.steps[0]!.cursor?.after).toBe("2026-09-06T12:00:00Z");
+    expect(await rows(root, "select id from issues order by id")).toEqual([1n, 2n, 3n, 4n, 6n].map((id) => ({ id })));
+    // A --from at or before the saved cursor needs no hold: it re-reads a window the cursor already covers.
+    const back = await runIn(root, ["issues"], { from: "2026-09-01" });
+    expect(back.data.steps[0]!.cursor?.after).toBe("2026-09-06T12:00:00Z");
+    expect(back.data.steps[0]!.reason).not.toContain("stays at");
+  });
+
+  test("off a TTY a --from that cannot apply is refused by the command itself; no run is recorded", async () => {
+    api.state.raw = `[{"seq": 5, "what": "x"}]`;
+    const root = makeProject({ "assets/events.ts": `import { ingest } from "@zabaca/croft";
+export default ingest({
+  write: "append",
+  incremental: "seq",
+  async *rows({ http }) { yield (await http.get("${api.url}/raw")).json<Record<string, unknown>[]>(); },
+});
+`, "assets/report.sql": "select 1 as x\n" });
+    expect((await cli(root, ["run", "events", "--json"])).code).toBe(0);
+    // Needs the saved cursor, so the detached child checks it before recording the run; the parent reports it.
+    const dup = await cli(root, ["run", "events", "--from", "3", "--json"]);
+    expect(dup.code).toBe(2);
+    expect(dup.json!.problems[0]).toMatchObject({ code: "BACKFILL_WOULD_DUPLICATE", asset: "events" });
+    // Needs only the plan: the parent refuses before starting a child.
+    const tr = await cli(root, ["run", "report", "--from=-7d", "--json"]);
+    expect(tr.code).toBe(2);
+    expect(tr.json!.problems[0]).toMatchObject({ code: "BACKFILL_UNSUPPORTED", asset: "report" });
+    const db = runsDb(root);
+    try {
+      expect(db.listRuns()).toHaveLength(1);
+      expect(db.listRuns({ failed: true })).toHaveLength(0);
+    } finally {
+      db.close();
+    }
+  }, 60_000);
 });
 
 describe("ctx.query over the asset's own table", () => {
@@ -495,6 +624,47 @@ describe("leases, timeouts and signals", () => {
     }
   });
 
+  // §4.3 status.running[] {phase, rowsFetched}: rows fetched inside a throttle window reach runs.summary at its
+  // end, so a run that fetched pages for less than a second does not show rowsFetched 0 all along.
+  test("runs.summary.progress counts the rows fetched so far while the step extracts", async () => {
+    api.state.slowPages = 6;
+    api.state.slowDelayMs = 150;
+    const root = makeProject({ "assets/slow.ts": slowPages(api.url) });
+    let done = false;
+    const running = runIn(root, ["slow"]).finally(() => {
+      done = true;
+    });
+    const db = runsDb(root);
+    try {
+      let seen: Record<string, unknown> | undefined;
+      while (!done && !seen) {
+        const p = (db.runningRuns()[0]?.summary as { progress?: Record<string, unknown> } | null)?.progress;
+        if (p?.phase === "extract" && Number(p.rowsFetched) > 0) seen = p;
+        else await new Promise((res) => setTimeout(res, 20));
+      }
+      expect(seen).toMatchObject({ asset: "slow", phase: "extract" });
+      expect(Object.keys(seen!).sort()).toEqual(["asset", "elapsedMs", "phase", "requests", "rowsFetched"]);
+      expect((await running).exit).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  // croft's own progress output is not asset output: --events lines emitted while rows() runs (inside the step's
+  // console capture) still reach stderr, and never the step log.
+  test("--events progress during extraction reaches stderr, not the step log", async () => {
+    api.state.slowPages = 4;
+    api.state.slowDelayMs = 200;
+    const root = makeProject({ "assets/slow.ts": slowPages(api.url) });
+    const r = await cli(root, ["run", "slow", "--foreground", "--json", "--events"]);
+    expect(r.code).toBe(0);
+    const events = r.stderr.trim().split("\n").map((l) => JSON.parse(l) as { type: string; phase?: string });
+    expect(events.some((e) => e.type === "progress" && e.phase === "extract")).toBe(true);
+    const log = readFileSync(logPath(join(root, ".croft"), r.json!.data.runId, "slow"), "utf8");
+    expect(log).not.toContain(`"type":"progress"`);
+    expect(log).toContain("page 4");
+  }, 30_000);
+
   test("an aborted signal interrupts the step: nothing is written, the run is interrupted, exit 130", async () => {
     api.state.slowPages = 50;
     api.state.slowDelayMs = 50;
@@ -579,6 +749,30 @@ describe("file ingests through the engine", () => {
     expect(await rows(root, "select sum(amount)::INT AS total from sales")).toEqual([{ total: 12 }]);
     // Nothing changed: the next run skips the write.
     expect((await runIn(root, ["sales"])).data.steps[0]!.status).toBe("unchanged");
+  });
+
+  // §3b: rows of a deleted file are kept "and status says '1 file gone'". status reads the catalog mirror, so an
+  // unchanged step (the only change was the deletion) must still record which files are gone.
+  test("a deletion alone leaves the step unchanged, and the catalog mirror lists the gone file", async () => {
+    const root = makeProject({
+      "files/sales/a.csv": "order_id,amount\n1,5\n",
+      "files/sales/b.csv": "order_id,amount\n2,7\n",
+      "assets/sales.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ file: "files/sales/*.csv", key: "order_id", incremental: true });\n`,
+    });
+    expect((await runIn(root, ["sales"])).exit).toBe(0);
+    rmSync(join(root, "files/sales/b.csv"));
+    const gone = await runIn(root, ["sales"]);
+    expect(gone.data.steps[0]).toMatchObject({ status: "unchanged", rows: { total: 2 } });
+    const db = runsDb(root);
+    try {
+      expect(getCatalog(db, "sales")).toMatchObject({ rows: 2, filesGone: ["files/sales/b.csv"] });
+      // The file comes back unchanged: nothing is gone any more.
+      writeFileSync(join(root, "files/sales/b.csv"), "order_id,amount\n2,7\n");
+      expect((await runIn(root, ["sales"])).data.steps[0]!.status).toBe("unchanged");
+      expect(getCatalog(db, "sales")!.filesGone).toBeUndefined();
+    } finally {
+      db.close();
+    }
   });
 });
 

@@ -62,8 +62,9 @@ export interface MockState {
   raw: string;
   /** /flaky answers 500 this many more times. */
   failures: number;
-  /** /limited answers 429 (Retry-After: 1) this many more times. */
+  /** /limited answers 429 (Retry-After: `retryAfter` seconds, default 1) this many more times. */
   limited: number;
+  retryAfter: string;
   /** /slow: pages and the delay before each. */
   slowPages: number;
   slowDelayMs: number;
@@ -79,7 +80,7 @@ export interface MockApi {
 
 export function mockApi(): MockApi {
   const state: MockState = {
-    issues: [], items: [], zones: [], raw: "[]", failures: 0, limited: 0, slowPages: 5, slowDelayMs: 300, log: [],
+    issues: [], items: [], zones: [], raw: "[]", failures: 0, limited: 0, retryAfter: "1", slowPages: 5, slowDelayMs: 300, log: [],
   };
   const json = (v: unknown, init: ResponseInit = {}) => new Response(JSON.stringify(v), { ...init, headers: { "content-type": "application/json", ...(init.headers ?? {}) } });
   const server: Server<undefined> = Bun.serve({
@@ -119,7 +120,7 @@ export function mockApi(): MockApi {
         case "/limited":
           if (state.limited > 0) {
             state.limited--;
-            return new Response("slow down", { status: 429, headers: { "retry-after": "1" } });
+            return new Response("slow down", { status: 429, headers: { "retry-after": state.retryAfter } });
           }
           return json([{ id: 1 }]);
         case "/slow": {

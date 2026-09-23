@@ -10,6 +10,8 @@ import type { Sql, Warehouse } from "../core/types.ts";
 import { acquire as acquireIntent, intentDir, intentFileName, listIntents, release as releaseIntent } from "../db/intent.ts";
 import { ensureState } from "../db/state.ts";
 import { closeAllWarehouses, openWarehouse } from "../db/warehouse.ts";
+import { cleanupProjects, cli, cliEnv, makeProject, mockApi } from "../run/testkit.ts";
+import { getCatalog } from "./catalog.ts";
 import { acquire, holderOf, listLeases } from "./leases.ts";
 import { reconcile } from "./reconcile.ts";
 import { RunsDb } from "./runs-db.ts";
@@ -108,6 +110,31 @@ describe("reconcile", () => {
     expect(wh.reads).toBe(0);
     expect(db.getRun(run.id)?.status).toBe("running");
     expect(holderOf(db, "orders")?.runId).toBe(run.id);
+  });
+
+  // A run recorded where the boot id could not be read (sysctl not on PATH) is alive while its process is:
+  // reconcile must not mark it crashed, release its leases or hand its staging back for deletion.
+  for (const boot of ["", "unknown"]) {
+    test(`a live run recorded with boot id ${JSON.stringify(boot)} is left alone`, async () => {
+      const identity = { ...me(), bootId: boot };
+      const run = db.createRun({ trigger: "manual", human: true, argv: ["run"], identity });
+      await acquire(db, "orders", run.id, { identity });
+      db.startStep({ runId: run.id, asset: "orders", attempt: 1, reason: "requested" });
+      mkdirSync(join(dir, "staging", run.id, "orders"), { recursive: true });
+      const r = await reconcile({ db, warehouse: fakeWarehouse({ writes: [] }) });
+      expect(r.crashed).toEqual([]);
+      expect(r.releasedLeases).toEqual([]);
+      expect(r.stagingDirs).toEqual([]);
+      expect(db.getRun(run.id)?.status).toBe("running");
+      expect(listLeases(db).map((l) => [l.asset, l.alive])).toEqual([["orders", true]]);
+    });
+  }
+
+  test("a dead run recorded with an empty boot id is still crashed (the start time decides)", async () => {
+    const run = await crashedRun({ ...deadIdentity(), bootId: "" });
+    const r = await reconcile({ db, warehouse: fakeWarehouse({ writes: [] }) });
+    expect(r.crashed).toEqual([run.id]);
+    expect(r.releasedLeases).toEqual(["customers", "orders", "refs"]);
   });
 
   test("a dead run becomes crashed; a landed commit becomes ok (recovered); the rest crashed", async () => {
@@ -343,6 +370,50 @@ describe("reconcile across processes", () => {
       child.kill("SIGKILL");
     }
   }, 20_000);
+});
+
+describe("reconcile refreshes the catalog mirror of a recovered step", () => {
+  const api = mockApi();
+  afterAll(() => {
+    api.stop();
+    cleanupProjects();
+  });
+
+  // A crash between the DuckDB commit and runs.sqlite: the step is recovered as ok, and status/context (which
+  // read the mirror) must see the committed rows and cursor, not the previous load's.
+  test("rows and cursor come from the warehouse after a crash after the commit", async () => {
+    const at = (d: number) => `2026-09-${String(d).padStart(2, "0")}T00:00:00Z`;
+    api.state.raw = JSON.stringify([1, 2, 3].map((id) => ({ id, ts: at(id) })));
+    const root = makeProject({ "assets/events.ts": `import { ingest } from "@zabaca/croft";
+export default ingest({
+  key: "id",
+  incremental: "ts",
+  async *rows({ http }) { yield (await http.get("${api.url}/raw")).json<Record<string, unknown>[]>(); },
+});
+` });
+    const stateDir = join(root, ".croft");
+    expect((await cli(root, ["run", "events", "--foreground", "--json"])).code).toBe(0);
+    api.state.raw = JSON.stringify(Array.from({ length: 10 }, (_, i) => ({ id: i + 1, ts: at(i + 1) })));
+    const killed = await cli(root, ["run", "events", "--foreground", "--json"], cliEnv({ CROFT_FAULT: "after_commit_before_sqlite" }));
+    expect(killed.signal).toBe("SIGKILL");
+
+    const runs = RunsDb.open(stateDir);
+    const w = openWarehouse({ path: join(root, "warehouse.duckdb"), mode: "read_write", timezone: "UTC", root, stateDir, register: false, isTTY: false });
+    try {
+      const crashedId = runs.listRuns()[0]!.id;
+      expect(getCatalog(runs, "events")).toMatchObject({ rows: 3, cursor: { field: "ts", value: at(3) } });
+      const r = await reconcile({ db: runs, warehouse: w });
+      expect(r.recovered).toEqual([{ runId: crashedId, asset: "events", attempt: 1, commits: 1 }]);
+      expect(getCatalog(runs, "events")).toMatchObject({
+        asset: "events", kind: "ingest", write: "merge", key: ["id"], rows: 10, lastRunId: crashedId,
+        cursor: { field: "ts", value: at(10), type: "timestamp" },
+      });
+      expect(getCatalog(runs, "events")!.behavior).toContain("updates rows by id");
+    } finally {
+      await w.close();
+      runs.close();
+    }
+  }, 60_000);
 });
 
 describe("reconcile against a real warehouse", () => {
