@@ -47,7 +47,8 @@ const run = lazyCommand({
     events: { type: "boolean", description: "NDJSON progress events on stderr" },
     "run-id": { type: "string", value: "<id>", hidden: true, description: "the run id a detached run was given (set by croft)" },
     detached: { type: "boolean", hidden: true, description: "marks the detached child of a run (set by croft)" },
-    "confirm-token": { type: "string", value: "<token>", hidden: true, description: "the confirmation being carried out (set by croft confirm)" },
+    // No option carries a confirmation token: only `croft confirm <token>` carries one out (§6), handing it
+    // to run in-process (main.ts Dispatch), never on a command line.
   },
 }, async () => (await import("./run.ts")).run);
 

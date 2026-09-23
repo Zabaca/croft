@@ -27,6 +27,30 @@ export interface MainIO {
   stderrTTY?: boolean;
   commands?: readonly Command[];
   bunVersion?: string;
+  /** Set only when croft runs one of its own commands in this process (croft confirm); see Dispatch. */
+  dispatch?: Dispatch;
+}
+
+/**
+ * What croft hands a command it runs itself, in this process, beyond argv. Nothing on the command line or in
+ * the environment can set it: `croft confirm <token>` passes the token here, so consent reaches the confirmed
+ * command only through the one prefix the Claude Code "ask" rule gates (DESIGN.md §6).
+ */
+export interface Dispatch {
+  /** The confirmation being carried out. The command spends it (Confirmations.consume) where it acts. */
+  readonly confirmToken?: string;
+  /** Set by the command: it finished without reaching its confirmation (nothing destructive was left to do,
+   *  e.g. the source recovered) and spent the token, so it cannot run the command again. */
+  confirmationNotNeeded?: boolean;
+  /** Set by main(): what the command returned, before rendering; unset when it failed with an error. */
+  result?: CommandResult;
+}
+
+const dispatches = new WeakMap<object, Dispatch>();
+
+/** The Dispatch a command was run with, when croft ran it for itself (undefined for a command line). */
+export function dispatchOf(ctx: object): Dispatch | undefined {
+  return dispatches.get(ctx);
 }
 
 /** Where the command name sits in argv and which global flags are present. Global flags may appear
@@ -70,6 +94,7 @@ export async function main(argv: readonly string[], io: MainIO = {}): Promise<nu
   });
   // Progress written while the command runs is redacted too; .env is read on the first write.
   render.redact = (text) => ctx.redactor()(text);
+  if (io.dispatch) dispatches.set(ctx, io.dispatch);
 
   // --version wins anywhere; a bare `croft` (or `croft --help`) shows the command list.
   let name = pre.version ? "version" : pre.name ?? "help";
@@ -103,6 +128,7 @@ export async function main(argv: readonly string[], io: MainIO = {}): Promise<nu
     // A lazily registered command's module is imported only now, once its flags are known to be good.
     if (cmd.load) cmd = await cmd.load();
     result = await cmd.run(ctx);
+    if (io.dispatch) io.dispatch.result = result;
   } catch (e) {
     failure = toFailure(bindingFailure(e, cmd?.name ?? name) ?? e);
   }

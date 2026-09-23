@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import type { Impact } from "../core/types.ts";
 import { RunsDb } from "../history/runs-db.ts";
-import { CONFIRMATION_TTL_MS, Confirmations, impactHash } from "./confirm.ts";
+import { CONFIRMATION_TTL_MS, Confirmations, grantDetached, impactHash, redeemGrant } from "./confirm.ts";
 
 let dir: string;
 let clock: number;
@@ -171,5 +171,73 @@ describe("consume", () => {
     expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
     const rejected = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
     expect((rejected.reason as CroftError).problem.details).toMatchObject({ reason: "used" });
+  });
+});
+
+describe("usable (croft confirm's check before anything runs)", () => {
+  test("a live token is returned without being spent", () => {
+    const c = confirms.create({ command: COMMAND, impact: impact() });
+    expect(confirms.usable(c.token)).toMatchObject({ token: c.token, command: COMMAND, impact: { rows: 265 } });
+    expect(confirms.get(c.token)?.usedAt).toBeNull();
+  });
+
+  test("used and expired tokens are CONFIRMATION_STALE without recomputing anything; unknown ones are usage errors", async () => {
+    const used = confirms.create({ command: COMMAND, impact: impact() });
+    await confirms.consume(used.token, () => impact());
+    expect((await stale((async () => confirms.usable(used.token))())).problem.details).toMatchObject({ reason: "used", impact: null });
+    const old = confirms.create({ command: COMMAND, impact: impact() });
+    clock += CONFIRMATION_TTL_MS;
+    const e = await stale((async () => confirms.usable(old.token))());
+    expect(e.problem.details).toMatchObject({ reason: "expired", impact: null, previousImpact: { rows: 265 } });
+    expect(confirms.get(old.token)?.usedAt).toBeNull();
+    expect(() => confirms.usable("c_000000")).toThrow("no confirmation");
+    expect(() => confirms.usable("nonsense")).toThrow("no confirmation");
+  });
+});
+
+describe("spendUnused (a confirmed command that never reached its confirmation)", () => {
+  test("spends a live token once, so it cannot be carried out again", async () => {
+    const c = confirms.create({ command: COMMAND, impact: impact() });
+    expect(confirms.spendUnused(c.token)).toBe(true);
+    expect(confirms.spendUnused(c.token)).toBe(false);
+    expect(confirms.get(c.token)?.usedAt).toBe("2026-09-22T18:40:00.000Z");
+    expect((await stale(confirms.consume(c.token, () => impact()))).problem.details).toMatchObject({ reason: "used" });
+    expect(confirms.spendUnused("nonsense")).toBe(false);
+  });
+});
+
+describe("detached grants (croft confirm → its detached run)", () => {
+  const RUN = "r_0922_1140_a1b2";
+
+  test("the child redeems the token with the secret, once; the file holds only a hash", () => {
+    const secret = grantDetached(dir, RUN, "c_7f3a9e");
+    expect(secret).toMatch(/^[0-9a-f]{48}$/);
+    const file = join(dir, "logs", RUN, "confirm-grant.json");
+    expect(readFileSync(file, "utf8")).not.toContain(secret);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(redeemGrant(dir, RUN, secret)).toBe("c_7f3a9e");
+    expect(existsSync(file)).toBe(false);
+    expect(() => redeemGrant(dir, RUN, secret)).toThrow("no confirmation grant");
+  });
+
+  test("a wrong secret, another run's grant, or no grant at all carries nothing (and the grant is gone)", () => {
+    const secret = grantDetached(dir, RUN, "c_7f3a9e");
+    expect(() => redeemGrant(dir, RUN, "c_7f3a9e")).toThrow("no confirmation grant");
+    expect(() => redeemGrant(dir, RUN, secret)).toThrow("no confirmation grant");
+    const other = grantDetached(dir, "r_0922_1141_zzzz", "c_7f3a9e");
+    expect(() => redeemGrant(dir, RUN, other)).toThrow("no confirmation grant");
+    let code = "";
+    try {
+      redeemGrant(dir, "r_0922_1142_none", "x");
+    } catch (e) {
+      code = (e as CroftError).code;
+    }
+    expect(code).toBe("USAGE_ERROR");
+  });
+
+  test("a hand-written grant file with a made-up hash is refused", () => {
+    const secret = grantDetached(dir, RUN, "c_7f3a9e");
+    writeFileSync(join(dir, "logs", RUN, "confirm-grant.json"), JSON.stringify({ token: "c_7f3a9e", runId: RUN, hash: "00".repeat(32) }));
+    expect(() => redeemGrant(dir, RUN, secret)).toThrow("no confirmation grant");
   });
 });

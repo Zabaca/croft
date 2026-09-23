@@ -11,7 +11,7 @@
 // This file also holds what the other read-only commands (context, query, secrets) share: loading asset
 // configs without failing on one broken file, the read-only warehouse, and value capping with redaction.
 import { readFileSync } from "node:fs";
-import { CroftError } from "../../core/errors.ts";
+import { CroftError, problem } from "../../core/errors.ts";
 import { CHECKS_ENFORCED, CHECKS_NOT_ENFORCED } from "../../core/phase.ts";
 import type { AssetKind, CursorType, Incremental, LockHolder, Problem, WriteMode } from "../../core/types.ts";
 import { hasState } from "../../db/state.ts";
@@ -610,7 +610,9 @@ export const describe: CommandImpl<DescribeData> = {
     };
     if (source === "catalog" && catalogRefreshedAt) data.catalogRefreshedAt = zoned(catalogRefreshedAt, tz)!;
     if (samples.redacted) data.redactedValues = true;
-    if (!found) next.push({ command: `croft delete ${name}`, reason: "its asset file is gone; the table is kept until you delete it" });
+    // An orphan (its asset file is gone) is a warning with a manual fix. Deleting the table is destructive, so
+    // it never appears in next (§4.3): only the user decides that.
+    if (!found) problems.push(orphanTable(name, kind, data.rows));
     else if (!wh?.tableExists && source !== "catalog" && !cat) next.push({ command: `croft run ${name}`, reason: "build the table" });
     if (samples.cut > 0) next.push({ command: `croft describe ${name} --full-values`, reason: "sample values were cut to 80 characters" });
     return { data, problems, next };
@@ -619,6 +621,18 @@ export const describe: CommandImpl<DescribeData> = {
     return formatDescribe(result.data, ctx.project.timezone, ctx.render.style.bold);
   },
 };
+
+/** ORPHAN_TABLE: the table outlived its asset file. No run updates it any more; it is kept until the user
+ *  decides, because deleting a table is destructive. */
+function orphanTable(name: string, kind: AssetKind | null, rows: number | null): Problem {
+  const file = `assets/${name}.${kind === "sql" ? "sql" : "ts"}`;
+  return problem("ORPHAN_TABLE", {
+    asset: name,
+    message: `${name} has no asset file (${file} is gone); its table${rows !== null ? ` of ${formatCount(rows)} rows` : ""} is kept, but no run updates it`,
+    hint: `put ${file} back to keep updating it; if the table should go instead, ask the user first: deleting it is destructive`,
+    fix: { kind: "manual", requiresHuman: true, description: `restore ${file}, or ask the user whether ${name} should be deleted` },
+  });
+}
 
 /** _croft.assets facts in the catalog's shape, so behaviorOf reads either. */
 function stateAsCatalog(name: string, wh: WarehouseAsset | null): CatalogAsset | null {

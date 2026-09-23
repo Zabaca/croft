@@ -8,6 +8,7 @@ import { closeAllWarehouses } from "../../db/warehouse.ts";
 import { RunsDb } from "../../history/runs-db.ts";
 import { initProject } from "../../project/init.ts";
 import { eventsPath, runExample } from "../../run/runner.ts";
+import { Confirmations } from "../../safety/confirm.ts";
 import { listTrash } from "../../safety/trash.ts";
 import { cleanupProjects, cli, cliEnv, keysetIssues, makeProject, mockApi, PKG, simpleGet, slowPages, startCli, until } from "../../run/testkit.ts";
 import { main } from "../main.ts";
@@ -210,16 +211,18 @@ describe("more crash points (CROFT_FAULT)", () => {
     api.state.zones = [];
     const asked = await cli(root, ["run", "zones", "--allow-shrink", "--foreground", "--json"]);
     const token = asked.json!.confirmation.token as string;
-    const killed = await cli(root, ["run", "zones", "--allow-shrink", "--confirm-token", token, "--foreground", "--json"], cliEnv({ CROFT_FAULT: "between_trash_and_drop" }));
-    expect(killed.signal).toBe("SIGKILL");
+    // croft confirm (off a TTY) detaches the run; its child is the process the fault kills.
+    const killed = await cli(root, ["confirm", token, "--json"], cliEnv({ CROFT_FAULT: "between_trash_and_drop" }));
+    expect(killed.code).toBe(1);
+    expect(killed.json!.data).toMatchObject({ outcome: "used", result: { status: "crashed" } });
     expect(listTrash(join(root, ".croft"), "zones")).toHaveLength(1);
     expect(await count(root, "zones")).toBe(4);
-    // The spent token is stale; a new one (same impact) goes through.
-    const stale = await cli(root, ["run", "zones", "--allow-shrink", "--confirm-token", token, "--foreground", "--json"]);
+    // The spent token is stale, refused before anything runs; a new one (same impact) goes through.
+    const stale = await cli(root, ["confirm", token, "--json"]);
     expect(stale.code).toBe(5);
-    expect(stale.json!.data.steps[0].error.code).toBe("CONFIRMATION_STALE");
+    expect(stale.json!.problems[0]).toMatchObject({ code: "CONFIRMATION_STALE", details: { reason: "used" } });
     const again = await cli(root, ["run", "zones", "--allow-shrink", "--foreground", "--json"]);
-    const done = await cli(root, ["run", "zones", "--allow-shrink", "--confirm-token", again.json!.confirmation.token, "--foreground", "--json"]);
+    const done = await cli(root, ["confirm", again.json!.confirmation.token, "--json"]);
     expect(done.code).toBe(0);
     expect(await count(root, "zones")).toBe(0);
     expect(listTrash(join(root, ".croft"), "zones")).toHaveLength(2);
@@ -228,7 +231,7 @@ describe("more crash points (CROFT_FAULT)", () => {
 });
 
 describe("--allow-shrink through the CLI", () => {
-  test("exit 5 with a confirmation; the hidden --confirm-token run (as croft confirm does it) trashes, then writes", async () => {
+  test("exit 5 with a confirmation; croft confirm's detached run trashes, then writes; run itself takes no token", async () => {
     api.state.zones = Array.from({ length: 4 }, (_, i) => ({ zone: i + 1 }));
     const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
     expect((await cli(root, ["run", "zones", "--json"])).code).toBe(0);
@@ -245,18 +248,69 @@ describe("--allow-shrink through the CLI", () => {
     expect(await count(root, "zones")).toBe(4);
 
     const token = asked.json!.confirmation.token as string;
-    const done = await cli(root, ["run", "zones", "--allow-shrink", "--confirm-token", token, "--json"]);
+    // §6: croft run carries out no confirmation itself; --confirm-token is no option at all.
+    for (const t of [token, "c_000000"]) {
+      const bypass = await cli(root, ["run", "zones", "--allow-shrink", "--confirm-token", t, "--json"]);
+      expect(bypass.code).toBe(2);
+      expect(bypass.json!.problems[0]).toMatchObject({ code: "USAGE_ERROR", message: "croft run has no option --confirm-token" });
+    }
+    expect(await count(root, "zones")).toBe(4);
+
+    const done = await cli(root, ["confirm", token, "--json"]);
     expect(done.code).toBe(0);
-    expect(done.json!.data.steps[0]).toMatchObject({ status: "ok", trashed: { rows: 4 } });
+    expect(done.json!.data).toMatchObject({ outcome: "used" });
+    expect(done.json!.data.result.steps[0]).toMatchObject({ status: "ok", trashed: { rows: 4 } });
     expect(await count(root, "zones")).toBe(0);
     expect(listTrash(join(root, ".croft"), "zones")[0]).toMatchObject({ rows: 4 });
     withRuns(root, (db) => {
-      // The run record keeps the user's own arguments, never the hidden ones.
-      expect(db.listRuns()[0]!.argv).toEqual(["run", "zones", "--allow-shrink", "--json"]);
+      // The run record keeps the user's own arguments, never the hidden ones; it ran in a detached child.
+      const r = db.listRuns()[0]!;
+      expect(r).toMatchObject({ trigger: "confirm", argv: ["run", "zones", "--allow-shrink", "--json"] });
+      expect(existsSync(join(root, ".croft", "logs", r.id, "process.log"))).toBe(true);   // a detached child's output
+      expect(existsSync(join(root, ".croft", "logs", r.id, "confirm-grant.json"))).toBe(false);   // redeemed once
     });
-    const unknown = await cli(root, ["run", "zones", "--allow-shrink", "--confirm-token", "c_000000", "--json"]);
-    expect(unknown.code).toBe(2);
   }, 60_000);
+
+  test("on a TTY croft confirm runs the confirmed run in its own process; a recovered source makes it a plain run", async () => {
+    const three = (v: number) => [1, 2, 3].map((zone) => ({ zone, v }));
+    api.state.zones = three(1);
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    expect((await inProcess(root, ["run", "zones", "--foreground"])).exit).toBe(0);
+    const ask = async () => {
+      api.state.zones = [];
+      const r = await inProcess(root, ["run", "zones", "--allow-shrink", "--foreground", "--json"]);
+      expect(r.exit).toBe(5);
+      return r.json.confirmation.token as string;
+    };
+    const tty = { stdinTTY: true, stdoutTTY: true };
+
+    const t1 = await ask();
+    const done = await inProcess(root, ["confirm", t1, "--json"], tty);
+    expect(done.exit).toBe(0);
+    expect(done.json.data).toMatchObject({ outcome: "used", result: { steps: [{ status: "ok", trashed: { rows: 3 } }] } });
+    expect(withRuns(root, (db) => db.listRuns()[0]!)).toMatchObject({ trigger: "confirm", pid: process.pid });
+
+    api.state.zones = three(1);
+    expect((await inProcess(root, ["run", "zones", "--foreground"])).exit).toBe(0);
+    const t2 = await ask();
+    api.state.zones = three(2);   // the source recovered before the user said yes
+    const plain = await inProcess(root, ["confirm", t2], tty);
+    expect(plain.exit).toBe(0);
+    expect(plain.stdout).toMatch(/^ok\s+zones\s+1 request, 3 rows/m);
+    expect(plain.stdout).toContain(`note: croft run zones --allow-shrink did not need confirmation ${t2}`);
+    expect(plain.stdout).not.toContain("trash");
+    withRuns(root, (db) => expect(new Confirmations(db).get(t2)!.usedAt).not.toBeNull());
+    expect(await count(root, "zones")).toBe(3);
+  }, 60_000);
+
+  test("the grant variable means nothing to a plain run, and is never passed on to its detached child", async () => {
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    const r = await cli(root, ["run", "zones", "--json"], cliEnv({ CROFT_CONFIRM_GRANT: "0".repeat(48) }));
+    expect(r.code).toBe(0);
+    expect(r.json!.data).toMatchObject({ status: "succeeded" });
+    withRuns(root, (db) => expect(db.listRuns()[0]!.trigger).toBe("manual"));
+  }, 30_000);
 });
 
 describe("in-process command", () => {
@@ -328,7 +382,8 @@ describe("in-process command", () => {
   });
 
   test("userArgs drops the hidden flags", () => {
-    expect(userArgs(["x", "--run-id", "r_0101_0000_abcd", "--detached", "--confirm-token=c_123456", "--json"])).toEqual(["x", "--json"]);
+    expect(userArgs(["x", "--run-id", "r_0101_0000_abcd", "--detached", "--json"])).toEqual(["x", "--json"]);
+    expect(userArgs(["x", "--run-id=r_0101_0000_abcd", "--allow-shrink"])).toEqual(["x", "--allow-shrink"]);
   });
 
   test("wait needs a run id", async () => {
