@@ -1,0 +1,4 @@
+{"event_id":"e1","kind":"click","at":"2026-03-01T10:00:00Z","props":{"x":1}}
+{"event_id":"e2","kind":"view","at":"2026-03-01T10:00:05Z","props":{"x":2,"y":[1,2]}}
+
+{"event_id":"e3","kind":"click","at":"2026-03-01T10:01:00Z","props":null,"count":3}

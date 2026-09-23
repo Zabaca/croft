@@ -1,0 +1,4 @@
+order_id,email,amount,ordered_on
+1001, Alice@Example.COM ,"$1,234.50",03/25/2026
+1002,bob@example.com,$20.00,03/26/2026
+1003,carol@example.com,($3.00),03/27/2026

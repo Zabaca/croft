@@ -1,0 +1,5 @@
+[
+  { "id": 1, "customer": { "name": "Alice", "tier": "gold" }, "total": 12.5, "placed_at": "2026-03-01T10:00:00Z", "tags": ["new"] },
+  { "id": 2, "customer": { "tier": "silver", "name": "Bob" }, "total": 20, "placed_at": "2026-03-02T11:30:00+02:00", "tags": [] },
+  { "id": 12345678901234567890, "customer": null, "total": 3.25, "placed_at": "2026-03-03T09:15:00Z", "tags": ["big", "id"] }
+]

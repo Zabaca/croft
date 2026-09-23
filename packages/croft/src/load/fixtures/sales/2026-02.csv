@@ -1,0 +1,3 @@
+order_id,email,amount,ordered_on,coupon
+1004,dan@example.com,$15.25,04/01/2026,SPRING
+1005,eve@example.com,"$2,000.00",04/02/2026,
