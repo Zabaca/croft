@@ -53,7 +53,8 @@ export const init: CommandImpl<InitData> = {
           return askYesNo(`Apply this change to ${edit.file}? [y/N] `);
         },
       } : {}),
-      // HOOK(example): pass `runExample` here once `croft run` exists (see ExampleRunner in project/init.ts).
+      // HOOK(example): the run engine loads example_sales in the new project (imported only when it runs).
+      runExample: async (root: string) => (await import("../../run/runner.ts")).runExample(root, { env: ctx.processEnv }),
     });
     return { data: result, problems: initProblems(result, from), next: nextSteps(result, from) };
   },

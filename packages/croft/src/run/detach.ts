@@ -1,0 +1,262 @@
+// Detached runs (DESIGN.md §5 "Processes" 2, §8 "Large first loads").
+//
+// Off a TTY, `croft run` executes in a detached child (`detached` + `unref`, env passed explicitly), so the
+// agent's shell timeout can never kill a long extraction. The invoking process follows the child's events
+// for --follow (default 100 s): when the run ends in time it prints the run's own result; otherwise it
+// returns exit 6 with the run id and `croft wait <id> --timeout 100s`.
+//
+// The parent picks the run id and hands it to the child (--run-id); the child creates the run record, does
+// the work in the foreground, and stores its whole result in runs.summary. Following reads only
+// runs.sqlite and <state>/logs/<run>/events.ndjson, never the warehouse, which the child needs.
+//
+// Run as a program (the child's entry point) this file calls the CLI's main() directly: the parent already
+// runs the project's croft, so the launcher has nothing to decide.
+import { type ChildProcess, spawn } from "node:child_process";
+import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { CroftError, problem } from "../core/errors.ts";
+import { isAlive } from "../core/proc.ts";
+import type { Problem, StepResult } from "../core/types.ts";
+import { follow, logDir, tail } from "../history/logs.ts";
+import { isRunId, newRunId, RunsDb, type RunRecord, type StepRecord } from "../history/runs-db.ts";
+import type { ProgressSnapshot } from "./ingest.ts";
+import { eventsPath, type RunData, type RunSummary } from "./runner.ts";
+
+/** Hidden flags the parent adds for its child. --detached implies the foreground: the child does the work. */
+export const CHILD_FLAGS = { runId: "--run-id", detached: "--detached" } as const;
+/** How long a non-TTY `croft run` follows its child, and how long `croft wait` waits, by default. */
+export const DEFAULT_FOLLOW_MS = 100_000;
+
+export const ENTRY = fileURLToPath(import.meta.url);
+
+/** "100s", "2m", "90" (seconds), "1.5h" → milliseconds. USAGE_ERROR otherwise. */
+export function parseWait(text: string, flag: string): number {
+  const t = text.trim();
+  const m = /^(\d+(?:\.\d+)?)\s*(ms|s|sec|secs|seconds?|m|min|mins|minutes?|h|hr|hrs|hours?)?$/i.exec(t);
+  if (!m) {
+    throw new CroftError("USAGE_ERROR", {
+      message: `${flag} ${JSON.stringify(text)} is not a duration`,
+      hint: `write it like 100s, 2m or 1h (a bare number is seconds)`,
+      details: { flag, value: text },
+    });
+  }
+  const n = Number(m[1]);
+  const unit = (m[2] ?? "s").toLowerCase();
+  const mult = unit === "ms" ? 1 : unit.startsWith("h") ? 3_600_000 : unit.startsWith("m") ? 60_000 : 1000;
+  return Math.round(n * mult);
+}
+
+export interface SpawnInput {
+  root: string;
+  stateDir: string;
+  /** The run command's arguments after "run", as the user gave them. */
+  args: readonly string[];
+  runId: string;
+  /** The child's whole environment; nothing is inherited implicitly. */
+  env: Record<string, string | undefined>;
+  execPath?: string;
+  entry?: string;
+}
+
+export interface Spawned {
+  child: ChildProcess;
+  pid: number;
+  /** The child's stdout and stderr, for a crash that happens before the run record exists. */
+  output: string;
+  exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+}
+
+/** Start `croft run … --run-id <id> --detached` in its own session, detached and unref'd. */
+export function spawnDetachedRun(i: SpawnInput): Spawned {
+  const dir = logDir(i.stateDir, i.runId);
+  mkdirSync(dir, { recursive: true });
+  const output = join(dir, "process.log");
+  const fd = openSync(output, "a");
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(i.env)) if (v !== undefined) env[k] = v;
+  let child: ChildProcess;
+  try {
+    child = spawn(i.execPath ?? process.execPath, [
+      "--no-env-file", i.entry ?? ENTRY, "run", ...i.args, CHILD_FLAGS.runId, i.runId, CHILD_FLAGS.detached,
+    ], { cwd: i.root, env, detached: true, stdio: ["ignore", fd, fd] });
+  } finally {
+    closeSync(fd);
+  }
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+    child.once("error", () => resolve({ code: null, signal: null }));
+  });
+  child.unref();
+  return { child, pid: child.pid ?? -1, output, exited };
+}
+
+export function pickRunId(timezone: string, now: Date = new Date()): string {
+  return newRunId(now, timezone);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Reading a run back
+
+/** The newest progress event of a run, from events.ndjson (only the tail is read). */
+export function lastProgress(stateDir: string, runId: string): ProgressSnapshot | undefined {
+  const t = tail(eventsPath(stateDir, runId), 50);
+  for (let i = t.lines.length - 1; i >= 0; i--) {
+    try {
+      const e = JSON.parse(t.lines[i]!) as { type?: string } & ProgressSnapshot;
+      if (e.type === "progress") return { asset: e.asset, phase: e.phase, rowsFetched: e.rowsFetched, requests: e.requests, elapsedMs: e.elapsedMs };
+    } catch {}
+  }
+  return undefined;
+}
+
+/** Finished steps of a run so far, from events.ndjson (the last result per asset). */
+export function finishedSteps(stateDir: string, runId: string): StepResult[] {
+  const t = tail(eventsPath(stateDir, runId), 10_000);
+  const out = new Map<string, StepResult>();
+  for (const line of t.lines) {
+    try {
+      const e = JSON.parse(line) as { type?: string; result?: StepResult };
+      if (e.type === "step" && e.result) out.set(e.result.asset, e.result);
+    } catch {}
+  }
+  return [...out.values()];
+}
+
+function stepFromRecord(s: StepRecord, attempts: number): StepResult {
+  const status: StepResult["status"] = s.status === "ok" || s.status === "skipped" || s.status === "unchanged" ? s.status : "failed";
+  const started = Date.parse(s.startedAt);
+  const finished = s.finishedAt ? Date.parse(s.finishedAt) : Date.now();
+  return {
+    asset: s.asset, status, reason: s.reason ?? "", behavior: "", attempt: s.attempt, maxAttempts: attempts,
+    rows: { in: s.rowsIn ?? 0, added: s.added ?? 0, updated: s.updated ?? 0, unchanged: 0, deleted: 0, total: 0 },
+    schemaChanges: [], checks: [], logsCommand: `croft logs ${s.asset}${status === "failed" ? " --failed" : ""}`,
+    durationMs: Number.isNaN(started) ? 0 : Math.max(0, finished - started), ...(s.error ? { error: s.error } : {}),
+  };
+}
+
+/** A run's result when it has no stored summary (it crashed): rebuilt from its step records. */
+export function summaryFromRecords(run: RunRecord, steps: StepRecord[]): RunSummary {
+  const last = new Map<string, StepRecord>();
+  for (const s of steps) {
+    const had = last.get(s.asset);
+    if (!had || s.attempt > had.attempt) last.set(s.asset, s);
+  }
+  const results = [...last.values()].map((s) => stepFromRecord(s, s.attempt));
+  const problems: Problem[] = results.flatMap((r) => (r.error ? [{ ...r.error, runId: run.id }] : []));
+  if (run.status === "crashed" && !problems.some((p) => p.code === "RUN_CRASHED")) {
+    problems.push(problem("RUN_CRASHED", {
+      runId: run.id, message: `run ${run.id} (pid ${run.pid ?? "?"}) stopped before it finished`,
+      hint: "steps that had not committed saved nothing; run the assets again", retryable: true,
+    }));
+  }
+  const exit = run.status === "succeeded" ? 0 : run.status === "interrupted" ? 130 : 1;
+  const next = run.status === "succeeded" ? [] : results.filter((r) => r.status === "failed").map((r) => ({ command: `croft logs ${r.asset} --failed`, reason: `see why ${r.asset} failed` }));
+  return { data: { runId: run.id, status: run.status, steps: results }, problems, next, exit, ok: run.status === "succeeded" };
+}
+
+/** A finished run's stored result (or one rebuilt from its steps). */
+export function finishedSummary(db: RunsDb, run: RunRecord): RunSummary {
+  const s = run.summary as Partial<RunSummary> | null;
+  if (s && typeof s === "object" && s.data && Array.isArray(s.problems) && typeof s.exit === "number") return s as RunSummary;
+  return summaryFromRecords(run, db.stepsFor(run.id));
+}
+
+/** The "still running" result: exit 6, what the run is doing, and the command to keep waiting. */
+export function runningSummary(stateDir: string, runId: string): RunSummary {
+  const progress = lastProgress(stateDir, runId);
+  const data: RunData = { runId, status: "running", ...(progress ? { progress } : {}), steps: finishedSteps(stateDir, runId) };
+  return {
+    data, problems: [], next: [{ command: `croft wait ${runId} --timeout 100s`, reason: "still running" }], exit: 6, ok: true,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Following
+
+export interface FollowInput {
+  stateDir: string;
+  runId: string;
+  timeoutMs: number;
+  /** Each events.ndjson line as it arrives (--events). */
+  onEvent?: (line: string) => void;
+  /** The detached child, when this process started it: its exit ends the wait. */
+  spawned?: Spawned;
+  pollMs?: number;
+  signal?: AbortSignal;
+}
+
+export type FollowResult =
+  | { kind: "finished"; summary: RunSummary }
+  | { kind: "running"; summary: RunSummary }
+  | { kind: "not_started"; problem: Problem };
+
+/**
+ * Follow a run until it ends or `timeoutMs` passes. A run whose process died is marked crashed. A child that
+ * exits before it created the run record is reported with the tail of its output.
+ */
+export async function followRun(i: FollowInput): Promise<FollowResult> {
+  const db = RunsDb.open(i.stateDir);
+  try {
+    const deadline = Date.now() + i.timeoutMs;
+    const child: { exit: { code: number | null; signal: NodeJS.Signals | null } | null } = { exit: null };
+    void i.spawned?.exited.then((x) => { child.exit = x; });
+    let lastAliveCheck = 0;
+    const settled = (): boolean => {
+      const run = db.getRun(i.runId);
+      if (run && run.status !== "running") return true;
+      if (child.exit) return true;
+      if (run && !i.spawned && Date.now() - lastAliveCheck > 1000) {
+        lastAliveCheck = Date.now();
+        if (run.pid === null || !run.procStart || !run.bootId || !isAlive({ pid: run.pid, procStart: run.procStart, bootId: run.bootId })) {
+          db.markCrashed(run.id);
+          return true;
+        }
+      }
+      return Date.now() >= deadline;
+    };
+    const path = eventsPath(i.stateDir, i.runId);
+    for await (const line of follow(path, { from: 0, pollMs: i.pollMs ?? 100, until: settled, ...(i.signal ? { signal: i.signal } : {}) })) {
+      if (line.trim()) i.onEvent?.(line);
+    }
+    let final = db.getRun(i.runId);
+    // The child exited while its run still says running: it died (a finished run is recorded before exit).
+    if (final && final.status === "running" && child.exit) {
+      db.markCrashed(final.id);
+      final = db.getRun(i.runId);
+    }
+    if (!final) {
+      if (child.exit) {
+        const out = existsSync(i.spawned!.output) ? tail(i.spawned!.output, 20).lines : [];
+        const how = child.exit.code !== null ? `exited with ${child.exit.code}` : `was killed (${child.exit.signal ?? "unknown"})`;
+        return { kind: "not_started", problem: problem("INTERNAL_ERROR", {
+          runId: i.runId,
+          message: `the run process ${how} before it recorded run ${i.runId}${out.length ? `: ${out.at(-1)}` : ""}`,
+          hint: "run it in the foreground to see the whole error: croft run <asset> --foreground",
+          details: { output: out },
+        }) };
+      }
+      if (i.spawned || existsSync(join(logDir(i.stateDir, i.runId), "process.log"))) return { kind: "running", summary: runningSummary(i.stateDir, i.runId) };
+      return { kind: "not_started", problem: unknownRun(i.runId).problem };
+    }
+    if (final.status === "running") return { kind: "running", summary: runningSummary(i.stateDir, i.runId) };
+    return { kind: "finished", summary: finishedSummary(db, final) };
+  } finally {
+    db.close();
+  }
+}
+
+/** RUN_NOT_FOUND-style usage error for `croft wait` with an unknown id. */
+export function unknownRun(runId: string): CroftError {
+  return new CroftError("USAGE_ERROR", {
+    message: isRunId(runId) ? `there is no run ${runId} in this project` : `${JSON.stringify(runId)} is not a run id (they look like r_0922_1130_x1c8)`,
+    hint: "croft logs --runs lists recent runs",
+    fix: { kind: "command", description: "list recent runs", command: "croft logs --runs" },
+    details: { runId },
+  });
+}
+
+if (import.meta.main) {
+  const { main } = await import("../cli/main.ts");
+  process.exitCode = await main(process.argv.slice(2));
+}
