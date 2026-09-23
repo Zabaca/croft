@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bun:*)",
+      "Bash(bunx:*)",
+      "Bash(git:*)",
+      "Bash(gh:*)",
+      "Bash(zbc:*)"
+    ]
+  }
+}

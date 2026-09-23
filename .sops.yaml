@@ -1,0 +1,11 @@
+# Add your age public keys below as recipients. Run `age-keygen` to generate
+# a keypair if you don't have one. The private key stays on your machine; the
+# public key goes here.
+#
+# CI: store the CI private key as a GitHub Actions secret (SOPS_AGE_KEY) and
+# add the matching public key to the recipients list below.
+#
+# After editing, run: sops updatekeys packages/infra/environments/<env>/secrets.yaml
+creation_rules:
+  - age: >-
+      # add public keys here, comma-separated

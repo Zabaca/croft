@@ -1,0 +1,10 @@
+{
+  "name": "croft",
+  "private": true,
+  "packageManager": "bun@1.3.4",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev"
+  }
+}
