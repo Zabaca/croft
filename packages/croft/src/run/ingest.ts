@@ -44,6 +44,9 @@ import { OwnTableQuery } from "./snapshot.ts";
 
 export type Phase = "extract" | "write" | "checks";
 
+/** A writer that sees another process waiting for the file yields this long before its next write (§5). */
+export const FAIRNESS_YIELD_MS = 200;
+
 export interface ProgressSnapshot {
   asset: string;
   phase: Phase;
@@ -501,8 +504,9 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
     };
   }
 
-  // 4. Write: one lease, one transaction.
+  // 4. Write: one lease, one transaction. Another process waiting for the file gets a turn first (§5 "Fairness").
   progress.setPhase("write");
+  if (runs.hasOtherWaiters()) await new Promise((r) => setTimeout(r, FAIRNESS_YIELD_MS));
   const previous = getCatalog(runs, asset);
   const write = (allowShrink: boolean) => warehouse.write(`ingest ${asset}`, async (raw) => {
     // Who holds the file, for other processes' lock messages; set only once this lease has it.

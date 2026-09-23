@@ -250,6 +250,7 @@ function nextSteps(steps: StepResult[], problems: Problem[]): Next[] {
   }
   const ok = steps.find((s) => s.status === "ok" && s.rows.total > 0);
   if (ok && next.length === 0) next.push({ command: `croft query "from ${ok.asset} limit 5"`, reason: `look at ${ok.asset}` });
+  if (steps.length === 0 && problems.length === 0) next.push({ command: "croft new --list", reason: "assets/ has no assets yet; start from a template" });
   return next;
 }
 
@@ -278,6 +279,8 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
         const h = runs.getLockHolder();
         return h && h.pid === pid ? h : null;
       },
+      // Fairness (§5 "Leases"): a writer that sees waiters yields between its write steps (ingest.ts).
+      onWait: () => runs.registerWaiter(`croft run${o.runId ? ` ${o.runId}` : ""}`),
     });
     const rec = await reconcile({ db: runs, warehouse });
     for (const dir of rec.stagingDirs) rmSync(dir, { recursive: true, force: true });
@@ -476,8 +479,8 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
     } finally {
       o.signal?.removeEventListener("abort", onOuterAbort);
       release(runs, runId);
+      runs.unregisterWaiter();
     }
-
   } finally {
     runs.close();
     await warehouse?.close();

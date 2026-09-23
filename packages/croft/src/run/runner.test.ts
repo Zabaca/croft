@@ -579,6 +579,28 @@ describe("sources, JSON keys, --no-wait and staging", () => {
   });
 });
 
+describe("fairness and empty projects", () => {
+  test("a writer yields 200 ms before its write when another process waits for the file", async () => {
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    const db = runsDb(root);
+    try {
+      db.registerWaiter("croft query", process.ppid); // a live process that is not this one
+    } finally {
+      db.close();
+    }
+    const out = await runIn(root, ["zones"]);
+    expect(out.exit).toBe(0);
+    expect(out.data.steps[0]!.durationMs).toBeGreaterThanOrEqual(190);
+  });
+
+  test("a project without assets runs nothing and points at the templates", async () => {
+    const root = makeProject({});
+    const out = await runIn(root, []);
+    expect(out).toMatchObject({ exit: 0, data: { status: "succeeded", steps: [] }, next: [{ command: "croft new --list" }] });
+  });
+});
+
 describe("concurrency, events and approvals", () => {
   test("extractions overlap up to croft.json concurrency; with concurrency 1 they run one after another", async () => {
     api.state.slowPages = 3;
