@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError, problem } from "../core/errors.ts";
@@ -110,6 +110,8 @@ describe("followRun", () => {
     writeFileSync(script, `await Bun.sleep(200);\n`);
     const spawned = spawnDetachedRun({ root: s, stateDir: s, args: ["x"], runId: "r_0101_0000_hand", env: { PATH: process.env.PATH }, entry: script });
     expect(spawned.output).toBe(processLogPath(s, "r_0101_0000_hand"));
+    // The child's output may quote asset output: only the user can read it.
+    expect(statSync(spawned.output).mode & 0o777).toBe(0o600);
     const rec = readChildRecord(s, "r_0101_0000_hand");
     expect(rec).toMatchObject({ pid: spawned.pid, procStart: procStart(spawned.pid)!, bootId: bootId() });
     await spawned.exited;
