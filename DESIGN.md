@@ -1,6 +1,6 @@
 # croft: design v1
 
-> **Status.** Final design for v1, dated 2026-09-22. It was produced by a design panel: four independent drafts (simplicity, AI operator, correctness and builder lenses), a synthesis, and three adversarial reviews (a non-data-engineer walking real journeys, Claude Code operating the tool, and a technical review backed by spikes). Claims are marked **[V]** when verified by a spike on Bun 1.3.14 with `@duckdb/node-api` 1.5.5-r.5 (DuckDB 1.5.5) on macOS arm64, and **[U]** when relied on but unverified. Appendix B lists the spikes. The working name during design was "tsdb"; the product is named **croft** (D52). **Phase 1 is implemented** (§11) in `packages/croft`, with about 1,600 tests, including an end-to-end suite that drives the real CLI through user journeys (`tests/e2e`). On 2026-09-23 the document was brought in line with that code (`packages/croft/src`), which is the source of truth where the two differ; decisions the build refined carry a **Build:** note, and decisions it changed have their own entries from D54 on (§13).
+> **Status.** Final design for v1, dated 2026-09-22. It was produced by a design panel: four independent drafts (simplicity, AI operator, correctness and builder lenses), a synthesis, and three adversarial reviews (a non-data-engineer walking real journeys, Claude Code operating the tool, and a technical review backed by spikes). Claims are marked **[V]** when verified by a spike on Bun 1.3.14 with `@duckdb/node-api` 1.5.5-r.5 (DuckDB 1.5.5) on macOS arm64, and **[U]** when relied on but unverified. Appendix B lists the spikes. The working name during design was "tsdb"; the product is named **croft** (D52). **Phase 1 is complete** (§11) in `packages/croft`, with about 1,650 tests, including an end-to-end suite that drives the real CLI through user journeys (`tests/e2e`). On 2026-09-23 the document was brought in line with that code (`packages/croft/src`), which is the source of truth where the two differ; decisions the build refined carry a **Build:** note, and decisions it changed have their own entries from D54 on (§13).
 
 ## Thesis
 
@@ -112,13 +112,13 @@ Claude Code: CLAUDE.md and .claude/skills/croft/SKILL.md are ready.
 - If `~/.bun/bin` is not on `PATH`, `bunx croft …` inside the project resolves the same local binary.
 - **No `.env` values leak through the launcher.** The launcher itself runs as plain `bun`, so Bun may have loaded `.env` files from the current folder into it. The pinned copy gets an environment rebuilt without those values, and a copy that runs locally with them loaded starts itself again with `--no-env-file`. Deleting keys from `process.env` is not enough, because Bun spawns children with the environment it started with unless it is given one [V]. For the same reason every child croft spawns gets an explicit `env` (§9.8).
 
-The bin is `bin/croft.mjs`, a small plain-JavaScript entry. Its `#!/bin/sh` first line runs the file with `bun` when Bun is on `PATH` and with `node` otherwise, and prints `NEEDS_BUN` itself when neither runtime exists (`npx croft` on a machine without Bun). Under Node it answers `NEEDS_BUN`; under Bun it imports `src/cli/main.ts`. The CLI itself is TypeScript source with no build step. The one exception is `@zabaca/croft/read`, the helper apps import (§5). It ships as prebuilt JavaScript plus `.d.ts`, because Node refuses to strip types from files under `node_modules` (`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`) [V]. The built `read.js` ran under Node 24.3 and 24.20 [V].
+The bin is `bin/croft.mjs`, a small plain-JavaScript entry. Its `#!/bin/sh` first line runs the file with `bun` when Bun is on `PATH` and with `node` otherwise, and prints `NEEDS_BUN` itself when neither runtime exists (`npx croft` on a machine without Bun). Under Node it answers `NEEDS_BUN`; under Bun it imports `src/cli/main.ts`. The CLI itself is TypeScript source with no build step. The one exception is `@zabaca/croft/read`, the helper apps import (§5). It ships as prebuilt JavaScript plus `.d.ts`, because Node refuses to strip types from files under `node_modules` (`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`) [V]. The built `read.js` ran under Node 24.3 and 24.20 [V]. `npm pack` and `npm publish` build it through the package's `prepack` script, so a clean checkout ships it too (§10).
 
 **`croft init` in an empty folder** generates:
 
 | File | Contents |
 |---|---|
-| `croft.json` | `{"$schema": "./node_modules/@zabaca/croft/croft.schema.json", "database": "warehouse.duckdb", "timezone": "America/Los_Angeles"}`. The timezone is detected at init, so "daily at 06:00" keeps its meaning on a UTC server. Optional keys: `serve` (`{"port": 7447, "host": "127.0.0.1"}`), `readCopy` (default `false`), `notify` (desktop on by default), `concurrency`. |
+| `croft.json` | `{"$schema": "./node_modules/@zabaca/croft/croft.schema.json", "database": "warehouse.duckdb", "timezone": "America/Los_Angeles"}`. The timezone is detected at init, so "daily at 06:00" keeps its meaning on a UTC server. Optional keys: `serve` (`{"port": 7447, "host": "127.0.0.1"}`), `readCopy` (default `false`), `notify` (desktop on by default), `concurrency`. Keys that a later phase's feature reads (`readCopy`, `notify.*` and `serve.*`, all phase 3) are accepted and validated early; `croft docs config` marks them unused until then (`core/phase.ts`). |
 | `package.json` | `{"private": true, "type": "module", "dependencies": {"@zabaca/croft": "0.1.0"}, "devDependencies": {"@types/bun": "1.3.14", "typescript": "5.9.2"}}`, with exact pins |
 | `tsconfig.json` | strict, `moduleResolution: "bundler"`, `types: ["bun"]`, includes `assets` and `lib`. Editors and Claude get type errors. |
 | `.env` / `.env.example` | `# Secrets for your assets, e.g. GITHUB_TOKEN=...`. `.env` is git-ignored and created with mode 0600; an existing `.env` is never touched. |
@@ -310,6 +310,8 @@ export default ingest({
 - `link` follows `res.next` from the `Link` header.
 - `page` uses page numbers and is only safe for data that does not change during extraction.
 
+`croft new` is phase 5. Until then, the keyset, cursor and Link-header patterns, and the file ingests of §3b, are templates on the docs page `croft docs ingest` (D60).
+
 The skill states the rules in plain words (§9):
 
 - Use keyset only when the API sorts ascending by that field.
@@ -323,7 +325,7 @@ The skill states the rules in plain words (§9):
   - a text column gives a string cursor.
 
   One change is allowed later: a date cursor becomes a timestamp cursor when its column widens from DATE. A cursor field missing from every row of a non-empty batch is `UNKNOWN_COLUMN`, with a did-you-mean. A column of any other type, a `unit` on a non-integer column, or a type that differs from the saved cursor type is `CURSOR_TYPE_MISMATCH`.
-- **`since` keeps the source's JSON type.** A timestamp cursor receives the *original text* the API sent, for example `"2026-09-22T17:58:03Z"`. An integer cursor receives a number, or an exact digit string beyond ±2^53.
+- **`since` keeps the source's JSON type.** A timestamp cursor receives the *original text* the API sent, for example `"2026-09-22T17:58:03Z"`. An integer cursor receives a number, or an exact digit string beyond ±2^53. A text cursor converts nothing: `--from` takes a value written like the saved cursor and passes it through as is (§8).
 - **Typed maximum.** After staging, croft computes the maximum on the *typed* column in DuckDB, so timestamps with different offsets compare as instants. It then stores that row's original text.
 - **Commits with the data.** The cursor is saved in the same transaction as the rows.
 - **Never regresses.** The new cursor is `greatest(saved, loaded)`. Zero rows leave it unchanged.
@@ -388,12 +390,16 @@ How file ingests work:
   - A keyless incremental file ingest that loads identical rows from different files gets `DUPLICATE_ROWS_ACROSS_FILES`, with the fix "add a key".
 - **`map(row)`** is an optional per-row hook for cleaning values. It gives file ingests the same "clean it in code" fix that API ingests have.
 - **CSV and TSV** are read with `all_varchar = true` and typed by croft's rules (§7), never by DuckDB's sniffer. The sniffer read `01/02/2024` as 2024-02-01, but read the same file month-first when one `03/25/2024` row was present [V].
-- **Header detection.** DuckDB can only guess the header when some column is not text. A header-less export of names and cities silently lost its first data row [V]. So when `csv.header` is not declared and every sniffed column is text, the first load fails with `CSV_HEADER_AMBIGUOUS`. The error shows the first two lines and offers `csv: { header: true | false }`. Preview and the first run always print the header they used: a CSV ingest's first load carries `StepResult.csvHeader` (`{header, from: declared|sniffed|known, columns}`, where `known` means the cells match the stored columns), and the run prints `CSV header: first line (detected): a, b, …` or `CSV header: none (…); the first line is data, columns named …`.
+- **Header detection.** DuckDB can only guess the header when some column is not text. A header-less export of names and cities silently lost its first data row [V]. So when `csv.header` is not declared and every sniffed column is text, the first load fails with `CSV_HEADER_AMBIGUOUS`. The error shows the first two lines and offers `csv: { header: true | false }`. It is a first-load error only. Later loads reuse the header decision stored with the columns: named columns mean a header line, and `column0`, `column1`, … mean none. So after the first load a header-only file is an empty file (0 rows), and an all-text file with a new column name is read with its header. Preview and the first run always print the header they used: a CSV ingest's first load carries `StepResult.csvHeader` (`{header, from: declared|sniffed|known, columns}`, where `known` means the cells match the stored columns), and the run prints `CSV header: first line (detected): a, b, …` or `CSV header: none (…); the first line is data, columns named …`.
 - **Encoding.** croft reads CSV as UTF-8. If DuckDB reports invalid UTF-8, croft retries as `latin-1` and warns `CSV_ENCODING_GUESSED` [V]. `csv: { encoding: "latin-1" }` makes the choice explicit.
 - **JSON and NDJSON** go through the same pipeline as API rows.
 - **Parquet** keeps the file's types, except that nested types become `JSON` (§7).
 
-**Zero-asset path.** To look at a file without making an asset, run `croft query "from 'files/sales/*.csv'"` [V]. Paths are relative to the project folder, wherever croft was started. It works before anything has run: with no warehouse yet, `croft query` runs on a private in-memory DuckDB with the same sandbox (`files/` only), so file reads work and no database is created. A table named there is `DB_NOT_FOUND` when it is an asset (fix: `croft run <asset>`), and `UNKNOWN_TABLE` otherwise.
+**Zero-asset path.** To look at a file without making an asset, run `croft query "from 'files/sales/*.csv'"` [V]. Paths are relative to the project folder, wherever croft was started. It works before anything has run: with no warehouse yet, `croft query` runs on a private in-memory DuckDB with the same sandbox (`files/` only), so file reads work and no database is created. A table named there is `DB_NOT_FOUND` when it is an asset, and `UNKNOWN_TABLE` otherwise (with the closest asset name). The wording follows `runs.sqlite`, in three cases:
+
+- **Built before and now missing** (the catalog lists tables): the file was deleted or moved. The fix is manual and the user's: put it back, or point `database` in `croft.json` at it. A run would start a new, empty warehouse and refetch everything from the sources.
+- **Runs that wrote no table yet:** the fix is `croft run <asset>` for that one asset, not a bare `croft run`, which would fetch every ingest.
+- **Nothing run yet:** the same fix.
 
 ### (c) SQL transform
 
@@ -598,7 +604,7 @@ Cross-asset checks that need their own query (for example "every open issue has 
 
 ### Conventions
 
-- **JSON.** `--json` prints exactly one envelope to stdout (§4.3); progress and logs go to stderr.
+- **JSON.** `--json` prints exactly one envelope to stdout (§4.3); progress and logs go to stderr. Output of asset code, a subprocess's included, never reaches stdout (§5, "Asset console output").
 - **No interactivity off a TTY.** croft never prompts when stdin is not a TTY, and uses no colors or spinners when stdout is not a TTY or `NO_COLOR` is set.
 - **Truncation.** Output is truncated by default (50 rows, 80-character values, 3 sample rows), with a note on how to get more (`--limit`, `--full-values`).
 - **Exit codes:**
@@ -624,13 +630,13 @@ Cross-asset checks that need their own query (for example "every open issue has 
 |---|---|---|
 | Setup | `init [dir] [--claude] [--no-install]` | scaffold a project (or `data/` inside an existing app); `--claude` only refreshes the Claude files; inside a project, no `dir` means that project (§2) |
 | | `doctor` | environment plus project summary, under 1 s, no writes |
-| | `new <kind> <name>` / `new --list` | write a commented, working template. Kinds: `api [--pagination keyset\|cursor\|link\|page]`, `file`, `sql`, `transform` |
+| | `new <kind> <name>` / `new --list` | write a commented, working template. Kinds: `api [--pagination keyset\|cursor\|link\|page]`, `file`, `sql`, `transform`. Phase 5; phase 1 ships its ingest templates as the docs page `croft docs ingest` (D60) |
 | | `secrets [set NAME [--stdin]]` | list declared secrets as set or missing; `set` writes `.env` from a hidden prompt or stdin |
-| | `docs [topic\|ERROR_CODE]` / `docs --list` | offline docs for the installed version |
+| | `docs [topic\|ERROR_CODE]` / `docs --list` | offline docs for the installed version; the topics include `ingest` (API and file templates) and `config` (`croft.json`) |
 | Inspect | `context` | the whole project in one payload, for agents (capped at 20 KB; `--asset` filters) |
 | | `status [--check]` | freshness and health of every asset, and running runs; never waits on the database |
 | | `describe <asset>` | behavior in words, columns, JSON keys, reads/read by, checks, cursor, recent writes, samples |
-| | `query "<sql>"` | one SELECT against the warehouse (read-only, sandboxed); `--preview` targets the preview database |
+| | `query "<sql>"` | one SELECT against the warehouse (read-only, sandboxed); `--preview` targets the preview database (phase 2; phase 1 registers it only to refuse) |
 | | `logs [asset\|run-id] [--failed] [--runs] [--follow]` | console output and errors of a step; `--runs` lists past runs and steps |
 | Try | `validate [asset…] [--types]` | static checks and a bind check of every SQL asset; never touches the warehouse |
 | | `preview <asset…> [--rows N] [--rebuild]` | build in a sandbox and diff against the live tables |
@@ -644,6 +650,15 @@ Cross-asset checks that need their own query (for example "every open issue has 
 | Serve | `serve [--host h] [--port 7447]` | optional read server for apps over HTTP, with the scheduler built in; steps aside for every write (§5) |
 
 `croft tick` also exists as an internal command, run every minute by the per-user OS job and by `croft serve` (§8). It is not counted above and is not meant to be run by hand.
+
+**Which phase ships what** (D59). `core/phase.ts` is the manifest of which command, and which `run`, `query` and `init` flag, ships in which phase (§11). The registry must register exactly the current phase's commands.
+
+- Phase 1 has `init`, `doctor`, `docs`, `help`, `version`, `secrets`, `context`, `status`, `describe`, `query`, `logs`, `run`, `wait` and `confirm`. `validate` and `preview` come in phase 2; `schedule`, `serve` and `tick` in phase 3; `rename`, `delete` and `restore` in phase 4; and `new` in phase 5.
+- Of `run`'s flags, `--dry-run`, `--only` and `--upstream` are phase 2, `--due` phase 3 and `--rebuild` phase 4. `init --with-hook` is phase 5.
+- `query --preview` is phase 2, but phase 1 registers it so it can refuse with a clear message (the preview database comes in a later version) rather than as an unknown flag. No other later-phase flag is registered.
+- The manifest also lists the `croft.json` keys a later phase reads (§2).
+
+`agent/contract.test.ts` checks every agent-facing text against the manifest and the registry: CLAUDE.md, SKILL.md, every `croft docs` page, and every hint, fix, `next[]` entry and option description in the source. A `croft <command>` must exist in this build, and a `--flag` must be an option of that command and not one a later phase adds. So phase 1's hints name only phase-1 commands. Where the v1 text of a problem points at `readCopy`, `croft serve`, `croft restore`, `--rebuild` or `croft new` (such as the `--rebuild` fixes in §8's backfill table), phase 1 says what it can do instead, and the test's allowlist of known exceptions is empty.
 
 **`run` flags:**
 
@@ -867,7 +882,9 @@ Turn off: croft schedule off
   - `created?: {columns, jsonColumns}` when the step created the table (the source of "new table, 31 columns (7 JSON)" in §4.2), and `csvHeader?` on a CSV ingest's first load (§3b)
 - **Phase-1 honesty.** Checks are declared, listed and passed to the write, but nothing evaluates them until phase 2. So `run` and `wait` data carry `checksEnforced: false`, `describe` data has `checksEnforced` after `checks`, and `context` data has it after `assets`; human output says `checks: not enforced until phase 2`. All of it is removed when phase 2 runs checks (`core/phase.ts`).
 - **`confirm`:** `{token, command, result, outcome: used|not_needed|unused|running, note?}`. `result` is the confirmed command's own `data` (`null` in human mode, where its output passes through as is), and its problems, `next`, confirmation and exit carry over to the envelope. `outcome` says what became of the token (§6).
-- **`status`:** `{healthy, running: [{runId, asset, pid, since, phase, rowsFetched}], assets: [{asset, kind, rows, lastRun: {runId, at, status, code}, next: {at, reason}, stale, staleReasons[], held, edited, filesGone?, schemaChangedAt?}], scheduling: {state: "on"|"off"|"paused", via: "os-job"|"serve"|null, lastTickAt}, serve?: {url, pid}}`.
+- **`status`:** `{healthy, running: [{runId, asset, pid, since, phase, rowsFetched}], assets: [{asset, kind, file, status, rows, lastRun: {runId, at, status, code}, next: {at, reason}, stale, staleReasons[], held, edited, filesGone?, schemaChangedAt?}], scheduling: {state: "on"|"off"|"paused", via: "os-job"|"serve"|null, lastTickAt}, serve?: {url, pid}}`.
+  - An asset's `status` is `ok`, `failed`, `crashed`, `interrupted`, `running`, `skipped`, `never_run`, `no_asset_file` or `unknown`. `unknown` means it was built before but the warehouse file is missing; `rows` is then `null`, as it is for an asset never built.
+  - When the catalog lists tables but the database file is missing, `status` reports `DB_NOT_FOUND` with `healthy: false`, and `context` carries the same problem and the same `unknown` assets. Both check the file with a `stat`, without opening DuckDB (§3b gives the wording).
 - **`describe`:** `{asset, kind, file, behavior: {words, write, key, incremental: {kind, field, cursorValue, cursorType, unit, lookback}}, reads, readBy, columns: [{name, type, pinned, pending, sourceName, format, addedAt, jsonKeys, kinds}], inputsSeen: {input: {seenLoadedAt, inputLastLoadedAt, pendingRows}}, builtWithCodeHash, checks, recentWrites, samples}`.
 - **`validate`:** `{order, assets: [{name, kind, inputs, outputColumns: [{name, type}] | null, behavior, codeChanged}]}`. `outputColumns` comes from `prepare()`.
 - **`context`:** `{project, assets: [compact describe], running, held, recentFailures, recentSchemaChanges: [{asset, at, runId, kind, column, from, to, readBy}]}`, capped at 20 KB with `truncated: true`.
@@ -899,7 +916,7 @@ No process ever owns the database for writing, and there is no write daemon. Fiv
 2. **Detached runs.** Off a TTY, `croft run` always executes in a detached child process (`detached` + `unref`; a child outlived its parent and was reparented [V]). The invoking process follows the child's events for `--follow` (default 100 s) and prints the result if the run finished. Otherwise it returns exit 6 with the run id.
    - This keeps every run from being killed by Claude Code's shell timeout (120 s by default, 600 s at most). A killed run would lose all extraction work.
    - On a TTY, runs stay in the foreground, and `--foreground` forces that off a TTY too.
-   - The run folder `<state>/logs/<run>/` holds, besides the step logs, files whose names start with `_` (which no asset name can): `_process.log` (the child's own stdout and stderr), `_process.json` (the spawn handshake: the child's pid, start time and boot id, written by the parent), and `_not_started.json` (the problem of a child that refused to start, such as a `--from` that cannot apply, §8).
+   - The run folder `<state>/logs/<run>/` holds, besides the step logs, files whose names start with `_` (which no asset name can): `_process.log` (the child's own stdout and stderr, created with mode 0600; everything in it is redacted, including subprocess output that reaches it through the fd capture below), `_process.json` (the spawn handshake: the child's pid, start time and boot id, written by the parent), and `_not_started.json` (the problem of a child that refused to start, such as a `--from` that cannot apply, §8).
    - `croft wait` for a child that died before it recorded its run (kill -9, OOM, a reboot during a slow import) reports it `crashed` (exit 1, `RUN_CRASHED`) from the handshake, never "still running" forever.
    - A live run writes its progress `{asset, phase, rowsFetched, requests, elapsedMs}` to `runs.summary.progress` at most every 500 ms (and what changed inside a window at its end), which `status` and `context` show as `running[]`; the finished run's result replaces it.
 3. **The per-user scheduler job** (§8). Every minute it starts the project-pinned `croft tick` for each registered project that has scheduling on, and that tick spawns `croft run --due` for due work.
@@ -909,6 +926,15 @@ No process ever owns the database for writing, and there is no write daemon. Fiv
 Each command imports asset files fresh, so edits are always picked up. Each TS file is imported in isolation, so one broken file fails only its own asset.
 
 **Asset console output.** Asset code runs in croft's own process, so its `console.*` (and direct `process.stdout`/`process.stderr` writes) would otherwise land on croft's stdout, breaking the one `--json` envelope and printing secrets unredacted. Inside a run, top-level output of an asset (collected while it is imported) and everything `rows()` and `map()` print, however deep their async work goes (an `AsyncLocalStorage` scope per step), go to that step's log, redacted like every log, which `croft logs` shows. Commands that only import assets (`query`, `describe`, `context`, `secrets`) print top-level output on stderr, prefixed with the file and redacted. Output that escapes any scope goes to stderr, redacted; never to stdout.
+
+**Capture at the file descriptors** (D62). A subprocess (Bun Shell `$`, which prints by default; `Bun.spawn` or `child_process` with inherited stdio) and `Bun.write(Bun.stdout)` write to fds 1 and 2 directly, past `console` and `process.stdout`. So while asset code runs:
+
+- fds 1 and 2 point at an unlinked temporary file (`dup2` through `bun:ffi`, since Bun has no `dup2` of its own). A file, not a pipe, so a write to it never blocks.
+- croft writes its own output (the envelope, progress) to close-on-exec duplicates of its real stdout and stderr, so no subprocess inherits them.
+- croft reads the file back every 50 ms, when a capture ends and at exit, in whole lines. Captured output goes to the running step's log when exactly one step runs, and otherwise to stderr, redacted.
+- The CLI and the detached child keep the capture on until exit once asset code has run, so a subprocess that outlives its step cannot reach stdout either.
+
+So Bun Shell's `$` needs no `.quiet()` inside an asset: its output, and that of `Bun.spawn` with inherited stdio, goes to the step log, redacted. The limits: output from concurrent steps is not attributed to a step; a partial line is held until a newline arrives, its step ends or 64 KB build up; a native crash can lose the last ~50 ms of output; and there is no capture on Windows (or where `bun:ffi` cannot load libc).
 
 **Signals.** SIGINT and SIGTERM abort the run's `AbortSignal`. The in-flight step is recorded as `interrupted` (its transaction, if any, is discarded), and the process exits 130.
 
@@ -1313,7 +1339,11 @@ Otherwise the asset is skipped with `SCHEDULE_HELD`, and `status` shows it plain
 - **Columns** are never removed automatically.
 - **Types** widen only when the widening is proven lossless (§7).
 - **Changing ingest code never refetches.**
-- **Shrink guard.** A replace ingest that would remove more than half of its rows (including all of them) fails with `SHRINK_GUARD`, because an expired token that returns `[]` must not wipe the table. The error's fix is `{kind: "manual", requiresHuman: true}`: "find out why the source returned 0 of 265 rows before overriding". Its details include the request count, last status and body preview. `--allow-shrink` is a destructive operation: trash first, then confirmation. `allowShrink: true` in the asset produces the warning `SHRINK_GUARD_DISABLED`.
+- **Shrink guard.** A replace ingest that would remove more than half of its rows (including all of them) fails with `SHRINK_GUARD`, because an expired token that returns `[]` must not wipe the table. The error's fix is `{kind: "manual", requiresHuman: true}`: "find out why the source returned 0 of 265 rows before overriding". Its details include the request count, last status and body preview. `--allow-shrink` is a destructive operation: trash first, then confirmation. `allowShrink: true` in a replace ingest is a standing decision made in code (D63):
+  - Loading the asset gives the warning `SHRINK_GUARD_DISABLED`, so every run of the asset carries it.
+  - A shrink under it needs no confirmation, but the current rows still go to the trash first. The trash reason is `allowShrink: true (<run>)`, `StepResult.trashed` is set, and the write's own `SHRINK_GUARD_DISABLED` after the shrink carries `details.trashPath`.
+  - It wins over `--allow-shrink`, so no token is issued.
+  - On a merge or append ingest the key does nothing, since only replace ingests have a shrink guard, and the load warning says so instead.
 - **Behavior changes.** Changing an ingest's `key`, `write` mode or incremental field while it has data fails with `INGEST_CONFIG_CHANGED`. The fixes offered are:
   - revert the change;
   - `croft run x --rebuild`, which refetches from scratch (trash first, confirmation);
@@ -1339,7 +1369,8 @@ These do **not** need confirmation, because they are recomputable or reversible:
 
 - `run --rebuild` of a SQL or full-refresh TS transform;
 - `run --from` on a merge ingest (an upsert; the cursor never regresses);
-- `rename`.
+- `rename`;
+- a shrink of a replace ingest that sets `allowShrink: true` (the user decided in code, and the trash still comes first).
 
 **How confirmation works:**
 
@@ -1653,7 +1684,9 @@ A backfill is a flag, and it is defined per asset type:
 | file ingest | `BACKFILL_UNSUPPORTED`: "changed files reload automatically; `croft run x --rebuild` reloads all files" |
 | SQL / TS transform | `BACKFILL_UNSUPPORTED`: "use `croft run x --rebuild`" |
 
-`<when>` accepts `2026-06-24`, a full ISO timestamp, or a relative value (`-90d`, `-12h`, `today`). croft converts it to the cursor's type and echoes the conversion: `since: 1782284400 (2026-06-24T00:00:00-07:00)`. `run --dry-run --from -90d` shows the same without fetching.
+`<when>` accepts `2026-06-24`, a full ISO timestamp, or a relative value (`-90d`, `-12h`, `today`). croft converts it to the cursor's type and echoes the conversion: `since: 1782284400 (2026-06-24T00:00:00-07:00)`. `run --dry-run --from -90d` shows the same without fetching. Phase 1 has no `run --dry-run`: an agent checks the cursor with `croft describe <asset>` first, then backfills with `croft run <asset> --from <when>`.
+
+**A text cursor converts nothing** (D64). `--from` takes a value written like the saved cursor (`v0006` for `v0005`) and passes it through as is. A relative value or `today` is always `CURSOR_TYPE_MISMATCH`. So is a date or a timestamp, unless the saved cursor is written the same way (a date field pinned to VARCHAR, say). The error comes before the run, exits 2, and its hint shows the saved value. Before the first load there is no saved value, so only relative values and `today` are refused. The skill's backfill recipe (`--from -90d`) applies to time cursors only.
 
 A `--from` that cannot apply is refused before the run starts: no run is recorded and no step fails. An asset named exactly refuses the whole command (exit 2, the error above); in a bare `croft run --from …` or a glob, the assets it does not apply to are skipped with the reason. Refusals that need only the plan (`BACKFILL_UNSUPPORTED`) come from the invoking process; those that need the saved cursor (`BACKFILL_WOULD_DUPLICATE`) come from the detached child before it records the run, and the parent prints them as its own result.
 
@@ -1670,6 +1703,8 @@ A crash, a kill or a rate-limit failure late in a long first load must not force
 ## 9. Claude Code integration
 
 The agent has never seen this tool. Everything it needs ships inside the installed version, and `croft init --claude` refreshes it.
+
+**Each phase ships these texts cut to its commands** (D59). Items 1 and 2 are the full v1 texts, the target for later phases. A phase ships them cut (`src/agent/claude-md.md` and `skill.md`): lines that send the agent to a command, flag or feature the phase lacks are left out or reworded, and SKILL.md gains a "This version" section rendered from the manifest in `core/phase.ts`, naming the commands the build has, the ones it lacks and what it does not do yet. `agent/templates.test.ts` lists every cut line with its reason, so no rule below disappears unnoticed; it replaced a test that compared the files with this section verbatim. `agent/contract.test.ts` guarantees that every command named in agent-facing text exists in the build (§4.1).
 
 **1. The `CLAUDE.md` managed block:**
 
@@ -1782,7 +1817,7 @@ A test fails if any thrown code is unregistered or has no fix template and docs 
 
 **The codes:**
 
-- **Project:** `DUPLICATE_OUTPUT_COLUMN`, `DECIMAL_PRECISION_UNSUPPORTED`, `QUERY_PATH_DENIED`, `ASSET_INVALID`, `NAME_INVALID`, `NAME_RESERVED`, `NAME_CONFLICT`, `HEADER_UNKNOWN_KEY`, `SQL_SYNTAX`, `SQL_NOT_SELECT`, `SQL_NOT_ONE_STATEMENT`, `PIVOT_NEEDS_VALUES`, `CATALOG_PREFIX`, `SQL_READS_FILES`, `INPUT_NEEDS_KEY`, `UNKNOWN_TABLE`, `UNKNOWN_COLUMN`, `QUOTE_IDENTIFIER`, `UNDECLARED_INPUT`, `CYCLE`, `SCHEDULE_INVALID`, `CHECK_INVALID`, `SECRET_MISSING`, `INCREMENTAL_WITHOUT_KEY`, `CURSOR_TYPE_MISMATCH`, `ASSET_OPENS_DATABASE`, `ASSET_RENAMED`, `QUERY_NOT_SELECT`, `USAGE_ERROR` (bad flags or arguments), `PROJECT_NOT_FOUND`, `QUERY_FAILED` (DuckDB failed while binding or running a user query, §5), `CONFIG_INVALID` (`croft.json`), `DB_NOT_FOUND` (the warehouse does not exist yet).
+- **Project:** `DUPLICATE_OUTPUT_COLUMN`, `DECIMAL_PRECISION_UNSUPPORTED`, `QUERY_PATH_DENIED`, `ASSET_INVALID`, `NAME_INVALID`, `NAME_RESERVED`, `NAME_CONFLICT`, `HEADER_UNKNOWN_KEY`, `SQL_SYNTAX`, `SQL_NOT_SELECT`, `SQL_NOT_ONE_STATEMENT`, `PIVOT_NEEDS_VALUES`, `CATALOG_PREFIX`, `SQL_READS_FILES`, `INPUT_NEEDS_KEY`, `UNKNOWN_TABLE`, `UNKNOWN_COLUMN`, `QUOTE_IDENTIFIER`, `UNDECLARED_INPUT`, `CYCLE`, `SCHEDULE_INVALID`, `CHECK_INVALID`, `SECRET_MISSING`, `INCREMENTAL_WITHOUT_KEY`, `CURSOR_TYPE_MISMATCH`, `ASSET_OPENS_DATABASE`, `ASSET_RENAMED`, `QUERY_NOT_SELECT`, `USAGE_ERROR` (bad flags or arguments), `PROJECT_NOT_FOUND`, `QUERY_FAILED` (DuckDB failed while binding or running a user query, §5), `CONFIG_INVALID` (`croft.json`), `DB_NOT_FOUND` (no warehouse file; worded by `runs.sqlite` as built before and now missing, runs that wrote no table yet, or nothing run yet, §3b).
 - **Run:** `HTTP_ERROR`, `ASSET_CODE_ERROR`, `ROW_NOT_OBJECT`, `UNSERIALIZABLE_VALUE`, `CSV_HEADER_AMBIGUOUS`, `PIN_ROUNDED`, `DDL_AFTER_DML` (an internal invariant), `KEYSET_STUCK`, `TIMEOUT`, `INTERRUPTED`, `TYPE_CONFLICT`, `TYPE_PIN_VIOLATION`, `KEY_NULL`, `CHECK_FAILED`, `SHRINK_GUARD`, `INGEST_CONFIG_CHANGED`, `PIN_CHANGES_DATA`, `UNKNOWN_INPUT_COLUMN`, `BACKFILL_UNSUPPORTED`, `BACKFILL_WOULD_DUPLICATE`, `LARGE_REPROCESS`, `INTERNAL_ERROR` (a croft bug), `RUN_CRASHED` (a step whose process died before it committed, found by `reconcile()`).
 - **Coordination:** `DB_BUSY`, `DB_HELD_BY_OTHER_PROGRAM`, `ASSET_BUSY`, `SCHEDULE_HELD`, `SERVE_UNAVAILABLE`, `SERVE_UNAUTHORIZED` (a `401`/`403` from `croft serve`; exit 2, never retried), `SERVE_UNSAFE_FILESYSTEM`, `QUERY_TOO_MANY_ROWS`.
 - **Safety:** `CONFIRMATION_REQUIRED`, `CONFIRMATION_STALE`, `REQUIRES_HUMAN`.
@@ -1798,6 +1833,8 @@ A test fails if any thrown code is unregistered or has no fix template and docs 
 - `validate` (with output columns), `preview` (including `--rebuild` for drift);
 - `logs` (`--failed`, `--runs`), `secrets`, `doctor`, `docs internals`.
 
+Phase 1 has no `run --dry-run`, `validate` or `preview` (phase 2). It backfills with `croft run <asset> --from <when>`, checking the saved cursor first with `croft describe <asset>`.
+
 **6. Protecting the agent's context window:**
 
 - Row caps (50 in `query`; 3 samples in check failures, 20 in `--json`).
@@ -1805,6 +1842,13 @@ A test fails if any thrown code is unregistered or has no fix template and docs 
 - Logs default to the last 200 lines.
 - `context` capped at 20 KB.
 - `.env` values redacted (D54). Every `.env` value of 4 or more characters is redacted from messages, hints and logs. In command data (query rows, samples), declared secrets are always redacted, and any other `.env` value only when it looks like a credential: 8 or more characters, and not only letters or only digits. Otherwise `PORT=5432` or `LOG_LEVEL=info` would rewrite ordinary values the agent reasons from. `data` then carries `redactedValues: true` (§4.3). A declared secret set in the shell instead of `.env` is covered too: declaring the project's secret names (`ProjectEnv.declare()`) registers their shell values, so redaction hides them even when no `secret()` call handed them out.
+  - **A value is redacted in its renderings, not just its raw text** (D61):
+    - escaped, as in JSON (including `\/`, as PHP writes it), in `util.inspect`'s quoting, and as `\xHH` or `\uHHHH`, up to three levels of escaping;
+    - split over lines by `util.inspect`, which writes a multi-line string as `'…\n' +` continuation lines;
+    - each line of 8 or more characters of a multi-line value (a PEM key's body), on its own;
+    - URL and form encoding (space as `+`), with percent escapes in either hex case;
+    - for values of 8 or more characters, base64 and base64url, including the value inside a longer encoded credential such as a Basic auth header (at most the characters of two bytes at either edge remain).
+  - **Not covered:** other encodings (hex, gzip, encryption), and a value split across two writes of a stream.
 
 **7. What `init` deliberately does not write.** It does not write `.claude/settings.json`. Permission rules and hooks change what Claude Code may do without asking, so they stay the user's decision (D27).
 
@@ -1832,10 +1876,12 @@ Declaring `secrets` drives `doctor`, `validate`, error messages and what `ctx.se
 
 ## 10. Implementation layout
 
-**One package**, `@zabaca/croft` on npm, with bin `croft` → `bin/croft.mjs`, which imports `src/cli/main.ts` (§2). The command is plain `croft`, just as `@zabaca/zbc` ships the command `zbc`. The package root also ships `croft.schema.json` (draft-07), and `package.json` `files` lists `bin`, `src`, `dist` and `croft.schema.json`. Its exports:
+**One package**, `@zabaca/croft` on npm, with bin `croft` → `bin/croft.mjs`, which imports `src/cli/main.ts` (§2). The command is plain `croft`, just as `@zabaca/zbc` ships the command `zbc`. The package root also ships `croft.schema.json` (draft-07), and `package.json` `files` lists `bin`, `src`, `dist` and `croft.schema.json`, and leaves out tests, test kits and fixtures. Its exports:
 
 - `.` → `src/index.ts`
 - `./read` → `dist/read.js` + `dist/read.d.ts`, built from `src/read.ts` with `bun build --target node` and code splitting at publish time. Direct mode is a separate hashed chunk (`dist/read-*.js`) that `read.js` imports only on first use, so the entry never imports `@duckdb/node-api`. The `.d.ts` is generated from `src/read-types.ts`, and a build test typechecks one consumer against both `dist/read.d.ts` and `src/read.ts` to catch drift.
+
+**Packing.** `dist/` is git-ignored, so the build runs from `package.json`: the `prepack` and `build` scripts both run `scripts/build-read.ts`. `npm pack` or `npm publish` from a clean checkout therefore ships `dist/read.js`, `dist/read.d.ts` and their chunks. `tests/pack.test.ts` packs a copy without `dist/` and `node_modules` and checks the tarball.
 
 **Dependencies:**
 
@@ -1852,7 +1898,8 @@ src/
                        commands/*.ts
   core/                errors.ts (CroftError, code registry, fix templates, exit codes), types.ts,
                        time.ts (formatInstant, the one timestamp renderer), proc.ts (pid + start time + boot id),
-                       output.ts (asset console output → step log or stderr), phase.ts (checksEnforced, phase 1)
+                       output.ts (asset output, console and fds 1 and 2 → step log or stderr),
+                       phase.ts (the phase manifest: commands, flags and config keys by phase; checksEnforced)
   read/                run.ts (routing: url, serve.json, direct), http.ts (loopback over node:net, else fetch),
                        server.ts, direct.ts (lazy chunk; shared instance, intent wait), locate.ts, select.ts
   project/             root.ts (croft.json, .env, relocation), init.ts (empty folder, existing repo → data/),
@@ -1886,8 +1933,9 @@ src/
   safety/              trash.ts (ATTACH-based trash/restore), confirm.ts (tokens, impact hash, detached-run grants),
                        guards.ts (shrink, config change, pin change, hold), rename.ts, delete.ts, oob.ts (out-of-band
                        detection)
-  agent/               templates/* (api by pagination, file, sql, transform), skill.md, claude-md.md,
-                       docs/*.md (one page per topic and per error code; embedded; served by `croft docs`)
+  agent/               templates/* (api by pagination, file, sql, transform), skill.md, claude-md.md (each phase's
+                       cut of §9), docs/*.md (one page per topic and per error code; embedded; served by
+                       `croft docs`; phase 1's ingest templates are docs/ingest.md), contract.test.ts (§4.1)
 ```
 
 **Commands load lazily.** `cli/commands/index.ts` registers each command with `lazyCommand(spec, loader)`. The spec (`name`, `summary`, `usage`, `options`, `maxPositionals`, `humanShowsProblems`) is all that help, flag parsing and did-you-mean need. The module (`run`, `human`) is imported only when that command runs, so a broken DuckDB binding fails only the commands that need DuckDB, reported as `DUCKDB_BINDING_MISSING` or `DUCKDB_BINDING_LOAD` with the fix `croft doctor`. `docs`, `help` and `version` import nothing heavy and are what a broken install still answers with. A command whose human output shows its own problems (`doctor`) sets `humanShowsProblems`; otherwise `main.ts` appends the standard problem blocks.
@@ -2168,6 +2216,8 @@ Each phase is usable end to end, and each ships `--json`, error codes, docs page
 | **4. Grow safely** | monotone partial commits for cursor ingests (resumable first loads); full trash, `restore` and `delete` (whole table and `--where`); `--rebuild` rules; `--from` backfill matrix; `INGEST_CONFIG_CHANGED` and key conversion; `PIN_CHANGES_DATA`; `rename` and `ASSET_RENAMED`; drift warnings; `OUT_OF_BAND_CHANGE`; pre-upgrade backups; `EMPTY_EXTRACT` | long-lived sources and paid transforms change shape without refetching or losing data | ~2 weeks |
 | **5. Agent-grade release** | all templates (every pagination style), a docs page per code, JSON Schemas and golden tests, generated input types (`.croft/types`, so `validate --types` catches renames in TS), agent evals in CI, CI matrix (Bun floor and latest), opt-in hook, npm 0.1 | Claude Code operates a project from a cold start, measured by evals | ~1.5 weeks |
 
+**Phase 1 is complete** (2026-09-23). `core/phase.ts` records which command and flag ships in which phase (§4.1), and the agent texts are cut to match (§9, D59). Phase 1 has no `run --dry-run`, `validate` or `preview` (phase 2): it backfills with `croft run <asset> --from <when>`, checking the saved cursor first with `croft describe <asset>`. Its ingest templates are the docs page `croft docs ingest`, ahead of phase 5's `croft new` (D60).
+
 The total is about 14.5 engineer-weeks and roughly 14–16k lines. The user chose to ship all five phases as v1.
 
 **Post-v1 candidates, in order:**
@@ -2289,6 +2339,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Options: DuckDB's sniffer; `all_varchar` plus croft's rules.
 - Choice: `all_varchar` plus rules, with `union_by_name`, UTF-8 then latin-1 fallback, money parsing, and a date format decided once per column.
 - Reason: the sniffer flips date order [V]; globs without `union_by_name` drop late columns [V]; Excel exports are often latin-1 [V].
+- Build: `CSV_HEADER_AMBIGUOUS` is asked on the first load only. Later loads reuse the stored header decision (named columns, or `column0`, `column1`, …), so a header-only export or a new column name never asks again (§3b).
 
 **D15. Type conflicts. (rev)**
 - Options: widen to VARCHAR automatically; fail; quarantine.
@@ -2318,12 +2369,13 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Options: the JS maximum of strings; a typed maximum in DuckDB.
 - Choice: the typed maximum, stored as the original text, never regressing. The cursor type (timestamp, date, integer with unit, string) is fixed on the first load, and `since`, lookback and `--from` are rendered in that type.
 - Reason: this orders correctly across offsets, hands the API back exactly what it sent, and keeps epoch-second APIs from receiving ISO strings.
-- Build: the type is fixed by the first load with a non-null cursor value, and may later change once, from date to timestamp, after a DATE widen. Integer cursors beyond 2^53 reach `since` as exact digit strings (§3a).
+- Build: the type is fixed by the first load with a non-null cursor value, and may later change once, from date to timestamp, after a DATE widen. Integer cursors beyond 2^53 reach `since` as exact digit strings (§3a). A text cursor takes `--from` as is (D64).
 
 **D20. Pagination. (rev)**
 - Options: `http.paginate` presets; plain `get` plus templates.
 - Choice: plain `get`, with `croft new api --pagination keyset|cursor|link|page` and `KEYSET_STUCK`.
 - Reason: one obvious loop per API style. Keyset is safe only for ascending sorts [V].
+- Build: `croft new` is phase 5. Phase 1's keyset, cursor and Link templates are on the docs page `croft docs ingest` (D60).
 
 **D21. Big integers.**
 - Options: exact strings; `JSON.rawJSON` objects; `bigint`.
@@ -2371,6 +2423,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 **D31. Emptiness guard. (rev)**
 - Choice: `SHRINK_GUARD` above 50% loss for ingests. Its override is a destructive operation (trash + confirmation), and its fix requires a human.
 - Reason: the override was the one path that wiped irreplaceable data without the trash.
+- Build: revised by D63. `allowShrink: true` in the asset is a standing override that asks nothing but still trashes first.
 
 **D32. App access. (rev, superseded by D53)**
 - Options: an open-per-query helper on the live file; a read copy.
@@ -2488,6 +2541,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Options: redact every `.env` value everywhere (D26 as first written); redact declared secrets only; redact everything in free text, but in command data only declared secrets and values that look like credentials.
 - Choice: the third. Every `.env` value of 4 or more characters is redacted from messages, hints and logs. In command data (query rows, samples), declared secrets are always redacted, and other `.env` values only when they have 8 or more characters and are not only letters or only digits. `data` then carries `redactedValues: true`.
 - Reason: `.env` also holds ordinary settings (`PORT=5432`, `LOG_LEVEL=info`, `NODE_ENV=production`). Redacting them everywhere rewrote values in query rows that an agent reasons from, and silently. Free text can afford to over-redact, data cannot, and the flag says when data was altered.
+- Build: extended by D61. A value is redacted in its escaped, encoded and multi-line renderings too.
 
 **D55. Loopback HTTP in `@zabaca/croft/read`. (new, 2026-09-23)**
 - Options: `fetch` or `node:http` with proxy settings turned off; a minimal HTTP/1.1 client over `node:net` for loopback hosts.
@@ -2509,6 +2563,36 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Choice: latest-loaded ownership. A key's row belongs to the latest file that provided it, and files loaded together provide their keys in read order. A changed file's reload also reads the asset's other present files, so a key it dropped falls back to the most recently loaded file that still has it, and only a key no present file has is deleted. New files take over the keys they contain, and re-exporting an older file makes it the latest provider of its keys again (§3b).
 - Reason: the first build deleted a row that an unchanged, overlapping export still had, and no later run brought it back, which broke the "exports overlap; the key removes repeats" promise of the `sales.ts` example. Latest-loaded needs no naming convention for exports.
 - Open: "the export that sorts last wins" is the alternative. It is rebuild-invariant (a full reload gives the same table as the incremental history, which latest-loaded does not promise), and it would keep a re-exported January file from overriding February's rows. It needs export names that sort by date.
+
+**D59. Agent texts per phase. (new, 2026-09-23)**
+- Options: ship the v1 texts of §9 from phase 1 (the first build, whose test compared the files with §9 verbatim); ship them cut to each phase's commands, checked against a phase manifest.
+- Choice: the second. `core/phase.ts` records which command, `run`/`query`/`init` flag and later-phase `croft.json` key ships in which phase, and the registry must match it. Each phase ships §9 cut to its commands; SKILL.md's "This version" section renders from the manifest, and `agent/templates.test.ts` lists every cut line with its reason. `agent/contract.test.ts` scans CLAUDE.md, SKILL.md, every `croft docs` page and every hint, fix and `next[]` in the source, and fails on a command or flag the build lacks. `query --preview` is registered in phase 1 only so it can refuse. §9 keeps the full v1 texts as the target (§4.1, §9).
+- Reason: the v1 texts told a phase-1 agent to run `croft validate` after every edit, `croft preview` before a run and `croft new` for a new asset, and hints pointed at `croft serve`, `croft restore`, `readCopy` and `--rebuild`. Each was a `USAGE_ERROR` at the step the agent was told to take. A test against the registry keeps later edits honest, and the cut list keeps every §9 rule in view until its phase lands.
+
+**D60. Ingest templates before `croft new`. (new, 2026-09-23)**
+- Options: build `croft new` in phase 1; ship the templates as a docs page until `croft new` lands with every template in phase 5.
+- Choice: the docs page `croft docs ingest` (`src/agent/docs/ingest.md`), listed by `croft docs --list` as the topic `ingest`. It holds API templates for keyset, cursor and Link-header paging, and file ingests from a folder or a URL. A test type-checks every template against the public API and validates it as an asset.
+- Reason: the skill's rule is "start from a template, don't invent APIs", and phase 1 builds only ingests. A page needs no command, and the test keeps it from drifting from the API.
+
+**D61. Redacting every rendering of a value. (new, 2026-09-23; extends D54)**
+- Options: match a value's raw text and its `encodeURIComponent` form (the first build); match every common rendering of it.
+- Choice: every rendering listed in §9.6: escaped (JSON, `\/`, `util.inspect` quoting, `\xHH`/`\uHHHH`, up to three levels), `util.inspect`'s multi-line split, each line of 8+ characters of a multi-line value, URL and form encoding in either hex case, and base64/base64url for values of 8+ characters, inside a longer encoded credential too. Longer alternatives come first, escape runs are bounded so no text can make the pattern backtrack for long, and texts of 16 KB or more are prefiltered by literal anchors. Other encodings and a value split across two stream writes are not covered.
+- Reason: asset code rarely prints a secret raw. It prints it inside an object (`console.log` escapes it), serializes it, or gets it echoed back by an API: escaped, URL-encoded, or base64-encoded in a Basic auth header quoted in an error. Raw-text matching missed all of those.
+
+**D62. Capturing fds 1 and 2 while asset code runs. (new, 2026-09-23)**
+- Options: route `console.*` and `process.stdout`/`process.stderr` writes only (the first build); also capture the file descriptors.
+- Choice: capture them. While asset code runs, fds 1 and 2 point at an unlinked temporary file (`dup2` through `bun:ffi`), and croft writes its own output to close-on-exec duplicates of its real stdout and stderr. Captured lines go to the running step's log when exactly one step runs, and otherwise to stderr, redacted. The CLI and the detached child keep the capture on until exit (§5).
+- Reason: a subprocess (Bun Shell `$` prints by default) and `Bun.write(Bun.stdout)` write to the descriptors directly, so their output corrupted the one `--json` envelope and landed unredacted in `_process.log`. A file rather than a pipe means a write never blocks. No capture on Windows, where there is no `dup2`.
+
+**D63. `allowShrink: true` in an asset. (new, 2026-09-23; revises D31)**
+- Options: the first build, where the key did not reach the write, so the guard still stopped the load; the key asks like `--allow-shrink`; a standing decision that asks nothing but still trashes first.
+- Choice: the standing decision, for replace ingests. Loading the asset gives `SHRINK_GUARD_DISABLED`, so every run carries it. A shrink moves the current rows to the trash (reason `allowShrink: true (<run>)`, `StepResult.trashed` set), then writes without a token, and the write's own `SHRINK_GUARD_DISABLED` carries `details.trashPath`. It wins over `--allow-shrink`. On a merge or append ingest the key does nothing, and the warning says so (§6).
+- Reason: the user made the decision in code, so asking again at each shrink adds nothing. The trash keeps D31's promise that no override wipes ingested data without it.
+
+**D64. `--from` on a text cursor. (new, 2026-09-23; refines D19 and D44)**
+- Options: pass any value through (the first build); convert dates and relative values to text; refuse what text cannot compare.
+- Choice: pass a value written like the saved cursor through as is, and refuse the rest with `CURSOR_TYPE_MISMATCH` before the run (exit 2, the hint shows the saved value): a relative value or `today` always, and a date or timestamp unless the saved cursor is written the same way (§8).
+- Reason: text compares as text, so croft cannot turn a date or a relative time into a cursor value. The first build handed `-90d` or `2026-09-01` to the API as a filter it could not use. So the skill's `--from -90d` recipe is for time cursors only.
 
 ---
 
