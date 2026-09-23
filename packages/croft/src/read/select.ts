@@ -20,14 +20,19 @@ export function toDuck(v: unknown): DuckDBValue {
   return stringifyLossless(v);
 }
 
-/** Map a DuckDB error from a user's query to a coded CroftError. */
+/**
+ * Map a DuckDB error from a user's query to a coded CroftError. Errors that are not DuckDB's ("<Kind> Error:
+ * ...") are returned unchanged: they are croft bugs, not problems with the query.
+ */
 export function mapQueryError(err: unknown, profile: Profile): unknown {
   if (err instanceof CroftError) return err;
   const mapped = mapSandboxError(err, profile);
   if (mapped !== err) return mapped;
   if (!(err instanceof Error)) return err;
   const first = err.message.split("\n")[0]!;
-  const kind = first.match(/^([A-Za-z ]+?) Error: /)?.[1] ?? null;
+  // "Failed to bind value: Invalid Input Error: ..." comes from binding params; the kind follows the prefix.
+  const kind = first.match(/^(?:Failed to bind value: )?([A-Z][A-Za-z ]*?) Error: /)?.[1] ?? null;
+  if (kind === null) return err;
   const details = { duckdb: first, duckdbErrorType: kind };
   const table = first.match(/Table with name (\S+?) does not exist/)?.[1];
   if (kind === "Catalog" && table) {
@@ -37,19 +42,22 @@ export function mapQueryError(err: unknown, profile: Profile): unknown {
   if (kind === "Binder" && column) {
     return new CroftError("UNKNOWN_COLUMN", { message: first.replace(/^Binder Error: /, ""), hint: "check the column name (croft describe <table> lists them)", details });
   }
-  // Everything else is still a problem with the query text or its values (Binder, Conversion, Invalid
-  // Input, Out of Range, ...). There is no dedicated code for query runtime errors yet; SQL_SYNTAX is the
-  // closest "fix your SQL" code, and details.duckdbErrorType says what DuckDB reported.
-  return new CroftError("SQL_SYNTAX", { message: first, hint: "fix the query; DuckDB's message says what went wrong", details });
+  if (kind === "Parser") {
+    return new CroftError("SQL_SYNTAX", { message: first, hint: "fix the SQL near the reported position", details });
+  }
+  // Everything else went wrong while DuckDB bound or ran the query (Binder, Catalog, Conversion, Invalid
+  // Input, Out of Range, IO, ...); details.duckdbErrorType says which.
+  return new CroftError("QUERY_FAILED", { message: first, hint: "fix the query; DuckDB's message says what went wrong", details });
 }
 
 /**
  * Gate, bind and run one SELECT, reading at most limit + 1 rows: more than `limit` is QUERY_TOO_MANY_ROWS,
  * never a truncated result. runAndReadUntil converts only the chunks it needs into JS, and a partly read
  * materialized result did not keep the file locked once the statement, connection and instance were closed.
+ * The gate always protects the connection's own database files; `protect` adds more (the state folder).
  */
-export async function runSelect(conn: DuckDBConnection, req: SelectRequest, o: { timezone: string; profile: Profile }): Promise<Row[]> {
-  await assertOneSelect(conn, req.sql, { profile: o.profile });
+export async function runSelect(conn: DuckDBConnection, req: SelectRequest, o: { timezone: string; profile: Profile; protect?: string[] }): Promise<Row[]> {
+  await assertOneSelect(conn, req.sql, { profile: o.profile, protect: o.protect });
   let stmt;
   try {
     stmt = await conn.prepare(req.sql);

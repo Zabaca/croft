@@ -2,9 +2,9 @@
 // the launcher and `croft tick` read it without running user code. The validator is hand-written so
 // every message names the key, what was expected and what was found.
 import { createHash } from "node:crypto";
-import { readFileSync, statSync, statfsSync } from "node:fs";
+import { lstatSync, readFileSync, readlinkSync, statSync, statfsSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { CroftError, problem } from "../core/errors.ts";
 import { checkTimeZone, systemTimeZone } from "../core/time.ts";
 import type { Fix, Problem } from "../core/types.ts";
@@ -68,8 +68,11 @@ export type ConfigResult = { ok: true; config: CroftConfig } | { ok: false; issu
 
 type Locate = (path: string) => JsonPosition | undefined;
 
-/** Parse and validate the text of croft.json. */
-export function parseConfig(text: string): ConfigResult {
+/** Where a croft.json lives, so its paths can be checked against the project folder (and ~). */
+export interface ConfigPlace { root: string; home?: string }
+
+/** Parse and validate the text of croft.json. With `place`, stateDir and database are checked on disk too. */
+export function parseConfig(text: string, place?: ConfigPlace): ConfigResult {
   const scan = scanJson(text);
   if (!scan.ok) {
     return { ok: false, issues: [{
@@ -78,11 +81,11 @@ export function parseConfig(text: string): ConfigResult {
     }] };
   }
   const raw: unknown = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
-  return validateConfig(raw, (path) => scan.paths.get(path));
+  return validateConfig(raw, (path) => scan.paths.get(path), place);
 }
 
 /** Validate a parsed croft.json, collecting every issue rather than stopping at the first. */
-export function validateConfig(raw: unknown, locate: Locate = () => undefined): ConfigResult {
+export function validateConfig(raw: unknown, locate: Locate = () => undefined, place?: ConfigPlace): ConfigResult {
   const issues: ConfigIssue[] = [];
   const add = (path: string, message: string, hint: string, fix?: Fix) => {
     const at = locate(path);
@@ -216,8 +219,53 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined): 
   let stateDir: string | null = null;
   if (raw.stateDir !== undefined && raw.stateDir !== null) stateDir = str(raw, "stateDir", "stateDir", "") || null;
 
+  if (place && !issues.length) {
+    for (const i of locationIssues(database, stateDir, place)) add(i.path, i.message, i.hint);
+  }
+
   if (issues.length) return { ok: false, issues };
   return { ok: true, config: { database, timezone, readCopy, notify: { desktop, webhook }, concurrency, serve, stateDir } };
+}
+
+/**
+ * stateDir and database locations that would break the sandbox (DESIGN.md §5). stateDir goes into the warehouse
+ * connection's allowed_directories and files/ into croft query's, so SQL assets, checks and ctx.query can read
+ * everything under stateDir, and `croft query` everything under files/. §2 relocation writes both keys, so
+ * this is the last check before a bad value reaches DuckDB. Paths are resolved without opening anything.
+ */
+function locationIssues(database: string, stateDir: string | null, place: ConfigPlace): { path: string; message: string; hint: string }[] {
+  const home = place.home ?? homedir();
+  const paths = resolvePaths(place.root, { database, stateDir } as CroftConfig, home);
+  const real = (p: string) => physicalPath(p).path;
+  const inside = (p: string, dir: string) => p === dir || p.startsWith(dir.endsWith(sep) ? dir : dir + sep);
+  const root = real(place.root);
+  const db = real(paths.database);
+  const state = real(paths.stateDir);
+  const folders = [["files/", paths.filesDir], ["assets/", paths.assetsDir], ["lib/", paths.libDir]].map(([name, p]) => [name!, real(p!)] as const);
+  const out: { path: string; message: string; hint: string }[] = [];
+  const fixState = 'remove "stateDir" to use .croft/ in the project folder, or name a folder of its own such as "~/.local/share/croft/<project>/.croft"';
+  if (stateDir !== null) {
+    const found = `"stateDir" is ${show(stateDir)}`;
+    const folder = folders.find(([, f]) => inside(state, f) || inside(f, state));
+    if (inside(root, state)) {
+      out.push({ path: "stateDir", message: `${found}, which is or holds the project folder; SQL could then read .env and the warehouse file`, hint: fixState });
+    } else if (inside(real(home), state)) {
+      out.push({ path: "stateDir", message: `${found}, which is or holds your home folder; SQL could then read every file in it`, hint: fixState });
+    } else if (folder) {
+      out.push({ path: "stateDir", message: `${found}, which overlaps the project's ${folder[0]} folder; croft query could then read serve.json (the serve token) and runs.sqlite`, hint: fixState });
+    } else if (inside(db, state)) {
+      out.push({ path: "stateDir", message: `${found}, a state folder that is or holds the database ${show(database)}; SQL assets may read the state folder but must never reach the warehouse file`, hint: "keep the database outside the state folder" });
+    }
+  }
+  const name = basename(db);
+  if (inside(db, folders[0]![1])) {
+    out.push({ path: "database", message: `"database" is ${show(database)}, inside files/, which croft query may read; the warehouse must stay out of SQL's reach`, hint: `set "database" to "${DEFAULTS.database}"` });
+  } else if (stateDir === null && inside(db, state)) {
+    out.push({ path: "database", message: `"database" is ${show(database)}, inside the state folder .croft/, which SQL assets may read`, hint: `set "database" to "${DEFAULTS.database}"` });
+  } else if (name === "preview.duckdb" || name.endsWith(".read.duckdb")) {
+    out.push({ path: "database", message: `"database" is ${show(database)}, a reserved name: croft uses preview.duckdb for previews and <name>.read.duckdb for the read copy`, hint: `set "database" to "${DEFAULTS.database}"` });
+  }
+  return out;
 }
 
 /** One CONFIG_INVALID problem per issue (for `doctor` and `validate`, which report all of them). */
@@ -231,7 +279,7 @@ export function configProblems(issues: ConfigIssue[], file = CONFIG_FILE): Probl
 }
 
 /** Read and validate <root>/croft.json. Throws CONFIG_INVALID listing every issue. */
-export function readConfig(root: string): CroftConfig {
+export function readConfig(root: string, home?: string): CroftConfig {
   const file = join(root, CONFIG_FILE);
   let text: string;
   try {
@@ -243,7 +291,7 @@ export function readConfig(root: string): CroftConfig {
       file: CONFIG_FILE,
     });
   }
-  const result = parseConfig(text);
+  const result = parseConfig(text, { root, home });
   if (result.ok) return result.config;
   throw configError(result.issues);
 }
@@ -315,7 +363,7 @@ export function loadProject(opts: { cwd?: string; root?: string; home?: string }
   const cwd = resolve(opts.cwd ?? process.cwd());
   const root = opts.root ? resolve(opts.root) : findRoot(cwd);
   if (!root || !isFile(join(root, CONFIG_FILE))) throw notFound(opts.root ? resolve(opts.root) : cwd, !!opts.root);
-  const config = readConfig(root);
+  const config = readConfig(root, opts.home);
   const paths = resolvePaths(root, config, opts.home);
   const inside = (p: string) => p === root || p.startsWith(root + sep);
   return {
@@ -384,6 +432,45 @@ function networkFilesystem(path: string): string | null {
 function isWsl(): boolean {
   if (process.env.WSL_DISTRO_NAME) return true;
   try { return /microsoft/i.test(readFileSync("/proc/version", "utf8")); } catch { return false; }
+}
+
+/**
+ * The path the OS resolves `path` to, found without opening anything. Bun's realpath opens the file (open +
+ * F_GETPATH on macOS), and closing that descriptor releases this process's DuckDB lock on it (§5, hazard 3);
+ * it also normalizes `..` lexically first. So symlinks are followed here one component at a time with lstat
+ * and readlink, and `..` after a symlink goes up from its target, as open(2) does. A missing tail is appended
+ * to the resolved part as written (`exists: false`). Relative paths resolve against `cwd`.
+ */
+export function physicalPath(path: string, cwd = process.cwd()): { path: string; exists: boolean } {
+  const queue = (isAbsolute(path) ? path : `${cwd}/${path}`).split("/").filter((s) => s !== "" && s !== ".");
+  let cur = ""; // resolved so far, without symlinks; "" is the file system root
+  let hops = 0;
+  while (queue.length) {
+    const part = queue.shift()!;
+    if (part === "..") {
+      cur = cur.slice(0, cur.lastIndexOf("/"));
+      continue;
+    }
+    const next = `${cur}/${part}`;
+    let st;
+    try {
+      st = lstatSync(next);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return { path: resolve(next, ...queue), exists: false };
+      throw e;
+    }
+    if (st.isSymbolicLink()) {
+      if (++hops > 40) throw Object.assign(new Error(`too many symbolic links in ${path}`), { code: "ELOOP" });
+      const target = readlinkSync(next);
+      queue.unshift(...target.split("/").filter((s) => s !== "" && s !== "."));
+      if (target.startsWith("/")) cur = "";
+      continue;
+    }
+    if (queue.length && !st.isDirectory()) return { path: resolve(next, ...queue), exists: false };
+    cur = next;
+  }
+  return { path: cur || "/", exists: true };
 }
 
 function expandHome(p: string, home: string): string {

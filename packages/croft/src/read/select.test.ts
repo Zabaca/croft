@@ -1,7 +1,44 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { linkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
+import { directQuery } from "./direct.ts";
 import { mapQueryError, toDuck, wireSafe } from "./select.ts";
+import { cleanup, makeProject } from "./testkit.ts";
 import { stringifyLossless, tooManyRows } from "./wire.ts";
+
+afterAll(() => cleanup());
+
+describe("direct mode goes through the full gate", () => {
+  const FAST = { intentWaitMs: 200, lockRetryMs: 300, pollMs: 20 };
+  const req = (sql: string) => ({ sql, params: [], limit: 100 });
+  async function rejection(p: Promise<unknown>): Promise<CroftError> {
+    try {
+      await p;
+    } catch (e) {
+      if (e instanceof CroftError) return e;
+      throw e;
+    }
+    throw new Error("expected a CroftError");
+  }
+
+  test("an app's query cannot read the warehouse file it has open, by any name, nor run side effects", async () => {
+    const p = await makeProject({ seed: ["CREATE TABLE t AS SELECT 1 AS a"] });
+    writeFileSync(join(p.root, "files", "a.csv"), "x\n1\n");
+    linkSync(p.database, join(p.root, "files", "copy.bin"));
+    for (const sql of [
+      `SELECT octet_length(content) AS n FROM read_blob('${p.database}')`,
+      `SELECT octet_length(content) AS n FROM read_blob('${join(p.root, "files", "copy.bin")}')`,
+      `SELECT * FROM '${join(p.root, "files", "..", "warehouse.duckdb")}'`,
+    ]) {
+      expect([sql, (await rejection(directQuery(p.project, req(sql), FAST))).code]).toEqual([sql, "QUERY_PATH_DENIED"]);
+    }
+    const e = await rejection(directQuery(p.project, req("SELECT * FROM enable_logging(storage = 'stdout')"), FAST));
+    expect(e.code).toBe("QUERY_NOT_SELECT");
+    // Files under files/ are still fine.
+    expect(await directQuery(p.project, req(`SELECT * FROM read_csv('${join(p.root, "files", "a.csv")}')`), FAST)).toEqual([{ x: 1 }]);
+  });
+});
 
 describe("wireSafe", () => {
   test("in-process rows equal their JSON round trip", () => {
@@ -47,10 +84,32 @@ describe("errors", () => {
     const column = mapQueryError(new Error('Binder Error: Referenced column "creatd_at" not found in FROM clause!'), "query") as CroftError;
     expect(column.code).toBe("UNKNOWN_COLUMN");
     const other = mapQueryError(new Error("Out of Range Error: Overflow in multiplication"), "query") as CroftError;
-    expect(other.code).toBe("SQL_SYNTAX");
+    expect(other.code).toBe("QUERY_FAILED");
     expect(other.problem.details).toMatchObject({ duckdbErrorType: "Out of Range" });
     const denied = mapQueryError(new Error('Permission Error: Cannot access file "/etc/hosts" - file system operations are disabled by configuration'), "query") as CroftError;
     expect(denied.code).toBe("QUERY_PATH_DENIED");
     expect(mapQueryError("not an error", "query")).toBe("not an error");
+  });
+
+  test("runtime errors in a user's query are QUERY_FAILED, not SQL_SYNTAX; parser errors stay SQL_SYNTAX", () => {
+    for (const [msg, kind] of [
+      ["Conversion Error: Could not convert string 'abc' to INT32", "Conversion"],
+      ["Invalid Input Error: Malformed JSON at byte 0 of input", "Invalid Input"],
+      ["Out of Range Error: Overflow in multiplication of INT32 (2147483647 * 2)!", "Out of Range"],
+      ["Binder Error: No function matches the given name and argument types 'lower(INTEGER)'", "Binder"],
+      ["Catalog Error: Scalar Function with name nope does not exist!", "Catalog"],
+      ["IO Error: No files found that match the pattern \"files/missing.csv\"", "IO"],
+      ["Interrupt Error: Interrupted!", "Interrupt"],
+      ["Failed to bind value: Invalid Input Error: Can not bind to parameter number 2, statement only has 1 parameter(s)", "Invalid Input"],
+    ] as const) {
+      const e = mapQueryError(new Error(`${msg}\nLINE 1: ...`), "query") as CroftError;
+      expect([msg, e.code]).toEqual([msg, "QUERY_FAILED"]);
+      expect(e.message).toBe(msg);
+      expect(e.problem.details).toMatchObject({ duckdb: msg, duckdbErrorType: kind });
+    }
+    expect((mapQueryError(new Error("Parser Error: syntax error at or near \"x\""), "query") as CroftError).code).toBe("SQL_SYNTAX");
+    // A JavaScript error is a croft bug, not a problem with the query: it passes through unchanged.
+    const bug = new TypeError("cannot read properties of undefined");
+    expect(mapQueryError(bug, "query")).toBe(bug);
   });
 });
