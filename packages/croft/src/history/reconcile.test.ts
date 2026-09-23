@@ -130,7 +130,7 @@ describe("reconcile", () => {
       rowsIn: 120, added: 100, updated: 20, error: null });
     const lost = db.getStep(run.id, "customers", 2)!;
     expect(lost).toMatchObject({ status: "crashed", reason: "input_changed" });
-    expect(lost.error).toMatchObject({ code: "INTERRUPTED", asset: "customers", runId: run.id, retryable: true,
+    expect(lost.error).toMatchObject({ code: "RUN_CRASHED", asset: "customers", runId: run.id, retryable: true,
       fix: { kind: "command", command: "croft run customers" } });
     expect(db.getStep(run.id, "refs", 1)?.status).toBe("unchanged");
     expect(listLeases(db)).toEqual([]);

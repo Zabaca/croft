@@ -315,7 +315,7 @@ describe("crash recovery with a real DuckDB file", () => {
         expect(r.stagingDirs).toEqual([join(dir, "staging", runId)]);
         expect(r.problems).toEqual([]);
         expect(db.getStep(runId, "orders", 1)).toMatchObject({ status: "ok", reason: "requested (recovered)", rowsIn: 1000, added: 1000 });
-        expect(db.getStep(runId, "customers", 1)?.error?.code).toBe("INTERRUPTED");
+        expect(db.getStep(runId, "customers", 1)?.error?.code).toBe("RUN_CRASHED");
         expect(tryAcquire(db, ["orders", "customers"], "r_next").ok).toBe(true);
 
         // DuckDB agrees: the committed rows are there, the uncommitted table is not.

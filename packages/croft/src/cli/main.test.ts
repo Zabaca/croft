@@ -278,7 +278,7 @@ describe("context", () => {
     const root = dir({ "croft.json": '{"timezone": "Pacific"}' });
     const r = await run(["proj", "--json"], { cwd: root, commands: ALL });
     expect(r.exit).toBe(2);
-    expect(envelope(r.stdout).problems[0]).toMatchObject({ code: "USAGE_ERROR", file: "croft.json", line: 1, column: 2 });
+    expect(envelope(r.stdout).problems[0]).toMatchObject({ code: "CONFIG_INVALID", file: "croft.json", line: 1, column: 2 });
     const docs = await run(["docs", "config", "--json"], { cwd: root });
     expect(docs.exit).toBe(0);
     expect(envelope(docs.stdout).database).toBe("");

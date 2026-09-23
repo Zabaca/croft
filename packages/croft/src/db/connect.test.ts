@@ -156,7 +156,7 @@ describe("time zone", () => {
     }
   });
 
-  test("an unknown zone is a USAGE_ERROR", async () => {
+  test("an unknown zone is CONFIG_INVALID", async () => {
     const p = project();
     const { instance, path } = await openInstance(p.db, "read_write");
     cleanup.push(() => instance.closeSync());
@@ -166,7 +166,7 @@ describe("time zone", () => {
     } catch (e) {
       caught = e;
     }
-    expect((caught as CroftError).code).toBe("USAGE_ERROR");
+    expect((caught as CroftError).code).toBe("CONFIG_INVALID");
   });
 });
 

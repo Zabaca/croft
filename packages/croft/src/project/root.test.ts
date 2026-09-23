@@ -111,13 +111,13 @@ describe("loadProject", () => {
     expect((err as CroftError).problem.hint).toContain("croft init");
   });
 
-  test("an invalid croft.json throws USAGE_ERROR listing every problem", () => {
+  test("an invalid croft.json throws CONFIG_INVALID listing every problem", () => {
     const root = project('{\n  "timezone": "Pacific",\n  "readCopy": "yes",\n  "serve": { "port": 0 }\n}\n');
     let err: unknown;
     try { readConfig(root); } catch (e) { err = e; }
     expect(err).toBeInstanceOf(CroftError);
     const e = err as CroftError;
-    expect(e.code).toBe("USAGE_ERROR");
+    expect(e.code).toBe("CONFIG_INVALID");
     expect(e.exit).toBe(2);
     expect(e.message).toBe([
       "croft.json has 3 problems:",
@@ -207,10 +207,10 @@ describe("croft.json validation messages", () => {
     if (r.ok) expect(r.config.serve.allowOrigins).toEqual(["http://localhost:3000"]);
   });
 
-  test("configProblems gives one USAGE_ERROR per issue", () => {
+  test("configProblems gives one CONFIG_INVALID per issue", () => {
     const ps = configProblems(issues('{\n  "timezone": "Pacific",\n  "concurrency": 0\n}'));
     expect(ps).toHaveLength(2);
-    expect(ps[0]).toMatchObject({ severity: "error", code: "USAGE_ERROR", file: "croft.json", line: 2, column: 3, docs: "croft docs USAGE_ERROR" });
+    expect(ps[0]).toMatchObject({ severity: "error", code: "CONFIG_INVALID", file: "croft.json", line: 2, column: 3, docs: "croft docs CONFIG_INVALID" });
     expect(ps[1]!.fix).toEqual({ kind: "manual", description: 'set "concurrency" to a number like 4' });
   });
 });

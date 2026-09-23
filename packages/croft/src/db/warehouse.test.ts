@@ -364,7 +364,7 @@ describe("one warehouse per path and mode", () => {
 
   test("a read-only open of a missing warehouse says so", async () => {
     const e = await rejection(wh(project(), { mode: "read_only" }).read(async () => {}, { purpose: "q" }));
-    expect(e.code).toBe("USAGE_ERROR");
+    expect(e.code).toBe("DB_NOT_FOUND");
     expect(e.message).toContain("does not exist yet");
   });
 
