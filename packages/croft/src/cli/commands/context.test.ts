@@ -34,7 +34,8 @@ describe("croft context --json", () => {
     expect(r.exit).toBe(0);
     expect(r.json).toMatchObject({ ok: true, command: "context", problems: [], next: [] });
     const d = r.json.data as ContextData;
-    expect(Object.keys(d)).toEqual(["project", "assets", "running", "held", "recentFailures", "recentSchemaChanges", "schemaChangesFrom", "truncated"]);
+    expect(Object.keys(d)).toEqual(["project", "assets", "checksEnforced", "running", "held", "recentFailures", "recentSchemaChanges", "schemaChangesFrom", "truncated"]);
+    expect(d.checksEnforced).toBe(false);
     expect(d.project).toEqual({ root: p.root, database: "warehouse.duckdb", timezone: "America/Los_Angeles", assets: 6, scheduling: { state: "off", via: null } });
     expect(byAsset(d).github_issues).toEqual({
       asset: "github_issues", kind: "ingest", file: "assets/github_issues.ts", description: "Issues of oven-sh/bun",
@@ -177,7 +178,7 @@ describe("the 20 KB cap", () => {
     });
     const d: ContextData = {
       project: { root: "/p", database: "w", timezone: "UTC", assets: 3, scheduling: { state: "off", via: null } },
-      assets: [asset(1), asset(2), asset(3)], running: [], held: [], recentFailures: [], recentSchemaChanges: [], schemaChangesFrom: "warehouse", truncated: false,
+      assets: [asset(1), asset(2), asset(3)], checksEnforced: false, running: [], held: [], recentFailures: [], recentSchemaChanges: [], schemaChangesFrom: "warehouse", truncated: false,
     };
     const size = Buffer.byteLength(toJsonLine(d));
     expect(capContext(d, size)).toBe(d);
@@ -207,5 +208,6 @@ describe("croft context: human output", () => {
     expect(r.stdout).toContain("Recent schema changes (7 days)");
     expect(r.stdout).toContain("  github_issues + updated_at TIMESTAMPTZ 60 min ago");
     expect(r.stdout).toContain("taxi_zones · ingest · assets/taxi_zones.ts · 265 rows · crashed (croft logs taxi_zones --failed) · 2 files gone");
+    expect(r.stdout.split("\n")).toContain("checks: not enforced until phase 2");
   });
 });

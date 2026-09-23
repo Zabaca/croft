@@ -24,7 +24,7 @@ const ZAP: Command<{ zapped: string; rows: number } | null> = {
   usage: "croft zap <asset> [--force]",
   options: {
     force: { type: "boolean", description: "test flag that must survive the round trip" },
-    "confirm-token": { type: "string", description: "(internal) set by croft confirm" },
+    "confirm-token": { type: "string", hidden: true, description: "set by croft confirm" },
   },
   maxPositionals: 1,
   async run(ctx) {
@@ -52,7 +52,7 @@ const ZAP: Command<{ zapped: string; rows: number } | null> = {
 
 // A command that takes a token but never checks it: croft confirm must catch that bug.
 const LAX: Command = {
-  name: "lax", summary: "test", usage: "croft lax", options: { "confirm-token": { type: "string", description: "" } },
+  name: "lax", summary: "test", usage: "croft lax", options: { "confirm-token": { type: "string", hidden: true, description: "" } },
   async run() {
     return { data: { done: true }, problems: [], next: [] };
   },

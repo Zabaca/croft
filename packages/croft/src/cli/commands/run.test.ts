@@ -267,10 +267,13 @@ describe("in-process command", () => {
     expect(r.exit).toBe(0);
     const lines = r.stdout.split("\n");
     expect(lines[0]).toMatch(/^run r_\d{4}_\d{4}_[0-9a-z]{4} · 1 asset$/);
-    expect(lines[1]).toMatch(/^ok\s+zones\s+1 request, 2 rows \(\d+ ms\)$/);
+    // §4.2: the first run says it created the table.
+    expect(lines[1]).toMatch(/^ok\s+zones\s+1 request, 2 rows \(\d+ ms\) · new table, 2 columns$/);
     expect(lines[2]).toContain("added 2 · updated 0 · unchanged 0 · 2 rows now");
-    expect(r.stdout).toMatch(/done \d+ ms · 1 updated · 0 failed/);
+    expect(r.stdout).toMatch(/done \d+ ms · 1 updated · 0 failed\nchecks: not enforced until phase 2\n/);
     expect(r.stdout).toContain('next: croft query "from zones limit 5"');
+    const again = await inProcess(root, ["run", "zones", "--foreground"]);
+    expect(again.stdout.split("\n")[1]).toMatch(/^ok\s+zones\s+1 request, 2 rows \(\d+ ms\)$/);
   });
 
   test("on a TTY the run stays in this process and shows progress on stderr", async () => {
@@ -285,13 +288,17 @@ describe("in-process command", () => {
     expect(runId.pid).toBe(process.pid);
   });
 
-  test("--from=-90d reaches the engine and the since conversion is echoed in the step", async () => {
+  test("--from -90d and --from=-90d reach the engine and the since conversion is echoed in the step", async () => {
     api.state.issues = [{ id: 1, title: "a", updated_at: "2026-09-01T10:00:00Z" }];
     const root = makeProject({ "assets/issues.ts": keysetIssues(api.url) });
-    const r = await inProcess(root, ["run", "issues", "--from=-90d", "--foreground", "--json"]);
-    expect(r.exit).toBe(0);
-    expect(r.json.data.steps[0].reason).toMatch(/^requested; since: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}-0[78]:00\)$/);
-    expect(api.state.log[0]!.query.since).toBeDefined();
+    for (const from of [["--from=-90d"], ["--from", "-90d"]]) {
+      api.state.log.length = 0;
+      const r = await inProcess(root, ["run", "issues", ...from, "--foreground", "--json"]);
+      expect(r.exit).toBe(0);
+      expect(r.json.data.checksEnforced).toBe(false);
+      expect(r.json.data.steps[0].reason).toMatch(/^requested; since: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}-0[78]:00\)$/);
+      expect(api.state.log[0]!.query.since).toBeDefined();
+    }
   });
 
   test("progressLine", () => {
@@ -308,6 +315,16 @@ describe("in-process command", () => {
     });
     expect(text).toContain("run r_0922_1130_x1c8 is still running (a: extract, 61,200 rows, 612 requests, 1 min 40 s)");
     expect(text).toContain("failed   b                  HTTP_ERROR: GET x failed (attempt 3 of 3)");
+  });
+
+  test("formatRun: a step that created its table says so (§4.2)", () => {
+    const text = formatRun({
+      runId: "r_0922_1015_k3f9", status: "succeeded",
+      steps: [{ asset: "github_issues", status: "ok", reason: "requested", behavior: "merge by id", attempt: 1, maxAttempts: 3, requests: 184,
+        rows: { in: 18342, added: 18342, updated: 0, unchanged: 0, deleted: 0, total: 18342 }, schemaChanges: [], checks: [],
+        logsCommand: "croft logs github_issues", durationMs: 41_200, created: { columns: 31, jsonColumns: 7 } }],
+    });
+    expect(text.split("\n")[1]).toBe("ok       github_issues      184 requests, 18,342 rows (41.2 s) · new table, 31 columns (7 JSON)");
   });
 
   test("userArgs drops the hidden flags", () => {
@@ -331,7 +348,7 @@ describe("init HOOK(example)", () => {
     expect(existsSync(eventsPath(join(root, ".croft"), withRuns(root, (db) => db.listRuns()[0]!.id)))).toBe(true);
   });
 
-  test("croft init's scaffold: the file ingest runs through the engine (or reports why it could not)", async () => {
+  test("croft init's scaffold: the file ingest runs through the engine", async () => {
     const base = makeProject({});
     const target = join(base, "fresh");
     const r = await initProject({
@@ -342,9 +359,8 @@ describe("init HOOK(example)", () => {
       },
       runExample: (root) => runExample(root, { env: {} }),
     });
-    expect(r.example.ran).toBe(true);
-    if (r.example.ran && r.example.ok) expect(r.example.rows).toBe(120);
-    else if (r.example.ran) expect(r.example.problems?.[0]?.message).toMatch(/not implemented yet|extractFiles/);
+    // load/files.ts is in: the scaffold's example_sales.csv loads in full.
+    expect(r.example).toMatchObject({ ran: true, ok: true, asset: "example_sales", rows: 120 });
   });
 
   test("the init command wires runExample at HOOK(example)", () => {

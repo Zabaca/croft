@@ -165,8 +165,8 @@ export interface FileBatch extends TypedBatch {
 }
 
 /** A client that can hand back a response's raw bytes. HttpResponse.text is decoded as UTF-8, which would corrupt
- *  Parquet and latin-1 files, so extractFiles downloads through `getBytes` when ctx.http has it, and otherwise
- *  through its own fetch with the same retry rules. */
+ *  Parquet and latin-1 files, so extractFiles downloads through `getBytes` (ctx.http, from http/http.ts, has it),
+ *  and through its own fetch with the same retry rules when handed a plain Http without it. */
 export interface ByteHttp {
   getBytes(url: string, init?: HttpInit): Promise<HttpResponse & { bytes: Uint8Array }>;
 }
@@ -583,8 +583,14 @@ const DOWNLOAD = { retries: 3, timeoutMs: 600_000, retryBaseMs: 500, maxRetryAft
 async function download(http: Http, url: string, headers: Record<string, string>, signal: AbortSignal, asset: string, runId: string): Promise<Download> {
   const bytesHttp = http as Partial<ByteHttp>;
   if (typeof bytesHttp.getBytes === "function") {
-    const res = await bytesHttp.getBytes(url, { headers });
-    return { status: res.status, url: res.url, headers: res.headers, bytes: res.bytes };
+    try {
+      // A whole file may take longer than an API page: the download's own timeout, not ctx.http's 30 s.
+      const res = await bytesHttp.getBytes(url, { headers, timeoutMs: DOWNLOAD.timeoutMs });
+      return { status: res.status, url: res.url, headers: res.headers, bytes: res.bytes };
+    } catch (e) {
+      if (signal.aborted) throw abortError(signal, asset, runId);
+      throw e;
+    }
   }
   for (let attempt = 1; ; attempt++) {
     if (signal.aborted) throw abortError(signal, asset, runId);

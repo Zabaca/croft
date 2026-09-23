@@ -28,8 +28,10 @@ describe("croft describe --json", () => {
     const d = r.json.data;
     expect(Object.keys(d)).toEqual([
       "asset", "kind", "file", "description", "next", "behavior", "reads", "readBy", "rows", "columns", "inputsSeen",
-      "builtWithCodeHash", "checks", "recentWrites", "recentRuns", "samples", "truncatedValues", "source",
+      "builtWithCodeHash", "checks", "checksEnforced", "recentWrites", "recentRuns", "samples", "truncatedValues", "source",
     ]);
+    // Phase 1 lists checks but does not run them, and says so (core/phase.ts).
+    expect(d.checksEnforced).toBe(false);
     expect(d).toMatchObject({
       asset: "github_issues", kind: "ingest", file: "assets/github_issues.ts", description: "Issues of oven-sh/bun",
       next: { at: null, reason: "manual" }, reads: [], readBy: [], rows: 3, inputsSeen: {}, builtWithCodeHash: "hash-1",
@@ -197,7 +199,9 @@ describe("croft describe: human output", () => {
     expect(lines).toContain("Cursor     updated_at = 2026-09-22T10:00:00Z");
     expect(lines).toContain("Table      3 rows · 6 columns · last write 2026-09-22T11:00:00-07:00 (+1 added, 0 updated)");
     expect(r.stdout).toContain("Columns    id BIGINT · title VARCHAR · state VARCHAR · labels JSON {color, name} · user JSON {id, login, site_admin} · updated_at TIMESTAMPTZ");
-    expect(lines).toContain("Checks     unique(id) · not_null(id) · not_null(title) · state IN ('open', 'closed')");
+    const checks = lines.indexOf("Checks     unique(id) · not_null(id) · not_null(title) · state IN ('open', 'closed')");
+    expect(checks).toBeGreaterThan(0);
+    expect(lines[checks + 1]).toBe("           checks: not enforced until phase 2");
     expect(r.stdout).toMatch(/Sample {5}id +title +state/);
   });
 });

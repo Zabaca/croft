@@ -68,8 +68,8 @@ export const CODES = {
   INGEST_CONFIG_CHANGED: { category: "run", severity: "error", exit: 1 },
   PIN_CHANGES_DATA: { category: "run", severity: "error", exit: 1 },
   UNKNOWN_INPUT_COLUMN: { category: "run", severity: "error", exit: 1 },
-  BACKFILL_UNSUPPORTED: { category: "run", severity: "error", exit: 1 },
-  BACKFILL_WOULD_DUPLICATE: { category: "run", severity: "error", exit: 1 },
+  BACKFILL_UNSUPPORTED: { category: "run", severity: "error", exit: 2 },       // usage: §8 "Backfills"
+  BACKFILL_WOULD_DUPLICATE: { category: "run", severity: "error", exit: 2 },   // usage: §8 "Backfills"
   LARGE_REPROCESS: { category: "run", severity: "error", exit: 1 },
   INTERNAL_ERROR: { category: "run", severity: "error", exit: 1 },
   RUN_CRASHED: { category: "run", severity: "error", exit: 1 },

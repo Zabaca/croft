@@ -1,6 +1,7 @@
 // The run engine in this process (executeRun), against a Bun.serve mock API: pagination, retries, the
 // shrink guard, big integers, type drift, cursors, --from, ctx.query, the catalog mirror and leases.
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DuckDBInstance } from "@duckdb/node-api";
@@ -54,6 +55,8 @@ describe("keyset pagination, cursors and the catalog mirror", () => {
     expect(step).toMatchObject({ asset: "issues", status: "ok", behavior: "merge by id", attempt: 1, maxAttempts: 3 });
     expect(step.rows).toMatchObject({ added: 3, updated: 0, total: 3 });
     expect(step.cursor).toMatchObject({ after: "2026-09-03T10:00:00Z" });
+    // This step created the table (§4.2 "new table, 3 columns"); _loaded_at is croft's and not counted.
+    expect(step.created).toEqual({ columns: 3, jsonColumns: 0 });
     // Ascending keyset with an inclusive `since`: pages (1,2), (2,3), (3); dedupe keeps one row per id.
     expect(step.requests).toBe(3);
     expect(step.rows.in).toBe(5);
@@ -99,6 +102,7 @@ describe("keyset pagination, cursors and the catalog mirror", () => {
     // Keyed timestamp cursors re-read 1 s (§3a "Boundary rows").
     expect(api.state.log[0]!.query.since).toBe("2026-09-02T09:59:59Z");
     const s = second.data.steps[0]!;
+    expect(s.created).toBeUndefined();
     expect(s.cursor).toEqual({ before: "2026-09-02T10:00:00Z", after: "2026-09-05T08:00:00Z", sinceUsed: "2026-09-02T09:59:59Z" });
     // The inclusive API returns id 3 again on the last page; dedupe by key keeps one.
     expect(s.rows).toMatchObject({ in: 3, added: 1, updated: 1, unchanged: 0, total: 3 });
@@ -364,12 +368,12 @@ export default ingest({
 `,
     });
     const replace = await runIn(root, ["zones"], { from: "2026-01-01" });
-    expect(replace.exit).toBe(1);
+    expect(replace.exit).toBe(2); // §8: a backfill that cannot apply is a usage error
     expect(replace.data.steps[0]!.error).toMatchObject({ code: "BACKFILL_UNSUPPORTED" });
     expect(replace.data.steps[0]!.error!.hint).toContain("croft run zones");
     await runIn(root, ["events"]);
     const dup = await runIn(root, ["events"], { from: "3" });
-    expect(dup.exit).toBe(1);
+    expect(dup.exit).toBe(2);
     expect(dup.data.steps[0]!.error?.code).toBe("BACKFILL_WOULD_DUPLICATE");
     const later = await runIn(root, ["events"], { from: "9" });
     expect(later.exit).toBe(0);
@@ -379,7 +383,7 @@ export default ingest({
     api.state.issues = [{ id: 1, title: "a", updated_at: "2026-09-01T10:00:00Z" }];
     const root = makeProject({ "assets/report.sql": "select 1 as x\n", "assets/issues.ts": keysetIssues(api.url) });
     const named = await runIn(root, ["report"], { from: "-7d" });
-    expect(named.exit).toBe(1);
+    expect(named.exit).toBe(2);
     expect(named.data.steps[0]!.error).toMatchObject({ code: "BACKFILL_UNSUPPORTED", hint: "transforms rebuild from their inputs: croft run report --rebuild" });
     const bare = await runIn(root, [], { from: "-7d" });
     expect(bare.exit).toBe(0);
@@ -469,6 +473,28 @@ describe("leases, timeouts and signals", () => {
     expect(out.data.steps[0]!.error).toMatchObject({ code: "TIMEOUT", details: { phase: "extract", rowsSoFar: 0 } });
   });
 
+  test("while a run works, runs.summary carries its progress (status and context read it); then its result", async () => {
+    api.state.slowPages = 6;
+    api.state.slowDelayMs = 150;
+    const root = makeProject({ "assets/slow.ts": slowPages(api.url) });
+    const running = runIn(root, ["slow"]);
+    const db = runsDb(root);
+    try {
+      let progress: Record<string, unknown> | undefined;
+      for (let i = 0; i < 200 && !progress; i++) {
+        const r = db.runningRuns()[0];
+        progress = (r?.summary as { progress?: Record<string, unknown> } | null)?.progress;
+        if (!progress) await new Promise((res) => setTimeout(res, 20));
+      }
+      expect(progress).toMatchObject({ asset: "slow", phase: "extract" });
+      const out = await running;
+      expect(out.exit).toBe(0);
+      expect((db.getRun(out.data.runId)!.summary as { data: { status: string } }).data.status).toBe("succeeded");
+    } finally {
+      db.close();
+    }
+  });
+
   test("an aborted signal interrupts the step: nothing is written, the run is interrupted, exit 130", async () => {
     api.state.slowPages = 50;
     api.state.slowDelayMs = 50;
@@ -487,6 +513,34 @@ describe("leases, timeouts and signals", () => {
       db.close();
     }
     expect(existsSync(join(root, "warehouse.duckdb")) ? await rows(root, "select count(*)::INT n from duckdb_tables() where table_name = 'slow'") : [{ n: 0 }]).toEqual([{ n: 0 }]);
+  });
+});
+
+describe("a lock wait and Ctrl-C", () => {
+  test("SIGINT while the warehouse is held by another program interrupts the wait at once (exit 130)", async () => {
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    expect((await runIn(root, ["zones"])).exit).toBe(0);
+    await closeAllWarehouses();
+    // Another program (think DuckDB UI) holds the file read-write; off a TTY a run would wait 90 s for it.
+    const holder = spawn(process.execPath, ["-e", `const { DuckDBInstance } = require(process.env.DUCKDB_API);
+(async () => { const db = await DuckDBInstance.create(process.env.DB_PATH); await db.connect(); console.log("held"); setInterval(() => {}, 1000); })();`], {
+      env: { ...process.env, DUCKDB_API: require.resolve("@duckdb/node-api"), DB_PATH: join(root, "warehouse.duckdb") },
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+    try {
+      await new Promise<void>((resolve) => holder.stdout!.on("data", (d) => String(d).includes("held") && resolve()));
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 300);
+      const started = Date.now();
+      const out = await runIn(root, ["zones"], { signal: ac.signal });
+      expect(Date.now() - started).toBeLessThan(5000);
+      expect(out.exit).toBe(130);
+      expect(out.data.status).toBe("interrupted");
+      expect(out.data.steps[0]!.error?.code).toBe("INTERRUPTED");
+    } finally {
+      holder.kill("SIGKILL");
+    }
   });
 });
 
@@ -511,6 +565,23 @@ describe("planning", () => {
   });
 });
 
+describe("file ingests through the engine", () => {
+  test("files outside files/ load from their snapshots; the warehouse sandbox never opens their folders", async () => {
+    const root = makeProject({
+      "exports/2026-01.csv": "order_id,amount\n1,5\n2,7\n",
+      "top.csv": "id\n9\n",
+      "assets/sales.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ file: "exports/*.csv", key: "order_id", incremental: true });\n`,
+      "assets/top.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ file: "*.csv" });\n`,
+    });
+    const out = await runIn(root, ["sales", "top"]);
+    expect(out.exit).toBe(0);
+    expect(out.data.steps.map((s) => [s.asset, s.status, s.rows.total])).toEqual([["sales", "ok", 2], ["top", "ok", 1]]);
+    expect(await rows(root, "select sum(amount)::INT AS total from sales")).toEqual([{ total: 12 }]);
+    // Nothing changed: the next run skips the write.
+    expect((await runIn(root, ["sales"])).data.steps[0]!.status).toBe("unchanged");
+  });
+});
+
 describe("sources, JSON keys, --no-wait and staging", () => {
   test("rows() may return an array or a promise of rows, not only a generator", async () => {
     const root = makeProject({
@@ -530,6 +601,7 @@ describe("sources, JSON keys, --no-wait and staging", () => {
     const root = makeProject({ "assets/meta.ts": simpleGet(api.url, "/raw", '\n  key: "id",') });
     const out = await runIn(root, ["meta"]);
     expect(out.exit).toBe(0);
+    expect(out.data.steps[0]!.created).toEqual({ columns: 2, jsonColumns: 1 });
     const db = runsDb(root);
     try {
       expect(getCatalog(db, "meta")!.columns.find((c) => c.name === "meta")).toMatchObject({ type: "JSON", jsonKeys: ["a", "b", "c"] });

@@ -18,6 +18,8 @@ const hit = (key: string) => {
   return n;
 };
 
+const BINARY = new Uint8Array([0x63, 0x61, 0x66, 0xe9, 0x0a, 0xff, 0x00, 0x1f, 0x8b, 0x08]);
+
 type Issue = { id: number; updated_at: string };
 const ISSUES: Issue[] = Array.from({ length: 7 }, (_, i) => ({ id: i + 1, updated_at: `2026-09-2${i}T00:00:00Z` }));
 
@@ -86,6 +88,12 @@ const server = Bun.serve({
       }
       case "/post":
         return new Response(`{"got":${seen.at(-1)!.body},"type":"${req.headers.get("content-type")}"}`);
+      case "/binary": {
+        // Bytes that are not UTF-8 (latin-1 "cafe", a lone 0xFF, a gzip magic): text() would mangle them.
+        if (req.headers.get("if-none-match") === '"v1"') return new Response(null, { status: 304, headers: { etag: '"v1"' } });
+        if (u.searchParams.get("flaky") && hit("binary-flaky") === 1) return new Response("later", { status: 503, headers: { "retry-after": "0.2" } });
+        return new Response(BINARY, { headers: { etag: '"v1"', "content-type": "application/octet-stream", link: '</binary?page=2>; rel="next"' } });
+      }
       default:
         return new Response("no route", { status: 404 });
     }
@@ -375,6 +383,66 @@ describe("timeouts and abort", () => {
     const err = await http.get(`${BASE}/echo`).then(() => null, (x: unknown) => x as Error);
     expect(err?.name).toBe("AbortError");
     expect(seen).toHaveLength(0);
+  });
+});
+
+describe("getBytes", () => {
+  test("keeps the body as raw bytes; text decodes on demand; headers, url and next come along", async () => {
+    const { http } = client();
+    const res = await http.getBytes(`${BASE}/binary`);
+    expect(res.status).toBe(200);
+    expect([...res.bytes]).toEqual([...BINARY]);
+    expect(res.headers.get("etag")).toBe('"v1"');
+    expect(res.url).toBe(`${BASE}/binary`);
+    expect(res.next).toBe(`${BASE}/binary?page=2`);
+    expect(res.text.startsWith("caf\uFFFD\n")).toBe(true);
+    expect(http.requests).toBe(1);
+    expect(http.attempts).toBe(1);
+  });
+
+  test("a 304 answering a conditional request is a success with an empty body", async () => {
+    const { http } = client();
+    const res = await http.getBytes(`${BASE}/binary`, { headers: { "If-None-Match": '"v1"' } });
+    expect(res.status).toBe(304);
+    expect(res.bytes.byteLength).toBe(0);
+    expect(seen[0]!.headers.get("if-none-match")).toBe('"v1"');
+  });
+
+  test("retries a 503 after its Retry-After, like get()", async () => {
+    const { http, lines } = client();
+    const t0 = performance.now();
+    const res = await http.getBytes(`${BASE}/binary`, { query: { flaky: 1 } });
+    expect(performance.now() - t0).toBeGreaterThanOrEqual(180);
+    expect([...res.bytes]).toEqual([...BINARY]);
+    expect(http.attempts).toBe(2);
+    expect(lines[0]).toContain("503");
+    expect(lines[0]).toContain("retrying in 200 ms (attempt 2 of 4)");
+  });
+
+  test("failures are HTTP_ERROR with redacted details and the body excerpt", async () => {
+    const env = new ProjectEnv({ root: null, fileValues: new Map([["API_TOKEN", "sekrit-token!42"]]) });
+    const { http, lines } = client({ redact: (t) => env.redact(t) });
+    const down = await httpError(http.getBytes(`${BASE}/down`, { query: { token: "sekrit-token!42" } }));
+    expect(down.problem.details).toMatchObject({ method: "GET", status: 502, attempts: 4, reason: "status" });
+    expect(String(down.problem.details!.body)).toStartWith('{"error":"database on fire","token":"[redacted:API_TOKEN]"');
+    for (const text of [down.message, JSON.stringify(down.problem.details), ...lines]) expect(text).not.toContain("sekrit");
+    const missing = await httpError(http.getBytes(`${BASE}/not-found`));
+    expect(missing.problem.details).toMatchObject({ status: 404, attempts: 1 });
+    expect(missing.problem.retryable).toBe(false);
+  });
+
+  test("the timeout covers the body, and aborting the run rejects with its reason", async () => {
+    const { http } = client();
+    const slow = await httpError(http.getBytes(`${BASE}/slow-body`, { timeoutMs: 150, retries: 0 }));
+    expect(slow.problem.details).toMatchObject({ reason: "timeout" });
+
+    const ac = new AbortController();
+    const aborted = client({ signal: ac.signal }).http;
+    const reason = new Error("interrupted by Ctrl-C");
+    setTimeout(() => ac.abort(reason), 50);
+    const t0 = performance.now();
+    expect(await aborted.getBytes(`${BASE}/slow`, { query: { ms: 2000 } }).then(() => null, (x: unknown) => x)).toBe(reason);
+    expect(performance.now() - t0).toBeLessThan(1000);
   });
 });
 

@@ -6,7 +6,7 @@ import { cleanup as cleanupChildren, spawnHolder, writeServeJson } from "../../r
 import {
   busyScenario, cleanup, cli, ISSUES_CATALOG, ISSUES_SEED, makeProject, NOW, runsDb, SCENARIO_FILES, seed, shape,
 } from "./inspect-testkit.ts";
-import { ago, sniffKind } from "./status.ts";
+import { ago, schemaChangesFromRuns, sniffKind } from "./status.ts";
 
 afterAll(async () => {
   cleanupChildren();
@@ -173,6 +173,27 @@ describe("croft status never waits on DuckDB", () => {
 });
 
 describe("helpers", () => {
+  test("schemaChangesFromRuns reads the run engine's stored result ({data: {steps}}) and a bare {steps}", () => {
+    const p = makeProject({ files: {} });
+    const db = runsDb(p.stateDir);
+    try {
+      const engine = db.createRun({ trigger: "manual", human: true, argv: ["run", "a"] });
+      db.finishRun(engine.id, "succeeded", {
+        data: { runId: engine.id, status: "succeeded", steps: [{ asset: "a", schemaChanges: [{ kind: "add_column", column: "x", type: "BIGINT" }] }] },
+        problems: [], next: [], exit: 0, ok: true,
+      });
+      const bare = db.createRun({ trigger: "manual", human: true, argv: ["run", "b"] });
+      db.finishRun(bare.id, "succeeded", { steps: [{ asset: "b", schemaChanges: [{ kind: "widen", column: "y", from: "INTEGER", to: "BIGINT" }] }] });
+      const live = db.createRun({ trigger: "manual", human: true, argv: ["run", "c"] });
+      db.setRunProgress(live.id, { asset: "c", phase: "extract", rowsFetched: 5, requests: 1, elapsedMs: 10 });
+      const changes = schemaChangesFromRuns(db, new Date(0));
+      expect(changes.map((c) => [c.asset, c.change.column])).toEqual(expect.arrayContaining([["a", "x"], ["b", "y"]]));
+      expect(changes).toHaveLength(2);
+    } finally {
+      db.close();
+    }
+  });
+
   test("ago", () => {
     const now = new Date("2026-09-22T19:00:00Z");
     expect(ago("2026-09-22T18:59:48Z", now)).toBe("12 s ago");

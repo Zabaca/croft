@@ -51,7 +51,7 @@ let attachSeq = 0;
  * does not exist (nothing to keep). Runs as its own write lease, before the destructive change.
  */
 export async function trashTable(warehouse: DuckWarehouse, asset: string, reason: string,
-  o: { runId?: string; now?: Date } = {}): Promise<TrashEntry | null> {
+  o: { runId?: string; now?: Date; signal?: AbortSignal } = {}): Promise<TrashEntry | null> {
   const stateDir = canonicalPath(warehouse.options.stateDir);
   const dir = trashDir(stateDir, asset);
   mkdirSync(dir, { recursive: true });
@@ -92,7 +92,7 @@ export async function trashTable(warehouse: DuckWarehouse, asset: string, reason
     } finally {
       await sql.exec(`DETACH ${quoteIdent(alias)}`).catch(() => {});
     }
-  }, { runId: o.runId ?? "trash", asset, transaction: false });
+  }, { runId: o.runId ?? "trash", asset, transaction: false, ...(o.signal ? { signal: o.signal } : {}) });
   if (!entry) return null;
   const out: TrashEntry = {
     asset, path, trashedAt: at.toISOString(), reason, runId: o.runId ?? null, rows: entry.rows,

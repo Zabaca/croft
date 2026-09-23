@@ -157,12 +157,14 @@ export function effectiveStatus(step: StepRecord, dead: Set<string>): string {
 /** A schema change recorded in a run's summary (the run engine's StepResults), for when DuckDB is busy. */
 export interface SummaryChange { asset: string; runId: string; at: string; change: Record<string, unknown> }
 
-/** Schema changes that runs since `since` recorded in their summaries ({steps: StepResult[]}). */
+/** Schema changes that runs since `since` recorded in their summaries: the run engine stores the whole
+ *  command result ({data: {steps: StepResult[]}}); a bare {steps} is read too. */
 export function schemaChangesFromRuns(db: RunsDb | null, since: Date): SummaryChange[] {
   if (!db) return [];
   const out: SummaryChange[] = [];
   for (const r of db.listRuns({ since, limit: 500 })) {
-    const steps = (r.summary as { steps?: unknown } | null)?.steps;
+    const summary = r.summary as { steps?: unknown; data?: { steps?: unknown } | null } | null;
+    const steps = summary?.data?.steps ?? summary?.steps;
     if (!Array.isArray(steps)) continue;
     for (const s of steps) {
       if (!s || typeof s !== "object") continue;

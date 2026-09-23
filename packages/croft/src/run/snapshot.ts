@@ -33,7 +33,7 @@ export interface SnapshotResult {
  * Copy `table` to `<dir>/snapshot.parquet` under one short read lease. The directory must be inside the
  * warehouse sandbox (the state folder). HUGEINT columns are stored as text.
  */
-export async function snapshotTable(warehouse: DuckWarehouse, table: string, dir: string): Promise<SnapshotResult> {
+export async function snapshotTable(warehouse: DuckWarehouse, table: string, dir: string, signal?: AbortSignal): Promise<SnapshotResult> {
   mkdirSync(dir, { recursive: true });
   const path = join(canonicalPath(dir), SNAPSHOT_FILE);
   return warehouse.read(async (db) => {
@@ -42,7 +42,7 @@ export async function snapshotTable(warehouse: DuckWarehouse, table: string, dir
     const select = columns.map((c) => AS_TEXT.has(c.type) ? `CAST(${quoteIdent(c.name)} AS VARCHAR) AS ${quoteIdent(c.name)}` : quoteIdent(c.name));
     await db.exec(`COPY (SELECT ${select.join(", ")} FROM main.${quoteIdent(table)}) TO ${quoteLiteral(path)} (FORMAT parquet)`);
     return { path, columns };
-  }, { purpose: `snapshot ${table} for ctx.query` });
+  }, { purpose: `snapshot ${table} for ctx.query`, ...(signal ? { signal } : {}) });
 }
 
 /** The view that puts a snapshot back under the table's name, with HUGEINT columns cast back. */
@@ -59,6 +59,8 @@ export interface OwnTableOptions {
   dir: string;
   stateDir: string;
   timezone: string;
+  /** The step's signal: Ctrl-C ends the wait for the snapshot's read lease. */
+  signal?: AbortSignal;
 }
 
 /** ctx.query for one ingest step. Lazy: nothing is copied unless the asset calls ctx.query. */
@@ -102,7 +104,7 @@ export class OwnTableQuery {
       }));
     }
     this.#init ??= (async () => {
-      const snap = await snapshotTable(this.o.warehouse, this.o.asset, this.o.dir);
+      const snap = await snapshotTable(this.o.warehouse, this.o.asset, this.o.dir, this.o.signal);
       const db = await openMemory({ timezone: this.o.timezone, stateDir: this.o.stateDir });
       this.#db = db;
       const conn = await db.connect();

@@ -11,6 +11,7 @@
 // then whole assets from the end (listed in data.omitted), and says truncated: true. --asset narrows it.
 import { existsSync } from "node:fs";
 import { CroftError, problem } from "../../core/errors.ts";
+import { CHECKS_ENFORCED, CHECKS_NOT_ENFORCED } from "../../core/phase.ts";
 import type { AssetKind, Problem } from "../../core/types.ts";
 import { liveIntents } from "../../db/intent.ts";
 import { hasState } from "../../db/state.ts";
@@ -68,6 +69,8 @@ export interface ContextData {
     scheduling: { state: "on" | "off" | "paused"; via: "os-job" | "serve" | null };
   };
   assets: CompactAsset[];
+  /** false in phase 1: the assets' checks are listed, not run (core/phase.ts). */
+  checksEnforced: boolean;
   running: RunningEntry[];
   held: string[];
   recentFailures: FailureEntry[];
@@ -222,6 +225,7 @@ export const context: CommandImpl<ContextData> = {
       },
       assets: state.data.assets.filter((a) => keep(a.asset))
         .map((a) => compact(a, byConfig.get(a.asset) ?? null, byCatalog.get(a.asset) ?? null, tz)),
+      checksEnforced: CHECKS_ENFORCED,
       running: state.data.running.filter((r) => r.asset === null || keep(r.asset)),
       held: [],
       recentFailures,
@@ -260,6 +264,7 @@ export function formatContext(d: ContextData, now: Date): string {
     if (a.columns?.length) lines.push(`  columns   ${columnsText(a.columns)}`);
     if (a.checks.length) lines.push(`  checks    ${a.checks.join(" · ")}`);
   }
+  if (d.checksEnforced === false && d.assets.some((a) => a.checks.length)) lines.push("", CHECKS_NOT_ENFORCED);
   if (d.omitted?.length) lines.push("", `(${d.omitted.length} more assets not shown: ${d.omitted.join(", ")}; croft context --asset <name>)`);
   if (d.running.length) {
     lines.push("", "Running");

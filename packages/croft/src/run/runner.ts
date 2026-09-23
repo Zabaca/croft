@@ -47,6 +47,8 @@ export interface RunData {
   status: RunStatus;
   progress?: ProgressSnapshot;
   steps: StepResult[];
+  /** Always false in phase 1 (core/phase.ts): the command adds it; runs.summary does not store it. */
+  checksEnforced?: boolean;
 }
 
 /** A run's whole command result: what `croft run` prints, stored in runs.summary for `croft wait`. */
@@ -270,9 +272,11 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
     // Every declared secret is hidden in data, not only the ones this run reads.
     for (const s of plan.steps) if (s.spec) env.declare(s.spec.secrets);
     const interactive = o.interactive === true;
+    // No file-ingest directories in the sandbox: extractFiles snapshots every file into the state folder, and
+    // the write reads only those snapshots (a `file: "*.csv"` ingest would otherwise open the whole root).
     warehouse = openWarehouse({
       path: paths.database, mode: "read_write", timezone: project.timezone, root: project.root, stateDir: paths.stateDir,
-      fileDirs: plan.fileDirs, isTTY: interactive, ...(o.runId ? { runId: o.runId } : {}),
+      isTTY: interactive, ...(o.runId ? { runId: o.runId } : {}),
       // --no-wait: a held database file is exit 4 at once, like a held asset.
       ...(o.noWait ? { waits: { offTtyMs: 0, ttyReadMs: 0, ttyWriteMs: 0 } } : {}),
       lookupHolder: (pid) => {
@@ -358,7 +362,15 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
         runs.startStep({ runId, asset, attempt, reason: step.reason, ...(step.codeHash ? { codeHash: step.codeHash } : {}), logPath: logPath(paths.stateDir, runId, asset) });
         log.write(`${new Date().toISOString()} ${asset} attempt ${attempt} of ${maxAttempts} (run ${runId}): ${step.behavior}`);
         events.emit({ type: "step", runId, asset, attempt, status: "running" });
-        const progress = new StepProgress(asset, (p) => events.emit({ type: "progress", runId, ...p }));
+        const progress = new StepProgress(asset, (p) => {
+          events.emit({ type: "progress", runId, ...p });
+          // status and context read a live run's phase and rows from runs.summary (throttled to 1/s by StepProgress).
+          try {
+            runs.setRunProgress(runId, p);
+          } catch {
+            // Progress must never fail a run (a busy runs.sqlite, say).
+          }
+        });
         const stepAc = new AbortController();
         const signal = AbortSignal.any([runSignal, stepAc.signal]);
         const timeoutMs = o.timeoutMs ?? step.timeoutMs;

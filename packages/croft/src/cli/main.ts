@@ -186,7 +186,7 @@ function parseFlags(cmd: Command, args: string[]): { values: Record<string, stri
   }
   let parsed;
   try {
-    parsed = parseArgs({ args, options, allowPositionals: true, strict: true });
+    parsed = parseArgs({ args: attachDashValues(args, all), options, allowPositionals: true, strict: true });
   } catch (e) {
     throw flagError(cmd, all, args, e as Error & { code?: string });
   }
@@ -203,11 +203,48 @@ function parseFlags(cmd: Command, args: string[]): { values: Record<string, stri
   return { values: parsed.values as Record<string, string | boolean | (string | boolean)[] | undefined>, positionals: parsed.positionals };
 }
 
+/**
+ * parseArgs refuses `--from -90d` in strict mode ("argument is ambiguous"): a value that starts with "-"
+ * could be a flag. croft's relative times (-90d, -12h) and negative numbers are such values, so an argument
+ * after a string option is its value when it is not itself one of this command's flags: `--from -90d`
+ * becomes `--from=-90d` (and `-f -90d` becomes `-f-90d`). A known flag after a string option is still
+ * "needs a value", and `--` always ends the options.
+ */
+export function attachDashValues(args: readonly string[], options: Record<string, OptionSpec>): string[] {
+  const shorts = new Map<string, string>();
+  for (const [name, o] of Object.entries(options)) if (o.short) shorts.set(o.short, name);
+  const isFlag = (a: string): boolean => {
+    if (a === "--") return true;
+    if (a.startsWith("--")) return Object.hasOwn(options, a.slice(2).split("=")[0]!);
+    return a.length > 1 && shorts.has(a[1]!);
+  };
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--") {
+      out.push(...args.slice(i));
+      break;
+    }
+    const next = args[i + 1];
+    const name = a.startsWith("--") && !a.includes("=") ? a.slice(2)
+      : /^-[^-]$/.test(a) ? shorts.get(a[1]!) : undefined;
+    const takesValue = name !== undefined && Object.hasOwn(options, name) && options[name]!.type === "string";
+    if (takesValue && next !== undefined && next.length > 1 && next.startsWith("-") && !isFlag(next)) {
+      out.push(a.startsWith("--") ? `${a}=${next}` : `${a}${next}`);
+      i++;
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
+
 function flagError(cmd: Command, all: Record<string, OptionSpec>, args: string[], e: Error & { code?: string }): CroftError {
   const usage = { kind: "command" as const, description: "show usage", command: `croft ${cmd.name} --help` };
   if (e.code === "ERR_PARSE_ARGS_UNKNOWN_OPTION") {
     const flag = /'([^']+)'/.exec(e.message)?.[1] ?? "";
-    const guess = flag.startsWith("--") ? didYouMean(flag.slice(2), Object.keys(all)) : undefined;
+    // Hidden options (set by croft itself) are never suggested.
+    const guess = flag.startsWith("--") ? didYouMean(flag.slice(2), Object.keys(all).filter((k) => !all[k]!.hidden)) : undefined;
     const corrected = guess
       ? ["croft", cmd.name, ...args.map((a) => (a === flag || a.startsWith(`${flag}=`) ? `--${guess}${a.slice(flag.length)}` : a))].map(shellQuote).join(" ")
       : "";
@@ -223,7 +260,7 @@ function flagError(cmd: Command, all: Record<string, OptionSpec>, args: string[]
     const takesValue = Object.entries(all).some(([k, o]) => `--${k}` === flag && o.type === "string");
     return new CroftError("USAGE_ERROR", {
       message: takesValue ? `${flag} needs a value` : `${flag} does not take a value`,
-      hint: takesValue ? `write ${flag} <value> (a value starting with "-" needs ${flag}=<value>)` : `write ${flag} on its own`,
+      hint: takesValue ? `write ${flag} <value> (a value that is also an option name needs ${flag}=<value>)` : `write ${flag} on its own`,
       fix: usage,
     });
   }

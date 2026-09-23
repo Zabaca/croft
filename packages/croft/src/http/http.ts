@@ -10,6 +10,7 @@
 // - HTTP_ERROR carries {method, url (redacted), status, attempts, retryAfterMs, requestIndex} and the
 //   first 500 bytes of the body. Every URL, body and message that leaves this module is redacted.
 // - res.next comes from the Link header; res.json() is lossless (unsafe integers become bigint).
+// - getBytes() (croft's own, for file downloads) keeps the body as raw bytes; everything above applies.
 import { CroftError } from "../core/errors.ts";
 import type { Http, HttpInit, HttpResponse } from "../types.ts";
 
@@ -31,9 +32,16 @@ export interface HttpOptions {
   maxRetryAfterMs?: number;
 }
 
+/** A response whose body was kept as raw bytes (getBytes). `text` decodes them as UTF-8 on first use. */
+export type BytesResponse = HttpResponse & { bytes: Uint8Array };
+
 /** Http plus counters the runner reports (StepResult.requests, run progress). */
 export interface HttpClient extends Http {
-  /** Logical requests made: one per get()/post() call, whatever its retries. */
+  /** GET that keeps the body as raw bytes, for file downloads: HttpResponse.text is UTF-8, which would
+   *  corrupt Parquet, gzip and latin-1 files. Same retries, Retry-After, timeout, signal, redaction and
+   *  HTTP_ERROR as get(); a 304 (the answer to a conditional request) is a success with an empty body. */
+  getBytes(url: string, init?: HttpInit): Promise<BytesResponse>;
+  /** Logical requests made: one per get()/post()/getBytes() call, whatever its retries. */
   readonly requests: number;
   /** HTTP attempts sent, retries included. */
   readonly attempts: number;
@@ -58,7 +66,9 @@ export function createHttp(opts: HttpOptions): HttpClient {
   let requests = 0;
   let attempts = 0;
 
-  async function request(method: "GET" | "POST", url: string, body: unknown, init: HttpInit = {}): Promise<HttpResponse> {
+  async function request(method: "GET" | "POST", url: string, body: unknown, init: HttpInit, raw: true): Promise<BytesResponse>;
+  async function request(method: "GET" | "POST", url: string, body: unknown, init?: HttpInit): Promise<HttpResponse>;
+  async function request(method: "GET" | "POST", url: string, body: unknown, init: HttpInit = {}, raw = false): Promise<HttpResponse> {
     const requestIndex = ++requests;
     const signal = opts.signal;
     if (signal.aborted) throw abortReason(signal);
@@ -87,9 +97,12 @@ export function createHttp(opts: HttpOptions): HttpClient {
           method, headers, body: payload as BodyInit | undefined, redirect: "follow",
           signal: AbortSignal.any([signal, timeout]),
         });
-        const text = await res.text();
         // Redirects are followed; a 304 only answers a conditional request the code made itself.
-        if (res.status < 400) return response(res, text, target, { method, shown, attempts: attempt, requestIndex, redact });
+        if (res.status < 400) {
+          const content = raw ? new Uint8Array(await res.arrayBuffer()) : await res.text();
+          return response(res, content, target, { method, shown, attempts: attempt, requestIndex, redact });
+        }
+        const text = await res.text();
         failure = {
           reason: "status", status: res.status, statusText: res.statusText, body: text,
           retryAfterMs: parseRetryAfter(res.headers.get("retry-after")),
@@ -116,6 +129,7 @@ export function createHttp(opts: HttpOptions): HttpClient {
   return {
     get: (url, init) => request("GET", url, undefined, init),
     post: (url, body, init) => request("POST", url, body, init),
+    getBytes: (url, init) => request("GET", url, undefined, init ?? {}, true),
     get requests() { return requests; },
     get attempts() { return attempts; },
   };
@@ -129,15 +143,20 @@ interface Attempted {
   redact: (text: string) => string;
 }
 
-function response(res: Response, text: string, target: string, a: Attempted): HttpResponse {
+/** The response handed to asset code. With raw bytes (getBytes), `bytes` holds the body and `text` is
+ *  decoded from it only when read, so a large download is not held twice. */
+function response(res: Response, body: string | Uint8Array, target: string, a: Attempted): HttpResponse {
   const url = res.url || target;
   const next = nextLink(res.headers.get("link"), url);
+  let decoded: string | undefined;
+  const textOf = () => (typeof body === "string" ? body : (decoded ??= new TextDecoder("utf-8").decode(body)));
   const out: HttpResponse = {
     status: res.status,
     url,
     headers: res.headers,
-    text,
+    text: "",
     json<T = unknown>(): T {
+      const text = textOf();
       try {
         return parseJsonLossless(text) as T;
       } catch (e) {
@@ -151,6 +170,11 @@ function response(res: Response, text: string, target: string, a: Attempted): Ht
       }
     },
   };
+  if (typeof body === "string") out.text = body;
+  else {
+    Object.defineProperty(out, "text", { get: textOf, enumerable: true, configurable: true });
+    (out as BytesResponse).bytes = body;
+  }
   if (next !== undefined) out.next = next;
   return out;
 }

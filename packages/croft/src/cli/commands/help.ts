@@ -18,8 +18,9 @@ export const GLOBAL_OPTIONS: Record<string, OptionSpec> = {
   version: { type: "boolean", short: "V", description: "print the croft version" },
 };
 
+/** The options help shows: hidden ones (set by croft itself) are left out. */
 export function optionHelp(options: Record<string, OptionSpec>): OptionHelp[] {
-  return Object.entries(options).map(([name, o]) => ({
+  return Object.entries(options).filter(([, o]) => !o.hidden).map(([name, o]) => ({
     flag: `--${name}`, ...(o.short ? { short: `-${o.short}` } : {}), type: o.type,
     ...(o.value ? { value: o.value } : {}), description: o.description,
   }));

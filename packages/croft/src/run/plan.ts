@@ -47,7 +47,8 @@ export interface RunPlan {
   steps: PlannedStep[];
   /** Discovery problems (bad or clashing file names); reported only when every asset was asked for. */
   problems: Problem[];
-  /** Directories of declared file ingests, for the warehouse sandbox (connect.ts allowed_directories). */
+  /** Directories of declared file ingests. The run's warehouse sandbox no longer needs them (files are read from
+   *  snapshots in the state folder); kept for tools that want to know where an ingest reads. */
   fileDirs: string[];
 }
 
