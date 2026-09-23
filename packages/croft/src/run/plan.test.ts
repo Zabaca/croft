@@ -95,6 +95,39 @@ describe("planRun", () => {
     expect(plan.fileDirs).toEqual([join(root, "exports")]);
   });
 
+  // An agent that just wrote assets/order.ts and runs `croft run order` must hear the real reason (NAME_RESERVED,
+  // rename to orders), not "there is no asset named order".
+  test("a selector naming a file that failed discovery reports that file's problem", async () => {
+    const root = makeProject({
+      "assets/order.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ async *rows() {} });\n`,
+      "assets/_private.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ async *rows() {} });\n`,
+      "assets/a/dup.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ async *rows() {} });\n`,
+      "assets/b/dup.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ async *rows() {} });\n`,
+      "assets/fine.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ async *rows() {} });\n`,
+    });
+    const codeOf = async (selectors: string[]) => {
+      try {
+        await planRun({ root, timezone: "UTC", selectors });
+        return null;
+      } catch (e) {
+        return e as { code: string; problem: { file?: string; hint: string; details?: Record<string, unknown> } };
+      }
+    };
+    const reserved = await codeOf(["order"]);
+    expect(reserved).toMatchObject({ code: "NAME_RESERVED", problem: { file: "assets/order.ts", details: { name: "order", suggestion: "orders" } } });
+    expect(reserved!.problem.hint).toContain("orders.ts");
+    expect(await codeOf(["_private"])).toMatchObject({ code: "NAME_RESERVED", problem: { file: "assets/_private.ts" } });
+    expect(await codeOf(["dup"])).toMatchObject({ code: "NAME_CONFLICT" });
+    expect(await codeOf(["ord*"])).toMatchObject({ code: "NAME_RESERVED" });
+    expect(await codeOf(["nothing"])).toMatchObject({ code: "USAGE_ERROR" });
+    // A glob that also matches a valid asset runs it, and reports the broken file as a problem.
+    const plan = await planRun({ root, timezone: "UTC", selectors: ["*"] });
+    expect(plan.steps.map((s) => s.asset)).toEqual(["fine"]);
+    expect(plan.problems.map((p) => p.code).sort()).toEqual(["NAME_CONFLICT", "NAME_RESERVED", "NAME_RESERVED"]);
+    // Naming only valid assets reports nothing about the others.
+    expect((await planRun({ root, timezone: "UTC", selectors: ["fine"] })).problems).toEqual([]);
+  });
+
   test("retries and timeout come from the asset", async () => {
     const root = makeProject({
       "assets/api.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ retries: 0, timeout: "30m", async *rows() {} });\n`,

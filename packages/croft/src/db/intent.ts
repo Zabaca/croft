@@ -9,7 +9,7 @@
 import { randomBytes } from "node:crypto";
 import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
 import { join } from "node:path";
-import { bootId, currentIdentity, isAlive, type ProcessIdentity } from "../core/proc.ts";
+import { currentIdentity, isAlive, type ProcessIdentity, sameBoot } from "../core/proc.ts";
 
 export interface Intent extends ProcessIdentity {
   runId: string | null;
@@ -141,10 +141,11 @@ const confirmed = new Map<string, number>();
 
 /**
  * The one liveness check for intent holders (server, doctor, @zabaca/croft/read): same boot and same
- * process start time, not only the PID, because PIDs are reused after a reboot.
+ * process start time, not only the PID, because PIDs are reused after a reboot. A boot id that could not be
+ * read (empty or UNKNOWN_BOOT, on either side) is unknown, not dead: the PID and start time decide.
  */
 export function isHolderAlive(id: ProcessIdentity): boolean {
-  if (id.pid <= 0 || id.bootId !== bootId()) return false;
+  if (id.pid <= 0 || !sameBoot(id.bootId)) return false;
   try {
     process.kill(id.pid, 0);
   } catch (e) {

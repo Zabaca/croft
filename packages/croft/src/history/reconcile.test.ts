@@ -110,6 +110,31 @@ describe("reconcile", () => {
     expect(holderOf(db, "orders")?.runId).toBe(run.id);
   });
 
+  // A run recorded where the boot id could not be read (sysctl not on PATH) is alive while its process is:
+  // reconcile must not mark it crashed, release its leases or hand its staging back for deletion.
+  for (const boot of ["", "unknown"]) {
+    test(`a live run recorded with boot id ${JSON.stringify(boot)} is left alone`, async () => {
+      const identity = { ...me(), bootId: boot };
+      const run = db.createRun({ trigger: "manual", human: true, argv: ["run"], identity });
+      await acquire(db, "orders", run.id, { identity });
+      db.startStep({ runId: run.id, asset: "orders", attempt: 1, reason: "requested" });
+      mkdirSync(join(dir, "staging", run.id, "orders"), { recursive: true });
+      const r = await reconcile({ db, warehouse: fakeWarehouse({ writes: [] }) });
+      expect(r.crashed).toEqual([]);
+      expect(r.releasedLeases).toEqual([]);
+      expect(r.stagingDirs).toEqual([]);
+      expect(db.getRun(run.id)?.status).toBe("running");
+      expect(listLeases(db).map((l) => [l.asset, l.alive])).toEqual([["orders", true]]);
+    });
+  }
+
+  test("a dead run recorded with an empty boot id is still crashed (the start time decides)", async () => {
+    const run = await crashedRun({ ...deadIdentity(), bootId: "" });
+    const r = await reconcile({ db, warehouse: fakeWarehouse({ writes: [] }) });
+    expect(r.crashed).toEqual([run.id]);
+    expect(r.releasedLeases).toEqual(["customers", "orders", "refs"]);
+  });
+
   test("a dead run becomes crashed; a landed commit becomes ok (recovered); the rest crashed", async () => {
     const run = await crashedRun();
     const other = db.createRun({ trigger: "manual", human: true, argv: ["run"] });   // live, untouched

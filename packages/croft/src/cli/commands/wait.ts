@@ -2,12 +2,9 @@
 // Blocks until a run ends and prints its result exactly as `croft run` would have (exit 0, or the run's own
 // failure exit), or exits 6 while it is still running. It reads runs.sqlite and the run's events only, so it
 // never waits on the database. A run whose process died is marked crashed. Spec in commands/index.ts.
-import { existsSync } from "node:fs";
-import { join } from "node:path";
 import { CroftError, isCode } from "../../core/errors.ts";
-import { logDir } from "../../history/logs.ts";
 import { isRunId, RunsDb } from "../../history/runs-db.ts";
-import { DEFAULT_FOLLOW_MS, followRun, parseWait, unknownRun } from "../../run/detach.ts";
+import { DEFAULT_FOLLOW_MS, detachedRunExists, followRun, parseWait, unknownRun } from "../../run/detach.ts";
 import type { RunData } from "../../run/runner.ts";
 import type { CommandImpl } from "../command.ts";
 import { formatRun, toResult } from "./run.ts";
@@ -32,8 +29,9 @@ export const wait: CommandImpl<RunData> = {
     } finally {
       db.close();
     }
-    // A detached child that has not recorded its run yet still has its process log.
-    if (!known && !existsSync(join(logDir(stateDir, runId), "process.log"))) throw unknownRun(runId);
+    // A detached child that has not recorded its run yet still has its process log and spawn handshake; one that
+    // died before recording it is reported crashed by followRun, not "running" forever.
+    if (!known && !detachedRunExists(stateDir, runId)) throw unknownRun(runId);
     const res = await followRun({
       stateDir, runId, timeoutMs,
       ...(ctx.values.events === true ? { onEvent: (line: string) => ctx.render.progress(line) } : {}),

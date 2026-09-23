@@ -9,16 +9,23 @@
 // the work in the foreground, and stores its whole result in runs.summary. Following reads only
 // runs.sqlite and <state>/logs/<run>/events.ndjson, never the warehouse, which the child needs.
 //
+// The run folder also gets, before the run record exists (names start with "_", which no asset's can):
+//   _process.log        the child's stdout and stderr
+//   _process.json       the spawn handshake: the child's {pid, procStart, bootId}, written by the parent, so
+//                       `croft wait` can tell a child that died before recording its run from one still starting
+//   _not_started.json   the problem of a child that refused to start (a --from that cannot apply, say)
+//
 // Run as a program (the child's entry point) this file calls the CLI's main() directly: the parent already
 // runs the project's croft, so the launcher has nothing to decide.
 import { type ChildProcess, spawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
-import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CroftError, problem } from "../core/errors.ts";
-import { isAlive } from "../core/proc.ts";
+import { bootId, procStart, type ProcessIdentity, recordAlive, UNKNOWN_START } from "../core/proc.ts";
 import type { Problem, StepResult } from "../core/types.ts";
-import { follow, logDir, tail } from "../history/logs.ts";
+import {
+  follow, logDir, NOT_STARTED_RECORD, PROCESS_RECORD, processLogPath, readRunRecord, tail, writeRunRecord,
+} from "../history/logs.ts";
 import { isRunId, newRunId, RunsDb, type RunRecord, type StepRecord } from "../history/runs-db.ts";
 import type { ProgressSnapshot } from "./ingest.ts";
 import { eventsPath, type RunData, type RunSummary } from "./runner.ts";
@@ -67,11 +74,35 @@ export interface Spawned {
   exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 }
 
+/** The spawn handshake (_process.json). */
+export interface ChildRecord extends ProcessIdentity { startedAt: string }
+
+export function writeChildRecord(stateDir: string, runId: string, id: ProcessIdentity): void {
+  const rec: ChildRecord = { pid: id.pid, procStart: id.procStart, bootId: id.bootId, startedAt: new Date().toISOString() };
+  writeRunRecord(stateDir, runId, PROCESS_RECORD, rec);
+}
+
+export function readChildRecord(stateDir: string, runId: string): ChildRecord | null {
+  const r = readRunRecord<Partial<ChildRecord>>(stateDir, runId, PROCESS_RECORD);
+  if (!r || typeof r.pid !== "number" || typeof r.procStart !== "string") return null;
+  return { pid: r.pid, procStart: r.procStart, bootId: typeof r.bootId === "string" ? r.bootId : "", startedAt: String(r.startedAt ?? "") };
+}
+
+/** A detached child that refused to start records why, for its parent and for `croft wait`. */
+export function writeNotStarted(stateDir: string, runId: string, p: Problem): void {
+  writeRunRecord(stateDir, runId, NOT_STARTED_RECORD, { ...p, runId });
+}
+
+export function readNotStarted(stateDir: string, runId: string): Problem | null {
+  const p = readRunRecord<Problem>(stateDir, runId, NOT_STARTED_RECORD);
+  return p && typeof p.code === "string" && typeof p.message === "string" ? p : null;
+}
+
 /** Start `croft run … --run-id <id> --detached` in its own session, detached and unref'd. */
 export function spawnDetachedRun(i: SpawnInput): Spawned {
   const dir = logDir(i.stateDir, i.runId);
   mkdirSync(dir, { recursive: true });
-  const output = join(dir, "process.log");
+  const output = processLogPath(i.stateDir, i.runId);
   const fd = openSync(output, "a");
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(i.env)) if (v !== undefined) env[k] = v;
@@ -88,6 +119,13 @@ export function spawnDetachedRun(i: SpawnInput): Spawned {
     child.once("error", () => resolve({ code: null, signal: null }));
   });
   child.unref();
+  if (child.pid !== undefined) {
+    try {
+      writeChildRecord(i.stateDir, i.runId, { pid: child.pid, procStart: procStart(child.pid) ?? UNKNOWN_START, bootId: bootId() });
+    } catch {
+      // Without the handshake `croft wait` still follows the run once it records itself.
+    }
+  }
   return { child, pid: child.pid ?? -1, output, exited };
 }
 
@@ -191,9 +229,27 @@ export type FollowResult =
   | { kind: "running"; summary: RunSummary }
   | { kind: "not_started"; problem: Problem };
 
+/** A run whose detached child died before it recorded the run (kill -9, OOM, a reboot during a slow import):
+ *  crashed, with nothing run. */
+export function crashedBeforeStart(stateDir: string, runId: string, child: ChildRecord): RunSummary {
+  const out = tail(processLogPath(stateDir, runId), 20).lines;
+  const last = out.filter((l) => l.trim()).at(-1);
+  const p = problem("RUN_CRASHED", {
+    runId,
+    message: `run ${runId} (pid ${child.pid}) stopped before it recorded anything${last ? `: ${last}` : ""}; nothing was run`,
+    hint: "run the command again; croft run <asset> --foreground shows any error as it happens",
+    retryable: true,
+    fix: { kind: "manual", description: "run the same croft run command again" },
+    details: { pid: child.pid, output: out },
+  });
+  return { data: { runId, status: "crashed", steps: [] }, problems: [p], next: [], exit: 1, ok: false };
+}
+
 /**
  * Follow a run until it ends or `timeoutMs` passes. A run whose process died is marked crashed. A child that
- * exits before it created the run record is reported with the tail of its output.
+ * exits before it created the run record is reported with the problem it recorded, or the tail of its output;
+ * without `spawned` (croft wait), a child whose recorded process is gone before it created the run record is
+ * crashed, never "running" forever.
  */
 export async function followRun(i: FollowInput): Promise<FollowResult> {
   const db = RunsDb.open(i.stateDir);
@@ -202,15 +258,25 @@ export async function followRun(i: FollowInput): Promise<FollowResult> {
     const child: { exit: { code: number | null; signal: NodeJS.Signals | null } | null } = { exit: null };
     void i.spawned?.exited.then((x) => { child.exit = x; });
     let lastAliveCheck = 0;
+    const gone: { rec: ChildRecord | null } = { rec: null };
     const settled = (): boolean => {
       const run = db.getRun(i.runId);
       if (run && run.status !== "running") return true;
       if (child.exit) return true;
-      if (run && !i.spawned && Date.now() - lastAliveCheck > 1000) {
+      if (!run && readNotStarted(i.stateDir, i.runId)) return true;
+      if (!i.spawned && Date.now() - lastAliveCheck > 1000) {
         lastAliveCheck = Date.now();
-        if (run.pid === null || !run.procStart || !run.bootId || !isAlive({ pid: run.pid, procStart: run.procStart, bootId: run.bootId })) {
+        // An empty or unknown boot id is unknown, not dead (core/proc.ts).
+        if (run && !recordAlive(run)) {
           db.markCrashed(run.id);
           return true;
+        }
+        if (!run) {
+          const rec = readChildRecord(i.stateDir, i.runId);
+          if (rec && !recordAlive(rec)) {
+            gone.rec = rec;
+            return true;
+          }
         }
       }
       return Date.now() >= deadline;
@@ -221,11 +287,13 @@ export async function followRun(i: FollowInput): Promise<FollowResult> {
     }
     let final = db.getRun(i.runId);
     // The child exited while its run still says running: it died (a finished run is recorded before exit).
-    if (final && final.status === "running" && child.exit) {
+    if (final && final.status === "running" && (child.exit || gone.rec)) {
       db.markCrashed(final.id);
       final = db.getRun(i.runId);
     }
     if (!final) {
+      const refused = readNotStarted(i.stateDir, i.runId);
+      if (refused) return { kind: "not_started", problem: { ...refused, runId: i.runId } };
       if (child.exit) {
         const out = existsSync(i.spawned!.output) ? tail(i.spawned!.output, 20).lines : [];
         const how = child.exit.code !== null ? `exited with ${child.exit.code}` : `was killed (${child.exit.signal ?? "unknown"})`;
@@ -236,7 +304,8 @@ export async function followRun(i: FollowInput): Promise<FollowResult> {
           details: { output: out },
         }) };
       }
-      if (i.spawned || existsSync(join(logDir(i.stateDir, i.runId), "process.log"))) return { kind: "running", summary: runningSummary(i.stateDir, i.runId) };
+      if (gone.rec) return { kind: "finished", summary: crashedBeforeStart(i.stateDir, i.runId, gone.rec) };
+      if (i.spawned || detachedRunExists(i.stateDir, i.runId)) return { kind: "running", summary: runningSummary(i.stateDir, i.runId) };
       return { kind: "not_started", problem: unknownRun(i.runId).problem };
     }
     if (final.status === "running") return { kind: "running", summary: runningSummary(i.stateDir, i.runId) };
@@ -244,6 +313,11 @@ export async function followRun(i: FollowInput): Promise<FollowResult> {
   } finally {
     db.close();
   }
+}
+
+/** Whether a detached run was started under this id, even if it has not recorded itself yet. */
+export function detachedRunExists(stateDir: string, runId: string): boolean {
+  return existsSync(processLogPath(stateDir, runId)) || readChildRecord(stateDir, runId) !== null;
 }
 
 /** RUN_NOT_FOUND-style usage error for `croft wait` with an unknown id. */

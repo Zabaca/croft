@@ -6,7 +6,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { CroftError, problem } from "../core/errors.ts";
-import { isAlive } from "../core/proc.ts";
+import { recordAlive } from "../core/proc.ts";
 import type { Problem, Sql, Warehouse } from "../core/types.ts";
 import { purgeDead } from "../db/intent.ts";
 import { reclaimDead, release } from "./leases.ts";
@@ -34,9 +34,9 @@ interface Commit { commits: number; rowsIn: number; added: number; updated: numb
 
 const DEFAULT_WAIT_MS = 2000;
 
+/** An empty or unknown boot id is unknown, not dead (core/proc.ts): the PID and start time decide. */
 function runAlive(r: RunRecord): boolean {
-  if (r.pid === null || !r.procStart || !r.bootId) return false;
-  return isAlive({ pid: r.pid, procStart: r.procStart, bootId: r.bootId });
+  return recordAlive(r);
 }
 
 /** lock_holder and lock_waiters record only a PID, so the best check is whether it exists. */

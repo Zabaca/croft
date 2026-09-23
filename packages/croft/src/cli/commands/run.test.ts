@@ -86,7 +86,7 @@ describe("detached runs", () => {
       expect(run.pid).not.toBe(parent.proc.pid); // the work was done by the detached child
     });
     // The child's own output went to its process log, not to the parent's stdout.
-    expect(existsSync(join(root, ".croft", "logs", runId, "process.log"))).toBe(true);
+    expect(existsSync(join(root, ".croft", "logs", runId, "_process.log"))).toBe(true);
   }, 30_000);
 
   test("a run that finishes within --follow prints its result and exit code; --events streams NDJSON", async () => {

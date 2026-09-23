@@ -4,7 +4,7 @@
 // lease, so a kill -9 can never leave an asset busy forever.
 import { setTimeout as sleep } from "node:timers/promises";
 import { CroftError } from "../core/errors.ts";
-import { currentIdentity, isAlive, type ProcessIdentity } from "../core/proc.ts";
+import { currentIdentity, recordAlive, type ProcessIdentity } from "../core/proc.ts";
 import type { RunsDb } from "./runs-db.ts";
 
 export interface Lease { asset: string; runId: string; pid: number; procStart: string; bootId: string; since: string }
@@ -39,11 +39,12 @@ function sameProcess(l: Lease, id: ProcessIdentity): boolean {
   return l.pid === id.pid && l.procStart === id.procStart && l.bootId === id.bootId;
 }
 
-/** True while the process that took the lease is still running. */
+/** True while the process that took the lease is still running. A lease without a start time names no
+ *  process croft recorded (dead); an empty boot id is unknown, not dead: the PID and start time decide. */
 export function leaseAlive(l: Lease): boolean {
-  if (!l.procStart || !l.bootId) return false;
+  if (!l.procStart) return false;
   if (sameProcess(l, currentIdentity())) return true;   // skip the `ps` spawn for our own leases
-  return isAlive({ pid: l.pid, procStart: l.procStart, bootId: l.bootId });
+  return recordAlive(l);
 }
 
 function rowsFor(db: RunsDb, assets: string[]): Lease[] {
@@ -53,11 +54,12 @@ function rowsFor(db: RunsDb, assets: string[]): Lease[] {
   return rows.map(toLease);
 }
 
-/** Delete a dead lease only if it is still the exact row we judged dead. */
+/** Delete a dead lease only if it is still the exact row we judged dead (NULL and "" read alike, as toLease
+ *  reads them). */
 function deleteIfUnchanged(db: RunsDb, l: Lease): boolean {
   return db.sqlite
-    .query("DELETE FROM leases WHERE asset = ? AND run_id = ? AND pid = ? AND proc_start IS ? AND boot_id IS ?")
-    .run(l.asset, l.runId, l.pid, l.procStart || null, l.bootId || null).changes === 1;
+    .query("DELETE FROM leases WHERE asset = ? AND run_id = ? AND pid = ? AND coalesce(proc_start, '') = ? AND coalesce(boot_id, '') = ?")
+    .run(l.asset, l.runId, l.pid, l.procStart, l.bootId).changes === 1;
 }
 
 /**

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bootId, currentIdentity, procStart } from "../core/proc.ts";
@@ -86,6 +86,24 @@ describe("liveness", () => {
     expect(removed.map((r) => r.file)).toContain(otherBoot);
     expect(removed).toHaveLength(4);
     expect(readdirSync(intentDir(state))).toEqual([]);
+  });
+
+  test("an intent whose boot id could not be read is live while its process is (never purged as dead)", async () => {
+    const state = stateDir();
+    const child = spawn("sleep", ["30"]);
+    try {
+      for (const boot of ["", "unknown"]) {
+        const id = { pid: child.pid!, procStart: procStart(child.pid!)!, bootId: boot };
+        const file = plant(state, id);
+        expect(isHolderAlive(id)).toBe(true);
+        expect(purgeDead(state)).toEqual([]);
+        expect(liveIntents(state).map((i) => i.file)).toEqual([file]);
+        purgeDead(state);
+        rmSync(file);
+      }
+    } finally {
+      child.kill("SIGKILL");
+    }
   });
 
   test("purgeDead keeps live intents", () => {

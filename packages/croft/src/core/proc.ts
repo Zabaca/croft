@@ -6,32 +6,78 @@
 // (a German terminal against the C-locale scheduler, a different TZ), so the value may depend on
 // neither: Linux uses /proc starttime (clock ticks since boot); macOS reads `ps -o lstart` under
 // LC_ALL=C TZ=UTC and stores epoch seconds.
+//
+// ps and sysctl are called by absolute path (/bin/ps, /usr/sbin/sysctl), so a PATH without /usr/sbin (an
+// agent's trimmed shell, a launchd job) cannot hide them. A boot id that still cannot be read is UNKNOWN_BOOT,
+// and an empty or unknown boot id on either side means "unknown", never "dead": the PID and the start time
+// decide. Reading it as dead made every writing command mark live runs crashed and take their leases.
 import { readFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 
 export interface ProcessIdentity {
   pid: number;
   procStart: string; // opaque, stable for the life of the process
-  bootId: string; // changes on every reboot
+  bootId: string; // changes on every reboot; UNKNOWN_BOOT when it could not be read
 }
+
+/** Where ps and sysctl are looked up by name when their absolute paths are missing. */
+const FALLBACK_PATH = "/usr/sbin:/sbin:/usr/bin:/bin";
+const SYSCTL = ["/usr/sbin/sysctl", "/sbin/sysctl"] as const;
+const PS = ["/bin/ps", "/usr/bin/ps"] as const;
 
 /** A fixed environment for ps and sysctl, so their text never depends on the caller's locale or zone. */
 function fixedEnv(): NodeJS.ProcessEnv {
-  return { PATH: process.env.PATH || "/bin:/usr/bin:/usr/sbin:/sbin", LC_ALL: "C", TZ: "UTC" };
+  return { PATH: [process.env.PATH, FALLBACK_PATH].filter((p) => p).join(":"), LC_ALL: "C", TZ: "UTC" };
 }
+
+/** Run a system tool by its absolute paths, then by its bare name (the fallback). null when it could not be
+ *  started at all. */
+function runTool(paths: readonly string[], args: string[]): SpawnSyncReturns<string> | null {
+  const bare = paths[0]!.slice(paths[0]!.lastIndexOf("/") + 1);
+  for (const cmd of [...paths, bare]) {
+    const out = spawnSync(cmd, args, { encoding: "utf8", env: fixedEnv() });
+    if (!out.error) return out;
+  }
+  return null;
+}
+
+/** A boot id that could not be read. Liveness then rests on the PID and the start time. */
+export const UNKNOWN_BOOT = "unknown";
 
 let cachedBootId: string | undefined;
 
-export function bootId(): string {
-  if (cachedBootId) return cachedBootId;
+function readBootId(): string {
   if (process.platform === "linux") {
-    cachedBootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
-  } else {
-    // macOS: "{ sec = 1758600000, usec = 123 } Tue Sep 23 ..." — the seconds identify the boot.
-    const out = spawnSync("sysctl", ["-n", "kern.boottime"], { encoding: "utf8", env: fixedEnv() }).stdout ?? "";
-    cachedBootId = out.match(/sec = (\d+)/)?.[1] ?? out.trim();
+    try {
+      return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    } catch {
+      return "";
+    }
   }
+  // macOS: "{ sec = 1758600000, usec = 123 } Tue Sep 23 ..." — the seconds identify the boot.
+  const res = runTool(SYSCTL, ["-n", "kern.boottime"]);
+  const out = res && res.status === 0 ? res.stdout ?? "" : "";
+  return out.match(/sec = (\d+)/)?.[1] ?? out.trim();
+}
+
+/** This machine's boot id, or UNKNOWN_BOOT when it cannot be read; never "". */
+export function bootId(): string {
+  cachedBootId ??= readBootId() || UNKNOWN_BOOT;
   return cachedBootId;
+}
+
+/** Whether a boot id was actually read: an empty, missing or UNKNOWN_BOOT id was not. */
+export function knownBoot(id: string | null | undefined): boolean {
+  return typeof id === "string" && id !== "" && id !== UNKNOWN_BOOT;
+}
+
+/**
+ * Whether a recorded boot id names this boot. Unknown on either side is no evidence of a reboot, so it
+ * counts as the same boot and the PID and start time decide.
+ */
+export function sameBoot(recorded: string | null | undefined, current: string = bootId()): boolean {
+  if (!knownBoot(recorded) || !knownBoot(current)) return true;
+  return recorded === current;
 }
 
 /** Start time recorded when it could not be read even though the process exists. */
@@ -75,15 +121,15 @@ export function procStart(pid: number): string | null {
       return pidExists(pid) ? UNKNOWN_START : null;
     }
   }
-  const out = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: fixedEnv() });
-  const text = (out.stdout ?? "").trim();
-  if (out.status === 0 && text) {
+  const out = runTool(PS, ["-o", "lstart=", "-p", String(pid)]);
+  const text = (out?.stdout ?? "").trim();
+  if (out && out.status === 0 && text) {
     const seconds = cLstartSeconds(text);
     // Text of an unexpected shape is still stable under the fixed environment, so it is kept as is.
     return seconds === null ? text : String(seconds);
   }
   // ps exits 1 with no output for a missing PID; anything else (spawn failure) is inconclusive.
-  if (!out.error && out.status === 1 && !pidExists(pid)) return null;
+  if (out && out.status === 1 && !pidExists(pid)) return null;
   return pidExists(pid) ? UNKNOWN_START : null;
 }
 
@@ -127,10 +173,20 @@ export function sameStart(recorded: string, current: string): boolean {
 /**
  * True only when the same process (same boot, same start time) is still running. When either
  * start time is unknown, falls back to "the PID exists in this boot" and errs on the side of alive.
+ * An empty or unknown boot id (on either side) skips the boot comparison; it never means dead.
  */
 export function isAlive(id: ProcessIdentity): boolean {
-  if (id.bootId !== bootId()) return false;
+  if (!sameBoot(id.bootId)) return false;
   const start = procStart(id.pid);
   if (start === null) return false;
   return sameStart(id.procStart, start);
+}
+
+/**
+ * isAlive for a stored record (a run, a lease), whose columns may be NULL or empty. Without a PID or a start
+ * time it names no process croft recorded, so it is dead; a missing boot id is unknown, not dead.
+ */
+export function recordAlive(r: { pid: number | null; procStart: string | null; bootId: string | null }): boolean {
+  if (r.pid === null || !r.procStart) return false;
+  return isAlive({ pid: r.pid, procStart: r.procStart, bootId: r.bootId ?? "" });
 }

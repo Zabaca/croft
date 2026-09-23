@@ -123,6 +123,27 @@ describe("dead holders", () => {
     expect(listLeases(db)).toEqual([]);
   });
 
+  // A holder whose boot id could not be read (sysctl not on its PATH) recorded "" or NULL: that is unknown, not
+  // dead, so a second run must get ASSET_BUSY rather than take the asset from under a live extraction.
+  test("a live holder recorded with an empty or NULL boot id keeps its lease", async () => {
+    const { id, child } = otherLiveProcess();
+    for (const boot of ["", null]) {
+      db.sqlite.query("INSERT INTO leases (asset, run_id, pid, proc_start, boot_id, since) VALUES ('orders', 'r_child', ?, ?, ?, ?)")
+        .run(id.pid, id.procStart, boot, since);
+      expect(listLeases(db)[0]?.alive).toBe(true);
+      expect(reclaimDead(db)).toEqual([]);
+      await expectCode(acquire(db, "orders", "r_me", { noWait: true }), "ASSET_BUSY");
+      db.sqlite.query("DELETE FROM leases").run();
+    }
+    // Once it exits, the same lease is reclaimed (the row is matched with its empty boot id).
+    db.sqlite.query("INSERT INTO leases (asset, run_id, pid, proc_start, boot_id, since) VALUES ('orders', 'r_child', ?, ?, '', ?)")
+      .run(id.pid, id.procStart, since);
+    child.kill("SIGKILL");
+    await new Promise((r) => child.on("exit", r));
+    expect(reclaimDead(db).map((l) => l.runId)).toEqual(["r_child"]);
+    expect(tryAcquire(db, "orders", "r_me").ok).toBe(true);
+  });
+
   test("a lease with no identity recorded counts as dead", () => {
     db.sqlite.query("INSERT INTO leases (asset, run_id, pid, since) VALUES ('x', 'r_x', 1, ?)").run(since);
     expect(reclaimDead(db).map((l) => l.asset)).toEqual(["x"]);

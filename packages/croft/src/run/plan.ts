@@ -7,7 +7,7 @@
 // bare `croft run` still lists them. Staleness, downstream and --dry-run arrive with transforms (phase 2).
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { CroftError } from "../core/errors.ts";
+import { CroftError, isCode } from "../core/errors.ts";
 import type { CursorType, Incremental, Problem, Reason, WriteMode } from "../core/types.ts";
 import type { FileIngest } from "../types.ts";
 import { type DiscoveredAsset, discoverAssets } from "../project/discover.ts";
@@ -45,7 +45,7 @@ export interface PlannedStep {
 
 export interface RunPlan {
   steps: PlannedStep[];
-  /** Discovery problems (bad or clashing file names); reported only when every asset was asked for. */
+  /** Discovery problems (bad or clashing file names): all of them for a bare run, else those a glob matched. */
   problems: Problem[];
   /** Directories of declared file ingests. The run's warehouse sandbox no longer needs them (files are read from
    *  snapshots in the state folder); kept for tools that want to know where an ingest reads. */
@@ -77,18 +77,37 @@ export function isGlob(selector: string): boolean {
   return GLOB_CHARS.test(selector);
 }
 
+/** Discovery problems (NAME_RESERVED, NAME_INVALID, NAME_CONFLICT) about files a selector names, by exact name
+ *  or glob: each carries the file's base name in details.name. */
+export function problemsNamed(selector: string, problems: readonly Problem[]): Problem[] {
+  const glob = isGlob(selector) ? new Bun.Glob(selector) : null;
+  return problems.filter((p) => {
+    const name = p.details?.name;
+    return typeof name === "string" && (glob ? glob.match(name) : name === selector);
+  });
+}
+
+/** A discovery problem as the error a selector that names that file fails with. */
+function discoveryError(p: Problem): CroftError {
+  const { severity: _s, docs: _d, code, ...init } = p;
+  return new CroftError(isCode(code) ? code : "USAGE_ERROR", init);
+}
+
 /**
  * The asset names a list of selectors picks, in name order: exact names or globs ('github_*'). An empty list
- * selects every asset. An unknown name or a glob that matches nothing is USAGE_ERROR, with a did-you-mean.
+ * selects every asset. An unknown name or a glob that matches nothing is USAGE_ERROR, with a did-you-mean,
+ * unless it names a file discovery refused (`order.ts`: NAME_RESERVED): then that file's own problem.
  */
-export function selectAssets(names: readonly string[], selectors: readonly string[]): string[] {
+export function selectAssets(names: readonly string[], selectors: readonly string[], problems: readonly Problem[] = []): string[] {
   if (selectors.length === 0) return [...names].sort();
   const picked = new Set<string>();
   for (const sel of selectors) {
+    const broken = problemsNamed(sel, problems);
     if (isGlob(sel)) {
       const glob = new Bun.Glob(sel);
       const hits = names.filter((n) => glob.match(n));
       if (hits.length === 0) {
+        if (broken[0]) throw discoveryError(broken[0]);
         throw new CroftError("USAGE_ERROR", {
           message: `no asset matches ${JSON.stringify(sel)}`,
           hint: names.length ? `assets are named after their files in assets/: ${names.slice(0, 20).join(", ")}` : "assets/ has no assets yet; croft new --list shows templates",
@@ -99,6 +118,7 @@ export function selectAssets(names: readonly string[], selectors: readonly strin
       continue;
     }
     if (!names.includes(sel)) {
+      if (broken[0]) throw discoveryError(broken[0]);
       const guess = didYouMean(sel, names);
       throw new CroftError("USAGE_ERROR", {
         message: `there is no asset named ${JSON.stringify(sel)}`,
@@ -192,7 +212,7 @@ function baseStep(a: DiscoveredAsset): Omit<PlannedStep, "kind" | "action" | "re
 export async function planRun(i: PlanInput): Promise<RunPlan> {
   const discovery = await discoverAssets(i.root);
   const names = discovery.assets.map((a) => a.name);
-  const selected = selectAssets(names, i.selectors);
+  const selected = selectAssets(names, i.selectors, discovery.problems);
   const steps: PlannedStep[] = [];
   const fileDirs = new Set<string>();
   for (const name of selected) {
@@ -234,7 +254,10 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
   }
   return {
     steps,
-    problems: i.selectors.length === 0 ? discovery.problems : [],
+    // Every discovery problem for a bare run; for selectors, those about files a glob also matched.
+    problems: i.selectors.length === 0
+      ? discovery.problems
+      : discovery.problems.filter((p) => i.selectors.some((sel) => problemsNamed(sel, [p]).length > 0)),
     fileDirs: [...fileDirs].filter((d) => d !== join(i.root, "files")),
   };
 }

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { bootId, currentIdentity, isAlive, procStart } from "./proc.ts";
+import { bootId, currentIdentity, isAlive, knownBoot, procStart, recordAlive, sameBoot, UNKNOWN_BOOT } from "./proc.ts";
 
 test("current process is alive", () => {
   expect(isAlive(currentIdentity())).toBe(true);
@@ -27,6 +27,45 @@ test("an unknown start time falls back to PID existence", () => {
   expect(isAlive({ ...me, procStart: "unknown" })).toBe(true);
   expect(isAlive({ pid: 2 ** 22 + 12345, procStart: "unknown", bootId: me.bootId })).toBe(false);
 });
+
+test("the boot id is read, never empty", () => {
+  expect(bootId()).not.toBe("");
+  expect(bootId()).not.toBe(UNKNOWN_BOOT);
+  expect(knownBoot(bootId())).toBe(true);
+});
+
+test("an empty or unknown boot id is unknown, not dead: the PID and start time decide", () => {
+  const me = currentIdentity();
+  for (const b of ["", UNKNOWN_BOOT]) {
+    expect(sameBoot(b)).toBe(true);
+    expect(sameBoot(me.bootId, b)).toBe(true);
+    expect(isAlive({ ...me, bootId: b })).toBe(true);
+    // Still dead when the start time does not match or the PID is gone.
+    expect(isAlive({ ...me, bootId: b, procStart: "1" })).toBe(false);
+    expect(isAlive({ pid: 2 ** 22 + 12345, procStart: me.procStart, bootId: b })).toBe(false);
+  }
+  expect(sameBoot("other-boot")).toBe(false);
+  expect(recordAlive({ pid: me.pid, procStart: me.procStart, bootId: null })).toBe(true);
+  expect(recordAlive({ pid: me.pid, procStart: me.procStart, bootId: "" })).toBe(true);
+  expect(recordAlive({ pid: null, procStart: me.procStart, bootId: me.bootId })).toBe(false);
+  expect(recordAlive({ pid: me.pid, procStart: null, bootId: me.bootId })).toBe(false);
+});
+
+// An agent's shell or a launchd job may have a PATH without /usr/sbin (where macOS keeps sysctl), or none.
+for (const PATH of ["", "/usr/bin:/bin", "/nonexistent"]) {
+  test(`with PATH=${JSON.stringify(PATH)} the boot id and start times are still read (ps and sysctl by absolute path)`, async () => {
+    const child = spawn(process.execPath, ["-e", `
+      import { bootId, currentIdentity, procStart } from ${JSON.stringify(join(import.meta.dir, "proc.ts"))};
+      console.log(JSON.stringify({ boot: bootId(), me: currentIdentity(), parent: procStart(${process.pid}) }));
+    `], { env: { PATH }, stdio: ["ignore", "pipe", "inherit"] });
+    const line = await createInterface({ input: child.stdout! })[Symbol.asyncIterator]().next();
+    const seen = JSON.parse(String(line.value)) as { boot: string; me: { pid: number; procStart: string; bootId: string }; parent: string };
+    expect(seen.boot).toBe(bootId());
+    expect(seen.me.bootId).toBe(bootId());
+    expect(seen.parent).toBe(currentIdentity().procStart);
+    expect(seen.me.procStart).not.toBe("unknown");
+  }, 20_000);
+}
 
 // A holder records its start time in its own environment and a checker reads it in another: a German
 // terminal against the C-locale scheduler, or a different TZ. Both must see the same value.
