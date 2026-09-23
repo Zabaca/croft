@@ -1,6 +1,14 @@
 // Time rendering in the project time zone (DESIGN.md §4 "Timestamps", §7 "Time zones").
 // JSON timestamps carry the project offset so they agree with `::DATE` in SQL. croft renders
 // instants itself because DuckDB's JSON helpers use the process-local zone.
+//
+// This is croft's one timestamp renderer: CLI JSON, croft serve and @zabaca/croft/read (db/values.ts),
+// cursors and messages all go through formatInstant, so an instant always reads the same way. Offsets are
+// always ±HH:MM (RFC 3339 has no seconds offset); the historic local-mean-time offsets with seconds are
+// rounded to the minute and the wall clock is shifted with them, so the string still names the exact instant.
+// Offsets come from Intl, i.e. the runtime's ICU data. DuckDB bundles its own ICU data for `::DATE` and the
+// SQL time functions; `croft doctor` warns with TZDATA_MISMATCH when the two disagree for the project zone.
+// No Bun-only APIs: read.ts imports this through db/values.ts.
 import { CroftError } from "./errors.ts";
 
 /** An instant: a Date, epoch milliseconds, epoch microseconds (bigint, DuckDB's TIMESTAMPTZ unit),
@@ -8,6 +16,8 @@ import { CroftError } from "./errors.ts";
 export type InstantInput = Date | number | bigint | string | { readonly micros: bigint };
 
 const MICROS_PER_SECOND = 1_000_000n;
+const US_PER_DAY = 86_400_000_000n;
+const DAY_MS = 86_400_000;
 // Date's range: ±8.64e15 ms. Intl cannot compute offsets outside it.
 const MAX_EPOCH_MS = 8.64e15;
 
@@ -58,15 +68,61 @@ function guessZone(input: string): string | undefined {
   return Intl.supportedValuesOf("timeZone").find((z) => z.toLowerCase().split("/").pop() === want);
 }
 
-/** UTC offset of `tz` at an instant, in whole minutes (historic second offsets are rounded). */
-export function offsetMinutes(epochMs: number, tz: string): number {
-  if (!Number.isFinite(epochMs) || Math.abs(epochMs) > MAX_EPOCH_MS) throw new RangeError(`instant out of range: ${epochMs}`);
+/** The exact offset from Intl, in seconds (one formatToParts call, ~20 µs). */
+function intlOffsetSeconds(tz: string, epochMs: number): number {
   const name = offsetFormat(tz).formatToParts(new Date(epochMs)).find((p) => p.type === "timeZoneName")?.value ?? "GMT";
   const m = /^GMT(?:([+-])(\d{1,2})(?::?(\d{2}))?(?::?(\d{2}))?)?$/.exec(name);
   if (!m) throw new RangeError(`unexpected offset "${name}" for ${tz}`);
   if (!m[1]) return 0;
   const seconds = Number(m[2]) * 3600 + Number(m[3] ?? 0) * 60 + Number(m[4] ?? 0);
-  return (m[1] === "-" ? -1 : 1) * Math.round(seconds / 60);
+  return m[1] === "-" ? -seconds : seconds;
+}
+
+// Offsets are cached per zone and UTC day: the offset at the day's first and last second and, on a transition
+// day, the first second on the new offset (a binary search of about 17 lookups). This assumes at most one
+// transition per UTC day, which real zones keep; rendering a result then costs two Intl calls per distinct day.
+interface DayOffsets { before: number; after: number; switchMs: number }
+const offsetCache = new Map<string, Map<number, DayOffsets>>();
+
+/** UTC offset of `tz` at an instant, in seconds, exactly (historic local mean time has seconds, e.g.
+ *  -07:52:58 for Los Angeles before 1883). Throws RangeError outside JS dates (±8.64e15 ms). */
+export function offsetSeconds(epochMs: number, tz: string): number {
+  if (!Number.isFinite(epochMs) || Math.abs(epochMs) > MAX_EPOCH_MS) throw new RangeError(`instant out of range: ${epochMs}`);
+  const ms = Math.floor(epochMs / 1000) * 1000;                                // offsets change on whole seconds
+  const day = Math.floor(ms / DAY_MS);
+  const start = day * DAY_MS;
+  const end = start + DAY_MS - 1000;
+  if (start < -MAX_EPOCH_MS || end > MAX_EPOCH_MS) return intlOffsetSeconds(tz, ms); // the edge day: no cache
+  let cache = offsetCache.get(tz);
+  if (!cache) offsetCache.set(tz, (cache = new Map()));
+  let info = cache.get(day);
+  if (!info) {
+    const before = intlOffsetSeconds(tz, start);
+    const after = intlOffsetSeconds(tz, end);
+    let switchMs = end + 1000;
+    if (before !== after) {
+      let lo = start;
+      let hi = end;
+      while (hi - lo > 1000) {
+        const mid = lo + Math.floor((hi - lo) / 2000) * 1000;
+        if (intlOffsetSeconds(tz, mid) === before) lo = mid;
+        else hi = mid;
+      }
+      switchMs = hi;
+    }
+    info = { before, after, switchMs };
+    if (cache.size > 100_000) cache.clear();
+    cache.set(day, info);
+  }
+  return ms >= info.switchMs ? info.after : info.before;
+}
+
+/** UTC offset of `tz` at an instant, in whole minutes: historic second offsets are rounded half away from
+ *  zero (-00:44:30 → -00:45). */
+export function offsetMinutes(epochMs: number, tz: string): number {
+  const seconds = offsetSeconds(epochMs, tz);
+  const minutes = Math.round(Math.abs(seconds) / 60);
+  return seconds < 0 && minutes !== 0 ? -minutes : minutes;
 }
 
 /** "+HH:MM" / "-HH:MM" for an offset in minutes; UTC is "+00:00". */
@@ -121,20 +177,60 @@ export function parseInstant(text: string): bigint {
   return micros;
 }
 
-/** ISO-8601 in the project zone with its offset, e.g. 2026-09-21T22:00:00-07:00.
- *  Fractions are kept: 3 digits for millisecond precision, 6 when microseconds are present. */
+/** ISO-8601 in the project zone with its ±HH:MM offset, e.g. 2026-09-21T22:00:00-07:00.
+ *  Fractions are kept: 3 digits for millisecond precision, 6 when microseconds are present. Beyond the range
+ *  of JS dates (±275,760 years, which DuckDB's TIMESTAMPTZ exceeds) there is no zone data: UTC, +00:00. */
 export function formatInstant(value: InstantInput, tz: string): string {
   const micros = toEpochMicros(value);
-  let seconds = micros / MICROS_PER_SECOND;
-  let fraction = micros % MICROS_PER_SECOND;
-  if (fraction < 0n) { fraction += MICROS_PER_SECOND; seconds -= 1n; }       // floor for pre-1970 instants
-  const epochMs = Number(seconds) * 1000;
-  const offset = offsetMinutes(epochMs, tz);
-  const wall = new Date(epochMs + offset * 60_000);
-  const frac = fraction === 0n ? "" : fraction % 1000n === 0n
-    ? `.${pad(Number(fraction / 1000n), 3)}` : `.${pad(Number(fraction), 6)}`;
-  return `${formatYear(wall.getUTCFullYear())}-${pad(wall.getUTCMonth() + 1, 2)}-${pad(wall.getUTCDate(), 2)}`
-    + `T${pad(wall.getUTCHours(), 2)}:${pad(wall.getUTCMinutes(), 2)}:${pad(wall.getUTCSeconds(), 2)}${frac}${formatOffset(offset)}`;
+  const epochMs = Number(floorDiv(micros, 1000n));
+  const offset = Math.abs(epochMs) <= MAX_EPOCH_MS ? offsetMinutes(epochMs, tz) : 0;
+  return formatNaive(micros + BigInt(offset) * 60n * MICROS_PER_SECOND, false) + formatOffset(offset);
+}
+
+/** Proleptic Gregorian date from days since 1970-01-01 (H. Hinnant's civil_from_days). */
+function civil(days: number): { y: number; m: number; d: number } {
+  const z = days + 719468;
+  const era = Math.floor(z / 146097);
+  const doe = z - era * 146097;
+  const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365);
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100));
+  const mp = Math.floor((5 * doy + 2) / 153);
+  const d = doy - Math.floor((153 * mp + 2) / 5) + 1;
+  const m = mp < 10 ? mp + 3 : mp - 9;
+  return { y: yoe + era * 400 + (m <= 2 ? 1 : 0), m, d };
+}
+
+/** YYYY-MM-DD from days since 1970-01-01; years outside 0000–9999 use ISO-8601 expanded years (±YYYYYY). */
+export function formatDate(days: number): string {
+  const { y, m, d } = civil(days);
+  return `${formatYear(y)}-${pad(m, 2)}-${pad(d, 2)}`;
+}
+
+/**
+ * "HH:MM:SS" plus fraction: always `fracDigits` wide when `fixed`; otherwise none when zero, and trimmed in
+ * groups of three (".5" never, ".500" for whole milliseconds, ".123456" for microseconds).
+ */
+export function formatClock(usOfDay: bigint, fracDigits: number, fixed: boolean, fracValue?: bigint): string {
+  const totalSec = usOfDay / MICROS_PER_SECOND;
+  const h = Number(totalSec / 3600n);
+  const mi = Number((totalSec / 60n) % 60n);
+  const s = Number(totalSec % 60n);
+  const frac = fracValue ?? usOfDay % MICROS_PER_SECOND;
+  const out = `${pad(h, 2)}:${pad(mi, 2)}:${pad(s, 2)}`;
+  if (!fixed && frac === 0n) return out;
+  let digits = frac.toString().padStart(fracDigits, "0");
+  if (!fixed) while (digits.length > 3 && digits.endsWith("000")) digits = digits.slice(0, -3);
+  return `${out}.${digits}`;
+}
+
+/** Naive ISO timestamp from microseconds since the epoch: microseconds always when `fixed`, else as formatClock. */
+export function formatNaive(micros: bigint, fixed: boolean): string {
+  const days = floorDiv(micros, US_PER_DAY);
+  return `${formatDate(Number(days))}T${formatClock(micros - days * US_PER_DAY, 6, fixed)}`;
+}
+
+function floorDiv(a: bigint, b: bigint): bigint {
+  return a % b < 0n ? a / b - 1n : a / b;
 }
 
 /** Wall-clock fields of an instant in `tz` (for schedules and human output). */

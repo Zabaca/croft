@@ -4,7 +4,7 @@ import { now, systemTimeZone } from "../core/time.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { findRoot, loadProject, notFound, type Project } from "../project/root.ts";
 import type { Command, Ctx, OptionValues } from "./command.ts";
-import type { Render } from "./render.ts";
+import type { Redactor, Render } from "./render.ts";
 
 export interface ContextInit {
   cwd: string;
@@ -76,15 +76,15 @@ export class CliContext implements Ctx {
     return now(this.processEnv);
   }
 
-  #redactor: ((text: string) => string) | undefined;
+  #redactor: Redactor | undefined;
 
-  /** Redaction for output, loading .env on first use. Best effort: an unreadable .env cannot leak
-   *  through croft either. */
-  redactor(): (text: string) => string {
+  /** Redaction for output, loading .env on first use: free text through ProjectEnv.redact, command data
+   *  through its narrower redactData. Best effort: an unreadable .env cannot leak through croft either. */
+  redactor(): Redactor {
     if (!this.#redactor) {
       try {
         const env = this.env;
-        this.#redactor = (text) => env.redact(text);
+        this.#redactor = Object.assign((text: string) => env.redact(text), { data: (text: string) => env.redactData(text) });
       } catch {
         this.#redactor = (text) => text;
       }

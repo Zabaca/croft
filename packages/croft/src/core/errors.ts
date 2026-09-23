@@ -164,14 +164,23 @@ export class CroftError extends Error {
   }
 }
 
-/** Exit code for a set of problems, following the precedence rules in DESIGN.md §4.3. */
+/**
+ * Exit code for a set of problems, following the precedence rules in DESIGN.md §4.3: 130 when interrupted,
+ * 6 while still running, 3 only when every failure is CHECK_FAILED, and 1 for any other failure mix that
+ * includes exit 1. Otherwise the highest registered exit wins (2 invalid < 4 busy < 5 needs a human).
+ * With CHECK_FAILED in the mix, the other failures decide: 4 or 5 when every one of them is a coordination
+ * (4) or safety (5) outcome, since "retry later" and "ask a human" still hold; otherwise 1 ("any non-check
+ * failure"), so an exit-2 code such as SECRET_MISSING or SQL_SYNTAX is never reported as checks-only.
+ */
 export function exitCodeFor(problems: Problem[], opts: { stillRunning?: boolean; pendingConfirmation?: boolean } = {}): number {
   const errors = problems.filter((p) => p.severity === "error");
   if (errors.some((p) => p.code === "INTERRUPTED")) return EXIT.INTERRUPTED;
   if (opts.stillRunning) return EXIT.STILL_RUNNING;
   if (errors.length === 0) return opts.pendingConfirmation ? EXIT.NEEDS_HUMAN : EXIT.OK;
-  if (errors.every((p) => p.code === "CHECK_FAILED")) return EXIT.CHECKS_FAILED;
-  const exits = errors.map((p) => (isCode(p.code) ? CODES[p.code].exit : EXIT.FAILED));
+  const others = errors.filter((p) => p.code !== "CHECK_FAILED");
+  if (others.length === 0) return EXIT.CHECKS_FAILED;
+  const exits = others.map((p) => (isCode(p.code) ? CODES[p.code].exit : EXIT.FAILED));
   if (exits.includes(EXIT.FAILED)) return EXIT.FAILED;
+  if (others.length < errors.length && !exits.every((e) => e === EXIT.BUSY || e === EXIT.NEEDS_HUMAN)) return EXIT.FAILED;
   return Math.max(...exits);
 }

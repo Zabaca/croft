@@ -7,8 +7,9 @@ import type { CursorType, Fix } from "../core/types.ts";
 import { openMemory } from "../db/connect.ts";
 import { TxGuard } from "../db/tx-guard.ts";
 import { closeAllWarehouses, LeaseSql, openWarehouse } from "../db/warehouse.ts";
-import { buildTypedBatch, type BuildTypedBatchOptions, castExpr, CURSOR_TEXT, lossExpr, numCanon, type TypedBatchResult } from "./cast.ts";
+import { buildTypedBatch, type BuildTypedBatchOptions, castExpr, CURSOR_TEXT, lossExpr, numCanon, realColumns, type TypedBatchResult } from "./cast.ts";
 import { ident } from "./classify.ts";
+import { readTableSchema } from "./evolve.ts";
 import { parseJsonLossless, STAGE_FILE, type StageOptions, writeStage } from "./stage.ts";
 import type { KnownColumn } from "./types.ts";
 
@@ -390,6 +391,20 @@ describe("evolution against stored columns (§7 table)", () => {
       "column dropped was dropped",
       "column added (VARCHAR) was added",
     ]);
+    await db.exec(`DROP TABLE a`);
+  });
+
+  test("types are spelled as evolve.ts spells them, so _croft.columns records match the real table", async () => {
+    const db = await testDb();
+    await db.exec(`CREATE TABLE a (id BIGINT, t TIME WITH TIME ZONE, l INT8[], d DECIMAL(10), _loaded_at TIMESTAMPTZ)`);
+    const real = await db.tx((t) => realColumns(t, "a"));
+    const evolved = await db.tx((t) => readTableSchema(t, "a"));
+    expect(real).toEqual(evolved!.filter((c) => c.name !== "_loaded_at"));
+    expect(real!.find((c) => c.name === "t")!.type).toBe("TIMETZ");
+    // write.ts records _croft.columns.type with evolve.ts's normalizeType: no false TABLE_MODIFIED_OUTSIDE_CROFT.
+    const recorded = evolved!.filter((c) => c.name !== "_loaded_at").map((c) => known(c.name, c.type));
+    const { batch } = await db.load([{ id: 1 }], { knownColumns: recorded });
+    expect(batch.warnings.filter((x) => x.code === "TABLE_MODIFIED_OUTSIDE_CROFT")).toEqual([]);
     await db.exec(`DROP TABLE a`);
   });
 });

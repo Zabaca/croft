@@ -16,10 +16,13 @@ import type { ColumnPin } from "../types.ts";
 import { didYouMean } from "../project/suggest.ts";
 import { type BatchCursor, RESERVED, type TypedBatch } from "./contract.ts";
 import { classify, ident, kindExpr, sqlString, stageRaw } from "./classify.ts";
+// evolve.ts owns type spelling: ColumnPlan.existing/target, the real table's types and _croft.columns.type
+// must compare equal (TIMETZ, BIGINT[], DECIMAL(p,s)).
+import { normalizeType } from "./evolve.ts";
 import type { StagedColumn } from "./stage.ts";
 import {
   type ColumnDecision, decimalParts, describeKinds, evolve, type IncomingColumn, jsKey, type KnownColumn, newColumnType,
-  normalizePins, normalizeType, type Pin, RE, typeFamily,
+  normalizePins, type Pin, RE, typeFamily,
 } from "./types.ts";
 
 export const typedTableName = (asset: string): string => `_croft_typed_${asset}`;

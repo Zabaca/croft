@@ -26,4 +26,28 @@ describe("error registry", () => {
     expect(exitCodeFor([], { pendingConfirmation: true })).toBe(EXIT.NEEDS_HUMAN);
     expect(exitCodeFor([], { stillRunning: true })).toBe(EXIT.STILL_RUNNING);
   });
+
+  test("CHECK_FAILED mixed with another failure is 1, unless the others are all busy (4) or needs-a-human (5)", () => {
+    const p = (code: keyof typeof CODES) => problem(code, { message: "x", hint: "y" });
+    const check = p("CHECK_FAILED");
+    // §4.3: 3 only when every failure is CHECK_FAILED. Exit-2 codes must not be hidden behind the 3.
+    expect(exitCodeFor([check, p("SECRET_MISSING")])).toBe(EXIT.FAILED);
+    expect(exitCodeFor([check, p("SQL_SYNTAX")])).toBe(EXIT.FAILED);
+    expect(exitCodeFor([p("UNKNOWN_COLUMN"), check, check])).toBe(EXIT.FAILED);
+    expect(exitCodeFor([check, p("QUERY_TOO_MANY_ROWS")])).toBe(EXIT.FAILED);           // coordination, but exit 2
+    expect(exitCodeFor([check, p("TYPE_CONFLICT")])).toBe(EXIT.FAILED);
+    expect(exitCodeFor([check, { severity: "error", code: "NOT_REGISTERED", message: "x", hint: "y", docs: "d" }])).toBe(EXIT.FAILED);
+    // Coordination and safety outcomes keep their own codes: retry later, or ask a human.
+    expect(exitCodeFor([check, p("DB_BUSY")])).toBe(EXIT.BUSY);
+    expect(exitCodeFor([check, p("CONFIRMATION_REQUIRED")])).toBe(EXIT.NEEDS_HUMAN);
+    expect(exitCodeFor([check, p("ASSET_BUSY"), p("REQUIRES_HUMAN")])).toBe(EXIT.NEEDS_HUMAN);
+    expect(exitCodeFor([check, p("DB_BUSY"), p("SQL_SYNTAX")])).toBe(EXIT.FAILED);
+    // Warnings never count; INTERRUPTED and still-running win as before.
+    expect(exitCodeFor([check, p("MIXED_TYPES")])).toBe(EXIT.CHECKS_FAILED);
+    expect(exitCodeFor([check, p("INTERRUPTED")])).toBe(EXIT.INTERRUPTED);
+    // Without CHECK_FAILED nothing changes.
+    expect(exitCodeFor([p("SQL_SYNTAX")])).toBe(EXIT.INVALID);
+    expect(exitCodeFor([p("SQL_SYNTAX"), p("DB_BUSY")])).toBe(EXIT.BUSY);
+    expect(exitCodeFor([p("SQL_SYNTAX"), p("HTTP_ERROR")])).toBe(EXIT.FAILED);
+  });
 });

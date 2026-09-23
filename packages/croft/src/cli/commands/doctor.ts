@@ -9,6 +9,7 @@ import { accessSync, constants as fsConstants, existsSync, readdirSync, readFile
 import { homedir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { CroftError, problem } from "../../core/errors.ts";
+import { now, offsetSeconds } from "../../core/time.ts";
 import type { LockHolder, Problem } from "../../core/types.ts";
 import { isHolderAlive, liveIntents } from "../../db/intent.ts";
 import { CLAUDE_MD, claudeBlock, findBlock, SKILL_PATH, skillStamp } from "../../agent/templates.ts";
@@ -53,6 +54,9 @@ export interface DoctorDeps {
   home: string;
   wsl: boolean;
   probeDuckdb(croftRoot: string): DuckdbProbe;
+  /** DuckDB's UTC offsets (seconds) for `tz` at each instant (epoch ms), from its bundled ICU data; null when
+   *  DuckDB does not know the zone. Default: duckdbOffsets (an in-memory DuckDB, after the binding check passed). */
+  duckdbOffsets?(tz: string, instants: readonly number[]): Promise<number[] | null>;
   rosetta(): boolean;
   synced(path: string): string | null;
   /** How long the warehouse probe waits on a lock before naming the holder. */
@@ -70,6 +74,7 @@ export function defaultDeps(env: Record<string, string | undefined>): DoctorDeps
     home: homedir(),
     wsl: process.platform === "linux" && isWsl(env),
     probeDuckdb,
+    duckdbOffsets,
     rosetta,
     synced: (p) => syncedLocation(p),
     lockWaitMs: 150,
@@ -132,6 +137,7 @@ export async function runDoctor(cwd: string, d: DoctorDeps): Promise<{ data: Doc
   if (project) {
     await checkWarehouse(r, d, project, probe.ok);
     await checkServe(r, d, project);
+    if (probe.ok) await checkTzdata(r, d, project.timezone);
   }
 
   // Project
@@ -454,6 +460,105 @@ async function checkServe(r: Report, d: DoctorDeps, project: Project): Promise<v
   const queries = typeof health.queriesToday === "number" ? ` · ${formatCount(health.queriesToday)} queries today` : "";
   r.add("environment", "serve", "ok", `croft serve on ${where} (pid ${s.pid}) · token in ${shownFile}${queries}`, undefined,
     { running: true, pid: s.pid, url: s.url, queriesToday: health.queriesToday ?? null });
+}
+
+// JSON timestamps take their offsets from Bun's Intl (core/time.ts); `::DATE` and every SQL time function use
+// DuckDB's bundled ICU data. When the two tzdata releases disagree for the project zone, a row's JSON timestamp
+// and its ::DATE can fall on different days. Compared from now over the next two years: every 12 hours, and
+// every 15 minutes across each 12-hour step where either side's offset changes (a transition), which catches a
+// different offset as well as a different switch time. Silent when they agree.
+const TZ_HORIZON_MS = 731 * 86_400_000;
+const TZ_STEP_MS = 12 * 3_600_000;
+const TZ_FINE_MS = 15 * 60_000;
+
+async function checkTzdata(r: Report, d: DoctorDeps, tz: string): Promise<void> {
+  const lookup = d.duckdbOffsets ?? duckdbOffsets;
+  let start: number;
+  try { start = now(d.env).getTime(); } catch { start = Date.now(); }
+  start = Math.floor(start / TZ_STEP_MS) * TZ_STEP_MS;
+  const coarse: number[] = [];
+  for (let t = start; t <= start + TZ_HORIZON_MS; t += TZ_STEP_MS) coarse.push(t);
+  let samples: { at: number; bun: number; duckdb: number }[];
+  try {
+    const duck = await lookup(tz, coarse);
+    if (duck === null) {
+      const p = problem("TZDATA_MISMATCH", {
+        message: `DuckDB's time zone data does not know ${tz}, which Bun's accepts; croft sets the project zone on every DuckDB connection`,
+        hint: `set "timezone" in croft.json to a zone name DuckDB also knows (the canonical IANA name, such as America/Los_Angeles)`,
+        fix: { kind: "manual", description: `change "timezone" in croft.json to a zone DuckDB knows` },
+        details: { timezone: tz, duckdbKnowsZone: false },
+      });
+      r.add("environment", "tzdata", "warn", `time zone data: DuckDB does not know ${tz}`, p, { timezone: tz });
+      return;
+    }
+    const bun = coarse.map((t) => offsetSeconds(t, tz));
+    const fine: number[] = [];
+    for (let i = 1; i < coarse.length; i++) {
+      if (bun[i] === bun[i - 1] && duck[i] === duck[i - 1]) continue;
+      for (let t = coarse[i - 1]! + TZ_FINE_MS; t < coarse[i]!; t += TZ_FINE_MS) fine.push(t);
+    }
+    const fineDuck = fine.length ? (await lookup(tz, fine)) ?? [] : [];
+    samples = [
+      ...coarse.map((at, i) => ({ at, bun: bun[i]!, duckdb: duck[i]! })),
+      ...fine.map((at, i) => ({ at, bun: offsetSeconds(at, tz), duckdb: fineDuck[i]! })),
+    ].sort((a, b) => a.at - b.at);
+  } catch (e) {
+    const msg = ((e as Error).message ?? String(e)).split("\n")[0]!.slice(0, 200);
+    r.add("environment", "tzdata", "info", `time zone data: not compared with DuckDB's (${msg})`, undefined, { timezone: tz });
+    return;
+  }
+  const bad = samples.filter((s) => s.bun !== s.duckdb);
+  if (bad.length === 0) return;
+  const show = (s: { at: number; bun: number; duckdb: number }) =>
+    ({ at: new Date(s.at).toISOString().replace(".000Z", "Z"), bun: offsetText(s.bun), duckdb: offsetText(s.duckdb) });
+  const first = show(bad[0]!);
+  const last = show(bad.at(-1)!);
+  const from = new Date(start).toISOString().slice(0, 10);
+  const until = new Date(start + TZ_HORIZON_MS).toISOString().slice(0, 10);
+  const p = problem("TZDATA_MISMATCH", {
+    message: `Bun's and DuckDB's time zone data disagree for ${tz} at ${formatCount(bad.length)} of ${formatCount(samples.length)} instants `
+      + `checked from ${from} to ${until}, first at ${first.at} (Bun ${first.bun}, DuckDB ${first.duckdb}). JSON timestamps use Bun's `
+      + `offsets and ::DATE uses DuckDB's, so near those instants a row's JSON timestamp and its ::DATE can fall on different days`,
+    hint: "upgrade Bun (bun upgrade) and croft so both carry a current tzdata release; until they agree, take days from SQL (::DATE), not from JSON timestamps",
+    fix: { kind: "manual", description: "upgrade Bun and croft until both use the same tzdata release; meanwhile compute days in SQL", requiresHuman: true },
+    details: { timezone: tz, checked: samples.length, mismatches: bad.length, from, until, first, last },
+  });
+  r.add("environment", "tzdata", "warn", `time zone data: Bun and DuckDB disagree for ${tz} (first at ${first.at}: Bun ${first.bun}, DuckDB ${first.duckdb})`,
+    p, { timezone: tz });
+}
+
+/** DuckDB's offsets for `tz`, read through its session TimeZone exactly as `::DATE` sees them; null when
+ *  DuckDB does not know the zone. */
+export async function duckdbOffsets(tz: string, instants: readonly number[]): Promise<number[] | null> {
+  const { DuckDBInstance } = await import("@duckdb/node-api");
+  const db = await DuckDBInstance.create(":memory:");
+  const c = await db.connect();
+  try {
+    try {
+      await c.run(`SET TimeZone = '${tz.replaceAll("'", "''")}'`);
+    } catch (e) {
+      if (/Unknown TimeZone/i.test((e as Error).message)) return null;
+      throw e;
+    }
+    const ms = instants.map((t) => Math.trunc(t));
+    if (ms.length === 0) return [];
+    const reader = await c.runAndReadAll(`SELECT t, date_part('timezone', make_timestamptz(t * 1000))::INTEGER AS off
+      FROM unnest([${ms.join(",")}]::BIGINT[]) AS u(t)`);
+    const byInstant = new Map<number, number>();
+    for (const [t, off] of reader.getRowsJS() as [bigint, number][]) byInstant.set(Number(t), off);
+    return ms.map((t) => byInstant.get(t) ?? Number.NaN);
+  } finally {
+    c.disconnectSync();
+    db.closeSync();
+  }
+}
+
+/** ±HH:MM, with :SS only for historic second offsets. */
+function offsetText(seconds: number): string {
+  if (!Number.isFinite(seconds)) return "?";
+  const a = Math.abs(seconds);
+  const ss = a % 60;
+  return `${seconds < 0 ? "-" : "+"}${String(Math.floor(a / 3600)).padStart(2, "0")}:${String(Math.floor((a % 3600) / 60)).padStart(2, "0")}${ss ? `:${String(ss).padStart(2, "0")}` : ""}`;
 }
 
 // ---------------------------------------------------------------------------------------------
