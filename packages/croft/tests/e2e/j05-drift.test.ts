@@ -3,7 +3,7 @@
 // failure is not retried. Once the source is fixed, the next run picks up from the old cursor.
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { at, githubAsset, githubRoute, issue, TOKEN } from "./fixtures.ts";
-import { bugTest, cleanupAll, findProblem, initProject, type MockApi, mockApi, show } from "./harness.ts";
+import { cleanupAll, findProblem, initProject, type MockApi, mockApi, show } from "./harness.ts";
 
 let api: MockApi;
 let driftDetails: Record<string, unknown> | undefined;
@@ -85,9 +85,11 @@ test("journey 5: number → text drift is TYPE_CONFLICT; nothing written; the cu
   expect(fixed.json.data.steps[0].cursor).toMatchObject({ before: at(4), after: at(6) });
 }, 120_000);
 
-// BUG (reported): DESIGN §4.3 fixes TYPE_CONFLICT details as {column, existingType, incomingKinds, badRows,
-// samples, readBy}; the build sends storedType / incoming / conflictKinds instead. Flip to test() once fixed.
-bugTest("journey 5b: TYPE_CONFLICT details use the §4.3 names", () => {
+// DESIGN §4.3 fixes TYPE_CONFLICT details as {column, existingType, incomingKinds, badRows, samples, readBy}
+// (the earlier storedType / incoming / conflictKinds stay as extra fields).
+test("journey 5b: TYPE_CONFLICT details use the §4.3 names", () => {
   expect(driftDetails).toBeDefined();
   for (const k of ["column", "existingType", "incomingKinds", "badRows", "samples", "readBy"]) expect(driftDetails).toHaveProperty(k);
+  expect(driftDetails).toMatchObject({ column: "score", existingType: "BIGINT" });
+  expect(driftDetails!.incomingKinds).toEqual(expect.arrayContaining(["string"]));
 });

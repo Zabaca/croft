@@ -356,10 +356,12 @@ function typeConflict(asset: string, d: ColumnDecision, readBy: string[] | undef
     effect: "nothing was written; downstream assets keep their current data",
     asset,
     fix: fixes[0],
+    // §4.3's fields first (column, existingType, incomingKinds, badRows, samples, readBy); storedType, incoming
+    // and conflictKinds are kept for readers of the earlier names.
     details: {
-      column: d.column, sourceName: d.sourceName, storedType: stored, incomingType, incoming: d.incoming,
-      conflictKinds: d.conflictKinds, badRows: d.badRows, samples: d.sampleRows ?? d.samples,
-      readBy: readBy ?? [], fixes, ...extra,
+      column: d.column, existingType: stored, incomingKinds: d.incoming, badRows: d.badRows, samples: d.sampleRows ?? d.samples,
+      readBy: readBy ?? [], sourceName: d.sourceName, storedType: stored, incomingType, incoming: d.incoming,
+      conflictKinds: d.conflictKinds, fixes, ...extra,
     },
   });
 }
@@ -394,7 +396,8 @@ function lossError(asset: string, d: ColumnDecision, nullCount: number, readBy: 
     hint: "the load was rolled back and the cursor did not move; fix it in order: clean the value, pin a type with a format, or pin VARCHAR",
     effect: "nothing was written; downstream assets keep their current data",
     asset, fix: fixes[0],
-    details: { ...details, fixes },
+    // §4.3: existingType is the type the values failed to fit (the message's "column … is <type>").
+    details: { existingType: target, incomingKinds: d.incoming, ...details, fixes },
   });
 }
 

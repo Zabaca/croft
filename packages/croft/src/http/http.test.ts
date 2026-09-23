@@ -33,6 +33,8 @@ const server = Bun.serve({
         return Response.json({ query: Object.fromEntries(u.searchParams), auth: req.headers.get("authorization") });
       case "/big":
         return new Response('{"id":12345678901234567890,"small":42,"neg":-9007199254740993,"f":1.5,"e":1e21,"list":[18446744073709551615]}');
+      case "/huge":
+        return new Response('[{"id":1,"payload":{"k":1,"huge":1e400,"list":[-1.5E+999]}},{"id":2,"top":1e400}]');
       case "/html":
         return new Response("<html>oops</html>", { headers: { "content-type": "text/html" } });
       case "/link": {
@@ -186,6 +188,21 @@ describe("responses", () => {
     expect(res.json<object>()).toEqual({ id: 12345678901234567890n, small: 42, neg: -9007199254740993n, f: 1.5, e: 1e21, list: [18446744073709551615n] });
     // Plain JSON.parse loses the digits; this is why res.json() exists.
     expect(String((JSON.parse(res.text) as { id: number }).id)).toBe("12345678901234567000");
+  });
+
+  test("json() keeps a number beyond DOUBLE (1e400) as its source text instead of Infinity", async () => {
+    const { http } = client();
+    const res = await http.get(`${BASE}/huge`);
+    const rows = res.json<{ id: number; payload?: { huge: unknown; list: unknown[] }; top?: unknown }[]>();
+    // A JSON.rawJSON value: JSON.isRawJSON tells it apart, .rawJSON is the text, and JSON.stringify writes it back exactly.
+    const isRaw = (JSON as unknown as { isRawJSON(v: unknown): boolean }).isRawJSON;
+    expect(isRaw(rows[0]!.payload!.huge)).toBe(true);
+    expect((rows[0]!.payload!.huge as { rawJSON: string }).rawJSON).toBe("1e400");
+    expect((rows[0]!.payload!.list[0] as { rawJSON: string }).rawJSON).toBe("-1.5E+999");
+    expect((rows[1]!.top as { rawJSON: string }).rawJSON).toBe("1e400");
+    expect(JSON.stringify(rows)).toBe(res.text);
+    // Plain JSON.parse turns it into Infinity, which JSON.stringify writes as null.
+    expect((JSON.parse(res.text) as { top?: number }[])[1]!.top).toBe(Infinity);
   });
 
   test("json() on a non-JSON body is an HTTP_ERROR with the body excerpt", async () => {
@@ -464,6 +481,15 @@ describe("parseJsonLossless", () => {
     expect(parseJsonLossless('[1.5, 1e21, 12345678901234567890.5, "12345678901234567890", -0, 0]')).toEqual([
       1.5, 1e21, 12345678901234567000, "12345678901234567890", -0, 0,
     ]);
+  });
+
+  test("a number beyond DOUBLE keeps its source text as JSON.rawJSON; the largest double stays a number", () => {
+    const raw = (v: unknown) => (v as { rawJSON?: string }).rawJSON;
+    expect(raw(parseJsonLossless("1e400"))).toBe("1e400");
+    expect(raw(parseJsonLossless("-1e400"))).toBe("-1e400");
+    expect(raw((parseJsonLossless("[2e308]") as unknown[])[0])).toBe("2e308");
+    expect(parseJsonLossless("1.7976931348623157e308")).toBe(Number.MAX_VALUE);
+    expect(JSON.stringify(parseJsonLossless('{"a":[1e400,{"b":-2E+400}]}'))).toBe('{"a":[1e400,{"b":-2E+400}]}');
   });
 });
 

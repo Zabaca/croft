@@ -1535,9 +1535,12 @@ function fileTypeConflict(asset: string, d: ColumnDecision, readBy: string[] | u
     hint: "the load was rolled back; fix it in order: clean the value in map(), pin a type with a format, or pin VARCHAR",
     effect: "nothing was written; downstream assets keep their current data",
     asset, fix: fixes[0],
+    // §4.3's fields first (column, existingType, incomingKinds, badRows, samples, readBy); storedType, incoming
+    // and conflictKinds are kept for readers of the earlier names.
     details: {
-      column: d.column, sourceName: d.sourceName, storedType: stored, incoming: d.incoming, conflictKinds: d.conflictKinds ?? [],
-      format: d.format ?? null, badRows: d.badRows ?? null, samples: d.sampleRows ?? d.samples, readBy: readBy ?? [], fixes,
+      column: d.column, existingType: stored, incomingKinds: d.incoming, badRows: d.badRows ?? null, samples: d.sampleRows ?? d.samples,
+      readBy: readBy ?? [], sourceName: d.sourceName, storedType: stored, incoming: d.incoming, conflictKinds: d.conflictKinds ?? [],
+      format: d.format ?? null, fixes,
     },
   });
 }

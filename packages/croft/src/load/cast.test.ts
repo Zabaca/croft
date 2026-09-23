@@ -175,6 +175,7 @@ describe("proven hazards (DESIGN.md §7, Appendix B)", () => {
     const c = await failure(db.load([{ t: "2024-01-01T10:00:00+02:00" }], { knownColumns: [known("t", "TIMESTAMP")] }));
     expect(c.code).toBe("TYPE_CONFLICT");
     expect(c.problem.details).toMatchObject({ storedType: "TIMESTAMP", conflictKinds: ["iso_instant"], badRows: 1 });
+    expect(c.problem.details).toMatchObject({ existingType: "TIMESTAMP", incomingKinds: ["iso_instant"] });
     const p = await failure(db.load([{ t: "2024-01-01T10:00:00+02:00" }, { t: "2024-01-01T10:00:00" }], { pins: { t: "TIMESTAMP" } }));
     expect(p.code).toBe("TYPE_PIN_VIOLATION");
     expect(p.problem.details).toMatchObject({ badRows: 1, samples: [{ row: 1, value: "2024-01-01T10:00:00+02:00" }] });
@@ -215,7 +216,7 @@ describe("proven hazards (DESIGN.md §7, Appendix B)", () => {
     await db.exec(`INSERT INTO a VALUES (9007199254740993), (5)`);
     const proof = await failure(db.load([{ n: 2.5 }], { knownColumns: [known("n", "BIGINT")] }));
     expect(proof.code).toBe("TYPE_CONFLICT");
-    expect(proof.problem.details).toMatchObject({ stored: true, badRows: 1, samples: ["9007199254740993"] });
+    expect(proof.problem.details).toMatchObject({ stored: true, badRows: 1, samples: ["9007199254740993"], existingType: "BIGINT", incomingKinds: ["float"] });
     await db.exec(`DELETE FROM a WHERE n > 100`);
     const widened = await db.load([{ n: 2.5 }], { knownColumns: [known("n", "BIGINT")] });
     expect(col(widened.batch, "n")).toMatchObject({ decision: "widen", target: "DOUBLE", proof: "double" });
@@ -258,11 +259,33 @@ describe("proven hazards (DESIGN.md §7, Appendix B)", () => {
     expect(rows.map((r) => r.id)).toEqual([12345678901234567890n, 18446744073709551615n, -9223372036854775809n, 170141183460469231731687303715884105727n]);
   });
 
+  test("a number beyond DOUBLE (1e400) from res.json(): exact inside a JSON column, text as a column of its own", async () => {
+    const db = await testDb();
+    const page = () => parseJsonLossless(
+      `[{"id":1,"payload":{"k":1,"huge":1e400},"top":5},{"id":2,"payload":{"k":2,"list":[-1e400]},"top":1e400}]`) as Record<string, unknown>[];
+    const { batch, rows, types } = await db.load([page()]);
+    // Inside a JSON column the number keeps its source text, still a JSON number (§4.3).
+    expect(types.payload).toBe("JSON");
+    expect(await db.all(`SELECT payload::VARCHAR AS p, json_type(payload, '$.huge') AS t FROM _croft_typed_a ORDER BY id`)).toEqual([
+      { p: `{"huge":1e400,"k":1}`, t: "DOUBLE" }, { p: `{"k":2,"list":[-1e400]}`, t: null },
+    ]);
+    // As a column value no numeric type can hold it: the column is text (MIXED_TYPES), and the text is exact.
+    expect(types.top).toBe("VARCHAR");
+    expect(rows.map((r) => r.top)).toEqual(["5", "1e400"]);
+    expect(batch.warnings.map((w) => [w.code, w.details?.column])).toEqual([["MIXED_TYPES", "top"]]);
+    // A DOUBLE column refuses it loudly, naming the value, rather than storing NULL or Infinity.
+    const e = await failure(db.load([page()], { knownColumns: [known("id", "BIGINT"), known("payload", "JSON"), known("top", "DOUBLE")] }));
+    expect(e.code).toBe("TYPE_CONFLICT");
+    expect(e.problem.details).toMatchObject({ column: "top", existingType: "DOUBLE", samples: [{ row: 2, value: "1e400" }] });
+  });
+
   test("integers beyond HUGEINT cannot be stored exactly: TYPE_CONFLICT, never a rounded value", async () => {
     const db = await testDb();
     const e = await failure(db.load([{ id: 10n ** 40n }]));
     expect(e.code).toBe("TYPE_CONFLICT");
     expect(e.problem.details).toMatchObject({ badRows: 1, samples: [{ value: "10000000000000000000000000000000000000000" }] });
+    // §4.3 names: the type the values had to fit, and the kinds that arrived.
+    expect(e.problem.details).toMatchObject({ existingType: "HUGEINT", incomingKinds: ["bigint"], readBy: [] });
   });
 
   test("NULL-only placeholders bind in typed SQL, and are retyped when values arrive", async () => {
@@ -360,6 +383,8 @@ describe("evolution against stored columns (§7 table)", () => {
       column: "amount", storedType: "BIGINT", incomingType: "VARCHAR", badRows: 3, readBy: ["daily_revenue", "report"],
       samples: [{ row: 1, value: "n/a 0" }, { row: 4, value: "n/a 3" }, { row: 7, value: "n/a 6" }],
     });
+    // §4.3's names for the same facts: the type the column has, and the kinds of value that arrived.
+    expect(e.problem.details).toMatchObject({ existingType: "BIGINT", incomingKinds: ["integer", "string"], conflictKinds: ["string"] });
     const fixes = e.problem.details!.fixes as Fix[];
     expect(fixes).toHaveLength(3);
     expect(fixes[0]!.description).toContain("clean the value in rows()");

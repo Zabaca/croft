@@ -541,6 +541,9 @@ describe("CSV", () => {
     expect(e.message).toContain("column day is DATE (format %m/%d/%Y)");
     expect(e.message).toContain(`"25/03/2026"`);
     expect(e.problem.details).toMatchObject({ column: "day", format: "%m/%d/%Y", badRows: 1 });
+    // §4.3's TYPE_CONFLICT fields, for file ingests too.
+    for (const k of ["column", "existingType", "incomingKinds", "badRows", "samples", "readBy"]) expect(e.problem.details).toHaveProperty(k);
+    expect(e.problem.details).toMatchObject({ existingType: "DATE", readBy: [] });
     expect(e.problem.fix!.description).toContain("map");
     expect(await q(p, `SELECT count(*)::INTEGER AS n FROM days`)).toEqual([{ n: 1 }]);
     expect(await q(p, `SELECT path FROM _croft.files ORDER BY path`)).toEqual([{ path: "files/a.csv" }]);
@@ -559,6 +562,7 @@ describe("CSV", () => {
     expect(e.code).toBe("TYPE_CONFLICT");
     expect(e.message).toContain("column qty is BIGINT");
     expect(e.problem.details!.samples).toEqual([{ row: 1, value: "five" }]);
+    expect(e.problem.details).toMatchObject({ column: "qty", existingType: "BIGINT", incomingKinds: ["integer", "string"], badRows: 1, readBy: [] });
 
     const m = project({ asset: "m" });
     m.put("files/m.csv", 'id,price\n1,"$1,000.10"\n');
