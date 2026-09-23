@@ -1,0 +1,110 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "croft.json",
+  "description": "A croft project's configuration (croft docs config). Editors use this schema; croft checks croft.json itself, including what a schema cannot, such as whether the timezone is a real IANA zone.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["timezone"],
+  "properties": {
+    "$schema": {
+      "description": "this schema, so editors can check croft.json",
+      "type": "string"
+    },
+    "database": {
+      "description": "the DuckDB file, relative to the project folder (absolute after relocation)",
+      "type": "string",
+      "pattern": "\\.duckdb$",
+      "default": "warehouse.duckdb"
+    },
+    "timezone": {
+      "description": "IANA zone for schedules, ::DATE and JSON timestamps, e.g. \"America/Los_Angeles\"; changing it rebuilds every transform",
+      "type": "string",
+      "pattern": "^\\S+$"
+    },
+    "readCopy": {
+      "description": "keep warehouse.read.duckdb, a copy for GUIs and notebooks, refreshed after runs",
+      "type": "boolean",
+      "default": false
+    },
+    "notify": {
+      "description": "what happens when a scheduled run fails",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "desktop": {
+          "description": "desktop notification when a scheduled run fails",
+          "type": "boolean",
+          "default": true
+        },
+        "webhook": {
+          "description": "http(s) URL that receives the failure envelope of a scheduled run",
+          "type": ["string", "null"],
+          "pattern": "^https?://\\S+$",
+          "default": null
+        }
+      }
+    },
+    "concurrency": {
+      "description": "extractions that run at the same time in one run (1-64)",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 64,
+      "default": 4
+    },
+    "serve": {
+      "description": "croft serve, the local HTTP server apps query through",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "port": {
+          "description": "croft serve port",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 7447
+        },
+        "host": {
+          "description": "croft serve address; anything but loopback must sit behind HTTPS",
+          "type": "string",
+          "pattern": "\\S",
+          "default": "127.0.0.1"
+        },
+        "queryTimeoutMs": {
+          "description": "deadline for one query over HTTP",
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 3600000,
+          "default": 30000
+        },
+        "maxConcurrent": {
+          "description": "queries running in DuckDB at once; the rest queue",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 4
+        },
+        "maxBytes": {
+          "description": "largest result in bytes; bigger results fail with QUERY_TOO_MANY_ROWS",
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 9007199254740991,
+          "default": 67108864
+        },
+        "allowOrigins": {
+          "description": "browser origins allowed to call croft serve, e.g. \"http://localhost:3000\"",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^https?://(\\[[0-9A-Fa-f:.]+\\]|[^/?#\\s:\\[\\]]+)(:[0-9]{1,5})?$"
+          },
+          "default": []
+        }
+      }
+    },
+    "stateDir": {
+      "description": "state folder; croft sets it when it moves state off a synced folder",
+      "type": ["string", "null"],
+      "pattern": "\\S"
+    }
+  }
+}

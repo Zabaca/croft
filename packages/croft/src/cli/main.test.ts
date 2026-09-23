@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { CroftError, problem } from "../core/errors.ts";
 import { systemTimeZone } from "../core/time.ts";
 import type { Envelope } from "../core/types.ts";
-import type { Command } from "./command.ts";
+import { type Command, lazyCommand } from "./command.ts";
 import { COMMANDS } from "./commands/index.ts";
 import { main, scanArgv, shellQuote, trimStack, type MainIO } from "./main.ts";
 import { CROFT_VERSION, versionAtLeast } from "./version.ts";
@@ -312,6 +312,86 @@ describe("redaction", () => {
     expect(r.stdout).toContain("info  INPUT_NOT_BUILT");
     expect(r.stdout).toContain('"token": "[redacted:TOKEN]"');
     expect(r.stdout).toContain("next: croft run x  # because");
+  });
+});
+
+describe("lazy commands", () => {
+  function lazy(load: () => Promise<Pick<Command, "run" | "human">>, extra: Partial<Command> = {}) {
+    let loads = 0;
+    const cmd = lazyCommand({ name: "lazy", summary: "test lazy", usage: "croft lazy", options: { rows: { type: "string", description: "rows" } }, maxPositionals: 0, ...extra },
+      async () => { loads++; return load(); });
+    return { cmd, loads: () => loads };
+  }
+  const ok = async () => ({ run: async () => ({ data: { ran: true }, problems: [], next: [] }), human: () => "ran it" });
+
+  test("the module loads only when the command runs, after its flags parse", async () => {
+    const l = lazy(ok);
+    const commands = [...COMMANDS, l.cmd];
+    expect((await run(["help", "--json"], { commands })).exit).toBe(0);
+    expect((await run(["lazy", "--help"], { commands })).stdout).toContain("--rows");
+    expect(envelope((await run(["lazy", "--rwos", "--json"], { commands })).stdout).problems[0].code).toBe("USAGE_ERROR");
+    expect((await run(["lazy", "extra"], { commands })).exit).toBe(2);
+    expect(l.loads()).toBe(0);
+    const r = await run(["lazy"], { commands });
+    expect(r).toMatchObject({ exit: 0, stdout: "ran it\n" });
+    expect(l.loads()).toBe(1);
+  });
+
+  const bindingErrors: [string, Error, string][] = [
+    ["a missing platform package", Object.assign(new Error("Cannot find package '@duckdb/node-bindings-linux-arm64' from '/p/node_modules/@duckdb/node-bindings/duckdb.js'"), { code: "ERR_MODULE_NOT_FOUND" }), "DUCKDB_BINDING_MISSING"],
+    ["a foreign-arch binding", Object.assign(new Error("dlopen(/p/node_modules/@duckdb/node-bindings-darwin-x64/duckdb.node, 0x0001): tried: '...' (mach-o file, but is an incompatible architecture (have 'x86_64', need 'arm64'))"), { code: "ERR_DLOPEN_FAILED" }), "DUCKDB_BINDING_MISSING"],
+    ["an old glibc", Object.assign(new Error("/lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.28' not found (required by /p/node_modules/@duckdb/node-bindings-linux-x64/libduckdb.so)"), { code: "ERR_DLOPEN_FAILED" }), "DUCKDB_BINDING_LOAD"],
+  ];
+  for (const [what, error, code] of bindingErrors) {
+    test(`a module that cannot load DuckDB (${what}) is ${code}, pointing at croft doctor`, async () => {
+      const l = lazy(async () => { throw error; });
+      const r = await run(["lazy", "--json"], { commands: [...COMMANDS, l.cmd] });
+      expect(r.exit).toBe(2);
+      const p = envelope(r.stdout).problems[0];
+      expect(p).toMatchObject({ code, fix: { kind: "command", command: "croft doctor" }, details: { command: "lazy" } });
+      expect(p.message).toStartWith("croft lazy needs DuckDB, whose binding does not load here");
+    });
+  }
+
+  test("a real failed import (Bun throws a ResolveMessage, which is not an Error) is DUCKDB_BINDING_MISSING", async () => {
+    const platform = "@duckdb/node-bindings-plan9-mips";
+    const l = lazy(async () => (await import(`${platform}/duckdb.node`)) as never);
+    const p = envelope((await run(["lazy", "--json"], { commands: [l.cmd] })).stdout).problems[0];
+    expect(p).toMatchObject({ code: "DUCKDB_BINDING_MISSING", fix: { command: "croft doctor" } });
+    expect(p.message).toContain(platform);
+  });
+
+  test("the same failure inside run() (a dynamic import there) is mapped too; other errors stay INTERNAL_ERROR", async () => {
+    const [, error] = bindingErrors[0]!;
+    const inRun = testCommand("inrun", async () => { throw error; });
+    expect(envelope((await run(["inrun", "--json"], { commands: [inRun] })).stdout).problems[0].code).toBe("DUCKDB_BINDING_MISSING");
+    const other = lazy(async () => { throw new Error("Cannot find module './typo.ts' from '/p/src/cli/commands/index.ts'"); });
+    expect(envelope((await run(["lazy", "--json"], { commands: [other.cmd] })).stdout).problems[0].code).toBe("INTERNAL_ERROR");
+    const sqlError = testCommand("sql", async () => { throw new Error("Binder Error: Referenced column \"x\" not found"); });
+    expect(envelope((await run(["sql", "--json"], { commands: [sqlError] })).stdout).problems[0].code).toBe("INTERNAL_ERROR");
+  });
+});
+
+describe("humanShowsProblems", () => {
+  const result = async () => ({
+    data: "the command's own text", next: [{ command: "croft init --claude", reason: "refresh" }],
+    problems: [problem("CLAUDE_FILES_OUTDATED", { message: "old skill", hint: "run croft init --claude", fix: { kind: "command", description: "d", command: "croft init --claude" } })],
+  });
+
+  test("off: main appends the problem blocks after the command's text", async () => {
+    const r = await run(["p"], { commands: [testCommand("p", result, { human: (res) => String(res.data) })] });
+    expect(r.stdout).toContain("the command's own text\nwarn  CLAUDE_FILES_OUTDATED  old skill\n");
+  });
+
+  test("on: the command prints its problems itself; next lines are still appended", async () => {
+    const r = await run(["p"], { commands: [testCommand("p", result, { human: (res) => String(res.data), humanShowsProblems: true })] });
+    expect(r.stdout).toBe("the command's own text\nnext: croft init --claude  # refresh\n");
+  });
+
+  test("on, but human() throws: the problems are printed the standard way after the JSON fallback", async () => {
+    const r = await run(["p"], { commands: [testCommand("p", result, { human: () => { throw new Error("formatter bug"); }, humanShowsProblems: true })] });
+    expect(r.stderr).toContain("INTERNAL_ERROR");
+    expect(r.stdout).toContain("warn  CLAUDE_FILES_OUTDATED  old skill");
   });
 });
 

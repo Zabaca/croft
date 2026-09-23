@@ -4,12 +4,12 @@
   "description": "Local-first data pipelines in TypeScript: ingest APIs and files, transform with SQL or TypeScript, keep DuckDB tables fresh.",
   "license": "MIT",
   "type": "module",
-  "bin": { "croft": "src/cli/main.ts" },
+  "bin": { "croft": "bin/croft.mjs" },
   "exports": {
     ".": "./src/index.ts",
     "./read": { "types": "./dist/read.d.ts", "default": "./dist/read.js" }
   },
-  "files": ["src", "dist", "!src/**/*.test.ts"],
+  "files": ["bin", "src", "dist", "croft.schema.json", "!src/**/*.test.ts"],
   "engines": { "bun": ">=1.3.14" },
   "scripts": {
     "test": "bun test",

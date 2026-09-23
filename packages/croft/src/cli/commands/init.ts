@@ -1,9 +1,12 @@
-// croft init [dir] [--claude] [--no-install] (DESIGN.md §2, §4.1, §9).
+// croft init [dir] [--claude] [--no-install] (DESIGN.md §2, §4.1, §9). Its spec (usage, options) is in
+// commands/index.ts.
 import { createInterface } from "node:readline/promises";
 import { relative, resolve } from "node:path";
+import { problem } from "../../core/errors.ts";
+import type { Problem } from "../../core/types.ts";
 import { initProject, type InitResult } from "../../project/init.ts";
 import { findRoot } from "../../project/root.ts";
-import type { Command, Ctx, Next } from "../command.ts";
+import type { CommandImpl, Ctx, Next } from "../command.ts";
 import { formatDuration } from "../render.ts";
 
 export type InitData = InitResult;
@@ -29,15 +32,7 @@ async function askYesNo(question: string): Promise<boolean> {
   }
 }
 
-export const init: Command<InitData> = {
-  name: "init",
-  summary: "create a croft project (or data/ inside an existing app); --claude refreshes the Claude files",
-  usage: "croft init [dir] [--claude] [--no-install]",
-  options: {
-    claude: { type: "boolean", description: "only refresh CLAUDE.md's croft block and .claude/skills/croft/SKILL.md" },
-    "no-install": { type: "boolean", description: "do not run bun install (the project needs it before its first run)" },
-  },
-  maxPositionals: 1,
+export const init: CommandImpl<InitData> = {
   async run(ctx) {
     const from = callerCwd(ctx);
     const dir = ctx.positionals[0];
@@ -50,6 +45,7 @@ export const init: Command<InitData> = {
       ...(dir !== undefined ? { displayTarget: shellQuote(dir) } : {}),
       claudeOnly: ctx.values.claude === true,
       install: ctx.values["no-install"] !== true,
+      env: ctx.processEnv,
       onProgress: (line) => ctx.render.progress(line),
       ...(interactive ? {
         confirmEdit: async (edit: { file: string; diff: string }) => {
@@ -59,15 +55,25 @@ export const init: Command<InitData> = {
       } : {}),
       // HOOK(example): pass `runExample` here once `croft run` exists (see ExampleRunner in project/init.ts).
     });
-    return { data: result, problems: [], next: nextSteps(result, from), ...(installFailed(result) ? { exit: 1, ok: false } : {}) };
+    return { data: result, problems: initProblems(result, from), next: nextSteps(result, from) };
   },
   human(result, ctx) {
     return describe(result.data, callerCwd(ctx));
   },
 };
 
-function installFailed(r: InitResult): boolean {
-  return r.install.ran && !r.install.ok;
+/** INSTALL_FAILED when bun install ran and failed: the project exists, but nothing can run in it yet. */
+export function initProblems(r: InitResult, from: string): Problem[] {
+  if (!r.install.ran || r.install.ok) return [];
+  const cd = cdPrefix(r.root, from);
+  const lastLine = (r.install.output ?? "").trim().split("\n").at(-1) ?? "";
+  const where = relative(from, r.root) || ".";
+  return [problem("INSTALL_FAILED", {
+    message: `bun install failed in ${where.startsWith("..") ? r.root : where}${lastLine ? ` (${lastLine})` : ""}; the project is created, but croft cannot run in it until the install succeeds`,
+    hint: `fix what bun install reports (a network or registry problem, usually), then run ${cd}bun install`,
+    fix: { kind: "command", description: "install the project's dependencies", command: `${cd}bun install` },
+    details: { root: r.root, command: r.install.command, ms: r.install.ms, output: r.install.output ?? "" },
+  })];
 }
 
 /** `cd <dir> && ` when the project is not the current folder. */

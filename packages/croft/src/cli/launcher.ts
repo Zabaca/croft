@@ -5,7 +5,7 @@
 // versions can never disagree. Outside a project only init, doctor, docs, version and help work.
 //
 // Bun loads .env, .env.<NODE_ENV> and .env.local from the working folder into every process started
-// without --no-env-file, and that includes this launcher (its shebang is plain `bun`). Children inherit
+// without --no-env-file, and that includes this launcher (bin/croft.mjs runs as plain `bun`). Children inherit
 // those values [V: Bun.spawn and node:child_process both passed them on], so the pinned copy gets an
 // environment rebuilt without them, and a copy that runs here but had .env loaded starts itself again
 // the same way: croft reads <root>/.env itself, and only declared secrets may reach asset code (§9.8).
@@ -69,6 +69,8 @@ export function scanCommand(argv: readonly string[]): { name: string; json: bool
 
 /** Decide what this invocation does. Reads the file system; never writes. */
 export function planLaunch(i: PlanInput): LaunchPlan {
+  // Node cannot parse croft's TypeScript, so under Node bin/croft.mjs says NEEDS_BUN before this runs; this
+  // covers a runtime that can load the TypeScript but is not Bun. Both print the same problem (bin.test.ts).
   if (!i.isBun) return { kind: "refuse", problem: needsBun().problem, exit: CODES.NEEDS_BUN.exit };
   const { name } = scanCommand(i.argv);
   const root = findRoot(i.cwd);
@@ -100,13 +102,13 @@ export function planLaunch(i: PlanInput): LaunchPlan {
   const why = i.installFailed
     ? `bun install ${i.installFailed.exit === null ? "could not start" : `exited with ${i.installFailed.exit}`}`
     : "node_modules has no @zabaca/croft";
-  const problem = new CroftError("DUCKDB_BINDING_MISSING", {
+  const problem = new CroftError("INSTALL_FAILED", {
     message: `this project's dependencies are not installed (${why}), so its pinned croft cannot run`,
     hint: `fix what bun install reports, then retry: cd ${root} && bun install`,
     fix: { kind: "command", description: "install the project's dependencies", command: `cd ${shellQuote(root)} && bun install` },
-    details: { root },
+    details: { root, ...(i.installFailed ? { install: "failed", exit: i.installFailed.exit } : { install: "not_run" }) },
   }).problem;
-  return { kind: "refuse", problem, exit: CODES.DUCKDB_BINDING_MISSING.exit };
+  return { kind: "refuse", problem, exit: CODES.INSTALL_FAILED.exit };
 }
 
 export interface LaunchOptions {
@@ -120,8 +122,8 @@ export interface LaunchOptions {
   selfRoot?: string;
   stdout?: (text: string) => void;
   stderr?: (text: string) => void;
-  /** `bun install` in the project; returns its exit code (null when it could not start). */
-  install?: (root: string) => number | null;
+  /** `bun install` in the project with `env`; returns its exit code (null when it could not start). */
+  install?: (root: string, env: Record<string, string>) => number | null;
   /** Starts the pinned copy and resolves with its exit code. */
   delegate?: (plan: Extract<LaunchPlan, { kind: "delegate" }>, argv: readonly string[], env: Record<string, string>) => Promise<number>;
 }
@@ -139,7 +141,7 @@ export async function launch(o: LaunchOptions): Promise<number> {
   let plan = planLaunch(input);
   if (plan.kind === "install") {
     stderr(`croft: installing this project's dependencies first (bun install in ${plan.root})\n`);
-    const exit = (o.install ?? bunInstall)(plan.root);
+    const exit = (o.install ?? bunInstall)(plan.root, launcherEnv(env, cwd));
     if (exit !== 0) stderr(`croft: bun install ${exit === null ? "could not start" : `exited with ${exit}`}\n`);
     plan = planLaunch({ ...input, ...(exit === 0 ? {} : { installFailed: { exit } }) });
     if (plan.kind === "install") plan = { kind: "local" };                  // installed, but no copy appeared
@@ -193,9 +195,11 @@ async function spawnPinned(plan: Extract<LaunchPlan, { kind: "delegate" }>, argv
   return 128 + (signal ? constants.signals[signal] ?? 1 : 1);
 }
 
-function bunInstall(root: string): number | null {
+/** `bun install` in `root` with `env` given explicitly: without it Bun hands the child the environment it
+ *  started with, .env values included [V]. */
+export function bunInstall(root: string, env: Record<string, string>): number | null {
   // bun install's own output goes to stderr, so a --json caller still gets exactly one envelope on stdout.
-  const r = Bun.spawnSync([process.execPath, "install"], { cwd: root, stdio: ["ignore", 2, 2] });
+  const r = Bun.spawnSync([process.execPath, "install"], { cwd: root, env, stdio: ["ignore", 2, 2] });
   return r.exitCode;
 }
 
@@ -245,7 +249,8 @@ function needsBun(): CroftError {
   });
 }
 
-/** The bin file of an installed croft copy (package.json "bin"), defaulting to src/cli/main.ts. */
+/** The bin file of an installed croft copy (package.json "bin", which is bin/croft.mjs), defaulting to
+ *  src/cli/main.ts for a copy whose package.json names none. */
 export function binOf(copy: string): string {
   try {
     const pkg = JSON.parse(readFileSync(join(copy, "package.json"), "utf8")) as { bin?: string | Record<string, string> };

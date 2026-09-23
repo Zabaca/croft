@@ -67,6 +67,9 @@ export interface InitOptions {
   runInstall?: (root: string) => InstallResult;
   runExample?: ExampleRunner;
   onProgress?: (line: string) => void;
+  /** The environment for bun install (the command passes the process's, after the launcher's cleanup).
+   *  Default process.env. */
+  env?: Record<string, string | undefined>;
 }
 
 export interface InitResult {
@@ -147,9 +150,13 @@ export async function initProject(o: InitOptions): Promise<InitResult> {
   }
 
   // Apply.
-  mkdirSync(root, { recursive: true });
-  for (const w of writes) apply(w);
-  mkdirSync(relocation ? resolveHome(relocation.stateDir, o.home) : join(root, ".croft"), { recursive: true });
+  try {
+    mkdirSync(root, { recursive: true });
+    for (const w of writes) apply(w);
+    mkdirSync(relocation ? resolveHome(relocation.stateDir, o.home) : join(root, ".croft"), { recursive: true });
+  } catch (e) {
+    throw notWritable(e, root);
+  }
 
   let tsconfig: TsconfigEdit | null = null;
   if (tsPlan && tsPlan.status !== "not_needed") {
@@ -168,7 +175,7 @@ export async function initProject(o: InitOptions): Promise<InitResult> {
   let install: InstallOutcome = { ran: false, reason: "skipped (--no-install)" };
   if (o.install !== false) {
     o.onProgress?.("Installing dependencies (bun install)…");
-    install = (o.runInstall ?? bunInstall)(root);
+    install = (o.runInstall ?? ((r: string) => bunInstall(r, o.env)))(root);
   }
 
   let example: ExampleOutcome;
@@ -211,7 +218,11 @@ async function refreshClaude(target: string, o: InitOptions): Promise<InitResult
     const appSkill = join(parent, ...SKILL_PATH.split("/"));
     writes.push({ ...planManaged(appSkill, skillMd(version)), rel: SKILL_PATH });
   }
-  for (const w of writes) apply(w);
+  try {
+    for (const w of writes) apply(w);
+  } catch (e) {
+    throw notWritable(e, root);
+  }
   let timezone = detectTimeZone();
   try {
     const tz = (JSON.parse(readFileSync(join(root, CONFIG_FILE), "utf8")) as { timezone?: unknown }).timezone;
@@ -297,10 +308,14 @@ export function appInstructions(appRoot: string, version: string = CROFT_VERSION
 }
 
 /** `bun install` in the new project with the Bun running croft. Output is captured, not streamed, so a
- *  --json caller still gets exactly one envelope on stdout. */
-export function bunInstall(root: string): InstallResult {
+ *  --json caller still gets exactly one envelope on stdout. The environment is passed explicitly: without
+ *  it Bun hands the child the environment it started with, including values it loaded from a .env that
+ *  croft has since removed [V]. */
+export function bunInstall(root: string, env: Record<string, string | undefined> = process.env): InstallResult {
   const started = performance.now();
-  const r = Bun.spawnSync([process.execPath, "install"], { cwd: root, stdout: "pipe", stderr: "pipe" });
+  const childEnv: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) if (v !== undefined) childEnv[k] = v;
+  const r = Bun.spawnSync([process.execPath, "install"], { cwd: root, env: childEnv, stdout: "pipe", stderr: "pipe" });
   const ms = Math.round(performance.now() - started);
   const output = `${r.stdout.toString()}${r.stderr.toString()}`.trim().split("\n").slice(-20).join("\n");
   return { ran: true, ok: r.exitCode === 0, command: "bun install", ms, ...(r.exitCode === 0 ? {} : { output }) };
@@ -318,6 +333,19 @@ function alreadyProject(root: string, target: string, display?: string): CroftEr
     hint: `to refresh CLAUDE.md and the croft skill for this version, run ${command}`,
     fix: { kind: "command", description: "refresh the Claude files", command },
     details: { root },
+  });
+}
+
+/** A write that failed for lack of permission or space: PROJECT_NOT_WRITABLE. Anything else is rethrown. */
+function notWritable(e: unknown, root: string): unknown {
+  const err = e as NodeJS.ErrnoException;
+  if (!["EACCES", "EPERM", "EROFS", "ENOSPC", "EDQUOT"].includes(err?.code ?? "")) return e;
+  const where = err.path ?? root;
+  return new CroftError("PROJECT_NOT_WRITABLE", {
+    message: `croft init cannot write to ${where} (${err.code}); whatever it wrote before that is left in place`,
+    hint: `choose a folder you can write to, or make ${dirname(where)} writable for your user, then run croft init again`,
+    fix: { kind: "manual", description: `make ${dirname(where)} writable for your user, or create the project somewhere else`, requiresHuman: true },
+    details: { root, path: where, error: err.code },
   });
 }
 

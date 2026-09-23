@@ -6,6 +6,7 @@
 // - While a run writes, the server answers 503 with Retry-After. The client honors it until `timeoutMs`
 //   (default 10 s) has passed, then throws SERVE_UNAVAILABLE; an unreachable explicit URL is retried the
 //   same way. An explicit URL never falls back to the file.
+// - A 401/403 is SERVE_UNAUTHORIZED (a missing or wrong token), never retried.
 // - A server found only through serve.json that does not answer counts as absent: the caller reads directly.
 // It uses no Bun-only APIs: this file ships in the Node build.
 import { CroftError, isCode, type ProblemInit } from "../core/errors.ts";
@@ -221,11 +222,11 @@ function unauthorized(target: ServerTarget, status: number): CroftError {
   const message = target.token
     ? `croft serve at ${target.url.origin} rejected the token from ${target.tokenSource} (${status})`
     : `croft serve at ${target.url.origin} requires a token (${status}), and none was found`;
-  return new CroftError("SERVE_UNAVAILABLE", {
+  return new CroftError("SERVE_UNAUTHORIZED", {
     message,
     hint: "pass { token }, or set CROFT_SERVE_TOKEN to the token in the project's .croft/serve.json (or the server's CROFT_SERVE_TOKEN)",
     fix: { kind: "manual", description: "give query() the token croft serve uses" },
     retryable: false,
-    details: { url: target.url.origin, status, reason: "unauthorized", tokenSource: target.tokenSource },
+    details: { url: target.url.origin, status, tokenSource: target.tokenSource },
   });
 }
