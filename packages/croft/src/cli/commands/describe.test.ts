@@ -132,7 +132,7 @@ export default transform({ inputs: ["github_issues"], key: "issue_id", increment
     expect(human.stdout).toContain("Cursor     created = 1758600000 (2025-09-22T21:00:00-07:00)");
   });
 
-  test("an asset whose file is gone is described from the warehouse, with how to delete it", async () => {
+  test("an asset whose file is gone is described from the warehouse; ORPHAN_TABLE says so, and next[] never deletes (§4.3)", async () => {
     const p = await issues();
     const db = runsDb(p.stateDir);
     putCatalog(db, ISSUES_CATALOG);
@@ -142,7 +142,14 @@ export default transform({ inputs: ["github_issues"], key: "issue_id", increment
     unlinkSync(`${p.root}/assets/github_issues.ts`);
     const r = await cli(["describe", "github_issues", "--json"], { cwd: p.root, env: ENV });
     expect(r.json.data).toMatchObject({ file: null, kind: "ingest", rows: 3, next: { reason: "none" } });
-    expect(r.json.next[0].command).toBe("croft delete github_issues");
+    // A destructive command never appears in next (§4.3); the orphan is a warning with a manual, human fix.
+    expect(r.json.next.map((n: { command: string }) => n.command).join("\n")).not.toMatch(/\bdelete\b/);
+    expect(r.exit).toBe(0);
+    expect(r.json.problems).toEqual([expect.objectContaining({
+      severity: "warning", code: "ORPHAN_TABLE", asset: "github_issues",
+      fix: expect.objectContaining({ kind: "manual", requiresHuman: true }),
+    })]);
+    expect(r.json.problems[0].message).toContain("assets/github_issues.ts");
   });
 
   test("sample values are redacted, then cut to 80 characters", async () => {

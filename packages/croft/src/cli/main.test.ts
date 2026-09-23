@@ -7,7 +7,7 @@ import { systemTimeZone } from "../core/time.ts";
 import type { Envelope } from "../core/types.ts";
 import { type Command, lazyCommand } from "./command.ts";
 import { COMMANDS } from "./commands/index.ts";
-import { main, scanArgv, shellQuote, trimStack, type MainIO } from "./main.ts";
+import { type Dispatch, dispatchOf, main, scanArgv, shellQuote, trimStack, type MainIO } from "./main.ts";
 import { CROFT_VERSION, versionAtLeast } from "./version.ts";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "croft-main-")));
@@ -253,22 +253,48 @@ describe("usage errors", () => {
     const hidden = testCommand("hid", async (ctx) => ({ data: ctx.values, problems: [], next: [] }), {
       options: {
         rows: { type: "string", description: "rows", value: "N" },
-        "confirm-token": { type: "string", hidden: true, description: "set by croft confirm" },
+        "child-id": { type: "string", hidden: true, description: "set by croft" },
       },
     });
     const cmds = [...COMMANDS, hidden];
-    expect(envelope((await run(["hid", "--confirm-token", "c_123456", "--json"], { commands: cmds })).stdout).data)
-      .toEqual({ "confirm-token": "c_123456", json: true });
+    expect(envelope((await run(["hid", "--child-id", "c_123456", "--json"], { commands: cmds })).stdout).data)
+      .toEqual({ "child-id": "c_123456", json: true });
     const help = envelope((await run(["help", "hid", "--json"], { commands: cmds })).stdout);
     expect(help.data.command.options.map((o: { flag: string }) => o.flag)).toEqual(["--rows"]);
-    const typo = envelope((await run(["hid", "--confirm-tokn", "x", "--json"], { commands: cmds })).stdout).problems[0];
+    const typo = envelope((await run(["hid", "--child-i", "x", "--json"], { commands: cmds })).stdout).problems[0];
     expect(typo.hint).toBe("croft hid --help lists its options");
-    expect(typo.details).toEqual({ option: "--confirm-tokn" });
-    // The real commands: run's --run-id, --detached and --confirm-token are hidden.
+    expect(typo.details).toEqual({ option: "--child-i" });
+    // The real commands: run's --run-id and --detached are hidden.
     const runHelp = envelope((await run(["help", "run", "--json"])).stdout).data.command.options.map((o: { flag: string }) => o.flag);
     expect(runHelp).toContain("--from");
     for (const f of ["--run-id", "--detached", "--confirm-token"]) expect(runHelp).not.toContain(f);
     expect((await run(["help", "run"])).stdout).not.toContain("confirm-token");
+  });
+
+  test("no command line carries a confirmation token: run has no --confirm-token (§6)", async () => {
+    for (const argv of [["run", "x", "--allow-shrink", "--confirm-token", "c_123456"], ["run", "x", "--allow-shrink", "--confirm-token=c_123456"]]) {
+      const r = await run([...argv, "--json"]);
+      expect(r.exit).toBe(2);
+      const p = envelope(r.stdout).problems[0];
+      expect(p).toMatchObject({ code: "USAGE_ERROR", message: "croft run has no option --confirm-token", details: { option: "--confirm-token" } });
+      expect(p.hint).toBe("croft run --help lists its options");
+    }
+  });
+
+  test("the Dispatch reaches a command only when croft runs it itself, never from argv; it gets the result back", async () => {
+    const seen: (Dispatch | undefined)[] = [];
+    const d = testCommand("disp", async (ctx) => {
+      seen.push(dispatchOf(ctx));
+      return { data: { done: true }, problems: [], next: [] };
+    });
+    const dispatch: Dispatch = { confirmToken: "c_123456" };
+    expect((await run(["disp", "--json"], { commands: [d], dispatch })).exit).toBe(0);
+    expect((await run(["disp", "--json"], { commands: [d] })).exit).toBe(0);
+    expect(seen).toEqual([dispatch, undefined]);
+    expect(dispatch.result).toMatchObject({ data: { done: true } });
+    const failing: Dispatch = { confirmToken: "c_123456" };
+    expect((await run(["busy", "--json"], { commands: [THROWS_BUSY], dispatch: failing })).exit).toBe(4);
+    expect(failing.result).toBeUndefined();
   });
 
   test("options and positionals reach the command; global flags work anywhere", async () => {

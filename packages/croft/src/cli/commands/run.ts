@@ -4,20 +4,26 @@
 // On a TTY (or with --foreground) the run executes in this process: SIGINT/SIGTERM interrupt it (exit 130).
 // Off a TTY it executes in a detached child (run/detach.ts); this process follows it for --follow (100 s)
 // and prints its result, or exits 6 with `croft wait <id>`. Hidden flags: --run-id and --detached (set by the
-// parent for its child), --confirm-token (set by `croft confirm`).
+// parent for its child).
+//
+// No flag carries a confirmation (§6): a destructive action runs only through `croft confirm <token>`, the one
+// prefix the Claude Code "ask" rule gates. confirm runs this command in its own process and hands it the token
+// through the CLI's Dispatch; when the run detaches, the child gets it through a one-time grant
+// (safety/confirm.ts). A token the run never reached because nothing needed consent is spent when the run ends.
 import { createInterface } from "node:readline/promises";
 import { CroftError, isCode } from "../../core/errors.ts";
 import type { Problem, StepResult } from "../../core/types.ts";
 import { isRunId, RunsDb } from "../../history/runs-db.ts";
-import { Confirmations } from "../../safety/confirm.ts";
+import { CONFIRM_GRANT_ENV, Confirmations, grantDetached, redeemGrant } from "../../safety/confirm.ts";
 import { DEFAULT_FOLLOW_MS, followRun, parseWait, pickRunId, spawnDetachedRun } from "../../run/detach.ts";
 import { loadErrors, planRun } from "../../run/plan.ts";
 import { checkRunFlags, executeRun, type RunData, type RunEvent, type RunSummary } from "../../run/runner.ts";
 import { CHECKS_ENFORCED, CHECKS_NOT_ENFORCED } from "../../core/phase.ts";
 import type { CommandImpl, CommandResult, Ctx } from "../command.ts";
+import { dispatchOf } from "../main.ts";
 import { formatCount, formatDuration } from "../render.ts";
 
-const HIDDEN_WITH_VALUE = new Set(["--run-id", "--confirm-token"]);
+const HIDDEN_WITH_VALUE = new Set(["--run-id"]);
 const HIDDEN_BOOLEAN = new Set(["--detached"]);
 
 /** The user's own arguments: without the flags croft adds for itself. */
@@ -64,6 +70,25 @@ export function toResult(s: RunSummary): CommandResult<RunData> {
   };
 }
 
+/**
+ * A confirmed run that ended without reaching its confirmation: the shrink guard did not trip (the source
+ * recovered, say), so nothing needed consent and it ran as a normal run. Its token is spent anyway, so it
+ * cannot run the command a second time, and croft confirm is told so. A run that did reach it spent the token
+ * in consume() and trashed first, so its ok step shows `trashed`; a failed run leaves an unreached token valid
+ * for another try; a run still going is settled by its detached child when it ends.
+ */
+function settleConfirmation(ctx: Ctx, token: string, s: RunSummary): void {
+  if (s.data.status === "running" || !s.ok || s.data.steps.some((step) => step.trashed)) return;
+  const db = RunsDb.open(ctx.project.paths.stateDir);
+  try {
+    new Confirmations(db).spendUnused(token);
+  } finally {
+    db.close();
+  }
+  const dispatch = dispatchOf(ctx);
+  if (dispatch) dispatch.confirmationNotNeeded = true;
+}
+
 function croftFrom(p: Problem): CroftError {
   const { severity: _s, docs: _d, code, ...init } = p;
   return new CroftError(isCode(code) ? code : "INTERNAL_ERROR", init);
@@ -76,12 +101,19 @@ export const run: CommandImpl<RunData> = {
     const selectors = [...ctx.positionals];
     const from = str(v.from);
     const allowShrink = v["allow-shrink"] === true;
-    const confirmToken = str(v["confirm-token"]);
     const runIdFlag = str(v["run-id"]);
     const detachedChild = v.detached === true;
     const events = v.events === true;
     if (runIdFlag !== undefined && !isRunId(runIdFlag)) {
       throw new CroftError("USAGE_ERROR", { message: `--run-id ${JSON.stringify(runIdFlag)} is not a run id`, hint: "--run-id is set by croft for a detached run; leave it out" });
+    }
+    // The confirmation being carried out, if any: from croft confirm in this process, or, in the detached child
+    // of a confirmed run, from the grant croft confirm wrote for this run id. Never from argv; the grant
+    // variable means nothing to any other run and is never passed on.
+    let confirmToken = dispatchOf(ctx)?.confirmToken;
+    const grantSecret = ctx.processEnv[CONFIRM_GRANT_ENV];
+    if (detachedChild && runIdFlag !== undefined && grantSecret !== undefined) {
+      confirmToken = redeemGrant(project.paths.stateDir, runIdFlag, grantSecret);
     }
     const followMs = str(v.follow) !== undefined ? parseWait(str(v.follow)!, "--follow") : DEFAULT_FOLLOW_MS;
     const interactive = ctx.isTTY.stdin && ctx.isTTY.stdout && !detachedChild;
@@ -111,13 +143,15 @@ export const run: CommandImpl<RunData> = {
       if (willRun) {
         const runId = pickRunId(project.timezone, ctx.now());
         const childArgs = args.filter((a) => a !== "--events");
-        if (confirmToken !== undefined) childArgs.push("--confirm-token", confirmToken);
-        const spawned = spawnDetachedRun({ root: project.root, stateDir: project.paths.stateDir, args: childArgs, runId, env: ctx.processEnv });
+        const env: Record<string, string | undefined> = { ...ctx.processEnv, [CONFIRM_GRANT_ENV]: undefined };
+        if (confirmToken !== undefined) env[CONFIRM_GRANT_ENV] = grantDetached(project.paths.stateDir, runId, confirmToken);
+        const spawned = spawnDetachedRun({ root: project.root, stateDir: project.paths.stateDir, args: childArgs, runId, env });
         const res = await followRun({
           stateDir: project.paths.stateDir, runId, timeoutMs: followMs, spawned,
           ...(events ? { onEvent: (line: string) => ctx.render.progress(line) } : {}),
         });
         if (res.kind === "not_started") throw croftFrom(res.problem);
+        if (confirmToken !== undefined) settleConfirmation(ctx, confirmToken, res.summary);
         return toResult(res.summary);
       }
     }
@@ -148,6 +182,7 @@ export const run: CommandImpl<RunData> = {
         ...(delays ? { retryDelaysMs: delays } : {}),
         ...(ctx.processEnv.CROFT_FAULT ? { fault: ctx.processEnv.CROFT_FAULT } : {}),
       });
+      if (confirmToken !== undefined) settleConfirmation(ctx, confirmToken, out);
       return toResult(out);
     } finally {
       process.off("SIGINT", onSignal);

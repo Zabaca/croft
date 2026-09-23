@@ -24,8 +24,9 @@ export interface OptionSpec {
   multiple?: boolean;
   description: string;
   value?: string;                    // placeholder in help, e.g. "N" for --rows N
-  /** Set by croft itself (a detached run's --run-id, croft confirm's --confirm-token): parsed like any
-   *  option, but left out of help and never suggested by did-you-mean. */
+  /** Set by croft itself (a detached run's --run-id and --detached): parsed like any option, but left out
+   *  of help and never suggested by did-you-mean. Never consent: a confirmation travels only in-process
+   *  (main.ts Dispatch), since any option can be typed. */
   hidden?: boolean;
 }
 
