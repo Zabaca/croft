@@ -10,7 +10,9 @@
 // runs.sqlite and <state>/logs/<run>/events.ndjson, never the warehouse, which the child needs.
 //
 // The run folder also gets, before the run record exists (names start with "_", which no asset's can):
-//   _process.log        the child's stdout and stderr
+//   _process.log        the child's stdout and stderr (mode 0600): croft's own envelope and messages, and what asset
+//                       code prints past its step log (a subprocess that outlives its step, output while several
+//                       steps run), which reaches it only through croft's fd capture (core/output.ts); all redacted
 //   _process.json       the spawn handshake: the child's {pid, procStart, bootId}, written by the parent, so
 //                       `croft wait` can tell a child that died before recording its run from one still starting
 //   _not_started.json   the problem of a child that refused to start (a --from that cannot apply, say)
@@ -21,12 +23,14 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { CroftError, problem } from "../core/errors.ts";
+import { defaultOutputRedactor, keepFdsCaptured } from "../core/output.ts";
 import { bootId, procStart, type ProcessIdentity, recordAlive, UNKNOWN_START } from "../core/proc.ts";
 import type { Problem, StepResult } from "../core/types.ts";
 import {
   follow, logDir, NOT_STARTED_RECORD, PROCESS_RECORD, processLogPath, readRunRecord, tail, writeRunRecord,
 } from "../history/logs.ts";
 import { isRunId, newRunId, RunsDb, type RunRecord, type StepRecord } from "../history/runs-db.ts";
+import { ProjectEnv } from "../project/env.ts";
 import type { ProgressSnapshot } from "./ingest.ts";
 import { eventsPath, type RunData, type RunSummary } from "./runner.ts";
 
@@ -103,7 +107,7 @@ export function spawnDetachedRun(i: SpawnInput): Spawned {
   const dir = logDir(i.stateDir, i.runId);
   mkdirSync(dir, { recursive: true });
   const output = processLogPath(i.stateDir, i.runId);
-  const fd = openSync(output, "a");
+  const fd = openSync(output, "a", 0o600);
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(i.env)) if (v !== undefined) env[k] = v;
   let child: ChildProcess;
@@ -331,6 +335,14 @@ export function unknownRun(runId: string): CroftError {
 }
 
 if (import.meta.main) {
+  // This process is the detached run; its stdout and stderr are _process.log. From the first asset code on, fds 1
+  // and 2 stay captured until exit, so what a subprocess prints is redacted before it gets there: with the
+  // project's .env (the cwd is the project root) until the run sets its own redactor (core/output.ts).
+  keepFdsCaptured();
+  defaultOutputRedactor(() => {
+    const env = ProjectEnv.load(process.cwd(), {});
+    return (text) => env.redact(text);
+  });
   const { main } = await import("../cli/main.ts");
   process.exitCode = await main(process.argv.slice(2));
 }

@@ -110,7 +110,8 @@ export function redactsInData(value: string, declared: boolean): boolean {
   return value.length >= MIN_DATA_REDACT && !/^\p{L}+$/u.test(value) && !/^\d+$/.test(value);
 }
 
-type Pattern = { re: RegExp; names: Map<string, string> };
+/** A compiled redaction (Redaction, below). */
+type Pattern = Redaction;
 
 /** The project's secrets: <root>/.env overlaid by the shell environment. Values are held in private
  *  fields so logging or serializing this object never prints them. */
@@ -219,8 +220,9 @@ export class ProjectEnv {
     }
   }
 
-  /** Replace every .env value (and every shell value handed out by secret()) of 4+ characters
-   *  with [redacted:NAME]. Longer values are replaced first so overlapping values stay hidden.
+  /** Replace every .env value (and every shell value handed out by secret()) of 4+ characters, in any of
+   *  its renderings (escaped, URL-encoded, base64, a line of a multi-line value: see below), with
+   *  [redacted:NAME]. Longer values are replaced first so overlapping values stay hidden.
    *  For free text: messages, hints, logs. */
   redact(text: string): string {
     return replaceWith(this.#compile(), text);
@@ -268,20 +270,201 @@ export class ProjectEnv {
   }
 }
 
-/** One regular expression over the values and their URL-encoded forms, longest first. */
-function buildPattern(entries: Iterable<[string, string]>): Pattern | null {
-  const names = new Map<string, string>();
-  for (const [name, value] of entries) {
-    for (const form of new Set([value, encodeURIComponent(value)])) if (!names.has(form)) names.set(form, name);
+// ---------------------------------------------------------------------------------------------------------
+// How a value can appear in text (§9.6: every rendering of a .env value is redacted).
+//
+// Asset code rarely prints a secret raw. It prints it inside an object (console.log and ctx.log use util.inspect,
+// which escapes \ ' and control characters and splits a multi-line string into '…\n' + lines), serializes it
+// (JSON.stringify escapes " \ and control characters), and APIs echo it back escaped (PHP's json_encode writes
+// "/" as "\/" and non-ASCII as \u00e9), URL-encoded, or base64-encoded (a Basic auth header echoed in an error).
+// So one value becomes several alternatives of one regular expression:
+//
+//   - the value itself, where every character other than a letter or digit may be written escaped: backslashes
+//     before it (JSON, inspect, \/, and text escaped up to three times), \n \t \r \b \f \v, \xHH or \uHHHH (either
+//     case); a line break may also be followed by inspect's `' +\n  '` continuation. This one pattern covers the
+//     raw text, JSON.stringify, util.inspect in any quote style, PHP-style \/ and ASCII-only JSON;
+//   - each line of 8+ characters of a multi-line value (a PEM key's body), in the same escaped-or-not form, so
+//     part of a key printed on its own is caught too;
+//   - its URL encodings: encodeURIComponent and form encoding (space as +), percent escapes in either case;
+//   - base64 and base64url, for values of 8+ characters, escaped-or-not like the value: of the whole value, and
+//     the three alignment-independent runs a base64 text carries when the value sits anywhere inside what was
+//     encoded (`user:<secret>` in a Basic auth header), so at most the characters of two bytes at either edge of
+//     the value remain.
+//
+// Longer alternatives come first, so a value that contains another is replaced whole. Not covered: other
+// encodings (hex, gzip, encryption), and a value split across two writes of a stream.
+const MIN_LINE_REDACT = 8;
+const MIN_BASE64_REDACT = 8;
+const SHORT_ESCAPES: Record<number, string> = { 8: "b", 9: "t", 10: "n", 11: "v", 12: "f", 13: "r" };
+/** inspect's continuation between the lines of a split multi-line string: `' +\n    '`. */
+const INSPECT_CONTINUATION = "(?:['\"`] \\+\\r?\\n[ \\t]*['\"`])?";
+
+/** A hex number as a regex matching it in either case, `[aA]` style. */
+function hexPattern(n: number, width: number): string {
+  return n.toString(16).padStart(width, "0").replace(/[a-f]/g, (c) => `[${c}${c.toUpperCase()}]`);
+}
+
+// Escape runs are bounded (three levels of JSON escaping: 7 backslashes before a character, 8 per backslash), so
+// a text with a long run of backslashes costs a bounded amount of backtracking per position.
+const ESCAPES_MAX = 8;
+const ESC = `\\\\{1,${ESCAPES_MAX}}`;
+const OPT_ESC = `\\\\{0,${ESCAPES_MAX}}`;
+
+/** One UTF-16 code unit of a value (not a backslash): itself, or any escaped rendering of it. */
+function charPattern(code: number): string {
+  const ch = String.fromCharCode(code);
+  if (/[A-Za-z0-9]/.test(ch)) return ch;
+  const u = `${ESC}u${hexPattern(code, 4)}`;
+  if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) {
+    const short = SHORT_ESCAPES[code];
+    const alt = `(?:\\x${code.toString(16).padStart(2, "0")}|${short ? `${ESC}${short}|` : ""}${ESC}x${hexPattern(code, 2)}|${u})`;
+    return code === 10 ? `${alt}${INSPECT_CONTINUATION}` : alt;
   }
-  if (names.size === 0) return null;
-  const alternatives = [...names.keys()].sort((a, b) => b.length - a.length).map(escapeRegExp);
-  return { re: new RegExp(alternatives.join("|"), "g"), names };
+  if (code >= 0x80) return `(?:\\u${code.toString(16).padStart(4, "0")}|${u})`;
+  return `(?:${OPT_ESC}\\${ch}|${u})`;                         // punctuation, optionally backslash-escaped
+}
+
+function escapedPattern(value: string): string {
+  let out = "";
+  for (let i = 0; i < value.length; i++) {
+    if (value.charCodeAt(i) !== 0x5c) {
+      out += charPattern(value.charCodeAt(i));
+      continue;
+    }
+    // A run of k backslashes, however many times escaped: k to 8k of them.
+    let k = 1;
+    while (value.charCodeAt(i + k) === 0x5c) k++;
+    out += `\\\\{${k},${k * ESCAPES_MAX}}`;
+    i += k - 1;
+  }
+  return out;
+}
+
+/** A URL encoding with its %HH escapes in either case. */
+function percentPattern(encoded: string): string {
+  return encoded.split(/(%[0-9A-F]{2})/).map((part, i) => (i % 2 ? `%${hexPattern(parseInt(part.slice(1), 16), 2)}` : escapeRegExp(part))).join("");
+}
+
+/** base64 and base64url texts that reveal `value` wherever it sits inside the encoded bytes. */
+function base64Forms(value: string): string[] {
+  const bytes = Buffer.from(value, "utf8");
+  const out = [bytes.toString("base64")];
+  for (let skip = 0; skip < 3; skip++) {
+    const whole = Math.floor((bytes.length - skip) / 3) * 3;
+    if (whole > 0) out.push(bytes.subarray(skip, skip + whole).toString("base64"));
+  }
+  return out.flatMap((b) => [b, b.replace(/=+$/, "").replaceAll("+", "-").replaceAll("/", "_")])
+    .filter((b) => b.length >= MIN_BASE64_REDACT);
+}
+
+/** One alternative: its regex source and the length of the shortest text it matches (for longest-first order). */
+type Alternative = { source: string; min: number };
+/** One value's alternatives, and literal strings at least one of which is in any text they match (null: none is
+ *  known, so the value is always tried). */
+type ValueForms = { name: string; alternatives: Alternative[]; anchors: string[] | null };
+
+/** The longest run of ASCII letters and digits, which every rendering above keeps as is (3+ characters). */
+function literalRun(s: string): string | null {
+  let best = "";
+  for (const run of s.match(/[A-Za-z0-9]+/g) ?? []) if (run.length > best.length) best = run;
+  return best.length >= 3 ? best : null;
+}
+
+/** The renderings of one value (see above). */
+function valueForms(name: string, value: string): ValueForms {
+  const alternatives: Alternative[] = [{ source: escapedPattern(value), min: value.length }];
+  const anchors: (string | null)[] = [literalRun(value)];        // also inside its URL encodings
+  if (/[\r\n]/.test(value)) {
+    for (const line of value.split(/\r\n|\r|\n/)) {
+      const t = line.trim();
+      if (t.length < MIN_LINE_REDACT) continue;
+      alternatives.push({ source: escapedPattern(t), min: t.length });
+      anchors.push(literalRun(t));
+    }
+  }
+  for (const encoded of [encodeURIComponent(value), new URLSearchParams([["", value]]).toString().slice(1)]) {
+    if (encoded !== value) alternatives.push({ source: percentPattern(encoded), min: encoded.length });
+  }
+  if (value.length >= MIN_BASE64_REDACT) {
+    // Escaped like any text: an API echoing a Basic auth header through json_encode writes its "/" as "\/".
+    for (const b of base64Forms(value)) {
+      alternatives.push({ source: escapedPattern(b), min: b.length });
+      anchors.push(literalRun(b));
+    }
+  }
+  return { name, alternatives, anchors: anchors.every((a) => a !== null) ? [...new Set(anchors as string[])] : null };
+}
+
+/** Texts at least this long first look for the values' anchors, and run a pattern over only the values found. */
+const PREFILTER_FROM = 16 * 1024;
+const MAX_SUBSETS = 32;
+
+type Compiled = { re: RegExp; names: string[] };
+
+/** Every rendering of a set of values as one regular expression (a capture group per alternative, longest first). */
+class Redaction {
+  readonly #values: ValueForms[];
+  readonly #all: Compiled;
+  readonly #subsets = new Map<string, Compiled>();
+
+  private constructor(values: ValueForms[]) {
+    this.#values = values;
+    this.#all = Redaction.#compile(values);
+  }
+
+  static build(entries: Iterable<[string, string]>): Redaction | null {
+    const values: ValueForms[] = [];
+    const seen = new Set<string>();
+    for (const [name, value] of entries) {
+      const forms = valueForms(name, value);
+      // The first name for a rendering wins.
+      forms.alternatives = forms.alternatives.filter((a) => !seen.has(a.source) && seen.add(a.source));
+      if (forms.alternatives.length) values.push(forms);
+    }
+    return values.length ? new Redaction(values) : null;
+  }
+
+  static #compile(values: ValueForms[]): Compiled {
+    const all = values.flatMap((v) => v.alternatives.map((a) => ({ ...a, name: v.name })));
+    all.sort((a, b) => b.min - a.min);
+    return { re: new RegExp(all.map((a) => `(${a.source})`).join("|"), "g"), names: all.map((a) => a.name) };
+  }
+
+  apply(text: string): string {
+    if (!text) return text;
+    let compiled = this.#all;
+    if (text.length >= PREFILTER_FROM) {
+      // A long text (a big log, a large object printed) costs a scan per anchor instead of the whole pattern.
+      const found: number[] = [];
+      this.#values.forEach((v, i) => {
+        if (!v.anchors || v.anchors.some((a) => text.includes(a))) found.push(i);
+      });
+      if (found.length === 0) return text;
+      if (found.length < this.#values.length) {
+        const key = found.join(",");
+        let subset = this.#subsets.get(key);
+        if (!subset) {
+          if (this.#subsets.size >= MAX_SUBSETS) this.#subsets.clear();
+          subset = Redaction.#compile(found.map((i) => this.#values[i]!));
+          this.#subsets.set(key, subset);
+        }
+        compiled = subset;
+      }
+    }
+    const { re, names } = compiled;
+    return text.replace(re, (match: string, ...groups: unknown[]) => {
+      for (let i = 0; i < names.length; i++) if (groups[i] !== undefined) return `[redacted:${names[i]}]`;
+      return match;
+    });
+  }
+}
+
+function buildPattern(entries: Iterable<[string, string]>): Pattern | null {
+  return Redaction.build(entries);
 }
 
 function replaceWith(pattern: Pattern | null, text: string): string {
-  if (!pattern || !text) return text;
-  return text.replace(pattern.re, (match) => `[redacted:${pattern.names.get(match)}]`);
+  return pattern ? pattern.apply(text) : text;
 }
 
 export function missingSecret(name: string, asset?: string): CroftError {

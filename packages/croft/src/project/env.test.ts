@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { inspect } from "node:util";
+import { formatWithOptions, inspect } from "node:util";
 import { CroftError } from "../core/errors.ts";
 import { ProjectEnv, parseDotenv } from "./env.ts";
 
@@ -258,5 +258,148 @@ describe("redactData (query rows and other command data)", () => {
     expect(env.redact("got 4242")).toBe("got [redacted:SHELL_PIN]");
     // An empty shell value does not win over .env, so the .env value is the one hidden.
     expect(env.redactData("f file-value-9")).toBe("f [redacted:FROM_FILE]");
+  });
+});
+
+// §9.6 / D54: every rendering of a .env value is redacted, not only its raw text. Asset code prints values inside
+// objects (util.inspect escapes them), serializes them (JSON.stringify), and APIs echo them back escaped (PHP's
+// json_encode writes "/" as "\/") or base64-encoded (a Basic auth header).
+describe("redact: escaped and encoded renderings", () => {
+  const PEM = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAsecretline1\nZZsecretline2abcdef\nAw==\n-----END RSA PRIVATE KEY-----\n";
+  const AWS = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+  const QUOTED = `it's "q" \`t\` back\\slash\tTab-9x`;
+  const UNI = "pässwörd-€-日本-x1";
+  const env = new ProjectEnv({
+    root: null,
+    fileValues: new Map([["GH_APP_KEY", PEM], ["AWS_SECRET", AWS], ["QUOTED", QUOTED], ["UNI", UNI], ["BASIC_PASS", "hunter2hunter2"]]),
+  });
+  const fragments = ["MIIEowIBAAKCAQEAsecretline1", "secretline1", "secretline2", "ZZsecretline2abcdef", "bPxRfiCYEXAMPLEKEY", "K7MDENG", "hunter2"];
+  const clean = (text: string) => {
+    const out = env.redact(text);
+    for (const f of fragments) expect(out, `${f} in ${out}`).not.toContain(f);
+    return out;
+  };
+  const fmt = (...args: unknown[]) => formatWithOptions({ colors: false, depth: 4 }, ...args);
+
+  test("a multi-line key inside an object printed like ctx.log / console.log (util.inspect splits it into lines)", () => {
+    const out = clean(fmt("auth config", { appId: 123, privateKey: PEM }));
+    expect(out).toContain("[redacted:GH_APP_KEY]");
+    expect(out).toContain("appId: 123");
+    // The whole value, with inspect's ' +\n  ' continuations, becomes one marker: not even the short "Aw==" line is left.
+    expect(out).not.toContain("Aw==");
+    clean(inspect(PEM));
+    clean(inspect([PEM], { breakLength: Infinity }));
+  });
+
+  test("JSON.stringify of a multi-line key, and each of its lines (8+ characters) printed on its own", () => {
+    const out = clean(JSON.stringify({ appId: 123, privateKey: PEM }));
+    expect(out).toBe('{"appId":123,"privateKey":"[redacted:GH_APP_KEY]"}');
+    clean(JSON.stringify(JSON.stringify({ k: PEM })));   // escaped twice
+    const lines = PEM.split("\n");
+    expect(clean(`line: ${lines[1]}`)).toBe("line: [redacted:GH_APP_KEY]");
+    expect(clean(`${lines[2]}!`)).toBe("[redacted:GH_APP_KEY]!");
+    // A value with Windows line endings is split the same way.
+    const crlf = new ProjectEnv({ root: null, fileValues: new Map([["K", "first-line-abc\r\nsecond-line-xyz"]]) });
+    expect(crlf.redact("a second-line-xyz b")).toBe("a [redacted:K] b");
+  });
+
+  test("an HTTP error body that JSON-escapes '/' as '\\/' (PHP json_encode), and plain JSON escaping", () => {
+    const body = JSON.stringify({ error: `invalid key ${AWS}` }).replaceAll("/", "\\/");
+    expect(body).toContain("wJalrXUtnFEMI\\/K7MDENG\\/bPxRfiCYEXAMPLEKEY");
+    expect(clean(body)).toBe('{"error":"invalid key [redacted:AWS_SECRET]"}');
+    expect(env.redact(JSON.stringify({ q: QUOTED }))).toBe('{"q":"[redacted:QUOTED]"}');
+    // An HTTP_ERROR message quoting the body, then stored as JSON (runs.sqlite, events.ndjson).
+    expect(clean(JSON.stringify({ message: `GET /x failed with 403: ${body}` }))).toContain("[redacted:AWS_SECRET]");
+  });
+
+  test("util.inspect quoting: single quotes with \\' escapes, double quotes and backticks", () => {
+    expect(env.redact(inspect(QUOTED))).toBe("'[redacted:QUOTED]'");
+    expect(env.redact(fmt({ q: QUOTED }))).toBe("{ q: '[redacted:QUOTED]' }");
+    expect(env.redact(inspect({ s: "it's " + AWS }))).toBe(`{ s: "it's [redacted:AWS_SECRET]" }`);
+    // Control characters are escaped as \x.. by inspect and \u00.. by JSON.
+    const ctl = new ProjectEnv({ root: null, fileValues: new Map([["CTL", "abc\x01def\x7fghi"]]) });
+    expect(ctl.redact(inspect("abc\x01def\x7fghi"))).toBe("'[redacted:CTL]'");
+    expect(ctl.redact(JSON.stringify("abc\x01def\x7fghi"))).toBe('"[redacted:CTL]"');
+  });
+
+  test("non-ASCII values, raw and \\u-escaped (json_encode, Python's json.dumps)", () => {
+    expect(env.redact(`x ${UNI} y`)).toBe("x [redacted:UNI] y");
+    const ascii = JSON.stringify(UNI).replace(/[\u0080-￿]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+    expect(ascii).toContain("\\u00e4");
+    expect(env.redact(ascii)).toBe('"[redacted:UNI]"');
+    const upper = ascii.replace(/\\u([0-9a-f]{4})/g, (_, h: string) => `\\u${h.toUpperCase()}`);
+    expect(env.redact(upper)).toBe('"[redacted:UNI]"');
+  });
+
+  test("URL-encoded forms, whatever the case of the percent escapes, and form encoding (space as +)", () => {
+    expect(env.redact(`?k=${encodeURIComponent(AWS)}`)).toBe("?k=[redacted:AWS_SECRET]");
+    const lower = encodeURIComponent(AWS).replace(/%([0-9A-F]{2})/g, (_, h: string) => `%${h.toLowerCase()}`);
+    expect(lower).toContain("%2f");
+    expect(env.redact(`?k=${lower}`)).toBe("?k=[redacted:AWS_SECRET]");
+    expect(env.redact(new URLSearchParams({ k: QUOTED }).toString())).toBe("k=[redacted:QUOTED]");
+  });
+
+  test("base64: of the whole value, and of the value inside a longer credential (Basic auth)", () => {
+    const b64 = (s: string) => Buffer.from(s).toString("base64");
+    expect(env.redact(`x ${b64(AWS)} y`)).toBe("x [redacted:AWS_SECRET] y");
+    for (const header of [b64(`user:${AWS}`), b64(`${AWS}:`), b64(`ab:${AWS}`), b64(`abc:hunter2hunter2`), b64(`hunter2hunter2:x`)]) {
+      const out = env.redact(`Authorization: Basic ${header}`);
+      expect(out, out).toContain("[redacted:");
+      // At most the base64 characters of a few bytes at each edge are left.
+      expect(out.replace(/\[redacted:\w+\]/g, "").length, out).toBeLessThanOrEqual("Authorization: Basic ".length + 16);
+    }
+    // base64url too (JWT-style encoders).
+    const url = b64(`u:${AWS}`).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+    expect(env.redact(url)).toContain("[redacted:AWS_SECRET]");
+    // A base64 text with "/" and "+", echoed in a JSON body that escapes "/" as "\/".
+    const odd = new ProjectEnv({ root: null, fileValues: new Map([["TOKEN", "tok>>>en???secret-9"]]) });
+    const header = b64("user:tok>>>en???secret-9");
+    expect(header).toContain("/");
+    expect(header).toContain("+");
+    const echoed = JSON.stringify({ got: `Basic ${header}` }).replaceAll("/", "\\/");
+    const out = odd.redact(echoed);
+    expect(out, out).toContain("[redacted:TOKEN]");
+    expect(out.replace(/\[redacted:\w+\]/g, "").length, out).toBeLessThanOrEqual('{"got":"Basic "}'.length + 16);
+  });
+
+  test("short values are not matched in base64 or line form, so ordinary text is left alone", () => {
+    const small = new ProjectEnv({ root: null, fileValues: new Map([["LEVEL", "info"], ["ML", "ab\ncd"]]) });
+    expect(small.redact("aW5mbw== and ab and cd")).toBe("aW5mbw== and ab and cd");
+    expect(small.redact("level info; ml ab\ncd")).toBe("level [redacted:LEVEL]; ml [redacted:ML]");
+  });
+
+  test("redactData catches the same renderings of a declared secret", () => {
+    const d = new ProjectEnv({ root: null, fileValues: new Map([["AWS_SECRET", AWS]]) });
+    expect(d.redactData(JSON.stringify({ e: AWS }).replaceAll("/", "\\/"))).toBe('{"e":"[redacted:AWS_SECRET]"}');
+  });
+
+  test("a large text with many values is redacted quickly", () => {
+    const many = new ProjectEnv({
+      root: null,
+      fileValues: new Map([...Array.from({ length: 40 }, (_, i) => [`K${i}`, `secret-value-${i}-/+=abcdef${i}`] as [string, string]), ["GH_APP_KEY", PEM]]),
+    });
+    const text = "lorem ipsum dolor sit amet, consectetur adipiscing elit 0123456789 {\"a\":\"b\\/c\"}\n".repeat(12_000);
+    const started = performance.now();
+    expect(many.redact(`${text}secret-value-7-/+=abcdef7`)).toEndWith("[redacted:K7]");
+    expect(many.redact(text)).toBe(text);
+    expect(performance.now() - started).toBeLessThan(2000);
+  });
+
+  test("a text of many backslashes does not make redaction backtrack for long", () => {
+    const bs = new ProjectEnv({ root: null, fileValues: new Map([["BS", "a\\\\\\\\\\b/c\\d"], ["P", "x/y/z/w/v"]]) });
+    const started = performance.now();
+    const text = `${"\\".repeat(5000)}/${"\\".repeat(5000)}u002f`;
+    expect(bs.redact(text)).toBe(text);
+    expect(bs.redact(`${"\\".repeat(3000)}a${"\\".repeat(10)}b\\/c\\\\d`)).toEndWith("[redacted:BS]");
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  test("a long text is redacted the same way, including values with no letters or digits", () => {
+    const odd = new ProjectEnv({ root: null, fileValues: new Map([["GH_APP_KEY", PEM], ["AWS_SECRET", AWS], ["PUNCT", "!@#$%^&*()"]]) });
+    const filler = "x".repeat(20_000);
+    const text = `${filler} ${JSON.stringify({ k: PEM })} ${filler} ${JSON.stringify(AWS).replaceAll("/", "\\/")} !@#$%^&*() ${filler}`;
+    const out = odd.redact(text);
+    expect(out).toBe(`${filler} {"k":"[redacted:GH_APP_KEY]"} ${filler} "[redacted:AWS_SECRET]" [redacted:PUNCT] ${filler}`);
+    expect(odd.redact(`${filler}${Buffer.from(`user:${AWS}`).toString("base64")}`)).toContain("[redacted:AWS_SECRET]");
   });
 });
