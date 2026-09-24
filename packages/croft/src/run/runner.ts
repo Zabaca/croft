@@ -99,7 +99,7 @@ export const SCHEDULED_LOCK_WAIT_MS = 30 * 60_000;
 
 /** What happens after a run ends (both no-ops until their phase-3 builders land; tests replace them). */
 export interface RunHooks {
-  refreshReadCopy?: (root: string) => Promise<void>;
+  refreshReadCopy?: (root: string) => Promise<unknown>;
   notifyScheduledFailure?: (root: string, failure: ScheduledFailure) => Promise<void>;
 }
 
@@ -474,7 +474,7 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
  */
 async function afterRun(o: RunnerOptions, out: RunOutcome): Promise<void> {
   const root = o.project.root;
-  const quietly = async (fn: () => Promise<void>) => {
+  const quietly = async (fn: () => Promise<unknown>) => {
     try {
       await fn();
     } catch {
@@ -487,7 +487,10 @@ async function afterRun(o: RunnerOptions, out: RunOutcome): Promise<void> {
   if (o.trigger === "schedule") {
     const failed = out.data.steps.filter((s) => s.status === "failed").map((s) => ({ asset: s.asset, error: s.error ?? null }));
     if (failed.length > 0) {
-      await quietly(() => (o.hooks?.notifyScheduledFailure ?? notifyScheduledFailure)(root, { project: root, runId: out.data.runId, failed }));
+      // The run's own ProjectEnv: its declared secrets and what secret() handed out are redacted too.
+      await quietly(() => o.hooks?.notifyScheduledFailure
+        ? o.hooks.notifyScheduledFailure(root, { project: root, runId: out.data.runId, failed })
+        : notifyScheduledFailure(root, { project: root, runId: out.data.runId, failed }, { env: o.env }));
     }
   }
 }

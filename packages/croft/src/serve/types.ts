@@ -60,6 +60,10 @@ export interface ServeQueryData {
   rows: Record<string, unknown>[];
   rowCount: number;
   tookMs: number;
+  /** Answered from the read copy (readCopy on) while a writer held the live file. Absent for live answers. */
+  stale?: true;
+  /** With stale: the read copy's mtime (the checkpoint it was taken at), in the project offset. */
+  asOf?: string;
 }
 
 export interface ServeEngineStatus {

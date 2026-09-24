@@ -18,9 +18,6 @@ import { PHASE, PHASE_COMPLETE } from "./phase.ts";
 
 /** Codes no source raises yet, with the phase (DESIGN.md §11) that raises them. */
 const NOT_YET_RAISED: Partial<Record<Code, number>> = {
-  // Phase 3: the scheduler.
-  SCHEDULE_HELD: 3,
-  SCHEDULER_STALE: 3,
   // Phase 4: rename, config and pin changes, drift.
   ASSET_RENAMED: 4,
   INGEST_CONFIG_CHANGED: 4,
