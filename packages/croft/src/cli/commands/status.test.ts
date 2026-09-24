@@ -443,17 +443,18 @@ describe("croft status: staleness", () => {
     expect(human).toContain("EDITED_SINCE_LAST_RUN");
   });
 
-  test("an incremental TS transform edited is forward-only: not stale, and the warning never offers a rebuild", async () => {
+  // §8: "18,556 rows were built by older code; to redo them: croft run issue_triage --rebuild". The rebuild trashes and
+  // asks, so it is a human's fix in the warning, and never in next.
+  test("an incremental TS transform edited is forward-only: not stale; the warning names the rebuild for a human, never in next", async () => {
     const p = await pipeline({ hashes: { issue_triage: "older-code" }, entries: { issue_triage: { rows: 18_556 } } });
     const { r, a } = await status(p);
     expect(a.issue_triage).toMatchObject({ status: "ok", stale: false, staleReasons: [], edited: true });
     expect(r.json.data.healthy).toBe(true);
     const edited = r.json.problems.find((x: { code: string }) => x.code === "EDITED_SINCE_LAST_RUN");
-    expect(edited).toMatchObject({ severity: "warning", asset: "issue_triage", file: "assets/issue_triage.ts" });
-    expect(edited.message).toBe("issue_triage edited since its last run; 18,556 rows were built by older code");
+    expect(edited).toMatchObject({ severity: "warning", asset: "issue_triage", file: "assets/issue_triage.ts", fix: { kind: "manual", requiresHuman: true } });
+    expect(edited.message).toBe("issue_triage edited since its last run; 18,556 rows were built by older code; to redo them: croft run issue_triage --rebuild");
     expect(edited.effect).toBe("the next run processes new input rows with the new code");
-    expect(JSON.stringify(r.json)).not.toContain("--rebuild");
-    expect((await cli(["status"], { cwd: p.root, env: ENV })).stdout).not.toContain("--rebuild");
+    expect(JSON.stringify(r.json.next)).not.toContain("--rebuild");
   });
 
   test("a full-refresh TS transform edited is stale (code_changed)", async () => {
@@ -500,7 +501,7 @@ describe("croft status: staleness", () => {
       expect(a.issue_triage).toMatchObject({ status: "skipped", stale: false, edited: true });
       const edited = r.json.problems.find((x: { code: string }) => x.code === "EDITED_SINCE_LAST_RUN");
       expect(edited).toMatchObject({ severity: "warning", asset: "issue_triage" });
-      expect(edited.message).toBe("issue_triage edited since its last run; 18,556 rows were built by older code");
+      expect(edited.message).toBe("issue_triage edited since its last run; 18,556 rows were built by older code; to redo them: croft run issue_triage --rebuild");
       expect((await cli(["status"], { cwd: p.root, env: ENV })).stdout).toMatch(/^issue_triage .* skipped · edited since its last run$/m);
     });
   }

@@ -163,6 +163,67 @@ describe("croft run --dry-run", () => {
     await expect(run({ selectors: ["zones", "charges"], allowShrink: true })).rejects.toMatchObject({ code: "USAGE_ERROR" });
   });
 
+  // §4.1: "dry-run: what would run and why, with windows and confirmations". --rebuild shows what would go to the
+  // trash and the confirmation the run would stop for, and never offers the destructive run in next.
+  test("--rebuild: what would go to the trash and be confirmed; exact names only; a rebuild that trashes is never in next", async () => {
+    const triage = `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["issues"], key: "id", incremental: true,
+  async *rows({ newRows, http }) { for await (const r of newRows("issues")) { await http.get("https://example.test/" + r.id); yield r; } },
+});
+`;
+    const built = [...CATALOG, entry("triage", { kind: "ts", write: "merge", key: ["id"], rows: 800, inputsSeen: { issues: { seenLoadedAt: T1, seenKey: [7], inputLastLoadedAt: T1 } } })];
+    const { run, project } = setup({ ...FILES, "assets/triage.ts": triage }, built);
+    const out = await run({ selectors: ["issues", "triage", "fresh", "sales", "consts"], rebuild: true, only: true });
+    expect(out.exit).toBe(0);
+    const s = stepsOf(out.data);
+    // An ingest with rows: they go to the trash first, then it is fetched from scratch (no window: no cursor).
+    expect(s.issues).toMatchObject({
+      action: "fetch", reasons: ["requested", "rebuild"], reason: "merge by id, from scratch (--rebuild): fetches everything",
+      confirmation: {
+        action: "rebuild", command: "croft run issues --rebuild",
+        impact: { asset: "issues", action: "ingest; --rebuild refetches from scratch", rows: 5000, downstream: ["triage"] },
+      },
+    });
+    expect(s.issues.window).toBeUndefined();
+    expect(s.issues.confirmation.impact.trashPath).toContain(join(".croft", "trash", "issues"));
+    // An incremental transform that makes requests: its rows, and every input row it would process again.
+    expect(s.triage).toMatchObject({
+      action: "rebuild",
+      confirmation: {
+        action: "rebuild", command: "croft run triage --rebuild",
+        impact: { asset: "triage", action: "incremental transform; --rebuild processes every input row again", rows: 800, estimatedRequests: 5000 },
+      },
+    });
+    expect(s.triage.reason).toStartWith("from scratch (--rebuild)");
+    // Never built, nothing to trash: no confirmation. A file ingest loads every file again.
+    expect(s.fresh).toMatchObject({ action: "fetch", reason: "merge by id, from scratch (--rebuild): fetches everything" });
+    expect(s.fresh.confirmation).toBeUndefined();
+    expect(s.sales).toMatchObject({ action: "fetch", reason: "merge by order_id, from scratch (--rebuild): loads every file" });
+    expect(s.sales.confirmation).toBeUndefined();
+    // SQL is recomputed as always: no trash, no confirmation.
+    expect(s.consts).toMatchObject({ action: "rebuild", reason: "from scratch (--rebuild); never built" });
+    expect(s.consts.confirmation).toBeUndefined();
+    const text = formatDryRun(out.data);
+    expect(text).toContain("needs confirmation: its 5,000 rows go to the trash first, then it is fetched from scratch");
+    expect(text).toContain("needs confirmation: its 800 rows go to the trash first, then every input row is processed again (about 5,000, and its code makes requests for them)");
+    // A destructive command never appears in next (§4.3); a dry run issues no token.
+    expect(out.next.some((n) => n.command.includes("--rebuild"))).toBe(false);
+    const db = RunsDb.open(project.paths.stateDir);
+    try {
+      expect(db.sqlite.query("SELECT count(*) AS n FROM confirmations").get()).toEqual({ n: 0 });
+    } finally {
+      db.close();
+    }
+    // A rebuild that needs no confirmation is offered as is.
+    expect((await run({ selectors: ["consts"], rebuild: true })).next).toEqual([{ command: "croft run consts --rebuild", reason: "run it" }]);
+    // The run's own rules: exact names, and not with --from or --allow-shrink.
+    await expect(run({ selectors: [], rebuild: true })).rejects.toMatchObject({ code: "USAGE_ERROR" });
+    await expect(run({ selectors: ["iss*"], rebuild: true })).rejects.toMatchObject({ code: "USAGE_ERROR" });
+    await expect(run({ selectors: ["issues"], rebuild: true, from: "-7d" })).rejects.toMatchObject({ code: "USAGE_ERROR" });
+    await expect(run({ selectors: ["zones"], rebuild: true, allowShrink: true })).rejects.toMatchObject({ code: "USAGE_ERROR" });
+  });
+
   test("the cost guard: an incremental transform that makes requests shows its pending rows, estimated from runs.sqlite", async () => {
     const triage = (above = "") => `import { transform } from "@zabaca/croft";
 export default transform({

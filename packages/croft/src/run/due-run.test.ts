@@ -3,7 +3,7 @@
 // and what reads them; the cost guard holds instead of asking; overlaps skip instead of waiting; retries as for
 // any run; last_attempt_at and last_fire_at recorded; the after-run hooks (read copy, failure notification).
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { currentIdentity } from "../core/proc.ts";
 import { closeAllWarehouses, warehouseFor } from "../db/warehouse.ts";
@@ -11,7 +11,7 @@ import { tryAcquire } from "../history/leases.ts";
 import { RunsDb } from "../history/runs-db.ts";
 import { loadProject } from "../project/root.ts";
 import { duePlan } from "../cli/commands/run.ts";
-import { dueWork } from "../schedule/due.ts";
+import { dueWork, FACTS_SETTING } from "../schedule/due.ts";
 import type { ScheduledFailure } from "../schedule/notify.ts";
 import { planRun } from "./plan.ts";
 import { type RunnerOptions, SCHEDULED_LOCK_WAIT_MS } from "./runner.ts";
@@ -154,6 +154,31 @@ describe("croft run --due: holds", () => {
     expect(db.scheduleState("issues")?.lastFireAt).toBeNull();
     db.close();
     expect(h.calls).toEqual({ readCopy: [], notify: [] });
+  });
+
+  // R32-08 (the run's side): the scheduler's run imported every TS transform to plan it, so the top-level code of code
+  // nobody had run executed unattended (§6 "The scheduler only runs code a human has run").
+  test("a TS asset nobody ran by hand is never imported: it is planned from what the scheduler knows of it, and held", async () => {
+    const root = await pipeline();
+    writeFileSync(join(root, "assets/triage.ts"), `import { appendFileSync } from "node:fs";
+appendFileSync(new URL("../imported.txt", import.meta.url), "triage\\n");
+import { transform } from "@zabaca/croft";
+export default transform({ inputs: ["issues"], key: "id", incremental: true, async *rows({ newRows }) { for await (const r of newRows("issues")) yield { id: r.id }; } });
+`);
+    // The tick's cached facts say it reads issues, so the run takes it downstream of the due ingest, and holds it.
+    const db = runsDb(root);
+    db.setSetting(FACTS_SETTING, { triage: { asset: "triage", file: "assets/triage.ts", kind: "ts", fileHash: "k", schedule: null, inputs: ["issues"], codeHash: null, incremental: true, ok: true } });
+    db.close();
+    const out = await runDue(root, ["issues"], nextFire().now);
+    expect(existsSync(join(root, "imported.txt"))).toBe(false);
+    expect(out.data.steps.map((s) => s.asset)).toEqual(["issues", "open_issues", "triage"]);
+    expect(out.data.steps[0]).toMatchObject({ asset: "issues", status: "ok" });
+    expect(out.data.steps[2]).toMatchObject({ asset: "triage", status: "skipped" });
+    expect(out.data.steps[2]!.skippedBecause).toStartWith("held (SCHEDULE_HELD): new: code edited");
+    expect(out.problems.find((p) => p.code === "SCHEDULE_HELD")).toMatchObject({ asset: "triage", fix: { command: "croft run triage" } });
+    // A run by hand imports it (and approves it).
+    expect((await runIn(root, ["triage"])).data.steps[0]).toMatchObject({ status: "ok" });
+    expect(readFileSync(join(root, "imported.txt"), "utf8")).toBe("triage\n");
   });
 
   test("SCHEDULE_HELD: an ingest whose code no longer loads is held, not failed", async () => {

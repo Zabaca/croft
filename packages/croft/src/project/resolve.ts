@@ -23,6 +23,11 @@
 // never runs the top-level code of unrelated ingests. Every SQL asset and every TS file that may be a transform is always
 // loaded, since the graph needs their inputs.
 //
+// A scheduled run (`croft run --due`, importApproved) imports a TS file only when the code hash of its bundle,
+// computed without running it, is the code a human last ran (§6 "The scheduler only runs code a human has run").
+// Any other is resolved without its code (`notImported`): its kind and inputs are what the scheduler knows of it
+// (its cached facts), else what its text shows, and the plan holds it.
+//
 // bindProject then binds every SQL asset in run order against empty tables with the columns the catalog mirror
 // has (sql/bind.ts ShadowCatalog): output columns, bind problems, and the unoptimized plan's scans, which it adds
 // to the inputs before building the graph again. The planner and validate use it.
@@ -41,7 +46,7 @@ import { openMemory } from "../db/connect.ts";
 import { allCatalog } from "../history/catalog.ts";
 import { RUNS_DB_FILE, RunsDb } from "../history/runs-db.ts";
 import { losslessReviver } from "../load/stage.ts";
-import type { StepKind } from "../run/plan.ts";
+import type { ApprovedImports, StepKind } from "../run/plan.ts";
 import { noteTimeZoneChange } from "../run/staleness.ts";
 import { parseSchedule, type Schedule } from "../schedule/types.ts";
 import { finiteJson } from "../sql/ast.ts";
@@ -53,7 +58,7 @@ import { buildGraph, type Graph } from "./graph.ts";
 import { loadProject } from "./root.ts";
 import { type LoadedSqlAsset, loadSqlAsset, sqlFingerprint } from "./sql-asset.ts";
 import { didYouMean } from "./suggest.ts";
-import { bundleTs, fingerprintOf, type LoadedTsAsset, loadTsAsset, normalizeBundle, type TsAssetSpec } from "./ts-asset.ts";
+import { bundleTs, fingerprintOf, type LoadedTsAsset, loadTsAsset, normalizeBundle, type TsAssetSpec, tsFingerprint } from "./ts-asset.ts";
 
 export interface ResolveInput {
   root: string;
@@ -75,6 +80,9 @@ export interface ResolveInput {
   /** The command that was typed, again with other selectors: the did-you-mean fix of a mistyped name
    *  (selectAssets). Default: `croft run <selectors>`. */
   retry?: (selectors: readonly string[]) => string;
+  /** A scheduled run: import a TS asset only when its bundle's code hash is `approved(asset)`; resolve any other
+   *  without its code (ResolvedAsset.notImported), from `known(asset)` or its text. Absent: import as usual. */
+  importApproved?: ApprovedImports;
 }
 
 export interface ResolvedProject {
@@ -146,6 +154,9 @@ export interface ResolvedAsset {
   problems: Problem[];
   /** What its top-level code printed while it was imported (resolveProject keepOutput; unredacted). */
   output?: string[];
+  /** ResolveInput.importApproved: its code is not the code a human last ran, so it was not imported. Its kind and
+   *  inputs are what the scheduler knew of it (or its text showed); codeHash is its bundle's. */
+  notImported?: true;
 }
 
 /**
@@ -422,6 +433,20 @@ function notLoaded(a: DiscoveredAsset): ResolvedAsset {
   return { ...base(a, "ingest"), loaded: false };
 }
 
+/** A TS asset a scheduled run does not import (ResolveInput.importApproved): its kind and inputs as the scheduler
+ *  knows them (else its kind from its text, and no inputs), with the code hash of its bundle (absent when it does
+ *  not bundle, so the hold says it does not load). */
+function notImported(a: DiscoveredAsset, codeHash: string | undefined,
+  known: { kind: AssetKind | null; inputs: readonly string[]; incremental: boolean } | null): ResolvedAsset {
+  const kind = known && known.kind !== "sql" ? known.kind : sniffKind(a);
+  const inputs = kind === "ts" ? [...(known?.inputs ?? [])] : [];
+  const incremental: Incremental = kind === "ts" && known?.incremental ? { kind: "new-rows", inputs } : NONE;
+  return {
+    ...base(a, kind), inputs, orderAfter: [...inputs], incremental, ok: codeHash !== undefined, notImported: true,
+    ...(codeHash ? { codeHash } : {}),
+  };
+}
+
 async function resolveAsset(a: DiscoveredAsset, i: ResolveInput, names: readonly string[], connection: () => Promise<DuckDBConnection>): Promise<ResolvedAsset> {
   if (a.kind === "sql") {
     const sql = await loadSqlAsset(a, { root: i.root, timezone: i.timezone, conn: await connection(), assetNames: names });
@@ -442,6 +467,11 @@ async function resolveAsset(a: DiscoveredAsset, i: ResolveInput, names: readonly
     ...(i.importTimeoutMs !== undefined ? { importTimeoutMs: i.importTimeoutMs } : {}),
   };
   const project = { root: i.root, timezone: i.timezone };
+  // A scheduled run imports only code a human has run: the hash of the bundle decides, before anything runs.
+  if (i.importApproved) {
+    const code = await tsFingerprint(a.path, project).catch(() => undefined);
+    if (code === undefined || code !== i.importApproved.approved(a.name)) return notImported(a, code, i.importApproved.known?.(a.name) ?? null);
+  }
   let output: string[] | undefined;
   let ts: LoadedTsAsset;
   if (i.keepOutput) {

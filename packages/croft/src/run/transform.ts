@@ -30,6 +30,11 @@
 // table holds the whole run (checks/run.ts ChunkCheckContext). A failure, a timeout or Ctrl-C loses at most the
 // current chunk, and the next run resumes after the last committed position.
 //
+// `croft run <transform> --rebuild` of an incremental transform (run/rebuild.ts) moves its table to the trash and
+// resets its positions before this step runs, so the step is its first build: every input row again. The cost guard's
+// count for it (rebuildGuard) is part of the rebuild's one confirmation, and the runner grants the guard's own
+// question for those rows.
+//
 // CROFT_FAULT kills the process at a named point (crash tests): after_stage, before_commit and
 // after_commit_before_sqlite as for ingests, and mid_chunk halfway through filling the chunk after the first
 // commit of an incremental transform.
@@ -423,6 +428,17 @@ export async function previewGuard(step: PlannedStep, warehouse: DuckWarehouse, 
   const state = await readState(warehouse, step.asset, inputsOf(step), signal);
   const g = await guardCount(step, warehouse, state.saved, signal, cap);
   return { ...g, fits: rowsWithin(Object.values(g.counts), g.limit, cap) };
+}
+
+/**
+ * `croft run <transform> --rebuild` (run/rebuild.ts): what the cost guard would count once the positions are reset,
+ * that is every row of each keyed input the code reads with newRows(). null when the guard does not apply (a
+ * full-refresh transform, or code that makes no requests). Its count goes into the rebuild's own confirmation, so
+ * one token covers both (§6).
+ */
+export async function rebuildGuard(step: PlannedStep, warehouse: DuckWarehouse, signal: AbortSignal): Promise<GuardCount | null> {
+  if (!costGuarded(step)) return null;
+  return guardCount(step, warehouse, new Map(), signal);
 }
 
 /** Input rows after the positions, per keyed input (the rows newRows() can hand over). */

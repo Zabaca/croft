@@ -119,16 +119,26 @@ describe("editedProblem", () => {
     expect(editedProblem(view({ codeHash: undefined }))).toBeNull();
   });
 
-  test("an incremental TS transform: how many rows older code built, and no command that does not exist", () => {
+  // §8 "What a code change does": status says "issue_triage edited since last run; 18,556 rows were built by older
+  // code; to redo them: croft run issue_triage --rebuild" (trash plus confirmation). The rebuild is the user's to
+  // decide (it may pay for every row again): a manual fix for a human, never a command to run.
+  test("an incremental TS transform: how many rows older code built, and the rebuild that redoes them, for a human", () => {
     const p = editedProblem(view({ asset: "issue_triage", file: "assets/issue_triage.ts", kind: "ts", incremental: true, codeHash: "h2", entry: entry("issue_triage", { rows: 18556 }) }))!;
     expect(p).toMatchObject({
       code: "EDITED_SINCE_LAST_RUN", severity: "warning", asset: "issue_triage", file: "assets/issue_triage.ts",
-      message: "issue_triage edited since its last run; 18,556 rows were built by older code",
+      message: "issue_triage edited since its last run; 18,556 rows were built by older code; to redo them: croft run issue_triage --rebuild",
+      hint: "an incremental transform applies new code to new input rows only, so paid calls are never repeated implicitly; "
+        + "croft run issue_triage --rebuild processes every input row again (its table goes to the trash first, after confirmation)",
+      effect: "the next run processes new input rows with the new code",
+      fix: { kind: "manual", requiresHuman: true },
       details: { codeHash: "h2", builtWith: "h1", rows: 18556 },
     });
-    expect(p.fix).toBeUndefined();
-    expect(JSON.stringify(p)).not.toContain("--");
-    expect(editedProblem(view({ kind: "ts", incremental: true, codeHash: "h2", entry: entry("x", { rows: 1 }) }))!.message).toEndWith("1 row was built by older code");
+    expect(p.fix!.description).toBe("ask the user whether to redo the 18,556 rows built by older code (paid calls may run again for each); only after a yes: croft run issue_triage --rebuild");
+    expect(editedProblem(view({ kind: "ts", incremental: true, codeHash: "h2", entry: entry("x", { rows: 1 }) }))!.message).toEndWith("1 row was built by older code; to redo it: croft run daily_revenue --rebuild");
+    // No rows built yet: nothing to redo.
+    const none = editedProblem(view({ kind: "ts", incremental: true, codeHash: "h2", entry: entry("x", { rows: 0 }) }))!;
+    expect(none.message).toBe("daily_revenue edited since its last run; 0 rows were built by older code");
+    expect(JSON.stringify(none)).not.toContain("--rebuild");
   });
 
   test("SQL and full-refresh TS transforms: the next run rebuilds them", () => {

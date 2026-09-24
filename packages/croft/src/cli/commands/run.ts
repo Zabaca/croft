@@ -1,8 +1,10 @@
 // croft run [selector…] (DESIGN.md §4.1 "run flags", §4.3 run/wait shapes, §5 "Processes", §6 confirmation,
 // §8 backfills). Its spec (usage, options) is in commands/index.ts.
 //
-// The plan (run/plan.ts) is made here, with the catalog mirror and --only, --upstream and --from, and handed to
-// the engine; --dry-run describes it (run/dry-run.ts) and stops, in this process, without opening the warehouse.
+// The plan (run/plan.ts) is made here, with the catalog mirror and --only, --upstream, --from and --rebuild, and
+// handed to the engine; --dry-run describes it (run/dry-run.ts) and stops, in this process, without opening the
+// warehouse. --rebuild takes exact names; an ingest or incremental transform it names trashes and asks first
+// (run/rebuild.ts), so the command that carries it out is `croft confirm <token>`.
 //
 // On a TTY (or with --foreground) the run executes in this process: SIGINT/SIGTERM interrupt it (exit 130).
 // Off a TTY it executes in a detached child (run/detach.ts); this process follows it for --follow (100 s)
@@ -34,7 +36,7 @@ import { dryRun, formatDryRun, refuseToken } from "../../run/dry-run.ts";
 import { croftError } from "../../run/ingest.ts";
 import { cursorTypesOf, loadErrors, type PlannedStep, planRun, readMirror, type RunPlan } from "../../run/plan.ts";
 import { checkRunFlags, executeRun, jsonSafe, lockWaitText, redactValue, type RunData, type RunEvent, type RunSummary } from "../../run/runner.ts";
-import { duePlanning, dueWork } from "../../schedule/due.ts";
+import { type AssetFacts, duePlanning, dueWork, FACTS_SETTING } from "../../schedule/due.ts";
 import type { CommandImpl, CommandResult, Ctx } from "../command.ts";
 import { dispatchOf } from "../main.ts";
 import { formatCount, formatDuration } from "../render.ts";
@@ -87,7 +89,7 @@ export function toResult(s: RunSummary): CommandResult<RunData> {
 }
 
 /** What the flags ask of the plan. */
-interface PlanFlags { selectors: readonly string[]; only: boolean; upstream: boolean; from?: string; due?: { now: Date } }
+interface PlanFlags { selectors: readonly string[]; only: boolean; upstream: boolean; from?: string; rebuild?: boolean; due?: { now: Date } }
 
 /** The run's plan, from the catalog mirror in runs.sqlite (never the warehouse). */
 async function planFor(project: Project, f: PlanFlags): Promise<RunPlan> {
@@ -95,14 +97,15 @@ async function planFor(project: Project, f: PlanFlags): Promise<RunPlan> {
   const catalog = readMirror(project.paths.stateDir);
   return planRun({
     root: project.root, timezone: project.timezone, selectors: f.selectors, catalog, cursorTypes: cursorTypesOf(catalog),
-    only: f.only, upstream: f.upstream, ...(f.from !== undefined ? { from: f.from } : {}),
+    only: f.only, upstream: f.upstream, ...(f.from !== undefined ? { from: f.from } : {}), ...(f.rebuild ? { rebuild: true } : {}),
   });
 }
 
 /**
  * --due: the plan of the assets the tick named (or, with none, of what is due now), with the scheduler's holds and
  * the fire each due ingest handles. A named asset whose file is gone since the tick is left out; with nothing left
- * the plan is empty.
+ * the plan is empty. Only code a human has run is imported (§6): a TS asset whose bundle is not its approved code
+ * is planned from the tick's cached facts (settings schedule.facts) and held, and its top-level code never runs.
  */
 export async function duePlan(project: Project, named: readonly string[], now: Date): Promise<RunPlan> {
   const empty: RunPlan = { steps: [], order: [], problems: [], fileDirs: [] };
@@ -120,9 +123,13 @@ export async function duePlan(project: Project, named: readonly string[], now: D
     }
     if (assets.length === 0) return empty;
     const catalog = allCatalog(runs);
+    const facts = runs.getSetting<Record<string, AssetFacts>>(FACTS_SETTING) ?? {};
     return await planRun({
       root: project.root, timezone: project.timezone, selectors: assets, catalog, cursorTypes: cursorTypesOf(catalog),
-      due: duePlanning({ project, runs, now, ...(fires ? { fires } : {}) }),
+      due: {
+        ...duePlanning({ project, runs, now, ...(fires ? { fires } : {}) }),
+        imports: { approved: (asset) => runs.approvedCode(asset), known: (asset) => (Object.hasOwn(facts, asset) ? facts[asset]! : null) },
+      },
     });
   } finally {
     runs.close();
@@ -131,7 +138,7 @@ export async function duePlan(project: Project, named: readonly string[], now: D
 
 /** --due goes with no other run flag: it runs what the scheduler would, as the scheduler would. */
 function checkDueFlags(v: Ctx["values"]): void {
-  const other = ["dry-run", "only", "upstream", "from", "allow-shrink"].find((f) => v[f] !== undefined && v[f] !== false);
+  const other = ["dry-run", "only", "upstream", "from", "allow-shrink", "rebuild"].find((f) => v[f] !== undefined && v[f] !== false);
   if (other) {
     throw new CroftError("USAGE_ERROR", {
       message: `--due runs what the scheduler would; it does not go with --${other}`,
@@ -195,10 +202,12 @@ export const run: CommandImpl<RunData | DryRunData> = {
     const selectors = [...ctx.positionals];
     const from = str(v.from);
     const allowShrink = v["allow-shrink"] === true;
+    const rebuild = v.rebuild === true;
     const due = v.due === true;
     if (due) checkDueFlags(v);
     const flags: PlanFlags = {
-      selectors, only: v.only === true, upstream: v.upstream === true, ...(from !== undefined ? { from } : {}), ...(due ? { due: { now: ctx.now() } } : {}),
+      selectors, only: v.only === true, upstream: v.upstream === true, ...(from !== undefined ? { from } : {}), ...(rebuild ? { rebuild } : {}),
+      ...(due ? { due: { now: ctx.now() } } : {}),
     };
     if (v["dry-run"] === true) {
       // Always in this process: it reads runs.sqlite and the asset files, and never waits.
@@ -245,7 +254,7 @@ export const run: CommandImpl<RunData | DryRunData> = {
     if (!foreground) {
       // Report usage problems here, at once, rather than from a child nobody is watching.
       const plan = planned = await planFor(project, flags);
-      checkRunFlags(plan, { selectors, ...(from !== undefined ? { from } : {}), allowShrink, ...(confirmToken !== undefined ? { confirmToken } : {}) });
+      checkRunFlags(plan, { selectors, ...(from !== undefined ? { from } : {}), allowShrink, rebuild, ...(confirmToken !== undefined ? { confirmToken } : {}) });
       const willRun = plan.steps.some((s) => s.action !== "skip" && loadErrors(s).length === 0);
       if (willRun) {
         const runId = pickRunId(project.timezone, ctx.now());
@@ -297,7 +306,7 @@ export const run: CommandImpl<RunData | DryRunData> = {
       const delays = retryDelays(ctx.processEnv);
       const out = await executeRun({
         project, env: ctx.env, selectors, argv, trigger: due ? "schedule" : confirmToken !== undefined ? "confirm" : "manual", human: !due, interactive, plan,
-        ...(runIdFlag ? { runId: runIdFlag } : {}), ...(from !== undefined ? { from } : {}), allowShrink,
+        ...(runIdFlag ? { runId: runIdFlag } : {}), ...(from !== undefined ? { from } : {}), allowShrink, ...(rebuild ? { rebuild } : {}),
         ...(confirmToken !== undefined ? { confirmToken } : {}),
         ...(interactive && !ctx.json ? { prompt: askYesNo } : {}),
         noWait: v["no-wait"] === true, signal: ac.signal,

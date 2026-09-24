@@ -7,7 +7,8 @@
 // the input has no InputSeen entry at all; an input that never had rows changes nothing), when an input was
 // replaced (input_replaced: the input's lastReplacedAt is newer than what the transform saw), or when its code
 // changed (code_changed). Incremental TS transforms are forward-only: new code applies to new rows, so their
-// code change is EDITED_SINCE_LAST_RUN, never a reason to run. Ingests are only ever never_built here.
+// code change is EDITED_SINCE_LAST_RUN, never a reason to run; the rows older code built are redone only by
+// `--rebuild`, which the warning names for a human to decide. Ingests are only ever never_built here.
 //
 // "What the transform saw" of an input is InputSeen.inputLastLoadedAt: the input's version when the transform
 // last read all of it. input_replaced compares the input's lastReplacedAt with it, so it clears once the
@@ -95,12 +96,23 @@ export function editedProblem(v: StaleView): Problem | null {
   const details = { codeHash: v.codeHash, builtWith: v.entry.codeHash, rows: v.entry.rows };
   const base = { asset: v.asset, file: v.file, details };
   if (v.kind === "ts" && v.incremental) {
+    // §8: the rows older code built are redone only by a rebuild, which trashes first and asks (it may pay for
+    // every row again): named in the message and a human's fix, never a command to run.
     const rows = v.entry.rows;
+    const built = `${v.asset} edited since its last run; ${count(rows)} row${rows === 1 ? " was" : "s were"} built by older code`;
+    const forward = "an incremental transform applies new code to new input rows only, so paid calls are never repeated implicitly";
+    const effect = "the next run processes new input rows with the new code";
+    if (rows === 0) return problem("EDITED_SINCE_LAST_RUN", { ...base, message: built, hint: forward, effect });
+    const rebuild = `croft run ${v.asset} --rebuild`;
     return problem("EDITED_SINCE_LAST_RUN", {
       ...base,
-      message: `${v.asset} edited since its last run; ${count(rows)} row${rows === 1 ? " was" : "s were"} built by older code`,
-      hint: "an incremental transform applies new code to new input rows only, so paid calls are never repeated implicitly; the rows built earlier keep their values",
-      effect: "the next run processes new input rows with the new code",
+      message: `${built}; to redo ${rows === 1 ? "it" : "them"}: ${rebuild}`,
+      hint: `${forward}; ${rebuild} processes every input row again (its table goes to the trash first, after confirmation)`,
+      effect,
+      fix: {
+        kind: "manual", requiresHuman: true,
+        description: `ask the user whether to redo the ${count(rows)} row${rows === 1 ? "" : "s"} built by older code (paid calls may run again for each); only after a yes: ${rebuild}`,
+      },
     });
   }
   if (v.kind === "ingest") {

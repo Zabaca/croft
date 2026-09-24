@@ -25,6 +25,15 @@
 // why. A code hash that changed only because croft.json's timezone did is "time zone changed", not an edit
 // (project/resolve.ts timeZoneChanged).
 //
+// --rebuild (§4.1, §6): the assets named, by exact name only (a bare --rebuild or a glob is USAGE_ERROR), are built
+// from scratch (PlannedStep.rebuild, reason "rebuild"): an ingest refetches, an incremental TS transform processes
+// every input row again (action rebuild), and an SQL or full-refresh TS transform is recomputed as always. What the
+// run takes besides them (downstream, --upstream) runs as in any run. The runner trashes and asks (run/rebuild.ts).
+//
+// --due in a scheduled run (§6 "The scheduler only runs code a human has run"): with DuePlanning.imports, a TS
+// asset whose code is not the code a human last ran is not imported at all (project/resolve.ts importApproved): its
+// step is planned from what the scheduler knows of it (PlannedStep.notImported) and held.
+//
 // A static error (a load error, CHECK_INVALID, CYCLE, a bind error) is a problem of its own step: that step
 // fails before it runs, and the rest of the run goes ahead. So is a blocking check that reads a table never built
 // that the run does not build first (unbuiltCheckTables): it names the table. A warning never blocks and does not
@@ -109,6 +118,13 @@ export interface PlannedStep {
   /** --due: the schedule fire this ingest's step handles (ISO-8601 UTC), recorded as its last_fire_at when the step
    *  starts (§8). */
   fire?: string;
+  /** --rebuild named it: built from scratch (§6). An ingest refetches (no cursor, no file list) and an incremental
+   *  TS transform processes every input row again (its positions reset); both move their table to the trash first,
+   *  after a confirmation (run/rebuild.ts). An SQL or full-refresh TS transform is recomputed as always. */
+  rebuild?: true;
+  /** --due: a TS asset whose code is not the code a human last ran, so it was not imported (DuePlanning.imports):
+   *  planned from what the scheduler knows of it, with no module, and held. */
+  notImported?: true;
 }
 
 /**
@@ -122,6 +138,17 @@ export interface DuePlanning {
   hold(step: { asset: string; file: string; kind: StepKind; codeHash?: string; ok: boolean }): { hold: Hold; reason: string; problem?: Problem } | null;
   /** The fire a due ingest handles (its schedule as written), or null. */
   fire(step: { asset: string; schedule?: string }): string | null;
+  /** What the scheduled run may import (§6): a TS asset only when the code hash of its bundle (computed without
+   *  running it) is `approved`; any other is planned from `known` (the scheduler's cached facts) and held. Absent:
+   *  every asset is imported, as in a run by hand. */
+  imports?: ApprovedImports;
+}
+
+/** project/resolve.ts ResolveInput.importApproved: the approved code hash of each asset, and what the scheduler
+ *  knows of one it does not import. */
+export interface ApprovedImports {
+  approved(asset: string): string | null;
+  known?(asset: string): { kind: "ingest" | "sql" | "ts" | null; inputs: readonly string[]; incremental: boolean } | null;
 }
 
 export interface RunPlan {
@@ -156,6 +183,9 @@ export interface PlanInput {
   /** --from: only fetches run. In a bare run or a glob, an ingest it does not apply to is planned as skip (one
    *  named exactly is refused by the runner's checkRunFlags instead), and so is every transform. */
   from?: string;
+  /** --rebuild: the named assets are built from scratch (PlannedStep.rebuild). Names only: a bare run or a glob is
+   *  USAGE_ERROR (rebuildSelectors). */
+  rebuild?: boolean;
   /** The command that was typed, again with other selectors: the did-you-mean fix of a mistyped name
    *  (project/resolve.ts selectAssets). Default: `croft run <selectors>`. */
   retry?: (selectors: readonly string[]) => string;
@@ -171,6 +201,23 @@ export const DEFAULT_RETRIES = 2;
 export const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 /** Why a bare or glob `--from` run skips an asset --from cannot apply to (§8). */
 export const FROM_ONLY_MERGE = "--from applies to merge ingests";
+
+/** The command that rebuilds one asset from scratch; `croft confirm` runs exactly this. */
+export function rebuildCommand(asset: string): string {
+  return `croft run ${asset} --rebuild`;
+}
+
+/** --rebuild takes the exact names of the assets to build from scratch (§6 "Guards aimed at agents": a destructive
+ *  option names what it destroys). USAGE_ERROR for a bare --rebuild or a glob. */
+export function rebuildSelectors(selectors: readonly string[]): void {
+  const glob = selectors.find((s) => isGlob(s));
+  if (selectors.length > 0 && glob === undefined) return;
+  throw new CroftError("USAGE_ERROR", {
+    message: glob === undefined ? "--rebuild takes the names of the assets to build from scratch" : `--rebuild takes exact asset names, not a glob (${glob})`,
+    hint: "name each asset: croft run <asset> --rebuild (an ingest or an incremental transform goes to the trash first, after confirmation)",
+    details: { selectors: [...selectors] },
+  });
+}
 
 /** Bind errors no column an input gains can fix: they count even when an input the run refreshes first could
  *  still change its columns. */
@@ -361,6 +408,8 @@ function sameColumns(a: readonly { name: string; type: string }[], b: readonly {
 /** Discover, resolve and bind the project, and decide what each asset the run takes does (see the top). Throws
  *  USAGE_ERROR (or the named file's discovery problem) for a selector that names nothing. */
 export async function planRun(i: PlanInput): Promise<RunPlan> {
+  // Before anything is imported: --rebuild names what it rebuilds.
+  if (i.rebuild) rebuildSelectors(i.selectors);
   const catalog = i.catalog ?? mirrorOf(i.root);
   const entries = new Map(catalog.map((c) => [c.asset, c]));
   const entry = (name: string) => entries.get(name) ?? null;
@@ -368,6 +417,7 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
     root: i.root, timezone: i.timezone, selectors: i.selectors, keepOutput: true, cursorTypes: i.cursorTypes ?? cursorTypesOf(catalog),
     builtHashes: (name) => entry(name)?.codeHash ?? null,
     ...(i.importTimeoutMs !== undefined ? { importTimeoutMs: i.importTimeoutMs } : {}), ...(i.retry ? { retry: i.retry } : {}),
+    ...(i.due?.imports ? { importApproved: i.due.imports } : {}),
   });
   const byName = new Map(project.assets.map((a) => [a.name, a]));
   const flags = { bare: i.selectors.length === 0, only: i.only === true, upstream: i.upstream === true, from: i.from !== undefined, due: i.due !== undefined };
@@ -411,6 +461,13 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
     bound = await bind(taken);
   }
   const graph = bound.graph;
+  // --rebuild: the named assets are built from scratch; what else the run takes runs as in any run.
+  if (i.rebuild) {
+    for (const name of project.selected) {
+      const t = taken.get(name);
+      if (t) t.reasons = new Set<Reason>(["requested", "rebuild", ...t.reasons]);
+    }
+  }
 
   const order = [
     ...graph.order.filter((n) => taken.has(n)),
@@ -507,6 +564,13 @@ function applyDue(step: PlannedStep, due: DuePlanning): void {
     if (h.problem) step.problems.push({ ...h.problem, asset: h.problem.asset ?? step.asset });
     return;
   }
+  // Code the plan did not import is not the code a human ran: it never runs here, whatever the hold said (an
+  // approval between the import and the hold).
+  if (step.notImported) {
+    step.hold = "code_not_run_by_hand";
+    step.reason = "held: its code has not been run by hand yet";
+    return;
+  }
   const fire = transform ? null : due.fire({ asset: step.asset, ...(step.spec?.schedule !== undefined ? { schedule: step.spec.schedule } : {}) });
   if (fire) step.fire = fire;
 }
@@ -559,8 +623,10 @@ interface StepContext {
 function stepOf(a: ResolvedAsset, t: Taken, c: StepContext): PlannedStep {
   const kind = stepKindOf(a);
   const spec = a.ts?.spec;
+  const rebuild = t.reasons.has("rebuild");
+  // An incremental TS transform rebuilt from scratch processes every input row again: a rebuild, not an update.
   const action: PlannedStep["action"] = kind === "rows" || kind === "file" ? "fetch"
-    : kind === "transform" && a.incremental.kind === "new-rows" ? "update" : "rebuild";
+    : kind === "transform" && a.incremental.kind === "new-rows" && !rebuild ? "update" : "rebuild";
   let problems = [...a.problems];
   const r = c.bind.results.get(a.name);
   if (r) {
@@ -576,13 +642,15 @@ function stepOf(a: ResolvedAsset, t: Taken, c: StepContext): PlannedStep {
   }
   problems.push(...c.checkTables.problems);
   const view = viewOf(a, c.inputs, c.entry);
-  if (kind === "transform" && a.incremental.kind === "new-rows") {
+  // A rebuild redoes the rows older code built: the warning about them does not apply to it.
+  if (kind === "transform" && a.incremental.kind === "new-rows" && !rebuild) {
     const edited = editedProblem(view);
     if (edited) problems.push(edited);
   }
   const reasons = [...t.reasons];
   return {
     asset: a.name, file: a.file, path: a.path, kind, action, reasons, reason: reasonText(a, t, view), problems,
+    ...(rebuild ? { rebuild: true as const } : {}), ...(a.notImported ? { notImported: true as const } : {}),
     ...(t.readers.length ? { neededBy: [...t.readers] } : {}),
     ...(a.ts ? { loaded: a.ts } : {}), ...(spec ? { spec } : {}), ...(a.sql ? { sql: a.sql } : {}),
     inputs: [...c.inputs], orderAfter: [...new Set([...a.orderAfter, ...c.inputs])], readBy: c.readBy,
@@ -715,9 +783,13 @@ function names(list: readonly string[], max = 3): string {
  *  describe its window and behavior instead. */
 function reasonText(a: ResolvedAsset, t: Taken, view: StaleView): string {
   const parts: string[] = [];
+  const rebuild = t.reasons.has("rebuild");
   if (t.reasons.has("requested")) parts.push("requested");
   if (t.reasons.has("schedule_due")) parts.push("scheduled");
+  if (rebuild) parts.push("from scratch (--rebuild)");
   if (!isTransform(a)) return parts.join("; ") || "requested";
+  // Forward-only: an incremental TS transform processes new input rows only, until it is rebuilt.
+  const forwardOnly = a.kind === "ts" && a.incremental.kind === "new-rows" && !rebuild;
   if (t.reasons.has("never_built")) parts.push("never built");
   const zone = a.timeZoneChanged;
   if (t.reasons.has("code_changed")) {
@@ -737,7 +809,12 @@ function reasonText(a: ResolvedAsset, t: Taken, view: StaleView): string {
   const are = (list: readonly string[], one: string, many: string) =>
     `${list.length === 1 ? "input" : "inputs"} ${names(list)} ${list.length === 1 ? one : many}`;
   if (changed.length) parts.push(are(changed, "has new rows", "have new rows"));
-  if (replaced.length) parts.push(`${are(replaced, "was replaced", "were replaced")} (restored, or changed outside croft)`);
+  // The rows a restore brought back are not new rows to an incremental transform (§6 "Trash, restore and delete":
+  // "input restored; --rebuild offered").
+  if (replaced.length) {
+    parts.push(`${are(replaced, "was replaced", "were replaced")} (restored, or changed outside croft)`
+      + (forwardOnly ? `: only new input rows are processed, and ${rebuildCommand(a.name)} redoes every row` : ""));
+  }
   // What an input the run refreshes first may bring (a transform never built reads all of it anyway).
   const fresh = t.feeding.filter((x) => !changed.includes(x));
   if (fresh.length && !t.reasons.has("never_built")) parts.push(are(fresh, "may have new rows", "may have new rows"));
@@ -745,7 +822,7 @@ function reasonText(a: ResolvedAsset, t: Taken, view: StaleView): string {
   if (t.readers.length) {
     parts.push(`${names(t.readers)} ${t.readers.length === 1 ? "reads" : "read"} ${t.reasons.has("never_built") ? "it" : "its new columns"}`);
   }
-  if (a.kind === "ts" && a.incremental.kind === "new-rows" && entry?.codeHash && a.codeHash) {
+  if (forwardOnly && entry?.codeHash && a.codeHash) {
     parts.push(entry.codeHash === a.codeHash ? "(TS code unchanged)"
       : zone ? `(time zone changed from ${zone.from}: the new zone applies to new input rows only)`
         : "(code edited: the new code applies to new input rows only)");
@@ -758,21 +835,37 @@ function reasonText(a: ResolvedAsset, t: Taken, view: StaleView): string {
 
 /**
  * BACKFILL_UNSUPPORTED for everything but cursor ingests; append ingests are checked against the saved
- * cursor by the ingest step (BACKFILL_WOULD_DUPLICATE). null when `--from` applies.
+ * cursor by the ingest step (BACKFILL_WOULD_DUPLICATE). null when `--from` applies. The texts are §8's table:
+ * where a rebuild is the backfill, they name --rebuild. A rebuild that trashes and asks (a file ingest, an
+ * incremental TS transform) is in the hint and a human's fix, never a command fix (§4.3: a destructive command is
+ * the user's to run).
  */
 export function backfillUnsupported(step: Pick<PlannedStep, "asset" | "file" | "kind" | "incremental" | "write">): CroftError | null {
   const at = { asset: step.asset, file: step.file };
+  const rebuild = rebuildCommand(step.asset);
+  const trashFirst = "its table goes to the trash first, after confirmation";
+  if (step.kind === "transform" && step.incremental.kind === "new-rows") {
+    return new CroftError("BACKFILL_UNSUPPORTED", {
+      ...at, message: `${step.asset} is a transform; --from applies to merge ingests`,
+      hint: `use ${rebuild}: it processes every input row again with the code as it is now (${trashFirst})`,
+      fix: {
+        kind: "manual", requiresHuman: true,
+        description: `ask the user whether ${step.asset} should process every input row again (its code may pay per row); only after a yes: ${rebuild}`,
+      },
+    });
+  }
   if (step.kind === "sql" || step.kind === "transform") {
     return new CroftError("BACKFILL_UNSUPPORTED", {
       ...at, message: `${step.asset} is a transform; --from applies to merge ingests`,
-      hint: `transforms are rebuilt from their inputs; there is nothing to backfill: croft run ${step.asset}`,
-      fix: { kind: "command", description: "run the transform", command: `croft run ${step.asset}` },
+      hint: `use ${rebuild}: a transform is recomputed from its inputs`,
+      fix: { kind: "command", description: "recompute the transform", command: rebuild },
     });
   }
   if (step.kind === "file") {
     return new CroftError("BACKFILL_UNSUPPORTED", {
       ...at, message: `${step.asset} is a file ingest; --from applies to merge ingests`,
-      hint: `changed files reload automatically on the next run; there is nothing to backfill: croft run ${step.asset}`,
+      hint: `changed files reload automatically; ${rebuild} reloads all files (${trashFirst})`,
+      fix: { kind: "command", description: "load the new and changed files", command: `croft run ${step.asset}` },
     });
   }
   if (step.incremental.kind !== "cursor" || step.write === "replace") {
