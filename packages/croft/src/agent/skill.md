@@ -2,7 +2,7 @@
 name: croft
 description: Build and operate this project's data pipelines with the croft CLI (DuckDB). Use when adding a data
   source, writing SQL or TypeScript transforms, adding checks, scheduling, debugging a failed run, backfilling,
-  or answering a question from project data.
+  renaming, or answering a question from project data.
 ---
 <!-- croft {{version}} -->
 croft is not dbt, dlt, SQLMesh or Dagster; do not assume their behavior. Ask the CLI: `croft docs <topic>`,
@@ -49,13 +49,13 @@ croft status                # failed, stale, held, never run, edited since its l
   lookback: incremental: { field: "created", unit: "s", lookback: "30 days" }. Epoch cursors need `unit`.
 
 ## Ask the user first (show the printed impact; wait for an explicit yes in this conversation)
-- `croft confirm <token>` (every destructive action ends here; in this version: `--allow-shrink`, which moves a
-  replace ingest's current rows to the trash before it writes fewer, and large paid reprocessing, LARGE_REPROCESS).
+- `croft confirm <token>` (every destructive action ends here: rebuild of an ingest or incremental TS transform,
+  --allow-shrink, delete, restore, lossy pin changes, key conversion, large paid reprocessing).
 - Adding `allowShrink: true`; changing key/write/incremental of an ingest that has data.
 - Raising `confirmAbove` of a transform that makes requests (more paid calls would run without asking).
-- Renaming or deleting files in assets/ (the table stays under the old name; this version cannot rename or drop it); `croft schedule on|off|pause`.
+- Renaming or deleting files in assets/ (use `croft rename`); `croft schedule on|off|pause`.
 - `croft serve` (it runs scheduled work unattended, and a `--host` other than 127.0.0.1 exposes data beyond this machine).
-- Deleting .croft/ or warehouse*.duckdb, or `git clean -X` (the trash lives in .croft/).
+- Deleting .croft/ or warehouse*.duckdb, or `git clean -X` (the trash and backups live in .croft/).
 - Weakening or deleting a failing check.
 
 ## Recipes
@@ -66,6 +66,7 @@ croft status                # failed, stale, held, never run, edited since its l
   run it by hand once (new code is held until then), then ask the user before `croft schedule on`.
 - Backfill: croft run <asset> --dry-run --from -90d, then the same without --dry-run. Merge ingests only.
   A date works too (--from 2026-06-24); a text cursor takes a value in its own format. The saved cursor never moves back.
+- Rename: croft rename <old> <new>; fix every reference it lists; validate; preview; run.
 - Wrong number: croft describe <asset> --json → croft preview <asset> --rebuild (drift) → query the upstream
   with the same filter; `croft docs internals` shows how _croft.writes maps rows to runs.
 - API changed: new fields appear automatically; fill them for old rows with --from (merge ingests).
