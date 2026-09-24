@@ -449,6 +449,48 @@ describe("croft status: staleness", () => {
     expect(a.issue_triage).toMatchObject({ stale: true, staleReasons: ["input_replaced"] });
   });
 
+  // §6 "Restore": "incremental TS transforms show 'input restored; croft run x --rebuild redoes it'". A plain run of one
+  // processes new input rows only, so the rows it built from the replaced version keep their values.
+  test("an incremental TS transform whose input was restored: its row names the rebuild that redoes it; SQL just reruns", async () => {
+    const p = await pipeline({ entries: { github_issues: { lastReplacedAt: "2026-09-22T18:56:00.000000Z" } } });
+    const db = runsDb(p.stateDir, () => new Date("2026-09-22T18:56:00.000Z"));
+    try {
+      const run = db.createRun({ id: "r_0922_1156_rest", trigger: "confirm", human: true, argv: ["restore", "github_issues"], identity: DEAD });
+      db.startStep({ runId: run.id, asset: "github_issues", attempt: 1, reason: "restored" });
+      db.finishStep(run.id, "github_issues", 1, { status: "ok", reason: "restored" });
+      db.finishRun(run.id, "succeeded");
+    } finally {
+      db.close();
+    }
+    const { a } = await status(p);
+    expect(a.issue_triage).toMatchObject({ stale: true, staleReasons: ["input_replaced"], replaced: [{ input: "github_issues", restored: true }] });
+    expect(a.open_issues.replaced).toBeUndefined();
+    const human = (await cli(["status"], { cwd: p.root, env: ENV })).stdout;
+    expect(human).toMatch(/^issue_triage .* ok · stale: input github_issues restored; croft run issue_triage --rebuild redoes it$/m);
+    expect(human).toMatch(/^open_issues .* ok · stale: an input was replaced \(croft run open_issues\)$/m);
+
+    // Replaced another way (changed outside croft, rows deleted): the same rebuild, without saying "restored".
+    const p2 = await pipeline({ entries: { github_issues: { lastReplacedAt: "2026-09-22T18:56:00.000000Z" } } });
+    expect((await status(p2)).a.issue_triage.replaced).toEqual([{ input: "github_issues", restored: false }]);
+    const text = (await cli(["status"], { cwd: p2.root, env: ENV })).stdout;
+    expect(text).toMatch(/^issue_triage .* ok · stale: input github_issues replaced \(rows deleted or changed\); croft run issue_triage --rebuild redoes it$/m);
+  });
+
+  // §6 "Behavior changes": the run fails before it fetches; status says so from the catalog mirror, with the run's fixes.
+  test("an ingest whose code changed its key: INGEST_CONFIG_CHANGED with the run's fixes, and its row says the run fails", async () => {
+    const p = await pipeline({ hashes: { github_issues: "older-code" }, files: { "assets/github_issues.ts": ISSUES_TS.replace('key: "id"', 'key: "number"') } });
+    const { r } = await status(p);
+    expect(r.json.problems.find((x: { code: string }) => x.code === "INGEST_CONFIG_CHANGED")).toMatchObject({
+      severity: "error", asset: "github_issues", file: "assets/github_issues.ts",
+      message: "github_issues's 18556 stored rows were written as merge by id, but its code now says merge by number (key: id → number); croft does not rewrite stored rows on its own",
+      fix: { kind: "edit", description: "put the key back as it was (key: id → number)", file: "assets/github_issues.ts" },
+      details: { pending: true, convertible: false },
+    });
+    expect(JSON.stringify(r.json.next)).not.toContain("--rebuild");
+    const human = (await cli(["status"], { cwd: p.root, env: ENV })).stdout;
+    expect(human).toMatch(/^github_issues .* ok · .*its code changes how its rows are written: croft run github_issues fails until that is settled \(INGEST_CONFIG_CHANGED\)/m);
+  });
+
   test("code_changed: an SQL transform edited since it was built is stale and edited; EDITED_SINCE_LAST_RUN says the run rebuilds it", async () => {
     const p = await pipeline();
     writeFileSync(join(p.root, "assets/open_issues.sql"), OPEN_SQL.replace("WHERE state = 'open'", "WHERE state <> 'closed'"));

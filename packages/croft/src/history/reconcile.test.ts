@@ -11,7 +11,7 @@ import { acquire as acquireIntent, intentDir, intentFileName, listIntents, relea
 import { ensureState } from "../db/state.ts";
 import { closeAllWarehouses, openWarehouse } from "../db/warehouse.ts";
 import { cleanupProjects, cli, cliEnv, makeProject, mockApi } from "../run/testkit.ts";
-import { getCatalog } from "./catalog.ts";
+import { type CatalogAsset, getCatalog, putCatalog } from "./catalog.ts";
 import { acquire, holderOf, listLeases } from "./leases.ts";
 import { reconcile } from "./reconcile.ts";
 import { RunsDb } from "./runs-db.ts";
@@ -482,6 +482,51 @@ describe("reconcile against a real warehouse", () => {
     ]);
     expect(r.lost).toEqual([{ runId: run.id, asset: "customers", attempt: 1 }]);
     expect(db.getStep(run.id, "orders", 2)).toMatchObject({ status: "ok", rowsIn: 20 });
+  });
+
+  // §8 "Large first loads": a cursor ingest commits parts while its cursor values arrive in order. A kill after some
+  // of them is recovered, but its extraction did not finish: the reason says so, and where the next run continues.
+  test("a killed cursor ingest that saved parts: the extraction did not finish, and the next run continues from the saved cursor", async () => {
+    const w = warehouse();
+    const events = (runId: string, rows: number): CatalogAsset => ({
+      asset: "events", kind: "ingest", behavior: "updates rows by id", write: "merge", key: ["id"], rows, columns: [],
+      cursor: { field: "ts", value: "2026-09-01T00:00:04Z", type: "timestamp", unit: null },
+      lastLoadedAt: null, lastReplacedAt: null, lastRunId: runId, codeHash: "h",
+    });
+    const header = (runId: string, attempt: number) => `2026-09-24T10:00:00.000Z events attempt ${attempt} of 3 (run ${runId}): merge by id`;
+    const start = (lines: string[]) => {
+      const run = db.createRun({ trigger: "manual", human: true, argv: ["run", "events"], identity: deadIdentity() });
+      const log = join(dir, `${run.id}.log`);
+      writeFileSync(log, `${lines.map((l) => l.replace("RUN", run.id)).join("\n")}\n`);
+      db.startStep({ runId: run.id, asset: "events", attempt: 1, reason: "requested", logPath: log });
+      putCatalog(db, events(run.id, 4));
+      return run.id;
+    };
+    const partial = start([header("RUN", 1), "commit 1: saved 2 rows as ts arrived in order; the saved position is 2026-09-01T00:00:02Z",
+      "commit 2: saved 2 rows as ts arrived in order; the saved position is 2026-09-01T00:00:04Z"]);
+    // The extraction ended (its log says so); the last write was cut off after two parts.
+    const ended = start([header("RUN", 1), "commit 1: saved 2 rows", "commit 2: saved 2 rows", "extracted 7 rows in 3 part(s), 4 request(s)"]);
+    // One write that landed before the kill, the classic case: the words stay as they were.
+    const whole = start([header("RUN", 1), "extracted 4 rows in 1 part(s), 2 request(s)"]);
+    const later = (s: number) => new Date(Date.now() + 3_600_000 + s * 1000).toISOString();
+    await w.write("seed", async (tx) => {
+      await ensureState(tx);
+      await tx.exec(`INSERT INTO _croft.assets (name, kind, write_mode, key_columns, cursor_value, cursor_type, row_count)
+        VALUES ('events', 'ingest', 'merge', ['id'], '2026-09-01T00:00:04Z', 'timestamp', 4)`);
+      await tx.exec(row, ["events", later(1), partial, 2, 1]);
+      await tx.exec(row, ["events", later(2), partial, 2, 1]);
+      await tx.exec(row, ["events", later(3), ended, 2, 1]);
+      await tx.exec(row, ["events", later(4), ended, 2, 1]);
+      await tx.exec(row, ["events", later(5), whole, 4, 1]);
+    }, { runId: "seed" });
+    const r = await reconcile({ db, warehouse: w });
+    expect(r.recovered).toHaveLength(3);
+    expect(db.getStep(partial, "events", 1)).toMatchObject({
+      status: "ok", rowsIn: 4,
+      reason: "requested (recovered: 2 commits; the extraction did not finish: 4 rows were saved, and the next run continues from ts 2026-09-01T00:00:04Z)",
+    });
+    expect(db.getStep(ended, "events", 1)!.reason).toBe("requested (recovered: 2 commits; the next run continues from ts 2026-09-01T00:00:04Z)");
+    expect(db.getStep(whole, "events", 1)!.reason).toBe("requested (recovered)");
   });
 
   test("a format-1 warehouse, whose _croft.writes has no attempt column, is matched by time alone", async () => {

@@ -3,7 +3,9 @@
 // lease with no write intent, and never ATTACHed.
 //
 //   plan       run/plan.ts, as `croft run <assets>` would plan it: the named assets, then the transforms
-//              downstream of them (the bind check's problems are on each step)
+//              downstream of them (the bind check's problems are on each step). A file renamed outside croft
+//              (ASSET_RENAMED) is never fetched from scratch: named exactly it fails before it runs, taken by a glob
+//              it is skipped with the problem, and so is what needs it; next names the rename that adopts its table
 //   hold       .croft/preview.duckdb is opened read-write (no write intent) for the whole preview, so two previews,
 //              or a preview and `croft query --preview`, take turns; the last preview's file and .croft/preview/
 //              are emptied first
@@ -65,7 +67,7 @@ import type { Project } from "../project/root.ts";
 import { isoMicros, wouldShrink } from "../safety/guards.ts";
 import { windowOf } from "./dry-run.ts";
 import { croftError, runIngest, StepProgress } from "./ingest.ts";
-import { cursorTypesOf, loadErrors, type PlannedStep, planRun, readMirror, type RunPlan } from "./plan.ts";
+import { cursorTypesOf, loadErrors, type PlannedStep, planRun, readMirror, type RunPlan, skipProblem } from "./plan.ts";
 import { withProjectChecks } from "./runner.ts";
 import { snapshotTable } from "./snapshot.ts";
 import { runSqlStep } from "./sql.ts";
@@ -410,6 +412,13 @@ class Engine {
     const entry: Entry = { step, named: isNamed, mode, state: "skipped", partial: false, asset: emptyAsset(step) };
     this.entries.set(name, entry);
     if (this.i.signal?.aborted) return this.skip(entry, "the preview was interrupted before it reached this asset");
+    // A file renamed outside croft, or what needs it, taken by a glob: never built from scratch, as in a run (plan.ts).
+    // Named exactly, its ASSET_RENAMED fails it below, like any static error.
+    if (step.renamed && step.action === "skip") {
+      const why = skipProblem(step);
+      if (why) this.problems.push(why);
+      return this.skip(entry, step.reason);
+    }
 
     // Inputs: built here, or read from the live snapshot (so is a downstream asset the preview only listed).
     const reads = readsOf(step);
@@ -717,6 +726,11 @@ class Engine {
     this.approve([...this.entries.values()].filter((e) => e.state === "built" && e.asset.status === "ok"));
     const apply = ok.length === namedEntries.length && ok.length > 0 ? ok.map((e) => e.step.asset) : [];
     const next: PreviewOutcome["next"] = [];
+    // A file renamed outside croft: the rename adopts its table (§6: no confirmation), then it previews from there.
+    for (const p of this.problems) {
+      const fix = p.code === "ASSET_RENAMED" && p.fix?.kind === "command" ? p.fix : null;
+      if (fix && !next.some((n) => n.command === fix.command)) next.push({ command: fix.command, reason: fix.description });
+    }
     const retry = namedEntries.filter((e) => e.state === "failed" || (e.state === "built" && e.asset.status === "failed"));
     if (retry.length) {
       next.push({ command: `croft preview ${namedEntries.map((e) => e.step.asset).join(" ")}${this.i.rebuild ? " --rebuild" : ""}`, reason: "preview again after the fix" });

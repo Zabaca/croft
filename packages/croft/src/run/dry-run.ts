@@ -13,7 +13,15 @@
 //                   rows to count yet: the step's reason says the run may ask, since they are unknown until then.
 //                   --rebuild of an ingest or an incremental TS transform (run/rebuild.ts): the rows that would go to
 //                   the trash, and for a paid transform every input row it would process again. A rebuild that
-//                   trashes is destructive, so the run it describes is never in next
+//                   trashes is destructive, so the run it describes is never in next.
+//                   An ingest whose code changed how its rows are written or typed (§6 "Behavior changes", "Pin
+//                   changes"; run/plan.ts pendingBehavior, pendingPins, from the mirror): a changed key, write mode
+//                   or cursor field fails the step before it runs (INGEST_CONFIG_CHANGED, as the run's settleConfig);
+//                   a key added to an append ingest (convert_key) or a pin that differs from the stored type
+//                   (pin_change) is the question the run asks before it fetches when stored rows would go or change,
+//                   with the rows at stake. `croft run <ingest>` only asks, so it stays in next
+//   renamed         a file renamed outside croft (ASSET_RENAMED, run/plan.ts): named, it would fail before it runs;
+//                   otherwise it is skipped with the problem. next leads with `croft rename <old> <new>`
 //   skips           an asset downstream of one that would fail before it runs (a static error) is skipped, as
 //                   the runner skips it; --from skips every transform, and in a bare run or a glob the ingests
 //                   it does not apply to; and a transform whose input was never built and is not built by the
@@ -31,12 +39,17 @@ import type { CursorType, DryRunConfirmation, DryRunData, DryRunStep, DryRunWind
 import { allCatalog, type CatalogAsset } from "../history/catalog.ts";
 import { listLeases } from "../history/leases.ts";
 import { RUNS_DB_FILE, RunsDb } from "../history/runs-db.ts";
+import { changeCommand } from "../load/config-change.ts";
 import { effectiveLookbackMs, renderSince } from "../load/cursor.ts";
 import { lookbackWords, selectorWords } from "../project/resolve.ts";
 import type { Project } from "../project/root.ts";
 import { cursorTypeOfPin } from "../project/ts-asset.ts";
+import { plannedTrashPath } from "../safety/trash.ts";
 import { croftError, fromSince, shrinkImpact } from "./ingest.ts";
-import { buildFirst, cursorTypesOf, FROM_ONLY_MERGE, inputNotBuilt, loadErrors, type PlannedStep, planRun, rebuildCommand, type RunPlan } from "./plan.ts";
+import {
+  type BehaviorSide, buildFirst, cursorTypesOf, FROM_ONLY_MERGE, loadErrors, pendingBehavior, pendingPins, type PlannedStep, planRun, rebuildCommand,
+  type RunPlan, skipProblem,
+} from "./plan.ts";
 import { rebuildImpact, rebuildKindOf, rebuildTrashes, rebuildWords } from "./rebuild.ts";
 import { checkRunFlags, shrinkCommand, withProjectChecks } from "./runner.ts";
 import { DEFAULT_CONFIRM_ABOVE, REPROCESS_ACTION } from "./transform.ts";
@@ -143,14 +156,23 @@ export async function dryRun(i: DryRunInput): Promise<DryRunOutcome> {
       reason: step.reason.replace(/^requested; /, ""), behavior: step.behavior, problems: errors,
     };
     if (step.action !== "skip") problems.push(...step.problems.map((p) => ({ ...p, asset: p.asset ?? step.asset })));
-    // Skipped for an input that will not exist: that is the news, with the run that builds the input.
-    const unbuilt = inputNotBuilt(step);
-    if (unbuilt) {
-      problems.push({ ...unbuilt, asset: unbuilt.asset ?? step.asset });
-      const build = buildFirst(unbuilt);
+    // Skipped for an input that will not exist, or as a file renamed outside croft: that is the news, with the run
+    // that builds the input, or the rename that adopts the table (nextOf).
+    const why = skipProblem(step);
+    if (why) {
+      problems.push({ ...why, asset: why.asset ?? step.asset });
+      const build = why.code === "INPUT_NOT_BUILT" ? buildFirst(why) : null;
       if (build && !builds.some((b) => b.command === build.command)) builds.push(build);
     }
     const ingest = step.kind === "rows" || step.kind === "file";
+    // A changed key, write mode or cursor field (§6 "Behavior changes"), as the catalog mirror shows it: the run
+    // settles it before it fetches, so it comes before the window. It fails the step, or the run asks to convert in
+    // place (confirmationOf); a rebuild has none to settle.
+    const behavior = ingest && step.action !== "skip" && errors.length === 0 && !step.rebuild ? pendingBehavior(sideOf(step), entry) : null;
+    if (behavior) {
+      problems.push(behavior.problem);
+      if (!behavior.convertible) out.problems = [behavior.problem];
+    }
 
     // An input that would fail or be skipped: the runner skips this step too.
     const stopped = step.inputs.find((x) => blocked.has(x));
@@ -160,7 +182,7 @@ export async function dryRun(i: DryRunInput): Promise<DryRunOutcome> {
     }
     if (step.action === "skip") out.skippedBecause = step.reason;
 
-    if (out.action !== "skip" && errors.length === 0 && ingest) {
+    if (out.action !== "skip" && out.problems.length === 0 && ingest) {
       try {
         // A rebuild fetches from scratch: no saved position, so no window.
         const window = step.rebuild ? null : windowOf(step, entry, { timezone: project.timezone, now, ...(i.from !== undefined ? { from: i.from } : {}) });
@@ -204,10 +226,16 @@ export async function dryRun(i: DryRunInput): Promise<DryRunOutcome> {
     steps.push(out);
   }
 
+  // A file renamed outside croft: the rename that adopts its table (§6: it needs no confirmation) comes first.
+  const renames: Next[] = [];
+  for (const p of problems) {
+    const fix = p.code === "ASSET_RENAMED" && p.fix?.kind === "command" ? p.fix : null;
+    if (fix && !renames.some((n) => n.command === fix.command)) renames.push({ command: fix.command, reason: fix.description });
+  }
   return {
     data: { dryRun: true, order: [...plan.order], steps },
     problems: dedupe(problems),
-    next: nextOf(steps, i, { builds, mayAsk }),
+    next: [...renames, ...nextOf(steps, i, { builds, mayAsk })],
     exit: plan.problems.some((p) => p.severity === "error") ? 2 : 0,
   };
 }
@@ -307,6 +335,10 @@ function confirmationOf(step: PlannedStep, entry: CatalogAsset | null, c: Confir
     if (paid?.unknown.length) return { until: paid.unknown, rows: paid.rows, limit };
     return null;
   }
+  // A key added to an append ingest, or a pin that differs from the stored type (§6): the run counts the stored rows
+  // first, and asks (the table to the trash first) only when some would go or change. It asks before anything else.
+  const change = changeConfirmation(step, entry, c.project.paths.stateDir);
+  if (change) return { confirmation: change };
   // --allow-shrink names exactly one replace ingest (checkRunFlags); allowShrink: true in its code needs no token.
   if (c.allowShrink && c.selectors[0] === step.asset && (step.kind === "rows" || step.kind === "file") && step.write === "replace"
     && step.spec?.allowShrink !== true && entry && entry.rows > 0) {
@@ -322,6 +354,31 @@ function confirmationOf(step: PlannedStep, entry: CatalogAsset | null, c: Confir
     if (pending.unknown.length) return { until: pending.unknown, rows: pending.rows, limit };
   }
   return null;
+}
+
+/** A planned ingest as the mirror-side checks of a code change take it (plan.ts pendingBehavior, pendingPins). */
+function sideOf(step: PlannedStep): BehaviorSide {
+  return { ...step, ...(step.spec?.pins ? { pins: step.spec.pins } : {}) };
+}
+
+/**
+ * The convert_key or pin_change question a run of this ingest would ask before it fetches (load/config-change.ts
+ * settleConfig), from the catalog mirror: a key added to an append ingest, or a pin that differs from the stored
+ * type. The mirror cannot count the rows that repeat a key or the values a pin changes, so this says what is at stake
+ * (the table goes to the trash first) and the run asks only when some would go or change. One question for both,
+ * as the run asks one. The impact's action is the run's.
+ */
+function changeConfirmation(step: PlannedStep, entry: CatalogAsset | null, stateDir: string): DryRunConfirmation | null {
+  if ((step.kind !== "rows" && step.kind !== "file") || step.rebuild || !entry) return null;
+  const side = sideOf(step);
+  const behavior = pendingBehavior(side, entry);
+  const convert = behavior?.convertible ? behavior.change.to.key : null;
+  const pins = pendingPins(side, entry);
+  if (!convert && pins.length === 0) return null;
+  const actions = [...(convert ? [`append ingest gains key ${convert.join(", ")}; duplicates removed in place`] : []),
+    ...pins.map((p) => `pin change: ${p.column} ${p.from} → ${p.to}`)];
+  const impact: Impact = { asset: step.asset, action: actions.join("; "), rows: entry.rows, trashPath: plannedTrashPath(stateDir, step.asset), downstream: [...step.readBy] };
+  return { action: convert ? "convert_key" : "pin_change", command: changeCommand(step.asset), impact };
 }
 
 /**
@@ -433,6 +490,8 @@ export function confirmationWords(c: DryRunConfirmation): string {
     const then = rebuildWords(rebuildKindOf(c.impact), c.impact.estimatedRequests !== undefined ? { estimatedRequests: c.impact.estimatedRequests } : {});
     return `needs confirmation: ${c.impact.rows > 0 ? `its ${n} rows go to the trash first, then ${then}` : then}`;
   }
+  if (c.action === "convert_key") return `needs confirmation if stored rows repeat a key: its ${n} rows go to the trash first (${c.impact.action})`;
+  if (c.action === "pin_change") return `needs confirmation if the pin would change stored values: its ${n} rows go to the trash first (${c.impact.action})`;
   return `needs confirmation: about ${n} input rows to process, and its code makes requests for them (LARGE_REPROCESS)`;
 }
 

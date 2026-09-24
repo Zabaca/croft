@@ -24,7 +24,12 @@
 //                   destructive command: that is only named in the skip)
 //   --rebuild       a named ingest or incremental TS transform first goes through run/rebuild.ts, once per run:
 //                   confirmation (the cost guard's rows included), trash, reset; then the step runs as the asset's
-//                   first build. An SQL or full-refresh TS transform just runs
+//                   first build. An SQL or full-refresh TS transform just runs. A step that fails after the reset
+//                   says in its hint that the asset is never built (or holds what its rebuild saved so far), that
+//                   a plain run builds it again, and that `croft restore <asset>` brings the previous table back:
+//                   the restore asks first, so it is never in next (afterReset)
+//   renamed         a file renamed outside croft (ASSET_RENAMED, plan.ts) never runs: named, its step fails before
+//                   it runs; otherwise it is skipped with the problem. next leads with `croft rename <old> <new>`
 //   retries         2 by default, after 30 s and 2 min (or the server's longer Retry-After, up to 5 min), for
 //                   retryable errors only
 //   no progress     no row yielded and no request completed for `timeout` (10 min) → TIMEOUT
@@ -80,7 +85,7 @@ import {
   croftError, fromSince, isRetryable, type ProgressSnapshot, runIngest, savedCursors, SHRINK_ACTION, shrinkCommand, StepProgress,
 } from "./ingest.ts";
 import { unknownInputs } from "./inputs.ts";
-import { backfillUnsupported, buildFirst, inputNotBuilt, isGlob, loadErrors, planRun, type PlannedStep, rebuildSelectors, type RunPlan } from "./plan.ts";
+import { backfillUnsupported, buildFirst, isGlob, loadErrors, planRun, type PlannedStep, rebuildSelectors, type RunPlan, skipProblem } from "./plan.ts";
 import { rebuildQuestion, Rebuilds, rebuildTrashes } from "./rebuild.ts";
 import { runSqlStep } from "./sql.ts";
 import { staleReasons } from "./staleness.ts";
@@ -456,12 +461,16 @@ function nextSteps(steps: StepResult[], problems: Problem[], deferred: ReadonlyM
   for (const p of problems) {
     const build = p.code === "INPUT_NOT_BUILT" && Array.isArray(p.details?.inputs) ? buildFirst(p) : null;
     if (build && !next.some((n) => n.command === build.command)) next.push(build);
+    // A file renamed outside croft: the rename adopts its table (§6: a rename needs no confirmation).
+    const fix = p.code === "ASSET_RENAMED" && p.fix?.kind === "command" ? p.fix : null;
+    if (fix && !next.some((n) => n.command === fix.command)) next.push({ command: fix.command, reason: fix.description });
   }
   const busy = problems.find((p) => p.code === "ASSET_BUSY");
   if (busy?.runId) next.push({ command: `croft wait ${busy.runId} --timeout 100s`, reason: `${busy.asset ?? "an asset"} is held by that run` });
   for (const s of steps) {
     if (s.status !== "failed" || !s.error) continue;
-    if (s.error.code === "INTERRUPTED") continue;
+    // Interrupted: nothing to read. Renamed: it failed before it ran, and its fix is in next already.
+    if (s.error.code === "INTERRUPTED" || s.error.code === "ASSET_RENAMED") continue;
     next.push({ command: `croft logs ${s.asset} --failed`, reason: `see why ${s.asset} failed` });
     if (isRetryable(s.error)) {
       next.push({
@@ -495,6 +504,22 @@ const HOLD_WORDS: Record<Hold, string> = {
 
 /** The reasons a planner gives only because the asset looked stale; the runner re-checks them. */
 const STALENESS: ReadonlySet<Reason> = new Set<Reason>(["never_built", "code_changed", "input_changed", "input_replaced"]);
+
+/**
+ * A --rebuild that failed after its reset (run/rebuild.ts): the table was dropped, its previous version is in the
+ * trash, and the step's error says both ways on in its hint: a plain run builds the asset again (a cursor ingest or a
+ * chunked transform continues from what it saved since the reset), or `croft restore` brings the previous table back.
+ * The restore replaces a table and asks first, so it is named in the hint, never in next (§4.3).
+ */
+function afterReset(p: Problem, step: PlannedStep, trashed: { path: string; rows: number } | null, now: CatalogAsset | null): void {
+  const asset = step.asset;
+  const again = step.kind === "file" ? "loads every file again" : step.kind === "rows" ? "fetches it again" : "builds it again";
+  const state = now ? `${asset} holds the ${now.rows.toLocaleString("en-US")} row${now.rows === 1 ? "" : "s"} its rebuild saved so far: croft run ${asset} continues it`
+    : `${asset} is never built now: croft run ${asset} ${again}`;
+  const back = trashed ? `, or croft restore ${asset} brings the previous table back (it asks first)` : "";
+  p.hint = `${p.hint ? `${p.hint}; ` : ""}${state}${back}`;
+  p.details = { ...p.details, rebuild: { reset: true, ...(trashed ? { trashPath: trashed.path, trashedRows: trashed.rows } : {}) } };
+}
 
 /** A stamp no row carries: warnings of a write that changed no row look at no rows (only whole-table ones run). */
 const NO_ROWS_STAMP = "1970-01-01T00:00:00.000000Z";
@@ -818,6 +843,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
           const reset = rebuilds.effect(asset);
           if (reset) p.effect = p.effect ? `${reset}; ${p.effect}` : reset;
           const trashed = rebuilds.trashed(asset);
+          if (reset) afterReset(p, step, trashed, getCatalog(runs, asset));
           runs.finishStep(runId, asset, attempt, { status: interrupted ? "interrupted" : "failed", error: redactValue(jsonSafe(p), env) });
           log.write(`${p.code}: ${p.message}${p.hint ? `\nhint: ${p.hint}` : ""}`);
           const result: StepResult = {
@@ -915,10 +941,10 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
         const idle = fromSkip(step) ?? (step.action === "skip" ? step.reason : undefined);
         if (idle !== undefined) {
           skipped(step, idle);
-          // Skipped for an input that will not exist: the run says so, with the run that builds the input (as the
-          // dry run does).
-          const unbuilt = fromSkip(step) === undefined ? inputNotBuilt(step) : undefined;
-          if (unbuilt) problems.push({ ...unbuilt, asset: unbuilt.asset ?? asset, runId });
+          // Skipped for an input that will not exist, or as a file renamed outside croft: the run says so, with the
+          // run that builds the input or the rename that adopts the table (as the dry run does).
+          const why = fromSkip(step) === undefined ? skipProblem(step) : undefined;
+          if (why) problems.push({ ...why, asset: why.asset ?? asset, runId });
           return null;
         }
         // A held step runs nothing, even when its code does not load (the scheduler met an edit in progress): the
