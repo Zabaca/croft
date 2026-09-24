@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { cleanupProjects, makeProject } from "../run/testkit.ts";
-import { type ResolvedAsset, resolveProject, sniffKind, stepKindOf } from "./resolve.ts";
+import { bindProject, type ResolvedAsset, resolveProject, sniffKind, stepKindOf } from "./resolve.ts";
 
 afterAll(() => cleanupProjects());
 
@@ -60,6 +60,7 @@ describe("resolveProject", () => {
     expect(a.issue_triage).toMatchObject({
       kind: "ts", ok: true, inputs: ["open_issues"], orderAfter: ["open_issues", "priorities"], write: "merge",
       incremental: { kind: "new-rows", inputs: ["open_issues"] }, confirmAbove: 50, usesHttp: false,
+      words: "updates rows by id; processes new and changed input rows once",
     });
     expect(a.issue_triage!.codeHash).toMatch(/^[0-9a-f]+$/);
     expect(stepKindOf(a.issue_triage!)).toBe("transform");
@@ -137,6 +138,46 @@ export default ingest({ async *rows() {} });
     expect((await resolveProject({ root, timezone: "UTC" })).problems.map((p) => p.code)).toEqual(["NAME_RESERVED"]);
     expect((await resolveProject({ root, timezone: "UTC", selectors: ["fine"] })).problems).toEqual([]);
     expect((await resolveProject({ root, timezone: "UTC", selectors: ["*"] })).problems.map((p) => p.code)).toEqual(["NAME_RESERVED"]);
+  });
+});
+
+describe("bindProject", () => {
+  const ISSUES = [
+    { name: "id", type: "BIGINT" }, { name: "title", type: "VARCHAR" }, { name: "state", type: "VARCHAR" },
+    { name: "closed_at", type: "TIMESTAMPTZ", pending: true }, { name: "_loaded_at", type: "TIMESTAMPTZ" },
+  ];
+
+  test("binds every SQL asset in run order against the mirror's columns and the output of the SQL before it", async () => {
+    const root = makeProject({
+      ...PROJECT,
+      "assets/wide.sql": "SELECT id, title, 1 AS extra FROM open_issues\n",
+      "assets/narrow.sql": "SELECT extra FROM wide\n",
+    });
+    const r = await resolveProject({ root, timezone: "UTC" });
+    const columns = (a: string) => (a === "github_issues" ? ISSUES : a === "wide" ? [{ name: "id", type: "BIGINT" }] : null);
+    const b = await bindProject(r, { timezone: "UTC", columns });
+    expect(b.results.get("open_issues")).toMatchObject({ outputColumns: [{ name: "id", type: "BIGINT" }, { name: "title", type: "VARCHAR" }], problems: [], planInputs: ["github_issues"] });
+    expect(b.results.get("priorities")!.outputColumns).toEqual([{ name: "p", type: "INTEGER" }]);
+    // wide is rebuilt first, so narrow binds against its new output, not the table the mirror describes.
+    expect(b.results.get("narrow")).toMatchObject({ outputColumns: [{ name: "extra", type: "INTEGER" }], problems: [] });
+    expect(b.inputs.get("narrow")).toEqual(["wide"]);
+    expect(b.graph.order).toEqual(["github_issues", "open_issues", "priorities", "issue_triage", "wide", "narrow"]);
+    expect(b.problems).toEqual([]);
+
+    // When wide is not rebuilt, narrow reads the table as it is.
+    const kept = await bindProject(r, { timezone: "UTC", columns, rebuilt: (a) => a !== "wide" });
+    expect(kept.results.get("narrow")!.problems.map((p) => p.code)).toEqual(["UNKNOWN_COLUMN"]);
+    expect(kept.results.get("narrow")!.problems[0]).toMatchObject({ file: "assets/narrow.sql", line: 1 });
+  });
+
+  test("an input with no columns yet is INPUT_NOT_BUILT; a pending column is passed on (NULL_ONLY_COLUMN)", async () => {
+    const root = makeProject({ ...PROJECT, "assets/closed.sql": "SELECT id, closed_at + 1 AS later FROM github_issues\n" });
+    const r = await resolveProject({ root, timezone: "UTC" });
+    const none = await bindProject(r, { timezone: "UTC", columns: () => null });
+    expect(none.results.get("open_issues")!.problems.map((p) => p.code)).toEqual(["INPUT_NOT_BUILT"]);
+    expect(none.results.get("open_issues")!.outputColumns).toBeNull();
+    const pending = await bindProject(r, { timezone: "UTC", columns: (a) => (a === "github_issues" ? ISSUES : null) });
+    expect(pending.results.get("closed")!.problems.map((p) => p.code)).toEqual(["NULL_ONLY_COLUMN"]);
   });
 });
 

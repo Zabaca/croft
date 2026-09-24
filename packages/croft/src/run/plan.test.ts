@@ -1,7 +1,14 @@
 import { afterAll, describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Incremental } from "../core/types.ts";
-import { backfillUnsupported, behaviorHash, behaviorLabel, behaviorWords, fileDirsOf, isGlob, planRun, resolveWrite, selectAssets } from "./plan.ts";
+import { type CatalogAsset, type CatalogColumn, putCatalog } from "../history/catalog.ts";
+import { RunsDb } from "../history/runs-db.ts";
+import {
+  backfillUnsupported, behaviorHash, behaviorLabel, behaviorWords, FROM_ONLY_MERGE, fileDirsOf, isGlob, loadErrors, type PlannedStep,
+  planRun, type RunPlan, resolveWrite, selectAssets, staleViewOf,
+} from "./plan.ts";
+import { staleReasons } from "./staleness.ts";
 import { cleanupProjects, makeProject } from "./testkit.ts";
 
 afterAll(() => cleanupProjects());
@@ -58,6 +65,10 @@ describe("behavior", () => {
       .toBe("updates rows by id; fetches created newer than the saved position, re-reading the last 30 days (created is epoch seconds)");
     expect(behaviorWords("replace", [], none)).toBe("replaces the table's contents; unchanged rows keep their _loaded_at");
     expect(behaviorWords("merge", ["order_id"], { kind: "files" })).toBe("updates rows by order_id; loads new and changed files only; rows of deleted files are kept");
+    // An incremental TS transform (newRows()): each input row once, again when it changes (§3e).
+    expect(behaviorWords("merge", ["issue_id"], { kind: "new-rows", inputs: ["github_issues"] }))
+      .toBe("updates rows by issue_id; processes new and changed input rows once");
+    expect(behaviorWords("append", [], { kind: "new-rows", inputs: ["events"] })).toBe("adds the new rows; processes new and changed input rows once");
   });
 
   test("the behavior hash changes with write, key and cursor field, not with the lookback", () => {
@@ -75,24 +86,227 @@ describe("behavior", () => {
   });
 });
 
-describe("planRun", () => {
-  test("ingests fetch; transforms skip with a note; file ingest dirs outside files/ reach the sandbox", async () => {
+// ---------------------------------------------------------------------------------------------------------
+// The phase-2 planner
+
+const INGEST = `import { ingest } from "@zabaca/croft";
+export default ingest({ key: "id", incremental: "updated_at", async *rows() {} });
+`;
+const TRIAGE = `import { transform } from "@zabaca/croft";
+export default transform({ inputs: ["open_issues"], key: "id", incremental: true, async *rows() {} });
+`;
+/** api → open_issues (SQL) → triage (incremental TS); consts (SQL) reads nothing. */
+const PROJECT = {
+  "assets/api.ts": INGEST,
+  "assets/open_issues.sql": "-- key: id\nSELECT id, title FROM api WHERE state = 'open'\n",
+  "assets/triage.ts": TRIAGE,
+  "assets/consts.sql": "SELECT 1 AS x\n",
+};
+
+const T1 = "2026-09-22T17:00:00.000000Z";
+const T2 = "2026-09-22T18:00:00.000000Z";
+const col = (name: string, type: string, pending = false): CatalogColumn => ({ name, type, sourceName: name, pinned: false, pending, format: null });
+const API_COLUMNS = [col("id", "BIGINT"), col("title", "VARCHAR"), col("state", "VARCHAR"), col("updated_at", "TIMESTAMPTZ"), col("_loaded_at", "TIMESTAMPTZ")];
+
+function entry(asset: string, o: Partial<CatalogAsset> = {}): CatalogAsset {
+  return {
+    asset, kind: "ingest", behavior: "", write: "replace", key: [], rows: 10, columns: [], cursor: null,
+    lastLoadedAt: T1, lastReplacedAt: null, lastRunId: "r_0922_1000_aaaa", codeHash: null, ...o,
+  };
+}
+
+const by = (plan: RunPlan) => Object.fromEntries(plan.steps.map((s) => [s.asset, s])) as Record<string, PlannedStep>;
+const codes = (s: PlannedStep | undefined) => (s?.problems ?? []).map((p) => p.code);
+
+/** Every asset built once, in the state the plan's own code hashes give: nothing is stale. */
+async function builtCatalog(root: string): Promise<CatalogAsset[]> {
+  const fresh = by(await planRun({ root, timezone: "America/Los_Angeles", selectors: [], catalog: [] }));
+  return [
+    entry("api", { kind: "ingest", write: "merge", key: ["id"], columns: API_COLUMNS, codeHash: fresh.api!.codeHash ?? null }),
+    entry("consts", { kind: "sql", codeHash: fresh.consts!.codeHash!, columns: [col("x", "INTEGER"), col("_loaded_at", "TIMESTAMPTZ")] }),
+    entry("open_issues", {
+      kind: "sql", key: ["id"], codeHash: fresh.open_issues!.codeHash!, columns: [col("id", "BIGINT"), col("title", "VARCHAR"), col("_loaded_at", "TIMESTAMPTZ")],
+      inputsSeen: { api: { seenLoadedAt: T1, seenKey: null, inputLastLoadedAt: T1 } },
+    }),
+    entry("triage", {
+      kind: "ts", write: "merge", key: ["id"], codeHash: fresh.triage!.codeHash!,
+      inputsSeen: { open_issues: { seenLoadedAt: T1, seenKey: [5], inputLastLoadedAt: T1 } },
+    }),
+  ];
+}
+
+function withEntry(catalog: CatalogAsset[], asset: string, o: Partial<CatalogAsset>): CatalogAsset[] {
+  return catalog.map((c) => (c.asset === asset ? { ...c, ...o } : c));
+}
+
+describe("planRun: what a run takes", () => {
+  test("a new project: every ingest fetches, every transform is never built; steps come in run order, ready to run", async () => {
     const root = makeProject({
-      "assets/api.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ key: "id", incremental: "updated_at", async *rows() {} });\n`,
+      ...PROJECT,
       "assets/sales.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ file: "exports/*.csv", incremental: true, key: "order_id" });\n`,
-      "assets/local.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ file: "files/a.csv" });\n`,
-      "assets/triage.ts": `import { transform } from "@zabaca/croft";\nexport default transform({ inputs: ["api"], async *rows() {} });\n`,
-      "assets/report.sql": "select 1 as x\n",
     });
-    const plan = await planRun({ root, timezone: "UTC", selectors: [] });
-    const by = Object.fromEntries(plan.steps.map((s) => [s.asset, s]));
-    expect(Object.keys(by)).toEqual(["api", "local", "report", "sales", "triage"]);
-    expect(by.api).toMatchObject({ kind: "rows", action: "fetch", write: "merge", behavior: "merge by id", retries: 2, timeoutMs: 600_000 });
-    expect(by.sales).toMatchObject({ kind: "file", action: "fetch", write: "merge" });
-    expect(by.triage).toMatchObject({ kind: "transform", action: "skip" });
-    expect(by.report).toMatchObject({ kind: "sql", action: "skip" });
-    expect(by.api!.codeHash).toMatch(/^[0-9a-f]+$/);
+    const plan = await planRun({ root, timezone: "America/Los_Angeles", selectors: [], catalog: [] });
+    expect(plan.order).toEqual(["api", "consts", "open_issues", "sales", "triage"]);
+    expect(plan.steps.map((s) => s.asset)).toEqual(plan.order);
+    expect(plan.problems).toEqual([]);
+    const s = by(plan);
+    expect(s.api).toMatchObject({ kind: "rows", action: "fetch", reasons: ["requested", "never_built"], reason: "requested", write: "merge", behavior: "merge by id", retries: 2, timeoutMs: 600_000, inputs: [], readBy: ["open_issues"] });
+    expect(s.sales).toMatchObject({ kind: "file", action: "fetch", write: "merge" });
+    expect(s.consts).toMatchObject({ kind: "sql", action: "rebuild", reasons: ["never_built"], reason: "never built", inputs: [], readBy: [] });
+    // The SQL step gets what runSqlStep needs: the loaded file, its inputs (AST ∪ plan scans), its code hash and words.
+    expect(s.open_issues).toMatchObject({
+      kind: "sql", action: "rebuild", reason: "never built", inputs: ["api"], orderAfter: ["api"], readBy: ["triage"], key: ["id"], write: "replace",
+      behavior: "replace; key id", words: "replaces the table's contents (key id, which must be unique); unchanged rows keep their _loaded_at",
+    });
+    expect(s.open_issues!.sql?.body).toContain("FROM api");
+    expect(s.open_issues!.codeHash).toBe(s.open_issues!.sql!.codeHash!);
+    expect(s.open_issues!.checks.map((c) => c.source)).toEqual(["unique(id)", "not_null(id)"]);
+    expect(s.open_issues!.reasons).toEqual(["never_built"]);
+    // An incremental TS transform updates; its words say it processes each input row once.
+    expect(s.triage).toMatchObject({
+      kind: "transform", action: "update", inputs: ["open_issues"], readBy: [], usesHttp: false,
+      words: "updates rows by id; processes new and changed input rows once",
+    });
+    expect(s.triage!.spec?.role).toBe("transform");
+    expect(s.triage!.loaded?.ok).toBe(true);
+    // No step has a problem: the bind check has no columns for api yet (INPUT_NOT_BUILT is not the run's news).
+    expect(plan.steps.flatMap((x) => x.problems)).toEqual([]);
     expect(plan.fileDirs).toEqual([join(root, "exports")]);
+  });
+
+  test("a bare run takes every ingest and what is stale; fresh transforms stay out; the reasons say why", async () => {
+    const root = makeProject(PROJECT);
+    const catalog = await builtCatalog(root);
+    const plan = await planRun({ root, timezone: "America/Los_Angeles", selectors: [], catalog });
+    // consts reads nothing and nothing changed: not in the run. The rest follow api, which always fetches.
+    expect(plan.order).toEqual(["api", "open_issues", "triage"]);
+    const s = by(plan);
+    expect(s.api).toMatchObject({ action: "fetch", reasons: ["requested"], reason: "requested" });
+    expect(s.open_issues).toMatchObject({ action: "rebuild", reasons: ["input_changed"], reason: "input api may have new rows" });
+    expect(s.triage).toMatchObject({ action: "update", reasons: ["input_changed"], reason: "input open_issues may have new rows (TS code unchanged)" });
+
+    // Edited SQL is stale on its own: code_changed.
+    const edited = await planRun({ root, timezone: "America/Los_Angeles", selectors: [], catalog: withEntry(catalog, "consts", { codeHash: "old" }) });
+    expect(by(edited).consts).toMatchObject({ action: "rebuild", reasons: ["code_changed"], reason: "SQL changed (assets/consts.sql)" });
+    // An input with rows the transform has not read, and one replaced (restored, or changed outside croft).
+    const moved = withEntry(withEntry(catalog, "api", { lastLoadedAt: T2 }), "open_issues", { lastReplacedAt: T2, lastLoadedAt: T1 });
+    const later = by(await planRun({ root, timezone: "America/Los_Angeles", selectors: ["open_issues", "triage"], catalog: moved, only: true }));
+    expect(later.open_issues).toMatchObject({ reasons: ["requested", "input_changed"], reason: "requested; input api has new rows" });
+    expect(later.triage!.reasons).toEqual(["requested", "input_replaced", "input_changed"]);
+    expect(later.triage!.reason).toBe("requested; input open_issues was replaced (restored, or changed outside croft); input open_issues may have new rows (TS code unchanged)");
+  });
+
+  test("named assets run whatever their staleness, then their stale downstream; --only stops there; --upstream adds stale inputs", async () => {
+    const root = makeProject(PROJECT);
+    const catalog = await builtCatalog(root);
+    const plan = (selectors: string[], o: { only?: boolean; upstream?: boolean; catalog?: CatalogAsset[] } = {}) =>
+      planRun({ root, timezone: "America/Los_Angeles", selectors, catalog: o.catalog ?? catalog, ...o });
+
+    const consts = await plan(["consts"]);
+    expect(consts.steps.map((s) => [s.asset, s.action, s.reason])).toEqual([["consts", "rebuild", "requested"]]);
+    expect((await plan(["api"])).order).toEqual(["api", "open_issues", "triage"]);
+    expect((await plan(["open_issues"])).order).toEqual(["open_issues", "triage"]);
+    expect((await plan(["api"], { only: true })).order).toEqual(["api"]);
+    expect((await plan(["open_*"], { only: true })).order).toEqual(["open_issues"]);
+
+    // --upstream: nothing upstream is stale, so nothing is added.
+    expect((await plan(["triage"], { upstream: true, only: true })).order).toEqual(["triage"]);
+    // open_issues has unread rows of api: it runs first. api itself is built, so it does not.
+    const staleOpen = withEntry(catalog, "api", { lastLoadedAt: T2 });
+    const up = await plan(["triage"], { upstream: true, catalog: staleOpen });
+    expect(up.order).toEqual(["open_issues", "triage"]);
+    expect(by(up).open_issues).toMatchObject({ reasons: ["input_changed"], reason: "input api has new rows" });
+    // An input never built is fetched first, and what reads it follows.
+    const noApi = catalog.filter((c) => c.asset !== "api");
+    const first = await plan(["triage"], { upstream: true, catalog: noApi });
+    expect(first.order).toEqual(["api", "open_issues", "triage"]);
+    expect(by(first).api!.reasons).toEqual(["never_built"]);
+    expect(by(first).open_issues).toMatchObject({ reasons: ["input_changed"], reason: "input api may have new rows" });
+    // A bare run with --only: every ingest and what is stale on its own, not what follows an ingest.
+    expect((await plan([], { only: true })).order).toEqual(["api"]);
+    expect((await plan([], { only: true, catalog: staleOpen })).order).toEqual(["api", "open_issues"]);
+  });
+
+  test("without a catalog it reads the mirror in runs.sqlite, and creates nothing when there is none", async () => {
+    const root = makeProject(PROJECT);
+    const bare = await planRun({ root, timezone: "America/Los_Angeles", selectors: [] });
+    expect(bare.order).toEqual(["api", "consts", "open_issues", "triage"]);
+    expect(existsSync(join(root, ".croft", "runs.sqlite"))).toBe(false);
+    const db = RunsDb.open(join(root, ".croft"));
+    try {
+      for (const e of await builtCatalog(root)) putCatalog(db, e);
+    } finally {
+      db.close();
+    }
+    expect((await planRun({ root, timezone: "America/Los_Angeles", selectors: [] })).order).toEqual(["api", "open_issues", "triage"]);
+  });
+
+  test("staleViewOf gives the runner what staleness needs to check a step again", async () => {
+    const root = makeProject(PROJECT);
+    const catalog = await builtCatalog(root);
+    const plan = await planRun({ root, timezone: "America/Los_Angeles", selectors: ["open_issues"], catalog, only: true });
+    const lookup = (c: CatalogAsset[]) => (a: string) => c.find((x) => x.asset === a) ?? null;
+    const step = plan.steps[0]!;
+    expect(staleViewOf(step, lookup(catalog))).toMatchObject({ asset: "open_issues", kind: "sql", incremental: false, inputs: ["api"], codeHash: step.codeHash });
+    expect(staleReasons(staleViewOf(step, lookup(catalog)))).toEqual([]);
+    expect(staleReasons(staleViewOf(step, lookup(withEntry(catalog, "api", { lastLoadedAt: T2 }))))).toEqual(["input_changed"]);
+  });
+});
+
+describe("planRun: static errors fail their own step", () => {
+  test("the bind check: an error fails the step when nothing before it can change its inputs' columns", async () => {
+    const root = makeProject({
+      "assets/api.ts": INGEST,
+      "assets/typo.sql": "-- key: id\nSELECT id, titel FROM api\n",
+      "assets/keyword.sql": `SELECT id, order FROM api\n`,
+      "assets/after.sql": "SELECT id FROM typo\n",
+    });
+    const catalog = [entry("api", { write: "merge", key: ["id"], columns: [...API_COLUMNS, col("order", "BIGINT")] })];
+    const named = by(await planRun({ root, timezone: "UTC", selectors: ["typo", "keyword"], catalog }));
+    expect(codes(named.typo)).toEqual(["UNKNOWN_COLUMN"]);
+    expect(named.typo!.problems[0]).toMatchObject({ severity: "error", asset: "typo", file: "assets/typo.sql", line: 2 });
+    expect(loadErrors(named.typo!)).toHaveLength(1);
+    // Quoting a keyword fixes the parse: QUOTE_IDENTIFIER replaces the loader's SQL_SYNTAX.
+    expect(codes(named.keyword)).toEqual(["QUOTE_IDENTIFIER"]);
+    // What reads a failing asset is still planned: the runner skips it when its input fails.
+    expect(named.after).toMatchObject({ action: "rebuild", problems: [] });
+
+    // In a bare run api fetches first and may bring the column: the step itself reports it if it is still missing.
+    const bare = by(await planRun({ root, timezone: "UTC", selectors: [], catalog }));
+    expect(codes(bare.typo)).toEqual([]);
+    // A keyword is wrong whatever api brings.
+    expect(codes(bare.keyword)).toEqual(["QUOTE_IDENTIFIER"]);
+  });
+
+  test("a cycle fails the assets on it, not the run; a broken transform is in a bare run even when it is not stale", async () => {
+    const root = makeProject({
+      "assets/a.sql": "SELECT * FROM b\n",
+      "assets/b.sql": "SELECT * FROM a\n",
+      "assets/api.ts": INGEST,
+      "assets/broken.ts": `import { transform } from "@zabaca/croft";\nexport default transform({ inputs: [ });\n`,
+    });
+    const plan = await planRun({ root, timezone: "UTC", selectors: [], catalog: [entry("broken", { kind: "ts" })] });
+    expect(plan.problems).toEqual([]);
+    const s = by(plan);
+    expect(codes(s.a)).toEqual(["CYCLE"]);
+    expect(s.a!.problems[0]).toMatchObject({ asset: "a", file: "assets/a.sql" });
+    expect(codes(s.b)).toEqual(["CYCLE"]);
+    expect(s.b!.problems[0]).toMatchObject({ asset: "b", file: "assets/b.sql" });
+    expect(s.api).toMatchObject({ action: "fetch", problems: [] });
+    expect(s.broken).toMatchObject({ kind: "transform", action: "rebuild", reasons: ["requested"] });
+    expect(loadErrors(s.broken!).length).toBeGreaterThan(0);
+    // The cycle's assets come last: they are out of the graph's order.
+    expect(plan.order).toEqual(["api", "broken", "a", "b"]);
+  });
+
+  test("an incremental TS transform edited since its last run carries EDITED_SINCE_LAST_RUN (forward-only)", async () => {
+    const root = makeProject(PROJECT);
+    const catalog = withEntry(await builtCatalog(root), "triage", { codeHash: "older", rows: 42 });
+    const s = by(await planRun({ root, timezone: "UTC", selectors: ["triage"], catalog }));
+    expect(s.triage!.reasons).toEqual(["requested"]);
+    expect(s.triage!.reason).toBe("requested (code edited: the new code applies to new input rows only)");
+    expect(s.triage!.problems).toMatchObject([{ code: "EDITED_SINCE_LAST_RUN", severity: "warning" }]);
+    expect(s.triage!.problems[0]!.message).toContain("42 rows were built by older code");
   });
 
   // An agent that just wrote assets/order.ts and runs `croft run order` must hear the real reason (NAME_RESERVED,
@@ -148,5 +362,24 @@ describe("the --from matrix (§8)", () => {
     expect(backfillUnsupported(step({ kind: "file" }))?.problem.hint).toContain("changed files reload automatically");
     expect(backfillUnsupported(step({ kind: "sql" }))?.problem.hint).toContain("nothing to backfill: croft run x");
     expect(backfillUnsupported(step({ kind: "transform" }))?.code).toBe("BACKFILL_UNSUPPORTED");
+  });
+
+  test("in a bare run or a glob, what --from does not apply to is skipped; what reads a backfilled ingest still runs", async () => {
+    const root = makeProject({
+      ...PROJECT,
+      "assets/zones.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ async *rows() {} });\n`,
+      "assets/zone_report.sql": "SELECT count(*) AS n FROM zones\n",
+    });
+    const catalog = await builtCatalog(root);
+    const s = by(await planRun({ root, timezone: "UTC", selectors: [], catalog: withEntry(catalog, "consts", { codeHash: "old" }), from: "-7d" }));
+    expect(s.api).toMatchObject({ action: "fetch" });
+    expect(s.zones).toMatchObject({ action: "skip", reason: FROM_ONLY_MERGE });
+    // zone_report reads only zones, which does not run; consts is stale but reads nothing.
+    expect(s.zone_report).toMatchObject({ action: "skip", reason: FROM_ONLY_MERGE });
+    expect(s.consts).toMatchObject({ action: "skip", reason: FROM_ONLY_MERGE });
+    expect(s.open_issues).toMatchObject({ action: "rebuild" });
+    expect(s.triage).toMatchObject({ action: "update" });
+    // Named exactly, nothing is skipped here: the runner refuses the command (BACKFILL_UNSUPPORTED) instead.
+    expect(by(await planRun({ root, timezone: "UTC", selectors: ["consts"], catalog, from: "-7d" })).consts!.action).toBe("rebuild");
   });
 });

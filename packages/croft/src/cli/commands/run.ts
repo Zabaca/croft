@@ -1,6 +1,9 @@
 // croft run [selector…] (DESIGN.md §4.1 "run flags", §4.3 run/wait shapes, §5 "Processes", §6 confirmation,
 // §8 backfills). Its spec (usage, options) is in commands/index.ts.
 //
+// The plan (run/plan.ts) is made here, with the catalog mirror and --only, --upstream and --from, and handed to
+// the engine; --dry-run describes it (run/dry-run.ts) and stops, in this process, without opening the warehouse.
+//
 // On a TTY (or with --foreground) the run executes in this process: SIGINT/SIGTERM interrupt it (exit 130).
 // Off a TTY it executes in a detached child (run/detach.ts); this process follows it for --follow (100 s)
 // and prints its result, or exits 6 with `croft wait <id>`. Hidden flags: --run-id and --detached (set by the
@@ -12,13 +15,15 @@
 // (safety/confirm.ts). A token the run never reached because nothing needed consent is spent when the run ends.
 import { createInterface } from "node:readline/promises";
 import { CroftError, isCode } from "../../core/errors.ts";
-import type { Problem, StepResult } from "../../core/types.ts";
+import type { DryRunData, Problem, StepResult } from "../../core/types.ts";
 import { isRunId, RunsDb } from "../../history/runs-db.ts";
+import type { Project } from "../../project/root.ts";
 import { CONFIRM_GRANT_ENV, Confirmations, grantDetached, redeemGrant } from "../../safety/confirm.ts";
-import { DEFAULT_FOLLOW_MS, followRun, parseWait, pickRunId, spawnDetachedRun } from "../../run/detach.ts";
-import { loadErrors, planRun } from "../../run/plan.ts";
-import { checkRunFlags, executeRun, type RunData, type RunEvent, type RunSummary } from "../../run/runner.ts";
-import { CHECKS_ENFORCED, CHECKS_NOT_ENFORCED, phaseStub } from "../../core/phase.ts";
+import { DEFAULT_FOLLOW_MS, followRun, parseWait, pickRunId, spawnDetachedRun, writeNotStarted } from "../../run/detach.ts";
+import { dryRun, formatDryRun, refuseToken } from "../../run/dry-run.ts";
+import { croftError } from "../../run/ingest.ts";
+import { cursorTypesOf, loadErrors, type PlannedStep, planRun, readMirror, type RunPlan } from "../../run/plan.ts";
+import { checkRunFlags, executeRun, jsonSafe, redactValue, type RunData, type RunEvent, type RunSummary } from "../../run/runner.ts";
 import type { CommandImpl, CommandResult, Ctx } from "../command.ts";
 import { dispatchOf } from "../main.ts";
 import { formatCount, formatDuration } from "../render.ts";
@@ -65,9 +70,21 @@ async function askYesNo(question: string): Promise<boolean> {
 
 export function toResult(s: RunSummary): CommandResult<RunData> {
   return {
-    data: { ...s.data, checksEnforced: CHECKS_ENFORCED }, problems: s.problems, next: s.next, exit: s.exit, ok: s.ok,
+    data: s.data, problems: s.problems, next: s.next, exit: s.exit, ok: s.ok,
     ...(s.confirmation ? { confirmation: s.confirmation } : {}),
   };
+}
+
+/** What the flags ask of the plan. */
+interface PlanFlags { selectors: readonly string[]; only: boolean; upstream: boolean; from?: string }
+
+/** The run's plan, from the catalog mirror in runs.sqlite (never the warehouse). */
+async function planFor(project: Project, f: PlanFlags): Promise<RunPlan> {
+  const catalog = readMirror(project.paths.stateDir);
+  return planRun({
+    root: project.root, timezone: project.timezone, selectors: f.selectors, catalog, cursorTypes: cursorTypesOf(catalog),
+    only: f.only, upstream: f.upstream, ...(f.from !== undefined ? { from: f.from } : {}),
+  });
 }
 
 /**
@@ -94,17 +111,20 @@ function croftFrom(p: Problem): CroftError {
   return new CroftError(isCode(code) ? code : "INTERNAL_ERROR", init);
 }
 
-export const run: CommandImpl<RunData> = {
-  async run(ctx) {
+export const run: CommandImpl<RunData | DryRunData> = {
+  async run(ctx): Promise<CommandResult<RunData | DryRunData>> {
     const v = ctx.values;
-    // PHASE 2 STUB: these flags are registered with their final specs; builder P implements them. Until then
-    // they refuse, rather than run what the flag was meant to preview or narrow.
-    if (v["dry-run"] === true) phaseStub("croft run --dry-run (run/dry-run.ts)");
-    if (v.only === true || v.upstream === true) phaseStub("croft run --only and --upstream (run/plan.ts)");
     const project = ctx.project;
     const selectors = [...ctx.positionals];
     const from = str(v.from);
     const allowShrink = v["allow-shrink"] === true;
+    const flags: PlanFlags = { selectors, only: v.only === true, upstream: v.upstream === true, ...(from !== undefined ? { from } : {}) };
+    if (v["dry-run"] === true) {
+      // Always in this process: it reads runs.sqlite and the asset files, and never waits.
+      if (dispatchOf(ctx)?.confirmToken !== undefined) refuseToken();
+      const out = await dryRun({ project, ...flags, allowShrink, now: ctx.now() });
+      return { data: out.data, problems: out.problems, next: out.next, exit: out.exit, ok: out.exit === 0 };
+    }
     const runIdFlag = str(v["run-id"]);
     const detachedChild = v.detached === true;
     const events = v.events === true;
@@ -139,11 +159,12 @@ export const run: CommandImpl<RunData> = {
       }
     }
 
+    let planned: RunPlan | undefined;
     if (!foreground) {
       // Report usage problems here, at once, rather than from a child nobody is watching.
-      const plan = await planRun({ root: project.root, timezone: project.timezone, selectors });
+      const plan = planned = await planFor(project, flags);
       checkRunFlags(plan, { selectors, ...(from !== undefined ? { from } : {}), allowShrink, ...(confirmToken !== undefined ? { confirmToken } : {}) });
-      const willRun = plan.steps.some((s) => s.action === "fetch" && loadErrors(s).length === 0);
+      const willRun = plan.steps.some((s) => s.action !== "skip" && loadErrors(s).length === 0);
       if (willRun) {
         const runId = pickRunId(project.timezone, ctx.now());
         const childArgs = args.filter((a) => a !== "--events");
@@ -160,6 +181,21 @@ export const run: CommandImpl<RunData> = {
       }
     }
 
+    // Nothing to detach for: the plan above runs here. A detached child plans again (the files may have changed
+    // meanwhile); its refusal before the run exists is recorded for the parent and `croft wait`, as the engine
+    // records its own.
+    let plan: RunPlan;
+    try {
+      plan = planned ?? await planFor(project, flags);
+    } catch (e) {
+      if (detachedChild && runIdFlag !== undefined) {
+        const err = croftError(e) ?? new CroftError("INTERNAL_ERROR", { message: String(e), hint: "report this croft bug" });
+        writeNotStarted(project.paths.stateDir, runIdFlag, redactValue(jsonSafe(err.problem), ctx.env));
+      }
+      throw e;
+    }
+    const kinds = new Map(plan.steps.map((s) => [s.asset, s.kind]));
+
     const ac = new AbortController();
     let signals = 0;
     const onSignal = (sig: NodeJS.Signals) => {
@@ -174,13 +210,13 @@ export const run: CommandImpl<RunData> = {
     try {
       const delays = retryDelays(ctx.processEnv);
       const out = await executeRun({
-        project, env: ctx.env, selectors, argv, trigger: confirmToken !== undefined ? "confirm" : "manual", human: true, interactive,
+        project, env: ctx.env, selectors, argv, trigger: confirmToken !== undefined ? "confirm" : "manual", human: true, interactive, plan,
         ...(runIdFlag ? { runId: runIdFlag } : {}), ...(from !== undefined ? { from } : {}), allowShrink,
         ...(confirmToken !== undefined ? { confirmToken } : {}),
         ...(interactive && !ctx.json ? { prompt: askYesNo } : {}),
         noWait: v["no-wait"] === true, signal: ac.signal,
         ...(events ? { onEvent: (line: string) => ctx.render.progress(line) } : interactive && !ctx.json ? { onEvent: (_line: string, e: RunEvent) => {
-          const text = progressLine(e);
+          const text = progressLine(e, kinds);
           if (text) ctx.render.progress(text);
         } } : {}),
         ...(delays ? { retryDelaysMs: delays } : {}),
@@ -194,14 +230,21 @@ export const run: CommandImpl<RunData> = {
     }
   },
   human(result, ctx) {
-    return formatRun(result.data, ctx);
+    const d = result.data;
+    return "dryRun" in d ? formatDryRun(d) : formatRun(d, ctx);
   },
 };
 
-/** What a person at a terminal sees on stderr while a run works (the result follows on stdout). */
-export function progressLine(e: RunEvent): string | null {
+const DOING: Record<PlannedStep["kind"], string> = { rows: "fetching", file: "loading files", sql: "rebuilding", transform: "running" };
+
+/** What a person at a terminal sees on stderr while a run works (the result follows on stdout). `kinds` names
+ *  what each step does (an ingest fetches, an SQL transform rebuilds); without it every step is fetching. */
+export function progressLine(e: RunEvent, kinds?: ReadonlyMap<string, PlannedStep["kind"]>): string | null {
   const assets = (v: unknown) => (Array.isArray(v) ? v.join(", ") : String(v));
-  if (e.type === "step" && e.status === "running") return `${String(e.asset)}: fetching${Number(e.attempt) > 1 ? ` (attempt ${String(e.attempt)})` : ""}…`;
+  if (e.type === "step" && e.status === "running") {
+    const doing = DOING[kinds?.get(String(e.asset)) ?? "rows"];
+    return `${String(e.asset)}: ${doing}${Number(e.attempt) > 1 ? ` (attempt ${String(e.attempt)})` : ""}…`;
+  }
   if (e.type === "retry") return `${String(e.asset)}: ${String(e.code)}; trying again at ${String(e.nextRetryAt)}`;
   if (e.type === "waiting") return `waiting for ${assets(e.assets)}: held by run ${assets(e.heldBy)}`;
   return null;
@@ -235,6 +278,10 @@ function stepLines(s: StepResult): string[] {
   const second = [`added ${formatCount(r.added)}`, `updated ${formatCount(r.updated)}`, `unchanged ${formatCount(r.unchanged)}`];
   if (r.deleted) second.push(`deleted ${formatCount(r.deleted)}`);
   second.push(`${plural(r.total, "row")} now`);
+  if (s.checks.length) {
+    const passed = s.checks.filter((c) => c.ok).length;
+    second.push(`checks ${formatCount(passed)}/${formatCount(s.checks.length)} ok`);
+  }
   if (s.cursor?.after !== undefined && s.cursor.after !== s.cursor.before) second.push(`since → ${s.cursor.after}`);
   if (s.trashed) second.push(`previous ${plural(s.trashed.rows, "row")} in the trash`);
   const lines = [head("ok", first.join(" · ")), `${pad}${second.join(" · ")}`];
@@ -265,7 +312,6 @@ export function formatRun(d: RunData, ctx?: Pick<Ctx, "render">): string {
   const updated = d.steps.filter((s) => s.status === "ok" && s.rows.added + s.rows.updated + s.rows.deleted > 0).length;
   const failed = d.steps.filter((s) => s.status === "failed").length;
   lines.push(`${d.status === "interrupted" ? "interrupted" : "done"} ${formatDuration(took)} · ${formatCount(updated)} updated · ${formatCount(failed)} failed`);
-  if (d.checksEnforced === false && d.steps.length) lines.push(CHECKS_NOT_ENFORCED);
   return lines.join("\n");
 }
 
