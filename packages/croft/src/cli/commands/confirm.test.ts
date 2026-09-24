@@ -259,6 +259,8 @@ describe("the stored command line", () => {
 
   test("confirmArgv drops croft and --json (adding --json back when confirm has it); the token is never in it", () => {
     expect(confirmArgv("croft run taxi_zones --allow-shrink", false)).toEqual(["run", "taxi_zones", "--allow-shrink"]);
+    // The cost guard's token (LARGE_REPROCESS) is for a plain run of the one transform.
+    expect(confirmArgv("croft run issue_triage", true)).toEqual(["run", "issue_triage", "--json"]);
     expect(confirmArgv("croft run x --json", true)).toEqual(["run", "x", "--json"]);
     expect(confirmArgv("croft run x -- y --json", true)).toEqual(["run", "x", "--json", "--", "y", "--json"]);
     expect(() => confirmArgv("rm -rf /", false)).toThrow("not a croft command");

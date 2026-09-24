@@ -225,6 +225,43 @@ describe("steps", () => {
     expect(db.latestStep("nothing")).toBeNull();
   });
 
+  test("lastCheckSources: the checks the asset's last ok step ran, from its run's summary; null when unknown", () => {
+    const result = (asset: string, status: StepResult["status"], checks: string[]): Partial<StepResult> =>
+      ({ asset, status, checks: checks.map((check) => ({ check, ok: true, failing: 0 })) });
+    expect(db.lastCheckSources("orders")).toBeNull();
+
+    const r1 = db.createRun({ trigger: "manual", human: true, argv: [] });
+    db.startStep({ runId: r1.id, asset: "orders", attempt: 1, reason: "requested" });
+    db.finishStep(r1.id, "orders", 1, { status: "ok" });
+    // Still running: its summary holds progress only.
+    db.setRunProgress(r1.id, { asset: "orders" });
+    expect(db.lastCheckSources("orders")).toBeNull();
+    db.finishRun(r1.id, "succeeded", { data: { runId: r1.id, steps: [result("orders", "ok", ["unique(id)", "not_null(id)"]), result("x", "ok", ["min_rows(1)"])] } });
+    expect(db.lastCheckSources("orders")).toEqual(["unique(id)", "not_null(id)"]);
+
+    // A later failed step does not count (its write rolled back); a later ok one does, even with no checks.
+    clock += 1000;
+    const r2 = db.createRun({ trigger: "manual", human: true, argv: [] });
+    db.startStep({ runId: r2.id, asset: "orders", attempt: 1, reason: "requested" });
+    db.finishStep(r2.id, "orders", 1, { status: "failed" });
+    db.finishRun(r2.id, "failed", { data: { runId: r2.id, steps: [result("orders", "failed", ["unique(id)", "amount >= 0"])] } });
+    expect(db.lastCheckSources("orders")).toEqual(["unique(id)", "not_null(id)"]);
+    clock += 1000;
+    const r3 = db.createRun({ trigger: "manual", human: true, argv: [] });
+    db.startStep({ runId: r3.id, asset: "orders", attempt: 1, reason: "requested" });
+    db.finishStep(r3.id, "orders", 1, { status: "ok" });
+    db.finishRun(r3.id, "succeeded", { data: { runId: r3.id, steps: [result("orders", "ok", [])] } });
+    expect(db.lastCheckSources("orders")).toEqual([]);
+
+    // A crashed run keeps no summary: unknown again.
+    clock += 1000;
+    const r4 = db.createRun({ trigger: "manual", human: true, argv: [] });
+    db.startStep({ runId: r4.id, asset: "orders", attempt: 1, reason: "requested" });
+    db.finishStep(r4.id, "orders", 1, { status: "ok", reason: "requested (recovered)" });
+    db.markCrashed(r4.id);
+    expect(db.lastCheckSources("orders")).toBeNull();
+  });
+
   test("danglingSteps lists running steps of ended runs only", () => {
     const live = db.createRun({ trigger: "manual", human: true, argv: [] });
     db.startStep({ runId: live.id, asset: "a", attempt: 1, reason: "requested" });

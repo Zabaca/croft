@@ -206,7 +206,7 @@ describe("reconcile", () => {
       { run_id: run.id, asset: "orders", rows_in: 200, added: 150, updated: 50 },
     ] }) });
     expect(r.recovered).toEqual([{ runId: run.id, asset: "orders", attempt: 1, commits: 2 }]);
-    expect(db.getStep(run.id, "orders", 1)).toMatchObject({ rowsIn: 700, added: 650, updated: 50 });
+    expect(db.getStep(run.id, "orders", 1)).toMatchObject({ status: "ok", reason: "schedule_due (recovered: 2 commits)", rowsIn: 700, added: 650, updated: 50 });
   });
 
   test("a busy warehouse leaves steps unresolved, still releases leases, and a later call resolves them", async () => {
