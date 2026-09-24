@@ -28,7 +28,10 @@ import { isAbsolute, sep } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { mapSandboxError, type Profile } from "../db/connect.ts";
 import { physicalPath } from "../project/root.ts";
-import { asciiLower, type AstNode, collect, location, looksLikePath, stringOf, type Use } from "./ast.ts";
+import {
+  asciiLower, type AstNode, collect, finiteJson, literal, location, looksLikePath, positional, stringOf, TABLE_ARGUMENT_FUNCTIONS, tableArguments,
+  type Use,
+} from "./ast.ts";
 
 export interface GateOptions {
   profile?: Profile;                                  // "serve" allows tables only
@@ -76,7 +79,7 @@ export const TABLE_FUNCTIONS: ReadonlyMap<string, TableFunctionKind> = new Map([
     read_ndjson_auto read_ndjson_objects read_parquet parquet_scan read_text read_blob read_duckdb glob
     sniff_csv parquet_metadata parquet_schema parquet_file_metadata parquet_kv_metadata parquet_full_metadata
     parquet_bloom_probe`),
-  ...kinds("table", "histogram histogram_values"),
+  ...kinds("table", [...TABLE_ARGUMENT_FUNCTIONS].join(" ")),
   ...kinds("hidden-sql", "query query_table json_execute_serialized_sql"),
   ...kinds("effect", `
     checkpoint force_checkpoint enable_logging disable_logging truncate_duckdb_logs enable_profiling
@@ -114,7 +117,8 @@ interface Serialized {
 
 async function serialize(conn: DuckDBConnection, sql: string): Promise<Serialized> {
   const reader = await conn.runAndReadAll("SELECT json_serialize_sql($1::VARCHAR)", [sql]);
-  return JSON.parse(String(reader.getRowsJS()[0]?.[0] ?? "{}")) as Serialized;
+  // A DOUBLE constant beyond range comes back as a bare Infinity (`SELECT 1e400`), which JSON.parse refuses.
+  return JSON.parse(finiteJson(String(reader.getRowsJS()[0]?.[0] ?? "{}"))) as Serialized;
 }
 
 function syntaxError(sql: string, s: Serialized, o: GateOptions): CroftError {
@@ -183,19 +187,6 @@ type Node = AstNode;
 const lower = asciiLower;
 const str = stringOf;
 
-/** A table function's positional arguments: named ones come as `name := v` (an alias) or `name = v`. */
-function positional(fn: Node): Node[] {
-  const children = Array.isArray(fn.children) ? (fn.children as Node[]) : [];
-  return children.filter((c) => !str(c.alias) && !(c.type === "COMPARE_EQUAL" && (c.left as Node | undefined)?.class === "COLUMN_REF"));
-}
-
-/** The string of a VARCHAR literal, or null. */
-function literal(n: Node | undefined): string | null {
-  if (n?.class !== "CONSTANT") return null;
-  const v = n.value as { type?: { id?: string }; is_null?: boolean; value?: unknown } | undefined;
-  return v && !v.is_null && (v.type?.id === "VARCHAR" || v.type?.id === "STRING_LITERAL") && typeof v.value === "string" ? v.value : null;
-}
-
 /** 'a' or ['a', 'b'] → the strings; anything computed → null. */
 function literalPaths(n: Node | undefined): string[] | null {
   const one = literal(n);
@@ -221,11 +212,10 @@ class Checker {
   }
 
   async check(stmt: SelectAst): Promise<void> {
-    const { uses, ctes } = collect(stmt);
-    for (const u of uses) {
+    for (const u of collect(stmt).uses) {
       if (u.kind === "scalar") await this.scalar(u.name, u.at);
       else if (u.kind === "table_function") await this.tableFunction(u.name, u.fn, u.at);
-      else if (u.kind === "relation") await this.relation(u, ctes);
+      else if (u.kind === "relation") await this.relation(u);
       else if (this.serve && !SHOW_LISTS.has(lower(u.name))) throw this.serveDenied(`SHOW ${u.name}`, undefined, "is not available");
     }
   }
@@ -256,15 +246,10 @@ class Checker {
         for (const p of paths) await guard.check(p, (why, hint) => this.pathDenied(why, hint, location(args[0]!) ?? at));
         return;
       }
-      case "table": {
-        const first = positional(fn)[0];
-        const text = literal(first);
-        const parts = first?.class === "COLUMN_REF" && Array.isArray(first.column_names) ? (first.column_names as unknown[]).map(str) : null;
-        if (text === null && !parts?.length) throw this.notLiteral(`${name}()`, location(first ?? fn) ?? at);
-        const [table, schema = "", catalog = ""] = text !== null ? [text] : [...parts!].reverse();
-        await this.relation({ kind: "relation", catalog, schema, name: table!, at: location(first!) ?? at }, new Set());
+      case "table":
+        // Its table, or file, comes next as a relation of its own (collect()), checked like any other.
+        if (!tableArguments(fn)) throw this.notLiteral(`${name}()`, location(positional(fn)[0] ?? fn) ?? at);
         return;
-      }
       case "hidden-sql":
         throw this.notSelect(`${name}() runs SQL or reads a table named in a string, which croft cannot check`,
           "write the SELECT, or name the table, directly in the query", at);
@@ -277,7 +262,7 @@ class Checker {
     }
   }
 
-  private async relation(u: Extract<Use, { kind: "relation" }>, ctes: Set<string>): Promise<void> {
+  private async relation(u: Extract<Use, { kind: "relation" }>): Promise<void> {
     const shown = [u.catalog, u.schema, u.name].filter(Boolean).join(".");
     if (looksLikePath(u.name)) {
       // `FROM 'files/x.csv'`: DuckDB reads the file through a replacement scan (or attaches a .duckdb file).
@@ -292,9 +277,9 @@ class Checker {
     const plain = u.catalog === "" && u.schema === "";
     const inMain = (u.catalog === "" || lower(u.catalog) === cat.current) && (u.schema === "" || lower(u.schema) === "main");
     if (inMain && cat.userTables.has(name)) return;
-    // A CTE reference; a CTE may not share a name with a built-in view, or a reference outside the CTE's
-    // scope would reach the view.
-    if (plain && ctes.has(name) && !cat.others.has(name)) return;
+    // A CTE in scope here (collect() scopes them as DuckDB does). A CTE may still not share a name with a
+    // built-in view: were the two ever to disagree about a scope, the name would reach the view.
+    if (plain && u.cte && !cat.others.has(name)) return;
     throw this.serveDenied(shown, u.at, "is not one of the project's tables; the read server reads those only");
   }
 

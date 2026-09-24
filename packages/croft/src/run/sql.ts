@@ -11,7 +11,8 @@
 //             (named apart from `next`, an asset name a TEMP table would shadow)
 //   write     load/table-batch.ts → writeBatch kind "sql": a diff like a replace ingest, so unchanged rows keep
 //             their stamps; a changed shape recreates the table; a duplicate key is CHECK_FAILED unique(key); then
-//             the blocking checks (StepInput.checks) and _croft.inputs, every input at the last_loaded_at it read
+//             the blocking checks (StepInput.checks) and _croft.inputs: every input's position at the
+//             last_loaded_at it read, and the version it read, the later of last_loaded_at and last_replaced_at
 //   after     the temp objects dropped and the catalog entry read back, in the transaction; after the commit,
 //             the catalog mirror and the non-blocking checks (checks/run.ts runWarnings, on a read lease)
 //
@@ -30,7 +31,7 @@ import { tableBatch } from "../load/table-batch.ts";
 import { type CheckHookResult, type InputPosition, writeBatch, type WriteBatchInput, type WriteResult } from "../load/write.ts";
 import { isoMicros } from "../safety/guards.ts";
 import { type AssetErrorOptions, mapAssetError } from "../sql/bind.ts";
-import { createdTable, croftError, FAIRNESS_YIELD_MS, fault } from "./ingest.ts";
+import { abortable, abortReason, createdTable, croftError, FAIRNESS_YIELD_MS, fault } from "./ingest.ts";
 import { behaviorWords, type PlannedStep } from "./plan.ts";
 import type { StepInput, StepOutcome } from "./step.ts";
 
@@ -47,6 +48,11 @@ interface InputRead {
   input: string;
   /** Its last_loaded_at (ISO-8601 UTC, microseconds); null when croft has never written a row to it. */
   lastLoadedAt: string | null;
+  /** The version read: the later of last_loaded_at and last_replaced_at, which _croft.inputs records as
+   *  input_last_loaded_at. An out-of-band change that no written row followed (a write that changed nothing but
+   *  folded the change in, doctor) moves last_replaced_at alone; staleness compares both with this, so
+   *  input_replaced clears once the step has read the input again (run/staleness.ts). */
+  version: string | null;
   rows: number;
   /** The position this asset recorded for it before (seen_loaded_at), null on the first read. */
   seenBefore: string | null;
@@ -93,7 +99,7 @@ export async function runSqlStep(i: StepInput): Promise<StepOutcome> {
         batch, target: { asset, write: "replace", key: step.key, runId },
         kind: "sql", file: step.file, ...(codeHash ? { codeHash } : {}), behaviorHash: step.behaviorHash, attempt: i.attempt,
         inputs: inputs.map((r) => ({ input: r.input, seenBefore: r.seenBefore, seenAfter: r.lastLoadedAt, rows: r.rows })),
-        positions: inputs.map((r): InputPosition => ({ input: r.input, seenLoadedAt: r.lastLoadedAt, seenKey: null, inputLastLoadedAt: r.lastLoadedAt })),
+        positions: inputs.map((r): InputPosition => ({ input: r.input, seenLoadedAt: r.lastLoadedAt, seenKey: null, inputLastLoadedAt: r.version })),
         ...(checks ? { checks } : {}), ...(i.readBy ? { readBy: i.readBy } : {}), ...(i.now ? { now: i.now() } : {}),
       });
       // An input the SQL no longer reads is no input any more: staleness must not wait for it.
@@ -149,45 +155,25 @@ function loadError(step: PlannedStep, p: Problem | undefined): CroftError {
   return new CroftError(isCode(code) ? code : "ASSET_INVALID", { ...init, asset: init.asset ?? step.asset, file: init.file ?? step.file });
 }
 
-/** The reason a signal was aborted with, when it is croft's (INTERRUPTED, TIMEOUT). */
-function abortReason(signal: AbortSignal, asset: string): CroftError {
-  return croftError(signal.reason)
-    ?? new CroftError("INTERRUPTED", { asset, message: `${asset} was interrupted`, hint: "nothing was saved from this step; run it again" });
-}
-
-/** An Sql that refuses every statement once the step is aborted, so Ctrl-C discards the transaction. */
-function abortable(sql: Sql, signal: AbortSignal, asset: string): Sql {
-  const check = () => {
-    if (signal.aborted) throw abortReason(signal, asset);
-  };
-  return {
-    all: async (text, params) => {
-      check();
-      return sql.all(text, params);
-    },
-    exec: async (text, params) => {
-      check();
-      return sql.exec(text, params);
-    },
-  };
-}
-
 const us = (v: number | bigint | null | undefined) => (v === null || v === undefined ? null : isoMicros(BigInt(v)));
 
-/** Each input's last_loaded_at and rows as this transaction sees them, and the position recorded before. */
+/** Each input's last_loaded_at, version and rows as this transaction sees them, and the position recorded
+ *  before. */
 async function readInputs(tx: Sql, asset: string, inputs: readonly string[]): Promise<InputRead[]> {
   if (inputs.length === 0) return [];
-  if (!(await hasState(tx))) return inputs.map((input) => ({ input, lastLoadedAt: null, rows: 0, seenBefore: null }));
-  const known = await tx.all<{ name: string; ll: number | bigint | null; n: number | bigint | null }>(
-    `SELECT name, epoch_us(last_loaded_at) AS ll, row_count AS n FROM _croft.assets
-     WHERE list_contains(CAST($1::JSON AS VARCHAR[]), lower(name))`, [JSON.stringify(inputs.map((n) => n.toLowerCase()))]);
+  if (!(await hasState(tx))) return inputs.map((input) => ({ input, lastLoadedAt: null, version: null, rows: 0, seenBefore: null }));
+  const known = await tx.all<{ name: string; ll: number | bigint | null; v: number | bigint | null; n: number | bigint | null }>(
+    `SELECT name, epoch_us(last_loaded_at) AS ll,
+       epoch_us(greatest(coalesce(last_loaded_at, last_replaced_at), coalesce(last_replaced_at, last_loaded_at))) AS v,
+       row_count AS n
+     FROM _croft.assets WHERE list_contains(CAST($1::JSON AS VARCHAR[]), lower(name))`, [JSON.stringify(inputs.map((n) => n.toLowerCase()))]);
   const seen = await tx.all<{ input: string; s: number | bigint | null }>(
     `SELECT input, epoch_us(seen_loaded_at) AS s FROM _croft.inputs WHERE asset = $1`, [asset]);
   const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
   return inputs.map((listed) => {
     const a = known.find((k) => same(k.name, listed));
     const input = a?.name ?? listed;
-    return { input, lastLoadedAt: us(a?.ll), rows: Number(a?.n ?? 0), seenBefore: us(seen.find((s) => same(s.input, input))?.s) };
+    return { input, lastLoadedAt: us(a?.ll), version: us(a?.v), rows: Number(a?.n ?? 0), seenBefore: us(seen.find((s) => same(s.input, input))?.s) };
   });
 }
 
@@ -294,8 +280,11 @@ async function warnings(i: StepInput, r: WriteResult): Promise<CheckHookResult> 
   i.progress.setPhase("checks");
   const asset = i.step.asset;
   try {
+    // The check sources of the asset's last ok step (this step's result is recorded after the run): a warning
+    // not among them is new or edited, and looks at the whole table this time (§3f).
+    const previous = i.runs.lastCheckSources(asset);
     return await i.warehouse.read(async (db) =>
-      runWarnings(db, { asset, table: tableRef(await currentDatabase(db), asset), loadedAt: r.loadedAt, rows: r.rows }, list),
+      runWarnings(db, { asset, table: tableRef(await currentDatabase(db), asset), loadedAt: r.loadedAt, rows: r.rows }, list, { file: i.step.file, previous }),
     { purpose: `check the warnings of ${asset}`, signal: i.signal });
   } catch (e) {
     const p = (croftError(e) ?? new CroftError("INTERNAL_ERROR", { message: e instanceof Error ? e.message : String(e), hint: "report this croft bug" })).problem;

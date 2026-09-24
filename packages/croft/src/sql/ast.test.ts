@@ -2,8 +2,10 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { DuckDBConnection } from "@duckdb/node-api";
 import { openMemory } from "../db/connect.ts";
 import {
-  catalogPrefixes, collect, finiteJson, location, NOT_VOLATILE, relationNames, VOLATILE_FUNCTIONS, VOLATILE_KEYWORDS, volatileUses, walk,
+  type AstNode, catalogPrefixes, collect, finiteJson, location, NOT_VOLATILE, relationNames, tableArguments, VOLATILE_FUNCTIONS, VOLATILE_KEYWORDS,
+  volatileUses, walk,
 } from "./ast.ts";
+import { planScans } from "./deps.ts";
 
 let db: Awaited<ReturnType<typeof openMemory>>;
 let conn: DuckDBConnection;
@@ -40,6 +42,84 @@ describe("relationNames", () => {
     expect(relationNames(await ast("SELECT * FROM other.main.t"))).toEqual([]);
     expect(relationNames(await ast("SELECT * FROM range(3)"))).toEqual([]);
   });
+
+  // Each case as DuckDB 1.5.5 binds it; "agrees with the unoptimized plan" below runs every one against DuckDB.
+  const SCOPES: [string, string, string[]][] = [
+    ["a CTE hides a table only in its own query", "SELECT * FROM orders WHERE id IN (WITH orders AS (SELECT 1 AS id) SELECT id FROM orders)", ["orders"]],
+    ["a CTE in one branch of a UNION", "SELECT id FROM (WITH customers AS (SELECT 1 AS id) SELECT id FROM customers) UNION ALL SELECT id FROM customers", ["customers"]],
+    ["a CTE on a parenthesized branch", "(WITH b AS (SELECT 1 AS x) SELECT * FROM b) UNION ALL SELECT x FROM b", ["b"]],
+    ["a CTE over a whole UNION", "WITH b AS (SELECT 1 AS x) SELECT * FROM b UNION ALL SELECT * FROM b", []],
+    ["a non-recursive CTE's body reads the table of its own name", "WITH orders AS (SELECT * FROM orders WHERE id > 1) SELECT * FROM orders", ["orders"]],
+    ["the same under WITH RECURSIVE, when the body does not recurse", "WITH RECURSIVE orders AS (SELECT * FROM orders WHERE id > 1) SELECT * FROM orders", ["orders"]],
+    ["a later CTE is not in scope in an earlier one", "WITH a AS (SELECT * FROM b), b AS (SELECT 1 AS x) SELECT * FROM a", ["b"]],
+    ["an earlier CTE is in scope in a later one", "WITH b AS (SELECT 1 AS x), a AS (SELECT * FROM b) SELECT * FROM a", []],
+    ["a recursive CTE reads itself in its recursive part only", "WITH RECURSIVE orders AS (SELECT id FROM orders WHERE id = 1 UNION ALL SELECT id + 1 FROM orders WHERE id < 3) SELECT * FROM orders", ["orders"]],
+    ["a recursive CTE", "WITH RECURSIVE r AS (SELECT id FROM orders UNION ALL SELECT id + 1 FROM r WHERE id < 3) SELECT * FROM r", ["orders"]],
+    ["an outer CTE in a scalar subquery", "WITH b AS (SELECT 7 AS x) SELECT (SELECT max(x) FROM b) AS m", []],
+    ["an outer CTE in a nested WITH", "WITH b AS (SELECT 1 AS x) SELECT * FROM (WITH a AS (SELECT * FROM b) SELECT * FROM a)", []],
+    ["a CTE differing in case", "WITH Recent AS (SELECT 1) SELECT * FROM recent", []],
+    ["a table macro's table", "SELECT * FROM histogram(orders, amount)", ["orders"]],
+    ["a table macro's table as a string", "SELECT * FROM histogram_values('orders', amount)", ["orders"]],
+    ["a table macro's table, main-qualified", "SELECT * FROM histogram(main.orders, amount)", ["orders"]],
+    ["a table macro's table as a named argument", "SELECT * FROM histogram_values(col_name := amount, source := 'orders')", ["orders"]],
+    ["a table macro over a CTE", "WITH orders AS (SELECT 5 AS amount) SELECT * FROM histogram(orders, amount)", []],
+    ["a table macro in a subquery", "SELECT (SELECT count(*) FROM histogram(customers, id)) AS n FROM orders", ["customers", "orders"]],
+  ];
+
+  test.each(SCOPES)("CTE scopes and table macros: %s", async (_why, sql, expected) => {
+    expect(relationNames(await ast(sql))).toEqual(expected);
+  });
+
+  test("agrees with the unoptimized plan on every scope case", async () => {
+    const db2 = await openMemory({ timezone: "UTC" });
+    try {
+      const shadow = await db2.connect();
+      await shadow.run("CREATE TABLE orders (id BIGINT, amount DOUBLE)");
+      await shadow.run("CREATE TABLE customers (id BIGINT)");
+      await shadow.run("CREATE TABLE b (x BIGINT)");
+      for (const [why, sql, expected] of SCOPES) expect([why, await planScans(shadow, sql)]).toEqual([why, [...expected].sort()]);
+    } finally {
+      db2.close();
+    }
+  });
+
+  test("a table macro's file or computed argument is not a relation", async () => {
+    expect(relationNames(await ast("SELECT * FROM histogram('files/x.csv', a)"))).toEqual([]);
+    expect(relationNames(await ast("SELECT * FROM histogram(\"files/x.csv\", a)"))).toEqual([]);
+    expect(relationNames(await ast("SELECT * FROM histogram('ord' || 'ers', a)"))).toEqual([]);
+    expect(relationNames(await ast("SELECT * FROM histogram(_croft.assets, a)"))).toEqual([]);
+  });
+});
+
+describe("tableArguments", () => {
+  const fnOf = async (sql: string) => {
+    let fn: AstNode | undefined;
+    walk(await ast(sql), (n) => {
+      if (n.type === "TABLE_FUNCTION") fn ??= n.function as AstNode;
+    });
+    return fn!;
+  };
+
+  test("the table a table macro names: an identifier, a string, or source :=", async () => {
+    expect(tableArguments(await fnOf("SELECT * FROM histogram(orders, amount)"))).toMatchObject([{ catalog: "", schema: "", name: "orders" }]);
+    expect(tableArguments(await fnOf("SELECT * FROM histogram(w.main.orders, amount)"))).toMatchObject([{ catalog: "w", schema: "main", name: "orders" }]);
+    expect(tableArguments(await fnOf("SELECT * FROM histogram('files/x.csv', amount)"))).toMatchObject([{ name: "files/x.csv", literal: true }]);
+    expect(tableArguments(await fnOf("SELECT * FROM histogram(col_name := amount, source := 'orders')"))).toMatchObject([{ name: "orders" }]);
+  });
+
+  test("null when the table is computed or missing", async () => {
+    expect(tableArguments(await fnOf("SELECT * FROM histogram('ord' || 'ers', amount)"))).toBeNull();
+    expect(tableArguments(await fnOf("SELECT * FROM histogram((SELECT 'orders'), amount)"))).toBeNull();
+    expect(tableArguments(await fnOf("SELECT * FROM histogram(col_name := amount)"))).toBeNull();
+    expect(tableArguments(await fnOf("SELECT * FROM histogram(source := 'a' || 'b', col_name := amount)"))).toBeNull();
+  });
+});
+
+test("collect marks each relation that a CTE in scope hides, and a table macro's table", async () => {
+  const { uses } = collect(await ast("WITH w AS (SELECT * FROM w) SELECT * FROM w, histogram(t, a), (SELECT * FROM w) x"));
+  expect(uses.filter((u) => u.kind === "relation").map((u) => u.kind === "relation" && [u.name, u.cte, u.via ?? null])).toEqual([
+    ["w", false, null], ["w", true, null], ["t", false, "histogram"], ["w", true, null],
+  ]);
 });
 
 test("collect finds functions, table functions and relations with their positions", async () => {

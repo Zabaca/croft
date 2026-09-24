@@ -8,6 +8,19 @@
 // table_name; a function call carries function_name (a table function sits under a TABLE_FUNCTION node's
 // `function` key); a CTE's name is a key of its query node's cte_map.map; a DuckDB position is query_location;
 // `current_date` and the other clock keywords are COLUMN_REF nodes, not functions.
+//
+// CTE scopes, as DuckDB 1.5.5 binds them (ast.test.ts checks every case against the unoptimized plan): the CTEs
+// of a query node (a SELECT_NODE, or a SET_OPERATION_NODE for a WITH over a whole UNION) are in scope in that
+// node and everything under it. Inside the CTE list, a CTE's body sees only the CTEs listed before it, not
+// itself or later ones: `WITH orders AS (SELECT * FROM orders WHERE …)` reads the table orders. A recursive
+// CTE (a RECURSIVE_CTE_NODE body) sees itself in its recursive part (`right`) only; its anchor reads the table.
+// A CTE name never hides a `main.`-qualified table.
+//
+// histogram and histogram_values (TABLE_ARGUMENT_FUNCTIONS) are table macros over query_table: their first
+// argument, or `source :=`, names the table they read, as an identifier or a string, and CTEs in scope count.
+// A string that is a path reads the file through a replacement scan. collect() reports that table as a
+// relation of its own (`via` the macro), so dependencies, catalog prefixes and path checks all see it.
+//
 // It uses no Bun-only APIs, so read.ts can import it through gate.ts.
 
 /** One node of json_serialize_sql's output. */
@@ -17,8 +30,17 @@ export type AstNode = Record<string, unknown>;
 export type Use =
   | { kind: "table_function"; name: string; fn: AstNode; at?: number }
   | { kind: "scalar"; name: string; at?: number }
-  | { kind: "relation"; catalog: string; schema: string; name: string; at?: number }
+  | {
+    kind: "relation"; catalog: string; schema: string; name: string; at?: number;
+    /** A CTE of this name is in scope here, so an unqualified name reads the CTE, not a table. */
+    cte: boolean;
+    /** The table macro (TABLE_ARGUMENT_FUNCTIONS) whose argument names it; absent for a table in FROM. */
+    via?: string;
+  }
   | { kind: "show"; name: string };
+
+/** Table functions and table macros whose first argument (or `source :=`) names the table they read. */
+export const TABLE_ARGUMENT_FUNCTIONS: ReadonlySet<string> = new Set(["histogram", "histogram_values"]);
 
 /** DuckDB matches built-in names ASCII case-insensitively; anything non-ASCII can only match a user object. */
 export const asciiLower = (s: string): string => s.replace(/[A-Z]/g, (c) => c.toLowerCase());
@@ -62,37 +84,128 @@ export function location(node: AstNode): number | undefined {
   return typeof loc === "number" && loc < 2 ** 53 ? loc : undefined;
 }
 
-/** Every function call, table reference and CTE name in the statement, in the AST's order (a query node's
- *  select list before its FROM). CTE names are ASCII-lowercased and collected over the whole statement,
- *  without their scopes. */
+/** A set of ASCII-lowercased CTE names in scope: shared, never changed once built. */
+type Scope = ReadonlySet<string>;
+const NO_CTES: Scope = new Set();
+const widen = (scope: Scope, names: readonly string[]): Scope => (names.length ? new Set([...scope, ...names]) : scope);
+
+/**
+ * Every function call, table reference and CTE name in the statement, in the AST's order (a query node's
+ * select list before its FROM; a table macro's table right after the macro). Each relation says whether a CTE of
+ * its name is in scope where it stands (see the scope rules above). `ctes` is every CTE name in the statement,
+ * ASCII-lowercased, whatever its scope.
+ */
 export function collect(ast: unknown): { uses: Use[]; ctes: Set<string> } {
   const uses: Use[] = [];
   const ctes = new Set<string>();
-  const stack: { node: unknown; head: boolean }[] = [{ node: ast, head: false }];
+  const stack: { node: unknown; head: boolean; scope: Scope }[] = [{ node: ast, head: false, scope: NO_CTES }];
   while (stack.length) {
-    const { node, head } = stack.pop()!;
+    const { node, head, scope } = stack.pop()!;
     if (Array.isArray(node)) {
-      for (let i = node.length - 1; i >= 0; i--) stack.push({ node: node[i], head: false });
+      for (let i = node.length - 1; i >= 0; i--) stack.push({ node: node[i], head: false, scope });
       continue;
     }
     if (!node || typeof node !== "object") continue;
     const rec = node as AstNode;
+    const hidden = (catalog: string, schema: string, name: string) => catalog === "" && schema === "" && scope.has(asciiLower(name));
     if (typeof rec.function_name === "string") {
       uses.push(head ? { kind: "table_function", name: rec.function_name, fn: rec, at: location(rec) } : { kind: "scalar", name: rec.function_name, at: location(rec) });
+      if (head && TABLE_ARGUMENT_FUNCTIONS.has(asciiLower(rec.function_name))) {
+        for (const t of tableArguments(rec) ?? []) {
+          uses.push({ kind: "relation", catalog: t.catalog, schema: t.schema, name: t.name, at: t.at, cte: hidden(t.catalog, t.schema, t.name), via: rec.function_name });
+        }
+      }
     }
     if (rec.type === "BASE_TABLE" && typeof rec.table_name === "string") {
-      uses.push({ kind: "relation", catalog: stringOf(rec.catalog_name), schema: stringOf(rec.schema_name), name: rec.table_name, at: location(rec) });
+      const catalog = stringOf(rec.catalog_name);
+      const schema = stringOf(rec.schema_name);
+      uses.push({ kind: "relation", catalog, schema, name: rec.table_name, at: location(rec), cte: hidden(catalog, schema, rec.table_name) });
     }
     if (rec.type === "SHOW_REF" && rec.query == null && typeof rec.table_name === "string" && rec.table_name !== "") {
       uses.push({ kind: "show", name: rec.table_name.replace(/^"(.*)"$/, "$1") });
     }
     const map = (rec.cte_map as { map?: unknown } | undefined)?.map;
-    if (Array.isArray(map)) for (const e of map) if (typeof e?.key === "string") ctes.add(asciiLower(e.key));
-    const next: { node: unknown; head: boolean }[] = [];
-    for (const [k, v] of Object.entries(rec)) if (v && typeof v === "object") next.push({ node: v, head: rec.type === "TABLE_FUNCTION" && k === "function" });
+    const listed: string[] = [];
+    if (Array.isArray(map)) for (const e of map) if (typeof e?.key === "string") listed.push(asciiLower(e.key));
+    for (const n of listed) ctes.add(n);
+    // The node's own parts see all of its CTEs; a recursive CTE's recursive part sees the CTE itself.
+    const inner = widen(scope, listed);
+    const recursive = rec.type === "RECURSIVE_CTE_NODE" && typeof rec.cte_name === "string" ? widen(scope, [asciiLower(rec.cte_name)]) : null;
+    const next: { node: unknown; head: boolean; scope: Scope }[] = [];
+    for (const [k, v] of Object.entries(rec)) {
+      if (!v || typeof v !== "object") continue;
+      if (k === "cte_map" && Array.isArray(map)) {
+        // Each CTE's body sees the CTEs listed before it, never itself or later ones.
+        map.forEach((e: unknown, i: number) => next.push({ node: e, head: false, scope: widen(scope, listed.slice(0, i)) }));
+        continue;
+      }
+      next.push({ node: v, head: rec.type === "TABLE_FUNCTION" && k === "function", scope: recursive && k === "right" ? recursive : inner });
+    }
     for (let i = next.length - 1; i >= 0; i--) stack.push(next[i]!);
   }
   return { uses, ctes };
+}
+
+// ---- Arguments --------------------------------------------------------------------------------------------
+
+/** A table function's positional arguments: named ones come as `name := v` (an alias) or `name = v`. */
+export function positional(fn: AstNode): AstNode[] {
+  const children = Array.isArray(fn.children) ? (fn.children as AstNode[]) : [];
+  return children.filter((c) => !stringOf(c.alias) && !(c.type === "COMPARE_EQUAL" && (c.left as AstNode | undefined)?.class === "COLUMN_REF"));
+}
+
+/** A table function's named argument `name := v` or `name = v` (ASCII case-insensitive), or undefined. */
+export function namedArgument(fn: AstNode, name: string): AstNode | undefined {
+  const children = Array.isArray(fn.children) ? (fn.children as AstNode[]) : [];
+  for (const c of children) {
+    if (asciiLower(stringOf(c.alias)) === name) return c;
+    const left = c.left as AstNode | undefined;
+    if (c.type === "COMPARE_EQUAL" && left?.class === "COLUMN_REF" && Array.isArray(left.column_names)
+      && left.column_names.length === 1 && asciiLower(stringOf(left.column_names[0])) === name) return c.right as AstNode | undefined;
+  }
+  return undefined;
+}
+
+/** The string of a VARCHAR literal, or null. */
+export function literal(n: AstNode | undefined): string | null {
+  if (n?.class !== "CONSTANT") return null;
+  const v = n.value as { type?: { id?: string }; is_null?: boolean; value?: unknown } | undefined;
+  return v && !v.is_null && (v.type?.id === "VARCHAR" || v.type?.id === "STRING_LITERAL") && typeof v.value === "string" ? v.value : null;
+}
+
+/** A table a table macro names. */
+export interface TableArgument {
+  catalog: string;
+  schema: string;
+  /** As written, without quotes; a file path when it looksLikePath. */
+  name: string;
+  /** Written as a string ('orders'), not an identifier. */
+  literal: boolean;
+  at?: number;
+}
+
+/**
+ * The tables a TABLE_ARGUMENT_FUNCTIONS call names: its first positional argument and its `source :=`, each an
+ * identifier (`orders`, `main.orders`) or a string ('orders', 'files/x.csv'). null when one of them is computed
+ * (`'ord' || 'ers'`, a subquery) or there is none: what it reads cannot be known without running it.
+ */
+export function tableArguments(fn: AstNode): TableArgument[] | null {
+  const args = [positional(fn)[0], namedArgument(fn, "source")].filter((a): a is AstNode => a !== undefined);
+  if (!args.length) return null;
+  const out: TableArgument[] = [];
+  for (const a of args) {
+    const text = literal(a);
+    const at = location(a);
+    if (text !== null) {
+      out.push({ catalog: "", schema: "", name: text, literal: true, ...(at !== undefined ? { at } : {}) });
+      continue;
+    }
+    const parts = a.class === "COLUMN_REF" && Array.isArray(a.column_names) ? (a.column_names as unknown[]).map(stringOf) : [];
+    if (!parts.length || parts.length > 3 || parts.some((p) => p === "")) return null;
+    const [name, schema = "", catalog = ""] = [...parts].reverse();
+    out.push({ catalog, schema, name: name!, literal: false, ...(at !== undefined ? { at } : {}) });
+  }
+  return out;
 }
 
 // A table name DuckDB would hand to a replacement scan (read_csv, read_parquet, read_json, a DuckDB file):
@@ -100,23 +213,20 @@ export function collect(ast: unknown): { uses: Use[]; ctes: Set<string> } {
 export const looksLikePath = (name: string): boolean => /[./\\]/.test(name);
 
 /**
- * The tables a statement reads by name: every BASE_TABLE reference in the main schema (unqualified or
- * `main.x`, no catalog) that is not a CTE, ASCII-lowercased, unique, in the AST's order. Left out: file paths
+ * The tables a statement reads by name: every table reference in the main schema (unqualified or `main.x`, no
+ * catalog) that is not a CTE in scope where it stands, and every table a table macro names
+ * (`histogram(orders, amount)`); ASCII-lowercased, unique, in the AST's order. Left out: file paths
  * (`FROM 'files/x.csv'`, a replacement scan: SQL_READS_FILES), other schemas (`_croft.assets`,
- * `information_schema.tables`) and catalog-qualified names (CATALOG_PREFIX). An unqualified CTE name hides a
- * table everywhere in the statement (collect() keeps no scopes), so a CTE that shadows an asset in one query
- * node hides that asset in the others too; `main.x` always names the table. sql/deps.ts adds the
- * unoptimized plan's scans, which respect scopes.
+ * `information_schema.tables`) and catalog-qualified names (CATALOG_PREFIX). `main.x` always names the table.
+ * sql/deps.ts adds the unoptimized plan's scans.
  */
 export function relationNames(ast: unknown): string[] {
-  const { uses, ctes } = collect(ast);
   const out: string[] = [];
-  for (const u of uses) {
-    if (u.kind !== "relation" || u.catalog !== "" || looksLikePath(u.name)) continue;
+  for (const u of collect(ast).uses) {
+    if (u.kind !== "relation" || u.catalog !== "" || u.cte || looksLikePath(u.name)) continue;
     if (u.schema !== "" && asciiLower(u.schema) !== "main") continue;
     const name = asciiLower(u.name);
-    // `main.x` names the table even where a CTE x is in scope.
-    if ((u.schema !== "" || !ctes.has(name)) && !out.includes(name)) out.push(name);
+    if (!out.includes(name)) out.push(name);
   }
   return out;
 }
@@ -153,7 +263,8 @@ export interface PrefixedRelation {
  * every table in the project database's main schema and tracks inputs by plain name, so a prefix either names
  * something croft cannot track (another database, croft's `_croft` state, DuckDB's `information_schema`) or
  * hides a dependency: DuckDB resolves `warehouse.orders` (catalog, no schema) and `memory.main.orders` to the
- * table, while relationNames() leaves them out. File paths are not tables here (SQL_READS_FILES).
+ * table, while relationNames() leaves them out. A table macro's table counts (`histogram(_croft.assets, x)`).
+ * File paths are not tables here (SQL_READS_FILES).
  */
 export function catalogPrefixes(ast: unknown): PrefixedRelation[] {
   const out: PrefixedRelation[] = [];

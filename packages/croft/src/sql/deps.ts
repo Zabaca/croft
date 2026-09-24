@@ -1,7 +1,9 @@
 // Dependencies from the unoptimized bound plan (DESIGN.md §3c "Dependencies"): the scans of
-// `PRAGMA disable_optimizer; EXPLAIN (FORMAT json) <body>` over the shadow catalog find the tables the AST
-// hides (table macros, PIVOT) and respect CTE shadowing. The optimizer must be off: it prunes scans
-// (`WHERE false`, `LIMIT 0`) [V]. An SQL asset's inputs are sql/ast.ts relationNames ∪ planScans.
+// `PRAGMA disable_optimizer; EXPLAIN (FORMAT json) <body>` over the shadow catalog. The AST walk (sql/ast.ts
+// relationNames) scopes CTE names and reads table macros' tables as DuckDB binds them, and the golden corpus
+// holds it to this plan case by case; the plan is the net under it for whatever a macro or a rewrite hides
+// from the parse tree. The optimizer must be off: it prunes scans (`WHERE false`, `LIMIT 0`) [V]. An SQL
+// asset's inputs are relationNames ∪ planScans.
 //
 // Verified on DuckDB 1.5.5 (deps.test.ts, and the golden corpus in deps-corpus/):
 // - PRAGMA disable_optimizer works on a connection whose configuration is locked (SET enable_optimizer is

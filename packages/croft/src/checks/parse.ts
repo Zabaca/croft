@@ -16,10 +16,17 @@
 // - validateChecks asks DuckDB's parser (json_serialize_sql on any connection; nothing is bound or run). The
 //   probe must come back as exactly the statement croft built: one SELECT_NODE, one select item, FROM the asset
 //   and nothing else, so text that closes the parenthesis and appends clauses or statements is refused. The
-//   AST is then walked like the query gate's (sql/gate.ts): a check reads tables only, so file paths, table
-//   functions that read files or run SQL given as a string, functions with side effects, and parameters are
-//   CHECK_INVALID. checks/run.ts repeats this vetting on the write transaction before it evaluates a rule, so a
-//   check that skipped validate is still never concatenated into anything unvetted.
+//   AST is then walked like the query gate's (sql/gate.ts): a check reads the project's tables only, by plain
+//   name (or `main.x`), so these are CHECK_INVALID:
+//   - file paths, in FROM or as a table macro's table (`histogram_values('.croft/x.csv', a)` reads the file
+//     through query_table, and a check never passes the gate's path guard, so no path is allowed at all);
+//   - a table macro whose table is computed (`histogram('a' || 'b', x)`), and a path-like string given to a
+//     catalog function (`pragma_table_info('x.csv')`, `sql_auto_complete`, which lists files);
+//   - a table outside the main schema or in another catalog (`_croft.assets`, `warehouse.main.orders`,
+//     `information_schema.tables`): croft cannot order the asset after it, or must not let checks read it;
+//   - table functions that read files or run SQL given as a string, functions with side effects, parameters.
+//   checks/run.ts repeats this vetting on the write transaction before it evaluates a rule, so a check that
+//   skipped validate is still never concatenated into anything unvetted.
 //
 // Check.sql per kind (what checks/run.ts evaluates):
 //   unique, not_null   the columns, each double-quoted with `"` doubled: `"a", "b"`
@@ -31,7 +38,9 @@ import { problem } from "../core/errors.ts";
 import type { Check, Problem } from "../core/types.ts";
 import { quoteIdent } from "../load/evolve.ts";
 import { editDistance } from "../project/suggest.ts";
-import { asciiLower, type AstNode, collect, looksLikePath, relationNames } from "../sql/ast.ts";
+import {
+  asciiLower, type AstNode, collect, finiteJson, literal, looksLikePath, relationNames, TABLE_ARGUMENT_FUNCTIONS, tableArguments, walk,
+} from "../sql/ast.ts";
 import { TABLE_FUNCTIONS } from "../sql/gate.ts";
 
 export interface ParseChecksInput {
@@ -89,8 +98,9 @@ export async function validateChecks(conn: DuckDBConnection, asset: string, chec
 
 /**
  * validateChecks, keeping what passed: the valid checks with `reads` taken from DuckDB's AST (sql/ast.ts
- * relationNames: main-schema tables, CTE names excluded, the asset itself left out), which is exact where
- * parseChecks' lexical reading is a close estimate. For resolving a project, where a connection is at hand.
+ * relationNames: main-schema tables and table macros' tables, CTEs in scope excluded, the asset itself left
+ * out), which is exact where parseChecks' lexical reading is a close estimate (it does not scope CTE names).
+ * For resolving a project, where a connection is at hand.
  */
 export async function analyzeChecks(conn: DuckDBConnection, asset: string, checks: readonly Check[], o: { file?: string } = {}): Promise<{ checks: Check[]; problems: Problem[] }> {
   const serialize = async (sql: string) => {
@@ -134,7 +144,8 @@ export async function vetCheck(serialize: (sql: string) => Promise<string>, asse
   if (lexical) return bad(lexical.why, lexical.hint);
   let parsed: { error?: boolean; error_message?: string; statements?: { node?: AstNode; named_param_map?: unknown }[] };
   try {
-    parsed = JSON.parse(await serialize(probeSql(asset, c.sql))) as typeof parsed;
+    // finiteJson: a DOUBLE constant beyond range (`amount < 1e400`) comes back as a bare Infinity.
+    parsed = JSON.parse(finiteJson(await serialize(probeSql(asset, c.sql)))) as typeof parsed;
   } catch (e) {
     return bad(`could not be parsed: ${firstLine(e)}`);
   }
@@ -150,8 +161,17 @@ export async function vetCheck(serialize: (sql: string) => Promise<string>, asse
   }
   if (hasParameter(stmts[0]!)) return bad("uses a parameter ($1 or ?); a check has none", "write the value into the check");
   for (const u of collect(node).uses) {
-    if (u.kind === "relation" && looksLikePath(u.name)) {
-      return bad(`reads the file ${u.name}; a check reads tables only`, "load the file with a file ingest (croft docs ingest), then name its table");
+    if (u.kind === "relation") {
+      // A path in FROM, or a table macro's table given as a path: DuckDB reads the file (a replacement scan).
+      if (looksLikePath(u.name)) {
+        return bad(`reads the file ${u.name}; a check reads tables only`, "load the file with a file ingest (croft docs ingest), then name its table");
+      }
+      // croft's own state, another catalog, information_schema: nothing croft tracks, so no ordering either.
+      if (u.catalog !== "" || (u.schema !== "" && asciiLower(u.schema) !== "main")) {
+        const shown = [u.catalog, u.schema, u.name].filter(Boolean).join(".");
+        return bad(`reads ${shown}, which is not one of the project's tables; a check reads those only, by plain name`,
+          `name the table without a prefix: ${u.name}`);
+      }
     }
     if (u.kind === "table_function") {
       const kind = TABLE_FUNCTIONS.get(asciiLower(u.name));
@@ -159,11 +179,33 @@ export async function vetCheck(serialize: (sql: string) => Promise<string>, asse
         return bad(`calls ${u.name}(), which a check may not use (it reads files, runs SQL given as text, or changes DuckDB)`,
           "read the project's tables by name in a subquery");
       }
+      // Its table comes as a relation of its own (checked above); a computed one could be any file.
+      if (kind === "table" && !tableArguments(u.fn)) {
+        return bad(`calls ${u.name}(), which must name its table directly (an identifier or a string); croft checks what a check reads`,
+          `write ${u.name}(<table>, <column>) with the table's name`);
+      }
+      // The catalog functions take names; a path there is never what a check needs (sql_auto_complete lists files).
+      if (kind === "local") {
+        const path = stringArguments(u.fn).find(looksLikePath);
+        if (path !== undefined) {
+          return bad(`calls ${u.name}(), which is given the path ${path}; a check reads tables only`, "read the project's tables by name in a subquery");
+        }
+      }
     }
     if (u.kind === "scalar" && asciiLower(u.name) === "write_log") return bad("calls write_log(), which writes to DuckDB's log", "remove it");
   }
   const self = asciiLower(asset);
   return { ok: true, reads: relationNames(node).filter((t) => t !== self) };
+}
+
+/** Every string literal among a table function's arguments, named ones included, nested ones too. */
+function stringArguments(fn: AstNode): string[] {
+  const out: string[] = [];
+  walk(fn.children, (n) => {
+    const s = literal(n);
+    if (s !== null) out.push(s);
+  });
+  return out;
 }
 
 /** Why the probe's statement is not exactly `SELECT (<one item>) FROM <asset>`, or null when it is. */
@@ -470,8 +512,10 @@ const CLAUSE = new Set(["where", "group", "having", "order", "limit", "offset", 
 /**
  * The tables a rule's subqueries read, from its tokens: names after a query's FROM (in a parenthesized group that
  * has a SELECT before it, or that starts with FROM: DuckDB's FROM-first form) or after JOIN, in the main schema
- * (bare or `main.x`), without table functions, file paths or CTE names; ASCII-lowercased, unique, in text order.
- * `extract(year FROM d)`, `substring(s FROM 2)`, `trim(x FROM s)` and `IS DISTINCT FROM` are not queries.
+ * (bare or `main.x`), and a table macro's first argument (`histogram(orders, x)`); without other table
+ * functions, file paths or CTE names (any CTE name in the text, whatever its scope); ASCII-lowercased, unique, in
+ * text order. `extract(year FROM d)`, `substring(s FROM 2)`, `trim(x FROM s)` and `IS DISTINCT FROM` are not
+ * queries. analyzeChecks replaces this estimate with DuckDB's AST (sql/ast.ts relationNames).
  */
 export function lexicalReads(t: Token[], match: Map<number, number>): string[] {
   type Ident = Extract<Token, { kind: "ident" }>;
@@ -481,6 +525,25 @@ export function lexicalReads(t: Token[], match: Map<number, number>): string[] {
   // A name that can be a table or an alias: any identifier but a word that starts the next clause.
   const word = (x: Token | undefined): x is Ident => x?.kind === "ident" && (x.quoted || !CLAUSE.has(x.lower));
   const past = (j: number) => (match.get(j) ?? j) + 1;
+  // A table macro's first argument when it is a whole argument naming a main-schema table: `orders`,
+  // `main.orders` or 'orders' (not a path); else null.
+  const macroTable = (k: number): string | null => {
+    const x = t[k];
+    let name: string | null = null;
+    let j = k + 1;
+    if (x?.kind === "string" && /^'(?:[^']|'')*'$/.test(x.text)) {
+      const s = x.text.slice(1, -1).replaceAll("''", "'");
+      name = looksLikePath(s) ? null : asciiLower(s);
+    } else if (x?.kind === "ident") {
+      const parts: Ident[] = [x];
+      while (t[j]?.text === "." && t[j + 1]?.kind === "ident") {
+        parts.push(t[j + 1] as Ident);
+        j += 2;
+      }
+      name = parts.length === 1 ? parts[0]!.lower : parts.length === 2 && parts[0]!.lower === "main" ? parts[1]!.lower : null;
+    }
+    return t[j]?.text === "," || t[j]?.text === ")" ? name : null;
+  };
   // CTE names: WITH [RECURSIVE] name [(cols)] AS [NOT] [MATERIALIZED] (, and the same after a comma.
   for (let k = 0; k < t.length; k++) {
     const x = t[k]!;
@@ -510,8 +573,12 @@ export function lexicalReads(t: Token[], match: Map<number, number>): string[] {
           parts.push(t[j + 1] as Ident);
           j += 2;
         }
-        if (t[j]?.text === "(") j = past(j);                                       // a table function
-        else {
+        if (t[j]?.text === "(") {                                                  // a table function
+          // A table macro names its table first: histogram(orders, amount), histogram('orders', amount).
+          const table = parts.length === 1 && TABLE_ARGUMENT_FUNCTIONS.has(parts[0]!.lower) ? macroTable(j + 1) : null;
+          if (table !== null && !ctes.has(table)) found.push({ name: table, at: x.at });
+          j = past(j);
+        } else {
           const name = parts.length === 1 ? parts[0]!.lower : parts.length === 2 && parts[0]!.lower === "main" ? parts[1]!.lower : null;
           if (name !== null && !ctes.has(name)) found.push({ name, at: x.at });
         }
