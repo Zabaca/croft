@@ -374,6 +374,58 @@ export default transform({
   }, 30_000);
 });
 
+describe("--rebuild through the CLI", () => {
+  test("between_trash_and_reset: the trash committed, the table did not change; a new confirmation finishes the rebuild", async () => {
+    api.state.zones = Array.from({ length: 4 }, (_, i) => ({ zone: i + 1 }));
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    await cli(root, ["run", "zones", "--foreground", "--json"]);
+    const asked = await cli(root, ["run", "zones", "--rebuild", "--foreground", "--json"]);
+    expect(asked.code).toBe(5);
+    const killed = await cli(root, ["confirm", asked.json!.confirmation.token, "--json"], cliEnv({ CROFT_FAULT: "between_trash_and_reset" }));
+    expect(killed.json!.data).toMatchObject({ outcome: "used", result: { status: "crashed" } });
+    expect(listTrash(join(root, ".croft"), "zones")).toHaveLength(1);
+    expect(await count(root, "zones")).toBe(4);
+    const again = await cli(root, ["run", "zones", "--rebuild", "--foreground", "--json"]);
+    api.state.zones = api.state.zones.slice(0, 3);
+    const done = await cli(root, ["confirm", again.json!.confirmation.token, "--json"]);
+    expect(done.code).toBe(0);
+    expect(await count(root, "zones")).toBe(3);
+    expect(listTrash(join(root, ".croft"), "zones")).toHaveLength(2);
+  }, 60_000);
+
+  test("off a TTY: exit 5 with a confirmation, nothing changed; croft confirm's detached run trashes, resets and refetches", async () => {
+    api.state.issues = [1, 2, 3].map((id) => ({ id, title: `t${id}`, updated_at: `2026-09-0${id}T10:00:00Z` }));
+    const root = makeProject({ "assets/issues.ts": keysetIssues(api.url) });
+    expect((await cli(root, ["run", "issues", "--json"])).code).toBe(0);
+    api.state.issues = api.state.issues.slice(1);
+    const dry = await cli(root, ["run", "issues", "--rebuild", "--dry-run", "--json"]);
+    expect(dry.code).toBe(0);
+    expect(dry.json!.data.steps[0]).toMatchObject({ confirmation: { action: "rebuild", command: "croft run issues --rebuild", impact: { rows: 3 } } });
+    expect(dry.json!.next).toEqual([]);
+
+    const asked = await cli(root, ["run", "issues", "--rebuild", "--json"]);
+    expect(asked.code).toBe(5);
+    expect(asked.json).toMatchObject({ ok: false, confirmation: { command: "croft run issues --rebuild", impact: { asset: "issues", rows: 3 } } });
+    expect(asked.json!.next.some((n: { command: string }) => n.command.includes("--rebuild") || n.command.includes("confirm"))).toBe(false);
+    expect(await count(root, "issues")).toBe(3);
+    expect(listTrash(join(root, ".croft"))).toEqual([]);
+
+    const done = await cli(root, ["confirm", asked.json!.confirmation.token, "--json"]);
+    expect(done.code).toBe(0);
+    expect(done.json!.data).toMatchObject({ outcome: "used", result: { steps: [{ asset: "issues", status: "ok", trashed: { rows: 3 }, rows: { total: 2 } }] } });
+    expect(await count(root, "issues")).toBe(2);
+    expect(listTrash(join(root, ".croft"), "issues")[0]).toMatchObject({ rows: 3 });
+    withRuns(root, (db) => expect(db.listRuns()[0]).toMatchObject({ trigger: "confirm", argv: ["run", "issues", "--rebuild", "--json"] }));
+    // Exact names only, refused by the command itself; --due takes no other run flag.
+    const bare = await cli(root, ["run", "--rebuild", "--json"]);
+    expect(bare.code).toBe(2);
+    expect(bare.json!.problems[0]).toMatchObject({ code: "USAGE_ERROR", message: "--rebuild takes the names of the assets to build from scratch" });
+    const due = await cli(root, ["run", "--due", "--rebuild", "--json"]);
+    expect(due.code).toBe(2);
+    expect(due.json!.problems[0]).toMatchObject({ code: "USAGE_ERROR", message: "--due runs what the scheduler would; it does not go with --rebuild" });
+  }, 60_000);
+});
+
 describe("--dry-run, --only and --upstream", () => {
   const ZONE_PROJECT = () => ({
     "assets/zones.ts": simpleGet(api.url, "/zones"),

@@ -37,6 +37,13 @@ function mismatch(message: string, hint: string, details: Record<string, unknown
   return new CroftError("CURSOR_TYPE_MISMATCH", { message, hint, asset, details });
 }
 
+/** The other way out of a cursor its field can no longer read (§8): a refetch from scratch, which trashes the table
+ *  first and asks (so it is named, never run for the user). */
+function refetch(asset: string | undefined, withNewType: boolean): string {
+  return `or refetch the ingest from scratch${withNewType ? " with the new type" : ""}: croft run ${asset ?? "<asset>"} --rebuild `
+    + "(its table goes to the trash first, after confirmation)";
+}
+
 export interface ResolveCursorInput {
   field: string;
   columnType: string;
@@ -61,7 +68,7 @@ export function resolveCursorType(o: ResolveCursorInput): CursorType {
   }
   if (o.saved && o.saved !== type && !(o.saved === "date" && type === "timestamp")) {
     throw mismatch(`cursor field ${o.field} was a ${o.saved} cursor and is now ${normalizeType(o.columnType)} (${type}); the cursor type is fixed on the first load`,
-      "revert the change to the cursor field: its type is fixed by the first load", details, o.asset);
+      `revert the change to the cursor field (its type is fixed by the first load), ${refetch(o.asset, true)}`, details, o.asset);
   }
   return type;
 }
@@ -162,7 +169,7 @@ export async function nextCursor(tx: Sql, o: NextCursorInput): Promise<NextCurso
   if (o.saved == null) return { value: batchMax, advanced: true, batchMax };
   if (!row.readable) {
     throw mismatch(`the saved cursor "${o.saved}" cannot be read as ${col.type} (column ${col.name})`,
-      "the cursor field's type changed after the first load; revert the change to the cursor field",
+      `the cursor field's type changed after the first load; revert the change to the cursor field, ${refetch(o.asset, true)}`,
       { field: o.field, saved: o.saved, columnType: col.type }, o.asset);
   }
   return row.newer ? { value: batchMax, advanced: true, batchMax } : { value: o.saved, advanced: false, batchMax };
@@ -274,7 +281,7 @@ export function renderSince(saved: string, o: SinceOptions): string | number {
       if (lookbackMs > 0) throw mismatch(`${name} is text; a lookback cannot be subtracted from text`, "remove lookback from incremental", details, o.asset);
       return saved;
     case "integer": {
-      if (!/^[+-]?\d+$/.test(saved.trim())) throw mismatch(`the saved cursor "${saved}" is not an integer`, "the saved position was not written by this cursor field; revert the change to the cursor field", details, o.asset);
+      if (!/^[+-]?\d+$/.test(saved.trim())) throw mismatch(`the saved cursor "${saved}" is not an integer`, `the saved position was not written by this cursor field; revert the change to the cursor field, ${refetch(o.asset, false)}`, details, o.asset);
       const v = BigInt(saved.trim());
       if (lookbackMs === 0) return toNumberOrText(v);
       if (!o.unit) {
@@ -287,7 +294,7 @@ export function renderSince(saved: string, o: SinceOptions): string | number {
     case "date":
     case "timestamp": {
       const form = parseIsoForm(saved);
-      if (!form) throw mismatch(`the saved cursor "${saved}" is not an ISO-8601 ${o.type}`, "the saved position was not written by this cursor field; revert the change to the cursor field", details, o.asset);
+      if (!form) throw mismatch(`the saved cursor "${saved}" is not an ISO-8601 ${o.type}`, `the saved position was not written by this cursor field; revert the change to the cursor field, ${refetch(o.asset, false)}`, details, o.asset);
       if (lookbackMs === 0) return saved;
       return renderForm(form.wall - BigInt(Math.ceil(lookbackMs)) * 1000n, form);
     }

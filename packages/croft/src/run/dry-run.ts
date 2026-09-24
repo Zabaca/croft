@@ -10,7 +10,10 @@
 //                   guard of an incremental TS transform that makes requests (LARGE_REPROCESS), with the pending
 //                   rows of the inputs it reads with newRows() estimated from the mirror and the steps
 //                   runs.sqlite recorded for each input. An input never built that the run builds first has no
-//                   rows to count yet: the step's reason says the run may ask, since they are unknown until then
+//                   rows to count yet: the step's reason says the run may ask, since they are unknown until then.
+//                   --rebuild of an ingest or an incremental TS transform (run/rebuild.ts): the rows that would go to
+//                   the trash, and for a paid transform every input row it would process again. A rebuild that
+//                   trashes is destructive, so the run it describes is never in next
 //   skips           an asset downstream of one that would fail before it runs (a static error) is skipped, as
 //                   the runner skips it; --from skips every transform, and in a bare run or a glob the ingests
 //                   it does not apply to; and a transform whose input was never built and is not built by the
@@ -33,7 +36,8 @@ import { lookbackWords, selectorWords } from "../project/resolve.ts";
 import type { Project } from "../project/root.ts";
 import { cursorTypeOfPin } from "../project/ts-asset.ts";
 import { croftError, fromSince, shrinkImpact } from "./ingest.ts";
-import { buildFirst, cursorTypesOf, FROM_ONLY_MERGE, inputNotBuilt, loadErrors, type PlannedStep, planRun, type RunPlan } from "./plan.ts";
+import { buildFirst, cursorTypesOf, FROM_ONLY_MERGE, inputNotBuilt, loadErrors, type PlannedStep, planRun, rebuildCommand, type RunPlan } from "./plan.ts";
+import { rebuildImpact, rebuildKindOf, rebuildTrashes, rebuildWords } from "./rebuild.ts";
 import { checkRunFlags, shrinkCommand, withProjectChecks } from "./runner.ts";
 import { DEFAULT_CONFIRM_ABOVE, REPROCESS_ACTION } from "./transform.ts";
 
@@ -45,6 +49,8 @@ export interface DryRunInput {
   /** --from, as typed. */
   from?: string;
   allowShrink?: boolean;
+  /** --rebuild: the named assets from scratch (run/plan.ts, run/rebuild.ts). */
+  rebuild?: boolean;
   /** The clock --from's relative values and `today` are read with (CROFT_NOW). */
   now?: Date;
   importTimeoutMs?: number;
@@ -105,10 +111,13 @@ export async function dryRun(i: DryRunInput): Promise<DryRunOutcome> {
     root: project.root, timezone: project.timezone, selectors: i.selectors, catalog: history.catalog,
     cursorTypes: cursorTypesOf(history.catalog), only: i.only === true, upstream: i.upstream === true,
     ...(i.from !== undefined ? { from: i.from } : {}), ...(i.importTimeoutMs !== undefined ? { importTimeoutMs: i.importTimeoutMs } : {}),
+    ...(i.rebuild ? { rebuild: true } : {}),
     // A mistyped name's fix is this dry run again, never a real run.
     retry: (selectors) => [...runWords({ ...i, selectors }), "--dry-run"].join(" "),
   });
-  checkRunFlags(planned, { selectors: i.selectors, ...(i.from !== undefined ? { from: i.from } : {}), allowShrink: i.allowShrink === true });
+  checkRunFlags(planned, {
+    selectors: i.selectors, ...(i.from !== undefined ? { from: i.from } : {}), allowShrink: i.allowShrink === true, rebuild: i.rebuild === true,
+  });
   // As a run does (runner.ts withProjectChecks): a TS transform whose inputs name no asset fails before it runs
   // (UNKNOWN_TABLE with a did-you-mean edit fix).
   const plan = await withProjectChecks(planned, project);
@@ -153,7 +162,8 @@ export async function dryRun(i: DryRunInput): Promise<DryRunOutcome> {
 
     if (out.action !== "skip" && errors.length === 0 && ingest) {
       try {
-        const window = windowOf(step, entry, { timezone: project.timezone, now, ...(i.from !== undefined ? { from: i.from } : {}) });
+        // A rebuild fetches from scratch: no saved position, so no window.
+        const window = step.rebuild ? null : windowOf(step, entry, { timezone: project.timezone, now, ...(i.from !== undefined ? { from: i.from } : {}) });
         if (window) out.window = window;
         out.reason = ingestWords(step, window, i.from);
       } catch (e) {
@@ -253,6 +263,7 @@ function instantOf(v: string | number, type: CursorType, unit: "s" | "ms" | unde
 
 /** The run line of an ingest: its behavior, and what it fetches (§4.2). */
 function ingestWords(step: PlannedStep, w: DryRunWindow | null, from: string | undefined): string {
+  if (step.rebuild) return `${step.behavior}, from scratch (--rebuild): ${step.kind === "file" ? "loads every file" : "fetches everything"}`;
   if (step.kind === "file") {
     return step.incremental.kind === "files" ? `${step.behavior}, new and changed files only` : `${step.behavior} (nothing is written when no file changed)`;
   }
@@ -282,6 +293,20 @@ interface ConfirmContext {
 interface Ask { confirmation?: DryRunConfirmation; until?: string[]; rows?: number; limit?: number }
 
 function confirmationOf(step: PlannedStep, entry: CatalogAsset | null, c: ConfirmContext): Ask | null {
+  // --rebuild of an ingest or an incremental TS transform (run/rebuild.ts): asks when the table has rows, or when a
+  // paid transform would process more input rows than its confirmAbove; one confirmation covers both.
+  if (step.rebuild && rebuildTrashes(step)) {
+    const rows = entry?.rows ?? 0;
+    const limit = step.confirmAbove ?? DEFAULT_CONFIRM_ABOVE;
+    // From scratch every input row is pending: the estimate with no saved position.
+    const paid = step.kind === "transform" && step.usesHttp === true ? pendingEstimate(step, null, c) : null;
+    if (rows > 0 || (paid !== null && paid.rows > limit)) {
+      const impact = rebuildImpact(c.project.paths.stateDir, step, rows, paid?.rows);
+      return { confirmation: { action: "rebuild", command: rebuildCommand(step.asset), impact } };
+    }
+    if (paid?.unknown.length) return { until: paid.unknown, rows: paid.rows, limit };
+    return null;
+  }
   // --allow-shrink names exactly one replace ingest (checkRunFlags); allowShrink: true in its code needs no token.
   if (c.allowShrink && c.selectors[0] === step.asset && (step.kind === "rows" || step.kind === "file") && step.write === "replace"
     && step.spec?.allowShrink !== true && entry && entry.rows > 0) {
@@ -369,9 +394,11 @@ function nextOf(steps: readonly DryRunStep[], i: DryRunInput, o: { builds: reado
   if (steps.some((s) => s.problems.length > 0)) next.push({ command: "croft validate", reason: "see every problem of the project with its fix" });
   // A step skipped for an input never built: the run that builds that input (and then what reads it).
   next.push(...o.builds);
-  // --allow-shrink is destructive: it never appears in next (§4.3); the user runs it themselves.
+  // --allow-shrink is destructive: it never appears in next (§4.3); the user runs it themselves. So is a --rebuild that
+  // would move a table to the trash; one that trashes nothing (SQL, a table never built) is a run like any other.
   const runnable = steps.some((s) => s.action !== "skip" && s.problems.length === 0);
-  if (runnable && !i.allowShrink) {
+  const trashes = steps.some((s) => s.confirmation?.action === "rebuild" && s.confirmation.impact.rows > 0);
+  if (runnable && !i.allowShrink && !trashes) {
     const waits = steps.some((s) => s.confirmation);
     const until = [...new Set(o.mayAsk.flatMap((m) => m.until))];
     const reason = waits ? "run it; it stops to ask before the steps that need confirmation"
@@ -388,11 +415,11 @@ function listed(list: readonly string[]): string {
 }
 
 /** `croft run` with the dry run's selectors and flags, less --dry-run (and --allow-shrink, which is destructive:
- *  it never appears in next or a fix, §4.3). */
-function runWords(i: Pick<DryRunInput, "selectors" | "only" | "upstream" | "from">): string[] {
+ *  it never appears in next or a fix, §4.3; nextOf leaves out a --rebuild that would trash). */
+function runWords(i: Pick<DryRunInput, "selectors" | "only" | "upstream" | "from" | "rebuild">): string[] {
   return [
     "croft run", ...selectorWords(i.selectors), ...(i.only ? ["--only"] : []), ...(i.upstream ? ["--upstream"] : []),
-    ...(i.from !== undefined ? [`--from ${i.from}`] : []),
+    ...(i.from !== undefined ? [`--from ${i.from}`] : []), ...(i.rebuild ? ["--rebuild"] : []),
   ];
 }
 
@@ -401,6 +428,10 @@ export function confirmationWords(c: DryRunConfirmation): string {
   const n = c.impact.rows.toLocaleString("en-US");
   if (c.action === "allow_shrink") {
     return `needs confirmation if the source returns less than half: the current ${n} rows go to the trash first`;
+  }
+  if (c.action === "rebuild") {
+    const then = rebuildWords(rebuildKindOf(c.impact), c.impact.estimatedRequests !== undefined ? { estimatedRequests: c.impact.estimatedRequests } : {});
+    return `needs confirmation: ${c.impact.rows > 0 ? `its ${n} rows go to the trash first, then ${then}` : then}`;
   }
   return `needs confirmation: about ${n} input rows to process, and its code makes requests for them (LARGE_REPROCESS)`;
 }

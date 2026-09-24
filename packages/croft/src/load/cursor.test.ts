@@ -43,6 +43,23 @@ describe("cursor type", () => {
     expect(thrown(() => resolveCursorType({ field: "updated_at", columnType: "TIMESTAMPTZ", unit: "s" })).code).toBe("CURSOR_TYPE_MISMATCH");
   });
 
+  // A cursor type that changed, or a saved position the field cannot have written, is fixed by reverting the change,
+  // or by a refetch from scratch with the new field (§8 "Backfills": --rebuild), which trashes and asks first.
+  test("a changed cursor type or an unreadable saved position: revert, or refetch from scratch with --rebuild", () => {
+    const changed = thrown(() => resolveCursorType({ field: "id", columnType: "VARCHAR", saved: "integer", asset: "events" }));
+    expect(changed.problem.hint).toBe("revert the change to the cursor field (its type is fixed by the first load), "
+      + "or refetch the ingest from scratch with the new type: croft run events --rebuild (its table goes to the trash first, after confirmation)");
+    // Without the asset's name the command keeps its placeholder.
+    expect(thrown(() => resolveCursorType({ field: "id", columnType: "VARCHAR", saved: "integer" })).problem.hint).toContain("croft run <asset> --rebuild");
+    for (const f of [
+      () => renderSince("abc", { type: "integer", asset: "events", field: "seq" }),
+      () => renderSince("not a time", { type: "timestamp", asset: "events", field: "at" }),
+    ]) {
+      expect(thrown(f).problem.hint).toBe("the saved position was not written by this cursor field; revert the change to the cursor field, "
+        + "or refetch the ingest from scratch: croft run events --rebuild (its table goes to the trash first, after confirmation)");
+    }
+  });
+
   test("validate reports lookback and unit misuse as CURSOR_TYPE_MISMATCH", () => {
     const codes = (o: Parameters<typeof validateCursorSpec>[0]) => validateCursorSpec(o).map((p) => [p.code, p.message]);
     expect(codes({ asset: "a", field: "id", type: "integer", lookbackMs: DAY })).toEqual([
@@ -280,6 +297,8 @@ describe("typed maximum in DuckDB", () => {
       e = err;
     }
     expect((e as CroftError).code).toBe("CURSOR_TYPE_MISMATCH");
+    expect((e as CroftError).problem.hint).toBe("the cursor field's type changed after the first load; revert the change to the cursor field, "
+      + "or refetch the ingest from scratch with the new type: croft run <asset> --rebuild (its table goes to the trash first, after confirmation)");
   });
 
   test("SINCE_IGNORED compares typed values, epoch numbers included", async () => {

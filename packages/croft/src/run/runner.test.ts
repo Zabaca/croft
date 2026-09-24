@@ -384,6 +384,252 @@ describe("the shrink guard and --allow-shrink", () => {
   });
 });
 
+describe("--rebuild (§4.1, §6 destructive operations, §8)", () => {
+  const issues = (ids: number[]) => ids.map((id) => ({ id, title: `t${id}`, updated_at: `2026-09-0${id}T10:00:00Z` }));
+  const g = globalThis as Record<string, unknown>;
+
+  test("an ingest: off a TTY it asks before fetching (exit 5); the token run trashes the table, then refetches from scratch", async () => {
+    api.state.issues = issues([1, 2, 3]);
+    const root = makeProject({ "assets/issues.ts": keysetIssues(api.url) });
+    expect((await runIn(root, ["issues"])).exit).toBe(0);
+    // The source lost issue 1 and gained issue 4: a refetch from scratch is the only thing that drops issue 1.
+    api.state.issues = issues([2, 3, 4]);
+    api.state.log.length = 0;
+    const asked = await runIn(root, ["issues"], { rebuild: true });
+    expect(asked.exit).toBe(5);
+    expect(asked.confirmation).toMatchObject({
+      command: "croft run issues --rebuild", impact: { asset: "issues", action: "ingest; --rebuild refetches from scratch", rows: 3, downstream: [] },
+    });
+    expect(asked.confirmation!.impact.trashPath).toContain(join(".croft", "trash", "issues"));
+    const token = asked.confirmation!.token;
+    expect(asked.data.steps[0]).toMatchObject({ status: "skipped", reason: "needs confirmation" });
+    expect(asked.data.steps[0]!.skippedBecause).toBe(`issues: its 3 rows would go to the trash, then it would be fetched from scratch; confirmation ${token} is waiting for a human`);
+    const p = asked.problems.find((x) => x.code === "CONFIRMATION_REQUIRED")!;
+    expect(p).toMatchObject({
+      asset: "issues", effect: "nothing was changed", fix: { kind: "manual", requiresHuman: true },
+      message: "needs confirmation (--rebuild): the 3 rows of issues go to the trash, then it is fetched from scratch",
+      details: { token, rows: 3 },
+    });
+    expect(p.hint).toBe(`the old table stays in the trash (.croft/trash/issues/); ask the user, and only if they agree: croft confirm ${token} (valid 15 min)`);
+    // Destructive commands never appear in next (§4.3).
+    expect(asked.next.some((n) => n.command.includes("--rebuild") || n.command.includes("confirm"))).toBe(false);
+    expect(api.state.log).toEqual([]);                      // nothing fetched before the yes
+    expect(listTrash(join(root, ".croft"))).toEqual([]);
+    expect(await rows(root, "select id::INT id from issues order by id")).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
+
+    const done = await runIn(root, ["issues"], { rebuild: true, confirmToken: token });
+    expect(done.exit).toBe(0);
+    expect(done.confirmation).toBeUndefined();
+    const step = done.data.steps[0]!;
+    expect(step).toMatchObject({ status: "ok", rows: { added: 3, total: 3 }, trashed: { rows: 3 } });
+    expect(step.reason).toBe("requested; from scratch (--rebuild)");
+    expect(step.created).toBeDefined();                      // a new table
+    expect(api.state.log[0]!.query.since).toBeUndefined();   // no cursor: from the start
+    expect(await rows(root, "select id::INT id from issues order by id")).toEqual([{ id: 2 }, { id: 3 }, { id: 4 }]);
+    const trash = listTrash(join(root, ".croft"), "issues");
+    expect(trash).toEqual([expect.objectContaining({ rows: 3, path: step.trashed!.path, reason: `run --rebuild (${done.data.runId})` })]);
+    // The version in the trash keeps its rows and its cursor, for croft restore.
+    const t = await DuckDBInstance.create(trash[0]!.path, { access_mode: "READ_ONLY" });
+    const c = await t.connect();
+    try {
+      expect((await c.runAndReadAll("select count(*)::INT n from issues")).getRowObjectsJS()).toEqual([{ n: 3 }]);
+      expect((await c.runAndReadAll("select cursor_value from _croft.assets")).getRowObjectsJS()).toEqual([{ cursor_value: "2026-09-03T10:00:00Z" }]);
+    } finally {
+      c.disconnectSync();
+      t.closeSync();
+    }
+    // The cursor starts again from what the refetch saw; the write history is kept.
+    const db = runsDb(root);
+    try {
+      expect(getCatalog(db, "issues")?.cursor?.value).toBe("2026-09-04T10:00:00Z");
+    } finally {
+      db.close();
+    }
+    expect(await rows(root, "select count(*)::INT n from _croft.writes where asset = 'issues'")).toEqual([{ n: 2 }]);
+    const log = readFileSync(logPath(join(root, ".croft"), done.data.runId, "issues"), "utf8");
+    expect(log).toContain("--rebuild confirmed: moving the current 3 rows of issues to the trash first");
+    // A spent token is stale.
+    const again = await runIn(root, ["issues"], { rebuild: true, confirmToken: token });
+    expect(again.data.steps[0]!.error?.code).toBe("CONFIRMATION_STALE");
+    expect(listTrash(join(root, ".croft"), "issues")).toHaveLength(1);
+  });
+
+  test("on a TTY it asks y/N first; no changes nothing, yes rebuilds", async () => {
+    api.state.issues = issues([1, 2]);
+    const root = makeProject({ "assets/issues.ts": keysetIssues(api.url), "assets/open.sql": "select id, title from issues\n" });
+    await runIn(root, ["issues"]);
+    const questions: string[] = [];
+    const no = await runIn(root, ["issues"], { rebuild: true, interactive: true, prompt: async (q) => (questions.push(q), false) });
+    expect(questions).toEqual([
+      "issues: its 2 rows go to the trash (.croft/trash/issues/), then it is fetched from scratch\n  then: open update\nProceed? [y/N] ",
+    ]);
+    expect(no.exit).toBe(5);
+    expect(no.data.steps[0]!.error).toMatchObject({
+      code: "CONFIRMATION_REQUIRED", effect: "nothing was changed",
+      message: "issues was not rebuilt: its 2 rows would go to the trash, then it would be fetched from scratch, and that needs a yes",
+      hint: "nothing was changed; to fetch only what is new, run it without --rebuild: croft run issues",
+    });
+    expect(no.data.steps.find((s) => s.asset === "open")).toMatchObject({ status: "skipped" });
+    expect(listTrash(join(root, ".croft"))).toEqual([]);
+    const yes = await runIn(root, ["issues"], { rebuild: true, interactive: true, prompt: async () => true });
+    expect(yes.exit).toBe(0);
+    expect(yes.data.steps[0]).toMatchObject({ status: "ok", trashed: { rows: 2 } });
+    expect(yes.data.steps.find((s) => s.asset === "open")).toMatchObject({ status: "ok" });
+  });
+
+  test("nothing to trash (never built): no confirmation; it is built as a first load", async () => {
+    api.state.issues = issues([1]);
+    const root = makeProject({ "assets/issues.ts": keysetIssues(api.url) });
+    const first = await runIn(root, ["issues"], { rebuild: true });
+    expect(first.exit).toBe(0);
+    expect(first.confirmation).toBeUndefined();
+    expect(first.data.steps[0]).toMatchObject({ status: "ok", rows: { total: 1 } });
+    expect(first.data.steps[0]!.trashed).toBeUndefined();
+    expect(listTrash(join(root, ".croft"))).toEqual([]);
+  });
+
+  test("names only, and not with --from or --allow-shrink: USAGE_ERROR before a run exists", async () => {
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones"), "assets/issues.ts": keysetIssues(api.url) });
+    await expect(runIn(root, [], { rebuild: true })).rejects.toMatchObject({ code: "USAGE_ERROR" });
+    await expect(runIn(root, ["z*"], { rebuild: true })).rejects.toMatchObject({ code: "USAGE_ERROR" });
+    await expect(runIn(root, ["issues"], { rebuild: true, from: "-1d" })).rejects.toMatchObject({
+      code: "USAGE_ERROR", problem: { message: "--rebuild and --from do not go together" },
+    });
+    await expect(runIn(root, ["zones"], { rebuild: true, allowShrink: true })).rejects.toMatchObject({
+      code: "USAGE_ERROR", problem: { message: "--rebuild and --allow-shrink do not go together" },
+    });
+    // Refused before the run exists: no run is recorded.
+    if (existsSync(join(root, ".croft", "runs.sqlite"))) {
+      const db = runsDb(root);
+      try {
+        expect(db.listRuns()).toEqual([]);
+      } finally {
+        db.close();
+      }
+    }
+  });
+
+  // §6: "These do not need confirmation, because they are recomputable: run --rebuild of a SQL or full-refresh TS
+  // transform".
+  test("an SQL or full-refresh TS transform: recomputed with no confirmation and nothing in the trash", async () => {
+    api.state.issues = issues([1, 2]);
+    const report = `import { transform } from "@zabaca/croft";
+export default transform({ inputs: ["issues"], key: "id", async *rows({ rows }) { for await (const r of rows("issues")) yield { id: r.id }; } });
+`;
+    const root = makeProject({ "assets/issues.ts": keysetIssues(api.url), "assets/open.sql": "select id, title from issues\n", "assets/report.ts": report });
+    await runIn(root, ["issues", "open", "report"]);
+    const out = await runIn(root, ["open", "report"], { rebuild: true });
+    expect(out.exit).toBe(0);
+    expect(out.confirmation).toBeUndefined();
+    expect(out.data.steps.map((s) => [s.asset, s.status, s.reason, s.rows.total, s.trashed])).toEqual([
+      ["open", "ok", "requested; from scratch (--rebuild)", 2, undefined],
+      ["report", "ok", "requested; from scratch (--rebuild)", 2, undefined],
+    ]);
+    expect(listTrash(join(root, ".croft"))).toEqual([]);
+  });
+
+  test("a file ingest: every file loads again, as on a first load (no file list)", async () => {
+    const root = makeProject({
+      "assets/sales.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ file: "files/sales/*.csv", incremental: true, key: "order_id" });\n`,
+      "files/sales/a.csv": "order_id,amount\n1,10\n2,20\n",
+    });
+    expect((await runIn(root, ["sales"])).data.steps[0]).toMatchObject({ status: "ok", rows: { added: 2 } });
+    // No file changed: a plain run loads nothing.
+    expect((await runIn(root, ["sales"])).data.steps[0]).toMatchObject({ status: "unchanged" });
+    const out = await runIn(root, ["sales"], { rebuild: true, interactive: true, prompt: async () => true });
+    expect(out.exit).toBe(0);
+    expect(out.data.steps[0]).toMatchObject({ status: "ok", rows: { added: 2, total: 2 }, trashed: { rows: 2 } });
+    expect(out.data.steps[0]!.csvHeader).toMatchObject({ header: true });
+  });
+
+  // §6: "run --rebuild of an incremental TS transform, or LARGE_REPROCESS: may spend money; trash first (rebuild only)".
+  test("an incremental TS transform: one confirmation covers the trash and the cost guard; positions reset, every row runs again", async () => {
+    api.state.issues = issues([1, 2, 3]);
+    api.state.zones = [{ zone: 1 }];
+    const triage = `import { transform } from "@zabaca/croft";
+const g = globalThis as any;
+export default transform({
+  inputs: ["issues"], key: "id", incremental: true, confirmAbove: 2,
+  async *rows({ newRows, http }) {
+    for await (const r of newRows("issues")) {
+      await http.get("${api.url}/zones");
+      yield { id: r.id, label: (g.__rb_label ?? "v1") + ":" + r.title };
+    }
+  },
+});
+`;
+    const root = makeProject({ "assets/issues.ts": keysetIssues(api.url), "assets/triage.ts": triage });
+    // The first build is over confirmAbove too: a person said yes on the terminal.
+    expect((await runIn(root, ["issues", "triage"], { interactive: true, prompt: async () => true })).exit).toBe(0);
+    api.state.issues = issues([1, 2, 3, 4]);
+    expect((await runIn(root, ["issues", "triage"])).data.steps.find((s) => s.asset === "triage")).toMatchObject({ status: "ok", requests: 1 });
+    g.__rb_label = "v2";
+    try {
+      api.state.log.length = 0;
+      const asked = await runIn(root, ["triage"], { rebuild: true });
+      expect(asked.exit).toBe(5);
+      expect(asked.confirmation).toMatchObject({
+        command: "croft run triage --rebuild",
+        impact: { asset: "triage", action: "incremental transform; --rebuild processes every input row again", rows: 4, downstream: [], estimatedRequests: 4 },
+      });
+      expect(asked.problems.find((x) => x.code === "CONFIRMATION_REQUIRED")!.message)
+        .toBe("needs confirmation (--rebuild): the 4 rows of triage go to the trash, then every input row is processed again (about 4, and its code makes requests for them)");
+      expect(api.state.log).toEqual([]);
+      // One token: the cost guard does not ask again once the rebuild was confirmed.
+      const done = await runIn(root, ["triage"], { rebuild: true, confirmToken: asked.confirmation!.token });
+      expect(done.exit).toBe(0);
+      expect(done.confirmation).toBeUndefined();
+      expect(done.data.steps[0]).toMatchObject({ status: "ok", requests: 4, rows: { in: 4, added: 4, total: 4 }, trashed: { rows: 4 } });
+      expect(await rows(root, "select label from triage order by id")).toEqual(["v2:t1", "v2:t2", "v2:t3", "v2:t4"].map((label) => ({ label })));
+      expect(listTrash(join(root, ".croft"), "triage")).toHaveLength(1);
+      // Its positions start again from the rebuild: nothing is pending now.
+      expect((await runIn(root, ["triage"])).data.steps[0]).toMatchObject({ status: "ok", rows: { in: 0 } });
+    } finally {
+      delete g.__rb_label;
+    }
+  });
+
+  test("a refetch that fails after the reset leaves the asset never built; the old rows are in the trash, and a plain run builds it again", async () => {
+    const root = makeProject({ "assets/flaky.ts": simpleGet(api.url, "/flaky", `\n  key: "id",\n  retries: 0,`) });
+    api.state.failures = 0;
+    expect((await runIn(root, ["flaky"])).exit).toBe(0);
+    api.state.failures = 10;
+    const out = await runIn(root, ["flaky"], { rebuild: true, interactive: true, prompt: async () => true });
+    api.state.failures = 0;
+    expect(out.exit).toBe(1);
+    const step = out.data.steps[0]!;
+    expect(step).toMatchObject({ status: "failed", trashed: { rows: 2 }, error: { code: "HTTP_ERROR" } });
+    expect(step.error!.effect).toStartWith(`flaky was reset for --rebuild before this failure: its previous 2 rows are in the trash (${step.trashed!.path}); croft run flaky builds it again`);
+    expect(await rows(root, "select count(*)::INT n from duckdb_tables() where table_name = 'flaky'")).toEqual([{ n: 0 }]);
+    const db = runsDb(root);
+    try {
+      expect(getCatalog(db, "flaky")).toBeNull();
+    } finally {
+      db.close();
+    }
+    const again = await runIn(root, ["flaky"]);
+    expect(again.exit).toBe(0);
+    expect(again.data.steps[0]).toMatchObject({ status: "ok", rows: { total: 2 } });
+  });
+
+  test("two rebuilds that each need a yes: one token per run; the other is skipped naming its command, never in next", async () => {
+    api.state.issues = issues([1, 2]);
+    api.state.zones = [{ zone: 1 }, { zone: 2 }];
+    const root = makeProject({ "assets/issues.ts": keysetIssues(api.url), "assets/zones.ts": simpleGet(api.url, "/zones") });
+    await runIn(root, ["issues", "zones"]);
+    const out = await runIn(root, ["issues", "zones"], { rebuild: true });
+    expect(out.exit).toBe(5);
+    const asked = out.confirmation!.impact.asset;
+    const other = asked === "issues" ? "zones" : "issues";
+    const skipped = out.data.steps.find((s) => s.asset === other)!;
+    expect(skipped.status).toBe("skipped");
+    expect(skipped.skippedBecause).toBe(`${other} needs a confirmation too (--rebuild would move its table to the trash and build it from scratch); `
+      + `croft asks for one at a time, so run it after confirmation ${out.confirmation!.token} is settled: croft run ${other} --rebuild`);
+    expect(out.next.some((n) => n.command.includes("--rebuild"))).toBe(false);
+    expect(listTrash(join(root, ".croft"))).toEqual([]);
+  });
+});
+
 describe("types across runs", () => {
   test("big integers reach DuckDB exactly through ctx.http's lossless JSON", async () => {
     api.state.raw = `[{"id": 1, "big": 12345678901234567890}, {"id": 2, "big": 9007199254740993}]`;
@@ -545,7 +791,7 @@ export default ingest({
     api.state.zones = [{ zone: 1 }];
     const root = makeProject({ "assets/report.sql": "select 1 as x\n", "assets/issues.ts": keysetIssues(api.url), "assets/zones.ts": simpleGet(api.url, "/zones") });
     await expect(runIn(root, ["report"], { from: "-7d" })).rejects.toMatchObject({
-      code: "BACKFILL_UNSUPPORTED", problem: { hint: "transforms are rebuilt from their inputs; there is nothing to backfill: croft run report" },
+      code: "BACKFILL_UNSUPPORTED", problem: { hint: "use croft run report --rebuild: a transform is recomputed from its inputs", fix: { command: "croft run report --rebuild" } },
     });
     // A bare run (or a glob) runs --from where it applies and skips the rest; nothing fails.
     const bare = await runIn(root, [], { from: "-7d" });

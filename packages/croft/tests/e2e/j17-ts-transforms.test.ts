@@ -214,13 +214,14 @@ describe("journey 17: TypeScript transforms that call a paid API", () => {
     expect(d.json.data.inputsSeen.issues.pendingRows).toBe(0);
 
     // A code edit (a new prompt) applies to new input rows only (§8): the 7 rows built by the old prompt are
-    // not paid for again, and status says so without offering a later phase's --rebuild.
+    // not paid for again, and status names the rebuild that would redo them, as a human's decision, never in next.
     p.write("assets/issue_labels.ts", labelsAsset({ llm: llm.url, prompt: "v2" }));
     const st = await p.json(["status"]);
     const edited = findProblem(st.json, "EDITED_SINCE_LAST_RUN");
     expect(edited, show(st)).toBeDefined();
-    expect(edited!.message).toContain("7 rows were built by older code");
-    expect(JSON.stringify(edited)).not.toContain("--rebuild");
+    expect(edited!.message).toContain("7 rows were built by older code; to redo them: croft run issue_labels --rebuild");
+    expect(edited!.fix).toMatchObject({ kind: "manual", requiresHuman: true });
+    expect(JSON.stringify(st.json.next)).not.toContain("--rebuild");
     const afterEdit = await p.json(["run"]);
     expect(afterEdit.code, show(afterEdit)).toBe(0);
     expect(llm.total()).toBe(8);
