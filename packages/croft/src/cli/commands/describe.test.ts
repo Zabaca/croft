@@ -1,5 +1,8 @@
 import { afterAll, describe, expect, test } from "bun:test";
+import { renameSync } from "node:fs";
+import { join } from "node:path";
 import { putCatalog } from "../../history/catalog.ts";
+import { tsFingerprint } from "../../project/ts-asset.ts";
 import { cleanup as cleanupChildren, spawnHolder } from "../../read/testkit.ts";
 import { behaviorOf, capValue, checksOf, DESCRIBE_TIMING, durationWords, loadConfigs, staticSecrets, type AssetConfig } from "./describe.ts";
 import {
@@ -501,5 +504,37 @@ describe("helpers", () => {
     const long = capValue({ k: "y".repeat(100) }, { full: false, redact, width: 10 });
     expect(long).toEqual({ value: `{"k":"yyy…`, cut: 1, redacted: false });
     expect(capValue("x".repeat(100), { full: true, redact }).cut).toBe(0);
+  });
+});
+
+describe("ASSET_RENAMED: a file renamed outside croft (§6)", () => {
+  /** github_issues built with the code of its file (the hash a run records), then its file renamed to tickets.ts. */
+  async function renamedOutside() {
+    const p = await issues();
+    const hash = await tsFingerprint(join(p.root, "assets/github_issues.ts"), p.project);
+    const db = runsDb(p.stateDir);
+    putCatalog(db, { ...ISSUES_CATALOG, codeHash: hash });
+    db.close();
+    renameSync(join(p.root, "assets/github_issues.ts"), join(p.root, "assets/tickets.ts"));
+    return p;
+  }
+
+  test("the new name: ASSET_RENAMED with croft rename as the fix, and no croft run next", async () => {
+    const p = await renamedOutside();
+    const r = await cli(["describe", "tickets", "--json"], { cwd: p.root, env: ENV });
+    expect(r.exit).toBe(2);   // a project error, as a broken asset file is
+    expect(r.json.data).toMatchObject({ asset: "tickets", file: "assets/tickets.ts", rows: null });
+    expect(r.json.problems).toEqual([expect.objectContaining({
+      code: "ASSET_RENAMED", asset: "tickets", file: "assets/tickets.ts",
+      fix: { kind: "command", description: "adopt github_issues's table and state as tickets", command: "croft rename github_issues tickets" },
+    })]);
+    expect(r.json.next.map((n: { command: string }) => n.command)).not.toContain("croft run tickets");
+  });
+
+  test("the old name: ASSET_RENAMED instead of ORPHAN_TABLE's manual fix", async () => {
+    const p = await renamedOutside();
+    const r = await cli(["describe", "github_issues", "--json"], { cwd: p.root, env: ENV });
+    expect(r.json.problems.map((x: { code: string }) => x.code)).toEqual(["ASSET_RENAMED"]);
+    expect(r.json.problems[0].fix.command).toBe("croft rename github_issues tickets");
   });
 });

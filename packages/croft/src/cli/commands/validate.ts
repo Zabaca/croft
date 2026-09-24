@@ -5,7 +5,9 @@
 //    shapes, ASSET_OPENS_DATABASE, TRANSFORM_MAKES_REQUESTS, SCHEDULE_INVALID, checks, CYCLE), plus what only
 //    the whole project shows: a TS transform's input that is no asset (UNKNOWN_TABLE), an incremental
 //    transform's newRows() input without a key (INPUT_NEEDS_KEY) and declared secrets that are not set
-//    (SECRET_MISSING, a warning: nothing fails until the asset runs, as in doctor).
+//    (SECRET_MISSING, a warning: nothing fails until the asset runs, as in doctor). An asset never built whose code
+//    built an orphan table (a file renamed outside croft), or a croft rename that stopped, is ASSET_RENAMED, with
+//    `croft rename <old> <new>` as the fix (project/rename.ts findRenamed; the catalog mirror and code hashes).
 // 2. The bind check (sql/bind.ts ShadowCatalog), over empty tables in an in-memory DuckDB:
 //    - every table the catalog mirror (runs.sqlite) knows is defined from its cached columns, _loaded_at and
 //      _file included, and its pending columns (all NULL so far) are passed for NULL_ONLY_COLUMN; a table never
@@ -169,16 +171,19 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
   })));
   const order = runOrder(graph, resolved.assets);
 
+  const renamed = await renamedAssets(i.project, catalog, byName);
   const problems: Problem[] = [
     ...resolved.problems.filter((p) => p.code !== "CYCLE"),
     ...cycles.filter((p) => selected.size === byName.size || cycleNames(p).some((n) => selected.has(n))),
+    // A rename that stopped before its new file exists belongs to no asset: the whole project reports it.
+    ...(selected.size === byName.size ? renamed.filter((p) => !byName.has(p.asset!)) : []),
   ];
   const assets: ValidateAsset[] = [];
   for (const name of order) {
     const a = byName.get(name);
     if (!a || !selected.has(name)) continue;
     const own = a.problems.filter((p) => !(bound.quoted.has(name) && p.code === "SQL_SYNTAX"));
-    problems.push(...[...own, ...staticProblems(a, byName, root, i.env), ...(bound.problems.get(name) ?? [])]
+    problems.push(...[...own, ...renamed.filter((p) => p.asset === name), ...staticProblems(a, byName, root, i.env), ...(bound.problems.get(name) ?? [])]
       .map((p) => (p.asset ? p : { ...p, asset: name })));
     const built = live.get(name);
     assets.push({
@@ -215,6 +220,25 @@ function readCatalog(stateDir: string): CatalogAsset[] {
     return [];
   } finally {
     db?.close();
+  }
+}
+
+/**
+ * ASSET_RENAMED (§6 "Nothing implicit destroys ingested data"): an asset never built whose code hash is an orphan
+ * table's (its file was renamed outside croft), or a croft rename that stopped (project/rename.ts findRenamed, from
+ * the mirror and the hashes resolveProject already has). Each problem's asset is the new name; its fix adopts the
+ * table (`croft rename <old> <new>`), where running the new asset would fetch everything again.
+ */
+async function renamedAssets(project: ValidateInput["project"], catalog: readonly CatalogAsset[], byName: ReadonlyMap<string, ResolvedAsset>): Promise<Problem[]> {
+  const { findRenamed, renamedProblem } = await import("../../project/rename.ts");
+  const codeHash = (n: string) => {
+    const a = byName.get(n);
+    return a && a.loaded ? a.codeHash ?? null : undefined;
+  };
+  try {
+    return (await findRenamed(project.root, { project, catalog, codeHash })).map(renamedProblem);
+  } catch {
+    return [];   // a detection that cannot read the project reports nothing; the checks above still stand
   }
 }
 

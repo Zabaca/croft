@@ -22,6 +22,10 @@
 // SCHEDULER_STALE (a warning, with the likely cause and the tick log) says the scheduler has not ticked for 3
 // minutes while on.
 //
+// ASSET_RENAMED (§6, project/rename.ts findRenamed): an asset never built whose code hash is an orphan table's (its
+// file was renamed outside croft), or a croft rename that stopped, is a problem with the fix `croft rename <old>
+// <new>`, and both rows say so instead of "never run (croft run …)", since a run would fetch everything again.
+//
 // `status` exits 0 because the command worked; `--check` exits 1 when anything is failed, crashed, held or
 // stale (the scheduler included), which makes it a health probe. In JSON, ok always means "the command worked" and data.healthy
 // carries health.
@@ -540,6 +544,7 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       if (changed) out.schemaChangedAt = zoned(changed, tz)!;
       return out;
     });
+    const renamed = await renamedProblems(project, discovery.assets, catalog, resolved ? definitions : null);
     const healthy = !missing && !rec.stale && !assets.some((a) => FAILED.has(a.status) || a.held || a.stale);
     const recentSteps = db
       ? db.listRuns({ since: new Date(now.getTime() - 7 * DAY_MS), limit: 200 }).flatMap((r) => db.stepsFor(r.id))
@@ -557,7 +562,7 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       if (copy) data.readCopy = copy;
     }
     // resolveProject's problems are discovery's (all of them: no selectors) and CYCLE.
-    const problems = [...(missing ? [missing] : []), ...(resolved ? resolved.problems : discovery.problems), ...resolution.problems];
+    const problems = [...(missing ? [missing] : []), ...(resolved ? resolved.problems : discovery.problems), ...resolution.problems, ...renamed];
     // The scheduler: stale (the diagnosis reads files only: no launchctl or crontab here), then the held assets.
     const schedulingProblems: Problem[] = [];
     if (rec.stale) {
@@ -571,6 +576,42 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
   } finally {
     db?.close();
   }
+}
+
+/**
+ * ASSET_RENAMED (DESIGN.md §6 "Nothing implicit destroys ingested data"): a never-built asset whose code built an
+ * orphan table (its file was renamed outside croft), or a croft rename that stopped (project/rename.ts findRenamed).
+ * The fix is `croft rename <orphan> <new>`, never a run, which would fetch everything again. From what status has
+ * read (the files, the mirror, the resolved code hashes; `definitions` null: hashed without importing). Never fails
+ * status.
+ */
+export async function renamedProblems(project: Project, discovered: readonly DiscoveredAsset[], catalog: readonly CatalogAsset[],
+  definitions: ReadonlyMap<string, ResolvedAsset> | null): Promise<Problem[]> {
+  try {
+    const { findRenamed, renamedProblem } = await import("../../project/rename.ts");
+    const codeHash = definitions ? (n: string) => {
+      const d = definitions.get(n);
+      return d && d.loaded ? d.codeHash ?? null : undefined;
+    } : undefined;
+    return (await findRenamed(project.root, { project, discovered, catalog, ...(codeHash ? { codeHash } : {}) })).map(renamedProblem);
+  } catch {
+    return [];
+  }
+}
+
+/** A renamed asset as a row of `croft status` shows it (both its names), from the ASSET_RENAMED problems. */
+export interface RenamedRow { from: string; to: string; unfinished: boolean }
+
+export function renamedRows(problems: readonly Problem[] | undefined): Map<string, RenamedRow> {
+  const out = new Map<string, RenamedRow>();
+  for (const p of problems ?? []) {
+    const d = p.details;
+    if (p.code !== "ASSET_RENAMED" || typeof d?.from !== "string" || typeof d?.to !== "string") continue;
+    const row = { from: d.from, to: d.to, unfinished: d.unfinished === true };
+    out.set(row.from, row);
+    out.set(row.to, row);
+  }
+  return out;
 }
 
 /** The stale assets a run would update for a reason other than never having been built (a never-run asset
@@ -633,10 +674,12 @@ export function statusNext(assets: readonly StatusAsset[]): Next[] {
   return next;
 }
 
-/** The STATUS column: the state plus the notes that matter (§4.2). */
-export function statusText(a: StatusAsset, now: Date): string {
+/** The STATUS column: the state plus the notes that matter (§4.2). `renamed`: the asset is one name of an
+ *  ASSET_RENAMED pair, whose row says `croft rename`, never `croft run` (a run would fetch everything again). */
+export function statusText(a: StatusAsset, now: Date, renamed?: RenamedRow): string {
   const notes: string[] = [];
   let head: string;
+  const rename = renamed ? `croft rename ${renamed.from} ${renamed.to}` : "";
   switch (a.status) {
     case "failed":
     case "crashed":
@@ -660,6 +703,13 @@ export function statusText(a: StatusAsset, now: Date): string {
       break;
     default:
       head = "ok";
+  }
+  if (renamed) {
+    const words = renamed.unfinished ? `the rename of ${renamed.from} to ${renamed.to} did not finish`
+      : a.asset === renamed.to ? `looks like ${renamed.from} renamed` : `looks renamed to ${renamed.to}`;
+    if (a.status === "never_run") head = `never run: ${words} (${rename})`;
+    else if (a.status === "no_asset_file") head = `no asset file: ${words} (${rename})`;
+    else notes.push(`${words} (${rename})`);
   }
   // Held from the scheduler (§6): on a healthy row it is the state, with the run that releases it.
   if (a.held && a.hold) {
@@ -700,12 +750,13 @@ export function formatStatus(d: StatusData, now: Date, o: { tz?: string; problem
   if (d.assets.length === 0) {
     return ["No assets yet: add one to assets/ (croft docs ingest has templates), then croft run <asset>.", schedulingLine(d, now, tz), ...tail].join("\n");
   }
+  const renamed = renamedRows(o.problems);
   const rows = d.assets.map((a) => [
     a.asset,
     a.rows === null ? "—" : formatCount(a.rows),
     a.lastRun ? ago(a.lastRun.at, now) : "—",
     nextText(a.next, tz, now),
-    statusText(a, now),
+    statusText(a, now, renamed.get(a.asset)),
   ]);
   const lines = [table(["ASSET", "ROWS", "LAST RUN", "NEXT", "STATUS"], rows, { limit: Infinity, maxWidth: 200 }).text];
   for (const r of d.running) {

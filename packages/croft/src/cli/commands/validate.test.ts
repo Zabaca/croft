@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tsconfigJson } from "../../agent/templates.ts";
 import { type CatalogAsset, type CatalogColumn, putCatalog } from "../../history/catalog.ts";
@@ -588,5 +588,25 @@ describe("--types", () => {
       { file: "lib/b.ts", line: 10, column: 1, severity: "error", code: "TS2345", message: "Argument of type 'X' is not assignable to parameter of type 'Y'.\nProperty 'z' is missing in type 'X'." },
       { severity: "error", code: "TS5083", message: "Cannot read file '/x/tsconfig.json'." },
     ]);
+  });
+});
+
+describe("ASSET_RENAMED (§6): a file renamed outside croft", () => {
+  test("a never-built asset with an orphan table's code is an error whose fix is croft rename; other code is not", async () => {
+    const p = makeProject({ files: { "assets/daily.sql": "-- key: d\nSELECT 1 AS d\n", "assets/other.sql": "SELECT 2 AS d\n" } });
+    const hash = (await resolveProject({ root: p.root, timezone: p.project.timezone })).assets.find((a) => a.name === "daily")!.codeHash!;
+    catalog(p, [{ ...ISSUES_BUILT, asset: "daily", kind: "sql", write: "replace", key: ["d"], cursor: null, columns: [col("d", "INTEGER")], codeHash: hash, rows: 7 }]);
+    renameSync(join(p.root, "assets/daily.sql"), join(p.root, "assets/per_day.sql"));
+
+    const r = await cli(["validate", "--json"], { cwd: p.root });
+    expect(r.exit).toBe(2);
+    expect(r.json.problems).toEqual([expect.objectContaining({
+      severity: "error", code: "ASSET_RENAMED", asset: "per_day", file: "assets/per_day.sql",
+      message: "assets/per_day.sql has never been built, and its code is the code that built daily (7 rows), whose asset file is gone: daily was renamed outside croft",
+      fix: { kind: "command", description: "adopt daily's table and state as per_day", command: "croft rename daily per_day" },
+    })]);
+    // Only for the selection.
+    expect((await cli(["validate", "other", "--json"], { cwd: p.root })).json.problems).toEqual([]);
+    expect((await cli(["validate", "per_day", "--json"], { cwd: p.root })).json.problems.map((x: { code: string }) => x.code)).toEqual(["ASSET_RENAMED"]);
   });
 });
