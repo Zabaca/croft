@@ -1,7 +1,9 @@
 // Running checks (DESIGN.md §3f): blocking ones inside the write transaction, after the write and before
 // commit, where a failure rolls back data, schema changes and cursor together [V]; warnings after commit,
 // recorded. Scope: `not_null` and row rules cover the rows this write changed (the batch), `unique` and
-// `min_rows` the whole table; a check whose text changed since the last run covers the whole table once.
+// `min_rows` the whole table; a check whose text changed since the last run covers the whole table once. An
+// incremental TS transform commits in chunks: min_rows applies once its run has finished, at the last chunk
+// (ChunkCheckContext).
 // CHECK_FAILED details are {check, failing, sample}: 20 sample rows collected, 3 rendered.
 //
 // Also in the details: `checked` (the rows in scope) and `scope` ("batch" or "table"); a blocking failure adds
@@ -60,17 +62,39 @@ interface Outcome {
   widened?: boolean;
 }
 
+/**
+ * The CheckContext of one chunk of an incremental TS transform (run/transform.ts). A chunk that is not its run's
+ * last is `unfinished`: the table does not hold the run's rows yet, so a check on how many rows the finished
+ * table has (min_rows) waits for the last chunk, and a first build of more rows than one chunk is not refused at
+ * its first chunk. Every other check runs on every chunk, unique included: a chunk that breaks it is refused
+ * before it commits, which a later chunk could not undo.
+ */
+export interface ChunkCheckContext extends CheckContext {
+  unfinished?: boolean;
+}
+
+/** `ctx` for a chunk that is not the last of its run (ChunkCheckContext). */
+export function unfinishedChunk(ctx: CheckContext): ChunkCheckContext {
+  return { ...ctx, unfinished: true };
+}
+
+/** Checks on the finished table's row count, which an unfinished chunk skips. */
+const COUNTS_FINISHED_TABLE = new Set<Check["kind"]>(["min_rows"]);
+
 /** The writeBatch hook (WriteBatchInput.checks, StepInput.checks) for an asset's blocking checks. It throws
- *  CHECK_FAILED, rolling the write back, when one fails, and otherwise returns one result per check. Non-blocking
- *  checks in `checks` are skipped here (runWarnings runs them). */
+ *  CHECK_FAILED, rolling the write back, when one fails, and otherwise returns one result per check it ran.
+ *  Non-blocking checks in `checks` are skipped here (runWarnings runs them), and so is min_rows on an unfinished
+ *  chunk (ChunkCheckContext). */
 export function checksHook(checks: readonly Check[], o: ChecksHookOptions): NonNullable<WriteBatchInput["checks"]> {
   const blocking = checks.filter((c) => c.blocking);
   const identity = identityColumns(checks);
   return async (tx: Sql, ctx: CheckContext): Promise<CheckHookResult> => {
-    if (!blocking.length) return { problems: [], results: [] };
+    const unfinished = (ctx as ChunkCheckContext).unfinished === true;
+    const due = unfinished ? blocking.filter((c) => !COUNTS_FINISHED_TABLE.has(c.kind)) : blocking;
+    if (!due.length) return { problems: [], results: [] };
     const counts = await scopeCounts(tx, ctx.table, ctx.loadedAt);
     const outcomes: Outcome[] = [];
-    for (const c of blocking) {
+    for (const c of due) {
       const whole = c.scope === "table" || isNew(c, o.previous);
       outcomes.push(await evaluate(tx, { asset: ctx.asset, table: ctx.table, loadedAt: ctx.loadedAt, file: o.file }, c, whole, counts));
     }

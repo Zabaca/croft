@@ -8,7 +8,7 @@ import { ingest, transform } from "../index.ts";
 import type { FileIngest, RowsIngest, TransformConfig } from "../types.ts";
 import { discoverAssets } from "./discover.ts";
 import {
-  bundleTs, cursorTypeOfPin, detectRequests, loadTsAsset, loadTsAssets, locateKey, normalizeBundle, opensDatabase,
+  bundleTs, cursorTypeOfPin, detectNewRows, detectRequests, loadTsAsset, loadTsAssets, locateKey, normalizeBundle, opensDatabase,
   packageName, parseDuration, scanImportGraph, stripLiterals, trimStack, tsFingerprint, validateDefinition,
   type ValidateOptions,
 } from "./ts-asset.ts";
@@ -311,12 +311,115 @@ export default transform({
     expect(detectRequests(`let x={https:1};x.httpClient=2;`)).toEqual([]);
   });
 
+  test("detectRequests: LLM SDKs count as requests, scoped families by their scope (the Vercel AI SDK, LangChain, …)", () => {
+    const via = (pkg: string) => detectRequests(`x()`, [pkg]);
+    for (const pkg of [
+      "ai", "ai/rsc", "@ai-sdk/openai", "@ai-sdk/anthropic", "@google/generative-ai", "@google/genai", "@mistralai/mistralai", "@mistralai/anything",
+      "cohere-ai", "groq-sdk", "ollama", "replicate", "langchain", "langchain/chat_models/openai", "@langchain/openai", "@langchain/core",
+      "@huggingface/inference", "@aws-sdk/client-bedrock-runtime", "@aws-sdk/client-bedrock-agent-runtime", "@azure/openai", "together-ai",
+      "@google-cloud/vertexai", "voyageai", "llamaindex", "@anthropic-ai/sdk", "@anthropic-ai/bedrock-sdk",
+    ]) {
+      expect(via(pkg).length).toBe(1);
+    }
+    expect(via("ai")).toEqual(["package ai"]);
+    expect(via("@ai-sdk/openai")).toEqual(["package @ai-sdk/openai"]);
+    // Names that merely look alike make no requests.
+    for (const pkg of ["aim", "ai-utils", "@ai-sdkx/foo", "@aws-sdk/client-s3", "lodash", "@mistral/other"]) expect(via(pkg)).toEqual([]);
+  });
+
+  test("an incremental transform calling the Vercel AI SDK per row makes requests (the cost guard applies)", async () => {
+    const root = project({
+      "assets/triage.ts": `import { transform } from "@zabaca/croft";
+import { generateText } from "ai";
+import { openai } from "@ai-sdk/openai";
+export default transform({
+  inputs: ["github_issues"],
+  key: "issue_id",
+  incremental: true,
+  async *rows({ newRows }) {
+    for await (const r of newRows("github_issues")) {
+      const out = await generateText({ model: openai("gpt-4o-mini"), prompt: String(r.title) });
+      yield { issue_id: r.id, label: out.text };
+    }
+  },
+});
+`,
+    });
+    for (const [pkg, body] of [["ai", "exports.generateText = async () => ({ text: 'x' });"], ["@ai-sdk/openai", "exports.openai = (m) => m;"]] as const) {
+      const dir = join(root, "node_modules", ...pkg.split("/"));
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "package.json"), JSON.stringify({ name: pkg, version: "4.0.0", main: "index.js" }));
+      writeFileSync(join(dir, "index.js"), body);
+    }
+    const a = await load(root, "triage");
+    expect(a.ok).toBe(true);
+    expect(a.usesHttp).toBe(true);
+  });
+
   test("stripLiterals blanks strings, templates, regexes and comments but keeps template expressions", () => {
     expect(stripLiterals(`a("http") + 'x' // http\n/* http */ b`).replace(/\s+/g, " ")).toBe(`a("") + '' b`);
     expect(stripLiterals("`http ${ctx.http} ${`nested ${http}`}`")).toBe("`${ctx.http}${`${http}`}`");
     expect(stripLiterals(`x = /http\\/[a-z/]+/g.test(s); y = a / b / c`)).toBe(`x = /./.test(s); y = a / b / c`);
     expect(stripLiterals(`return /http/.test(u)`)).toBe(`return /./.test(u)`);
     expect(stripLiterals(`{a:1};/http/`)).toBe(`{a:1};/./`);
+  });
+});
+
+describe("which inputs the code reads with newRows() (the cost guard counts only those)", () => {
+  test("detectNewRows: calls with the input's name as a string, through ctx or destructured", () => {
+    expect(detectNewRows(`async*rows({newRows,rows}){for await(let r of newRows("issues"))yield r;for await(let l of rows("labels"))yield l}`)).toEqual(["issues"]);
+    expect(detectNewRows(`async*rows(ctx){for await(let r of ctx.newRows('b'))yield r;for await(let r of ctx.newRows( "a" ))yield r}`)).toEqual(["a", "b"]);
+    expect(detectNewRows(`let{newRows}=ctx;newRows("a");newRows("a")`)).toEqual(["a"]);
+    expect(detectNewRows(`async*rows({rows}){for await(let l of rows("labels"))yield l}`)).toEqual([]);
+    // A string, a comment or a longer name mentioning newRows is not a call.
+    expect(detectNewRows(`renewRows("x");newRowsCount("y")`)).toEqual([]);
+  });
+
+  test("detectNewRows: null (every keyed input counts) whenever the code uses newRows in a way croft cannot follow", () => {
+    for (const code of [
+      `ctx.newRows(name)`,                                  // a computed name
+      `ctx.newRows(\`issues\`)`,                            // a template
+      `ctx.newRows("a" + b)`,                               // an expression
+      `let{newRows:nr}=ctx;nr("a")`,                        // renamed
+      `const f=ctx.newRows;f("a")`,                         // passed around
+      `helper({newRows});`,                                 // handed to code croft does not see
+      `ctx["newRows"]("a")`,                                // named in a string
+      `/* newRows */ x()`,                                  // a mention croft cannot place
+      `ctx.newRows("a\\u0062")`,                            // an escape
+    ]) {
+      expect(detectNewRows(code)).toBeNull();
+    }
+  });
+
+  test("loadTsAsset records them, lib/ helpers included", async () => {
+    const root = project({
+      "assets/triage.ts": `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["issues", "labels"],
+  key: "issue_id",
+  incremental: true,
+  async *rows({ newRows, rows }) {
+    const names = new Map<number, string>();
+    for await (const l of rows<{ id: number; name: string }>("labels")) names.set(l.id, l.name);
+    for await (const r of newRows<{ id: number; label_id: number }>("issues")) yield { issue_id: r.id, label: names.get(r.label_id) ?? null };
+  },
+});
+`,
+      "assets/helped.ts": `import { transform } from "@zabaca/croft";
+import { each } from "../lib/each.ts";
+export default transform({
+  inputs: ["issues"],
+  key: "issue_id",
+  incremental: true,
+  async *rows(ctx) {
+    for await (const r of each(ctx, "issues")) yield { issue_id: r.id };
+  },
+});
+`,
+      "lib/each.ts": `export async function* each(ctx: any, name: string) { for await (const r of ctx.newRows(name)) yield r; }\n`,
+    });
+    expect((await load(root, "triage")).readsNewRows).toEqual(["issues"]);
+    expect((await load(root, "helped")).readsNewRows).toBeNull();
   });
 });
 

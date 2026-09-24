@@ -1,32 +1,40 @@
 // One TS transform step (DESIGN.md §3e, §5 "Transforms", "Cost guard"), on the step contract (step.ts).
 //
-//   state       short read lease: the asset's stored columns, each input's facts (columns, key, last_loaded_at),
-//               and the positions committed so far (_croft.inputs)
+//   state       short read lease: the asset's stored columns, each input's facts (columns, key, last_loaded_at,
+//               version), and the positions committed so far (_croft.inputs)
 //   reuse       a chunk an earlier attempt staged but could not commit (a failed check, a busy database, a crash
-//               before COMMIT), made by the same code from the same positions, is committed first, so the calls
-//               that produced its rows are not made (or paid for) again
+//               before COMMIT), made by the same code with the same checks from the same positions, is committed
+//               first, so the calls that produced its rows are not made (or paid for) again. A chunk its commit
+//               refused for what it holds (CHECK_FAILED, KEY_NULL, …) is reused only while every input is still
+//               at the version it was staged from: once the user corrects the data, the code runs on it again
 //   cost guard  an incremental transform that makes requests and would process more than confirmAbove input
-//               rows (default 1000) asks StepInput.confirm before any of its code runs (LARGE_REPROCESS); the
-//               count is every keyed input's rows after its position, since which inputs the code reads with
-//               newRows() is known only once it runs
+//               rows (default 1000) asks StepInput.confirm before any of its code runs (LARGE_REPROCESS). It
+//               counts the rows after the position of each keyed input the code reads with newRows() (the scan
+//               of ts-asset.ts detectNewRows; every keyed input when the scan cannot tell); a lookup read with
+//               rows() is not processed row by row. An input the scan missed is counted when newRows() first
+//               reads it, before its first row is handed over
 //   extract     NO database lock: rows(ctx) → NDJSON parts (load/stage.ts); ctx.rows/newRows/query read Parquet
 //               snapshots of the inputs through a private DuckDB (run/inputs.ts); ctx.http, ctx.secret, ctx.log;
 //               console output and fds 1 and 2 go to the step log (core/output.ts)
-//   write       the load pipeline of an ingest: buildTypedBatch → writeBatch (kind "ts", the step attempt, the
-//               checks, the input positions in the same transaction) → catalog read-back → runs.sqlite mirror
+//   write       the load pipeline of an ingest: buildTypedBatch → writeBatch (kind "ts", the asset's file, the
+//               step attempt, the checks, the input positions in the same transaction) → catalog read-back →
+//               runs.sqlite mirror
 //
 // Full-refresh transforms commit once, when the code has finished; their newRows() is rows(). Incremental
 // transforms commit in chunks: once a chunk holds 500 rows or has been open 60 s, the next time the code asks
-// newRows() for a row, everything it yielded so far commits with the positions reached (every output of the
-// rows up to there has been yielded by then, inputs.ts), in one transaction with its checks, and the code gets
-// its next row only after that commit. A failure, a timeout or Ctrl-C loses at most the current chunk, and the
-// next run resumes after the last committed position.
+// newRows() for a row, everything it yielded so far commits with the positions of the input rows that count as
+// processed (inputs.ts "Positions": never past a row whose outputs may still be pending), in one transaction with
+// its checks, and the code gets its next row only after that commit. min_rows waits for the last chunk, when the
+// table holds the whole run (checks/run.ts ChunkCheckContext). A failure, a timeout or Ctrl-C loses at most the
+// current chunk, and the next run resumes after the last committed position.
 //
 // CROFT_FAULT kills the process at a named point (crash tests): after_stage, before_commit and
 // after_commit_before_sqlite as for ingests, and mid_chunk halfway through filling the chunk after the first
 // commit of an incremental transform.
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { unfinishedChunk } from "../checks/run.ts";
 import { CroftError, problem } from "../core/errors.ts";
 import { captureOutput, type OutputSink, writeStderr } from "../core/output.ts";
 import type { Confirmation, Impact, Problem, SchemaChange, Sql, StepResult } from "../core/types.ts";
@@ -37,16 +45,14 @@ import type { DuckWarehouse } from "../db/warehouse.ts";
 import { type CatalogAsset, type CatalogBase, getCatalog, putCatalog, readCatalogEntry, readInputsSeen } from "../history/catalog.ts";
 import { createHttp, displayUrl, excerpt, type HttpClient } from "../http/http.ts";
 import { buildTypedBatch } from "../load/cast.ts";
-import type { TypedBatch } from "../load/contract.ts";
-import { isReservedColumn, quoteIdent, readTableSchema, tempRef } from "../load/evolve.ts";
 import { MANIFEST_FILE, readStageManifest, type StageManifestFile, writeStage } from "../load/stage.ts";
 import type { KnownColumn } from "../load/types.ts";
-import { type InputPosition, writeBatch, type WriteResult } from "../load/write.ts";
+import { type CheckContext, type InputPosition, writeBatch, type WriteResult } from "../load/write.ts";
 import { readStoredColumns } from "../safety/guards.ts";
-import { codeError, createdTable, croftError, FAIRNESS_YIELD_MS, fault, type StepProgress } from "./ingest.ts";
+import { codeError, createdTable, croftError, FAIRNESS_YIELD_MS, fault, jsonKeys, type StepProgress, toKnown } from "./ingest.ts";
 import { stepAborted, TransformInputs } from "./inputs.ts";
 import type { PlannedStep } from "./plan.ts";
-import { countAfter, type InputFacts, readInputFacts, type SeenPosition } from "./snapshot.ts";
+import { countAfter, type InputFacts, type InputSnapshot, readInputFacts, type SeenPosition } from "./snapshot.ts";
 import type { StepInput, StepOutcome } from "./step.ts";
 
 /** When an incremental transform commits a chunk (§3e): at the first newRows() request after the chunk holds
@@ -69,13 +75,17 @@ const META_FILE = "chunk.json";
 
 /** A staged chunk's record, written next to its manifest once it is complete. */
 export interface ChunkMeta {
-  version: 1;
+  version: 2;
   asset: string;
   runId: string;
   attempt: number;
   codeHash: string;
+  /** The blocking checks the chunk was staged under (checksHash): other checks discard it. */
+  checkHash: string;
   /** The positions committed when the chunk began, by declared input: it is valid only on top of them. */
   before: Record<string, SeenPosition | null>;
+  /** Each declared input's version (InputFacts.version) when the step that staged the chunk began. */
+  basis: Record<string, string | null>;
   /** The positions that commit with it. */
   positions: InputPosition[];
   /** _croft.writes.inputs. */
@@ -83,7 +93,16 @@ export interface ChunkMeta {
   rows: number;
   /** The code had finished: the last chunk of its run. */
   final: boolean;
+  /** Set when a commit refused the chunk for what it holds (CHECK_FAILED, KEY_NULL, …), to the code it failed
+   *  with. Such a chunk is reused only while every input is at its `basis` version. */
+  refused?: string;
 }
+
+/** Failures that say nothing about a chunk's rows: a chunk they stopped is committed again as it is. Any other
+ *  croft code from its commit refuses the rows themselves (ChunkMeta.refused). */
+const NOT_ABOUT_THE_ROWS = new Set<string>([
+  "DB_BUSY", "DB_HELD_BY_OTHER_PROGRAM", "ASSET_BUSY", "DB_UNREADABLE", "INTERRUPTED", "TIMEOUT", "RUN_CRASHED", "INTERNAL_ERROR",
+]);
 
 interface TransformState {
   /** The asset's _croft.columns rows. */
@@ -122,17 +141,25 @@ export async function runTransform(i: StepInput): Promise<StepOutcome> {
   const committed = new Map(state.saved);
 
   // 2. A chunk an earlier attempt staged and did not commit.
-  const reusable = chunked ? stagedChunk(pendingDir, step, committed, inputNames) : null;
+  const checkHash = checksHash(step);
+  const staged = chunked ? stagedChunk(pendingDir, step, { committed, inputs: inputNames, facts: state.facts, checkHash }) : null;
+  const reusable = staged && "meta" in staged ? staged : null;
+  if (staged && "why" in staged) log.write(`discarded the chunk staged earlier: ${staged.why}`);
   if (chunked && !reusable) rmSync(pendingDir, { recursive: true, force: true });
   const afterReuse = new Map(committed);
   if (reusable) for (const p of reusable.meta.positions) afterReuse.set(p.input, positionOf(p));
 
   // 3. The cost guard, before any code runs.
   const usesHttp = step.usesHttp ?? step.loaded?.usesHttp ?? false;
+  let guard: Guard | null = null;
   if (incremental && usesHttp && !i.preview) {
     const limit = step.confirmAbove ?? spec.confirmAbove ?? DEFAULT_CONFIRM_ABOVE;
-    const counts = await pendingCounts(warehouse, inputNames, afterReuse, signal);
+    // The inputs the code reads with newRows(), when the scan could tell; otherwise every input counts.
+    const reads = step.loaded?.readsNewRows;
+    const counted = reads ? inputNames.filter((n) => reads.includes(n)) : [...inputNames];
+    const counts = counted.length ? await pendingCounts(warehouse, counted, afterReuse, signal) : {};
     const pending = Object.values(counts).reduce((a, b) => a + b, 0);
+    guard = { limit, counts, pending, counted: new Set(counted), confirmed: false };
     if (pending > limit) {
       const err = largeReprocess(step, pending, limit, counts, !i.confirm);
       if (!i.confirm) throw err;
@@ -152,6 +179,7 @@ export async function runTransform(i: StepInput): Promise<StepOutcome> {
         };
       }
       log.write(`confirmed: ${asset} processes ${pending} input rows (more than confirmAbove ${limit}) and makes requests for them`);
+      guard.confirmed = true;
     }
   }
 
@@ -159,8 +187,8 @@ export async function runTransform(i: StepInput): Promise<StepOutcome> {
   let previous = getCatalog(runs, asset);
   let known = state.known;
   let lastCatalog: CatalogAsset | undefined;
-  const commit = async (manifest: StageManifestFile, positions: InputPosition[], inputs: ChunkMeta["inputs"]) => {
-    const out = await commitChunk(i, { manifest, positions, inputs, previous, reads: inputNames });
+  const commit = async (manifest: StageManifestFile, positions: InputPosition[], inputs: ChunkMeta["inputs"], unfinished: boolean) => {
+    const out = await commitChunk(i, { manifest, positions, inputs, previous, reads: inputNames, unfinished });
     previous = out.catalog;
     lastCatalog = out.catalog;
     known = out.known;
@@ -170,10 +198,16 @@ export async function runTransform(i: StepInput): Promise<StepOutcome> {
   };
 
   if (reusable) {
-    log.write(`saving the chunk that ${reusable.meta.runId} (attempt ${reusable.meta.attempt}) staged and could not commit: ${reusable.meta.rows} rows, computed once already`);
-    await commit(reusable.manifest, reusable.meta.positions, reusable.meta.inputs);
+    const m = reusable.meta;
+    log.write(`saving the chunk that ${m.runId} (attempt ${m.attempt}) staged and could not commit: ${m.rows} rows, computed once already`);
+    try {
+      await commit(reusable.manifest, m.positions, m.inputs, !m.final);
+    } catch (e) {
+      refuse(pendingDir, e);
+      throw reusedChunkFailed(e, m);
+    }
     rmSync(pendingDir, { recursive: true, force: true });
-    totals.reused = reusable.meta.rows;
+    totals.reused = m.rows;
   }
 
   // 4. Run the code, with no database lock, committing chunk by chunk.
@@ -186,6 +220,7 @@ export async function runTransform(i: StepInput): Promise<StepOutcome> {
     ...(i.preview ? { limit: i.preview.rows } : {}),
     onRow: () => progress.touch(),
     ...(chunked ? { onRequest: (): Promise<void> => chunk.request(() => inputs.chunkPositions()) } : {}),
+    ...(guard ? { onNewInput: (input: string, snap: InputSnapshot) => countLate(guard!, step, input, snap, !i.confirm) } : {}),
   });
   const http = trackedHttp(createHttp({ ...i.http, signal: ctxSignal, redact: (t) => i.env.redact(t), log: (line) => log.write(line) }),
     progress, (t) => i.env.redact(t));
@@ -212,7 +247,9 @@ export async function runTransform(i: StepInput): Promise<StepOutcome> {
         throw codeError(e, step, project.root);
       }
       user = iterateSource(source);
-      const pull = new Pull(user, chunk, progress, () => {
+      const pull = new Pull(user, chunk, progress, (n) => {
+        // The outputs count toward the input rows that are processed (inputs.ts "Positions").
+        inputs.yielded(n);
         if (chunked && totals.chunks >= 1 && chunk.rows >= Math.max(1, Math.floor(CHUNK.rows / 2))) fault("mid_chunk", i.fault);
       });
       for (;;) {
@@ -238,7 +275,9 @@ export async function runTransform(i: StepInput): Promise<StepOutcome> {
         for (const s of read) readBefore[s.input] = s.rows;
         if (chunked) {
           writeMeta(dir, {
-            version: 1, asset, runId, attempt: i.attempt, codeHash: step.codeHash ?? "", before: Object.fromEntries(inputNames.map((n) => [n, committed.get(n) ?? null])),
+            version: 2, asset, runId, attempt: i.attempt, codeHash: step.codeHash ?? "", checkHash,
+            before: Object.fromEntries(inputNames.map((n) => [n, committed.get(n) ?? null])),
+            basis: Object.fromEntries(inputNames.map((n) => [n, state.facts.get(n)?.version ?? null])),
             positions, inputs: summary, rows: manifest.rows, final,
           });
         }
@@ -247,10 +286,11 @@ export async function runTransform(i: StepInput): Promise<StepOutcome> {
           ? `extracted ${manifest.rows} rows${totals.chunks ? ` (the last chunk)` : ""}, ${progress.requests} request(s)`
           : `chunk ${totals.chunks + 1}: ${manifest.rows} rows; saving them with the input positions reached`);
         try {
-          await commit(manifest, positions, summary);
+          await commit(manifest, positions, summary, chunked && !final);
           if (chunked) rmSync(dir, { recursive: true, force: true });
           chunk.committed();
         } catch (e) {
+          if (chunked) refuse(dir, e);
           chunk.failed(e);
           throw new WriteFailure(e);
         }
@@ -259,10 +299,11 @@ export async function runTransform(i: StepInput): Promise<StepOutcome> {
     });
   } catch (e) {
     internal.abort(croftError(e instanceof WriteFailure ? e.cause : e) ?? undefined);
-    if (signal.aborted) throw withSaved(stepAborted(signal, asset), totals);
+    const saved = savedPositions(state, committed);
+    if (signal.aborted) throw withSaved(stepAborted(signal, asset), totals, saved);
     // A failed write is croft's (or the checks'), reported as is; anything else came from the asset's code.
-    if (e instanceof WriteFailure) throw croftError(e.cause) ? withSaved(croftError(e.cause)!, totals) : e.cause;
-    throw withSaved(codeError(e, step, project.root), totals);
+    if (e instanceof WriteFailure) throw croftError(e.cause) ? withSaved(croftError(e.cause)!, totals, saved) : e.cause;
+    throw withSaved(codeError(e, step, project.root), totals, saved);
   } finally {
     if (!ctxSignal.aborted) internal.abort();
     // A generator stopped by a failure gets its finally blocks run; one waiting on the network is not awaited.
@@ -313,12 +354,6 @@ async function readState(warehouse: DuckWarehouse, asset: string, inputs: readon
   }, { purpose: `read the state of ${asset}`, signal });
 }
 
-function toKnown(stored: Awaited<ReturnType<typeof readStoredColumns>>): KnownColumn[] {
-  return stored.map((c) => ({
-    name: c.name, type: c.type, sourceName: c.source_name, format: c.format, pinned: c.pinned, pending: c.pending, kinds: c.kinds,
-  }));
-}
-
 /** A committed position as newRows() compares it (a key is DuckDB's text of each key value). */
 function positionOf(p: { seenLoadedAt: string | null; seenKey?: unknown }): SeenPosition | null {
   if (!p.seenLoadedAt) return null;
@@ -349,28 +384,78 @@ function writeMeta(dir: string, meta: ChunkMeta): void {
   renameSync(tmp, join(dir, META_FILE));
 }
 
+function readMeta(dir: string): ChunkMeta | null {
+  try {
+    return JSON.parse(readFileSync(join(dir, META_FILE), "utf8")) as ChunkMeta;
+  } catch {
+    return null;
+  }
+}
+
 const samePosition = (a: SeenPosition | null | undefined, b: SeenPosition | null | undefined) =>
   JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
-/** A complete staged chunk the step may commit as is: same code, staged on top of the positions committed now. */
-function stagedChunk(dir: string, step: PlannedStep, committed: ReadonlyMap<string, SeenPosition | null>, inputs: readonly string[]):
-  { meta: ChunkMeta; manifest: StageManifestFile } | null {
+/** The checks a chunk is staged under: the sources of the blocking ones, in order. Warnings run after the commit
+ *  and never refuse a chunk, so editing one keeps it. */
+export function checksHash(step: Pick<PlannedStep, "checks">): string {
+  const list = (step.checks ?? []).filter((c) => c.blocking).map((c) => c.source.trim());
+  return createHash("sha256").update(JSON.stringify(list)).digest("hex").slice(0, 16);
+}
+
+interface StagedContext {
+  committed: ReadonlyMap<string, SeenPosition | null>;
+  inputs: readonly string[];
+  /** The inputs' facts now (their versions). */
+  facts: ReadonlyMap<string, InputFacts | null>;
+  checkHash: string;
+}
+
+/**
+ * A complete staged chunk the step may commit as is: the same code and checks, staged on top of the positions
+ * committed now, and, when a commit refused it for what it holds, every input still at the version it was
+ * staged from (the user has not corrected the data since). `why` when there is a chunk that does not fit; null
+ * when there is none.
+ */
+function stagedChunk(dir: string, step: PlannedStep, s: StagedContext): { meta: ChunkMeta; manifest: StageManifestFile } | { why: string } | null {
   if (!existsSync(join(dir, META_FILE)) || !existsSync(join(dir, MANIFEST_FILE))) return null;
-  let meta: ChunkMeta;
-  try {
-    meta = JSON.parse(readFileSync(join(dir, META_FILE), "utf8")) as ChunkMeta;
-  } catch {
-    return null;
-  }
-  if (meta.version !== 1 || meta.asset !== step.asset || !step.codeHash || meta.codeHash !== step.codeHash) return null;
+  const meta = readMeta(dir);
+  if (!meta || meta.version !== 2 || meta.asset !== step.asset) return { why: "it was staged by another version of croft" };
+  if (!step.codeHash || meta.codeHash !== step.codeHash) return { why: `${step.file} changed since` };
+  if (meta.checkHash !== s.checkHash) return { why: "the checks changed since" };
   const names = Object.keys(meta.before ?? {}).sort();
-  if (JSON.stringify(names) !== JSON.stringify([...inputs].sort())) return null;
-  if (!names.every((n) => samePosition(meta.before[n], committed.get(n)))) return null;
+  if (JSON.stringify(names) !== JSON.stringify([...s.inputs].sort())) return { why: "the inputs changed since" };
+  if (!names.every((n) => samePosition(meta.before[n], s.committed.get(n)))) return { why: "other rows were saved since" };
+  if (meta.refused) {
+    const changed = names.find((n) => (meta.basis?.[n] ?? null) !== (s.facts.get(n)?.version ?? null));
+    if (changed) return { why: `${meta.refused} refused it, and ${changed} changed since; its rows are computed again` };
+  }
   try {
     return { meta, manifest: readStageManifest(dir) };
   } catch {
-    return null;
+    return { why: "its files are incomplete" };
   }
+}
+
+/** A commit of the chunk staged in `dir` failed: when the failure is about its rows, mark it refused. */
+function refuse(dir: string, e: unknown): void {
+  const code = croftError(e)?.code;
+  if (!code || NOT_ABOUT_THE_ROWS.has(code)) return;
+  const meta = readMeta(dir);
+  if (!meta) return;
+  try {
+    writeMeta(dir, { ...meta, refused: code });
+  } catch {}
+}
+
+/** A reused chunk's commit failed: its rows were computed by an earlier run, and are committed again (without
+ *  running the code) until the code, a check or an input changes. */
+function reusedChunkFailed(e: unknown, meta: ChunkMeta): unknown {
+  const err = croftError(e);
+  if (!err || NOT_ABOUT_THE_ROWS.has(err.code)) return e;
+  const note = `these ${meta.rows} rows were computed by an earlier run (${meta.runId}) and staged; croft saves them without running the code again until the code, a check or an input changes`;
+  err.problem.hint = err.problem.hint ? `${err.problem.hint} (${note})` : note;
+  err.problem.details = { ...err.problem.details, stagedBy: meta.runId };
+  return err;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -466,8 +551,9 @@ class Pull {
   done = false;
   #carry: Promise<IteratorResult<unknown>> | null = null;
 
+  /** `onRow(n)`: the code yielded a value of n rows. */
   constructor(private readonly user: SourceIterator, private readonly state: ChunkState, private readonly progress: StepProgress,
-    private readonly onRow: () => void) {}
+    private readonly onRow: (n: number) => void) {}
 
   chunk(): AsyncIterableIterator<unknown> {
     const it: AsyncIterableIterator<unknown> = {
@@ -495,7 +581,7 @@ class Pull {
         const n = rowCount(step.value);
         this.state.rows += n;
         this.progress.addRows(n);
-        this.onRow();
+        this.onRow(n);
         return { done: false, value: step.value };
       },
       // writeStage gives up on the source (an unserializable row, an abort): stop the code too.
@@ -527,6 +613,8 @@ interface CommitInput {
   inputs: ChunkMeta["inputs"];
   previous: CatalogAsset | null;
   reads: readonly string[];
+  /** A chunk that is not its run's last: min_rows waits (checks/run.ts ChunkCheckContext). */
+  unfinished: boolean;
 }
 
 /** One chunk (or the whole output) through the load pipeline, in one write transaction. */
@@ -543,11 +631,13 @@ async function commitChunk(i: StepInput, c: CommitInput): Promise<{ res: WriteRe
         const tx = abortable(raw, signal, asset);
         const known = toKnown(await readStoredColumns(tx, asset));
         const batch = await buildTypedBatch(tx, { manifest: c.manifest, knownColumns: known, pins: spec.pins, readBy: [...step.readBy] });
+        const checks = i.checks;
         const res = await writeBatch(tx, {
-          batch, target: { asset, write: step.write, key: step.key, runId }, kind: "ts",
+          batch, target: { asset, write: step.write, key: step.key, runId }, kind: "ts", file: step.file,
           ...(step.codeHash ? { codeHash: step.codeHash } : {}), behaviorHash: step.behaviorHash, pins: spec.pins,
           attempt: i.attempt, inputs: c.inputs, positions: c.positions,
-          ...(i.checks ? { checks: i.checks } : {}), ...(i.readBy ? { readBy: i.readBy } : {}), ...(i.now ? { now: i.now() } : {}),
+          ...(checks ? { checks: c.unfinished ? (sql: Sql, ctx: CheckContext) => checks(sql, unfinishedChunk(ctx)) : checks } : {}),
+          ...(i.readBy ? { readBy: i.readBy } : {}), ...(i.now ? { now: i.now() } : {}),
         });
         // Read-only, but inside the transaction: a failed statement would abort it, so these stay simple.
         const keys = await jsonKeys(tx, batch, c.previous);
@@ -574,21 +664,6 @@ function catalogBase(step: PlannedStep, o: { runId: string; keys: Record<string,
     asset: step.asset, kind: "ts", behavior: step.words, write: step.write, key: step.key, cursorField: null,
     codeHash: step.codeHash ?? null, lastRunId: o.runId, jsonKeys: o.keys, reads: [...o.reads],
   };
-}
-
-/** Keys seen in the batch's JSON columns, merged with the ones already known, capped at 50. */
-async function jsonKeys(tx: Sql, batch: TypedBatch, previous: CatalogAsset | null): Promise<Record<string, string[]>> {
-  const out: Record<string, string[]> = {};
-  const cols = (await readTableSchema(tx, batch.temp, "temp")) ?? [];
-  for (const c of cols) {
-    if (c.type !== "JSON" || isReservedColumn(c.name)) continue;
-    const rows = await tx.all<{ k: string }>(
-      `SELECT DISTINCT k FROM (SELECT unnest(json_keys(${quoteIdent(c.name)})) AS k FROM ${tempRef(batch.temp)}
-       WHERE json_type(${quoteIdent(c.name)}) = 'OBJECT') ORDER BY k LIMIT 50`);
-    const before = previous?.columns.find((x) => x.name === c.name)?.jsonKeys ?? [];
-    out[c.name] = [...new Set([...before, ...rows.map((r) => r.k)])].slice(0, 50);
-  }
-  return out;
 }
 
 /** An Sql that refuses every statement once the step is aborted, so Ctrl-C discards a running transaction. */
@@ -679,22 +754,79 @@ function dedupe(problems: Problem[]): Problem[] {
   });
 }
 
-/** A failure after some chunks committed: they stay, and the next run continues after them. */
-function withSaved(err: CroftError, totals: Totals): CroftError {
+/** The input positions this run committed (they moved from where the step began), in words and as details. */
+function savedPositions(state: TransformState, committed: ReadonlyMap<string, SeenPosition | null>): { text: string; positions: { input: string; seenLoadedAt: string; seenKey: string[] | null }[] } {
+  const positions: { input: string; seenLoadedAt: string; seenKey: string[] | null }[] = [];
+  const words: string[] = [];
+  for (const [input, p] of committed) {
+    if (!p || samePosition(p, state.saved.get(input))) continue;
+    positions.push({ input, seenLoadedAt: p.stamp, seenKey: p.key });
+    const key = state.facts.get(input)?.key ?? [];
+    words.push(p.key && p.key.length === key.length
+      ? `${input}: ${key.map((k, n) => `${k.name}=${p.key![n]}`).join(", ")} at ${p.stamp}`
+      : `${input}: every row stamped up to ${p.stamp}`);
+  }
+  return { text: words.join("; "), positions };
+}
+
+/** A failure after some chunks committed: they stay, with the input positions saved with them, and the next run
+ *  continues after those positions (which never pass a row whose output was not saved, inputs.ts). */
+function withSaved(err: CroftError, totals: Totals, saved: ReturnType<typeof savedPositions>): CroftError {
   if (totals.chunks === 0) return err;
-  const saved = `${totals.rows.in} row${totals.rows.in === 1 ? "" : "s"} from ${totals.chunks} earlier chunk${totals.chunks === 1 ? " were" : "s were"} saved`;
-  err.problem.effect = `${saved}; the next run continues after them`;
-  err.problem.details = { ...err.problem.details, savedRows: totals.rows.in, savedChunks: totals.chunks };
+  const rows = `${totals.rows.in} row${totals.rows.in === 1 ? "" : "s"} from ${totals.chunks} earlier chunk${totals.chunks === 1 ? " were" : "s were"} saved`;
+  err.problem.effect = saved.text
+    ? `${rows}; the next run continues after the input position${saved.positions.length === 1 ? "" : "s"} saved with them (${saved.text})`
+    : `${rows}; the next run continues after the input positions saved with them`;
+  err.problem.details = { ...err.problem.details, savedRows: totals.rows.in, savedChunks: totals.chunks, positions: saved.positions };
   return err;
 }
 
-/** LARGE_REPROCESS: the cost guard (§5). */
-function largeReprocess(step: PlannedStep, pending: number, limit: number, counts: Record<string, number>, noDecider: boolean): CroftError {
+/** The cost guard's count of one step (§5). */
+interface Guard {
+  limit: number;
+  /** Pending input rows per counted input. */
+  counts: Record<string, number>;
+  pending: number;
+  /** The inputs counted so far. */
+  counted: Set<string>;
+  /** A person approved the step's count before the code ran. */
+  confirmed: boolean;
+}
+
+/**
+ * newRows() is about to hand over the first row of an input the guard did not count before the code ran (the
+ * scan of the code could not tell it reads the input with newRows()): count it now, and refuse the input when
+ * the step's count goes over confirmAbove and no one approved the count.
+ */
+async function countLate(g: Guard, step: PlannedStep, input: string, snap: InputSnapshot, noDecider: boolean): Promise<void> {
+  if (g.counted.has(input)) return;
+  g.counted.add(input);
+  if (snap.facts.key.length === 0) return;
+  g.counts[input] = snap.rows;
+  g.pending += snap.rows;
+  if (g.confirmed || g.pending <= g.limit) return;
+  throw largeReprocess(step, g.pending, g.limit, g.counts, noDecider, input);
+}
+
+/** LARGE_REPROCESS: the cost guard (§5). `late`: an input counted only when newRows() first read it. */
+function largeReprocess(step: PlannedStep, pending: number, limit: number, counts: Record<string, number>, noDecider: boolean, late?: string): CroftError {
   const asset = step.asset;
   const per = Object.entries(counts).filter(([, n]) => n > 0).map(([k, n]) => `${k} ${n}`).join(", ");
+  const message = `${asset} would process ${pending} input rows (${per}), more than its confirmAbove of ${limit}, and its code makes requests (an API or an LLM) for them`;
+  const details = { pending, confirmAbove: limit, inputs: counts };
+  if (late) {
+    // Asking now would come after the code started: croft asks only before it runs, so the code has to show it.
+    const read = `newRows(${JSON.stringify(late)})`;
+    return new CroftError("LARGE_REPROCESS", {
+      asset, file: step.file, message,
+      hint: `croft could not tell from ${step.file} that it reads ${late} with newRows(), so it could not ask before the code ran; write ${read} with the input's name as a string, and croft asks first; or raise confirmAbove in ${step.file}`,
+      effect: `no row of ${late} was processed`,
+      fix: { kind: "edit", file: step.file, description: `read ${late} with ${read}, its name written as a string, so croft counts its rows and asks before the code runs` },
+      details: { ...details, uncounted: late },
+    });
+  }
   return new CroftError("LARGE_REPROCESS", {
-    asset, file: step.file,
-    message: `${asset} would process ${pending} input rows (${per}), more than its confirmAbove of ${limit}, and its code makes requests (an API or an LLM) for them`,
+    asset, file: step.file, message,
     hint: noDecider
       ? `a person has to approve this: croft run ${asset} shows the impact and asks first; to allow more rows without asking, raise confirmAbove in ${step.file}`
       : `ask the user before spending on ${pending} rows; to allow more rows without asking, raise confirmAbove in ${step.file}`,
@@ -703,7 +835,7 @@ function largeReprocess(step: PlannedStep, pending: number, limit: number, count
       kind: "manual", requiresHuman: true,
       description: `show the user that ${asset} would process ${pending} input rows and make requests for each; only after an explicit yes: croft run ${asset}`,
     },
-    details: { pending, confirmAbove: limit, inputs: counts },
+    details,
   });
 }
 

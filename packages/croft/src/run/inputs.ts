@@ -16,12 +16,26 @@
 // check). croft's own columns (_loaded_at, _file) are readable but not enumerable, so `yield { ...row }` passes
 // the data through without them, as an SQL transform's reserved-column exclusion does.
 //
-// Positions. newRows() hands rows over in snapshot order, (_loaded_at, key). An input row counts as fully
-// processed once the code asks for the next one (the usual `for await` loop has yielded every output of a row
-// by then); the position of an input is the last such row, across every newRows() iterator of it (the least
-// advanced one wins). A loop left early (break, a throw) does not count its last row as processed: the next
-// run reads it again rather than skip it. Asking for the next row is also where transform.ts may commit a
-// chunk (onRequest), since at that moment every output yielded so far belongs to rows up to the position.
+// Positions. newRows() hands rows over in snapshot order, (_loaded_at, key). A position must never pass a row
+// whose outputs are not yet yielded: a chunk commits the position with the outputs yielded so far, and a
+// failure after it would skip such a row for good. croft cannot see which outputs belong to which input row,
+// so an input row counts as processed only when both of these hold:
+// - the code asked for a later row (the usual `for await` loop yields a row's outputs before asking for the
+//   next; rows the code asked past are "asked");
+// - the code yielded at least as many output rows as that, counting only the outputs it yielded while this
+//   iterator was the newRows() iterator it asked last ("yields").
+// So row n is processed once n <= min(asked, yields). A loop that yields each row's outputs before asking for
+// the next is tracked exactly when each row yields one output, and conservatively when a row yields none (the
+// position lags, and a failure re-reads those rows rather than skip them). A loop that keeps calls in flight
+// (read ahead: ask for rows 1-3, then yield the output of row 1) is safe as long as it yields the outputs in the
+// order the rows came, at most one per row: the position then trails the outputs. Out-of-order results, or
+// several outputs per row while calls are in flight, can still move a position past a pending row.
+//
+// Once the code has finished (the last chunk), every output it will ever yield has been yielded, so a row it
+// asked past counts as processed whatever it yielded ("final" positions). A loop left early (break, a throw)
+// does not count its last row: the next run reads it again rather than skip it. The position of an input is its
+// least advanced newRows() iterator's. Asking for the next row is also where transform.ts may commit a chunk
+// (onRequest), with the "chunk" positions reached.
 import { readFileSync, realpathSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -86,19 +100,40 @@ export interface TransformInputsOptions {
   /** Called each time the code asks newRows() for its next row, after the position moved past the previous one
    *  and before the next is read: transform.ts commits a chunk here. A rejection reaches the code. */
   onRequest?: () => Promise<void>;
+  /** Called once per input, when newRows() of an incremental transform has taken its snapshot and before it
+   *  hands over the first row: transform.ts's cost guard counts an input here that it could not count before
+   *  the code ran. A rejection reaches the code, and no row of the input is handed over. */
+  onNewInput?: (input: string, snapshot: InputSnapshot) => Promise<void>;
 }
 
-/** One newRows() iterator's progress over the input's new.parquet. */
+/** Positions of rows handed over that do not count as processed yet, kept at most `maxPending` per iterator.
+ *  Past it the oldest are dropped, and the position waits (conservatively) until the count reaches a row still
+ *  kept. Tests shrink it. */
+export const POSITIONS = { maxPending: 100_000 };
+
+/** One newRows() iterator's progress over the input's new.parquet (see "Positions" above). */
 interface NewIterator {
-  /** Rows fully processed (the code asked for the one after), and the position after them (null: none yet). */
-  done: number;
-  donePos: SeenPosition | null;
   /** Rows handed over, and the position of the last one. */
   delivered: number;
   last: SeenPosition | null;
+  /** Rows the code asked past (it asked for a later one), and the position after them. */
+  asked: number;
+  askedPos: SeenPosition | null;
+  /** Output rows the code yielded while this iterator was the newRows() iterator it asked last. */
+  yields: number;
+  /** Rows that count as processed while the code runs (min(asked, yields)), and the position after them. */
+  done: number;
+  donePos: SeenPosition | null;
+  /** Row numbers (1-based) and positions of the rows handed over and not yet done, oldest first from `head`. */
+  pendingN: number[];
+  pendingPos: (SeenPosition | null)[];
+  head: number;
   /** The file was read to its end. */
   completed: boolean;
 }
+
+/** Which count a position is taken at: "chunk" while the code runs, "final" once it has finished. */
+export type PositionMode = "chunk" | "final";
 
 interface InputUse {
   /** The snapshots, being taken (a failed one is forgotten, to be tried again), and once taken. */
@@ -121,6 +156,10 @@ export class TransformInputs {
   #queryConn: Promise<DuckDBConnection> | null = null;
   #queryChain: Promise<unknown> = Promise.resolve();
   #uses = new Map<string, InputUse>();
+  /** The newRows() iterator the code asked last: the outputs it yields now are counted for it. */
+  #active: NewIterator | null = null;
+  /** Inputs whose first newRows() snapshot went through onNewInput. */
+  #announced = new Map<string, Promise<void>>();
   #closed = false;
 
   constructor(private readonly o: TransformInputsOptions) {
@@ -159,14 +198,28 @@ export class TransformInputs {
   // -------------------------------------------------------------------------------------------------------
   // Positions
 
-  /** The position of one input: the least advanced newRows() iterator's, else the committed one. */
-  position(input: string): SeenPosition | null {
+  /**
+   * The position of one input: its least advanced newRows() iterator's, else the committed one. "chunk": the
+   * rows that count as processed while the code runs; "final": every row the code asked past, once it has
+   * finished (see "Positions" above).
+   */
+  position(input: string, mode: PositionMode = "chunk"): SeenPosition | null {
     const use = this.#uses.get(input);
     const saved = this.o.saved.get(input) ?? null;
     if (!use || use.iterators.length === 0) return saved;
+    const count = (it: NewIterator) => (mode === "final" ? it.asked : it.done);
     let least = use.iterators[0]!;
-    for (const it of use.iterators) if (it.done < least.done) least = it;
-    return least.donePos ?? saved;
+    for (const it of use.iterators) if (count(it) < count(least)) least = it;
+    return (mode === "final" ? least.askedPos : least.donePos) ?? saved;
+  }
+
+  /** The code yielded `n` output rows: they count for the newRows() iterator it asked last. transform.ts calls
+   *  this for every value the code yields, before the next chunk can be cut. */
+  yielded(n: number): void {
+    const it = this.#active;
+    if (!it || n <= 0) return;
+    it.yields += n;
+    advance(it);
   }
 
   /** Inputs read with newRows() in this step (incremental transforms only). */
@@ -178,34 +231,36 @@ export class TransformInputs {
    *  of them read to its end yet (inputLastLoadedAt null, so staleness still sees the input as changed). */
   chunkPositions(): InputPosition[] {
     return this.tracked().map((input) => {
-      const p = this.position(input);
+      const p = this.position(input, "chunk");
       return { input, seenLoadedAt: p?.stamp ?? null, seenKey: p?.key ?? null, inputLastLoadedAt: null };
     });
   }
 
   /**
    * The positions to commit when the code has finished, for every declared input:
-   * - read with newRows(): its position; the input's last_loaded_at counts as seen only when every newRows()
-   *   iterator read its snapshot to the end (and no row cap cut it short);
+   * - read with newRows(): its final position; the input counts as seen in full (at its version) only when
+   *   every newRows() iterator read its snapshot to the end (and no row cap cut it short);
    * - otherwise (read in full, or not at all): an incremental transform keeps its newRows() position, and a
    *   full-refresh one records the input's last_loaded_at, as SQL steps do; either way the input counts as seen
-   *   at the last_loaded_at of what the code could read.
+   *   at the version of what the code could read.
+   * "Seen" (inputLastLoadedAt) is the input's version, the newer of last_loaded_at and last_replaced_at
+   * (InputFacts.version), so input_replaced clears once a transform re-read an input changed out of band.
    */
   finalPositions(): InputPosition[] {
     return this.o.inputs.map((input) => {
       const use = this.#uses.get(input)!;
       const at = this.seenAt(input);
       if (this.o.incremental && use.iterators.length > 0) {
-        const p = this.position(input);
+        const p = this.position(input, "final");
         const snap = use.newSnapshot;
         const complete = use.iterators.every((it) => it.completed) && snap !== undefined && !snap.capped;
-        return { input, seenLoadedAt: p?.stamp ?? null, seenKey: p?.key ?? null, inputLastLoadedAt: complete ? snap.facts.lastLoadedAt : null };
+        return { input, seenLoadedAt: p?.stamp ?? null, seenKey: p?.key ?? null, inputLastLoadedAt: complete ? snap.facts.version : null };
       }
       if (this.o.incremental) {
         const saved = this.o.saved.get(input) ?? null;
-        return { input, seenLoadedAt: saved?.stamp ?? null, seenKey: saved?.key ?? null, inputLastLoadedAt: at.capped ? null : at.lastLoadedAt };
+        return { input, seenLoadedAt: saved?.stamp ?? null, seenKey: saved?.key ?? null, inputLastLoadedAt: at.capped ? null : at.version };
       }
-      return { input, seenLoadedAt: at.lastLoadedAt, seenKey: null, inputLastLoadedAt: at.capped ? null : at.lastLoadedAt };
+      return { input, seenLoadedAt: at.lastLoadedAt, seenKey: null, inputLastLoadedAt: at.capped ? null : at.version };
     });
   }
 
@@ -241,11 +296,12 @@ export class TransformInputs {
 
   // -------------------------------------------------------------------------------------------------------
 
-  private seenAt(input: string): { lastLoadedAt: string | null; capped: boolean } {
+  private seenAt(input: string): { lastLoadedAt: string | null; version: string | null; capped: boolean } {
     const use = this.#uses.get(input);
     const snap = use?.allSnapshot ?? use?.newSnapshot;
-    if (snap) return { lastLoadedAt: snap.facts.lastLoadedAt, capped: snap.capped };
-    return { lastLoadedAt: this.o.facts.get(input)?.lastLoadedAt ?? null, capped: false };
+    if (snap) return { lastLoadedAt: snap.facts.lastLoadedAt, version: snap.facts.version, capped: snap.capped };
+    const facts = this.o.facts.get(input);
+    return { lastLoadedAt: facts?.lastLoadedAt ?? null, version: facts?.version ?? null, capped: false };
   }
 
   private declared(input: unknown, via: "rows" | "newRows" | "query"): string {
@@ -356,7 +412,9 @@ export class TransformInputs {
   /** newRows() of an incremental transform: the rows after the position, with the position tracked. */
   private newIterator(name: string): AsyncIterator<Row> {
     const use = this.#uses.get(name)!;
-    const it: NewIterator = { done: 0, donePos: null, delivered: 0, last: null, completed: false };
+    const it: NewIterator = {
+      delivered: 0, last: null, asked: 0, askedPos: null, yields: 0, done: 0, donePos: null, pendingN: [], pendingPos: [], head: 0, completed: false,
+    };
     use.iterators.push(it);
     let rows: AsyncGenerator<Row[]> | null = null;
     let page: Row[] = [];
@@ -365,13 +423,17 @@ export class TransformInputs {
     const guard = this.guard(name);
     return {
       next: async (): Promise<IteratorResult<Row>> => {
-        // Asking for the next row: the previous one is processed.
-        it.done = it.delivered;
-        it.donePos = it.last;
+        // Asking for the next row: the code has asked past every row handed over so far, and the outputs it
+        // yields from now on count for this iterator.
+        it.asked = it.delivered;
+        it.askedPos = it.last;
+        this.#active = it;
+        advance(it);
         if (it.completed) return { done: true, value: undefined };
         await this.o.onRequest?.();
         if (!rows) {
           const snap = await this.snapshot(name, "new");
+          await this.announce(name, snap);
           guard.columns(snap.facts.columns);
           keyCount = snap.facts.key.length;
           const extra = snap.facts.key.map((k, i) => `CAST(${quoteIdent(k.name)} AS VARCHAR) AS ${quoteIdent(POS_PREFIX + i)}`);
@@ -395,6 +457,7 @@ export class TransformInputs {
         const stamp = data[RESERVED.loadedAt];
         it.last = typeof stamp === "string" ? { stamp, key: keyCount > 0 ? key : null } : it.last;
         it.delivered++;
+        pend(it, it.delivered, it.last);
         use.rows++;
         this.o.onRow?.();
         return { done: false, value: guard.row(data) };
@@ -405,6 +468,18 @@ export class TransformInputs {
         return { done: true, value: undefined };
       },
     };
+  }
+
+  /** onNewInput, once per input, however many newRows() iterators read it. */
+  private announce(name: string, snap: InputSnapshot): Promise<void> {
+    if (!this.o.onNewInput) return Promise.resolve();
+    let p = this.#announced.get(name);
+    if (!p) {
+      p = this.o.onNewInput(name, snap);
+      p.catch(() => {}); // each iterator that waits on it gets the rejection
+      this.#announced.set(name, p);
+    }
+    return p;
   }
 
   private async runQuery(sql: string, params: unknown[], caller: string): Promise<Row[]> {
@@ -606,5 +681,30 @@ export class TransformInputs {
       message: `ctx.query: ${init.message}`,
       details: { ...init.details, sql: sql.slice(0, 500) },
     });
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Row counts of one newRows() iterator
+
+/** Row `n` was handed over at `pos`: it is pending until the counts reach it. */
+function pend(it: NewIterator, n: number, pos: SeenPosition | null): void {
+  it.pendingN.push(n);
+  it.pendingPos.push(pos);
+  if (it.pendingN.length - it.head > POSITIONS.maxPending) it.head++;
+  if (it.head > 4096 && it.head * 2 > it.pendingN.length) {
+    it.pendingN.splice(0, it.head);
+    it.pendingPos.splice(0, it.head);
+    it.head = 0;
+  }
+}
+
+/** Move `done` up to min(asked, yields): the rows that count as processed while the code runs. */
+function advance(it: NewIterator): void {
+  const target = Math.min(it.asked, it.yields);
+  while (it.head < it.pendingN.length && it.pendingN[it.head]! <= target) {
+    it.done = it.pendingN[it.head]!;
+    it.donePos = it.pendingPos[it.head]!;
+    it.head++;
   }
 }
