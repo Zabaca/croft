@@ -1,7 +1,8 @@
 // Test fixtures for the scheduler's due work and ticks (schedule/due.ts, schedule/tick.ts): temp projects with a
 // scheduled ingest, state written straight into runs.sqlite (catalog entries, steps, approvals), and a marker an
 // asset's top-level code appends to, which proves when asset code was imported. Not imported by croft.
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Problem } from "../core/types.ts";
 import type { CatalogAsset, InputSeen } from "../history/catalog.ts";
 import { RunsDb } from "../history/runs-db.ts";
@@ -100,6 +101,29 @@ export function recordStep(p: SchedProject, s: {
   } finally {
     db.close();
   }
+}
+
+/** A step of `asset` skipped for an input (attempt 0, as run/runner.ts records it), in a scheduled run of its own
+ *  that started at `at` and whose stored summary gives `because` as skippedBecause. */
+export function recordSkip(p: SchedProject, s: { asset: string; at: string; because: string; human?: boolean }): string {
+  const db = p.db(new Date(s.at));
+  try {
+    const human = s.human ?? false;
+    const run = db.createRun({ trigger: human ? "manual" : "schedule", human, argv: ["run", "--due", s.asset], identity: DEAD });
+    db.startStep({ runId: run.id, asset: s.asset, attempt: 0, reason: "stale" });
+    db.finishStep(run.id, s.asset, 0, { status: "skipped", reason: "stale" });
+    db.finishRun(run.id, "succeeded", { data: { runId: run.id, steps: [{ asset: s.asset, status: "skipped", skippedBecause: s.because }] } });
+    return run.id;
+  } finally {
+    db.close();
+  }
+}
+
+/** The same project with croft.json's timezone changed (nothing else). */
+export function rezone(p: SchedProject, timezone: string): SchedProject {
+  const file = join(p.root, "croft.json");
+  writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, "utf8")), timezone }));
+  return { ...p, project: loadProject({ root: p.root }) };
 }
 
 /** Scheduling for the project (the settings row `croft schedule` writes). */

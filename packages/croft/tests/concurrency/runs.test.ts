@@ -270,13 +270,13 @@ describe("runs and readers (slow: real processes)", () => {
     expect(await view()).toMatchObject({ due: false });
   }, 60_000);
 
-  // Bug: a `croft run --due` that meets a lease taken after its tick planned skips the asset "held: run … holds it;
-  // it stays due", but the asset is no longer due: the tick recorded the fire as handled (schedule_state.last_fire_at,
-  // schedule/tick.ts, before it spawns the run) and the skip (run/runner.ts, leasedBy) never puts it back. DESIGN §8:
-  // "Overlaps skip. An asset still leased ... is skipped and stays due." If the manual run that holds the lease then
-  // fails, the fire is lost until the next one. Repro below: the tick's run is slowed at import by a flag file, a
-  // manual run takes the lease meanwhile, and `croft schedule status` then shows feed due: false.
-  bugTest("a scheduled run that meets a manual run's lease skips the asset, which stays due (the fire is not lost)", async () => {
+  // A `croft run --due` that meets a lease taken after its tick planned skips the asset "held: run … holds it; it
+  // stays due", and it does stay due (DESIGN §8: "Overlaps skip. An asset still leased ... is skipped and stays due."):
+  // the tick records the fire before it spawns the run, noted with the run (settings schedule.spawned), and a fire
+  // the ended run never attempted goes back (schedule/due.ts), so it is not lost if the manual run then fails. Once a
+  // bug (the fire was spent). The tick's run is slowed at import by a flag file, a manual run takes the lease
+  // meanwhile, and `croft schedule status` then shows feed due: true.
+  test("a scheduled run that meets a manual run's lease skips the asset, which stays due (the fire is not lost)", async () => {
     const { project: p } = await initProject();
     const gate = new Gate();
     api.route("/c4b/feed", async () => {

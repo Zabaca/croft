@@ -1,7 +1,9 @@
 // The project tick (schedule/tick.ts, cli/commands/tick.ts; DESIGN.md §8 "Each tick only plans and spawns"): exits
 // when scheduling is off or paused, the singleton, the heartbeat, reconcile, one detached run per group with the
-// fire recorded first, runs still starting counted as taken, and, in real processes, a tick with nothing changed
-// importing no asset code, and a real tick starting a real `croft run --due` against a mock API.
+// fire recorded first, runs still starting counted as taken, a fire the run did not attempt (a child that died
+// before it recorded the run, a lease met after planning, a spawn that failed) staying due, and, in real processes,
+// a tick with nothing changed importing no asset code, a tick never importing code nobody has run, and a real tick
+// starting a real `croft run --due` against a mock API.
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,7 +12,8 @@ import { currentIdentity, type ProcessIdentity } from "../core/proc.ts";
 import { closeAllWarehouses } from "../db/warehouse.ts";
 import { writeChildRecord } from "../run/detach.ts";
 import { cleanupProjects, cli, cliEnv, keysetIssues, mockApi, runIn, until } from "../run/testkit.ts";
-import { SPAWNED_SETTING } from "./due.ts";
+import { tryAcquire } from "../history/leases.ts";
+import { FAILED_STARTS_SETTING, RETRY_BACKOFF_MS, SPAWNED_SETTING } from "./due.ts";
 import type { ScheduledFailure } from "./notify.ts";
 import {
   approveAll, built, DEAD, imports, recordStep, type SchedProject, schedProject, scheduledIngest, scheduleStateOf, scheduling,
@@ -52,6 +55,8 @@ async function pipeline(): Promise<SchedProject> {
   built(p, "open_issues", { kind: "sql", lastLoadedAt: "2026-09-22T10:05:01.000000Z", inputsSeen: { issues: { inputLastLoadedAt: "2026-09-22T10:05:00.000000Z" } } });
   recordStep(p, { asset: "issues", at: "2026-09-22T10:05:00Z", status: "ok" });
   recordStep(p, { asset: "open_issues", at: "2026-09-22T10:05:01Z", status: "ok" });
+  // A tick after the run by hand: it imports the approved code (nothing is due).
+  await tick(p, "2026-09-22T10:05:30Z", { spawn: async () => { throw new Error("nothing is due"); } });
   const db = p.db();
   db.setSetting(SPAWNED_SETTING, []);
   db.close();
@@ -164,8 +169,14 @@ describe("a tick records a heartbeat, reconciles, and starts one run per group",
       exited: null, heartbeatAt: "2026-09-22T11:00:30.000Z", spawned: [{ runId: s.runId, assets: ["issues"] }], held: [], importedAssetCode: false,
     });
     expect(scheduleStateOf(p, "issues")).toMatchObject({ lastFireAt: "2026-09-22T11:00:00.000Z", lastAttemptAt: "2026-09-22T11:00:30.000Z" });
+    // Noted with the run: the fire, and the last_fire_at it replaced.
+    const db = p.db();
+    expect(db.getSetting<unknown[]>(SPAWNED_SETTING)).toEqual([{
+      runId: s.runId, assets: ["issues"], at: "2026-09-22T11:00:30.000Z", fires: { issues: { fire: "2026-09-22T11:00:00.000Z", before: null } },
+    }]);
+    db.close();
 
-    // The next tick: the fire is handled.
+    // The next tick: the run is starting (its child is alive): nothing starts again.
     expect((await tick(p, "2026-09-22T11:01:30Z")).spawned).toEqual([]);
   });
 
@@ -179,10 +190,83 @@ describe("a tick records a heartbeat, reconciles, and starts one run per group",
     const again = await tick(p, "2026-09-22T10:21:00Z");
     expect(again.spawned).toEqual([]);
     expect(again.result.held).toEqual([{ asset: "open_issues", code: "leased", reason: `the scheduled run ${runId} is starting; it stays due` }]);
-    // Its process is gone and it never recorded a run: the transform is started again.
+    // Its process is gone and it never recorded a run: a failed start, reported and notified; the transform waits
+    // RETRY_BACKOFF_MS (a child that dies at once is not started again every minute), then it is started again.
     writeChildRecord(p.stateDir, runId, DEAD);
-    const third = await tick(p, "2026-09-22T10:22:00Z");
-    expect(third.spawned.map((s) => s.assets)).toEqual([["open_issues"]]);
+    const notified: ScheduledFailure[] = [];
+    const notify = async (_root: string, f: ScheduledFailure) => void notified.push(f);
+    const third = await tick(p, "2026-09-22T10:22:00Z", { notify });
+    expect(third.spawned).toEqual([]);
+    expect(third.result.held).toEqual([{
+      asset: "open_issues", code: "backoff", reason: `the scheduled run ${runId} did not start it (its process ended before it recorded the run); tries again after 10:35`,
+    }]);
+    expect(third.problems.map((x) => [x.code, x.severity])).toEqual([["RUN_CRASHED", "warning"]]);
+    expect(notified).toEqual([{ project: p.root, runId, failed: [{ asset: "open_issues", error: expect.objectContaining({ code: "RUN_CRASHED" }) }] }]);
+    // Reported once, waited out, then started again.
+    const fourth = await tick(p, "2026-09-22T10:23:00Z", { notify });
+    expect([fourth.spawned, fourth.problems, notified.length]).toEqual([[], [], 1]);
+    const fifth = await tick(p, "2026-09-22T10:35:00Z", { notify });
+    expect(fifth.spawned.map((s) => s.assets)).toEqual([["open_issues"]]);
+  });
+
+  test("a child killed before it recorded its run: the fire stays due, and runs once more after RETRY_BACKOFF_MS", async () => {
+    const p = await pipeline();
+    const notified: ScheduledFailure[] = [];
+    const notify = async (_root: string, f: ScheduledFailure) => void notified.push(f);
+    // The child dies at once (killed, out of memory, a crash while planning): it never records its run.
+    const first = await tick(p, "2026-09-22T11:00:30Z", { notify, spawn: async (r) => writeChildRecord(r.stateDir, r.runId, DEAD) });
+    expect(first.result.spawned.map((s) => s.assets)).toEqual([["issues"]]);
+    const runId = first.result.spawned[0]!.runId;
+    expect(scheduleStateOf(p, "issues")?.lastFireAt).toBe("2026-09-22T11:00:00.000Z");
+
+    const next = await tick(p, "2026-09-22T11:01:30Z", { notify });
+    expect(next.spawned).toEqual([]);
+    // Not handled: last_fire_at goes back; the fire is due, and held for the wait.
+    expect(scheduleStateOf(p, "issues")?.lastFireAt).toBeNull();
+    expect(next.result.held).toEqual([{
+      asset: "issues", code: "backoff", reason: `the scheduled run ${runId} did not start it (its process ended before it recorded the run); tries again after 11:15`,
+    }]);
+    expect(next.problems).toEqual([expect.objectContaining({
+      code: "RUN_CRASHED", severity: "warning", message: `the scheduled run ${runId} did not start issues: its process ended before it recorded the run`,
+      effect: "it stays due; it runs again after 11:15",
+    })]);
+    expect(notified).toEqual([{ project: p.root, runId, failed: [{ asset: "issues", error: expect.objectContaining({ code: "RUN_CRASHED" }) }] }]);
+    const db = p.db();
+    expect(db.getSetting<unknown[]>(SPAWNED_SETTING)).toEqual([]);
+    expect(db.getSetting<unknown[]>(FAILED_STARTS_SETTING)).toEqual([{
+      runId, assets: ["issues"], at: "2026-09-22T11:00:30.000Z", reason: "its process ended before it recorded the run", unrecorded: true,
+    }]);
+    db.close();
+
+    expect((await tick(p, "2026-09-22T11:10:00Z", { notify })).spawned).toEqual([]);
+    expect(RETRY_BACKOFF_MS).toBe(15 * 60_000);
+    const again = await tick(p, "2026-09-22T11:15:30Z", { notify });
+    expect(again.spawned.map((s) => s.assets)).toEqual([["issues"]]);
+    expect(scheduleStateOf(p, "issues")?.lastFireAt).toBe("2026-09-22T11:00:00.000Z");
+    expect(notified).toHaveLength(1);
+  });
+
+  test("a scheduled run that meets a lease taken after the tick planned skips the ingest, which stays due", async () => {
+    const p = await pipeline();
+    const first = await tick(p, "2026-09-22T11:00:30Z");
+    const runId = first.result.spawned[0]!.runId;
+    // A person's run takes issues; the scheduled run then records itself, finds issues leased and skips it (no step).
+    const db = p.db();
+    expect(tryAcquire(db, ["issues"], "r_0922_1100_hand", currentIdentity()).ok).toBe(true);
+    const run = db.createRun({ id: runId, trigger: "schedule", human: false, argv: ["run", "--due", "issues"], identity: DEAD });
+    db.finishRun(run.id, "succeeded");
+    db.close();
+    const next = await tick(p, "2026-09-22T11:01:30Z");
+    expect(next.spawned).toEqual([]);
+    expect(next.result.held).toEqual([{ asset: "issues", code: "leased", reason: "run r_0922_1100_hand holds it; it stays due" }]);
+    expect(scheduleStateOf(p, "issues")?.lastFireAt).toBeNull();
+    expect(next.problems).toEqual([]);
+    // The person's run ends without handling it (it failed, say): the next tick runs the fire, with no wait.
+    const db2 = p.db();
+    db2.sqlite.query("DELETE FROM leases").run();
+    db2.close();
+    const third = await tick(p, "2026-09-22T11:02:30Z");
+    expect(third.spawned.map((s) => s.assets)).toEqual([["issues"]]);
   });
 
   test("held assets are listed and not started", async () => {
@@ -190,18 +274,29 @@ describe("a tick records a heartbeat, reconciles, and starts one run per group",
     writeFileSync(join(p.root, "assets/issues.ts"), scheduledIngest({ body: `yield [{ id: 1, title: "test" }];` }));
     const out = await tick(p, "2026-09-22T11:00:30Z");
     expect(out.spawned).toEqual([]);
-    expect(out.result.importedAssetCode).toBe(true);
+    // Bundled, not imported: nobody ran the edit.
+    expect(out.result.importedAssetCode).toBe(false);
     expect(out.result.held.map((h) => [h.asset, h.code])).toEqual([["issues", "SCHEDULE_HELD"]]);
-    expect(formatTick(out.result)).toMatch(/^tick: nothing due · read changed asset files \(\d+ ms\)\n {2}held issues \(SCHEDULE_HELD\): code edited .* ago, not run by hand yet; croft run issues releases it$/);
+    expect(formatTick(out.result)).toMatch(/^tick: nothing due \(\d+ ms\)\n {2}held issues \(SCHEDULE_HELD\): code edited .* ago, not run by hand yet; croft run issues releases it$/);
     // Still due: last_fire_at did not move.
     expect(scheduleStateOf(p, "issues")?.lastFireAt).toBeNull();
   });
 
-  test("a run that cannot be started is a problem, and the tick goes on", async () => {
+  test("a run that cannot be started is a problem, and the tick goes on; the fire stays due and is tried again after a wait", async () => {
     const p = await pipeline();
-    const out = await tick(p, "2026-09-22T11:00:30Z", { spawn: async () => { throw new Error("spawn bun ENOENT"); } });
+    const notified: ScheduledFailure[] = [];
+    const notify = async (_root: string, f: ScheduledFailure) => void notified.push(f);
+    const out = await tick(p, "2026-09-22T11:00:30Z", { notify, spawn: async () => { throw new Error("spawn bun ENOENT"); } });
     expect(out.result.spawned).toEqual([]);
-    expect(out.problems.map((x) => x.message)).toEqual(["the scheduler could not start the run of issues: spawn bun ENOENT"]);
+    expect(out.problems.map((x) => [x.message, x.effect])).toEqual([
+      ["the scheduler could not start the run of issues: spawn bun ENOENT", "it stays due; the scheduler tries again after 11:15"],
+    ]);
+    expect(notified).toEqual([{ project: p.root, runId: expect.any(String), failed: [{ asset: "issues", error: expect.objectContaining({ code: "RUN_CRASHED" }) }] }]);
+    expect(scheduleStateOf(p, "issues")?.lastFireAt).toBeNull();
+    const next = await tick(p, "2026-09-22T11:01:30Z", { notify });
+    expect(next.spawned).toEqual([]);
+    expect(next.result.held).toEqual([{ asset: "issues", code: "backoff", reason: expect.stringContaining("(it could not be started: spawn bun ENOENT); tries again after 11:15") }]);
+    expect((await tick(p, "2026-09-22T11:15:30Z", { notify })).spawned.map((s) => s.assets)).toEqual([["issues"]]);
   });
 });
 
@@ -212,33 +307,51 @@ describe("croft tick in real processes", () => {
     CROFT_NOW: now, CROFT_HOME: home, CROFT_JOB_LABEL: `dev.croft.test-tick-${process.pid}`, CROFT_FORBID_OS_JOBS: "1", CROFT_NOTIFY_DRY: "1", ...extra,
   });
 
-  test("a tick with nothing changed imports no asset code", async () => {
+  test("a tick with nothing changed imports no asset code; a tick never imports code nobody has run", async () => {
     const marker = join(mkdtempSync(join(tmpdir(), "croft-marker-")), "imported.log");
     const p = schedProject({ "assets/issues.ts": scheduledIngest({ marker }), "assets/open_issues.sql": "select id from issues\n" });
     scheduling(p, "on");
+    // New, never run by hand: the SQL is parsed; the ingest is bundled, not imported (its top-level code never runs
+    // under the scheduler), and it is held at its fire (its text shows the schedule).
     let r = await cli(p.root, ["tick", "--json"], env("2026-09-22T10:05:00Z"));
     expect(r.code).toBe(0);
     expect(r.json?.data).toMatchObject({ exited: null, importedAssetCode: true, spawned: [] });
     expect(r.json?.data.held.map((h: { asset: string; code: string }) => [h.asset, h.code])).toEqual([["issues", "SCHEDULE_HELD"]]);
-    expect(imports(marker)).toBe(1);
+    expect(imports(marker)).toBe(0);
 
     r = await cli(p.root, ["tick", "--json"], env("2026-09-22T10:06:00Z"));
     expect(r.json?.data).toMatchObject({ exited: null, importedAssetCode: false, heartbeatAt: "2026-09-22T10:06:00.000Z" });
     expect(r.json?.data.tookMs).toBeLessThan(1000);
-    expect(imports(marker)).toBe(1);
+    expect(imports(marker)).toBe(0);
 
-    // An edit: that tick imports it again, the next one does not.
-    writeFileSync(join(p.root, "assets/issues.ts"), scheduledIngest({ marker, schedule: "daily at 06:00" }));
+    // Run by hand (that run imports it): the next tick imports the approved code once, the one after does not.
+    const run = await cli(p.root, ["run", "issues", "--only", "--foreground", "--json"], env("2026-09-22T10:06:30Z"));
+    expect(run.code).toBe(0);
+    expect(imports(marker)).toBe(1);
     r = await cli(p.root, ["tick"], env("2026-09-22T10:07:00Z"));
-    expect(r.code).toBe(0);
     expect(r.stdout).toContain("tick: nothing due · read changed asset files");
     expect(imports(marker)).toBe(2);
-    expect(scheduleStateOf(p, "issues")).toMatchObject({ phrase: "daily at 06:00", cron: "0 6 * * *" });
-    await cli(p.root, ["tick"], env("2026-09-22T10:08:00Z"));
+    await cli(p.root, ["tick"], env("2026-09-22T10:07:30Z"));
     expect(imports(marker)).toBe(2);
 
-    scheduling(p, "off");
+    // An edit nobody has run: the tick holds it without importing it, and keeps the approved code's schedule.
+    writeFileSync(join(p.root, "assets/issues.ts"), scheduledIngest({ marker, schedule: "daily at 06:00" }));
+    r = await cli(p.root, ["tick", "--json"], env("2026-09-22T10:08:00Z"));
+    expect(r.code).toBe(0);
+    expect(r.json?.data.importedAssetCode).toBe(false);
+    expect(imports(marker)).toBe(2);
+    expect(scheduleStateOf(p, "issues")).toMatchObject({ phrase: "every hour", cron: "0 * * * *" });
+    // Run by hand: the next tick imports it, and reads its new schedule.
+    expect((await cli(p.root, ["run", "issues", "--only", "--foreground", "--json"], env("2026-09-22T10:08:30Z"))).code).toBe(0);
+    expect(imports(marker)).toBe(3);
     r = await cli(p.root, ["tick"], env("2026-09-22T10:09:00Z"));
+    expect(imports(marker)).toBe(4);
+    expect(scheduleStateOf(p, "issues")).toMatchObject({ phrase: "daily at 06:00", cron: "0 6 * * *" });
+    await cli(p.root, ["tick"], env("2026-09-22T10:09:30Z"));
+    expect(imports(marker)).toBe(4);
+
+    scheduling(p, "off");
+    r = await cli(p.root, ["tick"], env("2026-09-22T10:10:00Z"));
     expect(r.stdout.trim()).toBe("tick: nothing to do: scheduling is off for this project");
   }, 60_000);
 
