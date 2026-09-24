@@ -16,13 +16,19 @@
 // and test kits aside) with the TypeScript parser, not only hints, fixes and next[] entries: a message, a
 // docs line or a log line reaches the agent just the same. core/phase.ts is exempt: it names every phase's
 // commands on purpose (the SKILL.md notes it renders are checked below).
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import ts from "typescript";
-import { CODES } from "../core/errors.ts";
-import { validateDefinition } from "../project/ts-asset.ts";
+import { analyzeChecks, parseChecks, probeSql } from "../checks/parse.ts";
+import { type Code, CODES, isCode } from "../core/errors.ts";
+import type { Problem } from "../core/types.ts";
+import { openMemory } from "../db/connect.ts";
+import { quoteIdent } from "../load/evolve.ts";
+import { type LoadedSqlAsset, loadSqlAsset } from "../project/sql-asset.ts";
+import { loadTsAsset } from "../project/ts-asset.ts";
+import { ShadowCatalog, type ShadowColumn } from "../sql/bind.ts";
 import { LATER_COMMANDS, laterFlags, SHIPPED_COMMANDS, versionNotes } from "../core/phase.ts";
 import type { Ctx } from "../cli/command.ts";
 import { docs } from "../cli/commands/docs.ts";
@@ -113,15 +119,45 @@ describe("croft tells the agent to use only what this build has", () => {
     expect(findings).toEqual([]);
   });
 
-  test("the loop is edit → croft run → croft query / describe / logs, and backfill is croft run --from", () => {
+  test("the loop is edit → validate → preview → run → query, and a backfill starts with a dry run", () => {
     for (const block of [claudeBlock("project"), claudeBlock("app")]) {
       const loop = block.split("\n").find((l) => l.startsWith("Loop:"))!;
-      expect(loop).toContain("`croft run <asset>`");
-      expect(loop).toContain('`croft query "..."`');
-      expect(loop).toContain("`croft describe <asset>`");
-      expect(loop).toContain("`croft logs <asset>`");
+      expect([...loop.matchAll(/`(croft [^`]+)`/g)].map((m) => m[1])).toEqual([
+        "croft validate --json", "croft preview <asset>", "croft run <asset>", 'croft query "..."',
+      ]);
     }
-    expect(skillMd()).toContain("croft run <asset> --from -90d");
+    const skill = skillMd();
+    for (const step of ["2. `croft validate --json` after EVERY edit", "3. `croft preview <name>`", "4. `croft run <name>`"]) {
+      expect(skill).toContain(step);
+    }
+    expect(skill).toContain("croft run <asset> --dry-run --from -90d, then the same without --dry-run");
+  });
+
+  test("every croft docs page the texts name exists", async () => {
+    // Placeholders (croft docs <topic>, the X a template literal's substitution reads as) name no page.
+    const PLACEHOLDERS = new Set(["X", "CODE", "ERROR_CODE"]);
+    const texts: { where: string; text: string }[] = [
+      { where: "CLAUDE.md", text: claudeBlock("project") },
+      { where: "CLAUDE.md (app)", text: claudeBlock("app") },
+      { where: "SKILL.md", text: skillMd() },
+      ...(await allDocs()).map((p) => ({ where: `croft docs ${p.name}`, text: p.page })),
+    ];
+    for (const file of sourceFiles()) {
+      const rel = relative(SRC, file).split("\\").join("/");
+      for (const s of sourceStrings(file, readFileSync(file, "utf8"))) texts.push({ where: `src/${rel}:${s.line}`, text: s.text });
+    }
+    const missing: string[] = [];
+    for (const t of texts) {
+      for (const m of t.text.matchAll(/\bcroft docs ([A-Za-z_][\w-]*)/g)) {
+        if (PLACEHOLDERS.has(m[1]!)) continue;
+        try {
+          await docsPage(m[1]!);
+        } catch {
+          missing.push(`${t.where}: croft docs ${m[1]}`);
+        }
+      }
+    }
+    expect(missing).toEqual([]);
   });
 
   test("the scaffold's files", () => {
@@ -148,43 +184,6 @@ describe("croft tells the agent to use only what this build has", () => {
     for (const e of ELSEWHERE) expect(findings.some((f) => f.where.startsWith(`src/${e.file}:`) && f.text.includes(e.text)), `${e.file}: ${e.text} is fixed; drop it from ELSEWHERE`).toBe(true);
   });
 
-  test("croft docs ingest: every template type-checks against the real API and is a valid asset", async () => {
-    // Without `croft new` in this version, these templates are what the skill sends the agent to ("don't
-    // invent APIs"), so they must be exactly the public API: tsc with the scaffold's options, then the
-    // loader's own validation.
-    const page = await docsPage("ingest");
-    const blocks = [...page.matchAll(/```ts\n([\s\S]*?)```/g)].map((m) => m[1]!);
-    expect(blocks.length).toBeGreaterThanOrEqual(5);
-    const dir = realpathSync(mkdtempSync(join(tmpdir(), "croft-docs-ingest-")));
-    try {
-      const files = blocks.map((code) => {
-        const name = /^\/\/ assets\/([a-z][a-z0-9_]*)\.ts/.exec(code)?.[1];
-        expect(name, code.slice(0, 80)).toBeDefined();
-        const path = join(dir, `${name}.ts`);
-        writeFileSync(path, code.replace('from "@zabaca/croft"', `from ${JSON.stringify(join(SRC, "index.ts"))}`));
-        return { name: name!, path, code };
-      });
-      const options: ts.CompilerOptions = {
-        ...(JSON.parse(tsconfigJson()).compilerOptions as object),
-        target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler,
-        typeRoots: [join(SRC, "..", "node_modules", "@types")],
-      } as ts.CompilerOptions;
-      const program = ts.createProgram(files.map((f) => f.path), options);
-      const diagnostics = ts.getPreEmitDiagnostics(program)
-        .filter((d) => d.file && files.some((f) => f.path === d.file!.fileName))
-        .map((d) => `${d.file!.fileName.split("/").pop()}: ${ts.flattenDiagnosticMessageText(d.messageText, "\n")}`);
-      expect(diagnostics).toEqual([]);
-      for (const f of files) {
-        const mod = await import(f.path);
-        const v = validateDefinition(mod.default, { name: f.name, file: `assets/${f.name}.ts`, source: f.code, hasDefault: "default" in mod });
-        expect(v.problems.filter((p) => p.severity === "error"), f.name).toEqual([]);
-        expect(v.spec, f.name).toBeDefined();
-      }
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
   test("the source scan reads every string and template literal, but not names, types or module paths", () => {
     const text = `import { a } from "./a.ts";
 type Mode = "--not-text";
@@ -196,4 +195,187 @@ log(\`plain\`);`;
     const spec = `lazyCommand({ name: "q", description: "not an option", options: { preview: { type: "boolean", description: "o1" } } });`;
     expect(sourceStrings("y.ts", spec).map((s) => s.text)).toEqual(["q", "not an option", "boolean", "o1"]);
   });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// Pages for the codes, and the templates in the pages
+
+/** The codes phase 2 brings (DESIGN.md §11: SQL assets, the bind check, checks, TS transforms, staleness), and
+ *  the older ones its SQL assets and bind check raise most. Each has a page of its own. */
+const PHASE_2_CODES: Code[] = [
+  "HEADER_UNKNOWN_KEY", "SQL_SYNTAX", "SQL_NOT_SELECT", "SQL_NOT_ONE_STATEMENT", "PIVOT_NEEDS_VALUES", "CATALOG_PREFIX",
+  "SQL_READS_FILES", "VOLATILE_SQL", "DUPLICATE_OUTPUT_COLUMN", "UNKNOWN_TABLE", "UNKNOWN_COLUMN", "QUOTE_IDENTIFIER",
+  "NULL_ONLY_COLUMN", "INPUT_NOT_BUILT", "CYCLE", "CHECK_INVALID", "CHECK_FAILED", "INPUT_NEEDS_KEY", "UNDECLARED_INPUT",
+  "UNKNOWN_INPUT_COLUMN", "LARGE_REPROCESS", "TRANSFORM_MAKES_REQUESTS", "EDITED_SINCE_LAST_RUN",
+];
+
+describe("croft docs pages", () => {
+  test("every code phase 2 brings has a page of its own, titled with the code", async () => {
+    for (const code of PHASE_2_CODES) {
+      const d = (await docs.run({ positionals: [code], values: {} } as unknown as Ctx)).data as { source: string; page: string };
+      expect(d.source, code).toBe("file");
+      expect(d.page, code).toMatch(new RegExp(`^# ${code}: \\S`));
+    }
+  });
+
+  test("a page named after a code is that code's page", async () => {
+    for (const p of await allDocs()) {
+      if (!isCode(p.name) || !p.page.startsWith("# ")) continue;
+      expect(p.page.split("\n")[0]!.startsWith(`# ${p.name}: `), p.name).toBe(true);
+    }
+  });
+
+  test("the topics for writing assets are listed", async () => {
+    const list = (await docs.run({ positionals: [], values: { list: true } } as unknown as Ctx)).data as { topics: { name: string; summary: string }[] };
+    const topics = new Map(list.topics.map((t) => [t.name, t.summary]));
+    for (const name of ["ingest", "sql", "transforms", "checks"]) {
+      expect(topics.get(name), name).toBeDefined();
+      expect(topics.get(name)!.length, name).toBeLessThanOrEqual(100);
+    }
+  });
+});
+
+/** A fenced template in a docs page: ```ts whose first line is `// assets/<name>.ts`, or ```sql whose first
+ *  line is `-- assets/<name>.sql`. Pages use no other fences, so every fenced block is checked. */
+interface Template { page: string; lang: "ts" | "sql"; name: string; code: string }
+
+async function docsTemplates(): Promise<Template[]> {
+  const out: Template[] = [];
+  for (const p of await allDocs()) {
+    for (const m of p.page.matchAll(/```([a-z]*)\n([\s\S]*?)```/g)) {
+      const [, lang, code] = m as unknown as [string, string, string];
+      const name = (lang === "ts" ? /^\/\/ assets\/([a-z][a-z0-9_]*)\.ts\b/ : /^-- assets\/([a-z][a-z0-9_]*)\.sql\b/).exec(code)?.[1];
+      if ((lang !== "ts" && lang !== "sql") || !name) throw new Error(`croft docs ${p.name}: a \`\`\`${lang} block that is not a template: ${code.slice(0, 80)}`);
+      out.push({ page: p.name, lang, name, code });
+    }
+  }
+  return out;
+}
+
+/** The columns of the ingests the SQL templates read, as a run types them: example_sales of a new project, and
+ *  github_issues of croft docs ingest. */
+const TEMPLATE_INPUTS: Record<string, ShadowColumn[]> = {
+  example_sales: [
+    { name: "order_id", type: "BIGINT" }, { name: "order_date", type: "DATE" }, { name: "customer", type: "VARCHAR" },
+    { name: "region", type: "VARCHAR" }, { name: "product", type: "VARCHAR" }, { name: "quantity", type: "BIGINT" },
+    { name: "unit_price", type: "DOUBLE" }, { name: "amount", type: "DOUBLE" }, { name: "_file", type: "VARCHAR" },
+  ],
+  github_issues: [
+    { name: "id", type: "BIGINT" }, { name: "number", type: "BIGINT" }, { name: "title", type: "VARCHAR" },
+    { name: "body", type: "VARCHAR" }, { name: "state", type: "VARCHAR" }, { name: "user", type: "JSON" },
+    { name: "labels", type: "JSON" }, { name: "comments", type: "BIGINT" }, { name: "pull_request", type: "JSON" },
+    { name: "created_at", type: "TIMESTAMPTZ" }, { name: "updated_at", type: "TIMESTAMPTZ" },
+  ],
+};
+
+describe("the templates in croft docs pages are valid assets", () => {
+  // Without `croft new` in this version, these templates are what the skill sends the agent to ("start from the
+  // closest template; don't invent APIs"), so they must be the public API exactly, and SQL that DuckDB binds:
+  // tsc with the scaffold's options and croft's own loaders, in a project whose node_modules has this package.
+  let templates: Template[] = [];
+  let dir = "";
+  const pathOf = (t: Template) => join(dir, "assets", `${t.name}.${t.lang}`);
+
+  beforeAll(async () => {
+    templates = await docsTemplates();
+    dir = realpathSync(mkdtempSync(join(tmpdir(), "croft-docs-templates-")));
+    mkdirSync(join(dir, "assets"));
+    mkdirSync(join(dir, "node_modules", "@zabaca"), { recursive: true });
+    symlinkSync(join(SRC, ".."), join(dir, "node_modules", "@zabaca", "croft"));
+    for (const t of templates) writeFileSync(pathOf(t), t.code);
+  });
+  afterAll(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("the pages have their templates, each named after its file, each name once", () => {
+    const count = (page: string, lang: string) => templates.filter((t) => t.page === page && t.lang === lang).length;
+    expect(count("ingest", "ts")).toBeGreaterThanOrEqual(5);
+    expect(count("transforms", "ts")).toBeGreaterThanOrEqual(3);
+    expect(count("sql", "sql")).toBeGreaterThanOrEqual(3);
+    expect(count("checks", "ts") + count("checks", "sql")).toBeGreaterThanOrEqual(2);
+    const names = templates.map((t) => t.name);
+    expect(names.length).toBe(new Set(names).size);
+  });
+
+  test("every TypeScript template type-checks against the real API and loads with no problem", async () => {
+    const files = templates.filter((t) => t.lang === "ts");
+    const options: ts.CompilerOptions = {
+      ...(JSON.parse(tsconfigJson()).compilerOptions as object),
+      target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler,
+      typeRoots: [join(SRC, "..", "node_modules", "@types")],
+    } as ts.CompilerOptions;
+    const program = ts.createProgram(files.map(pathOf), options);
+    const diagnostics = ts.getPreEmitDiagnostics(program)
+      .filter((d) => d.file && files.some((f) => pathOf(f) === d.file!.fileName))
+      .map((d) => `${d.file!.fileName.split("/").pop()}: ${ts.flattenDiagnosticMessageText(d.messageText, "\n")}`);
+    expect(diagnostics).toEqual([]);
+
+    const db = await openMemory({ timezone: "UTC" });
+    try {
+      const conn = await db.connect();
+      let paid = 0;
+      for (const t of files) {
+        const a = await loadTsAsset({ name: t.name, file: `assets/${t.name}.ts`, path: pathOf(t) }, { root: dir, timezone: "UTC" });
+        expect(a.problems, `croft docs ${t.page}: ${t.name}`).toEqual([]);
+        const spec = a.spec!;
+        expect(spec, t.name).toBeDefined();
+        const parsed = parseChecks({ asset: t.name, file: a.file, key: spec.key, checks: spec.checks, warnings: spec.warnings });
+        expect(parsed.problems, t.name).toEqual([]);
+        expect((await analyzeChecks(conn, t.name, parsed.checks)).problems, t.name).toEqual([]);
+        // SKILL.md: a TS transform that calls an API per row keeps `incremental: true` + `newRows()`, "the template
+        // default"; so a template that makes requests is incremental, and the cost guard covers it.
+        if (spec.role === "transform" && a.usesHttp) {
+          paid++;
+          expect(spec.incremental.kind, t.name).toBe("new-rows");
+        }
+      }
+      expect(paid).toBeGreaterThanOrEqual(1);
+    } finally {
+      db.close();
+    }
+  }, 60_000);
+
+  test("every SQL template loads, binds against what it reads, and its checks bind to its output", async () => {
+    const sql = templates.filter((t) => t.lang === "sql");
+    const assetNames = [...templates.map((t) => t.name), ...Object.keys(TEMPLATE_INPUTS)];
+    const db = await openMemory({ timezone: "UTC" });
+    const shadow = await ShadowCatalog.open("UTC");
+    try {
+      const conn = await db.connect();
+      const loaded = new Map<string, LoadedSqlAsset>();
+      for (const t of sql) {
+        const a = await loadSqlAsset({ name: t.name, file: `assets/${t.name}.sql`, path: pathOf(t) }, { root: dir, timezone: "UTC", conn, assetNames });
+        expect(a.problems, `croft docs ${t.page}: ${t.name}`).toEqual([]);
+        loaded.set(t.name, a);
+      }
+      for (const [table, columns] of Object.entries(TEMPLATE_INPUTS)) await shadow.define(table, columns);
+      // In dependency order: an asset binds once what it reads has columns, and its output feeds its readers.
+      const defined = new Set(Object.keys(TEMPLATE_INPUTS));
+      const pending = new Set(loaded.keys());
+      while (pending.size) {
+        const next = [...pending].find((n) => loaded.get(n)!.astInputs.every((i) => defined.has(i)));
+        if (!next) throw new Error(`no SQL template can bind: ${[...pending].map((n) => `${n} reads ${loaded.get(n)!.astInputs.join(", ")}`).join("; ")}`);
+        const a = loaded.get(next)!;
+        const r = await shadow.bind(a);
+        expect(r.problems, a.name).toEqual([]);
+        await shadow.define(a.name, r.outputColumns!);
+        defined.add(a.name);
+        pending.delete(a.name);
+        const parsed = parseChecks({ asset: a.name, file: a.file, key: a.header.key, checks: a.header.checks, warnings: a.header.warnings });
+        expect(parsed.problems, a.name).toEqual([]);
+        expect((await analyzeChecks(conn, a.name, parsed.checks)).problems, a.name).toEqual([]);
+        const bindProblems: Problem[] = [];
+        for (const c of parsed.checks) {
+          if (c.kind === "min_rows") continue;
+          const body = c.kind === "rule" ? probeSql(a.name, c.sql) : `SELECT ${c.sql} FROM ${quoteIdent(a.name)}`;
+          bindProblems.push(...(await shadow.bind({ ...a, body, headerLines: 0, astInputs: [a.name, ...c.reads], problems: [] })).problems);
+        }
+        expect(bindProblems, a.name).toEqual([]);
+      }
+    } finally {
+      shadow.close();
+      db.close();
+    }
+  }, 60_000);
 });

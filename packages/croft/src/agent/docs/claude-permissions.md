@@ -4,9 +4,11 @@ croft init writes CLAUDE.md and .claude/skills/croft/SKILL.md, and nothing else 
 writes .claude/settings.json: permission rules change what Claude Code may do without asking, so they stay
 your decision.
 
-Every destructive croft action (rebuilding an ingest, --allow-shrink, delete, restore, lossy pin changes,
-key conversion, large paid reprocessing) ends in one command: croft confirm <token>. So one "ask" rule makes
-Claude Code stop and ask you before any of them. The "deny" rules keep your secrets out of the agent's reach.
+Every destructive croft action ends in one command: croft confirm <token>. In this version those are
+--allow-shrink (a replace ingest about to write far fewer rows than it has) and large paid reprocessing (an
+incremental transform that would make requests for more rows than its confirmAbove, LARGE_REPROCESS); the
+destructive actions of later versions end there too. So one "ask" rule makes Claude Code stop and ask you
+before any of them. The "deny" rules keep your secrets out of the agent's reach.
 
 Suggested rules, for .claude/settings.json (shared with your team) or .claude/settings.local.json (just you):
 
