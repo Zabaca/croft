@@ -257,6 +257,18 @@ export default transform({
     expect(stepsOf((await run({ selectors: ["clean"], upstream: true })).data).clean).toMatchObject({ action: "rebuild", problems: [] });
   });
 
+  test("a TS transform whose inputs name no asset: the dry run shows UNKNOWN_TABLE with the did-you-mean edit, as the run fails it", async () => {
+    const { run } = setup({
+      ...FILES,
+      "assets/typo.ts": `import { transform } from "@zabaca/croft";\nexport default transform({\n  inputs: ["issuez"], key: "id",\n  async *rows({ rows }) { for await (const r of rows<{ id: number }>("issuez")) yield { id: r.id }; },\n});\n`,
+    });
+    const out = await run({ selectors: ["typo"] });
+    expect(stepsOf(out.data).typo!.problems).toMatchObject([{
+      code: "UNKNOWN_TABLE", line: 3, fix: { kind: "edit", replace: { from: "issuez", to: "issues" } },
+    }]);
+    expect(JSON.stringify(out)).not.toContain("croft run issuez");
+  });
+
   test("a step that would fail before it runs is shown with its problem; what reads it is skipped, as the runner skips it", async () => {
     const { run } = setup({
       ...FILES,

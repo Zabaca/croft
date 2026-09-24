@@ -624,6 +624,17 @@ export function inputNotBuilt(step: Pick<PlannedStep, "action" | "problems">): P
   return step.action === "skip" ? step.problems.find((p) => p.code === "INPUT_NOT_BUILT" && Array.isArray(p.details?.inputs)) : undefined;
 }
 
+/** The next step for a step skipped with INPUT_NOT_BUILT: its fix, the run that builds the never-built input. */
+export function buildFirst(p: Problem): { command: string; reason: string } | null {
+  if (p.fix?.kind !== "command") return null;
+  const inputs = Array.isArray(p.details?.inputs) ? p.details.inputs.map(String) : [];
+  const roots = Array.isArray(p.details?.notBuilt) ? p.details.notBuilt.map(String) : inputs;
+  const one = roots.length === 1;
+  const direct = roots.length === inputs.length && roots.every((r) => inputs.includes(r));
+  const what = direct ? (one ? "it" : "them") : `${listed(inputs)}, which ${inputs.length === 1 ? "needs" : "need"} ${one ? "it" : "them"}`;
+  return { command: p.fix.command, reason: `build ${listed(roots)} first: ${p.asset ?? "a step"} reads ${what}, and ${one ? "it has" : "they have"} never been built` };
+}
+
 /** "a", "a and b", "a, b and c". */
 function listed(list: readonly string[]): string {
   return list.length <= 1 ? list.join("") : `${list.slice(0, -1).join(", ")} and ${list.at(-1)}`;

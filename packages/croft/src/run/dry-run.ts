@@ -33,8 +33,8 @@ import { lookbackWords, selectorWords } from "../project/resolve.ts";
 import type { Project } from "../project/root.ts";
 import { cursorTypeOfPin } from "../project/ts-asset.ts";
 import { croftError, fromSince, shrinkImpact } from "./ingest.ts";
-import { cursorTypesOf, FROM_ONLY_MERGE, inputNotBuilt, loadErrors, type PlannedStep, planRun, type RunPlan } from "./plan.ts";
-import { checkRunFlags, shrinkCommand } from "./runner.ts";
+import { buildFirst, cursorTypesOf, FROM_ONLY_MERGE, inputNotBuilt, loadErrors, type PlannedStep, planRun, type RunPlan } from "./plan.ts";
+import { checkRunFlags, shrinkCommand, withProjectChecks } from "./runner.ts";
 import { DEFAULT_CONFIRM_ABOVE, REPROCESS_ACTION } from "./transform.ts";
 
 export interface DryRunInput {
@@ -101,14 +101,17 @@ export async function dryRun(i: DryRunInput): Promise<DryRunOutcome> {
   const { project } = i;
   const history = readHistory(project.paths.stateDir);
   const entries = new Map(history.catalog.map((c) => [c.asset, c]));
-  const plan = await planRun({
+  const planned = await planRun({
     root: project.root, timezone: project.timezone, selectors: i.selectors, catalog: history.catalog,
     cursorTypes: cursorTypesOf(history.catalog), only: i.only === true, upstream: i.upstream === true,
     ...(i.from !== undefined ? { from: i.from } : {}), ...(i.importTimeoutMs !== undefined ? { importTimeoutMs: i.importTimeoutMs } : {}),
     // A mistyped name's fix is this dry run again, never a real run.
     retry: (selectors) => [...runWords({ ...i, selectors }), "--dry-run"].join(" "),
   });
-  checkRunFlags(plan, { selectors: i.selectors, ...(i.from !== undefined ? { from: i.from } : {}), allowShrink: i.allowShrink === true });
+  checkRunFlags(planned, { selectors: i.selectors, ...(i.from !== undefined ? { from: i.from } : {}), allowShrink: i.allowShrink === true });
+  // As a run does (runner.ts withProjectChecks): a TS transform whose inputs name no asset fails before it runs
+  // (UNKNOWN_TABLE with a did-you-mean edit fix).
+  const plan = await withProjectChecks(planned, project);
   const now = i.now ?? clockNow();
   const steps: DryRunStep[] = [];
   const problems: Problem[] = [...plan.problems];
@@ -377,17 +380,6 @@ function nextOf(steps: readonly DryRunStep[], i: DryRunInput, o: { builds: reado
     next.push({ command: runWords(i).join(" "), reason });
   }
   return next;
-}
-
-/** The next step for a step skipped with INPUT_NOT_BUILT: its fix, the run that builds the never-built input. */
-function buildFirst(p: Problem): Next | null {
-  if (p.fix?.kind !== "command") return null;
-  const inputs = Array.isArray(p.details?.inputs) ? p.details.inputs.map(String) : [];
-  const roots = Array.isArray(p.details?.notBuilt) ? p.details.notBuilt.map(String) : inputs;
-  const one = roots.length === 1;
-  const direct = roots.length === inputs.length && roots.every((r) => inputs.includes(r));
-  const what = direct ? (one ? "it" : "them") : `${listed(inputs)}, which ${inputs.length === 1 ? "needs" : "need"} ${one ? "it" : "them"}`;
-  return { command: p.fix.command, reason: `build ${listed(roots)} first: ${p.asset ?? "a step"} reads ${what}, and ${one ? "it has" : "they have"} never been built` };
 }
 
 /** "a", "a and b", "a, b and c". */

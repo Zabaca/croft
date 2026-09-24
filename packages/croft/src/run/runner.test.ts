@@ -834,6 +834,16 @@ describe("planning", () => {
     await expect(runIn(root, ["zonez"])).rejects.toMatchObject({ code: "USAGE_ERROR", problem: { hint: "did you mean zones?" } });
     await expect(runIn(root, ["nothing_*"])).rejects.toMatchObject({ code: "USAGE_ERROR" });
   });
+
+  test("a named asset whose input was never built is skipped, and the run says so with the run that builds it", async () => {
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones"), "assets/report.sql": "-- key: zone\nselect zone from zones\n" });
+    const out = await runIn(root, ["report"]);
+    expect(out.data.steps).toMatchObject([{ asset: "report", status: "skipped" }]);
+    expect(out.problems).toMatchObject([{ code: "INPUT_NOT_BUILT", severity: "warning", asset: "report", fix: { kind: "command", command: "croft run zones" } }]);
+    expect(out.next[0]).toEqual({ command: "croft run zones", reason: "build zones first: report reads it, and it has never been built" });
+    expect(out.exit).toBe(0);
+  });
 });
 
 describe("a TS transform's inputs that name no asset", () => {
@@ -880,12 +890,14 @@ export default transform({
       "assets/typo.ts": `import { transform } from "@zabaca/croft";\nexport default transform({ inputs: ["issuez", "issues"], key: "id", async *rows() {} });\n`,
     });
     const project = loadProject({ root });
-    const plan = await planRun({ root, timezone: project.timezone, selectors: ["typo"] });
-    expect(plan.steps[0]!.problems.map((p) => p.code)).not.toContain("UNKNOWN_TABLE");
+    // issues is built in the same run, so typo is planned (an input never built and not built by the run skips it).
+    const plan = await planRun({ root, timezone: project.timezone, selectors: ["issues", "typo"] });
+    const typo = (p: typeof plan) => p.steps.find((x) => x.asset === "typo")!;
+    expect(typo(plan).problems.map((p) => p.code)).not.toContain("UNKNOWN_TABLE");
     const once = await withProjectChecks(plan, project);
     const twice = await withProjectChecks(once, project);
     for (const p of [once, twice]) {
-      expect(p.steps[0]!.problems.filter((x) => x.code === "UNKNOWN_TABLE").map((x) => x.details?.table)).toEqual(["issuez"]);
+      expect(typo(p).problems.filter((x) => x.code === "UNKNOWN_TABLE").map((x) => x.details?.table)).toEqual(["issuez"]);
     }
   });
 });

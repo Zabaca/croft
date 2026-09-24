@@ -233,6 +233,37 @@ SELECT id, title || '!' AS title, length(title) AS n FROM issues WHERE state = '
     expect(await rows(root, "select count(*) as n from issues", { preview: true })).toEqual([{ n: 4 }]);
   }, 60_000);
 
+  test("an edited SQL input the previewed asset reads a new column of is built first from the snapshots, not listed", async () => {
+    api.issues = [issue(1, 1), issue(2, 2, { state: "closed" }), issue(3, 3)];
+    const root = makeProject({
+      "assets/issues.ts": ISSUES(), "assets/open_issues.sql": OPEN,
+      "assets/titles.sql": "-- key: id\nSELECT id, upper(title) AS t FROM open_issues\n",
+    });
+    await run(root);
+    writeFiles(root, {
+      "assets/open_issues.sql": "-- key: id\nSELECT id, title, length(title) AS n FROM issues WHERE state = 'open'\n",
+      "assets/titles.sql": "-- key: id\nSELECT id, upper(title) AS t, n FROM open_issues\n",
+    });
+    const out = await preview(root, ["titles"]);
+    expect(out.problems.filter((p) => p.severity === "error")).toEqual([]);
+    expect(byName(out.data.assets, "open_issues")).toMatchObject({ status: "ok" });
+    expect(byName(out.data.assets, "titles")).toMatchObject({ status: "ok", rows: 2 });
+    expect(await rows(root, "select id, n from titles order by id", { preview: true })).toEqual([{ id: 1, n: 7 }, { id: 3, n: 7 }]);
+  }, 60_000);
+
+  test("a warning that reads another built table is evaluated against its snapshot", async () => {
+    api.issues = [issue(1, 1), issue(2, 2, { state: "closed" }), issue(3, 3)];
+    const root = makeProject({
+      "assets/issues.ts": ISSUES(), "assets/open_issues.sql": OPEN,
+      "assets/zones.sql": "-- key: z\nSELECT 1 AS z\n",
+    });
+    await run(root);
+    writeFiles(root, { "assets/open_issues.sql": `-- key: id\n-- warn: (select count(*) from zones) > 0\n${OPEN.split("\n").filter((l) => !l.startsWith("-- key")).join("\n")}` });
+    const out = await preview(root, ["open_issues"]);
+    expect(out.problems.filter((p) => p.severity === "error")).toEqual([]);
+    expect(JSON.stringify(out)).not.toContain("does not exist");
+  }, 60_000);
+
   test("a failing blocking check fails the asset like a run would (exit 3), and keeps its table to explore", async () => {
     api.issues = [issue(1, 1), issue(2, 2)];
     const root = makeProject({ "assets/issues.ts": ISSUES(), "assets/open_issues.sql": OPEN });

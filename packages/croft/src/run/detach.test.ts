@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError, problem } from "../core/errors.ts";
@@ -134,6 +134,42 @@ describe("followRun", () => {
     } finally {
       db.close();
     }
+  });
+
+  test("croft run's parent returns once the child that finished its run has exited (it closes the warehouse last)", async () => {
+    const s = stateDir();
+    const script = join(s, "linger.ts");
+    const marker = join(s, "exited");
+    writeFileSync(script, `
+      import { writeFileSync } from "node:fs";
+      import { RunsDb } from ${JSON.stringify(join(import.meta.dir, "../history/runs-db.ts"))};
+      const db = RunsDb.open(${JSON.stringify(s)});
+      db.createRun({ id: "r_0101_0000_lngr", trigger: "manual", human: false, argv: ["run"] });
+      db.finishRun("r_0101_0000_lngr", "succeeded", { data: { runId: "r_0101_0000_lngr", status: "succeeded", steps: [] }, problems: [], next: [], exit: 0, ok: true });
+      db.close();
+      await Bun.sleep(400);
+      process.on("exit", () => writeFileSync(${JSON.stringify(marker)}, "1"));
+    `);
+    const spawned = spawnDetachedRun({ root: s, stateDir: s, args: [], runId: "r_0101_0000_lngr", env: { PATH: process.env.PATH }, entry: script });
+    const res = await followRun({ stateDir: s, runId: "r_0101_0000_lngr", timeoutMs: 10_000, pollMs: 20, spawned });
+    expect(res).toMatchObject({ kind: "finished", summary: { exit: 0 } });
+    expect(existsSync(marker)).toBe(true);
+    // A child that does not exit in time does not hold the parent for long.
+    const s2 = stateDir();
+    const stuck = join(s2, "stuck.ts");
+    writeFileSync(stuck, `
+      import { RunsDb } from ${JSON.stringify(join(import.meta.dir, "../history/runs-db.ts"))};
+      const db = RunsDb.open(${JSON.stringify(s2)});
+      db.createRun({ id: "r_0101_0000_stck", trigger: "manual", human: false, argv: ["run"] });
+      db.finishRun("r_0101_0000_stck", "succeeded", { data: { runId: "r_0101_0000_stck", status: "succeeded", steps: [] }, problems: [], next: [], exit: 0, ok: true });
+      db.close();
+      await Bun.sleep(20_000);
+    `);
+    const sp2 = spawnDetachedRun({ root: s2, stateDir: s2, args: [], runId: "r_0101_0000_stck", env: { PATH: process.env.PATH }, entry: stuck });
+    const t0 = Date.now();
+    expect(await followRun({ stateDir: s2, runId: "r_0101_0000_stck", timeoutMs: 10_000, pollMs: 20, spawned: sp2, exitGraceMs: 300 })).toMatchObject({ kind: "finished" });
+    expect(Date.now() - t0).toBeLessThan(5000);
+    sp2.child.kill("SIGKILL");
   });
 
   test("an unknown run with no process log is not_started; with one it is still starting", async () => {

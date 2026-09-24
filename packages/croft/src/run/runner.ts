@@ -59,7 +59,7 @@ import {
   croftError, fromSince, isRetryable, type ProgressSnapshot, runIngest, savedCursors, SHRINK_ACTION, shrinkCommand, StepProgress,
 } from "./ingest.ts";
 import { unknownInputs } from "./inputs.ts";
-import { backfillUnsupported, isGlob, loadErrors, planRun, type PlannedStep, type RunPlan } from "./plan.ts";
+import { backfillUnsupported, buildFirst, inputNotBuilt, isGlob, loadErrors, planRun, type PlannedStep, type RunPlan } from "./plan.ts";
 import { runSqlStep } from "./sql.ts";
 import { staleReasons } from "./staleness.ts";
 import type { ConfirmDecider, ConfirmRequest, StepInput, StepOutcome } from "./step.ts";
@@ -389,6 +389,10 @@ const ACTION_WORDS: Record<ConfirmRequest["action"], string> = {
 
 function nextSteps(steps: StepResult[], problems: Problem[], deferred: ReadonlyMap<string, ConfirmRequest>): Next[] {
   const next: Next[] = [];
+  for (const p of problems) {
+    const build = p.code === "INPUT_NOT_BUILT" && Array.isArray(p.details?.inputs) ? buildFirst(p) : null;
+    if (build && !next.some((n) => n.command === build.command)) next.push(build);
+  }
   const busy = problems.find((p) => p.code === "ASSET_BUSY");
   if (busy?.runId) next.push({ command: `croft wait ${busy.runId} --timeout 100s`, reason: `${busy.asset ?? "an asset"} is held by that run` });
   for (const s of steps) {
@@ -709,6 +713,10 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
         const idle = fromSkip(step) ?? (step.action === "skip" ? step.reason : undefined);
         if (idle !== undefined) {
           skipped(step, idle);
+          // Skipped for an input that will not exist: the run says so, with the run that builds the input (as the
+          // dry run does).
+          const unbuilt = fromSkip(step) === undefined ? inputNotBuilt(step) : undefined;
+          if (unbuilt) problems.push({ ...unbuilt, asset: unbuilt.asset ?? asset, runId });
           return null;
         }
         const errors = loadErrors(step);

@@ -188,7 +188,12 @@ export async function runPreview(i: PreviewInput): Promise<PreviewOutcome> {
   // What the preview may build: the named assets, and the SQL downstream of them.
   const candidates = plan.order.filter((n) => named.has(n) || byName.get(n)?.kind === "sql");
   const needs = new Set<string>(candidates);
-  for (const n of candidates) for (const x of readsOf(byName.get(n)!)) needs.add(x);
+  // A warning's tables no longer order the steps (plan.ts: only blocking checks' reads are in orderAfter), but a
+  // warning the plan kept reads its table as it is: snapshot that table too.
+  for (const n of candidates) {
+    const s = byName.get(n)!;
+    for (const x of [...readsOf(s), ...s.checks.flatMap((c) => c.reads)]) if (x !== n) needs.add(x);
+  }
 
   mkdirSync(stateDir, { recursive: true });
   const dir = previewDirectory(stateDir);
@@ -409,7 +414,9 @@ class Engine {
     // Inputs: built here, or read from the live snapshot (so is a downstream asset the preview only listed).
     const reads = readsOf(step);
     const builtInputs = reads.filter((x) => usable(this.entries.get(x)));
-    if (!isNamed) {
+    // An SQL input the plan rebuilds first because an asset of the preview reads its new output
+    // (PlannedStep.neededBy) is built from the snapshots, as a named one is, so its reader previews against its new columns.
+    if (!isNamed && !step.neededBy?.length) {
       // SQL downstream of what the preview built: only from complete, non-ingest previews that passed their checks.
       const why = this.downstreamBlock(reads, builtInputs);
       if (why) return this.list(entry, why);

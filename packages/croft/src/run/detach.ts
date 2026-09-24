@@ -229,6 +229,8 @@ export interface FollowInput {
   spawned?: Spawned;
   pollMs?: number;
   signal?: AbortSignal;
+  /** How long to let a spawned child that recorded its finished run exit (it closes the warehouse). Default 3000. */
+  exitGraceMs?: number;
 }
 
 export type FollowResult =
@@ -295,6 +297,12 @@ export async function followRun(i: FollowInput): Promise<FollowResult> {
       if (line.trim()) i.onEvent?.(line);
     }
     let final = db.getRun(i.runId);
+    // A finished run is recorded before its process exits, and the process still closes the warehouse after
+    // (a checkpoint writes the file). Let it exit, briefly, so the next command neither waits on the lock nor sees
+    // the file change after this one returned.
+    if (final && final.status !== "running" && i.spawned && !child.exit) {
+      await Promise.race([i.spawned.exited, Bun.sleep(i.exitGraceMs ?? 3000)]);
+    }
     // The child exited while its run still says running: it died (a finished run is recorded before exit).
     if (final && final.status === "running" && (child.exit || gone.rec)) {
       db.markCrashed(final.id);
