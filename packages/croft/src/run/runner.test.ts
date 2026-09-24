@@ -14,7 +14,7 @@ import { loadProject } from "../project/root.ts";
 import { listTrash } from "../safety/trash.ts";
 import { planRun } from "./plan.ts";
 import { withProjectChecks } from "./runner.ts";
-import { cleanupProjects, cli, keysetIssues, linkItems, makeProject, mockApi, runIn, simpleGet, slowPages } from "./testkit.ts";
+import { cleanupProjects, cli, cliEnv, keysetIssues, linkItems, makeProject, mockApi, runIn, simpleGet, slowPages } from "./testkit.ts";
 
 const api = mockApi();
 afterAll(async () => {
@@ -1211,6 +1211,60 @@ export default ingest({ secrets: ["VAULT_KEY"], key: "id", async *rows({ secret 
       expect((db.getRun(out.data.runId)!.summary as { data: { steps: { behavior: string }[] } }).data.steps[0]!.behavior).toBe("replace");
     } finally {
       db.close();
+    }
+  });
+});
+
+describe("the project clock", () => {
+  // runs.sqlite follows the project clock (CROFT_NOW in tests), like run ids, _loaded_at and the scheduler's fires, so
+  // a run by hand at 11:05 counts as having handled the 11:00 fire.
+  test("a run and its steps are stamped with the runner's clock", async () => {
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    const at = new Date("2031-05-06T07:08:09.000Z");
+    const out = await runIn(root, ["zones"], { now: () => at });
+    expect(out.exit).toBe(0);
+    const db = runsDb(root);
+    try {
+      expect(db.getRun(out.data.runId)).toMatchObject({ startedAt: at.toISOString(), finishedAt: at.toISOString() });
+      expect(db.stepsFor(out.data.runId)).toMatchObject([{ asset: "zones", startedAt: at.toISOString(), finishedAt: at.toISOString() }]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("a failed run's staging is kept 3 days on the clock that stamped it", async () => {
+    const { mkdirSync } = await import("node:fs");
+    const { pruneStaging } = await import("./runner.ts");
+    const root = makeProject({});
+    const state = join(root, ".croft");
+    // CROFT_NOW ten days back: the run ended just now on its own clock.
+    const db = RunsDb.open(state, { now: () => new Date(Date.now() - 10 * 86_400_000) });
+    try {
+      const run = db.createRun({ trigger: "manual", human: true, argv: ["run"] });
+      db.finishRun(run.id, "failed");
+      mkdirSync(join(state, "staging", run.id, "a"), { recursive: true });
+      expect(pruneStaging(state, db)).toEqual([]);
+      expect(pruneStaging(state, db, Date.now() + 4 * 86_400_000).map((d) => d.split("/").at(-1))).toEqual([run.id]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("croft run under CROFT_NOW stamps runs.sqlite with it, detached or not", async () => {
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    const at = "2031-05-06T07:08:09.000Z";
+    for (const mode of [["--foreground"], []]) {
+      const r = await cli(root, ["run", "zones", ...mode, "--json"], cliEnv({ CROFT_NOW: at }));
+      expect(r.code, r.stderr).toBe(0);
+      const db = runsDb(root);
+      try {
+        expect(db.getRun(r.json!.data.runId)).toMatchObject({ startedAt: at, finishedAt: at });
+        expect(db.stepsFor(r.json!.data.runId)).toMatchObject([{ startedAt: at }]);
+      } finally {
+        db.close();
+      }
     }
   });
 });

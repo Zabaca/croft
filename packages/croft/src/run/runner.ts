@@ -501,7 +501,10 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
   // Asset output that escapes its step's scope reaches stderr redacted with this project's .env (core/output.ts).
   setOutputRedactor((t) => env.redact(t));
   mkdirSync(paths.stateDir, { recursive: true });
-  const runs = RunsDb.open(paths.stateDir);
+  // runs.sqlite follows the project clock (CROFT_NOW), like run ids, _loaded_at and the scheduler's fires: a run by
+  // hand at 11:05 has handled the 11:00 fire.
+  const clock = o.now ?? (() => clockNow());
+  const runs = RunsDb.open(paths.stateDir, { now: clock });
   let warehouse: DuckWarehouse | undefined;
   try {
     const interactive = o.interactive === true;
@@ -642,7 +645,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
         const asset = step.asset;
         const codeHash = codeHashOf(step);
         const log = openLog(paths.stateDir, runId, asset, { redact: (t) => env.redact(t) });
-        if (scheduled) recordAttempt(runs, step, attempt, (o.now ?? clockNow)());
+        if (scheduled) recordAttempt(runs, step, attempt, clock());
         runs.startStep({ runId, asset, attempt, reason: step.reason, ...(codeHash ? { codeHash } : {}), logPath: logPath(paths.stateDir, runId, asset) });
         // What the asset's top-level code printed when the plan imported it (core/output.ts).
         if (attempt === 1) for (const line of step.output ?? []) log.write(line);
@@ -1078,6 +1081,8 @@ export function pruneStaging(stateDir: string, runs: RunsDb, now: number = Date.
     return [];
   }
   const removed: string[] = [];
+  // A run's end is on the project clock (CROFT_NOW), a file's time on the real one: `now` is real.
+  const skew = runs.now().getTime() - Date.now();
   const drop = (dir: string) => {
     rmSync(dir, { recursive: true, force: true });
     removed.push(dir);
@@ -1094,7 +1099,7 @@ export function pruneStaging(stateDir: string, runs: RunsDb, now: number = Date.
       }
       const run = runs.getRun(name);
       if (run?.status === "running") continue;
-      const ended = run?.finishedAt ? Date.parse(run.finishedAt) : statSync(dir).mtimeMs;
+      const ended = run?.finishedAt ? Date.parse(run.finishedAt) - skew : statSync(dir).mtimeMs;
       if (now - ended < STAGING_KEEP_MS) continue;
       drop(dir);
     } catch {
