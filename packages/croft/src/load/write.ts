@@ -56,6 +56,7 @@ import { RESERVED, type TypedBatch, type WriteTarget } from "./contract.ts";
 import { detectSinceIgnored, nextCursor, resolveCursorType } from "./cursor.ts";
 import { currentDatabase, type EvolveResult, evolveTable, isReservedColumn, normalizeType, quoteIdent, quoteLiteral, type RealColumn,
   readTableSchema, tableRef, tempRef } from "./evolve.ts";
+import { instantsInZone } from "../checks/run.ts";
 
 /**
  * BOOLEAN column files.ts adds to a typed batch that carries rows of unchanged files ("Overlapping files" above).
@@ -408,10 +409,11 @@ async function assertUniqueKey(tx: Sql, o: KeyOwner & {
     `SELECT ${part}, count(*) AS __n FROM ${tempRef(o.temp)}${loaded} GROUP BY ALL HAVING count(*) > 1 ORDER BY ${part}`);
   if (groups.length === 0) return;
   const failing = groups.reduce((n, g) => n + Number(g.__n), 0);
-  const sample = (await tx.all<Record<string, unknown>>(
-    `SELECT ${o.columns.map(quoteIdent).join(", ")} FROM ${tempRef(o.temp)}${loaded}
-     QUALIFY count(*) OVER (PARTITION BY ${part}) > 1 ORDER BY ${part}, ${quoteIdent(RESERVED.seq)} LIMIT ${CHECK_SAMPLES}`,
-  )).map((r) => JSON.parse(json(r)) as Record<string, unknown>);
+  const sampleSql = `SELECT ${o.columns.map(quoteIdent).join(", ")} FROM ${tempRef(o.temp)}${loaded}
+     QUALIFY count(*) OVER (PARTITION BY ${part}) > 1 ORDER BY ${part}, ${quoteIdent(RESERVED.seq)} LIMIT ${CHECK_SAMPLES}`;
+  // Samples show TIMESTAMPTZ with the project offset, as `croft query` does (DESIGN §4 Conventions).
+  const sample = (await instantsInZone(tx, sampleSql, await tx.all<Record<string, unknown>>(sampleSql)))
+    .map((r) => JSON.parse(json(r)) as Record<string, unknown>);
   const keyText = o.key.join(", ");
   const keyOf = (g: Record<string, unknown>) => {
     const pairs = o.key.map((k) => `${k}=${shown(Object.entries(g).find(([c]) => sameName(c, k))?.[1])}`);

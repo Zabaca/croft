@@ -431,7 +431,8 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       if (file && status !== "running") {
         const current = def?.codeHash;
         const ranWith = step?.codeHash ?? cat?.codeHash ?? null;
-        if (current && ranWith) edited = current !== ranWith;
+        // A code hash that differs only because croft.json's timezone changed is no edit (resolve.ts timeZoneChanged).
+        if (current && ranWith) edited = current !== ranWith && !(def?.timeZoneChanged && ranWith === cat?.codeHash);
         else if (step) {
           try {
             edited = statSync(file.path).mtimeMs > Date.parse(step.startedAt);

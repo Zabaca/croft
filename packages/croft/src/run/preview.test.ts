@@ -459,7 +459,9 @@ describe("croft preview: locks and interrupts", () => {
     const root = makeProject({ "assets/issues.ts": ISSUES(), "assets/open_issues.sql": OPEN });
     await run(root);
     const project = loadProject({ root });
-    const holder = spawnHolder(project.paths.database, 2500);
+    // onWait fires only on a failed attempt after >= 2000 ms of waiting, and attempts are 500-1000 ms apart by then:
+    // hold long enough that one surely lands inside the window.
+    const holder = spawnHolder(project.paths.database, 4000);
     await holder.waitFor("held");
     const waits: string[] = [];
     const pending = preview(root, ["open_issues"], { onWait: (_h, _ms, what) => waits.push(what) });
