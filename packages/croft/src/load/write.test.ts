@@ -839,6 +839,7 @@ describe("out-of-band changes", () => {
     await w.write("outside", (tx) => tx.exec(`DELETE FROM zones WHERE id = 3`), { runId: "x" });
     const r = await load(w, "zones", { ...zones, rows: zoneRows(3) }, { key: ["id"], now: T1 });
     const p = r.warnings.find((x) => x.code === "OUT_OF_BAND_CHANGE");
+    expect(p?.message).toBe("zones was changed outside croft: 1 row removed (3 → 2)");
     expect(p?.details).toEqual({
       expected: { rowCount: 3, maxLoadedAt: "2026-09-22T10:00:00.000000Z" },
       actual: { exists: true, rowCount: 2, maxLoadedAt: "2026-09-22T10:00:00.000000Z" },
@@ -856,7 +857,8 @@ describe("out-of-band changes", () => {
     await w.write("outside", (tx) => tx.exec(`UPDATE zones SET _loaded_at = '2026-09-23T00:00:00Z'`), { runId: "x" });
     const r = await load(w, "zones", { ...zones, rows: zoneRows(1, { 1: "changed" }) }, { key: ["id"], now: T1 });
     expect(r.loadedAt).toBe("2026-09-23T00:00:00.000001Z");
-    expect(r.warnings.map((x) => x.code)).toContain("OUT_OF_BAND_CHANGE");
+    expect(r.warnings.find((x) => x.code === "OUT_OF_BAND_CHANGE")?.message)
+      .toBe("zones was changed outside croft: the same 1 row, but rows stamped after croft's last write (newest _loaded_at 2026-09-23T00:00:00.000000Z, croft's 2026-09-22T10:00:00.000000Z)");
   });
 
   test("a column added outside croft is TABLE_MODIFIED_OUTSIDE_CROFT, and state catches up", async () => {

@@ -52,8 +52,9 @@ import { CroftError, problem } from "../core/errors.ts";
 import type { AssetKind, ColumnPlan, CursorType, Problem, SchemaChange, Sql, StepResult, ValueKind } from "../core/types.ts";
 import { type InstantInput, now as clockNow, toEpochMicros } from "../core/time.ts";
 import { ensureState } from "../db/state.ts";
-import { assertNoShrink, detectOutOfBand, type ExtractInfo, isoMicros, readStoredColumns, type StoredColumn, tableStats,
+import { assertNoShrink, type ExtractInfo, isoMicros, readStoredColumns, type StoredColumn, tableStats,
   compareSchema } from "../safety/guards.ts";
+import { checkOutOfBand } from "../safety/out-of-band.ts";
 import { type AppliedPins, applyPinChanges } from "./config-change.ts";
 import { RESERVED, type TypedBatch, type WriteTarget } from "./contract.ts";
 import { detectSinceIgnored, nextCursor, resolveCursorType } from "./cursor.ts";
@@ -201,7 +202,7 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
   const before = await tableStats(tx, asset, db);
 
   // 3a: something other than croft wrote or reshaped the table since the last commit.
-  const oob = await detectOutOfBand(tx, asset, before);
+  const oob = await checkOutOfBand(tx, asset, before);
   if (oob) warnings.push(oob.problem);
   if (!warned("TABLE_MODIFIED_OUTSIDE_CROFT")) {
     const p = compareSchema(asset, before.exists ? before.columns : null, stored);
