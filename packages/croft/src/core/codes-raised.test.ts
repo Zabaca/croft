@@ -18,24 +18,6 @@ import { PHASE } from "./phase.ts";
 
 /** Codes no source raises yet, with the phase (DESIGN.md §11) that raises them. */
 const NOT_YET_RAISED: Partial<Record<Code, number>> = {
-  // Phase 2: SQL assets, bind, graph, checks, TS transforms, staleness.
-  DUPLICATE_OUTPUT_COLUMN: 2,
-  HEADER_UNKNOWN_KEY: 2,
-  SQL_NOT_SELECT: 2,
-  PIVOT_NEEDS_VALUES: 2,
-  CATALOG_PREFIX: 2,
-  SQL_READS_FILES: 2,
-  INPUT_NEEDS_KEY: 2,
-  QUOTE_IDENTIFIER: 2,
-  UNDECLARED_INPUT: 2,
-  CYCLE: 2,
-  CHECK_INVALID: 2,
-  CHECK_FAILED: 2,
-  UNKNOWN_INPUT_COLUMN: 2,
-  LARGE_REPROCESS: 2,
-  VOLATILE_SQL: 2,
-  INPUT_NOT_BUILT: 2,
-  EDITED_SINCE_LAST_RUN: 2,
   // Phase 3: the scheduler.
   SCHEDULE_HELD: 3,
   SCHEDULER_STALE: 3,
