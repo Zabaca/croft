@@ -7,6 +7,7 @@ import type { ColumnPlan, Problem, Sql, ValueKind } from "../core/types.ts";
 import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/warehouse.ts";
 import type { BatchCursor, TypedBatch, WriteTarget } from "./contract.ts";
 import { quoteIdent, readTableSchema } from "./evolve.ts";
+import { tableBatch } from "./table-batch.ts";
 import { type WriteBatchInput, type WriteResult, writeBatch } from "./write.ts";
 
 afterAll(() => closeAllWarehouses());
@@ -889,5 +890,162 @@ describe("identifiers", () => {
       return writeBatch(tx, { batch, target: { asset: "zones", write: "replace", key: ["id"], runId: "r" }, now: T1 });
     }, { runId: "r" });
     expect(r.rows).toMatchObject({ added: 1, unchanged: 2, total: 3 });
+  });
+});
+
+describe("transform keys (sql and ts): a duplicate is a failed check, never a silent dedupe", () => {
+  test("a duplicate key in a SQL transform's batch is CHECK_FAILED unique(key) with samples; nothing is written", async () => {
+    const w = warehouse();
+    await load(w, "agg", { ...zones, rows: zoneRows(3) }, { key: ["id"], now: T0, kind: "sql" });
+    const before = await table(w, "agg");
+    const rows = [...zoneRows(3), { id: 2, zone: "again", borough: "Queens" }, { id: 3, zone: "x", borough: "Bronx" }, { id: 3, zone: "y", borough: "Bronx" }];
+    const e = await rejection(load(w, "agg", { ...zones, rows }, { key: ["id"], now: T1, kind: "sql", file: "assets/agg.sql" }));
+    expect(e.code).toBe("CHECK_FAILED");
+    expect(e.problem).toMatchObject({ asset: "agg", file: "assets/agg.sql", effect: "nothing was written; agg keeps its previous 3 rows" });
+    expect(e.problem.message).toBe("unique(id): 5 of 6 rows share their key with another row, e.g. id=2 ×2, id=3 ×3");
+    expect(e.problem.details).toEqual({
+      check: "unique(id)", failing: 5, sample: [
+        { id: 2, zone: "zone 2", borough: "Queens" }, { id: 2, zone: "again", borough: "Queens" },
+        { id: 3, zone: "zone 3", borough: "Bronx" }, { id: 3, zone: "x", borough: "Bronx" }, { id: 3, zone: "y", borough: "Bronx" },
+      ],
+    });
+    expect(e.problem.fix).toMatchObject({ kind: "edit", file: "assets/agg.sql" });
+    expect(e.problem.hint).toContain("GROUP BY id");
+    expect(await table(w, "agg")).toEqual(before);
+    expect((await writesRows(w, "agg")).length).toBe(1);
+  });
+
+  test("a TS transform's too, with at most 20 samples and composite keys rendered in full; an ingest's batch is deduplicated", async () => {
+    const w = warehouse();
+    const spec = (rows: Rows) => ({ columns: { day: "DATE", currency: "VARCHAR", net: "DOUBLE" }, rows });
+    const rows = Array.from({ length: 30 }, (_, i) => ({ day: "2026-09-01", currency: i % 2 ? "usd" : "eur", net: i }));
+    const e = await rejection(load(w, "rev", spec(rows), { key: ["day", "currency"], write: "merge", kind: "ts", now: T0 }));
+    expect(e.code).toBe("CHECK_FAILED");
+    expect(e.problem.message).toBe(`unique(day, currency): 30 of 30 rows share their key with another row, e.g. (day="2026-09-01", currency="eur") ×15, (day="2026-09-01", currency="usd") ×15`);
+    expect(e.problem.details).toMatchObject({ check: "unique(day, currency)", failing: 30 });
+    expect((e.problem.details!.sample as unknown[]).length).toBe(20);
+    expect(e.problem.fix).toEqual({ kind: "manual", description: "make rows() return one row per day, currency, or change key" });
+    const ok = await load(w, "rev", spec(rows), { key: ["day", "currency"], write: "merge", now: T0 });
+    expect(ok.rows).toMatchObject({ in: 30, added: 2 });
+  });
+
+  test("KEY_NULL in a SQL transform speaks of its SELECT", async () => {
+    const w = warehouse();
+    const e = await rejection(load(w, "agg", { ...zones, rows: [{ id: 1, zone: "a" }, { zone: "b" }] }, { key: ["id"], now: T0, kind: "sql", file: "assets/agg.sql" }));
+    expect(e.code).toBe("KEY_NULL");
+    expect(e.problem.hint).toBe("a key is never empty; leave such rows out of the SELECT (WHERE id IS NOT NULL), or choose a key that is always set");
+    expect(e.problem.fix).toMatchObject({ kind: "edit", file: "assets/agg.sql" });
+    const m = await rejection(load(w, "agg", { columns: { zone: "VARCHAR" }, rows: [{ zone: "a" }] }, { key: ["id"], now: T0, kind: "sql" }));
+    expect(m.problem.message).toBe("agg: the key id is not a column its SELECT returns");
+    // Even when the SELECT returned no rows: its columns are known all the same.
+    const empty = await rejection(load(w, "agg", { columns: { zone: "VARCHAR" }, rows: [] }, { key: ["id"], now: T0, kind: "sql" }));
+    expect(empty.problem.message).toBe("agg: the key id is not a column its SELECT returns");
+  });
+});
+
+describe("a SQL transform's SELECT defines its table", () => {
+  const cols = (w: DuckWarehouse, name: string) =>
+    read<{ name: string; type: string }>(w, `SELECT column_name AS name, data_type AS type FROM duckdb_columns() WHERE table_name = $1 ORDER BY column_index`, [name]);
+
+  test("the same shape is a diff: unchanged rows keep their stamp", async () => {
+    const w = warehouse();
+    await load(w, "agg", { ...zones, rows: zoneRows(3) }, { key: ["id"], now: T0, kind: "sql" });
+    const r = await load(w, "agg", { ...zones, rows: zoneRows(3, { 2: "renamed" }) }, { key: ["id"], now: T1, kind: "sql" });
+    expect(r.schemaChanges).toEqual([]);
+    expect(r.rows).toEqual({ in: 3, added: 0, updated: 1, unchanged: 2, deleted: 0, total: 3 });
+    expect(await stamps(w, "agg")).toEqual({ 1: "2026-09-22T10:00:00.000000Z", 2: "2026-09-22T11:00:00.000000Z", 3: "2026-09-22T10:00:00.000000Z" });
+  });
+
+  test("a changed shape recreates the table: every row is restamped, and _croft.columns starts over", async () => {
+    const w = warehouse();
+    await load(w, "agg", { ...zones, rows: zoneRows(3) }, { key: ["id"], now: T0, kind: "sql" });
+    const r = await load(w, "agg", { columns: { id: "BIGINT", zone: "VARCHAR", n: "INTEGER" }, rows: zoneRows(3).map((z) => ({ id: z.id, zone: z.zone, n: 1 })) },
+      { key: ["id"], now: T1, kind: "sql" });
+    expect(r.schemaChanges).toEqual([{ kind: "recreate", reason: "shape_changed" }]);
+    expect(r.created).toBe(false);
+    expect(r.changed).toBe(true);
+    expect(r.rows).toEqual({ in: 3, added: 3, updated: 0, unchanged: 0, deleted: 3, total: 3 });
+    expect(new Set(Object.values(await stamps(w, "agg")))).toEqual(new Set(["2026-09-22T11:00:00.000000Z"]));
+    expect(await cols(w, "agg")).toEqual([
+      { name: "id", type: "BIGINT" }, { name: "zone", type: "VARCHAR" }, { name: "n", type: "INTEGER" }, { name: "_loaded_at", type: "TIMESTAMP WITH TIME ZONE" },
+    ]);
+    expect(await read(w, `SELECT name, type, strftime(added_at AT TIME ZONE 'UTC', '%H') AS h FROM _croft.columns WHERE asset = 'agg' ORDER BY name`)).toEqual([
+      { name: "id", type: "BIGINT", h: "11" }, { name: "n", type: "INTEGER", h: "11" }, { name: "zone", type: "VARCHAR", h: "11" },
+    ]);
+    expect((await writesRows(w, "agg"))[1]!.schema_changes).toEqual([{ kind: "recreate", reason: "shape_changed" }]);
+    expect(r.warnings.map((p) => p.code)).toEqual([]);
+  });
+
+  test("a retyped or a reordered column recreates the table too", async () => {
+    const w = warehouse();
+    await load(w, "agg", { ...zones, rows: zoneRows(2) }, { key: ["id"], now: T0, kind: "sql" });
+    const retyped = await load(w, "agg", { columns: { id: "INTEGER", zone: "VARCHAR", borough: "VARCHAR" }, rows: zoneRows(2) }, { key: ["id"], now: T1, kind: "sql" });
+    expect(retyped.schemaChanges).toEqual([{ kind: "recreate", reason: "shape_changed" }]);
+    const reordered = await load(w, "agg", { columns: { zone: "VARCHAR", id: "INTEGER", borough: "VARCHAR" }, rows: zoneRows(2) }, { key: ["id"], now: T2, kind: "sql" });
+    expect(reordered.schemaChanges).toEqual([{ kind: "recreate", reason: "shape_changed" }]);
+    expect((await cols(w, "agg")).map((c) => c.name)).toEqual(["zone", "id", "borough", "_loaded_at"]);
+    const same = await load(w, "agg", { columns: { zone: "VARCHAR", id: "INTEGER", borough: "VARCHAR" }, rows: zoneRows(2) }, { key: ["id"], now: T3, kind: "sql" });
+    expect(same.schemaChanges).toEqual([]);
+    expect(same.rows).toMatchObject({ unchanged: 2 });
+  });
+
+  test("a table an ingest left behind (with _file, or _loaded_at not last) is another shape", async () => {
+    const w = warehouse();
+    await load(w, "agg", { columns: { id: "BIGINT", zone: "VARCHAR", _file: "VARCHAR" }, rows: [{ id: 1, zone: "a", _file: "f.csv" }] }, { key: ["id"], now: T0 });
+    expect((await cols(w, "agg")).map((c) => c.name)).toEqual(["id", "zone", "_file", "_loaded_at"]);
+    const r = await load(w, "agg", { columns: { id: "BIGINT", zone: "VARCHAR" }, rows: [{ id: 1, zone: "a" }] }, { key: ["id"], now: T1, kind: "sql" });
+    expect(r.schemaChanges).toEqual([{ kind: "recreate", reason: "shape_changed" }]);
+    expect((await cols(w, "agg")).map((c) => c.name)).toEqual(["id", "zone", "_loaded_at"]);
+    await load(w, "late", { columns: { id: "BIGINT" }, rows: [{ id: 1 }] }, { key: ["id"], now: T0 });
+    await w.write("outside", (tx) => tx.exec(`ALTER TABLE late ADD COLUMN zone VARCHAR`), { runId: "x" });
+    const moved = await load(w, "late", { columns: { id: "BIGINT", zone: "VARCHAR" }, rows: [{ id: 1, zone: "a" }] }, { key: ["id"], now: T1, kind: "sql" });
+    expect(moved.schemaChanges).toEqual([{ kind: "recreate", reason: "shape_changed" }]);
+    expect((await cols(w, "late")).map((c) => c.name)).toEqual(["id", "zone", "_loaded_at"]);
+  });
+
+  test("dropping a column is the SQL's decision: no COLUMN_STOPPED_ARRIVING, and an all-NULL column is not pending", async () => {
+    const w = warehouse();
+    const rows = (n: number) => Array.from({ length: n }, (_, i) => ({ id: i + 1, email: `u${i}@x`, note: null }));
+    await load(w, "people", { columns: { id: "BIGINT", email: "VARCHAR", note: "VARCHAR" }, rows: rows(150) }, { key: ["id"], now: T0, kind: "sql" });
+    expect(await read(w, `SELECT name, pending FROM _croft.columns WHERE asset = 'people' ORDER BY name`)).toEqual([
+      { name: "email", pending: false }, { name: "id", pending: false }, { name: "note", pending: false },
+    ]);
+    const r = await load(w, "people", { columns: { id: "BIGINT" }, rows: rows(150).map((x) => ({ id: x.id })) }, { key: ["id"], now: T1, kind: "sql" });
+    expect(r.warnings.map((p) => p.code)).toEqual([]);
+    expect(r.schemaChanges).toEqual([{ kind: "recreate", reason: "shape_changed" }]);
+  });
+
+  test("the SELECT's own types are kept: STRUCT, MAP and LIST columns are created, then diffed by value", async () => {
+    const w = warehouse();
+    const write = (now: string, v: number) => w.write("nested", async (tx) => {
+      await tx.exec(`CREATE TEMP TABLE nb AS SELECT *, row_number() OVER () AS _croft_seq FROM (
+        SELECT 1 AS id, {'x': ${v}, 'y': 'a'} AS s, MAP {'k': 1} AS m, [1, 2] AS l UNION ALL SELECT 2, {'x': 2, 'y': 'b'}, MAP {'k': 2}, [3])`);
+      const batch = await tableBatch(tx, { temp: "nb", asset: "nested" });
+      const res = await writeBatch(tx, { batch, target: { asset: "nested", write: "replace", key: ["id"], runId: `r_${v}` }, kind: "sql", now });
+      await tx.exec(`DROP TABLE temp.main.nb`);
+      return res;
+    }, { runId: `r_${v}` });
+    expect((await write(T0, 1)).created).toBe(true);
+    expect((await cols(w, "nested")).map((c) => c.type)).toEqual(["INTEGER", "STRUCT(x INTEGER, y VARCHAR)", "MAP(VARCHAR, INTEGER)", "INTEGER[]", "TIMESTAMP WITH TIME ZONE"]);
+    expect((await write(T1, 1)).rows).toMatchObject({ unchanged: 2, updated: 0 });
+    expect((await write(T2, 5)).rows).toMatchObject({ unchanged: 1, updated: 1 });
+  });
+
+  test("a failing check rolls a recreate back: the old table, its rows and its columns are all there", async () => {
+    const w = warehouse();
+    await load(w, "agg", { ...zones, rows: zoneRows(3) }, { key: ["id"], now: T0, kind: "sql" });
+    const snapshot = async () => ({
+      rows: await table(w, "agg"), cols: await cols(w, "agg"), columns: await read(w, `SELECT * FROM _croft.columns ORDER BY name`),
+      assets: await read(w, `SELECT * FROM _croft.assets`), writes: await writesRows(w, "agg"),
+    });
+    const before = await snapshot();
+    const e = await rejection(load(w, "agg", { columns: { id: "BIGINT", n: "INTEGER" }, rows: [{ id: 1, n: 1 }] }, {
+      key: ["id"], now: T1, kind: "sql",
+      checks: async () => {
+        throw new CroftError("CHECK_FAILED", { message: "min_rows(2): 1 row", hint: "fix the SQL" });
+      },
+    }));
+    expect(e.code).toBe("CHECK_FAILED");
+    expect(await snapshot()).toEqual(before);
   });
 });
