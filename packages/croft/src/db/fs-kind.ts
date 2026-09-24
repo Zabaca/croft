@@ -1,8 +1,11 @@
 // Which filesystem holds the warehouse (DESIGN.md §5 "Same kernel only"). DuckDB's lock is a POSIX fcntl
 // lock, which only holds between processes of one kernel: on a VM or container share (virtiofs, Docker
-// Desktop's grpcfuse and fakeowner, 9p, which is also WSL's drives) or a network filesystem (NFS, SMB, AFP,
-// sshfs) a process on the other side neither sees nor honors it. croft serve holds the file for hours and
-// hands it over by that lock, so it refuses such a mount with SERVE_UNSAFE_FILESYSTEM.
+// Desktop's grpcfuse, fakeowner and osxfs, 9p, which is also WSL's drives, VirtualBox, VMware and Parallels
+// shared folders), a network filesystem (NFS, SMB, AFP, AFS, sshfs, WebDAV), a cluster filesystem (CephFS,
+// GlusterFS, Lustre, GPFS) or cloud storage mounted through FUSE (rclone, s3fs, gcsfuse, goofys) a process on
+// the other side neither sees nor honors it. croft serve holds the file for hours and hands it over by that
+// lock, so it refuses such a mount with SERVE_UNSAFE_FILESYSTEM. The types are one table (UNSAFE), plus any FUSE
+// mount whose source names another machine (host:path, remote:, a URL).
 //
 // - Linux: the longest mount point in /proc/self/mounts that holds the folder, which names FUSE subtypes
 //   (fuse.sshfs, fuse.grpcfuse) and virtiofs; without /proc, the statfs magic number, where every FUSE mount
@@ -111,12 +114,24 @@ const MAGIC: Record<number, string> = {
 };
 
 const DOCKER = "Docker Desktop's file sharing";
+const CLUSTER = "a cluster filesystem shared between machines";
+
+/** Filesystem types (as /proc/mounts or macOS `mount` name them, lower case) whose locks do not hold across
+ *  the machines, VMs or containers that share them, and what they are in words. */
 const UNSAFE: Record<string, string> = {
+  // VM and container shares.
   virtiofs: "virtiofs, a VM or container file share",
   grpcfuse: `grpcfuse, ${DOCKER}`,
   "fuse.grpcfuse": `grpcfuse, ${DOCKER}`,
   fakeowner: `fakeowner, ${DOCKER}`,
+  osxfs: `osxfs, ${DOCKER}`,
+  "fuse.osxfs": `osxfs, ${DOCKER}`,
   "9p": "9p, a VM share or a WSL drive",
+  vboxsf: "vboxsf, a VirtualBox shared folder",
+  vmhgfs: "vmhgfs, a VMware shared folder",
+  "fuse.vmhgfs-fuse": "vmhgfs-fuse, a VMware shared folder",
+  prl_fs: "prl_fs, a Parallels shared folder",
+  // Network filesystems.
   nfs: "NFS, a network filesystem",
   nfs4: "NFS, a network filesystem",
   smbfs: "SMB, a network share",
@@ -124,17 +139,51 @@ const UNSAFE: Record<string, string> = {
   smb2: "SMB, a network share",
   smb3: "SMB, a network share",
   afpfs: "AFP, a network share",
+  afs: "AFS, a network filesystem",
   "fuse.sshfs": "sshfs, a folder on another machine",
   sshfs: "sshfs, a folder on another machine",
   webdav: "WebDAV, a network folder",
+  davfs: "davfs2, a WebDAV network folder",
+  "fuse.davfs": "davfs2, a WebDAV network folder",
+  "fuse.davfs2": "davfs2, a WebDAV network folder",
+  "fuse.curlftpfs": "curlftpfs, an FTP folder on the network",
+  "fuse.gvfsd-fuse": "GVfs, a desktop network mount (SMB, SFTP, WebDAV or a cloud drive)",
+  // Cluster filesystems.
+  ceph: `CephFS, ${CLUSTER}`,
+  "fuse.ceph": `CephFS, ${CLUSTER}`,
+  "fuse.ceph-fuse": `CephFS, ${CLUSTER}`,
+  glusterfs: `GlusterFS, ${CLUSTER}`,
+  "fuse.glusterfs": `GlusterFS, ${CLUSTER}`,
+  lustre: `Lustre, ${CLUSTER}`,
+  gpfs: `GPFS (IBM Storage Scale), ${CLUSTER}`,
+  beegfs: `BeeGFS, ${CLUSTER}`,
+  ocfs2: `OCFS2, ${CLUSTER}`,
+  gfs2: `GFS2, ${CLUSTER}`,
+  "fuse.juicefs": `JuiceFS, ${CLUSTER}`,
+  // Cloud storage mounted through FUSE.
+  "fuse.rclone": "rclone, a cloud or network folder",
+  "fuse.s3fs": "s3fs, an S3 bucket on the network",
+  "fuse.goofys": "goofys, an S3 bucket on the network",
+  "fuse.mountpoint-s3": "Mountpoint for Amazon S3, an S3 bucket on the network",
+  "fuse.gcsfuse": "gcsfuse, a Google Cloud Storage bucket on the network",
+  "fuse.blobfuse": "blobfuse, an Azure storage container on the network",
+  "fuse.blobfuse2": "blobfuse, an Azure storage container on the network",
 };
+
+/** FUSE's own types: Linux's plain "fuse" and "fuse.<program>", and macFUSE's, which name every mount alike. */
+const FUSE = /^(fuse|fuse\..+|macfuse|osxfuse)$/i;
 
 /** Why a filesystem type (and mount source) cannot hold DuckDB's lock, or null when it can. */
 export function unsafeLabel(type: string, source: string): string | null {
   const known = UNSAFE[type.toLowerCase()];
   if (known) return known;
-  // macFUSE shows every FUSE mount under one type; sshfs is the one whose source is user@host:path.
-  if (/^(macfuse|osxfuse|fuse)$/i.test(type) && /^[^\s/@]+@[^\s/:]+:/.test(source)) return UNSAFE.sshfs!;
+  if (!FUSE.test(type)) return null;
+  // A FUSE mount whose source names another machine: sshfs's user@host:path, a URL (davfs2 as plain fuse), or
+  // host:path and rclone's remote:path. A local FUSE mount's source is a folder, a device or a program name.
+  if (/^[^\s/@]+@[^\s/:]+:/.test(source)) return UNSAFE.sshfs!;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(source) || /^[^\s/:]+:/.test(source)) {
+    return `${type.toLowerCase()}, a FUSE mount of ${source}, a folder on the network`;
+  }
   return null;
 }
 

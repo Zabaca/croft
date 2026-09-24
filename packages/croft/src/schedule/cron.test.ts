@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { CroftError } from "../core/errors.ts";
 import { formatInstant } from "../core/time.ts";
-import { type Cron, latestFireAtOrBefore, LOOKBACK_DAYS, nextFires, parseCron } from "./cron.ts";
+import { type Cron, CRON_FIELDS_HINT, latestFireAtOrBefore, LOOKBACK_DAYS, nextFires, parseCron } from "./cron.ts";
+import { parseSchedule } from "./types.ts";
 
 const LA = "America/Los_Angeles";
 const NY = "America/New_York";
@@ -135,6 +136,85 @@ describe("parseCron", () => {
       const s = refused(text).suggestion!;
       expect(parseCron(s).ok).toBe(true);
     }
+  });
+
+  test("a backwards day-of-week range from 7 (Sunday) is the plain range from 0", () => {
+    expect(refused("0 0 * * 7-mon")).toMatchObject({
+      problem: 'schedule "0 0 * * 7-mon": the range 7-mon in the day of week field runs backwards', suggestion: "0 0 * * 0-1",
+    });
+    expect(refused("0 0 * * 7-sat").suggestion).toBe("0 0 * * 0-6");
+    expect(refused("0 0 * * 7-2/2").suggestion).toBe("0 0 * * 0-2/2");
+    expect(refused("0 0 * * 1,7-3").suggestion).toBe("0 0 * * 1,0-3");
+  });
+
+  test("a suggestion fixes every problem it can, or is not offered", () => {
+    expect(refused("0 0 * janu mno")).toMatchObject({
+      problem: 'schedule "0 0 * janu mno": "janu" is not a month (jan-dec or 1-12)', suggestion: "0 0 * jan mon",
+    });
+    expect(refused("0 0 * janu mno").hint).toStartWith("did you mean 0 0 * jan mon?");
+    expect(refused("0 0 * * mno,tuw").suggestion).toBe("0 0 * * mon,tue");
+    expect(refused("0 0 * * 7-mno").suggestion).toBe("0 0 * * 0-1");          // the name, then the range
+    // The month is fixable, but hour 25 is not: no suggestion, and the hint says how a cron reads.
+    const p = refused("0 25 * janu *");
+    expect(p.suggestion).toBeUndefined();
+    expect(p.hint).toBe(CRON_FIELDS_HINT);
+  });
+
+  test("six fields: the extra field is the seconds or a year, whichever leaves a cron that parses", () => {
+    expect(refused("0 6 * * 1-5 2026")).toMatchObject({
+      problem: 'schedule "0 6 * * 1-5 2026" has 6 fields; a cron has 5 (minute hour day-of-month month day-of-week), with no year field',
+      hint: "drop the last field: 0 6 * * 1-5", suggestion: "0 6 * * 1-5",
+    });
+    expect(refused("0 6 * * * #x").suggestion).toBe("0 6 * * *");
+    expect(refused("0 18 ? * MON-FRI *").suggestion).toBe("0 18 ? * MON-FRI");  // AWS: minute ... day-of-week year
+    expect(refused("0 0 6 * * ?")).toMatchObject({ suggestion: "0 6 * * ?", hint: "drop the first (seconds) field: 0 6 * * ?" });
+    // Seconds first, with a misspelled day: the seconds go, and the day is fixed.
+    expect(refused("0 0 6 * * mno")).toMatchObject({ suggestion: "0 6 * * mon", hint: "drop the first (seconds) field, and fix the rest: 0 6 * * mon" });
+    expect(refused("x y z a b c").suggestion).toBeUndefined();
+    expect(refused("x y z a b c").hint).toBe(CRON_FIELDS_HINT);
+  });
+
+  test("seven fields (Quartz: seconds first, year last): both go", () => {
+    expect(refused("0 0 6 * * ? 2026")).toMatchObject({
+      problem: 'schedule "0 0 6 * * ? 2026" has 7 fields; croft schedules to the minute and has no year field',
+      hint: "drop the first (seconds) and last (year) fields: 0 6 * * ?", suggestion: "0 6 * * ?",
+    });
+    expect(refused("a b c d e f g").suggestion).toBeUndefined();
+  });
+
+  test("property: over a corpus of bad crons, every suggestion parses, here and as a schedule", () => {
+    const good = ["0", "6", "*", "*", "*"];
+    const bad: string[][] = [
+      ["60", "59-0", "59-0/5", "5-3", "a", "*/0", "*/x", "1,,2", "-1", "30-10/7", "5-", "0-59/0"],
+      ["24", "23-0", "22-2/2", "5-3", "noon", "*/0", "25-1", "9am"],
+      ["0", "32", "31-1", "15-2/3", "L", "15W", "LW", "L-3", "31-0", "30-2/40"],
+      ["13", "dec-jan", "12-1", "janury", "janu", "jnu", "feb-jan/2", "0", "dec-jnu", "13-1"],
+      ["8", "7-mon", "7-sat", "7-1/2", "7-0/3", "sat-mon", "fri-mon", "6-1/3", "mnday", "mno", "mon-frii", "tuw,thr", "tusday,thurday", "7-mno", "7-mnday",
+        "1#2", "L", "5L", "sun-sat-mon", "7-6", "7-6/2", "sat-7", "?x"],
+    ];
+    const corpus = new Set<string>();
+    const withField = (fields: string[], i: number, v: string) => fields.map((f, j) => (j === i ? v : f));
+    for (let i = 0; i < 5; i++) {
+      for (const v of bad[i]!) {
+        const one = withField(good, i, v);
+        corpus.add(one.join(" "));
+        corpus.add(`0 ${one.join(" ")}`);            // seconds first
+        corpus.add(`${one.join(" ")} 2026`);         // a year last
+        corpus.add(`0 ${one.join(" ")} 2026`);       // both
+        for (let j = i + 1; j < 5; j++) for (const w of bad[j]!.slice(0, 4)) corpus.add(withField(one, j, w).join(" "));
+      }
+    }
+    let offered = 0;
+    for (const text of corpus) {
+      const p = parseCron(text);
+      if (p.ok || p.suggestion === undefined) continue;
+      offered++;
+      const again = parseCron(p.suggestion);
+      expect(again.ok, `${JSON.stringify(text)} suggests ${JSON.stringify(p.suggestion)}: ${again.ok ? "" : again.problem}`).toBe(true);
+      expect(parseSchedule(p.suggestion).ok, `${JSON.stringify(p.suggestion)} as a schedule`).toBe(true);
+      expect(p.hint).toContain(p.suggestion);
+    }
+    expect(offered).toBeGreaterThan(200);                // the property is not empty
   });
 });
 

@@ -3,7 +3,9 @@ import { mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
-import { assertSafeFilesystem, filesystemKind, type FsProbe, parseMacMounts, parseProcMounts, realProbe, unsafeLabel } from "./fs-kind.ts";
+import {
+  assertSafeFilesystem, filesystemKind, folderKind, type FsProbe, parseMacMounts, parseProcMounts, realProbe, unsafeLabel,
+} from "./fs-kind.ts";
 
 const PROC_MOUNTS = `overlay / overlay rw,relatime,lowerdir=/x,upperdir=/y,workdir=/z 0 0
 proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
@@ -131,6 +133,60 @@ describe("unsafeLabel", () => {
     }
     for (const t of ["apfs", "hfs", "ext4", "xfs", "btrfs", "zfs", "overlay", "tmpfs", "fuse", "fuseblk", "macfuse"]) {
       expect(unsafeLabel(t, "")).toBeNull();
+    }
+  });
+
+  // One row per filesystem: VM shares, cluster and network filesystems, FUSE cloud and network mounts.
+  test.each([
+    ["vboxsf", "VirtualBox"], ["vmhgfs", "VMware"], ["fuse.vmhgfs-fuse", "VMware"], ["prl_fs", "Parallels"],
+    ["osxfs", "Docker"], ["fuse.osxfs", "Docker"],
+    ["ceph", "CephFS"], ["fuse.ceph", "CephFS"], ["fuse.ceph-fuse", "CephFS"], ["glusterfs", "GlusterFS"], ["fuse.glusterfs", "GlusterFS"],
+    ["lustre", "Lustre"], ["gpfs", "GPFS"], ["beegfs", "BeeGFS"], ["ocfs2", "OCFS2"], ["gfs2", "GFS2"], ["afs", "AFS"],
+    ["fuse.juicefs", "JuiceFS"],
+    ["davfs", "WebDAV"], ["fuse.davfs", "WebDAV"], ["fuse.davfs2", "WebDAV"],
+    ["fuse.rclone", "rclone"], ["fuse.s3fs", "s3fs"], ["fuse.gcsfuse", "gcsfuse"], ["fuse.goofys", "goofys"],
+    ["fuse.mountpoint-s3", "Mountpoint for Amazon S3"], ["fuse.blobfuse", "blobfuse"], ["fuse.blobfuse2", "blobfuse"],
+    ["fuse.curlftpfs", "FTP"], ["fuse.gvfsd-fuse", "GVfs"],
+  ])("%s is unsafe (%s)", (type, name) => {
+    expect(unsafeLabel(type, "")).toContain(name);
+    expect(unsafeLabel(type.toUpperCase(), "")).toContain(name);
+  });
+
+  test("a FUSE mount of a remote source is unsafe whatever its type: host:path, remote:, or a URL", () => {
+    for (const type of ["fuse", "macfuse", "osxfuse", "fuse.anything"]) {
+      expect(unsafeLabel(type, "https://dav.example.com/remote.php/webdav")).toContain("network");
+      expect(unsafeLabel(type, "ftp://files.example.com/")).toContain("network");
+      expect(unsafeLabel(type, "gdrive:")).toContain("network");
+      expect(unsafeLabel(type, "s3remote:bucket/path")).toContain("network");
+      expect(unsafeLabel(type, "files.example.com:/srv")).toContain("network");
+    }
+    expect(unsafeLabel("fuse", "ada@host:/srv")).toContain("sshfs");
+    // Local FUSE mounts: a folder or a device as the source, or just the program's name.
+    for (const source of ["/home/ada/.cipher", "/dev/sdb1", "encfs", "portal", "bindfs", ""]) {
+      expect(unsafeLabel("fuse", source), source).toBeNull();
+      expect(unsafeLabel("fuse.gocryptfs", source), source).toBeNull();
+    }
+    // A remote-looking source on a kernel filesystem proves nothing (NFS names are already in the table).
+    expect(unsafeLabel("ext4", "host:/x")).toBeNull();
+  });
+
+  test("the review's /proc/mounts lines are all refused", () => {
+    const lines = [
+      "data /work vboxsf rw,nodev,relatime 0 0",
+      "vmhgfs-fuse /work fuse.vmhgfs-fuse rw,nosuid,nodev 0 0",
+      "prl_fs /work prl_fs rw,nosuid,nodev 0 0",
+      "osxfs /work fuse.osxfs rw,nosuid,nodev 0 0",
+      "10.0.0.1:6789:/ /work ceph rw,relatime,name=admin 0 0",
+      "gl1:/vol /work fuse.glusterfs rw,relatime 0 0",
+      "10.0.0.2@tcp:/lfs /work lustre rw 0 0",
+      "remote: /work fuse.rclone rw,nosuid,nodev 0 0",
+      "s3fs /work fuse.s3fs rw,nosuid,nodev 0 0",
+      "https://dav.example.com /work fuse rw,nosuid,nodev 0 0",
+    ];
+    for (const line of lines) {
+      const k = folderKind("/work/project", linux({ procMounts: () => `/dev/sda1 / ext4 rw 0 0\n${line}\n` }));
+      expect(k.unsafe, line).toBeString();
+      expect(k.mountPoint).toBe("/work");
     }
   });
 });
