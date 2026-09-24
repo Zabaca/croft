@@ -6,8 +6,8 @@
 //   the job really ticks this project. In that order, so the job's first run (RunAtLoad) already finds the
 //   project. When none comes, SCHEDULER_STALE names the likely cause with the tail of tick.log. If the job
 //   cannot be installed, the setting and the registry are put back as they were. With --no-os-job (servers,
-//   containers, WSL) nothing is installed and nothing is waited for: croft serve ticks while it runs. After a
-//   pause, `on` resumes the project as it was ticked: one ticked by croft serve only stays so (no OS job).
+//   containers, WSL) nothing is installed and nothing is waited for: croft serve ticks while it runs. While
+//   paused, `on` resumes the project as it was ticked: one ticked by croft serve only stays so (no OS job).
 // - off: record it off, take the project out of the registry, and remove the OS job once no project needs it.
 // - pause [--for 2h]: ticks exit at once until the pause ends, or until `croft schedule on` (`on --no-os-job`, which
 //   every resume hint names, for a project ticked by croft serve only).
@@ -675,14 +675,14 @@ function inspected(e: Invocation): JobInfo | null {
 }
 
 /**
- * How `on` ticks the project: croft serve with --no-os-job; after a pause (ended or not), as it was ticked before
- * it, so resuming a project ticked by croft serve only never installs the OS job (R32-10); otherwise the OS job.
- * `on` while on through croft serve still asks for the job: that is how a project moves to it.
+ * How `on` ticks the project: croft serve with --no-os-job; while paused, as it was ticked before the pause, so
+ * resuming a project ticked by croft serve only never installs the OS job (R32-10); otherwise the OS job. A pause
+ * whose end has passed reads as on, as every surface shows it: `on` while on through croft serve asks for the job,
+ * which is how a project moves to it (the serve_not_running hint says so).
  */
-function viaForOn(raw: unknown, before: SchedulingRecord, noOsJob: boolean): "os-job" | "serve" {
+function viaForOn(before: SchedulingRecord, noOsJob: boolean): "os-job" | "serve" {
   if (noOsJob) return "serve";
-  const resuming = !!raw && typeof raw === "object" && (raw as { state?: unknown }).state === "paused";
-  return resuming && before.via === "serve" ? "serve" : "os-job";
+  return before.state === "paused" && before.via === "serve" ? "serve" : "os-job";
 }
 
 async function turnOn(e: Invocation, noOsJob: boolean): Promise<CommandResult<ScheduleData>> {
@@ -702,7 +702,7 @@ async function turnOn(e: Invocation, noOsJob: boolean): Promise<CommandResult<Sc
     saved.scheduling = db.getSetting("scheduling");
     saved.since = db.getSetting(SINCE_KEY);
     before = schedulingOf(db, now);
-    via = viaForOn(saved.scheduling, before, noOsJob);
+    via = viaForOn(before, noOsJob);
     db.setScheduling({ state: "on", via });
     if (before.state !== "on" || before.via !== via) db.setSetting(SINCE_KEY, now.toISOString());
   } finally {

@@ -489,15 +489,15 @@ describe("croft schedule on after a pause resumes it as it was (R32-10)", () => 
     expect(readScheduling(p.stateDir, new Date(NOW))).toMatchObject({ state: "on", via: "serve" });
   });
 
-  test("a pause that has already ended still resumes as it was", async () => {
+  test("a pause that has ended reads as on, as every surface shows it: croft schedule on then asks for the OS job", async () => {
     await sched(["on", "--no-os-job"], deps().deps);
     await sched(["pause", "--for", "1h"], deps().deps);
     const later = { ...env, CROFT_NOW: "2026-09-24T20:00:00.000Z" };
-    const { deps: d, calls } = deps();
-    const r = await sched(["on", "--json"], d, { env: later });
+    const status = await sched(["status", "--json"], deps().deps, { env: later });
+    expect(status.json.data.scheduling).toMatchObject({ state: "on", via: "serve" });
+    const r = await sched(["on", "--json"], deps({ tick: true }).deps, { env: later });
     expect(r.exit).toBe(0);
-    expect(calls).toEqual([]);
-    expect(r.json.data.scheduling).toMatchObject({ state: "on", via: "serve" });
+    expect(r.json.data.scheduling).toMatchObject({ state: "on", via: "os-job" });
   });
 
   test("--no-os-job still switches a paused OS-job project to croft serve; a paused OS-job project resumes on the job", async () => {
