@@ -503,14 +503,15 @@ describe("webhook", () => {
   test("loopback webhooks bypass HTTP_PROXY", async () => {
     const hook = mockHook([ok()]);
     project({ desktop: false, webhook: hook.url() });
-    const saved = { HTTP_PROXY: process.env.HTTP_PROXY, http_proxy: process.env.http_proxy };
-    process.env.HTTP_PROXY = "http://127.0.0.1:9";
-    process.env.http_proxy = "http://127.0.0.1:9";
-    try {
-      await notifyScheduledFailure(root, failure(), { processEnv: DRY, retryDelaysMs: [1, 1] });
-    } finally {
-      for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
-    }
+    // In a child process: Bun reads the proxy variables once per process, so setting them here would send every
+    // later test's fetch in this process through the dead proxy.
+    const script = `const { notifyScheduledFailure } = await import(${JSON.stringify(new URL("./notify.ts", import.meta.url).href)});
+await notifyScheduledFailure(${JSON.stringify(root)}, ${JSON.stringify(failure())}, { processEnv: ${JSON.stringify(DRY)}, retryDelaysMs: [1, 1] });`;
+    const child = Bun.spawn([process.execPath, "-e", script], {
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", HTTP_PROXY: "http://127.0.0.1:9", http_proxy: "http://127.0.0.1:9" },
+      stdout: "pipe", stderr: "pipe",
+    });
+    expect(await child.exited).toBe(0);
     expect(hook.hits).toHaveLength(1);
   });
 
