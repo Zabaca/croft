@@ -13,9 +13,12 @@
 // prefix the Claude Code "ask" rule gates. confirm runs this command in its own process and hands it the token
 // through the CLI's Dispatch; when the run detaches, the child gets it through a one-time grant
 // (safety/confirm.ts). A token the run never reached because nothing needed consent is spent when the run ends.
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { CroftError, isCode } from "../../core/errors.ts";
 import type { DryRunData, Problem, StepResult } from "../../core/types.ts";
+import { logDir } from "../../history/logs.ts";
 import { isRunId, RunsDb } from "../../history/runs-db.ts";
 import type { Project } from "../../project/root.ts";
 import { CONFIRM_GRANT_ENV, Confirmations, grantDetached, redeemGrant } from "../../safety/confirm.ts";
@@ -87,23 +90,47 @@ async function planFor(project: Project, f: PlanFlags): Promise<RunPlan> {
   });
 }
 
+/** In a confirmed run's log directory: the token that run ended without reaching (settleConfirmation). */
+const UNREACHED_FILE = "confirm-unreached";
+
 /**
  * A confirmed run that ended without reaching its confirmation: the shrink guard did not trip (the source
- * recovered, say), so nothing needed consent and it ran as a normal run. Its token is spent anyway, so it
- * cannot run the command a second time, and croft confirm is told so. A run that did reach it spent the token
- * in consume() and trashed first, so its ok step shows `trashed`; a failed run leaves an unreached token valid
- * for another try; a run still going is settled by its detached child when it ends.
+ * recovered, say), or the cost guard found no more rows than confirmAbove, so nothing needed consent and it ran as
+ * a normal run. Its token is spent anyway, so it cannot run the command a second time, and croft confirm is told
+ * so (outcome "not_needed"). A run that did reach it spent the token in consume() (then trashed, or processed its
+ * backlog), and croft confirm says "used" (§6). A failed run leaves an unreached token valid for another try; a
+ * run still going is settled by its detached child when it ends.
+ *
+ * A detached run is settled twice, by its child when the run ends and by the parent following it, in either
+ * order. Whoever finds the token unspent first notes that in the run's log directory before spending it, so the
+ * other still tells an unreached token from one the run spent.
  */
 function settleConfirmation(ctx: Ctx, token: string, s: RunSummary): void {
   if (s.data.status === "running" || !s.ok || s.data.steps.some((step) => step.trashed)) return;
-  const db = RunsDb.open(ctx.project.paths.stateDir);
+  const stateDir = ctx.project.paths.stateDir;
+  const note = join(logDir(stateDir, s.data.runId), UNREACHED_FILE);
+  const db = RunsDb.open(stateDir);
+  let unreached: boolean;
   try {
-    new Confirmations(db).spendUnused(token);
+    const confirmations = new Confirmations(db);
+    if (confirmations.get(token)?.usedAt === null) {
+      mkdirSync(dirname(note), { recursive: true });
+      writeFileSync(note, token);
+    }
+    unreached = confirmations.spendUnused(token) || noted(note, token);
   } finally {
     db.close();
   }
   const dispatch = dispatchOf(ctx);
-  if (dispatch) dispatch.confirmationNotNeeded = true;
+  if (dispatch && unreached) dispatch.confirmationNotNeeded = true;
+}
+
+function noted(path: string, token: string): boolean {
+  try {
+    return readFileSync(path, "utf8") === token;
+  } catch {
+    return false;
+  }
 }
 
 function croftFrom(p: Problem): CroftError {
@@ -257,12 +284,16 @@ const plural = (n: number, word: string) => `${formatCount(n)} ${word}${n === 1 
 
 function stepLines(s: StepResult): string[] {
   const head = (label: string, text: string) => `${label.padEnd(8)} ${s.asset.padEnd(18)} ${text}`;
-  const pad = " ".repeat(28);
+  // The step's text column: 28, or further right after a name longer than its column.
+  const pad = " ".repeat(head("", "").length);
   if (s.status === "failed") {
     const e = s.error;
     const attempt = s.attempt > 1 ? ` (attempt ${s.attempt} of ${s.maxAttempts})` : "";
     const retry = s.nextRetryAt ? ` · retry planned ${s.nextRetryAt}` : "";
-    return [head("failed", `${e ? `${e.code}: ${e.message}` : "failed"}${attempt}${retry}`), `${pad}${s.logsCommand}`];
+    // A multi-line error (CHECK_FAILED's sample rows, "also failing: …") keeps its lines under the step's text,
+    // as §3f shows it; the attempt goes with its first line.
+    const [first, ...more] = (e ? `${e.code}: ${e.message}` : "failed").split("\n");
+    return [head("failed", `${first}${attempt}${retry}`), ...more.map((l) => `${pad}${l}`), `${pad}${s.logsCommand}`];
   }
   if (s.status === "skipped") return [head("skipped", s.skippedBecause ?? s.reason)];
   if (s.status === "unchanged") return [head("ok", `unchanged · ${s.reason}`)];
@@ -278,10 +309,12 @@ function stepLines(s: StepResult): string[] {
   const second = [`added ${formatCount(r.added)}`, `updated ${formatCount(r.updated)}`, `unchanged ${formatCount(r.unchanged)}`];
   if (r.deleted) second.push(`deleted ${formatCount(r.deleted)}`);
   second.push(`${plural(r.total, "row")} now`);
-  if (s.checks.length) {
-    const passed = s.checks.filter((c) => c.ok).length;
-    second.push(`checks ${formatCount(passed)}/${formatCount(s.checks.length)} ok`);
-  }
+  // Blocking checks and warnings apart (§4.2 "checks 3/3 ok · 1 warning"). A blocking check that fails fails its
+  // step, so on an ok step a failing entry is a warning (one that failed, or could not run).
+  const passed = s.checks.filter((c) => c.ok).length;
+  const warned = s.checks.length - passed;
+  if (passed) second.push(`checks ${formatCount(passed)}/${formatCount(passed)} ok`);
+  if (warned) second.push(plural(warned, "warning"));
   if (s.cursor?.after !== undefined && s.cursor.after !== s.cursor.before) second.push(`since → ${s.cursor.after}`);
   if (s.trashed) second.push(`previous ${plural(s.trashed.rows, "row")} in the trash`);
   const lines = [head("ok", first.join(" · ")), `${pad}${second.join(" · ")}`];

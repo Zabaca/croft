@@ -18,11 +18,11 @@ const T1 = "2026-09-22T11:00:00Z";
 const T2 = "2026-09-22T12:00:00Z";
 const FILE = "assets/orders.sql";
 
-function warehouse(): DuckWarehouse {
+function warehouse(timezone = "UTC"): DuckWarehouse {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "croft-checks-")));
   mkdirSync(join(root, ".croft"));
   mkdirSync(join(root, "files"));
-  return openWarehouse({ path: join(root, "warehouse.duckdb"), mode: "read_write", timezone: "UTC", root, stateDir: join(root, ".croft"), register: false, isTTY: false });
+  return openWarehouse({ path: join(root, "warehouse.duckdb"), mode: "read_write", timezone, root, stateDir: join(root, ".croft"), register: false, isTTY: false });
 }
 
 type Rows = Record<string, unknown>[];
@@ -133,12 +133,12 @@ describe("checksHook: blocking checks in the write transaction", () => {
       hint: `correct ${FILE} or the data, then: croft run orders`,
       fix: { kind: "manual", description: `correct ${FILE} or the data, then: croft run orders` },
       effect: "nothing was written; orders keeps its previous 4 rows",
-      details: { check: "not_null(author)", failing: 1, checked: 2, scope: "batch", sample: [{ id: 2, email: "p2@x.io", amount: 20, author: null, updated_at: "2026-09-22T11:00:00.000000Z", note: "x" }] },
+      details: { check: "not_null(author)", failing: 1, checked: 2, scope: "batch", sample: [{ id: 2, email: "p2@x.io", amount: 20, author: null, updated_at: "2026-09-22T11:00:00+00:00", note: "x" }] },
     });
     expect(e.problem.message.split("\n")).toEqual([
       "not_null(author): 1 of 2 rows",
       // The line has room for these; note would not fit.
-      '  id=2  email="p2@x.io"  amount=20  author=NULL  updated_at="2026-09-22T11:00:00.000000Z"',
+      '  id=2  email="p2@x.io"  amount=20  author=NULL  updated_at="2026-09-22T11:00:00+00:00"',
     ]);
     expect(e.problem.details?.results).toEqual([
       { check: "unique(id)", ok: true, failing: 0 },
@@ -147,6 +147,28 @@ describe("checksHook: blocking checks in the write transaction", () => {
     ]);
     expect(await snapshot()).toEqual(before);
     delete COLUMNS.note;
+  });
+
+  test("samples show a TIMESTAMPTZ with the project offset, as croft query does (§4 Conventions); text stays text", async () => {
+    const w = warehouse("America/Los_Angeles");
+    const base = ["id", "email", "amount", "author", "updated_at"];
+    // email holds text that looks like an instant: a VARCHAR is never reinterpreted.
+    const rows = [{ id: 1, email: "2026-09-22T11:00:00Z", amount: 5, author: null, updated_at: T1 }];
+    const checks = checksOf({ key: ["id"], checks: ["not_null(author, updated_at)"], warnings: ["amount > 10"] });
+    const e = await rejection(load(w, "orders", rows, { key: ["id"], columns: base, checks: hook(checks) }));
+    expect(e.problem.details!.sample).toEqual([{ id: 1, email: "2026-09-22T11:00:00Z", amount: 5, author: null, updated_at: "2026-09-22T04:00:00-07:00" }]);
+    // The rendered line too (amount does not fit).
+    expect(e.problem.message.split("\n")[1]).toBe('  id=1  email="2026-09-22T11:00:00Z"  author=NULL  updated_at="2026-09-22T04:00:00-07:00"');
+    expect((e.problem.details!.results as { sample?: unknown[] }[])[2]!.sample).toEqual(e.problem.details!.sample as unknown[]);
+    // A warning's sample too, after the commit.
+    const r = await load(w, "orders", [{ ...rows[0]!, author: "a1" }], { key: ["id"], columns: base, checks: hook(checks) });
+    const out = await w.read((sql) => runWarnings(sql, { asset: "orders", table: '"warehouse"."main"."orders"', loadedAt: r.loadedAt, rows: r.rows }, checks, { file: FILE }), { purpose: "test" });
+    expect(out.results).toEqual([{ check: "amount > 10", ok: false, failing: 1, sample: [{ id: 1, email: "2026-09-22T11:00:00Z", amount: 5, author: "a1", updated_at: "2026-09-22T04:00:00-07:00" }] }]);
+    expect(out.problems[0]!.details!.sample).toEqual(out.results[0]!.sample!);
+    // unique's sample (a QUALIFY query) as well.
+    const twins = [{ id: 1, email: "e", amount: 5, author: "a", updated_at: T1 }, { id: 2, email: "e", amount: 5, author: "a", updated_at: T2 }];
+    const dup = await rejection(load(w, "orders", twins, { key: ["id"], columns: base, checks: hook(checksOf({ checks: ["unique(email)"] })) }));
+    expect((dup.problem.details!.sample as { updated_at: string }[]).map((r) => r.updated_at).sort()).toEqual(["2026-09-22T04:00:00-07:00", "2026-09-22T05:00:00-07:00"]);
   });
 
   test("20 samples collected, 3 rendered; every failing check is reported", async () => {
