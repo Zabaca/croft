@@ -132,7 +132,8 @@ describe("croft schedule on", () => {
     expect(data.scheduling).toEqual({ state: "on", via: "os-job", lastTickAt: "2026-09-24T10:05:00-07:00", stale: false });
     expect(data.firstTick).toMatchObject({ ok: true, at: "2026-09-24T10:05:00-07:00" });
     expect(data.job).toEqual({
-      kind: "launchd", label, file: plistPath(home), installed: true, loaded: true, bun: BUN(), bunExists: true, bunStable: true, changed: true,
+      kind: "launchd", label, file: plistPath(home), installed: true, loaded: true, bun: BUN(), bunVersion: Bun.version, bunExists: true,
+      bunStable: true, bunSkipped: [], changed: true,
     });
     expect(existsSync(plistPath(home))).toBe(true);
     expect(existsSync(home.tickScript)).toBe(true);
@@ -161,8 +162,9 @@ describe("croft schedule on", () => {
     const r = await sched(["on"], deps({ tick: true }).deps);
     expect(r.exit).toBe(0);
     const lines = r.stdout.split("\n");
-    expect(lines.slice(0, 7)).toEqual([
+    expect(lines.slice(0, 8)).toEqual([
       `Scheduling is on for ${p.root} (one job per user; checked every minute; survives restarts).`,
+      `The job runs Bun ${Bun.version} from ~/.bun/bin/bun.`,
       "Waiting for the first tick… ok (after 0 s)",
       "  github_issues   every hour   0 * * * *   next 11:00",
       "  taxi_zones      monthly      0 0 1 * *   next Oct 1 00:00",
@@ -173,6 +175,28 @@ describe("croft schedule on", () => {
     expect(r.stdout).toContain("warn  SCHEDULE_HELD  issue_triage");
     expect(r.stdout).toContain("next: croft run issue_triage");
     expect(r.stderr).toBe("");
+  });
+
+  test("the job's Bun and its version; a stable Bun passed over for being too old is a note", async () => {
+    const brew = "/opt/homebrew/bin/bun";
+    const job = {
+      platform: "darwin" as const, uid: 501, execPath: brew, runningVersion: "1.3.14", sleep: () => {},
+      exists: (x: string) => x === BUN() || x === brew, bunVersion: (x: string) => (x === BUN() ? "1.0.0" : null),
+    };
+    const r = await sched(["on", "--json"], deps({ tick: true, job }).deps);
+    expect(r.json.data.job).toMatchObject({ bun: brew, bunVersion: "1.3.14", bunStable: true, bunSkipped: [{ path: BUN(), version: "1.0.0" }] });
+    const human = await sched(["on"], deps({ tick: true, job }).deps);
+    expect(human.stdout.split("\n").slice(0, 3)).toEqual([
+      `Scheduling is on for ${p.root} (one job per user; checked every minute; survives restarts).`,
+      "The job runs Bun 1.3.14 from /opt/homebrew/bin/bun.",
+      "note: ~/.bun/bin/bun is Bun 1.0.0, older than croft needs (1.3.14), so the job does not run it",
+    ]);
+    // Newer than croft needs but older than the Bun running croft; one that does not run at all.
+    const newer = { ...job, runningVersion: "1.4.2", bunVersion: (x: string) => (x === BUN() ? "1.3.14" : null) };
+    const older = await sched(["on"], deps({ tick: true, job: newer }).deps);
+    expect(older.stdout.split("\n")[2]).toBe("note: ~/.bun/bin/bun is Bun 1.3.14, older than the Bun running croft (1.4.2), so the job does not run it");
+    const broken = await sched(["on"], deps({ tick: true, job: { ...job, bunVersion: () => null } }).deps);
+    expect(broken.stdout.split("\n")[2]).toBe("note: ~/.bun/bin/bun does not run (it printed no version), so the job does not run it");
   });
 
   test("a project under the home folder is shown as ~/…", () => {
@@ -242,7 +266,7 @@ describe("croft schedule on", () => {
     expect(calls.some((c) => c[1] === "bootstrap")).toBe(false);
     expect(r.json.problems.map((x: { code: string }) => x.code)).toEqual(["SCHEDULE_HELD"]);
     const human = await sched(["on"], deps().deps);
-    expect(human.stdout.split("\n")[1]).toBe("Already ticking: last tick 0 s ago.");
+    expect(human.stdout.split("\n")[2]).toBe("Already ticking: last tick 0 s ago.");
     // Turning it on again keeps the time it was turned on.
     expect(setting().since).toBe(NOW);
   });
@@ -387,23 +411,40 @@ describe("croft schedule pause", () => {
     const r = await sched(["pause", "--for", "2h", "--json"], deps().deps);
     expect(r.exit).toBe(0);
     expect(r.json.data.scheduling).toEqual({ state: "paused", via: "serve", lastTickAt: null, pausedUntil: "2026-09-24T12:05:00-07:00" });
-    expect(r.json.next).toEqual([{ command: "croft schedule on", reason: "resume scheduled runs now" }]);
+    expect(r.json.next).toEqual([{ command: "croft schedule on --no-os-job", reason: "resume scheduled runs now" }]);
     expect(setting().scheduling).toEqual({ state: "paused", via: "serve", pausedUntil: "2026-09-24T19:05:00.000Z" });
     // After the pause it reads as on; a tick is due within a minute of its end, so it is not stale yet.
     expect(readScheduling(p.stateDir, new Date("2026-09-24T19:06:00Z"))).toMatchObject({ state: "on", stale: false });
     expect(readScheduling(p.stateDir, new Date("2026-09-24T19:09:00Z"))).toMatchObject({ state: "on", stale: true });
     const human = await sched(["pause", "--for", "30m"], deps().deps);
-    expect(human.stdout.split("\n")[0]).toBe(`Scheduling is paused for ${p.root} until 10:35 (in 30 min); croft schedule on resumes it now.`);
+    expect(human.stdout.split("\n")[0]).toBe(`Scheduling is paused for ${p.root} until 10:35 (in 30 min); croft schedule on --no-os-job resumes it now.`);
   });
 
   test("without --for: until croft schedule on, which resumes it", async () => {
-    await sched(["on", "--no-os-job"], deps().deps);
+    await sched(["on"], deps({ tick: true }).deps);
     const r = await sched(["pause", "--json"], deps().deps);
-    expect(r.json.data.scheduling).toEqual({ state: "paused", via: "serve", lastTickAt: null, pausedUntil: null });
+    expect(r.json.data.scheduling).toEqual({ state: "paused", via: "os-job", lastTickAt: "2026-09-24T10:05:00-07:00", pausedUntil: null });
     const human = await sched(["pause"], deps().deps);
     expect(human.stdout.split("\n")[0]).toBe(`Scheduling is paused for ${p.root} until croft schedule on; croft schedule on resumes it now.`);
     const on = await sched(["on", "--no-os-job", "--json"], deps().deps);
     expect(on.json.data.scheduling).toMatchObject({ state: "on", via: "serve" });
+  });
+
+  test("a project ticked by croft serve only is told to resume with --no-os-job; one on the OS job without it", async () => {
+    await sched(["on", "--no-os-job"], deps().deps);
+    const serveOnly = await sched(["pause", "--for", "2h", "--json"], deps().deps);
+    expect(serveOnly.json.next).toEqual([{ command: "croft schedule on --no-os-job", reason: "resume scheduled runs now" }]);
+    const human = await sched(["pause", "--for", "30m"], deps().deps);
+    expect(human.stdout.split("\n")[0]).toBe(`Scheduling is paused for ${p.root} until 10:35 (in 30 min); croft schedule on --no-os-job resumes it now.`);
+    const open = await sched(["pause"], deps().deps);
+    expect(open.stdout.split("\n")[0]).toBe(`Scheduling is paused for ${p.root} until croft schedule on --no-os-job; croft schedule on --no-os-job resumes it now.`);
+    const status = await sched(["status"], deps().deps);
+    expect(status.stdout.split("\n")[0]).toBe("Scheduling paused · until croft schedule on --no-os-job · ticks from croft serve (not running) · never ticked");
+
+    await sched(["off"], deps().deps);
+    await sched(["on"], deps({ tick: true }).deps);
+    const osJob = await sched(["pause", "--json"], deps().deps);
+    expect(osJob.json.next).toEqual([{ command: "croft schedule on", reason: "resume scheduled runs now" }]);
   });
 
   test("pausing scheduling that is off is refused", async () => {
@@ -413,6 +454,70 @@ describe("croft schedule pause", () => {
       code: "USAGE_ERROR", message: "scheduling is off for this project, so there is nothing to pause",
       fix: { kind: "command", command: "croft schedule status" },
     });
+  });
+});
+
+describe("croft schedule on after a pause resumes it as it was (R32-10)", () => {
+  test("a project ticked by croft serve only stays so: no OS job is installed on macOS", async () => {
+    await sched(["on", "--no-os-job"], deps().deps);
+    await sched(["pause", "--for", "2h"], deps().deps);
+    const { deps: d, calls } = deps({ tick: true });
+    const r = await sched(["on", "--json"], d);
+    expect(r.exit).toBe(0);
+    expect(calls).toEqual([]);
+    expect(existsSync(plistPath(home))).toBe(false);
+    expect(r.json.data).toMatchObject({ scheduling: { state: "on", via: "serve", stale: false }, job: null, firstTick: null });
+    expect(setting().scheduling).toEqual({ state: "on", via: "serve" });
+    expect(listProjects(home)).toEqual([{ root: p.root, addedAt: NOW, via: "serve" }]);
+    const human = await sched(["pause"], deps().deps);
+    expect(human.exit).toBe(0);
+    const again = await sched(["on"], deps().deps);
+    expect(again.stdout.split("\n")[0]).toBe(`Scheduling is on for ${p.root}, ticked by croft serve only (no OS job): nothing runs on a schedule while croft serve is stopped.`);
+  });
+
+  test("on Linux without crontab (a container), resuming works instead of failing with INSTALL_FAILED", async () => {
+    const linux = { platform: "linux" as const, uid: 1000, execPath: BUN(), exists: (x: string) => x === BUN(), sleep: () => {} };
+    const noCron = (argv: string[]) => (argv[0] === "crontab" ? { status: 127, stderr: "crontab: not found" } : undefined);
+    await sched(["on", "--no-os-job"], deps({ job: linux, respond: noCron }).deps);
+    await sched(["pause", "--for", "2h"], deps({ job: linux, respond: noCron }).deps);
+    const { deps: d, calls } = deps({ job: linux, respond: noCron });
+    const r = await sched(["on", "--json"], d);
+    expect(r.exit).toBe(0);
+    expect(r.json.problems.map((x: { code: string }) => x.code)).not.toContain("INSTALL_FAILED");
+    expect(calls).toEqual([]);
+    expect(r.json.data.scheduling).toMatchObject({ state: "on", via: "serve" });
+    expect(readScheduling(p.stateDir, new Date(NOW))).toMatchObject({ state: "on", via: "serve" });
+  });
+
+  test("a pause that has already ended still resumes as it was", async () => {
+    await sched(["on", "--no-os-job"], deps().deps);
+    await sched(["pause", "--for", "1h"], deps().deps);
+    const later = { ...env, CROFT_NOW: "2026-09-24T20:00:00.000Z" };
+    const { deps: d, calls } = deps();
+    const r = await sched(["on", "--json"], d, { env: later });
+    expect(r.exit).toBe(0);
+    expect(calls).toEqual([]);
+    expect(r.json.data.scheduling).toMatchObject({ state: "on", via: "serve" });
+  });
+
+  test("--no-os-job still switches a paused OS-job project to croft serve; a paused OS-job project resumes on the job", async () => {
+    await sched(["on"], deps({ tick: true }).deps);
+    await sched(["pause"], deps().deps);
+    const resumed = await sched(["on", "--json"], deps({ tick: true }).deps);
+    expect(resumed.json.data.scheduling).toMatchObject({ state: "on", via: "os-job" });
+    expect(resumed.json.data.job).toMatchObject({ installed: true });
+    await sched(["pause"], deps().deps);
+    const { deps: d, calls } = deps();
+    const serve = await sched(["on", "--no-os-job", "--json"], d);
+    expect(serve.json.data.scheduling).toMatchObject({ state: "on", via: "serve" });
+    expect(calls).toContainEqual(["/bin/launchctl", "bootout", `gui/501/${label}`]);
+  });
+
+  test("on (not paused) through croft serve, croft schedule on still asks for the OS job, as the serve_not_running hint says", async () => {
+    await sched(["on", "--no-os-job"], deps().deps);
+    const r = await sched(["on", "--json"], deps({ tick: true }).deps);
+    expect(r.json.data.scheduling).toMatchObject({ state: "on", via: "os-job" });
+    expect(listProjects(home)).toEqual([{ root: p.root, addedAt: NOW, via: "os-job" }]);
   });
 });
 
@@ -458,7 +563,7 @@ describe("croft schedule status", () => {
     const d = r.json.data;
     expect(d).toMatchObject({
       action: "status", root: p.root, scheduling: { state: "on", via: "os-job", lastTickAt: "2026-09-24T10:05:00-07:00", stale: false },
-      job: { kind: "launchd", label, file: plistPath(home), installed: true, loaded: true, bun: BUN(), bunExists: true },
+      job: { kind: "launchd", label, file: plistPath(home), installed: true, loaded: true, bun: BUN(), bunVersion: Bun.version, bunExists: true },
       registry: { projects: 1, osJob: 1 }, serve: null,
     });
     expect(d.assets.map((a: { asset: string }) => a.asset)).toEqual(VIEW.map((v) => v.asset));
@@ -477,7 +582,7 @@ describe("croft schedule status", () => {
     const r = await sched(["status"], deps().deps);
     const lines = r.stdout.split("\n");
     expect(lines[0]).toBe("Scheduling on · ticks from the per-user OS job · last tick 12 s ago");
-    expect(lines[1]).toBe(`Job: launchd ${label} · installed, loaded · bun ${BUN()}`);
+    expect(lines[1]).toBe(`Job: launchd ${label} · installed, loaded · Bun ${Bun.version} at ~/.bun/bin/bun`);
     const row = (name: string) => lines.find((l) => l.startsWith(`${name} `))!.split(/\s{3,}/);
     expect(lines[2]!.split(/\s{3,}/)).toEqual(["ASSET", "SCHEDULE", "CRON", "NEXT", "LAST FIRE", "STATUS"]);
     expect(row("github_issues")).toEqual(["github_issues", "every hour", "0 * * * *", "in 55 min", "10:00", "—"]);
@@ -485,6 +590,22 @@ describe("croft schedule status", () => {
     expect(row("sales")).toEqual(["sales", "manual", "—", "—", "—", "—"]);
     expect(row("issue_triage")).toEqual(["issue_triage", "after inputs", "—", "—", "—", "held: new asset, not run by hand yet (croft run issue_triage)"]);
     expect(row("open_issues")).toEqual(["open_issues", "after inputs", "—", "—", "—", "due: stale: input github_issues changed"]);
+  });
+
+  test("the job's Bun: its version asked of it; one older than croft needs, or one that does not run, is a note", async () => {
+    await onAndTicking("2026-09-24T17:04:48.000Z");
+    const ask = (v: string | null) => deps({ job: { platform: "darwin", uid: 501, execPath: "/usr/local/bin/bun", exists: (x) => x === BUN(), bunVersion: () => v, sleep: () => {} } }).deps;
+    const r = await sched(["status", "--json"], ask("1.0.0"));
+    expect(r.json.data.job).toMatchObject({ bun: BUN(), bunVersion: "1.0.0", bunExists: true });
+    const human = (await sched(["status"], ask("1.0.0"))).stdout.split("\n");
+    expect(human[1]).toBe(`Job: launchd ${label} · installed, loaded · Bun 1.0.0 at ~/.bun/bin/bun`);
+    expect(human[2]).toBe("note: the job's Bun (1.0.0) is older than croft needs (1.3.14): croft schedule on points the job at a newer one");
+    const dead = (await sched(["status"], ask(null))).stdout.split("\n");
+    expect(dead[1]).toBe(`Job: launchd ${label} · installed, loaded · Bun at ~/.bun/bin/bun (does not run)`);
+    expect(dead[2]).toBe("note: the job's Bun does not run (it printed no version): croft schedule on points the job at one that does");
+    // Gone: said as missing, and not asked.
+    const gone = await sched(["status"], deps({ job: { platform: "darwin", uid: 501, execPath: "/usr/local/bin/bun", exists: () => false, bunVersion: () => { throw new Error("asked"); }, sleep: () => {} } }).deps);
+    expect(gone.stdout.split("\n")[1]).toBe(`Job: launchd ${label} · installed, loaded · Bun at ~/.bun/bin/bun (missing)`);
   });
 
   test("stale: no tick for more than 3 minutes is SCHEDULER_STALE, with the cause (here: the job is gone)", async () => {

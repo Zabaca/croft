@@ -48,7 +48,7 @@ import { croftHome, type CroftHome } from "../../schedule/home.ts";
 import type { CommandImpl, CommandResult, Ctx, Next } from "../command.ts";
 import { formatCount, table } from "../render.ts";
 import {
-  clockText, defaultScheduleView, fireText, heldProblem, HUMAN_HOLDS, logTailLines, nextFireOf, type Scheduling, SCHEDULING_OFF,
+  clockText, defaultScheduleView, fireText, heldProblem, HUMAN_HOLDS, logTailLines, nextFireOf, resumeCommand, type Scheduling, SCHEDULING_OFF,
   schedulingJson, schedulingOf, type SchedulingRecord, type ScheduleViewFn, staleProblem,
 } from "./schedule.ts";
 
@@ -702,7 +702,7 @@ export function formatStatus(d: StatusData, now: Date, o: { tz?: string; problem
 
 function schedulingLine(d: StatusData, now: Date, tz: string): string {
   const s = d.scheduling;
-  const parts = [`Scheduling ${s.state}${s.state === "paused" ? ` ${s.pausedUntil ? `until ${clockText(s.pausedUntil, tz, now)}` : "until croft schedule on"}` : ""}`];
+  const parts = [`Scheduling ${s.state}${s.state === "paused" ? ` ${s.pausedUntil ? `until ${clockText(s.pausedUntil, tz, now)}` : `until ${resumeCommand(s.via)}`}` : ""}`];
   if (s.lastTickAt) parts.push(`last tick ${ago(s.lastTickAt, now)}${s.stale ? " (stale)" : ""}`);
   else if (s.state === "on") parts.push(s.stale ? "no tick yet (stale)" : "no tick yet");
   parts.push(`${d.running.length} running`);

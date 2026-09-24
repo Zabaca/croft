@@ -31,7 +31,9 @@ import type { CommandImpl } from "../command.ts";
 import { LAUNCH_ENV, SELF_ROOT } from "../launcher.ts";
 import { formatCount, formatProblem } from "../render.ts";
 import { BUN_FLOOR, BUN_TESTED, CROFT_VERSION, versionAtLeast } from "../version.ts";
-import { agoText, clockText, logTailLines, readScheduling, schedulingJson, type SchedulingRecord, staleProblem, tickerText } from "./schedule.ts";
+import {
+  agoText, clockText, logTailLines, readScheduling, resumeCommand, schedulingJson, type SchedulingRecord, staleProblem, tickerText,
+} from "./schedule.ts";
 
 export type Section = "environment" | "project" | "scheduling";
 export type CheckStatus = "ok" | "warn" | "error" | "info";
@@ -874,7 +876,9 @@ function checkScheduling(r: Report, d: DoctorDeps, project: Project): void {
   const last = rec.heartbeatAt ? `last tick ${agoText(rec.heartbeatAt, at)}`
     : rec.since ? `no tick since it was turned on ${agoText(rec.since, at)}` : "no tick yet";
   if (rec.state === "paused") {
-    const until = rec.pausedUntil ? `until ${clockText(rec.pausedUntil, tz, at)} (croft schedule on resumes it now)` : "until croft schedule on";
+    // A project ticked by croft serve only resumes with --no-os-job, so following the line never installs the OS job.
+    const resume = resumeCommand(rec.via);
+    const until = rec.pausedUntil ? `until ${clockText(rec.pausedUntil, tz, at)} (${resume} resumes it now)` : `until ${resume}`;
     r.add("scheduling", "scheduling", "ok", `paused ${until}${rec.heartbeatAt ? ` · ${last}` : ""}`, undefined, details);
     return;
   }

@@ -838,6 +838,18 @@ describe("the Scheduling section", () => {
     expect(check(paused.data.checks, "scheduling")).toMatchObject({ status: "ok", text: "paused until 04:00 (croft schedule on resumes it now) · last tick 12 s ago" });
   });
 
+  test("paused, ticked by croft serve only: resumed with croft schedule on --no-os-job (R32-10)", async () => {
+    const root = await project();
+    turnOn(root, { state: "paused", via: "serve", pausedUntil: "2026-09-24T19:00:00.000Z" }, { heartbeat: TICKED });
+    const until = await runDoctor(root, deps({ env: { CROFT_NOW: AT }, croftHome: fakeHome() }));
+    expect(check(until.data.checks, "scheduling")).toMatchObject({
+      status: "ok", text: "paused until 04:00 (croft schedule on --no-os-job resumes it now) · last tick 12 s ago",
+    });
+    turnOn(root, { state: "paused", via: "serve", pausedUntil: null });
+    const open = await runDoctor(root, deps({ env: { CROFT_NOW: AT }, croftHome: fakeHome() }));
+    expect(check(open.data.checks, "scheduling")).toMatchObject({ status: "ok", text: "paused until croft schedule on --no-os-job · last tick 12 s ago" });
+  });
+
   test("stale: SCHEDULER_STALE with the cause, the tick log under it, and the fix", async () => {
     const root = await project();
     const home = fakeHome();

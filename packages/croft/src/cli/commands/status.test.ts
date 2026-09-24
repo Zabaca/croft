@@ -726,6 +726,16 @@ describe("croft status: scheduling", () => {
     expect(human.trimEnd().split("\n").at(-1)).toBe("Scheduling paused until 14:00 · last tick 2 h ago · 0 running");
   });
 
+  test("paused with no end: the line names the command that resumes it, --no-os-job for croft serve only (R32-10)", async () => {
+    const p = await pipeline({ files: { "assets/github_issues.ts": SCHEDULED_TS } });
+    const d: StatusDeps = { scheduleView: async () => view() };
+    turnOn(p, { paused: null, heartbeat: "2026-09-22T17:00:00.000Z" });
+    expect((await run(p, [], d)).stdout.trimEnd().split("\n").at(-1)).toBe("Scheduling paused until croft schedule on · last tick 2 h ago · 0 running");
+    turnOn(p, { via: "serve", paused: null });
+    expect((await run(p, [], d)).stdout.trimEnd().split("\n").at(-1))
+      .toBe("Scheduling paused until croft schedule on --no-os-job · last tick 2 h ago · 0 running");
+  });
+
   test("the scheduler's view failing: NEXT comes from the schedule itself, with a warning", async () => {
     const p = await pipeline({ files: { "assets/github_issues.ts": SCHEDULED_TS } });
     turnOn(p, { heartbeat: "2026-09-22T18:59:48.000Z" });

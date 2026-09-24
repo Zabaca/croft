@@ -144,7 +144,8 @@ describe("journey 20: croft schedule", () => {
     // missed run once, at 16:00.
     const paused = await ok(["schedule", "pause", "--for", "2h"], 13, 30);
     expect(paused.data.scheduling).toMatchObject({ state: "paused", pausedUntil: laTime(15, 30) });
-    expect(paused.next).toEqual([expect.objectContaining({ command: "croft schedule on" })]);
+    // Ticked by croft serve only: the resume hint keeps it so (R32-10).
+    expect(paused.next).toEqual([expect.objectContaining({ command: "croft schedule on --no-os-job" })]);
     expect((await ok(["status"], 13, 31)).data.scheduling).toMatchObject({ state: "paused", pausedUntil: laTime(15, 30) });
     for (const h of [14, 15]) {
       const t = await ok(["tick"], h);
