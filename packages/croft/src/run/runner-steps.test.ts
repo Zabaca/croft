@@ -452,9 +452,20 @@ export default transform({
 
   test("a run nobody started by hand has nobody to ask: the guard fails the step", async () => {
     const root = project();
-    const out = await run2(root, { human: false, trigger: "schedule" });
+    const out = await run2(root, { human: false });
     expect(out.step("triage").error?.code).toBe("LARGE_REPROCESS");
     expect(out.confirmation).toBeUndefined();
+  });
+
+  test("a scheduled run holds the transform instead (§5: until a person runs it), recorded for the tick", async () => {
+    const root = project();
+    const out = await run2(root, { human: false, trigger: "schedule" });
+    expect(out.step("triage")).toMatchObject({ status: "skipped" });
+    expect(out.step("triage").skippedBecause).toStartWith("held (LARGE_REPROCESS): ");
+    expect(out.problems.find((p) => p.code === "LARGE_REPROCESS")?.severity).toBe("warning");
+    expect(out.confirmation).toBeUndefined();
+    expect(out.exit).toBe(0);
+    withRuns(root, (db) => expect(db.latestStep("triage")).toMatchObject({ status: "skipped", error: { code: "LARGE_REPROCESS" } }));
   });
 });
 

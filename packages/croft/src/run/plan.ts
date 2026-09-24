@@ -106,6 +106,22 @@ export interface PlannedStep {
   timeoutMs: number;
   /** What the asset's top-level code printed while it was imported (unredacted; the step log redacts it). */
   output?: string[];
+  /** --due: the schedule fire this ingest's step handles (ISO-8601 UTC), recorded as its last_fire_at when the step
+   *  starts (§8). */
+  fire?: string;
+}
+
+/**
+ * --due (the scheduler's run, §8 "What counts as due"): what holds each step back, and the fire each due ingest
+ * handles. schedule/due.ts duePlanning() reads both from runs.sqlite; the plan applies them to every step it takes,
+ * downstream included, with the code hashes it just computed.
+ */
+export interface DuePlanning {
+  /** Why the scheduler must not run this step now (SCHEDULE_HELD, LARGE_REPROCESS, paused, leased), or null.
+   *  `reason` becomes the step's reason; `problem` (a warning) goes with the skipped step. */
+  hold(step: { asset: string; file: string; kind: StepKind; codeHash?: string; ok: boolean }): { hold: Hold; reason: string; problem?: Problem } | null;
+  /** The fire a due ingest handles (its schedule as written), or null. */
+  fire(step: { asset: string; schedule?: string }): string | null;
 }
 
 export interface RunPlan {
@@ -143,6 +159,10 @@ export interface PlanInput {
   /** The command that was typed, again with other selectors: the did-you-mean fix of a mistyped name
    *  (project/resolve.ts selectAssets). Default: `croft run <selectors>`. */
   retry?: (selectors: readonly string[]) => string;
+  /** --due: the selectors are the due assets the tick found (ingests whose schedule fired, stale transforms). An
+   *  ingest is taken as schedule_due, a transform only for its staleness (one that is up to date by now is
+   *  skipped), and every step, downstream included, gets the scheduler's holds. */
+  due?: DuePlanning;
 }
 
 /** TS assets get 2 retries after a retryable error (§8 "Retries"). */
@@ -243,7 +263,7 @@ const isTransform = (a: ResolvedAsset) => a.kind === "sql" || a.kind === "ts";
 const hasErrors = (a: ResolvedAsset) => a.problems.some((p) => p.severity === "error");
 
 /** Which assets the run takes, and why (see the top of this file). Keys in no particular order. */
-function choose(s: Scope, selected: readonly string[], o: { bare: boolean; only: boolean; upstream: boolean; from: boolean }): Map<string, Taken> {
+function choose(s: Scope, selected: readonly string[], o: { bare: boolean; only: boolean; upstream: boolean; from: boolean; due: boolean }): Map<string, Taken> {
   const taken = new Map<string, Taken>();
   const take = (name: string, reasons: readonly Reason[], feeding: readonly string[] = []) => {
     const t = taken.get(name) ?? { reasons: new Set<Reason>(), feeding: [], readers: [] };
@@ -260,6 +280,12 @@ function choose(s: Scope, selected: readonly string[], o: { bare: boolean; only:
       if (!isTransform(a)) take(a.name, ["requested", ...s.stale(a.name)]);
       else if (s.stale(a.name).length) take(a.name, s.stale(a.name));
       else if (hasErrors(a) || s.onCycle.has(a.name)) take(a.name, ["requested"]);
+    }
+  } else if (o.due) {
+    // The scheduler asks for what it found due, not for a rebuild: a transform runs only while it is stale.
+    for (const name of selected) {
+      const a = s.byName.get(name);
+      take(name, a && isTransform(a) ? s.stale(name) : ["schedule_due", ...s.stale(name)]);
     }
   } else {
     for (const name of selected) take(name, ["requested", ...s.stale(name)]);
@@ -344,7 +370,7 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
     ...(i.importTimeoutMs !== undefined ? { importTimeoutMs: i.importTimeoutMs } : {}), ...(i.retry ? { retry: i.retry } : {}),
   });
   const byName = new Map(project.assets.map((a) => [a.name, a]));
-  const flags = { bare: i.selectors.length === 0, only: i.only === true, upstream: i.upstream === true, from: i.from !== undefined };
+  const flags = { bare: i.selectors.length === 0, only: i.only === true, upstream: i.upstream === true, from: i.from !== undefined, due: i.due !== undefined };
   const columns = (name: string) => entry(name)?.columns ?? null;
   const bind = (taken: ReadonlyMap<string, Taken>) => bindProject(project, { timezone: i.timezone, columns, rebuilt: (n) => taken.has(n) });
   // Every SQL asset bound as validate binds it, each against the new output of the SQL it reads: the columns an
@@ -447,6 +473,7 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
         skipForInputs(step, missing, roots);
       }
     }
+    if (i.due) applyDue(step, i.due);
     if (step.kind === "file" && step.action !== "skip" && a.ts?.definition) {
       for (const d of fileDirsOf(i.root, a.ts.definition.config as FileIngest)) fileDirs.add(d);
     }
@@ -458,6 +485,30 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
     problems: project.problems.filter((p) => p.code !== "CYCLE"),
     fileDirs: [...fileDirs].filter((d) => d !== join(i.root, "files")),
   };
+}
+
+/**
+ * --due on one step: a transform the tick found stale that is up to date by now is skipped (another run built it
+ * meanwhile); a step the scheduler must not run is held, with its reason and problem, and runs nothing, even when
+ * its code does not load (an edit in progress); a due ingest notes the fire it handles.
+ */
+function applyDue(step: PlannedStep, due: DuePlanning): void {
+  if (step.action === "skip") return;
+  const transform = step.kind === "sql" || step.kind === "transform";
+  if (transform && step.reasons.length === 0) {
+    step.action = "skip";
+    step.reason = "up to date: nothing it reads changed since the scheduler found it due";
+    return;
+  }
+  const h = due.hold({ asset: step.asset, file: step.file, kind: step.kind, ...(step.codeHash ? { codeHash: step.codeHash } : {}), ok: loadErrors(step).length === 0 });
+  if (h) {
+    step.hold = h.hold;
+    step.reason = h.reason;
+    if (h.problem) step.problems.push({ ...h.problem, asset: h.problem.asset ?? step.asset });
+    return;
+  }
+  const fire = transform ? null : due.fire({ asset: step.asset, ...(step.spec?.schedule !== undefined ? { schedule: step.spec.schedule } : {}) });
+  if (fire) step.fire = fire;
 }
 
 function viewOf(a: ResolvedAsset, inputs: readonly string[], entry: (name: string) => CatalogAsset | null): StaleView {
@@ -665,6 +716,7 @@ function names(list: readonly string[], max = 3): string {
 function reasonText(a: ResolvedAsset, t: Taken, view: StaleView): string {
   const parts: string[] = [];
   if (t.reasons.has("requested")) parts.push("requested");
+  if (t.reasons.has("schedule_due")) parts.push("scheduled");
   if (!isTransform(a)) return parts.join("; ") || "requested";
   if (t.reasons.has("never_built")) parts.push("never built");
   const zone = a.timeZoneChanged;

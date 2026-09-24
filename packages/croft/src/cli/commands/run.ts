@@ -9,6 +9,11 @@
 // and prints its result, or exits 6 with `croft wait <id>`. Hidden flags: --run-id and --detached (set by the
 // parent for its child).
 //
+// --due (hidden) is the scheduler's run (§8): `croft tick` starts one detached per group of due assets, named on the
+// command line (without names it runs what is due now). Its trigger is "schedule" and it is not a person's run
+// (human false): it never asks, never approves code, and its plan holds what the scheduler must not run
+// (schedule/due.ts duePlanning, run/plan.ts). It goes with no other run flag.
+//
 // No flag carries a confirmation (§6): a destructive action runs only through `croft confirm <token>`, the one
 // prefix the Claude Code "ask" rule gates. confirm runs this command in its own process and hands it the token
 // through the CLI's Dispatch; when the run detaches, the child gets it through a one-time grant
@@ -19,7 +24,9 @@ import { createInterface } from "node:readline/promises";
 import { CroftError, isCode } from "../../core/errors.ts";
 import type { DryRunData, Problem, StepResult } from "../../core/types.ts";
 import { logDir } from "../../history/logs.ts";
+import { allCatalog } from "../../history/catalog.ts";
 import { isRunId, RunsDb } from "../../history/runs-db.ts";
+import { discoverAssets } from "../../project/discover.ts";
 import type { Project } from "../../project/root.ts";
 import { CONFIRM_GRANT_ENV, Confirmations, grantDetached, redeemGrant } from "../../safety/confirm.ts";
 import { DEFAULT_FOLLOW_MS, followRun, parseWait, pickRunId, spawnDetachedRun, writeNotStarted } from "../../run/detach.ts";
@@ -27,6 +34,7 @@ import { dryRun, formatDryRun, refuseToken } from "../../run/dry-run.ts";
 import { croftError } from "../../run/ingest.ts";
 import { cursorTypesOf, loadErrors, type PlannedStep, planRun, readMirror, type RunPlan } from "../../run/plan.ts";
 import { checkRunFlags, executeRun, jsonSafe, redactValue, type RunData, type RunEvent, type RunSummary } from "../../run/runner.ts";
+import { duePlanning, dueWork } from "../../schedule/due.ts";
 import type { CommandImpl, CommandResult, Ctx } from "../command.ts";
 import { dispatchOf } from "../main.ts";
 import { formatCount, formatDuration } from "../render.ts";
@@ -79,15 +87,57 @@ export function toResult(s: RunSummary): CommandResult<RunData> {
 }
 
 /** What the flags ask of the plan. */
-interface PlanFlags { selectors: readonly string[]; only: boolean; upstream: boolean; from?: string }
+interface PlanFlags { selectors: readonly string[]; only: boolean; upstream: boolean; from?: string; due?: { now: Date } }
 
 /** The run's plan, from the catalog mirror in runs.sqlite (never the warehouse). */
 async function planFor(project: Project, f: PlanFlags): Promise<RunPlan> {
+  if (f.due) return duePlan(project, f.selectors, f.due.now);
   const catalog = readMirror(project.paths.stateDir);
   return planRun({
     root: project.root, timezone: project.timezone, selectors: f.selectors, catalog, cursorTypes: cursorTypesOf(catalog),
     only: f.only, upstream: f.upstream, ...(f.from !== undefined ? { from: f.from } : {}),
   });
+}
+
+/**
+ * --due: the plan of the assets the tick named (or, with none, of what is due now), with the scheduler's holds and
+ * the fire each due ingest handles. A named asset whose file is gone since the tick is left out; with nothing left
+ * the plan is empty.
+ */
+export async function duePlan(project: Project, named: readonly string[], now: Date): Promise<RunPlan> {
+  const empty: RunPlan = { steps: [], order: [], problems: [], fileDirs: [] };
+  const runs = RunsDb.open(project.paths.stateDir, { now: () => now });
+  try {
+    let assets: string[];
+    let fires: Map<string, string> | undefined;
+    if (named.length === 0) {
+      const work = await dueWork({ project, runs, now, store: true });
+      assets = work.groups.flat();
+      fires = work.fires;
+    } else {
+      const exists = new Set((await discoverAssets(project.root, { assetsDir: project.paths.assetsDir })).assets.map((a) => a.name));
+      assets = named.filter((n) => exists.has(n));
+    }
+    if (assets.length === 0) return empty;
+    const catalog = allCatalog(runs);
+    return await planRun({
+      root: project.root, timezone: project.timezone, selectors: assets, catalog, cursorTypes: cursorTypesOf(catalog),
+      due: duePlanning({ project, runs, now, ...(fires ? { fires } : {}) }),
+    });
+  } finally {
+    runs.close();
+  }
+}
+
+/** --due goes with no other run flag: it runs what the scheduler would, as the scheduler would. */
+function checkDueFlags(v: Ctx["values"]): void {
+  const other = ["dry-run", "only", "upstream", "from", "allow-shrink"].find((f) => v[f] !== undefined && v[f] !== false);
+  if (other) {
+    throw new CroftError("USAGE_ERROR", {
+      message: `--due runs what the scheduler would; it does not go with --${other}`,
+      hint: "leave --due out: croft tick starts it by itself; to run assets by hand, name them: croft run <asset>",
+    });
+  }
 }
 
 /** In a confirmed run's log directory: the token that run ended without reaching (settleConfirmation). */
@@ -145,7 +195,11 @@ export const run: CommandImpl<RunData | DryRunData> = {
     const selectors = [...ctx.positionals];
     const from = str(v.from);
     const allowShrink = v["allow-shrink"] === true;
-    const flags: PlanFlags = { selectors, only: v.only === true, upstream: v.upstream === true, ...(from !== undefined ? { from } : {}) };
+    const due = v.due === true;
+    if (due) checkDueFlags(v);
+    const flags: PlanFlags = {
+      selectors, only: v.only === true, upstream: v.upstream === true, ...(from !== undefined ? { from } : {}), ...(due ? { due: { now: ctx.now() } } : {}),
+    };
     if (v["dry-run"] === true) {
       // Always in this process: it reads runs.sqlite and the asset files, and never waits.
       if (dispatchOf(ctx)?.confirmToken !== undefined) refuseToken();
@@ -160,14 +214,15 @@ export const run: CommandImpl<RunData | DryRunData> = {
     }
     // The confirmation being carried out, if any: from croft confirm in this process, or, in the detached child
     // of a confirmed run, from the grant croft confirm wrote for this run id. Never from argv; the grant
-    // variable means nothing to any other run and is never passed on.
-    let confirmToken = dispatchOf(ctx)?.confirmToken;
+    // variable means nothing to any other run and is never passed on. A scheduled run carries none.
+    let confirmToken = due ? undefined : dispatchOf(ctx)?.confirmToken;
     const grantSecret = ctx.processEnv[CONFIRM_GRANT_ENV];
-    if (detachedChild && runIdFlag !== undefined && grantSecret !== undefined) {
+    if (!due && detachedChild && runIdFlag !== undefined && grantSecret !== undefined) {
       confirmToken = redeemGrant(project.paths.stateDir, runIdFlag, grantSecret);
     }
     const followMs = str(v.follow) !== undefined ? parseWait(str(v.follow)!, "--follow") : DEFAULT_FOLLOW_MS;
-    const interactive = ctx.isTTY.stdin && ctx.isTTY.stdout && !detachedChild;
+    // A scheduled run never asks: it holds what needs a person instead.
+    const interactive = ctx.isTTY.stdin && ctx.isTTY.stdout && !detachedChild && !due;
     const foreground = v.foreground === true || interactive || detachedChild;
     const args = userArgs(ctx.argv);
     const argv = ["run", ...args];
@@ -237,7 +292,7 @@ export const run: CommandImpl<RunData | DryRunData> = {
     try {
       const delays = retryDelays(ctx.processEnv);
       const out = await executeRun({
-        project, env: ctx.env, selectors, argv, trigger: confirmToken !== undefined ? "confirm" : "manual", human: true, interactive, plan,
+        project, env: ctx.env, selectors, argv, trigger: due ? "schedule" : confirmToken !== undefined ? "confirm" : "manual", human: !due, interactive, plan,
         ...(runIdFlag ? { runId: runIdFlag } : {}), ...(from !== undefined ? { from } : {}), allowShrink,
         ...(confirmToken !== undefined ? { confirmToken } : {}),
         ...(interactive && !ctx.json ? { prompt: askYesNo } : {}),
@@ -250,6 +305,8 @@ export const run: CommandImpl<RunData | DryRunData> = {
         ...(ctx.processEnv.CROFT_FAULT ? { fault: ctx.processEnv.CROFT_FAULT } : {}),
       });
       if (confirmToken !== undefined) settleConfirmation(ctx, confirmToken, out);
+      // Nothing due is not an empty project: the template hint of an empty run does not apply.
+      if (due && out.data.steps.length === 0) out.next = out.next.filter((n) => n.command !== "croft docs ingest");
       return toResult(out);
     } finally {
       process.off("SIGINT", onSignal);
