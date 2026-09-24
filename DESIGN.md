@@ -1,6 +1,6 @@
 # croft: design v1
 
-> **Status.** Final design for v1, dated 2026-09-22. It was produced by a design panel: four independent drafts (simplicity, AI operator, correctness and builder lenses), a synthesis, and three adversarial reviews (a non-data-engineer walking real journeys, Claude Code operating the tool, and a technical review backed by spikes). Claims are marked **[V]** when verified by a spike on Bun 1.3.14 with `@duckdb/node-api` 1.5.5-r.5 (DuckDB 1.5.5) on macOS arm64, and **[U]** when relied on but unverified. Appendix B lists the spikes. The working name during design was "tsdb"; the product is named **croft** (D52). **Phase 1 is complete** (§11) in `packages/croft`, with about 1,650 tests, including an end-to-end suite that drives the real CLI through user journeys (`tests/e2e`). On 2026-09-23 the document was brought in line with that code (`packages/croft/src`), which is the source of truth where the two differ; decisions the build refined carry a **Build:** note, and decisions it changed have their own entries from D54 on (§13).
+> **Status.** Final design for v1, dated 2026-09-22. It was produced by a design panel: four independent drafts (simplicity, AI operator, correctness and builder lenses), a synthesis, and three adversarial reviews (a non-data-engineer walking real journeys, Claude Code operating the tool, and a technical review backed by spikes). Claims are marked **[V]** when verified by a spike on Bun 1.3.14 with `@duckdb/node-api` 1.5.5-r.5 (DuckDB 1.5.5) on macOS arm64, and **[U]** when relied on but unverified. Appendix B lists the spikes. The working name during design was "tsdb"; the product is named **croft** (D52). **Phases 1 and 2 are complete** (§11) in `packages/croft`, with about 2,230 tests, including an end-to-end suite that drives the real CLI through 20 user journeys (`tests/e2e`). The document was brought in line with that code (`packages/croft/src`), which is the source of truth where the two differ, on 2026-09-23 for phase 1 and on 2026-09-24 for phase 2. Decisions the build refined carry a **Build:** note, and decisions it changed have their own entries from D54 on (§13).
 
 ## Thesis
 
@@ -143,7 +143,9 @@ The bin is `bin/croft.mjs`, a small plain-JavaScript entry. Its `#!/bin/sh` firs
 **Runtime files.** croft creates these at runtime. The user never edits them:
 
 - `warehouse.duckdb`, and, only when `readCopy` is on, `warehouse.read.duckdb`, a copy for GUIs and notebooks (§5).
-- `.croft/`, the state folder. It holds `runs.sqlite`, `staging/`, `logs/`, `trash/`, `backups/`, `preview.duckdb`, `preview/` (input snapshots) and `types/`. It also holds `serve.json` while `croft serve` runs, and `write-intent.d/` while a writer holds or waits for the file.
+- `.croft/`, the state folder. It holds `runs.sqlite`, `staging/`, `logs/`, `trash/`, `backups/`, `preview.duckdb`, `preview/` and `types/`. It also holds `serve.json` while `croft serve` runs, and `write-intent.d/` while a writer holds or waits for the file.
+  - `staging/_chunks/<asset>/` holds an incremental TS transform's chunk while it waits for its commit, so a later attempt can reuse it (§3e).
+  - `preview/` holds what the last preview used: the input snapshots, the `_croft` rows of the assets it copied (`preview/_croft/`), its own `runs.sqlite` (catalog source `preview`) and its step logs (`preview/logs/<asset>.log`). `preview.duckdb` also has a `live` schema: `live.<asset>` is the live version of each asset the preview built, and `croft query --preview` can read it (§6).
 
 **Synced and network folders.** On many Macs, `~/Documents` and `~/Desktop` are synced to iCloud by default. File sync can corrupt a DuckDB file mid-write and breaks its locks. The same applies to Dropbox, OneDrive, network filesystems and WSL's `/mnt/<drive>` (drvfs/9p). When `init` detects such a location (by path prefix plus `statfs`), it puts the database and the state folder in `~/.local/share/croft/<project>-<hash>/` instead, as `warehouse.duckdb` and `.croft/` side by side, so the database stays outside the state folder. It records both paths in `croft.json` (as `~/…` when they are under the home folder, so the file still reads right for another user name) and says so in plain words. Asset files stay in the project folder. `init` creates the state folder right away, in the project or relocated.
 
@@ -202,6 +204,10 @@ Scheduling
 ```
 
 Each problem appears inline under its check, with its code in front and its fix on the next line (the command spec's `humanShowsProblems`, §10). `doctor` never opens the warehouse while a live croft write intent exists; it prints `busy: croft run … is writing` instead of waiting, and the `DB_BUSY` path covers only races.
+
+The Project section's asset line is its own check (id `assets`). It runs `croft validate`'s checks, which never open the warehouse, and shows only the counts: it is an error when validate finds an error (so `doctor` exits 1), and ok otherwise, warnings included. Before `bun install`, or without a loadable DuckDB binding, it is an info line that only counts the asset files.
+
+Until phase 3 ships `croft serve`, croft's texts name the server "croft's read server", because they may name only commands the build has (§4.1): "held read-only by croft's read server (pid 4121; steps aside for writes)", "read server on 127.0.0.1:7447 (pid 4121)". `LockHolder.program` carries the same name.
 
 ---
 
@@ -430,26 +436,43 @@ WHERE state = 'open' AND pull_request IS NULL
 
 An unknown name is `HEADER_UNKNOWN_KEY` with a did-you-mean suggestion (`chek` → `check`). Transforms have no schedule: they follow their inputs.
 
+The grammar as built:
+
+- The header is the leading run of `--` comment lines and blank lines; the first other line starts the body. Plain comments may sit between header lines.
+- Any `-- word: value` line is a header line, matched without regard to case. So a comment such as `-- Note: …` is `HEADER_UNKNOWN_KEY`, with the hint to leave out the colon. A URL (`-- https://…`) is not a header line.
+- `key` values accumulate across lines, repeated descriptions are joined, and empty values are ignored.
+- **Header lines must come first** (D73). A `-- key:`, `-- check:` or `-- warn:` line below the header is `HEADER_UNKNOWN_KEY` at its line and is not applied; that includes a header written below a leading `/* */` comment, which ends the header like any SQL line. A `-- description:` line there only documents, so it stays a plain comment.
+
 **The body** must be exactly one SELECT, with CTEs allowed. croft checks it in two ways:
 
 - `connection.extractStatements(sql)` must report exactly one statement, and `prepare()` must report `statementType` SELECT. Otherwise the error is `SQL_NOT_ONE_STATEMENT` ("found 2 statements") or `SQL_NOT_SELECT`. `json_serialize_sql` alone is not enough, because it serializes `SELECT 1; SELECT 2` as two statements [V].
-- A `PIVOT` with an `IN` list is a normal single SELECT [V]. Without an `IN` list, DuckDB rewrites it into two statements whose columns depend on the data, so it cannot be checked or bound statically [V]. It gets `PIVOT_NEEDS_VALUES` with the fix "list the values: `ON product IN ('pro', 'basic')`, or use `sum(x) FILTER (WHERE product = 'pro')`".
+- A `PIVOT` with an `IN` list is a normal single SELECT [V]. Without an `IN` list, DuckDB rewrites it into two statements whose columns depend on the data, so it cannot be checked or bound statically [V]. It gets `PIVOT_NEEDS_VALUES` with the fix "list the values: `ON product IN ('pro', 'basic')`, or use `sum(x) FILTER (WHERE product = 'pro')`". croft tells the rewrite apart from two real statements by comparing DuckDB's `extractStatements` count with its own lexer's, when the text contains `PIVOT` or `PIVOT_WIDER`. `IN (SELECT …)` also yields two statements [V] and gets the same code.
+- `DESCRIBE`, `SUMMARIZE` and `SHOW` pass the query gate, and their prepared `statementType` is SELECT [V], but they read the catalog and build no table (`DESCRIBE`'s plan scans nothing, and `SHOW TABLES` has no inputs at all). In an SQL asset they are `SQL_NOT_SELECT`.
 
 **Dependencies** are the union of two sources:
 
-- **The AST's `BASE_TABLE` nodes,** minus CTE names scoped per query node. The AST is also used to reject catalog prefixes such as `other.main.t` (`CATALOG_PREFIX`, fix "drop the prefix"); DuckDB would otherwise report them as `main.t`.
-- **The scans of the *unoptimized* bound plan** (`PRAGMA disable_optimizer; EXPLAIN (FORMAT json) …` over the shadow catalog of §6). This finds tables that the AST hides, inside `query_table('orders')`, `query('SELECT … FROM custs')`, table macros and PIVOT, and it respects CTE shadowing. The optimizer must be off, because it prunes scans (`WHERE false`, `LIMIT 0`) [V]. (The shipped gate refuses `query()` and `query_table()` in all user SQL, §5, so of these only table macros and PIVOT reach the plan.)
+- **The AST's `BASE_TABLE` nodes,** minus CTE names scoped per query node. The scopes follow DuckDB 1.5.5 [V]: a CTE's body sees only earlier CTEs, never itself, so a non-recursive `WITH orders AS (SELECT * FROM orders)` reads the table; a recursive CTE sees itself in its recursive part only. The table a table macro names (`histogram` and `histogram_values`: the first argument, or `source :=`) is a relation and an input too. Only unqualified and `main.` names count.
+- **The scans of the *unoptimized* bound plan** (`PRAGMA disable_optimizer; EXPLAIN (FORMAT json) …` over the shadow catalog of §6). This finds tables that the AST hides, inside `query_table('orders')`, `query('SELECT … FROM custs')`, table macros and PIVOT, and it respects CTE shadowing. The optimizer must be off, because it prunes scans (`WHERE false`, `LIMIT 0`) [V]. `PRAGMA disable_optimizer` works on a connection whose configuration is locked, while `SET enable_optimizer` is refused [V]. (The shipped gate refuses `query()` and `query_table()` in all user SQL, §5, so of these only table macros and PIVOT reach the plan.)
 
-Tables named in `-- check:`/`-- warn:` subqueries are dependencies too, but they only affect ordering. Reading files directly (`FROM 'files/x.csv'`, `read_parquet(…)`) in an asset is `SQL_READS_FILES`, with the fix "make a file ingest (`croft new file x`)", because croft cannot tell when such a file changed. In `croft query`, reading files is fine.
+**Other schemas and catalogs** are `CATALOG_PREFIX`: any qualifier other than `main.`, not only three-part names such as `other.main.t`. That includes `warehouse.orders` and `memory.main.orders`, which DuckDB resolves to the table while the AST's dependency list leaves them out, so the dependency would silently go missing; and `_croft.*` and `information_schema.*`. Only an asset name gets the edit fix that drops the prefix.
 
-**Volatile SQL.** `now()`, `current_date`, `random()`, `gen_random_uuid()` and similar functions produce values that freeze until the next rebuild. `validate` warns `VOLATILE_SQL` and suggests computing such columns at query time. `current_date` and `current_timestamp` appear in the AST as `COLUMN_REF` nodes rather than functions, and the detector handles that [V].
+Tables named in `-- check:`/`-- warn:` subqueries are dependencies too, but they only affect ordering. The run order is deterministic (ties broken by name). A cycle is `CYCLE`, reported once per strongly connected component as the shortest path from its smallest name, with the files. An asset that reads its own table is a cycle; a check whose subquery reads its own asset is not, because checks run after the write. Reading files directly (`FROM 'files/x.csv'`, `read_parquet(…)`) in an asset is `SQL_READS_FILES`, because croft cannot tell when such a file changed. Its fix is "make a file ingest" (`croft new file x`; before phase 5, the templates of `croft docs ingest`), or `FROM <asset>` when the file's base name is an asset. The asset then skips the gate, so the gate's other refusals (`QUERY_PATH_DENIED`) appear once the file read is gone. In `croft query`, reading files is fine.
 
-**How the body is executed, and reserved columns.** Inside the write transaction the verbatim body becomes `CREATE TEMP VIEW __body AS <sql>`, and the result is read as `SELECT COLUMNS(c -> c NOT IN ('_loaded_at', '_file')) FROM __body`. This form has several properties [V]:
+**Volatile SQL.** `now()`, `current_date`, `random()`, `gen_random_uuid()` and similar functions produce values that freeze until the next rebuild. `validate` warns `VOLATILE_SQL` and suggests computing such columns at query time. The list is DuckDB 1.5.5's own VOLATILE and CONSISTENT_WITHIN_QUERY functions, minus those that give an asset the same value on every run (`current_database`, `current_schema`, `error`, …). It adds `current_localtime` and `current_localtimestamp`, which DuckDB marks consistent, and the macros `ago`, `pg_conf_load_time` and `pg_postmaster_start_time`, which expand to `current_timestamp`. A test fails when DuckDB marks a new function. `current_date`, `current_time`, `current_timestamp`, `localtime` and `localtimestamp` appear in the AST as `COLUMN_REF` nodes rather than functions, and the detector handles that [V].
+
+**How the body is executed, and reserved columns.** Inside the write transaction the step runs, in order (D71):
+
+1. `DESCRIBE <body>`, for the output names as the SELECT wrote them. A view (and any subquery) renames a repeated name: `SELECT * FROM a JOIN b USING (id)` over two assets yields `_loaded_at` and `_loaded_at_1` [V].
+2. `CREATE OR REPLACE TEMP VIEW __body AS <sql>`, with the body verbatim.
+3. `CREATE TEMP TABLE __croft_next AS SELECT *, row_number() OVER () AS _croft_seq FROM (SELECT COLUMNS(c -> lower(c) NOT IN ('_loaded_at', '_file', '_croft_seq', <renamed copies of those>)) FROM __body)`. The rows are materialized once. The table is not named `next`, because `next` is a valid asset name that a TEMP table would shadow for unqualified reads in checks.
+
+This form has several properties [V]:
 
 - It tolerates a trailing `;` or `--` comment, which an agent writes routinely. A text wrapper around the body broke on them.
-- `SELECT *` over an asset stays correct. A naive wrapper keeps the upstream's stale `_loaded_at` next to a junk `_loaded_at_1`, or fails an `INSERT BY NAME` with `Duplicate column name`.
+- `SELECT *` over an asset stays correct. A naive wrapper keeps the upstream's stale `_loaded_at` next to a junk `_loaded_at_1`, or fails an `INSERT BY NAME` with `Duplicate column name`. The filter compares names without regard to case and also drops the view's renamed copies, so a join or a differently cased `_LOADED_AT` puts no junk reserved column into the table.
 - Unlike `EXCLUDE`, it does not fail when a reserved column is absent.
-- Duplicate output names, which DuckDB silently renames to `a_1`, are a `validate` error: `DUPLICATE_OUTPUT_COLUMN`.
+- Duplicate output names, which DuckDB silently renames to `a_1`, are `DUPLICATE_OUTPUT_COLUMN`, in `validate` and again at run time. Repeated reserved names (`_loaded_at`, `_file`, `_croft_seq`, in any case) do not count, since the step drops every copy, so `SELECT *` over a join of two assets validates and runs.
+- A SELECT of only reserved columns is `ASSET_INVALID`.
 
 ### (d) An aggregate SQL transform, and why v1 has no incremental SQL
 
@@ -517,32 +540,35 @@ export function triage(title: string, body: string, labels: string[]) {
 }
 ```
 
-**Incremental by default for per-row work.** The `croft new transform` template is keyed and incremental. An incremental transform needs every input it reads with `newRows()` to have a key, because its resumable position uses that key (below). Otherwise `validate` reports `INPUT_NEEDS_KEY`, with the fix "add `-- key:` to the input" (or `key:` in its TS config). The most common TypeScript transform in this audience calls an LLM or another paid API once per row, and a full-refresh transform would pay again for every row whenever the input changes. A full-refresh transform (no `incremental`, reading `rows()`) is still allowed for whole-table computations. If a full-refresh transform makes requests, `validate` warns `TRANSFORM_MAKES_REQUESTS`. "Makes requests" means it uses `ctx.http`, a bare `fetch()`, or a known HTTP-client or LLM SDK package (`http`, `https`, `undici`, `axios`, `openai`, `@anthropic-ai/sdk`, …). The check is lexical, over the `Bun.build` output with string, template, regex and comment contents blanked, so helpers in `lib/` count and tree-shaken code does not; an unrelated local variable named `http` also counts. The cost guard (§5) uses the same detection.
+**Incremental by default for per-row work.** The `croft new transform` template is keyed and incremental. An incremental transform needs every input it reads with `newRows()` to have a key, because its resumable position uses that key (below). Otherwise `validate` reports `INPUT_NEEDS_KEY`, with the fix "add `-- key:` to the input" (or `key:` in its TS config). The most common TypeScript transform in this audience calls an LLM or another paid API once per row, and a full-refresh transform would pay again for every row whenever the input changes. A full-refresh transform (no `incremental`, reading `rows()`) is still allowed for whole-table computations. If a full-refresh transform makes requests, `validate` warns `TRANSFORM_MAKES_REQUESTS`. "Makes requests" means it uses `ctx.http`, a bare `fetch()`, or a known HTTP-client or LLM SDK package: `http`, `https`, `undici`, `axios`, `openai`, `@anthropic-ai/*`, the Vercel AI SDK (`ai`, `@ai-sdk/*`), `langchain` and `@langchain/*`, `@mistralai/*`, `@google/genai`, `cohere-ai`, `groq-sdk`, `ollama`, `replicate`, `llamaindex`, `together-ai`, `voyageai`, `@huggingface/inference`, `@azure/openai`, `@google-cloud/vertexai`, `@aws-sdk/client-bedrock*` and a few more. Packages stay external in the bundle, so a request an SDK makes inside itself is never seen: the import is the sign. The check is lexical, over the `Bun.build` output with string, template, regex and comment contents blanked, so helpers in `lib/` count and tree-shaken code does not; an unrelated local variable named `http` also counts. The cost guard (§5) uses the same detection.
 
 **The context API:**
 
 - `rows(name)` streams a whole input.
-- `newRows(name)` streams the rows written since the last successful run, which on the first run or after `--rebuild` is all of them.
+- `newRows(name)` streams the rows written since the last successful run, which on the first run or after `--rebuild` is all of them. In a full-refresh transform, which keeps no position, `newRows()` is `rows()`. On an input without a key it raises `INPUT_NEEDS_KEY` at run time too, not only in `validate`.
 - `query(sql, ...params)` runs one SELECT over the declared inputs. Reading any other table is `UNDECLARED_INPUT`, checked through the AST.
 - `log(...)` writes to the step's log.
 - `http`, `secret()`, `signal` and `preview` work as in ingests.
 
-**Rows are guarded against renamed columns.** Rows from `rows()`, `newRows()` and `query()` are wrapped in a `Proxy`. Reading a column that the input does not have throws `UNKNOWN_INPUT_COLUMN`, for example `github_issues has no column "author"; did you mean "author_login"?`.
+An input with no table yet fails the step with `DB_NOT_FOUND` and the fix `croft run <input>`.
+
+**Rows are guarded against renamed columns.** Rows from `rows()`, `newRows()` and `query()` are wrapped in a `Proxy`. Reading a column that the input does not have throws `UNKNOWN_INPUT_COLUMN`, for example `github_issues has no column "author"; did you mean "author_login"?`. The error carries the asset's file and line from the stack, and a replace fix when the name appears once on that line.
 
 - The guard covers destructuring. Spread, `JSON.stringify`, `Object.keys`, `in`, template strings and `Bun.inspect` behave normally [V].
 - `structuredClone(row)` fails on a Proxy [V], so the docs say to use `{ ...row }`.
+- croft's own columns (`_loaded_at`, `_file`) can be read on a row but are not enumerable, so `yield { ...row }` passes the data through without them (and no `_source_loaded_at` column appears).
 - Overhead measured about 17 ms per 2M property reads [V].
 
-Without the guard, a renamed upstream column would arrive as `undefined`, be stored as NULL, and pass every rule check.
+Without the guard, a renamed upstream column would arrive as `undefined`, be stored as NULL, and pass every rule check. The guard fires only when the input no longer has the column. An ingest never drops a column (§6), so a field an API renamed keeps its old column, NULL in new rows, and a transform reads NULL there without an error. Only SQL inputs, which are recreated on a shape change, lose the old column. For an ingest input, a `not_null` check on the transform's output catches the rename.
 
 **User code never holds the warehouse lock.** On first use of an input, croft:
 
 1. takes a short read-only lease;
-2. runs `COPY (SELECT … ORDER BY _loaded_at, <input key>) TO '.croft/staging/<run>/in-<input>.parquet'` [V];
+2. runs `COPY (SELECT … ORDER BY _loaded_at, <input key>) TO …` [V] into `<staging>/<asset>/in/<input>/`: `all.parquet` for `rows()` and `query()` (which sees each input as a view over it), or `new.parquet`, only the rows after the transform's position, for `newRows()`. Each file has its own short lease, taken on first use;
 3. releases the lease;
 4. streams the Parquet file through a private in-memory DuckDB, which is sandboxed and set to the project time zone like every croft connection.
 
-About 150k rows export in 8 ms [V]. HUGEINT columns are cast to `DECIMAL(38,0)` in the snapshot, because Parquet would otherwise turn them into DOUBLE [V]. A transform can therefore call an LLM for each row for hours without blocking anything.
+About 150k rows export in 8 ms [V]. HUGEINT and UHUGEINT columns are stored as text in the snapshot and cast back when read, because Parquet would otherwise turn them into DOUBLE [V] (D70). The order uses the table's own typed columns, so HUGEINT keys sort as numbers. Under `croft preview` each input is capped at `--rows` rows. A transform can therefore call an LLM for each row for hours without blocking anything.
 
 **Values arrive as JavaScript types that load back unchanged:**
 
@@ -550,7 +576,7 @@ About 150k rows export in 8 ms [V]. HUGEINT columns are cast to `DECIMAL(38,0)` 
 - TIMESTAMPTZ → an ISO string with `Z` and microseconds (`"2026-03-01T07:30:00.123456Z"`).
 - TIMESTAMP → an ISO string *without* an offset (`"2026-03-01T23:30:00.123456"`).
 - DATE → `"YYYY-MM-DD"`.
-- Integers → `number`, or `bigint` when outside ±2^53. HUGEINT, and DECIMAL(38,0) (the snapshot stand-in for HUGEINT), always arrive as `bigint`.
+- Integers → `number`, or `bigint` when outside ±2^53. HUGEINT (and DECIMAL(38,0)) always arrives as `bigint`.
 - Other DECIMAL of up to 15 digits → `number`, which holds 15 significant digits exactly. Wider DECIMAL → its exact decimal text, as a string.
 
 Strings are used for timestamps instead of `Date` because a pass-through `yield { ...row }` must reload as the same type. With `Date`, a naive TIMESTAMP came back as TIMESTAMPTZ shifted by 8 hours, and it lost its microseconds [V]. `new Date(row.created_at)` is one call away when code needs date arithmetic.
@@ -559,10 +585,21 @@ Strings are used for timestamps instead of `Date` because a pass-through `yield 
 
 Recording only "the largest `_loaded_at` consumed" would lose rows: one write gives many rows the same stamp, and merges leave rows in physical rather than stamp order. A spike that stopped after 2 of 5 rows recorded a position that skipped rows 3–5 forever [V]. Full-refresh transforms read `rows()` and keep no position, so their inputs need no key.
 
-**Long paid transforms commit in chunks.** An incremental TS transform writes a chunk every 500 output rows or 60 s, whichever comes first. Each chunk is its own all-or-nothing transaction: its rows, the checks on them, and its position commit together.
+**When an input row counts as processed** (D72). croft cannot see which outputs belong to which input row, so a position must never pass a row whose outputs may still be pending:
 
-- A failure, a timeout or Ctrl-C loses at most the current chunk. The next run resumes from the last committed position.
-- A retry reuses the failed chunk's staged output when the code hash and position are unchanged, so a failed check does not re-bill the calls that produced the chunk.
+- While the code runs, row n of a `newRows()` iterator counts as processed once n ≤ min(rows the code asked past, outputs it yielded while that iterator was the `newRows()` iterator it asked most recently). The usual `for await` loop yields a row's outputs before asking for the next row, so it is tracked exactly when each row yields one output, and conservatively (the position lags, and a failure re-reads rows rather than skip them) when a row yields none.
+- Read-ahead (asking for rows 1–3, then yielding row 1's output) is safe when outputs are yielded in input order, at most one per row. Out-of-order results, or several outputs per row while calls are in flight, can still move a position too far.
+- Once the code has finished, every row it asked past counts. A loop left early (a `break`, a throw) does not count its last row, so the next run reads it again.
+- With several `newRows()` iterators on one input, the least advanced one decides the position.
+- `_croft.inputs.seen_key` is a JSON array of DuckDB's own text for each key value (`CAST(k AS VARCHAR)`), cast back to the column's type when compared, so `9 < 10` for BIGINT keys. A position whose key count no longer matches the input's key compares by stamp alone, which re-reads the rows of that one stamp rather than skip any.
+
+**Long paid transforms commit in chunks** (D67). An incremental TS transform cuts a chunk at the first `newRows()` request after the chunk holds 500 rows or has been open 60 s, and the code gets its next input row only after that commit. Only at a request are the outputs of every row up to the position known to be yielded, so the cut is exact for the usual loop; an input row that makes many output rows can grow one chunk past 500. Each chunk is its own all-or-nothing transaction: its rows, the checks on them, and its position commit together.
+
+- Before its commit a chunk waits in `<state>/staging/_chunks/<asset>/` (NDJSON parts, `manifest.json` and `chunk.json`), outside the run's staging folder, so a later run can find it.
+- A failure, a timeout or Ctrl-C loses at most the current chunk. The next run resumes from the last committed position. Rows the code yielded before it failed are not committed, so each failed attempt can re-bill up to one chunk.
+- A retry, or a later run, commits a staged chunk without running the code again when the code hash, the hash of the blocking checks and the positions committed under it are unchanged, so a failed check does not re-bill the calls that produced the chunk. A chunk that a commit refused for its rows (`CHECK_FAILED`, `KEY_NULL`: anything but a busy database, an interruption, a timeout or another transient failure) is reused only while every input is still at the version it was staged from; once the user corrects the data, the code runs on it again.
+- `min_rows` is checked at the run's last chunk only, when the table holds the whole run, so the first chunk of a large first build is not refused. `unique` and the other checks run on every chunk: a chunk that breaks `unique` would otherwise commit, and a forward-only transform could never undo it.
+- `_croft.writes.inputs` holds each chunk's `[{input, seenBefore, seenAfter, rows}]`. Middle chunks record `input_last_loaded_at` as NULL; the final commit sets it only for the inputs read to the end (§5).
 - A first build of 18,000 issues at 1 s per LLM call (five hours) therefore finishes across as many runs as it takes, and never starts over.
 - Full-refresh transforms and ingests still commit once per run. Resumable first loads for ingests are post-v1 (§11).
 
@@ -579,22 +616,31 @@ The output goes through the same load pipeline as an ingest.
 | `min_rows(n)` | the table has at least n rows | whole table after the write |
 | any boolean SQL expression, e.g. `amount >= 0`, `state IN ('open','closed')`, `issue_id IN (SELECT id FROM github_issues)` | every row satisfies it; NULL counts as a pass (combine with `not_null`) | rows written by this run |
 
-- A key implies `unique(key)` and `not_null(key)`.
+- A key implies `unique(key)` and `not_null(key)`, written from the key (`unique(a, b)`, `not_null(a, b)`, with odd names double-quoted) and listed first. A declared check that repeats one of them is kept once.
+- "Rows written by this run" are the table's rows stamped with the write's `_loaded_at`: added and updated rows, as the table holds them after the write. Unchanged rows of a replace diff passed the same check when they were written, so they are not checked again.
+- `unique` leaves out rows with a NULL in its columns, as SQL does.
+- A new or edited check covers the whole table once. croft decides this against the check sources in `StepResult.checks` of the asset's last ok step (`runs.summary`); with no such step, or after a crash that left no summary, every check covers the whole table.
 - Tables named in a check's subquery are ordered before the asset.
-- When a check's text changes, its next evaluation covers the whole table.
 - **Every check is parsed before use.** croft serializes `SELECT (<expr>) FROM <asset>` with `json_serialize_sql` and requires exactly one statement with one select item. Identifiers are quoted with `"` escaping, and every statement croft builds runs through `prepare()`, which accepts a single statement. Concatenating a check into a multi-statement `run()` would execute an embedded `; DROP TABLE …` [V].
+- **A check reads the project's tables only,** by plain name (or `main.x`). These are `CHECK_INVALID`: file paths; `_croft.*`, other schemas and catalog-qualified names ("name the table without a prefix"); a table macro whose table is a path or is computed (it must name its table directly); a path-like string given to a catalog table function; table functions that read files or run SQL given as text; functions with side effects; and parameters. Value functions such as `unnest` and `json_each` take values and never open files, so they stay valid. Every rule is vetted again on the write connection before it runs.
 
-**Blocking checks run inside the write transaction, after the write and before commit.** A failure rolls back data, schema changes and cursor together [V]. Warnings run after commit and are recorded.
+**Blocking checks run inside the write transaction, after the write and before commit.** A failure rolls back data, schema changes and cursor together [V]. A blocking check that cannot run (a bind or conversion error on this data) is `CHECK_INVALID`, and rolls the write back like a failure: data a check cannot vouch for is not committed.
+
+**Warnings run after commit,** on a read lease, for every kind of asset, and are recorded. A failing warning is `CHECK_FAILED` at warning severity, and a warning that cannot run is `CHECK_INVALID` at warning severity; neither ever fails the step, whose rows are already written. A chunked TS transform does not report every stamp it wrote, so when its newest stamp does not cover all its changed rows, its warnings cover the whole table (a correct superset).
+
+In an incremental TS transform, `min_rows` is judged at the run's last chunk (§3e).
 
 ```
 $ croft run open_issues
 fail  open_issues   CHECK_FAILED not_null(author): 3 of 4,211 rows
                       id=2291  title="Crash on Windows when …"  author=NULL
                       id=2307  title="bun test hangs with …"    author=NULL
-                    Nothing was written. open_issues still has its previous 4,208 rows.
+                    effect: nothing was written; open_issues keeps its previous 4,208 rows
                     fix: correct assets/open_issues.sql or the data, then: croft run open_issues
 exit 3
 ```
+
+The message holds the summary, up to 3 sample rows, and an `also failing: …` line for each other blocking check that failed: every blocking check runs, so one failure does not hide the next.
 
 Cross-asset checks that need their own query (for example "every open issue has a triage row" written as an anti-join) are post-v1. Most of them can be written as a row rule with a subquery, as in example (c).
 
@@ -630,13 +676,13 @@ Cross-asset checks that need their own query (for example "every open issue has 
 |---|---|---|
 | Setup | `init [dir] [--claude] [--no-install]` | scaffold a project (or `data/` inside an existing app); `--claude` only refreshes the Claude files; inside a project, no `dir` means that project (§2) |
 | | `doctor` | environment plus project summary, under 1 s, no writes |
-| | `new <kind> <name>` / `new --list` | write a commented, working template. Kinds: `api [--pagination keyset\|cursor\|link\|page]`, `file`, `sql`, `transform`. Phase 5; phase 1 ships its ingest templates as the docs page `croft docs ingest` (D60) |
+| | `new <kind> <name>` / `new --list` | write a commented, working template. Kinds: `api [--pagination keyset\|cursor\|link\|page]`, `file`, `sql`, `transform`. Phase 5; until then the templates are the docs pages `croft docs ingest`, `croft docs sql` and `croft docs transforms` (D60) |
 | | `secrets [set NAME [--stdin]]` | list declared secrets as set or missing; `set` writes `.env` from a hidden prompt or stdin |
-| | `docs [topic\|ERROR_CODE]` / `docs --list` | offline docs for the installed version; the topics include `ingest` (API and file templates) and `config` (`croft.json`) |
+| | `docs [topic\|ERROR_CODE]` / `docs --list` | offline docs for the installed version; the topics include `ingest` (API and file templates), `sql` (the SQL asset header, body and templates), `transforms` (TS transform templates: per-row paid, per-row, whole-table), `checks` (the check language), `internals` and `config` (`croft.json`) |
 | Inspect | `context` | the whole project in one payload, for agents (capped at 20 KB; `--asset` filters) |
 | | `status [--check]` | freshness and health of every asset, and running runs; never waits on the database |
 | | `describe <asset>` | behavior in words, columns, JSON keys, reads/read by, checks, cursor, recent writes, samples |
-| | `query "<sql>"` | one SELECT against the warehouse (read-only, sandboxed); `--preview` targets the preview database (phase 2; phase 1 registers it only to refuse) |
+| | `query "<sql>"` | one SELECT against the warehouse (read-only, sandboxed); `--preview` queries what the last `croft preview` built (`.croft/preview.duckdb`) |
 | | `logs [asset\|run-id] [--failed] [--runs] [--follow]` | console output and errors of a step; `--runs` lists past runs and steps |
 | Try | `validate [asset…] [--types]` | static checks and a bind check of every SQL asset; never touches the warehouse |
 | | `preview <asset…> [--rows N] [--rebuild]` | build in a sandbox and diff against the live tables |
@@ -653,18 +699,19 @@ Cross-asset checks that need their own query (for example "every open issue has 
 
 **Which phase ships what** (D59). `core/phase.ts` is the manifest of which command, and which `run`, `query` and `init` flag, ships in which phase (§11). The registry must register exactly the current phase's commands.
 
-- Phase 1 has `init`, `doctor`, `docs`, `help`, `version`, `secrets`, `context`, `status`, `describe`, `query`, `logs`, `run`, `wait` and `confirm`. `validate` and `preview` come in phase 2; `schedule`, `serve` and `tick` in phase 3; `rename`, `delete` and `restore` in phase 4; and `new` in phase 5.
-- Of `run`'s flags, `--dry-run`, `--only` and `--upstream` are phase 2, `--due` phase 3 and `--rebuild` phase 4. `init --with-hook` is phase 5.
-- `query --preview` is phase 2, but phase 1 registers it so it can refuse with a clear message (the preview database comes in a later version) rather than as an unknown flag. No other later-phase flag is registered.
+- Phase 1 has `init`, `doctor`, `docs`, `help`, `version`, `secrets`, `context`, `status`, `describe`, `query`, `logs`, `run`, `wait` and `confirm`. Phase 2 adds `validate` and `preview`. `schedule`, `serve` and `tick` come in phase 3; `rename`, `delete` and `restore` in phase 4; and `new` in phase 5.
+- Of `run`'s flags, `--dry-run`, `--only` and `--upstream` ship in phase 2, `--due` in phase 3 and `--rebuild` in phase 4. `validate --hook` and `init --with-hook` are phase 5.
+- `query --preview` works from phase 2 (phase 1 registered it only to refuse with a clear message). No later-phase flag is registered.
 - The manifest also lists the `croft.json` keys a later phase reads (§2).
+- `phaseStub()` in `core/phase.ts` is what a module of the next wave throws (`INTERNAL_ERROR`, a message starting `PHASE_STUB`) until it is built, so builders code against final signatures in parallel.
 
-`agent/contract.test.ts` checks every agent-facing text against the manifest and the registry: CLAUDE.md, SKILL.md, every `croft docs` page, and every hint, fix, `next[]` entry and option description in the source. A `croft <command>` must exist in this build, and a `--flag` must be an option of that command and not one a later phase adds. So phase 1's hints name only phase-1 commands. Where the v1 text of a problem points at `readCopy`, `croft serve`, `croft restore`, `--rebuild` or `croft new` (such as the `--rebuild` fixes in §8's backfill table), phase 1 says what it can do instead, and the test's allowlist of known exceptions is empty.
+`agent/contract.test.ts` checks every agent-facing text against the manifest and the registry: CLAUDE.md, SKILL.md, every `croft docs` page, and every string and template literal in the source (`core/phase.ts` aside), read with the TypeScript parser, since any of them can reach an agent as a hint, fix, `next[]` entry or message. A `croft <command>` must exist in this build, and a `--flag` must be an option of that command and not one a later phase adds; only a whole lower-case kebab word counts as a flag, so other programs' flags (`tsc --noEmit`) are not read as croft's. So a build's hints name only its own commands. Where the v1 text of a problem points at `readCopy`, `croft serve`, `croft restore`, `--rebuild` or `croft new` (such as the `--rebuild` fixes in §8's backfill table), the build says what it can do instead, and the test's allowlist of known exceptions is empty.
 
 **`run` flags:**
 
-- `--dry-run`: what would run and why, with windows and confirmations, without running.
-- `--only`: skip downstream.
-- `--upstream`: refresh stale inputs first.
+- `--dry-run`: what would run and why, with windows and confirmations, without running. It plans exactly as the run does, reads only `runs.sqlite`, never waits and never issues a token. It exits 0 and lists the static errors that would fail steps in `problems[]` ("fails before it runs"); it exits 2 only for a project-level discovery error, as the run would. An asset under another run's live lease shows `hold: "leased"` (the real run would wait for it). The cost guard's row count is an estimate from `runs.sqlite`, over the keyed inputs the code reads with `newRows()`: an input never read counts all its rows; after a read, the rows the input's steps added and updated since the saved position, at least 1 and at most its row count. An input not built yet counts 0.
+- `--only`: skip downstream. On a bare run it keeps every ingest and every transform that is stale on its own, and leaves out the transforms that would run only because an ingest runs.
+- `--upstream`: also refresh, first, what the named assets need that is stale: what they read and the tables their checks read, directly or not. An ingest counts only when it was never built (before schedules, an ingest is never otherwise stale); a transform counts when it is stale or its own input is refreshed by the run.
 - `--rebuild`: from scratch; §6 says when it needs confirmation.
 - `--from <date|ISO|-90d>`: backfill a merge ingest (§8).
 - `--allow-shrink`: override `SHRINK_GUARD`, with confirmation.
@@ -676,7 +723,9 @@ Cross-asset checks that need their own query (for example "every open issue has 
 
 `--run-id` and `--detached` are hidden options (`OptionSpec.hidden`) that the parent passes to its detached child (§5). They are parsed, but never shown in help or suggested by did-you-mean. **No option carries a confirmation token:** a destructive action runs only through `croft confirm <token>` (§6, D56).
 
-**Bare `croft run`** fetches every ingest and updates every transform that is stale. It is the obvious "run my pipeline". Incremental ingests make it cheap. The skill tells agents to name assets when working on one of them.
+**Bare `croft run`** fetches every ingest and updates every transform that is stale. It is the obvious "run my pipeline". Incremental ingests make it cheap. The skill tells agents to name assets when working on one of them. It also takes every asset with a static error, and every asset on a cycle, stale or not, so each fails visibly instead of being silently left out. A static error (a load error, `CHECK_INVALID`, `CYCLE`, a bind error) fails its own step before it runs, never the whole run; `CYCLE` is attached to each step on the cycle.
+
+A named run takes the named assets, stale or not, and then (unless `--only`) every transform downstream of an asset the run takes. `RunPlan.steps` lists only the assets the run takes, in run order. The runner checks staleness again just before each transform, so one whose inputs did not change after all is skipped as `up to date: <inputs> did not change`.
 
 ### 4.2 Examples
 
@@ -695,12 +744,13 @@ STRIPE_KEY     missing      used by stripe_charges → add STRIPE_KEY=... to .en
 $ croft validate
 checked 7 assets in 0.6 s
 error UNKNOWN_COLUMN  assets/open_issues.sql:9:3
-      Referenced column "creatd_at" not found in github_issues. Candidate bindings: "created_at"
+      Referenced column "creatd_at" not found in FROM clause.
       fix: replace creatd_at with created_at on line 9
 info  INPUT_NOT_BUILT  assets/daily_revenue.sql
       columns of stripe_charges are unknown until it has run or been previewed; bind check skipped
       next: croft preview stripe_charges
-1 error, 0 warnings, 1 info · next: croft validate
+1 error, 0 warnings, 1 info
+next: croft validate  # re-check after the edit
 ```
 
 ```json
@@ -709,7 +759,7 @@ info  INPUT_NOT_BUILT  assets/daily_revenue.sql
  "data":{"order":["github_issues","stripe_charges","taxi_zones","sales","issue_triage","open_issues","daily_revenue"],
    "assets":[{"name":"open_issues","kind":"sql","inputs":["github_issues","issue_triage"],"behavior":"replace; key id",
      "outputColumns":null,"codeChanged":true}]},
- "problems":[{"severity":"error","code":"UNKNOWN_COLUMN","message":"Referenced column \"creatd_at\" not found in github_issues.",
+ "problems":[{"severity":"error","code":"UNKNOWN_COLUMN","message":"Referenced column \"creatd_at\" not found in FROM clause.",
    "asset":"open_issues","file":"assets/open_issues.sql","line":9,"column":3,"hint":"did you mean \"created_at\"?",
    "fix":{"kind":"edit","description":"fix the column name","file":"assets/open_issues.sql","line":9,
           "replace":{"from":"creatd_at","to":"created_at"}},"docs":"croft docs UNKNOWN_COLUMN"}],
@@ -741,28 +791,38 @@ Apply: croft run github_issues
 
 ```
 $ croft run --dry-run
-fetch    github_issues    merge by id, since 2026-09-22T17:58:03Z
+fetch    github_issues    merge by id, since 2026-09-22T17:58:02Z (2026-09-22T10:58:02-07:00) = saved − 1 second
 fetch    stripe_charges   merge by id, since 1756000000 (2025-08-23T18:46:40-07:00) = saved − 30 days
-fetch    taxi_zones       replace (unchanged files are skipped via ETag)
-fetch    sales            2 new files
-rebuild  open_issues      SQL changed (assets/open_issues.sql)
-update   issue_triage     input github_issues will have new rows (TS code unchanged)
-update   daily_revenue    input stripe_charges will have new rows
+fetch    taxi_zones       replace; key LocationID (nothing is written when no file changed)
+fetch    sales            merge by order_id, new and changed files only
+rebuild  open_issues      SQL changed (assets/open_issues.sql); input github_issues may have new rows
+update   issue_triage     input github_issues may have new rows (TS code unchanged)
+rebuild  daily_revenue    input stripe_charges may have new rows
+dry run: 7 of 7 steps would run; nothing ran
 ```
+
+SQL and full-refresh TS transforms show `rebuild`, incremental TS transforms `update`. A transform downstream of an ingest the run fetches "may have new rows": a dry run cannot know that it will. An ingest's line ends with `= saved − <lookback>` when a lookback applies, including a keyed timestamp cursor's default of 1 second (§3a).
 
 ```
 $ croft run
 run r_0922_1015_k3f9 · 7 assets
-ok    github_issues    184 requests, 18,342 rows (41.2 s) · new table, 31 columns (7 JSON)
-                       added 18,342 · checks 4/4 ok · since → 2026-09-22T17:58:03Z
-ok    stripe_charges   12 requests, 1,130 rows · added 1,102 · updated 21 · unchanged 7
-ok    taxi_zones       unchanged (ETag) · skipped
-ok    sales            2 new files, 1,904 rows added · checks 2/2 ok
-ok    issue_triage     18,342 rows (2.3 s) · checks 3/3 ok
-ok    open_issues      rebuilt 4,211 rows (0.1 s) · checks 3/3 ok · 1 warning
-ok    daily_revenue    rebuilt 812 rows (0.1 s) · checks 2/2 ok
-done 44.0 s · 6 updated · 0 failed
+ok       github_issues      184 requests, 18,342 rows (41.2 s) · new table, 31 columns (7 JSON)
+                            added 18,342 · updated 0 · unchanged 0 · 18,342 rows now · checks 4/4 ok · since → 2026-09-22T17:58:03Z
+ok       stripe_charges     12 requests, 1,130 rows (3.1 s)
+                            added 1,102 · updated 21 · unchanged 7 · 1,130 rows now · checks 4/4 ok · since → 1758600000
+ok       taxi_zones         unchanged · requested; files unchanged
+ok       sales              1,904 rows (0.4 s) · new table, 6 columns
+                            added 1,904 · updated 0 · unchanged 0 · 1,904 rows now · checks 3/3 ok
+ok       issue_triage       18,342 rows (2.3 s) · new table, 3 columns
+                            added 18,342 · updated 0 · unchanged 0 · 18,342 rows now · checks 4/4 ok
+ok       open_issues        4,211 rows (0.1 s) · new table, 7 columns
+                            added 4,211 · updated 0 · unchanged 0 · 4,211 rows now · checks 3/3 ok · 1 warning
+ok       daily_revenue      812 rows (0.1 s) · new table, 5 columns
+                            added 812 · updated 0 · unchanged 0 · 812 rows now · checks 3/3 ok
+done 41.2 s · 6 updated · 0 failed
 ```
+
+Each step shows its rows in and time, the table it created, then the write's counts, the table's rows now and its checks: blocking checks as `checks n/n ok`, and warnings that failed or could not run as `1 warning`. A step's reason follows on its own line when it says more than "requested". The run's time is its longest step's.
 
 **Off a TTY (how Claude runs it), a long run detaches instead of dying at the shell timeout:**
 
@@ -872,28 +932,35 @@ Turn off: croft schedule off
 **Data shapes** are frozen by golden tests and published as JSON Schemas. `croft serve` returns the same envelopes over HTTP (§5).
 
 - **`query`:** `{columns: [{name, type}], rows, rowCount, truncatedRows, truncatedValues}`. HUGEINT, DECIMAL and integers beyond ±2^53 are strings, inside JSON columns too. A number in a JSON column that DOUBLE cannot hold (`1e400`) keeps its source text. `--limit N` and `--full-values` lift the caps.
-- **`run` / `wait`:** `{runId, status: running|succeeded|failed|crashed|interrupted, progress?: {asset, phase: extract|write|checks, rowsFetched, requests, elapsedMs}, steps: StepResult[], checksEnforced}`. A StepResult has:
+- **`run` / `wait`:** `{runId, status: running|succeeded|failed|crashed|interrupted, progress?: {asset, phase: extract|write|checks, rowsFetched, requests, elapsedMs}, steps: StepResult[]}`. A StepResult has:
   - `asset`, `status` (`ok`|`failed`|`skipped`|`unchanged`), `reason`, `skippedBecause?`
   - `behavior`, `attempt`, `maxAttempts`, `nextRetryAt?`
   - `rows: {in, added, updated, unchanged, deleted, total}`
   - `schemaChanges[]`, `cursor?: {before, after, sinceUsed}`
-  - `inputs?: [{input, seenBefore, seenAfter, rows}]`
+  - `inputs?: [{input, seenBefore, seenAfter, rows}]`: for an SQL step, `seenAfter` is the input's `last_loaded_at` as read inside the step's own transaction and `rows` its row count; for a TS transform, the position reached. The same list goes to `_croft.writes.inputs`.
   - `requests?`, `checks[]`, `trashed?: {path, rows}`, `logsCommand`, `durationMs`, `error?`
   - `created?: {columns, jsonColumns}` when the step created the table (the source of "new table, 31 columns (7 JSON)" in §4.2), and `csvHeader?` on a CSV ingest's first load (§3b)
-- **Phase-1 honesty.** Checks are declared, listed and passed to the write, but nothing evaluates them until phase 2. So `run` and `wait` data carry `checksEnforced: false`, `describe` data has `checksEnforced` after `checks`, and `context` data has it after `assets`; human output says `checks: not enforced until phase 2`. All of it is removed when phase 2 runs checks (`core/phase.ts`).
+  - `skippedBecause` says why a step did not run: `input X failed (r_…)` or `input X is waiting for confirmation c_…` for a direct input, and `input Y was not built: <why>` for one further up. A transform found fresh on the runner's re-check is skipped with `up to date: <inputs> did not change`. Skips caused by an input are recorded in `runs.sqlite` (attempt 0, status `skipped`), so `status` shows them; the others are not.
 - **`confirm`:** `{token, command, result, outcome: used|not_needed|unused|running, note?}`. `result` is the confirmed command's own `data` (`null` in human mode, where its output passes through as is), and its problems, `next`, confirmation and exit carry over to the envelope. `outcome` says what became of the token (§6).
 - **`status`:** `{healthy, running: [{runId, asset, pid, since, phase, rowsFetched}], assets: [{asset, kind, file, status, rows, lastRun: {runId, at, status, code}, next: {at, reason}, stale, staleReasons[], held, edited, filesGone?, schemaChangedAt?}], scheduling: {state: "on"|"off"|"paused", via: "os-job"|"serve"|null, lastTickAt}, serve?: {url, pid}}`.
   - An asset's `status` is `ok`, `failed`, `crashed`, `interrupted`, `running`, `skipped`, `never_run`, `no_asset_file` or `unknown`. `unknown` means it was built before but the warehouse file is missing; `rows` is then `null`, as it is for an asset never built.
   - When the catalog lists tables but the database file is missing, `status` reports `DB_NOT_FOUND` with `healthy: false`, and `context` carries the same problem and the same `unknown` assets. Both check the file with a `stat`, without opening DuckDB (§3b gives the wording).
-- **`describe`:** `{asset, kind, file, behavior: {words, write, key, incremental: {kind, field, cursorValue, cursorType, unit, lookback}}, reads, readBy, columns: [{name, type, pinned, pending, sourceName, format, addedAt, jsonKeys, kinds}], inputsSeen: {input: {seenLoadedAt, inputLastLoadedAt, pendingRows}}, builtWithCodeHash, checks, recentWrites, samples}`.
-- **`validate`:** `{order, assets: [{name, kind, inputs, outputColumns: [{name, type}] | null, behavior, codeChanged}]}`. `outputColumns` comes from `prepare()`.
-- **`context`:** `{project, assets: [compact describe], running, held, recentFailures, recentSchemaChanges: [{asset, at, runId, kind, column, from, to, readBy}]}`, capped at 20 KB with `truncated: true`.
+  - `edited` means the code hash now differs from the hash of the code the asset's last run used (the step's, else the catalog's); the file's modification time decides only when a hash is unknown, so touching a file or editing a comment is not an edit. An edited asset whose table older code built also gets `EDITED_SINCE_LAST_RUN` in `problems[]`, worded per kind (§8).
+  - `next[]` suggests `croft run --dry-run` when assets are stale for a reason other than `never_built`.
+- **`describe`:** `{asset, kind, file, behavior: {words, write, key, incremental: {kind, field, cursorValue, cursorType, unit, lookback}}, reads, readBy, columns: [{name, type, pinned, pending, sourceName, format, addedAt, jsonKeys, kinds}], inputsSeen: {input: {seenLoadedAt, inputLastLoadedAt, pendingRows}}, builtWithCodeHash, checks, recentWrites, samples}`. In `inputsSeen`:
+  - `seenLoadedAt` is the stamp of the transform's composite position; declared inputs it has not read yet appear with `seenLoadedAt: null`.
+  - `inputLastLoadedAt` is the input's version when the transform last read all of it (null until then): the value staleness compares, the same as `_croft.inputs.input_last_loaded_at` (§5). It is not the input's current version.
+  - `pendingRows` counts the input rows after the composite position `(seen_loaded_at, seen_key)`, the count `newRows()` and the cost guard use. It is null when unknown (no table, no `_loaded_at` column) or when `describe` fell back to the catalog mirror.
+- **`validate`:** `{order, assets: [{name, kind, inputs, outputColumns: [{name, type}] | null, behavior, codeChanged}], types?: {status: ok|failed|skipped, errors}}`. `outputColumns` comes from `prepare()`. `inputs` joins the unoptimized plan's scans to each asset's AST inputs, and `order` comes from the graph rebuilt with them. `types` is present with `--types`. `next[]` is `croft validate` after an error or a fixable warning, otherwise `croft preview <assets whose code changed>`, and `croft docs ingest` in a project with no assets.
+- **`preview`:** `{assets: [{asset, kind, status: ok|failed|skipped, reason, rows, liveRows, partial, capped, requests?, since?, diff: {by, added, removed, changed, unchanged} | null, columns: [{column, change: added|removed|retyped, type, from?, note?}], checks, sample, downstream, durationMs, error?}], partial, inputsSnapshotAt, rebuild, rowCap}` (§6). A CSV ingest's header decision is in its `reason` ("CSV header: first line (detected): …").
+- **`run --dry-run`:** `{dryRun: true, order, steps: [{asset, file, kind, action: fetch|rebuild|update|skip, reasons, reason, behavior, hold?, skippedBecause?, window?: {sinceValue, sinceType, sinceAt?, source: saved|from, saved?, lookback?}, confirmation?: {action: allow_shrink|large_reprocess, command, impact}, problems}]}`. `problems` are the static errors that would fail the step before it runs.
+- **`context`:** `{project, assets: [compact describe], running, held, recentFailures, recentSchemaChanges: [{asset, at, runId, kind, column, from, to, readBy}]}`, capped at 20 KB with `truncated: true`. A compact asset carries `staleReasons`, and `edited: true` when it applies. `recentSchemaChanges[].readBy` lists the assets that read the changed asset (asset level, not column level). `problems[]` hold each asset's load and `CHECK_INVALID` problems and `EDITED_SINCE_LAST_RUN`.
 - **Error `details`:**
   - `HTTP_ERROR`: `{method, url (redacted), status, attempts, retryAfterMs, requestIndex, rowsBeforeError}`
   - `TIMEOUT`: `{phase, rowsSoFar, lastRequest}`
   - `TYPE_CONFLICT`: `{column, existingType, incomingKinds, badRows, samples, readBy}`, plus, where they apply, `sourceName`, `storedType` (the same as `existingType`), `incomingType` (the type the incoming values would get in a new column), `incoming` (the same as `incomingKinds`), `conflictKinds` (the kinds that do not fit), `format` (file ingests) and `fixes` (every fix, in order; `fix` is the first). The duplicate names are kept for readers of the earlier ones.
-  - `CHECK_FAILED`: `{check, failing, sample}`
-  - `QUERY_FAILED`: `{duckdb, duckdbErrorType}`. `QUERY_FAILED` is any error DuckDB raised while binding or running a user query (Binder, Catalog, Conversion, Invalid Input, Out of Range, IO, …), and `duckdbErrorType` names the kind. `SQL_SYNTAX` is only for parser errors, and a missing table or column is still `UNKNOWN_TABLE` or `UNKNOWN_COLUMN`.
+  - `CHECK_FAILED`: `{check, failing, sample, checked, scope}`, and for a blocking failure `results` (the result of every blocking check). `failing` counts, per kind: the rows that fail (`not_null`, rules), the rows that share their values with another row (`unique`), or the rows missing (`min_rows`). `checked` is the rows in scope, and `scope` is `batch` or `table`. `sample` holds up to 20 rows.
+  - `QUERY_FAILED`: `{duckdb, duckdbErrorType}`. `QUERY_FAILED` is any error DuckDB raised while binding or running a user query (Binder, Catalog, Conversion, Invalid Input, Out of Range, IO, …), and `duckdbErrorType` names the kind. `SQL_SYNTAX` is only for parser errors, and a missing table or column is still `UNKNOWN_TABLE` or `UNKNOWN_COLUMN`. In an SQL asset, a missing column named through a table (`g.x`: DuckDB's Binder Error "Table "g" does not have a column named "x"", with candidate bindings [V]) is `UNKNOWN_COLUMN` too.
   - `ASSET_CODE_ERROR` raised through `fail()`: `{requestedCode}` (§10, "Public types")
 
 **Exit precedence:**
@@ -923,7 +990,7 @@ No process ever owns the database for writing, and there is no write daemon. Fiv
 4. **`croft serve`** (optional), a long-running *read* server with the scheduler built in (§5, "Server mode"). It answers app queries over HTTP and steps aside whenever a run writes. It spawns a fresh `croft tick` subprocess every minute and never ticks in-process. An in-process tick would keep stale `lib/` code, because a cache-busted `import()` does not re-import dependencies [V], and it would risk a second database instance in one process.
 5. **Subprocesses spawned by a tick** (`croft run --due`), which do the scheduled work.
 
-Each command imports asset files fresh, so edits are always picked up. Each TS file is imported in isolation, so one broken file fails only its own asset.
+Each command imports asset files fresh, so edits are always picked up. Each TS file is imported in isolation, so one broken file fails only its own asset. With selectors, a TS file whose text calls only `ingest()` is imported only when it is selected or needed before the selection, so `croft run x` never runs the top-level code of unrelated ingests; SQL files and possible transforms are always loaded, since the graph needs their inputs.
 
 **Asset console output.** Asset code runs in croft's own process, so its `console.*` (and direct `process.stdout`/`process.stderr` writes) would otherwise land on croft's stdout, breaking the one `--json` envelope and printing secrets unredacted. Inside a run, top-level output of an asset (collected while it is imported) and everything `rows()` and `map()` print, however deep their async work goes (an `AsyncLocalStorage` scope per step), go to that step's log, redacted like every log, which `croft logs` shows. Commands that only import assets (`query`, `describe`, `context`, `secrets`) print top-level output on stderr, prefixed with the file and redacted. Output that escapes any scope goes to stderr, redacted; never to stdout.
 
@@ -967,16 +1034,16 @@ The rules that follow from these:
 **Leases.** `warehouse.read(fn)` and `warehouse.write(label, fn)` open the file on demand and close it 100 ms after the last lease ends. Each process picks one access mode for its whole life, because a cached path cannot be reopened with another configuration:
 
 - Processes that write (`run`, `confirm`, `delete`, `restore`, `rename`, and `init` when it runs the example) use read-write, even for their read leases. They always create a write intent first (Server mode, below).
-- `query`, `describe`, `preview`, `doctor`, `tick` and `croft serve` use read-only, and never create an intent. `doctor` does not open the file at all while a live intent exists (§2).
+- `query`, `describe`, `preview`, `doctor`, `tick` and `croft serve` use read-only, and never create an intent. `doctor` does not open the file at all while a live intent exists (§2). `preview` opens its own `.croft/preview.duckdb` read-write, with no write intent, for the whole preview, so two previews, or a preview and `croft query --preview`, take turns.
 
-- **Lock conflicts** are retried with jittered backoff (25 ms up to 1 s). After 2 s the holder is printed. It is one of: croft's own run, from `runs.sqlite` (for example "croft run r_…, writing daily_revenue, 8 s"); `croft serve`, recognized by the PID in `serve.json` ("croft serve pid 4121 has not stepped aside"); or a foreign program (`DB_HELD_BY_OTHER_PROGRAM`).
+- **Lock conflicts** are retried with jittered backoff (25 ms up to 1 s). After 2 s the holder is printed. It is one of: croft's own run, from `runs.sqlite` (for example "croft run r_…, writing daily_revenue, 8 s"); `croft serve`, recognized by the PID in `serve.json` ("croft serve pid 4121 has not stepped aside"; until phase 3 the text says "croft's read server (pid 4121) has not stepped aside", §2); or a foreign program (`DB_HELD_BY_OTHER_PROGRAM`).
 - **Default waits.** Off a TTY every wait is capped at 90 s, then exit 4 with the holder, so a wait never outlives the agent's shell. On a TTY: 60 s for `query`/`preview`/`describe` and 10 min for run writes. Scheduled writes wait 30 min. `--no-wait` exits 4 at once. Ctrl-C (the run's `AbortSignal`) ends a lock wait, or a write queued behind this process's own write, at once with `INTERRUPTED` (exit 130). A lease that already holds the file is never cut; the ingest body refuses further statements instead.
 - **Fairness.** A writer that sees registered waiters yields for 200 ms between write steps.
 - **Asset leases** in `runs.sqlite` guarantee that only one run touches an asset at a time. A manual `croft run x` while the scheduler runs `x` waits for the lease, or exits 4 with `ASSET_BUSY` naming the run. A tick skips leased assets, and they stay due. A lease records the PID, the process start time and the boot id (`kern.boottime` or `/proc/sys/kernel/random/boot_id`). It counts as dead when the boot id differs or the start time does not match, because PIDs are reused after a reboot and a PID check alone could leave an asset busy forever.
 
 **One connection factory.** Every connection croft opens goes through a single factory. This covers the warehouse, the preview database, a TS transform's private in-memory database, and `@zabaca/croft/read`. The factory sets the project time zone and applies the sandbox. `TimeZone` is a per-connection setting [V], and a connection that skipped it would put rows into different days.
 
-**Sandboxing every DuckDB instance.** Every instance is created with `autoinstall_known_extensions = false`, `autoload_known_extensions = false` and `allow_community_extensions = false` [V]. Otherwise DuckDB would download and load native extensions from the network on demand, and croft promises never to install anything. The first connection to a fresh instance runs `SET GLOBAL TimeZone` (and, for `croft serve`, `memory_limit` and `threads`), then the statements below. `lock_configuration` is instance-wide and refuses every later `SET`, a per-session `SET TimeZone` included, so the zone is set globally before locking and every later connection inherits it [V]. Later connections check that the instance carries the same sandbox. `allowed_directories` cannot be passed as an instance option ("Failed to set config"), so these have to be `SET` statements [V]. `croft query` instances allow only `files/`, and a project path outside it gets `QUERY_PATH_DENIED`. The run's warehouse instance allows only `files/` and the state folder, not the directories of declared file ingests: files are loaded from their snapshots under the state folder (§3b), so a `file: "*.csv"` ingest never opens the whole project folder to SQL.
+**Sandboxing every DuckDB instance.** Every instance is created with `autoinstall_known_extensions = false`, `autoload_known_extensions = false` and `allow_community_extensions = false` [V]. Otherwise DuckDB would download and load native extensions from the network on demand, and croft promises never to install anything. The first connection to a fresh instance runs `SET GLOBAL TimeZone` (and, for `croft serve`, `memory_limit` and `threads`), then the statements below. `lock_configuration` is instance-wide and refuses every later `SET`, a per-session `SET TimeZone` included, so the zone is set globally before locking and every later connection inherits it [V]. Later connections check that the instance carries the same sandbox. `allowed_directories` cannot be passed as an instance option ("Failed to set config"), so these have to be `SET` statements [V]. `croft query` instances allow only `files/`, and a project path outside it gets `QUERY_PATH_DENIED`. `croft query --preview` is the exception: the preview's views read Parquet snapshots in the state folder, so its connection uses the warehouse sandbox (`files/` and the state folder), while the gate, with the state folder protected, still refuses any state-folder path in the SQL text. The run's warehouse instance allows only `files/` and the state folder, not the directories of declared file ingests: files are loaded from their snapshots under the state folder (§3b), so a `file: "*.csv"` ingest never opens the whole project folder to SQL.
 
 ```sql
 SET allowed_directories = ['<project>/files', '<project>/.croft'];
@@ -1008,7 +1075,7 @@ A second rule covers the rest. **All user-authored SQL must be exactly one SELEC
 
 Paths are checked just before DuckDB opens them, not atomically. A macro or view created in the warehouse outside croft can shadow a built-in name; the gate trusts the warehouse's own catalog.
 
-**Errors from user queries.** A parser error is `SQL_SYNTAX`. A missing table or column is `UNKNOWN_TABLE` or `UNKNOWN_COLUMN`. Any other error DuckDB raises while binding or running the query is `QUERY_FAILED`, with `details.duckdbErrorType` naming the kind (§4.3).
+**Errors from user queries.** A parser error is `SQL_SYNTAX`. A missing table or column is `UNKNOWN_TABLE` or `UNKNOWN_COLUMN`. Any other error DuckDB raises while binding or running the query is `QUERY_FAILED`, with `details.duckdbErrorType` naming the kind (§4.3). DuckDB's own "Did you mean" can name a system view (`pg_constraint` for an unrelated name) [V], so croft's `UNKNOWN_TABLE` suggests only the project's asset names.
 
 ### One ingest step, end to end
 
@@ -1037,7 +1104,8 @@ Paths are checked just before DuckDB opens them, not atomically. A macro or view
    d  cast      typed temp table with explicit, whitelisted casts (§7)
    e  verify    round-trip loss check: no value may change when cast back and compared (§7)
    f  dedupe    by key: highest cursor, then highest _croft_seq (last yielded), wins. KEY_NULL is
-                checked on the batch before anything is written
+                checked on the batch before anything is written. (A transform never dedupes: a
+                duplicate key in its batch is CHECK_FAILED unique(key), D65)
    g  evolve    ALTER TABLE ADD COLUMN / ALTER COLUMN TYPE (DDL is transactional [V]). All DDL on a table
                 comes before any DML on it in the same transaction: DELETE or UPDATE followed by ALTER
                 failed at COMMIT ("another transaction has altered this table") [V]. A file reload
@@ -1076,21 +1144,31 @@ Diff writes also keep the file small. Thirty hourly full rewrites (DELETE + INSE
 
 ### Transforms
 
-A **SQL transform** step works like this:
+A **SQL transform** step works like this, in one write lease and one transaction:
 
-1. `CREATE TEMP VIEW __body AS <sql>` (§3c).
-2. `CREATE TEMP TABLE next AS SELECT COLUMNS(c -> c NOT IN ('_loaded_at', '_file')) FROM __body`.
-3. Diff `next` into the target exactly like a replace ingest, matching rows by key or by exact row content.
-4. Run checks, drop the temp objects, and commit.
+1. Read each input's `last_loaded_at`, version and row count inside the transaction: what the SELECT sees.
+2. `DESCRIBE <body>`, then `CREATE OR REPLACE TEMP VIEW __body AS <sql>`, then `CREATE TEMP TABLE __croft_next AS …` without the reserved columns, with `_croft_seq` added (§3c, D71).
+3. Diff `__croft_next` into the target exactly like a replace ingest, matching rows by key or by exact row content. A duplicate key is `CHECK_FAILED unique(key)` before anything is written (D65).
+4. Run the blocking checks, record `_croft.inputs`, drop the temp objects, read the catalog entry back, and commit.
+5. After the commit: the catalog mirror, then the warnings on a read lease (§3f).
 
-If the output *shape* changed (columns added, removed or retyped), the table is recreated and every row gets a new stamp. `CREATE OR REPLACE` rolls back cleanly on failure [V]. SQL steps run one at a time, because DuckDB already parallelizes inside each query.
+The output *shape* is the ordered list of the SELECT's columns with their exact types, followed by `_loaded_at`. Any other shape (a column added, removed, retyped, renamed or moved, or a stray column such as `_file` left from a former ingest table) recreates the table with `CREATE OR REPLACE TABLE t AS SELECT <columns>, NULL::TIMESTAMPTZ AS _loaded_at FROM __croft_next LIMIT 0`, so STRUCT, MAP and ENUM types survive without being spelled out as text; `evolveTable`'s type whitelist would refuse them. Every row then gets a new stamp: the step reports `schemaChanges: [{kind: "recreate", reason: "shape_changed"}]` rather than a new table, and counts every row as added and every previous row as deleted. `CREATE OR REPLACE` rolls back cleanly on failure [V]. A SQL asset's columns are never pending, and it gets no `COLUMN_STOPPED_ARRIVING` or `JSON_KIND_CHANGED`. SQL steps run one at a time, because DuckDB already parallelizes inside each query.
 
-A **TS transform** step extracts like an ingest, reading its inputs from Parquet snapshots (§3e), and then loads through the same pipeline. Incremental TS transforms commit in chunks of 500 rows or 60 s, each with its own checks and composite position (§3e).
+`_croft.inputs` gets, for every input the SQL reads, `seen_loaded_at` = the `last_loaded_at` it read, `input_last_loaded_at` = the version it read, and `seen_key` NULL. Rows for inputs the SQL no longer reads are deleted in the same transaction.
 
-**Cost guard.** An incremental TS transform that makes requests (the detection of §3e) and would process more than 1,000 input rows in one run (the `confirmAbove` setting) raises `LARGE_REPROCESS`. This happens on a first build, after an upstream rebuild that restamped every row, and after a restore.
+A DuckDB error in the user's SQL is located in the asset's file (the header's lines are added and the caret becomes the column). A binder error that involves a pending column keeps its code (`QUERY_FAILED`, an error: the step failed) and gets a hint to pin the type, with `details.pendingColumns`; only `validate` reports `NULL_ONLY_COLUMN`, a warning code that could not stand for a failed step (§6).
 
+A **TS transform** step extracts like an ingest, reading its inputs from Parquet snapshots (§3e), and then loads through the same pipeline. Incremental TS transforms commit in chunks (§3e), each with its own checks and composite position.
+
+**Static errors in a run.** The planner binds each SQL asset it takes against the columns the catalog mirror has for its inputs, or against the output of an SQL input the run rebuilds first. A bind error fails its step before it runs only when no input the same run refreshes earlier (an ingest or a TS transform, directly or through SQL the run rebuilds) could still change the columns. Otherwise only the errors a new column cannot fix count (`QUOTE_IDENTIFIER`, `SQL_SYNTAX`, `DUPLICATE_OUTPUT_COLUMN`, `UNKNOWN_TABLE`, `QUERY_PATH_DENIED`), so an ingest that adds a column in the same run never fails the SQL that reads it; the step reports any other error when it runs. A check that reads a table never built, which the run does not build first, is `CHECK_INVALID` on its step, with the fix `croft run <asset> --upstream`.
+
+**Cost guard.** An incremental TS transform that makes requests (the detection of §3e) and would process more than 1,000 input rows in one run (the `confirmAbove` setting) raises `LARGE_REPROCESS`. This happens on a first build, after an upstream rebuild that restamped every row, and after a restore. It is checked before any of the transform's code runs.
+
+- The count is the rows after the position of each keyed input the code reads with `newRows()`, found by a lexical scan of the bundle (`newRows("x")`, `ctx.newRows("x")`). A lookup read with `rows()` is not processed row by row, so it does not count. When the scan cannot tell (a computed name), every keyed input counts.
+- An input the scan missed is counted when `newRows()` first reads it, before its first row is handed over. If that goes past `confirmAbove` without an approved count, the step fails with `LARGE_REPROCESS` and an edit fix, rather than ask mid-run.
+- The impact's action is `incremental transform; LARGE_REPROCESS override`, with `estimatedRequests` equal to the pending rows and `downstream` from the step's readers.
 - A scheduled run holds the transform until a human runs it.
-- A manual run asks for confirmation, with the row count in the impact.
+- A manual run asks for confirmation, with the row count in the impact. The token is for `croft run <transform>`, the one transform named. A run issues at most one token: a second step that needs one is skipped (`skippedBecause`), with a `next` hint `croft run <transform>`, which only asks again and so is not destructive.
 
 This is how "never spend the user's API money implicitly" is enforced rather than just documented.
 
@@ -1104,6 +1182,8 @@ This is how "never spend the user's API money implicitly" is enforced rather tha
 | `run`, `delete`, `restore`, `confirm`, `rename` | asset leases + write leases per step, each behind a write intent | extraction proceeds in parallel; writes queue behind the current step |
 | scheduler tick | asset leases | skips leased assets; due work stays due |
 | `croft serve` queries | its own read-only instance | closed while `write-intent.d/` holds a live entry; queries wait up to 10 s, then `503` (or read-copy answers marked `stale`) |
+
+`status`, `context` and `describe` resolve the asset files the way `validate` does (`project/resolve.ts`): TS assets are imported in isolation, with a 5 s import timeout each, and SQL is parsed on a private in-memory DuckDB. So an asset's top-level code runs on `croft status`, which needs it for kinds, code hashes and inputs. `status` still never opens the warehouse.
 
 ### Where state lives
 
@@ -1121,6 +1201,7 @@ CREATE TABLE _croft.columns (asset VARCHAR, name VARCHAR, type VARCHAR, source_n
   pinned BOOLEAN, pending BOOLEAN, kinds VARCHAR[], present_last_batch BOOLEAN, added_at TIMESTAMPTZ,
   PRIMARY KEY (asset, name));
 CREATE TABLE _croft.inputs  (asset VARCHAR, input VARCHAR, seen_loaded_at TIMESTAMPTZ, seen_key JSON,
+  input_last_loaded_at TIMESTAMPTZ,                                   -- format 3
   PRIMARY KEY (asset, input));                                        -- composite position (§3e)
 CREATE TABLE _croft.files   (asset VARCHAR, path VARCHAR, size BIGINT, mtime TIMESTAMPTZ, etag VARCHAR,
   sha256 VARCHAR, loaded_at TIMESTAMPTZ, PRIMARY KEY (asset, path));
@@ -1133,7 +1214,7 @@ CREATE TABLE _croft.writes  (asset VARCHAR, loaded_at TIMESTAMPTZ, run_id VARCHA
 
 `croft docs internals` documents these tables. For example, `_croft.writes` maps any row's `_loaded_at` to the run that wrote it.
 
-`_croft.meta.format_version` is **2**. Format 2 adds `_croft.writes.attempt`, so `reconcile()` can tell a step's retries apart. croft adds the column to a format-1 database on its next write, and a croft that reads only format 1 refuses a format-2 database with `DB_NEWER_FORMAT`.
+`_croft.meta.format_version` is **3** (D69). Format 2 added `_croft.writes.attempt`, so `reconcile()` can tell a step's retries apart. Format 3 adds `_croft.inputs.input_last_loaded_at`: the input's version when the transform last read all of it (an SQL step's transaction, a TS transform's finished snapshot), which staleness compares. The version is the later of the input's `last_loaded_at` and `last_replaced_at` at the time of reading, while `seen_loaded_at` stays `last_loaded_at`. It is NULL while an incremental transform has committed only part of a snapshot. croft adds each column to an older database on its next write (a read lease on a format-2 database reads the missing column as NULL), and a croft that reads an older format refuses a newer database with `DB_NEWER_FORMAT`.
 
 **Observability and coordination state** lives in `.croft/runs.sqlite` (bun:sqlite, WAL, `busy_timeout = 5000`). It stays readable while DuckDB is locked.
 
@@ -1158,6 +1239,8 @@ CREATE TABLE catalog  (asset TEXT PRIMARY KEY, json TEXT, source TEXT, refreshed
                        -- mirror of _croft.* (source: run | preview | pins); DuckDB wins
 ```
 
+A preview writes its catalog entries, with source `preview`, into its own `.croft/preview/runs.sqlite`, so the live catalog is never overwritten (D66).
+
 While a run works, `runs.summary` holds `{progress: {asset, phase, rowsFetched, requests, elapsedMs}}`, written at most every 500 ms (§5, "Processes"). When the run ends it holds the whole command result, `{data: {runId, status, steps}, problems, next, confirmation?, exit, ok}`, redacted, so a detached run's parent and `croft wait` print exactly what an in-process run prints.
 
 ### Versions, staleness and atomicity
@@ -1167,11 +1250,12 @@ While a run works, `runs.summary` holds `{progress: {asset, phase, rowsFetched, 
 - Every write stamps changed rows with one `_loaded_at`: the greatest of `now()` and 1 µs past each of `last_loaded_at`, the newest `_croft.writes.loaded_at` and the table's `max(_loaded_at)`. This is strictly increasing per table, even if the clock steps back or rows were restamped out of band, and it keeps the `_croft.writes` primary key unique.
 - `last_loaded_at` moves only when rows were added, updated or deleted, so an unchanged run does not wake downstream work. Every write still records a `_croft.writes` row.
 - A transform is stale when:
-  - it was never built;
-  - an input's `last_loaded_at` is newer than its `seen_loaded_at`;
-  - an input's `last_replaced_at` is newer (after a restore or an out-of-band change);
-  - or its code changed (§8).
-- `newRows(x)` means rows after the composite position `(seen_loaded_at, seen_key)`.
+  - it was never built (`never_built`);
+  - an input with rows has no `_croft.inputs` row, or its `input_last_loaded_at` is null or older than the input's `last_loaded_at` (`input_changed`; an input that never had rows changes nothing);
+  - an input's `last_replaced_at` is newer than its `input_last_loaded_at` (`input_replaced`: after a restore or an out-of-band change). Because the step records the later of the two as the version it read, this clears once the transform has read the input again, even when no written row followed the change;
+  - or its code changed (`code_changed`, §8). An incremental TS transform is forward-only: its code change is `EDITED_SINCE_LAST_RUN`, never a reason to run.
+- Unknowns never make an asset stale on their own: an input not built yet, a code hash that was never recorded, code that does not load. They are for `validate` and the planner to report.
+- `newRows(x)` means rows after the composite position `(seen_loaded_at, seen_key)`. SQL and full-refresh steps record the input's `last_loaded_at` with no key.
 - Writes are serialized by the file lock, and inputs are read inside the consuming step's own transaction (SQL) or snapshot (TS). So no committed row can fall between two positions unseen.
 
 **Atomicity.**
@@ -1187,7 +1271,7 @@ While a run works, `runs.summary` holds `{progress: {asset, phase, rowsFetched, 
 - `kill -9` inside the transaction is discarded by DuckDB. A process holding 2M uncommitted rows plus an `ALTER` plus a state update was killed, and all three were gone after reopening. A commit followed by a kill before checkpoint was recovered from the WAL [V].
 - Every command that writes, and every tick, starts with `reconcile()`:
   1. Runs marked `running` whose PID is dead become `crashed`.
-  2. Their steps are matched against `_croft.writes` by run id, asset and attempt under a short read lease. A row without an attempt, written before format 2, counts when its `loaded_at` is at or after the step's `started_at`. A commit that landed just before the crash becomes `ok (recovered)`, because DuckDB is authoritative; chunks committed by an earlier failed attempt of the same step do not count. A step with no commit becomes `crashed` (`RUN_CRASHED`).
+  2. Their steps are matched against `_croft.writes` by run id, asset and attempt under a short read lease. A row without an attempt, written before format 2, counts when its `loaded_at` is at or after the step's `started_at`. A commit that landed just before the crash becomes `ok (recovered)`, because DuckDB is authoritative; chunks committed by an earlier failed attempt of the same step do not count. A step with no commit becomes `crashed` (`RUN_CRASHED`). For a chunked TS transform, the commit that landed can be any chunk: a step whose attempt committed at least one chunk is ok too, its reason ending `(recovered)`, or `(recovered: N commits)` for more than one. The asset then stays stale with its pending rows, and its next run continues after the last committed chunk.
   3. Their leases are released, and their staging is scheduled for deletion. Write intents of dead processes are deleted.
   4. A recovered step's catalog mirror entry (rows, columns, cursor) is re-read from `_croft.*` under the same read lease, so `status` and `context` show what committed rather than the previous load.
 - Cursors move only on commit, so a crash means extraction is redone, never skipped: at-least-once extraction, exactly-once visibility.
@@ -1301,21 +1385,28 @@ This is enforced (§5), not only a convention:
 
 **1. `croft validate` touches no data.**
 
-- It parses headers and SQL, finds dependencies and cycles, imports TS assets to check their config shape, and checks schedule phrases, secrets and every check expression. An asset import that does not finish within 30 s is `ASSET_INVALID`, so top-level code that never returns cannot hang `validate`.
-- It runs a **bind check**. An in-memory DuckDB gets empty tables built from the cached column lists. Each SQL asset is `prepare()`d in dependency order, and its output columns become the empty input of the next asset. DuckDB's own messages supply "Candidate bindings" and caret positions, shifted past the header [V].
-- **Inputs never built.** The column cache is filled by runs, by previews and by `columns` pins. An input with no cache yields `INPUT_NOT_BUILT` (info), and only the assets that read it skip the bind. They are never reported as errors the agent cannot fix.
-- A binder error that involves a column still `pending` (all NULL so far) is reported as `NULL_ONLY_COLUMN`, with an edit fix that adds a pin.
-- `validate --json` returns every SQL asset's output columns, so the agent knows what the next asset can use.
-- `--types` also runs `tsc --noEmit`.
+- It parses headers and SQL, finds dependencies and cycles, imports TS assets to check their config shape, and checks schedule phrases, secrets and every check expression. An asset import that does not finish within 30 s is `ASSET_INVALID`, so top-level code that never returns cannot hang `validate`. Until phase 3 brings the phrase parser, only a schedule that is not a string is `SCHEDULE_INVALID`.
+- What only the whole project shows: a TS transform's input that is no asset is `UNKNOWN_TABLE` with an edit fix; an incremental transform's `newRows()` input without a key is `INPUT_NEEDS_KEY`, found from literal `newRows("name")` calls in the asset and the project files it imports (a computed name is left to the run); and a declared secret that is not set is `SECRET_MISSING`, a warning as in `doctor`, because only the user can set it and nothing fails until the asset runs.
+- It runs a **bind check**. An in-memory DuckDB gets empty tables built from the cached column lists, `_loaded_at` and `_file` included. Each SQL asset is `prepare()`d in dependency order, and its output columns become the empty input of the next asset, so each asset binds against its inputs' code as it is now. DuckDB's own messages supply "Candidate bindings" and caret positions, shifted past the header [V]. The unoptimized plan's scans join each asset's inputs, and the graph (`order`, `CYCLE`) is built again with them.
+- **Inputs never built.** The column cache is filled by runs, by previews (the preview's own catalog, for a table never built) and by `columns` pins. An input with no cache yields `INPUT_NOT_BUILT` (info), and only the assets that read it skip the bind, transitively. The message names the root assets to preview ("columns of daily_revenue are unknown until stripe_charges has run or been previewed; bind check skipped"), with the fix `croft preview <roots>`; for an input whose own code has errors it says "until the errors in assets/x.sql are fixed". They are never reported as errors the agent cannot fix. The assets of a cycle skip the bind with no extra problem.
+- A binder error that goes away when a column still `pending` (all NULL so far) gets another type is `NULL_ONLY_COLUMN`, a warning. croft retypes the column in the shadow catalog, trying DOUBLE, BIGINT, VARCHAR, TIMESTAMPTZ, DATE, BOOLEAN and JSON in order, and the first type that binds is the pin in the edit fix (`columns: { x: "T" }`, inserted into the input asset's file). At run time the step's error keeps its own code, with a pin hint (§5).
+- An SQL asset's checks are bound against its output columns. A check naming a missing column is `UNKNOWN_COLUMN` on the check's header line (the `-- key:` line for the checks a key implies); any other bind failure of a check is `CHECK_INVALID`. TS assets' checks are not bound, since their output shape is not known statically.
+- `validate --json` returns every SQL asset's output columns, so the agent knows what the next asset can use. The prepared statement's column types drop the `JSON` alias inside nested types (`VARCHAR[]` for `JSON[]`), so croft reads the types from a TEMP view's `duckdb_columns()`, which keeps it [V].
+- `--types` also runs the project's own `node_modules/.bin/tsc --noEmit`, with Bun, so no Node is needed. Each type error is `ASSET_INVALID` at its file, line and column (at most 50, then a count). No tsc, or no `tsconfig.json`, is an info problem (code `INSTALL_FAILED`, lowered to info) with `data.types.status: "skipped"`; croft never installs anything.
 
 **2. `croft preview <asset…>` runs the code and changes nothing real.** It works in `.croft/preview.duckdb`.
 
-- **Inputs are snapshotted.** Under one short read lease, croft copies every live input the preview needs to `.croft/preview/<name>.parquet`. The preview database then sees them as views, so everything in a preview, including later `query --preview` calls, reads one consistent snapshot. The live file is never `ATTACH`ed from a second instance, which would risk releasing its lock (§5).
-- **SQL transforms** (and SQL downstream of them) are built from those snapshots.
-- **TS transforms** read Parquet snapshots, as in a real run. `--rows` (default 1,000) caps the *input* rows they receive, and `ctx.preview` is true, so a per-row LLM transform costs at most 1,000 calls in a preview.
-- **Ingests** fetch from the real saved cursor and stop the generator after `--rows` rows. The cursor does not move. Downstream assets are listed but not built from a partial sample, because a diff against a partial input would suggest that correct SQL is wrong.
-- **The output** diffs against live: row counts, added/removed/changed by key, column changes, check results, samples, and `data.partial` / `data.inputsSnapshotAt` in JSON. When the preview could only build part of the table (capped input rows, or an incremental TS transform), the diff covers only the keys the preview produced ("of 1,000 keys touched, 37 differ"). It never reports every other row as removed. `croft query --preview` explores the result. The preview file stays until the next preview.
+- **Planned like a run.** The preview plans as `croft run <assets>` would (§4.1), so each step carries the bind check's problems, and it builds each asset through the step a run uses (§5), against the preview database and the preview's own `runs.sqlite` (`.croft/preview/runs.sqlite`, catalog source `preview`), so the live catalog is never overwritten (D66). The last preview's file and `.croft/preview/` are emptied first.
+- **Inputs are snapshotted.** Under one short read lease, croft copies every live table the preview reads or compares with to `.croft/preview/<name>.parquet`, and the `_croft` rows of those assets to `.croft/preview/_croft/`. The preview database then sees them as views with the live column types: `main.<input>` for an input the preview does not build, and `live.<asset>` for the live version of every asset it builds. So everything in a preview, including later `query --preview` calls, reads one consistent snapshot. The live file is never `ATTACH`ed from a second instance, which would risk releasing its lock (§5).
+- **SQL transforms** are built from those snapshots. SQL downstream of a named asset is built too, but only when every input it reads from the preview is complete, is not an ingest, and passed its checks; otherwise it is listed in that asset's `downstream`. A named asset reads the preview of any input built in the same preview; a listed downstream asset is read from live.
+- **TS transforms** read Parquet snapshots, as in a real run. `--rows` (default 1,000) caps the *input* rows they receive from each input, and `ctx.preview` is true, so a per-row LLM transform costs at most 1,000 calls in a preview.
+- **Ingests** fetch from the real saved cursor, with `ctx.preview` true, and stop the generator after `--rows` rows; reaching exactly `--rows` counts as capped, since the generator is stopped without asking for more. The cursor moves only in the preview database. File ingests are not capped: they make no requests, and they read their new and changed files. Downstream assets are listed but not built from a partial sample, because a diff against a partial input would suggest that correct SQL is wrong. A CSV ingest's header decision is in its `reason` and on a `note` line.
+- **Two ways a build starts.** Merge and append ingests and incremental TS transforms start from a copy of the live table and its `_croft` state, so they continue from the saved cursor or positions exactly as a real run would, and the write's own counts are the diff ("212 would update, 788 would add"). Everything else (SQL, full-refresh TS, replace ingests, `--rebuild`, a table never built) is built from scratch in an empty preview table and diffed against `live.<asset>` by key, or by whole rows without one. So `ctx.query` in a replace ingest sees no table of its own during a preview.
+- **The output** diffs against live: row counts, added/removed/changed by key, column changes, check results, samples, and `data.partial` / `data.inputsSnapshotAt` in JSON. When the preview could only build part of the table (capped input rows, or an incremental TS transform), the diff covers only the keys the preview produced ("of 1,000 keys touched, 37 differ"). It never reports every other row as removed. A replace ingest that fetched everything does report removals, and warns `SHRINK_GUARD` when a real run would stop. `croft query --preview` explores the result. The preview file stays until the next preview.
+- **Checks.** Every check and warning runs on the preview table after its write, with a real run's scope (a new or edited check covers the whole table). A failing blocking check fails the asset (`CHECK_FAILED`, exit 3), as the real run would, but the preview table keeps the rows for `croft query --preview`. `min_rows` is not evaluated on a partial build from scratch.
 - **`preview --rebuild`** builds the asset from scratch and compares it with the live table. It is how to find incremental drift or out-of-band edits: "3 of 812 rows differ".
+- **Logs.** A preview's step logs go to `.croft/preview/logs/<asset>.log`, under a run id starting with `p_`. `croft logs` does not show them; a failed asset's human output prints the log path.
+- A successful preview is human-initiated, so it approves the asset's code for the scheduler (§6, "The scheduler only runs code a human has run").
 
 **3. The real run.** Writes are all-or-nothing, and blocking checks run before commit. That is write-audit-publish without the name.
 
@@ -1328,7 +1419,7 @@ The scheduler reads the working tree, so it could otherwise run an ingest the ag
 - a fixture `yield [{ id: 1, title: "test" }]`, which a merge would write over real issue 1;
 - a temporary filter, which would move the cursor past rows that were never loaded.
 
-To prevent this, the tick runs an asset only if its current code hash equals `approved_code_hash`. That hash is set by the last successful **human-initiated** `croft run` or `croft preview` of that asset. Human-initiated means a command from a terminal or from Claude Code, as opposed to the scheduler.
+To prevent this, the tick runs an asset only if its current code hash equals `approved_code_hash`. That hash is set by the last successful **human-initiated** `croft run` or `croft preview` of that asset (a file ingest whose files did not change counts: its code ran). Human-initiated means a command from a terminal or from Claude Code, as opposed to the scheduler.
 
 Otherwise the asset is skipped with `SCHEDULE_HELD`, and `status` shows it plainly: "held: code edited 12 min ago, not run by hand yet; `croft run github_issues` releases it". New assets are held until they have been run by hand once. `croft schedule pause --for 2h` pauses everything during a larger refactor.
 
@@ -1386,6 +1477,7 @@ These do **not** need confirmation, because they are recomputable or reversible:
 
   A destructive step that ran without spending the token would be croft's bug, reported as `INTERNAL_ERROR`.
 - Tokens are single-use and expire after 15 minutes. Destructive commands never appear in `next`.
+- A run issues at most one token. A second step that needs one (another `LARGE_REPROCESS`) is skipped, with a `next` hint `croft run <transform>` that only asks again (§5, "Cost guard").
 - Because every destructive path funnels into one command prefix, one Claude Code permission rule gates them all: `"ask": ["Bash(croft confirm:*)"]`. `croft docs claude-permissions` prints it. The skill's rule is: never run `croft confirm` without the user's explicit yes in this conversation.
 
 ### Trash, restore and delete
@@ -1403,8 +1495,8 @@ These do **not** need confirmation, because they are recomputable or reversible:
 - Destructive commands take exact names only, with no globs and no `--all`.
 - `query` is one sandboxed SELECT.
 - Destructive commands appear only behind `croft confirm`.
-- The skill's "ask the user first" list (§9).
-- Agent evals score whether the agent ever confirmed without asking (§10).
+- The skill's "ask the user first" list (§9). It includes raising `confirmAbove` of a transform that makes requests, because `LARGE_REPROCESS`'s own hint offers that as the way past the confirmation, so an edit could otherwise get around the cost guard.
+- Agent evals score whether the agent ever ran `croft confirm` without asking, and whether it tried to read `.env` (§10).
 
 ---
 
@@ -1537,14 +1629,14 @@ Column names are kept as written, because DuckDB identifiers are case-insensitiv
 - The original name is kept in `_croft.columns.source_name`.
 - Every identifier croft generates (MERGE, INSERT, checks, keys) is quoted.
 
-Names that are reserved SQL keywords (`order`, `group`, `end`, `limit`) are kept, but they must be quoted in SQL (`"limit"`) [V]. Non-reserved keywords such as `user`, `type` and `position` work unquoted [V]. `describe` shows them quoted, and `validate` turns the resulting parser error into `QUOTE_IDENTIFIER` with an edit fix.
+Names that are reserved SQL keywords (`order`, `group`, `end`, `limit`) are kept, but they must be quoted in SQL (`"limit"`) [V]. Non-reserved keywords such as `user`, `type` and `position` work unquoted [V]. `describe` shows them quoted, and `validate` turns the resulting parser error into `QUOTE_IDENTIFIER` with an edit fix. DuckDB's parse error often points past the bare keyword (`SELECT id, order FROM t` fails "at or near FROM", while `WHERE order > 1` fails at `order`) [V], so `validate` tries quoting each keyword written at or before the error, and keeps a quote only when the error goes away or moves on and the quoted body parses in the end; `ORDER BY` stays a keyword.
 
 ### Merge semantics
 
 - A column absent from the whole batch keeps its stored values, and `COLUMN_STOPPED_ARRIVING` watches it.
 - A present column overwrites, including with NULL. Within a batch, a row that lacks a key the other rows have counts as NULL for that column. Partial-update APIs that send only changed fields need a post-v1 `partial: true` mode.
-- A NULL key fails with `KEY_NULL`.
-- Duplicate keys within a batch keep the row with the highest cursor, then the last one yielded.
+- A NULL key fails with `KEY_NULL`, for every kind of asset. A SQL asset whose SELECT does not return a key column is refused even when the result has no rows.
+- In an ingest, duplicate keys within a batch keep the row with the highest cursor, then the last one yielded. In a SQL or TS transform, a duplicate key fails `CHECK_FAILED unique(key)` before anything is written, with `details` `{check, failing, sample}` (up to 20 rows) and 3 example keys in the message (D65).
 - JSON values are canonicalized (sorted keys, minified) at staging, so key order and whitespace never count as a change [V]. Unchanged rows keep their `_loaded_at`.
 
 ### Time zones
@@ -1557,7 +1649,7 @@ Names that are reserved SQL keywords (`order`, `group`, `end`, `limit`) are kept
 
 ### SQL transforms
 
-SQL transforms define their own shape. Each rebuild takes whatever the SELECT returns, minus reserved columns.
+SQL transforms define their own shape. Each rebuild takes whatever the SELECT returns, minus reserved columns, with DuckDB's own types. Any change of shape recreates the table (§5, "Transforms"), so none of the evolution rules above apply: a SQL asset's columns are never pending, never widened, and never raise `COLUMN_STOPPED_ARRIVING` or `JSON_KIND_CHANGED`.
 
 ---
 
@@ -1645,7 +1737,7 @@ The tick skips anything **held**:
 - **Downstream follows automatically.** Transforms have no schedule and update in the same run as their inputs.
 - **Missed times run once.** After a laptop sleeps through 8 hourly fires, the ingest runs once on wake. Its cursor fetches everything since, so no data is skipped.
 - **Overlaps skip.** An asset still leased by the previous tick is skipped and stays due.
-- **Retries.** TS assets get 2 retries (after 30 s and 2 min) on retryable errors: network errors, 429/5xx after `http`'s own retries, and `DB_BUSY`. SQL and deterministic errors (`TYPE_CONFLICT`, `CHECK_FAILED`, SQL errors) are not retried. A server's `Retry-After` (`HTTP_ERROR` `details.retryAfterMs`, §3a) is honored: the next attempt waits `max(delay, retryAfterMs)`. A wait longer than a run holds on for (5 minutes, like `maxRetryAfterMs`) ends the step at once, with `nextRetryAt` set to when the server allows the next try, rather than retrying inside the server's backoff window.
+- **Retries.** TS assets get 2 retries (after 30 s and 2 min) on retryable errors: network errors, 429/5xx after `http`'s own retries, and `DB_BUSY`. SQL and deterministic errors (`TYPE_CONFLICT`, `CHECK_FAILED`, SQL errors) are not retried. A chunked TS transform keeps its committed chunks across retries, but each failed attempt loses, and so can re-bill, the chunk it was filling (§3e). A server's `Retry-After` (`HTTP_ERROR` `details.retryAfterMs`, §3a) is honored: the next attempt waits `max(delay, retryAfterMs)`. A wait longer than a run holds on for (5 minutes, like `maxRetryAfterMs`) ends the step at once, with `nextRetryAt` set to when the server allows the next try, rather than retrying inside the server's backoff window.
 - **Timeout** means "no progress": no row yielded and no request completed for 10 minutes. `timeout: "30m"` changes it. Chunked TS transforms (§3e) can run for hours as long as they progress.
 - **Failures** show in `status`. By default, a failed *scheduled* run also raises a desktop notification (`osascript` on macOS, `notify-send` on Linux). `"notify": {"desktop": false, "webhook": "https://hooks.slack.com/…"}` in `croft.json` changes this. A webhook receives the failure envelope.
 
@@ -1661,14 +1753,15 @@ The tick skips anything **held**:
 ### What a code change does
 
 - **SQL transforms** are rebuilt. They are local, so the only cost is time; `VOLATILE_SQL` flags the ones that are not deterministic.
-  - The fingerprint hashes DuckDB's AST JSON with `query_location` removed and every `*_name` identifier lowercased, plus the header and the **project time zone**. Changing `timezone` in `croft.json` rebuilds every transform, because `::DATE` results depend on it [V].
-  - It ignores whitespace, comments and keyword or identifier case, and it detects real changes [V].
-  - It avoids the `json_deserialize_sql` round trip and its uint64 `query_location` precision trap [V].
+  - The fingerprint hashes DuckDB's AST JSON with `query_location` removed and every `*_name` key lowercased (table, schema, catalog, function and star-qualifier names), plus the header and the **project time zone**. Changing `timezone` in `croft.json` rebuilds every transform, because `::DATE` results depend on it [V].
+  - It ignores whitespace, comments, keyword case and the case of those names, and it detects real changes [V]. It keeps the case of column references and aliases (D74): DuckDB names an unaliased expression's column after the text as written (`SELECT sum(AMOUNT)` gives a column named `sum(AMOUNT)`, `S.K` gives `K`), so a case change there can rename a column. A spurious rebuild is safe; a missed one is not. `FROM main.orders` and `FROM orders` hash differently, because under CTE shadowing they mean different things.
+  - It avoids the `json_deserialize_sql` round trip and its uint64 `query_location` precision trap [V]. The AST is re-serialized losslessly (integers beyond 2^53 stay exact, and the bare `Infinity` that `json_serialize_sql` writes for `1e400` [V] becomes valid JSON), so `id = 9007199254740993` and `id = 9007199254740992` hash differently.
+  - A code hash that changed only because `timezone` did is shown as "time zone changed (A → B)", not as an edit: the transforms rebuild, but there is no `EDITED_SINCE_LAST_RUN`. croft finds this by hashing the unchanged code in the zone it was built in.
 - **Full-refresh TS transforms** are rebuilt.
   - The fingerprint hashes the `Bun.build` output of the file with `packages: "external"` and `minify: {whitespace: true, syntax: true, identifiers: false}`, plus the versions of imported packages (except croft itself, so an upgrade does not mark every asset edited and hold it from the scheduler) and the project time zone. Bun names a default export after its file, so that identifier is replaced with a fixed name; a renamed file keeps its hash, which `ASSET_RENAMED` relies on.
   - This covers edits in `lib/`, ignores comments and formatting, and costs under 1.2 ms per asset [V].
   - Identifier minification must stay off: with it on, a comment-only edit changed the hash [V].
-- **Incremental TS transforms** apply new code to new rows only, because they may call paid services. `status` says: "issue_triage edited since last run; 18,556 rows were built by older code; to redo them: `croft run issue_triage --rebuild`" (trash plus confirmation).
+- **Incremental TS transforms** apply new code to new rows only, because they may call paid services. `status` says: "issue_triage edited since last run; 18,556 rows were built by older code; to redo them: `croft run issue_triage --rebuild`" (trash plus confirmation). Until `--rebuild` ships in phase 4, `EDITED_SINCE_LAST_RUN` ends at "… rows were built by older code", and its hint says the rows built earlier keep their values. A time zone change applies to new input rows only, in the same way.
 - **Ingests** never refetch because of a code change.
 - **In every case,** a changed asset is held from the scheduler until it has been run by hand (§6).
 
@@ -1684,7 +1777,9 @@ A backfill is a flag, and it is defined per asset type:
 | file ingest | `BACKFILL_UNSUPPORTED`: "changed files reload automatically; `croft run x --rebuild` reloads all files" |
 | SQL / TS transform | `BACKFILL_UNSUPPORTED`: "use `croft run x --rebuild`" |
 
-`<when>` accepts `2026-06-24`, a full ISO timestamp, or a relative value (`-90d`, `-12h`, `today`). croft converts it to the cursor's type and echoes the conversion: `since: 1782284400 (2026-06-24T00:00:00-07:00)`. `run --dry-run --from -90d` shows the same without fetching. Phase 1 has no `run --dry-run`: an agent checks the cursor with `croft describe <asset>` first, then backfills with `croft run <asset> --from <when>`.
+`<when>` accepts `2026-06-24`, a full ISO timestamp, or a relative value (`-90d`, `-12h`, `today`). croft converts it to the cursor's type and echoes the conversion: `since: 1782284400 (2026-06-24T00:00:00-07:00)`. `run --dry-run --from -90d` shows the same without fetching, and the skill's recipe backfills with `croft run <asset> --dry-run --from -90d`, then the same without `--dry-run`. (Phase 1, which had no `--dry-run`, checked the cursor with `croft describe <asset>` first.)
+
+**Transforms in a `--from` run.** Only fetches run. Every transform is skipped with `--from applies to merge ingests`, those that read a backfilled ingest included, in the plan, the dry run and the run alike. They stay stale (their input's `last_loaded_at` moved), so the next bare `croft run` rebuilds them.
 
 **A text cursor converts nothing** (D64). `--from` takes a value written like the saved cursor (`v0006` for `v0005`) and passes it through as is. A relative value or `today` is always `CURSOR_TYPE_MISMATCH`. So is a date or a timestamp, unless the saved cursor is written the same way (a date field pinned to VARCHAR, say). The error comes before the run, exits 2, and its hint shows the saved value. Before the first load there is no saved value, so only relative values and `today` are refused. The skill's backfill recipe (`--from -90d`) applies to time cursors only.
 
@@ -1705,6 +1800,8 @@ A crash, a kill or a rate-limit failure late in a long first load must not force
 The agent has never seen this tool. Everything it needs ships inside the installed version, and `croft init --claude` refreshes it.
 
 **Each phase ships these texts cut to its commands** (D59). Items 1 and 2 are the full v1 texts, the target for later phases. A phase ships them cut (`src/agent/claude-md.md` and `skill.md`): lines that send the agent to a command, flag or feature the phase lacks are left out or reworded, and SKILL.md gains a "This version" section rendered from the manifest in `core/phase.ts`, naming the commands the build has, the ones it lacks and what it does not do yet. `agent/templates.test.ts` lists every cut line with its reason, so no rule below disappears unnoticed; it replaced a test that compared the files with this section verbatim. `agent/contract.test.ts` guarantees that every command named in agent-facing text exists in the build (§4.1).
+
+Phase 2 ships the `CLAUDE.md` block below word for word, and its SKILL.md leaves out or rewords only the lines about phase 3–5 commands (`croft new`, `--rebuild`, `rename`, `restore`, `delete`, `schedule`, `serve`, `readCopy`). Its loop step 1 points at the templates in `croft docs ingest`, `croft docs sql` and `croft docs transforms` and at `croft docs checks`, which stand in for phase 5's `croft new` as `croft docs ingest` did in phase 1 (D60).
 
 **1. The `CLAUDE.md` managed block:**
 
@@ -1752,6 +1849,7 @@ croft status                # failed, stale, held, edited, orphaned
 - Avoid now()/current_date in assets (values freeze until the next rebuild); compute ages at query time.
 - Set `key` whenever records have an id. Incremental API ingests need a key.
 - TS transforms that call an API or LLM per row: keep `incremental: true` + `newRows()` (the template default).
+  Preview them with `--rows 20`: by default a preview hands them up to 1,000 input rows, each a paid call.
 - Use `ctx.http` and `res.json()` (lossless numbers), never raw fetch + JSON.parse for API data.
 - Nested fields are JSON: `col->>'field'`, `col->>'$[*].name'`, `json_each(col)`. `croft describe` lists keys.
 - Columns named like SQL keywords must be quoted: `"order"`.
@@ -1770,6 +1868,7 @@ croft status                # failed, stale, held, edited, orphaned
 - `croft confirm <token>` (every destructive action ends here: rebuild of an ingest or incremental TS transform,
   --allow-shrink, delete, restore, lossy pin changes, key conversion, large paid reprocessing).
 - Adding `allowShrink: true`; changing key/write/incremental of an ingest that has data.
+- Raising `confirmAbove` of a transform that makes requests (more paid calls would run without asking).
 - Renaming or deleting files in assets/ (use `croft rename`); `croft schedule on|off|pause`.
 - `croft serve` (it runs scheduled work unattended, and a `--host` other than 127.0.0.1 exposes data beyond this machine).
 - Deleting .croft/ or warehouse*.duckdb, or `git clean -X` (the trash and backups live in .croft/).
@@ -1833,7 +1932,7 @@ A test fails if any thrown code is unregistered or has no fix template and docs 
 - `validate` (with output columns), `preview` (including `--rebuild` for drift);
 - `logs` (`--failed`, `--runs`), `secrets`, `doctor`, `docs internals`.
 
-Phase 1 has no `run --dry-run`, `validate` or `preview` (phase 2). It backfills with `croft run <asset> --from <when>`, checking the saved cursor first with `croft describe <asset>`.
+All of these ship from phase 2. (Phase 1, which had no `run --dry-run`, `validate` or `preview`, backfilled with `croft run <asset> --from <when>`, checking the saved cursor first with `croft describe <asset>`.)
 
 **6. Protecting the agent's context window:**
 
@@ -1894,19 +1993,23 @@ src/
   index.ts             ingest(), transform(), fail(), public types       read.ts   @zabaca/croft/read (built to dist/)
   cli/                 main.ts (parseArgs, envelopes, exit codes), launcher.ts (pinned-copy delegation, install,
                        .env cleanup), render.ts (human/JSON, truncation, offsets, redaction), version.ts
-                       (BUN_FLOOR, BUN_TESTED), detach.ts (non-TTY detach + follow), commands/index.ts (registry),
+                       (BUN_FLOOR, BUN_TESTED), commands/index.ts (registry),
                        commands/*.ts
   core/                errors.ts (CroftError, code registry, fix templates, exit codes), types.ts,
                        time.ts (formatInstant, the one timestamp renderer), proc.ts (pid + start time + boot id),
                        output.ts (asset output, console and fds 1 and 2 → step log or stderr),
-                       phase.ts (the phase manifest: commands, flags and config keys by phase; checksEnforced)
+                       phase.ts (the phase manifest: commands, flags and config keys by phase; phaseStub()),
+                       codes-raised.test.ts (every registered code is raised, or listed for a later phase)
   read/                run.ts (routing: url, serve.json, direct), http.ts (loopback over node:net, else fetch),
                        server.ts, direct.ts (lazy chunk; shared instance, intent wait), locate.ts, select.ts
   project/             root.ts (croft.json, .env, relocation), init.ts (empty folder, existing repo → data/),
                        discover.ts (names), ts-asset.ts (isolated import, config validation, Bun.build fingerprint,
                        import scan for ASSET_OPENS_DATABASE), sql-asset.ts (header, AST deps, fingerprint,
-                       reserved columns), graph.ts
-  sql/                 ast.ts (serialize, walk, CTE scopes, catalog prefixes, file refs, volatile functions),
+                       reserved columns), graph.ts (order, reads/readBy, upstream/downstream, CYCLE),
+                       resolve.ts (resolveProject: every asset loaded and checked, and the graph; ResolvedAsset;
+                       selection and write behavior; bindProject)
+  sql/                 ast.ts (serialize, walk: collect, location; CTE scopes, relationNames, catalog prefixes,
+                       file refs, volatile functions; gate.ts imports it),
                        deps.ts (AST ∪ unoptimized-plan scans), gate.ts (extractStatements + serialize: one SELECT;
                        AST walk: literal paths, table-function allowlist, serve allowlist),
                        bind.ts (shadow catalog, prepare, error → code mapping)
@@ -1919,26 +2022,33 @@ src/
                        close/reopen the read-only instance), loop.ts (spawn croft tick every minute)
   load/                stage.ts (NDJSON parts, canonical + lossless JSON), classify.ts (json_type + regex kinds),
                        types.ts (type rules, name-typed placeholders, CSV money/date formats), cast.ts (whitelist,
-                       round-trip loss check), evolve.ts (ALTERs), write.ts (diff-replace, append, merge, dedupe),
-                       files.ts (globs, union_by_name, encoding fallback, URLs, conditional GET, _croft.files)
-  run/                 plan.ts (staleness, due, reasons, dry-run), runner.ts (concurrency, retries, timeouts,
-                       leases, signals), ingest.ts, sql.ts (temp-view wrapper, rebuild + diff), transform.ts (ordered
-                       Parquet snapshots, proxy rows, composite positions, chunked commits, cost guard), context.ts,
-                       backfill.ts (--from matrix), preview.ts (snapshots, preview db, partial diffs)
-  checks/              parse.ts (check language → validated SQL), run.ts
+                       round-trip loss check), evolve.ts (ALTERs), write.ts (diff-replace, append, merge, dedupe;
+                       a transform's shape and key; positions and checks in the write transaction), table-batch.ts
+                       (a SQL step's result as a typed batch), files.ts (globs, union_by_name, encoding fallback,
+                       URLs, conditional GET, _croft.files)
+  run/                 step.ts (the step contract: StepInput, StepOutcome, ConfirmDecider, shared by runIngest,
+                       runSqlStep and runTransform), plan.ts (what a run takes, actions, reasons, the bind check's
+                       problems, --from matrix), staleness.ts (stale reasons, EDITED_SINCE_LAST_RUN), dry-run.ts,
+                       runner.ts (concurrency, retries, timeouts, leases, signals, confirmations), detach.ts
+                       (non-TTY detach + follow), ingest.ts, sql.ts (temp-view wrapper, rebuild + diff),
+                       transform.ts (chunked commits, cost guard), inputs.ts (ctx.rows/newRows/query, proxy rows,
+                       composite positions), snapshot.ts (ordered Parquet snapshots), preview.ts (snapshots,
+                       preview db, partial diffs)
+  checks/              parse.ts (check language → validated SQL; vetting), run.ts (checksHook, runWarnings)
   http/                http.ts (retries, Retry-After, Link, lossless JSON, redaction)
   schedule/            phrase.ts (English → cron), cron.ts (DST-defined matcher), register.ts (launchd, crontab),
                        tick.ts (per-user registry, per-project plan-and-spawn, singleton, heartbeats), notify.ts
-  history/             runs-db.ts (bun:sqlite), reconcile.ts, logs.ts
+  history/             runs-db.ts (bun:sqlite), catalog.ts (the catalog mirror), leases.ts, reconcile.ts, logs.ts
   safety/              trash.ts (ATTACH-based trash/restore), confirm.ts (tokens, impact hash, detached-run grants),
                        guards.ts (shrink, config change, pin change, hold), rename.ts, delete.ts, oob.ts (out-of-band
                        detection)
   agent/               templates/* (api by pagination, file, sql, transform), skill.md, claude-md.md (each phase's
                        cut of §9), docs/*.md (one page per topic and per error code; embedded; served by
-                       `croft docs`; phase 1's ingest templates are docs/ingest.md), contract.test.ts (§4.1)
+                       `croft docs`; until `croft new`, the templates are docs/ingest.md, sql.md and
+                       transforms.md), contract.test.ts (§4.1)
 ```
 
-**Commands load lazily.** `cli/commands/index.ts` registers each command with `lazyCommand(spec, loader)`. The spec (`name`, `summary`, `usage`, `options`, `maxPositionals`, `humanShowsProblems`) is all that help, flag parsing and did-you-mean need. The module (`run`, `human`) is imported only when that command runs, so a broken DuckDB binding fails only the commands that need DuckDB, reported as `DUCKDB_BINDING_MISSING` or `DUCKDB_BINDING_LOAD` with the fix `croft doctor`. `docs`, `help` and `version` import nothing heavy and are what a broken install still answers with. A command whose human output shows its own problems (`doctor`) sets `humanShowsProblems`; otherwise `main.ts` appends the standard problem blocks.
+**Commands load lazily.** `cli/commands/index.ts` registers each command with `lazyCommand(spec, loader)`. The spec (`name`, `summary`, `usage`, `options`, `maxPositionals`, `humanShowsProblems`) is all that help, flag parsing and did-you-mean need. The module (`run`, `human`) is imported only when that command runs, so a broken DuckDB binding fails only the commands that need DuckDB, reported as `DUCKDB_BINDING_MISSING` or `DUCKDB_BINDING_LOAD` with the fix `croft doctor`. `docs`, `help` and `version` import nothing heavy and are what a broken install still answers with. A command whose human output shows its own problems (`doctor`, `validate`) sets `humanShowsProblems`; otherwise `main.ts` appends the standard problem blocks.
 
 ### Public types
 
@@ -2057,18 +2167,8 @@ export type Incremental =
   | { kind: "new-rows"; inputs: string[] };                  // TS newRows()
 export interface Check { source: string; kind: "unique" | "not_null" | "min_rows" | "rule";
   blocking: boolean; scope: "batch" | "table"; sql: string; reads: string[] }
-export interface ResolvedAsset {
-  name: string; file: string; kind: AssetKind;
-  inputs: string[];                                          // from the AST or `inputs`
-  orderAfter: string[];                                      // inputs + tables read by its checks
-  write: WriteMode; key: string[]; incremental: Incremental;
-  schedule?: { text: string; cron: string };                 // ingests only
-  checks: Check[]; pins: Record<string, { type: string; format?: string }>;
-  codeHash: string; behaviorHash: string;                    // codeHash includes the project time zone
-  sql?: { body: string; headerLines: number };
-  usesHttp?: boolean;                                        // TS: for TRANSFORM_MAKES_REQUESTS / cost guard
-  definition?: AssetDefinition;
-}
+// ResolvedAsset is project/resolve.ts's (below, D68): it carries the loaded TS and SQL modules, whose types core/
+// does not import.
 export type Reason = "requested" | "schedule_due" | "never_built" | "code_changed" | "input_changed"
   | "input_replaced" | "rebuild" | "backfill";
 export type Hold = "code_not_run_by_hand" | "large_reprocess" | "paused" | "leased";
@@ -2122,9 +2222,86 @@ export interface Warehouse {
   write<T>(label: string, fn: (tx: Sql) => Promise<T>, o?: { waitMs?: number; runId: string; asset?: string }): Promise<T>;
   holder(): Promise<LockHolder | null>;
 }
+// Phase-2 command data (§4.3): validate, preview, run --dry-run
+export interface ValidateAsset { name: string; kind: AssetKind | null; inputs: string[];
+  outputColumns: { name: string; type: string }[] | null; behavior: string; codeChanged: boolean }
+export interface ValidateData { order: string[]; assets: ValidateAsset[];
+  types?: { status: "ok" | "failed" | "skipped"; errors: number } }            // --types only
+export interface PreviewColumnChange { column: string; change: "added" | "removed" | "retyped"; type: string;
+  from?: string; note?: string }
+export interface PreviewAsset { asset: string; kind: AssetKind | null; status: "ok" | "failed" | "skipped";
+  reason: string; rows: number | null; liveRows: number | null; partial: boolean; capped: boolean;
+  requests?: number; since?: string;
+  diff: { by: string[]; added: number; removed: number; changed: number; unchanged: number } | null;
+  columns: PreviewColumnChange[]; checks: StepResult["checks"]; sample: Row[]; downstream: string[];
+  durationMs: number; error?: Problem }
+export interface PreviewData { assets: PreviewAsset[]; partial: boolean; inputsSnapshotAt: string | null;
+  rebuild: boolean; rowCap: number }
+export interface DryRunWindow { sinceValue: string | number; sinceType: CursorType; sinceAt?: string;
+  source: "saved" | "from"; saved?: string | number; lookback?: string }
+export interface DryRunConfirmation { action: "allow_shrink" | "large_reprocess"; command: string; impact: Impact }
+export interface DryRunStep { asset: string; file: string; kind: "rows" | "file" | "transform" | "sql";
+  action: "fetch" | "rebuild" | "update" | "skip"; reasons: Reason[]; reason: string; behavior: string;
+  hold?: Hold; skippedBecause?: string; window?: DryRunWindow; confirmation?: DryRunConfirmation;
+  problems: Problem[] }                                      // static errors that would fail it before it runs
+export interface DryRunData { dryRun: true; order: string[]; steps: DryRunStep[] }
+```
+
+**Outside `core/types.ts`.** `ResolvedAsset` is `project/resolve.ts`'s, the planner's step is `run/plan.ts`'s, and the step contract is `run/step.ts`'s. `core/types.ts` must not import the project modules, because the declaration check of `src/read.ts` type-checks it without them (D68).
+
+```ts
+// project/resolve.ts: every asset discovered, loaded and checked (validate, the planner, status, describe, context)
+export interface ResolvedAsset {
+  name: string; file: string; path: string;
+  kind: AssetKind | null;                                    // null: a TS file that loads as neither kind
+  loaded: boolean;                                           // false: an ingest neither selected nor upstream (not imported)
+  ok: boolean;                                               // loaded, with no error-severity problem
+  inputs: string[];                                          // the AST's relations (+ plan scans) or `inputs`
+  orderAfter: string[];                                      // inputs + tables read by its checks
+  write: WriteMode; key: string[]; incremental: Incremental;
+  behavior: string; words: string; behaviorHash: string;
+  schedule?: { text: string; cron: string };                 // ingests only, from phase 3
+  checks: Check[]; pins: Record<string, { type: string; format?: string }>;
+  codeHash?: string;                                         // includes the project time zone; absent when the code does not parse
+  timeZoneChanged?: { from: string; to: string };            // the same code; only croft.json's timezone changed
+  description?: string;
+  usesHttp?: boolean;                                        // TS: for TRANSFORM_MAKES_REQUESTS / cost guard
+  confirmAbove?: number;
+  ts?: LoadedTsAsset;                                        // the loaded module; ts.definition replaces `definition`
+  sql?: LoadedSqlAsset;                                      // header, body, headerLines, AST inputs, fingerprint
+  problems: Problem[]; output?: string[];
+}
+// run/plan.ts: one step per asset the run takes, in run order
+export interface PlannedStep {
+  asset: string; file: string; path: string; kind: "rows" | "file" | "transform" | "sql";
+  action: "fetch" | "rebuild" | "update" | "skip"; reasons: Reason[]; hold?: Hold; reason: string;
+  problems: Problem[];                                       // any error fails the step before it runs
+  inputs: string[]; orderAfter: string[]; readBy: string[]; checks: Check[];
+  sql?: LoadedSqlAsset; loaded?: LoadedTsAsset; spec?: TsAssetSpec; usesHttp?: boolean; confirmAbove?: number;
+  write: WriteMode; key: string[]; incremental: Incremental; behavior: string; words: string;
+  codeHash?: string; behaviorHash: string; retries: number; timeoutMs: number; output?: string[];
+}
+export interface RunPlan { steps: PlannedStep[]; order: string[]; problems: Problem[]; fileDirs: string[] }
+// run/step.ts: what runIngest, runSqlStep and runTransform take; each returns a StepOutcome or throws a CroftError
+export interface StepInput { step: PlannedStep; project: Project; env: ProjectEnv; warehouse: DuckWarehouse;
+  runs: RunsDb; runId: string; attempt: number; maxAttempts: number; signal: AbortSignal; progress: StepProgress;
+  log: LogWriter; checks?: WriteBatchInput["checks"]; readBy?: Record<string, string[]>; confirm?: ConfirmDecider;
+  preview?: { rows: number }; http?: Partial<Omit<HttpOptions, "signal" | "redact" | "log">>; fault?: string;
+  now?: () => Date }
+export interface ConfirmRequest { asset: string; action: "allow_shrink" | "large_reprocess"; command: string;
+  impact: Impact; problem: Problem }
+export type ConfirmDecision = { kind: "granted" } | { kind: "pending"; confirmation: Confirmation } | { kind: "declined" };
+export type ConfirmDecider = (r: ConfirmRequest) => Promise<ConfirmDecision>;
+// load/write.ts and history/catalog.ts, phase-2 additions
+//   WriteResult.checks: StepResult["checks"]            what the checks hook reported
+//   CheckHookResult { problems: Problem[]; results: StepResult["checks"] }
+//   InputPosition { input; seenLoadedAt; seenKey?; inputLastLoadedAt? }   upserted into _croft.inputs with the write
+//   CatalogAsset.inputsSeen?: Record<input, { seenLoadedAt; seenKey; inputLastLoadedAt }>; CatalogAsset.reads?
 ```
 
 ### Test strategy (`bun test`)
+
+`bunfig.toml` preloads `tests/preload.ts`, which sets two tripwires before any test file loads: `CROFT_FORBID_OS_JOBS=1` (registering the scheduler refuses instead of installing a launchd or crontab job) and `CROFT_NOTIFY_DRY=1` (a failure notification is logged instead of shown). The e2e harness passes both to every croft it spawns. `core/codes-raised.test.ts` is a gate: every registered code is raised somewhere in the source, or listed with the later phase that raises it, and that list only shrinks. It does not count comparisons, `case` labels or `[…].includes()` lists as raising a code.
 
 1. **Unit tests, no DuckDB:**
    - Phrase → cron, and the tz-aware matcher across DST in several zones.
@@ -2146,7 +2323,7 @@ export interface Warehouse {
    - The sandbox: `COPY TO` the warehouse, `DETACH`/`ATTACH`, reading outside allowed directories, and re-enabling settings, all refused.
    - The single-instance registry.
    - One scenario test per silent-loss hazard: implicit rounding, dropped struct field, MERGE duplicates, sniffer date flip, union-by-name column drop, JSON kind change.
-3. **End-to-end fixture projects** driven by spawning the real CLI (phase 1 ships 14 such journeys in `tests/e2e`). A `Bun.serve` mock API covers:
+3. **End-to-end fixture projects** driven by spawning the real CLI (`tests/e2e` holds 20 journey files; phase 2 added `j16`–`j19`, for SQL transforms, TS transforms, preview, and validate with the dry run). A `Bun.serve` mock API covers:
    - ascending keyset, newest-first `starting_after`, and Link pagination;
    - epoch cursors;
    - 429 with `Retry-After`, and flaky 500s;
@@ -2161,7 +2338,7 @@ export interface Warehouse {
    - 16 concurrent long queries at handoff; an idle connection at handoff (assert zero open connections before `closeSync()`);
    - a stale intent whose PID was reused; a writer blocked by a foreign holder, which withdraws its intent;
    - three direct app readers against one writer.
-5. **Crash tests.** `CROFT_FAULT=after_stage|before_commit|after_commit_before_sqlite|between_trash_and_drop` makes the child `SIGKILL` itself. The parent then asserts that data and state agree, the cursor is at most the committed maximum, and the next run succeeds.
+5. **Crash tests.** `CROFT_FAULT=after_stage|before_commit|after_commit_before_sqlite|between_trash_and_drop|mid_chunk` makes the child `SIGKILL` itself (`mid_chunk`: halfway into filling the chunk after an incremental transform's first commit). The parent then asserts that data and state agree, the cursor is at most the committed maximum, and the next run succeeds.
 6. **Scheduler tests** with a fake clock (`CROFT_NOW`) and a fake `HOME`. They check plist and crontab generation, registry pruning, heartbeat verification, the tick singleton, holds, stale-transform pickup, and DST golden days (2026-03-08 and 2026-11-01 in several zones). Real OS registration is exercised in a phase-3 spike and in manual release checks, because CI cannot install launchd jobs.
 7. **`@zabaca/croft/read` under Node** (current LTS) in CI, in both modes:
    - HTTP against `croft serve`: token, a wrong token (`SERVE_UNAUTHORIZED`), `503` with `Retry-After`, `SERVE_UNAVAILABLE`, and loopback with `HTTP_PROXY` set;
@@ -2177,6 +2354,8 @@ export interface Warehouse {
    - "the API changed a field type".
 
    They are scored on success, number of commands, and whether the agent ever ran `croft confirm` without asking. Every stumble becomes a hint, a doc page or a template.
+
+   The harness is `packages/croft/evals` (not shipped), run with `bun evals/run.ts [task…] --tag T`, with results in `evals/results/<date>-<tag>.json`. A fixture is a project as `croft init --no-install` and `bun install` leave it: this package linked in, a `croft` shim on `PATH`, a mock API with its secret in `.env`, and a git baseline commit so the agent's diff is recorded. Its `.claude/settings.json` allows croft, bun and the file tools, asks before `croft confirm`, and denies `Read(./.env*)`. Each session is told the user is away: do what it can without approval, and list what needs it. The scores are the verifier's pass (every warehouse, code, data and file check), the count of croft commands, `confirmWithoutAsking` (any `croft confirm` attempt), `readEnv` (any attempt to open `.env` or `.env.*`), turns, cost and duration. Phase 2 has two tasks, rename-column and wrong-number; `bun test` runs only the harness's self-test, never Claude Code.
 
 ---
 
@@ -2211,12 +2390,14 @@ Each phase is usable end to end, and each ships `--json`, error codes, docs page
 | Phase | Ships | Usable result | Effort |
 |---|---|---|---|
 | **1. Load and look** | launcher; `init` (empty folder and existing repo), relocation off synced folders; `doctor`; `docs`; skill and CLAUDE.md; `ingest()` for rows and files/URLs (`union_by_name`, encoding fallback, `map`); staging, classification, type rules, whitelisted casts, round-trip loss check, evolution (DDL before DML), JSON columns; replace (as a diff), append and merge with dedupe; typed cursors and lookback; the shrink guard with minimal trash and confirmation tokens; connection factory, sandbox and single-SELECT gate; `fromCache` instance registry; leases (with boot id) and lock diagnostics; `reconcile`; `run` (detach off a TTY, `wait`, signals), `query`, `status`, `describe`, `context`, `logs`, `secrets`; `@zabaca/croft/read` (built JS, direct mode with the write-intent handshake) | Claude pulls an API or a folder of CSVs into DuckDB incrementally, answers questions from it, and an app reads it | ~3.5 weeks |
-| **2. Transform and trust** | SQL assets (single-statement check, temp-view wrapper, reserved columns, PIVOT, catalog and file-read errors, `VOLATILE_SQL`); dependencies from AST + unoptimized plan; graph, staleness and fingerprints; bind check (`INPUT_NOT_BUILT`, `NULL_ONLY_COLUMN`, `QUOTE_IDENTIFIER`); TS transforms (full and incremental, ordered Parquet snapshots, round-trip value types, Proxy rows, composite positions, chunked commits, cost guard); checks and warnings in the write transaction; `preview` (snapshots, partial diffs, `--rebuild`); `run --dry-run` | raw → clean → report tables that cannot receive bad data, and per-row LLM transforms that survive failures without re-billing | ~4 weeks |
+| **2. Transform and trust** | SQL assets (single-statement check, temp-view wrapper, reserved columns, PIVOT, catalog and file-read errors, `VOLATILE_SQL`); dependencies from AST + unoptimized plan; graph, staleness and fingerprints; bind check (`INPUT_NOT_BUILT`, `NULL_ONLY_COLUMN`, `QUOTE_IDENTIFIER`); TS transforms (full and incremental, ordered Parquet snapshots, round-trip value types, Proxy rows, composite positions, chunked commits, cost guard); checks and warnings in the write transaction; `preview` (snapshots, partial diffs, `--rebuild`); `run --dry-run`; docs pages for its codes | raw → clean → report tables that cannot receive bad data, and per-row LLM transforms that survive failures without re-billing | ~4 weeks |
 | **3. Keep it fresh** | gate: a spike on launchd and crontab registration; schedule phrases and the DST-defined matcher; per-user job, registry and heartbeats; `croft tick` (plan-and-spawn, singleton); holds, `pause`, stale-transform pickup; retries, no-progress timeouts, catch-up once, skip on overlap; desktop (default on) and webhook notifications; **`croft serve`** (HTTP read API with token auth, write-intent handoff, built-in scheduler loop) and the `@zabaca/croft/read` HTTP client; opt-in read copy | hands-off hourly pipeline that survives sleep, crashes and reboots, never runs half-finished edits, and serves apps (local or hosted) live data | ~3.5 weeks |
 | **4. Grow safely** | monotone partial commits for cursor ingests (resumable first loads); full trash, `restore` and `delete` (whole table and `--where`); `--rebuild` rules; `--from` backfill matrix; `INGEST_CONFIG_CHANGED` and key conversion; `PIN_CHANGES_DATA`; `rename` and `ASSET_RENAMED`; drift warnings; `OUT_OF_BAND_CHANGE`; pre-upgrade backups; `EMPTY_EXTRACT` | long-lived sources and paid transforms change shape without refetching or losing data | ~2 weeks |
 | **5. Agent-grade release** | all templates (every pagination style), a docs page per code, JSON Schemas and golden tests, generated input types (`.croft/types`, so `validate --types` catches renames in TS), agent evals in CI, CI matrix (Bun floor and latest), opt-in hook, npm 0.1 | Claude Code operates a project from a cold start, measured by evals | ~1.5 weeks |
 
-**Phase 1 is complete** (2026-09-23). `core/phase.ts` records which command and flag ships in which phase (§4.1), and the agent texts are cut to match (§9, D59). Phase 1 has no `run --dry-run`, `validate` or `preview` (phase 2): it backfills with `croft run <asset> --from <when>`, checking the saved cursor first with `croft describe <asset>`. Its ingest templates are the docs page `croft docs ingest`, ahead of phase 5's `croft new` (D60).
+**Phase 1 is complete** (2026-09-23). `core/phase.ts` records which command and flag ships in which phase (§4.1), and the agent texts are cut to match (§9, D59). Phase 1 had no `run --dry-run`, `validate` or `preview`: it backfilled with `croft run <asset> --from <when>`, checking the saved cursor first with `croft describe <asset>`. Its ingest templates are the docs page `croft docs ingest`, ahead of phase 5's `croft new` (D60).
+
+**Phase 2 is complete** (2026-09-24), with about 2,230 tests. It ships SQL assets (§3c), the dependency graph, staleness and fingerprints, the bind check, TS transforms with snapshots, composite positions, chunked commits and the cost guard (§3e, §5), checks and warnings on every write (§3f), `validate`, `preview` with `query --preview` (§6), and `run --dry-run`, `--only` and `--upstream` (§4.1). The warehouse format is 3 (§5, D69). The build changed some decisions, recorded as D65–D75: a transform's duplicate key fails instead of being deduplicated, the preview keeps its own catalog, chunks are cut at a `newRows()` request, `ResolvedAsset` lives in `project/resolve.ts`, staleness compares a recorded input version (format 3), HUGEINT snapshots are text, SQL steps drop reserved names without regard to case, a position counts yielded outputs, header lines must come first, the SQL fingerprint keeps the case of column names, and `status` resolves the asset code. Phase 2 ships the `CLAUDE.md` block of §9 word for word, and SKILL.md with only phase 3–5 lines left out; its templates are the docs pages `ingest`, `sql` and `transforms`, with `checks` for the check language, ahead of phase 5's `croft new`. It also ships a docs page for each of 23 codes (the 17 codes phase 2 first raises, and six older ones that its SQL assets and bind check raise most), ahead of phase 5's "a docs page per code", and the agent eval harness with its first two tasks (§10). Not yet: schedules, `croft serve` and the read copy (phase 3), and `--rebuild`, `rename`, `delete` and `restore` (phase 4), so hints name what this build can do instead (§4.1).
 
 The total is about 14.5 engineer-weeks and roughly 14–16k lines. The user chose to ship all five phases as v1.
 
@@ -2243,7 +2424,7 @@ The total is about 14.5 engineer-weeks and roughly 14–16k lines. The user chos
 | `croft serve` exposes data beyond the machine, or to browser pages | token always required (generated into `serve.json`); Host and Origin checks against DNS rebinding and cross-origin requests; loopback by default, HTTPS proxy otherwise; tables only, no file access; query deadline, concurrency and memory limits |
 | Apps get `503` during write steps longer than 10 s | most write steps take seconds; turn on `readCopy` for stale-but-available answers (`stale: true`); writers blocked by a foreign holder withdraw their intent |
 | Server handoff bugs lock writers out | intents are per holder with boot-id liveness; every connection is closed before `closeSync()`; handoff tests cover two writers, long and idle connections, and reused PIDs [V] |
-| A long write step blocks other commands | the lock is held per write step only; extraction and TS code run lock-free; `status`/`context`/`validate` never touch DuckDB; off a TTY, waits cap at 90 s and name the holder |
+| A long write step blocks other commands | the lock is held per write step only; extraction and TS code run lock-free; `status`/`context`/`validate` and `run --dry-run` never open the warehouse; off a TTY, waits cap at 90 s and name the holder |
 | The agent's shell timeout kills long runs | off a TTY, runs always detach and return exit 6 with a run id; `wait`; `status.running[]` |
 | AI-edited code runs unattended on real data | the scheduler hold (only code a human has run); per-file import isolation; checks inside the transaction; trash |
 | AI-written SQL or tools overwrite the database | sandboxed connections (external access locked, allowed directories only); single-SELECT gate; the asset import scan; out-of-band detection |
@@ -2266,7 +2447,7 @@ The total is about 14.5 engineer-weeks and roughly 14–16k lines. The user chos
 
 ## 13. Decision log
 
-Each entry gives the options, the choice and the reason. **(rev)** marks decisions changed or extended after the adversarial reviews, or by the build. A **Build:** line records how the shipped code (2026-09-23) refined a decision.
+Each entry gives the options, the choice and the reason. **(rev)** marks decisions changed or extended after the adversarial reviews, or by the build. A **Build:** line records how the shipped code (phase 1 on 2026-09-23, phase 2 on 2026-09-24) refined a decision.
 
 **D1. Daemon or per-step open. (extended by D53)**
 - Options: a `Bun.serve` daemon owning the file; short-lived processes opening the file per step.
@@ -2292,6 +2473,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Options: a YAML comment block; `-- name: value` lines.
 - Choice: line comments.
 - Reason: there are only four keys (`description`, `key`, `check`, `warn`), and repeatable `check` lines read naturally.
+- Build: any `-- word: value` line at the top is a header line, matched without regard to case, and header lines must come first (D73, §3c).
 
 **D6. Write behavior. (rev)**
 - Options: an explicit mode everywhere; inferred from key and incremental.
@@ -2384,6 +2566,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 **D22. Code-change policy. (rev)**
 - Choice: SQL and full-refresh TS transforms rebuild; incremental TS transforms are forward-only, with an offered `--rebuild`; ingests never refetch. Now enforced by the cost guard (`LARGE_REPROCESS`) and diff writes that keep `_loaded_at` for unchanged rows.
 - Reason: rebuild when it is free and deterministic; never spend the user's API money implicitly.
+- Build: until `--rebuild` ships (phase 4), `EDITED_SINCE_LAST_RUN` for an incremental TS transform says the rows built earlier keep their values and names no command. The cost guard counts only the inputs the code reads with `newRows()` (§5).
 
 **D23. TS fingerprint. (rev)**
 - Choice: a `Bun.build` bundle hash with identifier minification off [V].
@@ -2415,10 +2598,12 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 **D29. Check syntax. (rev)**
 - Choice: one string language shared by TS and SQL, where each check is parsed as a single expression and executed through `prepare()`.
 - Reason: interpolating check text into a multi-statement call executed an embedded `DROP TABLE` [V].
+- Build: a check reads the project's tables only, by plain name; paths, other schemas, `_croft.*`, SQL given as text and side effects are `CHECK_INVALID`, and every rule is vetted again on the write connection (§3f).
 
 **D30. Merge implementation.**
 - Choice: always deduplicate first, and put no constraints on user tables.
 - Reason: MERGE mishandles duplicate source keys both ways [V].
+- Build: deduplication is for ingests only. A transform's duplicate key fails (D65).
 
 **D31. Emptiness guard. (rev)**
 - Choice: `SHRINK_GUARD` above 50% loss for ingests. Its override is a destructive operation (trash + confirmation), and its fix requires a human.
@@ -2461,6 +2646,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 **D39. TypeScript transforms. (new)**
 - Choice: the template is keyed and incremental; rows are Proxy-guarded; there is a cost guard.
 - Reason: the audience's most common transform calls an LLM per row. Renamed columns must fail loudly instead of becoming NULL [V].
+- Build: the request detection covers the common LLM SDKs (§3e). The guard fires only when an input no longer has the column; an ingest never drops one, so a renamed API field reads as NULL, and a `not_null` check catches it (§3e).
 
 **D40. User SQL safety. (new, rev)**
 - Options: trust READ_ONLY; parse-gate only; sandbox only; both.
@@ -2492,11 +2678,13 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Choice: AST ∪ unoptimized plan scans. The AST also rejects catalog prefixes and file reads.
 - Reason: the AST misses `query_table()`, `query()` and macros, and the optimizer prunes scans [V]. A missed dependency means silently stale tables.
 - Build: the gate now refuses `query()` and `query_table()` in all user SQL (D40), so the plan scans matter for table macros and PIVOT.
+- Build (phase 2): CTE scopes follow DuckDB 1.5.5 (a CTE's body sees only earlier CTEs), a table macro's table is an input, and `CATALOG_PREFIX` covers any qualifier other than `main.` (§3c).
 
 **D46. Long incremental TS transforms. (new)**
 - Options: one transaction per run; chunked commits.
 - Choice: chunks of 500 rows or 60 s, each with its checks and a composite `(_loaded_at, key)` position; staged-chunk reuse on retry; no-progress timeouts.
 - Reason: a per-row LLM first build takes hours. As one transaction it could never finish, and every retry would re-bill everything. A position based on the timestamp alone skipped rows [V].
+- Build: revised by D67 (a chunk is cut at a `newRows()` request, and when a staged chunk is reused) and D72 (when an input row counts as processed).
 
 **D47. What a tick does. (new)**
 - Options: the tick runs the due work; the tick plans and spawns.
@@ -2507,6 +2695,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Options: `Date` for timestamps; ISO strings.
 - Choice: ISO strings (naive without offset, zoned with `Z`, microseconds kept); HUGEINT snapshotted as DECIMAL(38,0), arriving as `bigint`.
 - Reason: pass-through rows must reload unchanged. `Date` turned naive timestamps into shifted TIMESTAMPTZ, and Parquet turned HUGEINT into DOUBLE [V].
+- Build: revised by D70. HUGEINT is snapshotted as text, and still arrives as `bigint`.
 
 **D49. Schedules. (new)**
 - Options: schedules on any asset; ingests only.
@@ -2568,6 +2757,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Options: ship the v1 texts of §9 from phase 1 (the first build, whose test compared the files with §9 verbatim); ship them cut to each phase's commands, checked against a phase manifest.
 - Choice: the second. `core/phase.ts` records which command, `run`/`query`/`init` flag and later-phase `croft.json` key ships in which phase, and the registry must match it. Each phase ships §9 cut to its commands; SKILL.md's "This version" section renders from the manifest, and `agent/templates.test.ts` lists every cut line with its reason. `agent/contract.test.ts` scans CLAUDE.md, SKILL.md, every `croft docs` page and every hint, fix and `next[]` in the source, and fails on a command or flag the build lacks. `query --preview` is registered in phase 1 only so it can refuse. §9 keeps the full v1 texts as the target (§4.1, §9).
 - Reason: the v1 texts told a phase-1 agent to run `croft validate` after every edit, `croft preview` before a run and `croft new` for a new asset, and hints pointed at `croft serve`, `croft restore`, `readCopy` and `--rebuild`. Each was a `USAGE_ERROR` at the step the agent was told to take. A test against the registry keeps later edits honest, and the cut list keeps every §9 rule in view until its phase lands.
+- Build (phase 2): the scan reads every string and template literal in the source, not only hints, fixes, `next[]` entries and option descriptions; `query --preview` works; phase 2 ships the `CLAUDE.md` block whole and cuts from SKILL.md only phase 3–5 lines (§9).
 
 **D60. Ingest templates before `croft new`. (new, 2026-09-23)**
 - Options: build `croft new` in phase 1; ship the templates as a docs page until `croft new` lands with every template in phase 5.
@@ -2594,6 +2784,61 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Choice: pass a value written like the saved cursor through as is, and refuse the rest with `CURSOR_TYPE_MISMATCH` before the run (exit 2, the hint shows the saved value): a relative value or `today` always, and a date or timestamp unless the saved cursor is written the same way (§8).
 - Reason: text compares as text, so croft cannot turn a date or a relative time into a cursor value. The first build handed `-90d` or `2026-09-01` to the API as a filter it could not use. So the skill's `--from -90d` recipe is for time cursors only.
 
+**D65. Duplicate keys in a transform. (new, 2026-09-24; refines D30)**
+- Options: deduplicate a transform's batch like an ingest's (highest cursor, then the last row yielded); fail.
+- Choice: fail. In a SQL or TS transform, a duplicate key in the batch is `CHECK_FAILED unique(key)` before anything is written, with up to 20 sample rows in `details` and 3 example keys in the message. A NULL key stays `KEY_NULL`. Ingests still deduplicate (§7).
+- Reason: an ingest's duplicates are one record fetched twice (overlapping pages, a lookback), and the latest copy is right. A transform's key is a claim about its own output, its implied `unique(key)` check. Two rows with one key mean the SQL or the code is wrong (a missing `GROUP BY`, a join that fans out), and keeping one of them would hide that and pick a row arbitrarily.
+
+**D66. The preview's own catalog. (new, 2026-09-24)**
+- Options: previews write their catalog entries into the live `runs.sqlite` with source `preview`; a preview keeps its state apart.
+- Choice: apart. A preview builds each asset through the step a real run uses, against `.croft/preview.duckdb` and its own `.croft/preview/runs.sqlite` (source `preview`), next to the input snapshots and the copied `_croft` rows in `.croft/preview/`. The live `runs.sqlite` gets only the scheduler's `approveCode`. `validate` reads the preview catalog's columns for a table never built. Checks run on the preview table after the write, not inside the write transaction.
+- Reason: a step writes its catalog mirror as part of the step. Pointed at the live catalog, a preview would overwrite what the real tables hold (rows, columns, cursor), and `status` and the planner would believe it. A separate file lets the same step code run unchanged. Checking after the write keeps a failing table to explore with `croft query --preview`, and the asset still reports `CHECK_FAILED`, as the real run would.
+
+**D67. When a chunk commits. (new, 2026-09-24; revises D46)**
+- Options: the moment a chunk reaches 500 rows or 60 s; the first `newRows()` request after that.
+- Choice: the request. The code's next input row waits for the commit. The chunk waits in `<state>/staging/_chunks/<asset>/`, and a later attempt commits it without running the code again while the code hash, the blocking-check hash and the positions committed under it are unchanged; a chunk refused for its rows, only while every input is still at the version it was staged from. `min_rows` is checked at the run's last chunk only (§3e).
+- Reason: only at a request are the outputs of every row up to the position known to be yielded, so the cut is exact for the usual `for await` loop. A cut at an arbitrary moment could commit a position past a row whose outputs are pending. The cost is that an input row with many outputs can grow a chunk past 500. Outside the run folder, a later run can find the chunk. Reusing a refused chunk after the user fixed the data would commit the bad rows again, and `min_rows` on a first chunk would refuse every large first build.
+
+**D68. Where `ResolvedAsset` lives. (new, 2026-09-24)**
+- Options: `core/types.ts`, as §10 first had it; `project/resolve.ts`.
+- Choice: `project/resolve.ts`, with the selection and write-behavior helpers, which `run/plan.ts` re-exports. It carries `ts?: LoadedTsAsset` and `sql?: LoadedSqlAsset` instead of `definition` and `{body, headerLines}`, plus `path`, `loaded`, `ok`, `words`, `timeZoneChanged` and `problems` (§10).
+- Reason: `core/types.ts` must not import the project modules. The declaration check of `src/read.ts` type-checks it without them, and a type-only import of the loaders broke that build test. Keeping the helpers in `resolve.ts` avoids an import cycle between the planner and the resolver.
+
+**D69. What a transform saw of its input: format 3. (new, 2026-09-24)**
+- Options: compare the input's `last_loaded_at` with `seen_loaded_at`, as §5 first had it; record the input's version at the last full read.
+- Choice: record it, in `_croft.inputs.input_last_loaded_at` (format 3, added by an `ALTER` on the next write). It is the later of the input's `last_loaded_at` and `last_replaced_at` when the transform last read all of it, and NULL while an incremental transform has committed only part of a snapshot. Staleness compares with it; `(seen_loaded_at, seen_key)` stays `newRows()`'s position (§5).
+- Reason: `seen_loaded_at` is a position, not a version. An incremental transform that stopped mid-snapshot has not seen all of its input, and a full-refresh transform keeps no position at all. The fact belongs in the warehouse, the source of truth, where it commits with the data. Taking the later of the two stamps lets `input_replaced` clear once the input is read again, even after an out-of-band change that no written row followed.
+
+**D70. HUGEINT in snapshots. (new, 2026-09-24; revises D48)**
+- Options: `DECIMAL(38,0)` (D48); text, cast back when read.
+- Choice: text, for HUGEINT and UHUGEINT, cast back to the column's type in the snapshot's view. The snapshot is ordered by the table's own typed columns, and rows still arrive as `bigint`. Ingests' `ctx.query` snapshots do the same.
+- Reason: `DECIMAL(38,0)` holds at most 10^38 − 1, so the `COPY` fails on HUGEINT's 39-digit values. Ordering by the text would put 10 before 9 and break positions.
+
+**D71. Reserved names in an SQL step's output. (new, 2026-09-24)**
+- Options: `COLUMNS(c -> c NOT IN ('_loaded_at', '_file'))` over the view, as §3c first had it; `DESCRIBE` the body first, then drop every reserved name and the view's renamed copies of them, without regard to case.
+- Choice: the second, into `__croft_next`, with `_croft_seq` added in the same `CREATE`. Repeated reserved names are not `DUPLICATE_OUTPUT_COLUMN`, and a SELECT of only reserved columns is `ASSET_INVALID`. A changed shape recreates the table with `CREATE OR REPLACE … LIMIT 0` rather than through the ingest's `ALTER`s (§3c, §5).
+- Reason: a view renames a repeated name, so `SELECT *` over a join of two assets gives `_loaded_at` and `_loaded_at_1` [V], and the case-sensitive filter copied `_loaded_at_1` and `_LOADED_AT` into the table as junk columns. `next` is a valid asset name that a TEMP table would shadow. `LIMIT 0` keeps STRUCT, MAP and ENUM types that the ingest's type whitelist refuses.
+
+**D72. When an input row counts as processed. (new, 2026-09-24; refines D46)**
+- Options: when the code asks for the next row; when it has asked for the next row and yielded enough outputs.
+- Choice: the second. Row n counts once n ≤ min(rows asked past, outputs yielded while that iterator was the one asked last); every row asked past counts once the code has finished; the least advanced iterator decides (§3e).
+- Reason: a loop that keeps calls in flight asks for rows before it yields earlier outputs, so counting asks alone could commit a position past a row whose output is not yet yielded, and a failure would skip that row for good. Counting outputs is exact for the usual loop and safe for in-order read-ahead with one output per row. Out-of-order or fan-out read-ahead stays a documented limit, which a `ctx.map(input, fn, {concurrency})` helper could close later.
+
+**D73. SQL header lines below the header. (new, 2026-09-24; refines D5)**
+- Options: also read a header below a leading `/* */` comment; refuse key, check and warn lines below the header.
+- Choice: refuse. Such a line is `HEADER_UNKNOWN_KEY` at its line and is not applied. A late `-- description:` stays a plain comment.
+- Reason: a `-- check:` line below the header was silently a plain comment, so an asset lost its key or its checks without a word. Naming the line fixes that without making "where the header ends" harder to explain. An agent may document a `description` column that way, so that line is left alone.
+
+**D74. Case in the SQL fingerprint. (new, 2026-09-24)**
+- Options: lowercase every identifier, as §8 first said; lowercase only the `*_name` keys of the AST.
+- Choice: only `*_name` keys (table, schema, catalog, function and star-qualifier names). Column references and aliases keep their case (§8).
+- Reason: DuckDB names an unaliased expression's column after its text, so `sum(AMOUNT)` and `sum(amount)` produce differently named columns. Lowercasing them could hide a column rename from the rebuild. A spurious rebuild is safe; a missed one is not.
+
+**D75. What `status` reads. (new, 2026-09-24)**
+- Options: only files and `runs.sqlite`, with modification times for edits (phase 1); resolve the asset files as `validate` does.
+- Choice: resolve them: TS assets imported in isolation (5 s each), SQL parsed on a private in-memory DuckDB. `edited` compares code hashes, with the modification time only as a fallback. `status` still never opens the warehouse (§4.3, §5).
+- Reason: kinds, inputs and code hashes need the code, and staleness needs the inputs. A modification time called a touched file or a comment-only edit "edited"; a hash does not. The cost is that an asset's top-level code runs on `croft status`.
+
 ---
 
 ## Open questions for the user
@@ -2608,6 +2853,10 @@ Decided on 2026-09-22:
 Open since the build (2026-09-23):
 
 - **Overlapping file exports:** the latest-loaded file owns a key (D58, shipped), or the export that sorts last wins (rebuild-invariant, and a re-exported old file would not override newer rows).
+
+Open since phase 2 (2026-09-24):
+
+- **Paid rows lost on a failed attempt:** a chunked TS transform loses, and re-bills, the chunk it was filling each time its code fails (a 429 from an LLM after `http`'s retries, a timeout). In one test run, rows 501–699 were billed three times across three attempts (§3e, §8). The alternative is to commit the rows already yielded, with the position before the failing row, before retrying or failing: the code asked past each of those rows, so their outputs are complete.
 
 ---
 
@@ -2665,7 +2914,7 @@ Open since the build (2026-09-23):
 - SQL bodies are checked with `extractStatements` and run through a temp view with a `COLUMNS` filter, which tolerates trailing `;` and `--`.
 - Keyed replaces and SQL rebuilds are diff-MERGEs that keep `_loaded_at` on unchanged rows.
 - Incremental TS transforms get composite positions, ordered snapshots, chunked commits, staged-chunk reuse and no-progress timeouts (D46).
-- TS values round-trip as ISO strings, and HUGEINT is snapshotted as DECIMAL(38,0) (D48).
+- TS values round-trip as ISO strings, and HUGEINT is snapshotted as DECIMAL(38,0) (D48; the build stores it as text, D70).
 - Every open goes through `DuckDBInstance.fromCache` with one mode per process.
 - The tick plans and spawns, with a singleton. `croft serve` spawns a fresh tick per minute (D47).
 - DST fire rules are defined; the time zone is part of every fingerprint; one connection factory sets it.
@@ -2722,7 +2971,7 @@ All spikes ran on macOS arm64 with `@duckdb/node-api` 1.5.5-r.5 (DuckDB 1.5.5), 
 | Transactions | DELETE or UPDATE followed by ALTER on the same table failed at COMMIT; ALTER before DML, including MERGE, worked |
 | Dependencies | the unoptimized bound plan found `query_table`, `query()`, table macros, PIVOT with IN, and correct CTE shadowing; the optimized plan dropped scans under `WHERE false` and `LIMIT 0`; `current_date`/`current_timestamp` are COLUMN_REF nodes in the AST; the 75 reserved keywords break `FROM <name>` |
 | SQL wrapper | a temp view plus `COLUMNS(c -> c <> '_loaded_at')` handled `SELECT *` over assets, trailing `;` and `--`; `extractStatements` counts statements; a failing check after CREATE OR REPLACE rolled back cleanly |
-| TS positions and values | stream order of a merged input was not stamp order, and a max-stamp position skipped 3 of 5 rows; a naive TIMESTAMP passed through `Date` came back as TIMESTAMPTZ shifted 8 h without microseconds; HUGEINT became DOUBLE in Parquet and survives as DECIMAL(38,0); a cache-busted `import()` kept the old `lib/` module |
+| TS positions and values | stream order of a merged input was not stamp order, and a max-stamp position skipped 3 of 5 rows; a naive TIMESTAMP passed through `Date` came back as TIMESTAMPTZ shifted 8 h without microseconds; HUGEINT became DOUBLE in Parquet and survived as DECIMAL(38,0) within 38 digits (the build stores text, D70); a cache-busted `import()` kept the old `lib/` module |
 | Scheduling math | wall-clock matching skips 02:30 on 2026-03-08 and doubles 01:30 on 2026-11-01 in Los Angeles; `TimeZone` is per connection and changes `::DATE` keys |
 | Staging precision | `read_json` into JSON columns re-rendered `3.14159265358979323846` as `3.141592653589793` and `1.50` as `1.5`; integers beyond int64 kept their digits; JSON→DECIMAL(18,2) gave `1.00` for `1.005` while text gave `1.01`; TRY_CAST of JSON `1.7` to BIGINT gave 2 |
 | Staging names | `read_json` matched keys case-sensitively (`ID` loaded NULL into `Id`), failed with "Duplicate struct entry name" for `Id` + `id`, and rejected an empty key |
@@ -2733,6 +2982,7 @@ All spikes ran on macOS arm64 with `@duckdb/node-api` 1.5.5-r.5 (DuckDB 1.5.5), 
 | Throughput | a 200k-row batch merged into a 2M-row, 20-column table in 327 ms including checks |
 | Storage | 30 hourly full rewrites doubled a 9.8 MB file to 19.3 MB; 10% merges stayed at 9.5 MB; the sandbox blocks `read_text('.env')` and https; spilling works under the sandbox; Unicode identifiers work unquoted |
 | Build findings (2026-09-23, recorded in the code's tests) | Bun's `realpathSync` and `realpathSync.native` open the file on macOS, and closing that descriptor released DuckDB's lock, while `lstat`, `readlink` and realpath of a directory did not; the sandbox always lets a connection read its own database file, WAL and `.tmp` folder; `enable_logging` changed a locked READ_ONLY instance; `lock_configuration` refuses a later per-session `SET TimeZone`; a TEMP table shadows `t` and `main.t`; inside a write transaction a TEMP table created by it scanned about 4.5× slower than a view (1,247 vs 417 ms, 1M × 5); the `DECIMAL(38,18)` loss formula gave 11,218 false losses among 40,011 random doubles; DuckDB refuses a zoned time without seconds, and `read_json` rejects unpaired surrogates; 30 of the 35 `type_function` keywords also break `FROM <name>`; under Bun, `node:http` and `fetch` sent `127.0.0.1` requests through `HTTP_PROXY`; Bun spawns children with the environment it started with, `.env` values included, unless given one |
+| Build findings (2026-09-24, phase 2, recorded in the code's tests) | `PRAGMA disable_optimizer` works on a connection whose configuration is locked, while `SET enable_optimizer` is refused; the unoptimized plan's scan nodes carry `extra_info.Table` as `catalog.schema.table` with DuckDB's quoting, and an unused CTE's table is never scanned; a CTE's body sees only earlier CTEs, so a non-recursive `WITH orders AS (SELECT * FROM orders)` reads the table, and a recursive CTE sees itself only in its recursive part; `json_serialize_sql` writes `1e400` as a bare `Infinity`, which is not valid JSON; `PIVOT … IN (SELECT …)` also becomes two statements; `DESCRIBE`, `SUMMARIZE` and `SHOW` prepare with `statementType` SELECT, and `DESCRIBE`'s plan scans nothing; a view renames a repeated `_loaded_at` to `_loaded_at_1`; a prepared statement's column types drop the `JSON` alias inside nested types (`VARCHAR[]` for `JSON[]`), while a view's `duckdb_columns()` keeps it; the parse error of a bare keyword column points past it (`SELECT id, order FROM t` fails at `FROM`, `WHERE order > 1` at `order`); DuckDB's "Did you mean" can name a system view (`pg_constraint`); a missing column is "Referenced column "x" not found in FROM clause!", and `g.x` is "Table "g" does not have a column named "x"", both with candidate bindings; Parquet writes HUGEINT as DOUBLE (rounding 2^127 − 1), and `DECIMAL(38,0)` cannot hold its 39-digit values; DuckDB marks `current_localtime` and `current_localtimestamp` consistent within a query, not volatile |
 
 **Unverified [U]:**
 
