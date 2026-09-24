@@ -382,7 +382,7 @@ export async function bundleTs(entry: string): Promise<BundleResult> {
     name: "croft-local-packages",
     setup(build) {
       build.onResolve({ filter: /^[^./]/ }, (args) => {
-        if (args.kind === "entry-point" || isBuiltin(args.path)) return undefined;
+        if (args.kind.startsWith("entry-point") || isBuiltin(args.path)) return undefined;
         const file = linkedPackageFile(args.path, args.importer);
         if (file) return { path: file };
         importedFrom[packageName(args.path)] ??= dirname(args.importer);

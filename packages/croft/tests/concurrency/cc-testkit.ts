@@ -239,7 +239,7 @@ export async function startServe(p: { root: string; stateDir: string }, o: { env
     stderr: () => err,
     async engine() {
       const res = await fetch(`${url}/status`, { headers: auth() });
-      const body = await res.json() as { data: { engine: EngineStatus } };
+      const body = await res.json() as { data: { serve: { engine: EngineStatus } } };
       return body.data.serve.engine;
     },
     async query(sql, q = {}) {
