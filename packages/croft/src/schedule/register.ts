@@ -6,14 +6,18 @@
 //   `crontab -l` and written with `crontab -`; every other line is kept as it was.
 // launchd's PATH is /usr/bin:/bin:/usr/sbin:/sbin [V] and cron's is as bare, so the job names Bun by absolute
 // path, preferring a stable one (~/.bun/bin/bun, Homebrew's) over a version manager's, which disappears on
-// upgrade. Output goes to ~/.croft/logs/tick.log, which heartbeat.ts reads to diagnose a job that never ticks.
+// upgrade, but never a stable one older than croft needs (a curl install left behind): each candidate's
+// `bun --version` is compared with the running Bun and croft's floor (pickBun). Output goes to
+// ~/.croft/logs/tick.log, which heartbeat.ts reads to diagnose a job that never ticks.
 //
 // ensureJob and removeJob are idempotent: a job whose content is unchanged is not rewritten or reloaded.
 // Commands go through an OsRunner (os.ts), so tests pass a fake one; and with CROFT_FORBID_OS_JOBS=1
 // (tests/preload.ts) both refuse the real home folder outright, before any file is written.
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { BUN_FLOOR, versionAtLeast } from "../cli/version.ts";
 import { CroftError } from "../core/errors.ts";
 import type { CroftHome, Env } from "./home.ts";
 import type { ExecResult, OsRunner } from "./os.ts";
@@ -32,6 +36,10 @@ export interface JobOptions {
   execPath?: string;
   /** Whether a candidate Bun path exists (tests fake the machine's). */
   exists?: (path: string) => boolean;
+  /** A candidate Bun's version (`<bun> --version`), or null when it does not run; bunVersionOf. */
+  bunVersion?: (path: string) => string | null;
+  /** The running Bun's version; Bun.version. */
+  runningVersion?: string;
   /** Between bootstrap attempts; Bun.sleepSync. */
   sleep?: (ms: number) => void;
 }
@@ -40,6 +48,10 @@ export interface BunChoice {
   path: string;
   /** False when the only Bun found is a version manager's (it may vanish on the next upgrade). */
   stable: boolean;
+  /** Its version, when known (the running Bun's, or what `<path> --version` said). */
+  version: string | null;
+  /** Stable candidates passed over: older than croft needs, or not running at all (version null). */
+  skipped: { path: string; version: string | null }[];
 }
 
 export interface JobResult {
@@ -76,21 +88,71 @@ export function isVersionManagedPath(p: string): boolean {
   return VERSIONED.some((re) => re.test(p));
 }
 
-/** The Bun the job runs: $BUN_INSTALL/bin/bun, ~/.bun/bin/bun (the official installer, which `bun upgrade`
- *  replaces in place), /opt/homebrew/bin/bun, /usr/local/bin/bun (Homebrew's stable symlinks), else the Bun
- *  running now. */
+/**
+ * The Bun the job runs. The stable candidates, in order: $BUN_INSTALL/bin/bun, ~/.bun/bin/bun (the official
+ * installer, which `bun upgrade` replaces in place), /opt/homebrew/bin/bun, /usr/local/bin/bun (Homebrew's stable
+ * symlinks). The job starts each project's pinned croft on it, so an old one left behind must not win:
+ * 1. the first stable candidate at least as new as the running Bun (and croft's floor, engines.bun);
+ * 2. else the running Bun, when its own path is stable;
+ * 3. else the first stable candidate croft still runs on (at least the floor), rather than a version manager's
+ *    path that vanishes on upgrade;
+ * 4. else the running Bun (unstable).
+ * The running Bun's own path is never run to ask; every other candidate is asked once (`<bun> --version`).
+ */
 export function pickBun(home: CroftHome, o: JobOptions = {}): BunChoice {
   const env = o.env ?? process.env;
   const exists = o.exists ?? existsSync;
-  const candidates = [
+  const probe = o.bunVersion ?? bunVersionOf;
+  const self = o.execPath ?? process.execPath;
+  const running = o.runningVersion ?? Bun.version;
+  const want = versionAtLeast(running, BUN_FLOOR) ? running : BUN_FLOOR;
+  const candidates = [...new Set([
     ...(env.BUN_INSTALL ? [join(resolve(env.BUN_INSTALL), "bin", "bun")] : []),
     join(home.userHome, ".bun", "bin", "bun"),
     "/opt/homebrew/bin/bun",
     "/usr/local/bin/bun",
-  ];
-  for (const c of candidates) if (exists(c)) return { path: c, stable: true };
-  const self = o.execPath ?? process.execPath;
-  return { path: self, stable: !isVersionManagedPath(self) };
+  ])].filter((c) => exists(c));
+  const asked = new Map<string, string | null>();
+  const versionOf = (c: string): string | null => {
+    if (sameFile(c, self)) return running;
+    if (!asked.has(c)) asked.set(c, probe(c));
+    return asked.get(c)!;
+  };
+  const choose = (path: string, stable: boolean, version: string | null): BunChoice => ({
+    path, stable, version,
+    skipped: candidates.filter((c) => c !== path && asked.has(c)).map((c) => ({ path: c, version: asked.get(c)! })),
+  });
+  const atLeast = (floor: string) => candidates.find((c) => {
+    const v = versionOf(c);
+    return v !== null && versionAtLeast(v, floor);
+  });
+  const current = atLeast(want);
+  if (current !== undefined) return choose(current, true, versionOf(current));
+  if (!isVersionManagedPath(self)) return choose(self, true, running);
+  const older = atLeast(BUN_FLOOR);
+  if (older !== undefined) return choose(older, true, versionOf(older));
+  return choose(self, false, running);
+}
+
+/** `<bun> --version`: the version it prints, or null when it does not run, fails, or prints something else. */
+export function bunVersionOf(path: string): string | null {
+  try {
+    const r = spawnSync(path, ["--version"], { encoding: "utf8", timeout: 5000, env: { PATH: "/usr/bin:/bin", LC_ALL: "C" } });
+    if (r.status !== 0 || typeof r.stdout !== "string") return null;
+    return /^\s*v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]*)?)\s*$/.exec(r.stdout)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether two paths are the same file: the same path, or the same real file. */
+function sameFile(a: string, b: string): boolean {
+  if (resolve(a) === resolve(b)) return true;
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return false;
+  }
 }
 
 /** PATH for the job and the ticks it starts: Bun's folder first, then the system's. */
