@@ -27,6 +27,7 @@ import { guardImport } from "../core/output.ts";
 import type { CursorType, Incremental, Problem, WriteMode } from "../core/types.ts";
 import { parseSchedule } from "../schedule/types.ts";
 import type { AssetDefinition } from "../types.ts";
+import { safeType } from "../load/evolve.ts";
 import { NAME_PATTERN, type DiscoveredAsset } from "./discover.ts";
 import { ProjectEnv } from "./env.ts";
 import { didYouMean } from "./suggest.ts";
@@ -802,6 +803,7 @@ const FILE_INGEST_KEYS = [...INGEST_KEYS, "file", "format", "csv", "incremental"
 const TRANSFORM_KEYS = [...COMMON_KEYS, "inputs", "incremental", "confirmAbove", "rows"];
 const CURSOR_KEYS = ["field", "unit", "lookback"];
 const CSV_KEYS = ["delimiter", "header", "skip", "encoding"];
+const PLAIN_TYPES = "pin a plain SQL type such as BIGINT, DOUBLE, VARCHAR, DATE, TIMESTAMPTZ, JSON or DECIMAL(18,2)";
 const PIN_KEYS = ["type", "format"];
 const WRITE_MODES = ["replace", "append", "merge"] as const;
 const FORMATS = ["csv", "tsv", "json", "ndjson", "parquet"] as const;
@@ -1084,6 +1086,15 @@ function validateCommon(c: Checker, cfg: Record<string, unknown>): Common {
   out.checks = stringList(c, cfg, "checks", 'checks: ["not_null(id)", "amount >= 0"]');
   out.warnings = stringList(c, cfg, "warnings", 'warnings: ["min_rows(10)"]');
 
+  // A pin reaches DDL, so only a plain SQL type passes (load/evolve.ts safeType; DESIGN.md §6 "Pin changes").
+  const plainType = (type: string) => {
+    try {
+      safeType(type, "");
+      return true;
+    } catch {
+      return false;
+    }
+  };
   if (cfg.columns !== undefined) {
     if (!isPlainObject(cfg.columns)) {
       c.invalid("columns", `columns must map column names to types, got ${describe(cfg.columns)}`, 'columns: { amount: "DECIMAL(18,2)", day: { type: "DATE", format: "%d/%m/%Y" } }');
@@ -1092,6 +1103,7 @@ function validateCommon(c: Checker, cfg: Record<string, unknown>): Common {
         const at = `columns.${col}`;
         if (typeof pin === "string") {
           if (pin.trim() === "") c.invalid("columns", `${at} is an empty type`, `give a DuckDB type: ${col}: "BIGINT"`);
+          else if (!plainType(pin)) c.invalid("columns", `${at} is "${pin.trim()}", which is not a plain SQL type`, PLAIN_TYPES);
           else out.pins[col] = { type: pin.trim() };
         } else if (isPlainObject(pin)) {
           for (const k of Object.keys(definedEntries(pin))) {
@@ -1102,6 +1114,8 @@ function validateCommon(c: Checker, cfg: Record<string, unknown>): Common {
           }
           if (typeof pin.type !== "string" || pin.type.trim() === "") {
             c.invalid("columns", `${at}.type must be a DuckDB type name, got ${describe(pin.type)}`, `${col}: { type: "DATE", format: "%d/%m/%Y" }`);
+          } else if (!plainType(pin.type)) {
+            c.invalid("columns", `${at}.type is "${pin.type.trim()}", which is not a plain SQL type`, PLAIN_TYPES);
           } else if (pin.format !== undefined && (typeof pin.format !== "string" || pin.format === "")) {
             c.invalid("columns", `${at}.format must be a strptime pattern such as "%d/%m/%Y", got ${describe(pin.format)}`, `remove format, or write one such as "%d/%m/%Y"`);
           } else {

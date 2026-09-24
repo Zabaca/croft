@@ -289,6 +289,28 @@ describe("croft status when the warehouse file is missing", () => {
     expect(r.json.data.healthy).toBe(false);                       // never built: stale, as before
     expect(r.json.data.assets.map((a: { status: string }) => a.status)).toEqual(Array(5).fill("never_run"));
   });
+
+  test("an asset croft delete removed (its step says deleted, its mirror entry is gone) is never built again", async () => {
+    const p = makeProject({ files: SCENARIO_FILES });
+    let clock = Date.parse("2026-09-22T18:00:00Z");
+    const db = runsDb(p.stateDir, () => new Date((clock += 1000)));
+    try {
+      const built = db.createRun({ id: "r_0922_1100_bld1", trigger: "manual", human: true, argv: ["run", "github_issues"], identity: DEAD });
+      db.startStep({ runId: built.id, asset: "github_issues", attempt: 1, reason: "requested" });
+      db.finishStep(built.id, "github_issues", 1, { status: "ok" });
+      db.finishRun(built.id, "succeeded");
+      const del = db.createRun({ id: "r_0922_1101_del1", trigger: "confirm", human: true, argv: ["delete", "github_issues"], identity: DEAD });
+      db.startStep({ runId: del.id, asset: "github_issues", attempt: 1, reason: "deleted" });
+      db.finishStep(del.id, "github_issues", 1, { status: "ok", reason: "deleted" });
+      db.finishRun(del.id, "succeeded");
+    } finally {
+      db.close();
+    }
+    const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+    const a = r.json.data.assets.find((x: { asset: string }) => x.asset === "github_issues");
+    expect(a).toMatchObject({ status: "never_run", rows: null, stale: true, staleReasons: ["never_built"], lastRun: { runId: "r_0922_1101_del1", status: "ok" } });
+    expect(r.json.problems).toEqual([]);
+  });
 });
 
 describe("croft status never waits on DuckDB", () => {

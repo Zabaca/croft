@@ -203,8 +203,9 @@ export function checkRunFlags(plan: RunPlan, o: Pick<RunnerOptions, "selectors" 
       throw usage("--rebuild and --allow-shrink do not go together", "a rebuild moves the table to the trash first, so no shrink guard applies: croft run <asset> --rebuild");
     }
   }
-  if (o.confirmToken !== undefined && !o.allowShrink && !o.rebuild && named?.kind !== "transform") {
-    throw usage("a confirmation applies only to --allow-shrink, --rebuild or the cost guard of one transform", "croft confirm <token> runs the confirmed command for you");
+  if (o.confirmToken !== undefined && !o.allowShrink && !o.rebuild && (!named || named.kind === "sql")) {
+    throw usage("a confirmation applies only to --allow-shrink, --rebuild, the cost guard of one transform, or a key or pin change of one ingest",
+      "croft confirm <token> runs the confirmed command for you");
   }
   if (o.from !== undefined && !o.allowShrink) {
     for (const s of plan.steps) {
@@ -771,7 +772,12 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
               // The cost guard asks a person; a scheduled run has nobody to ask, so the guard fails the step.
               out = await runTransform({ ...input, ...(o.human ?? true ? { confirm: decider } : {}) });
             } else {
-              out = await runIngest({ ...input, ...(o.from !== undefined ? { from: o.from } : {}), ...(o.allowShrink ? { confirm: decider } : {}) });
+              // A changed key or pin asks a person too (load/config-change.ts); a scheduled run has nobody to ask, so it
+              // fails. A --rebuild starts from scratch, so it has no change to settle.
+              out = await runIngest({
+                ...input, ...(o.from !== undefined ? { from: o.from } : {}), ...(o.allowShrink ? { confirm: decider } : {}),
+                ...(o.human ?? true ? { confirmChange: decider } : {}), ...(step.rebuild ? { rebuild: true } : {}),
+              });
             }
             const trashed = rebuilds.trashed(asset);
             if (trashed) out.result.trashed = { path: trashed.path, rows: trashed.rows };

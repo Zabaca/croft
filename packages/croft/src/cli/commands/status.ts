@@ -12,7 +12,8 @@
 // code the asset had, which never ran), else the catalog's; when either hash is unknown (a file that does not
 // bundle, a run that recorded none) the file's modification time since that step decides. An
 // edited asset whose table was built by older code also gets EDITED_SINCE_LAST_RUN, worded per kind: an
-// incremental TS transform is forward-only, so its warning says the rows already built keep their values.
+// incremental TS transform is forward-only, so its warning says how many rows older code built, and names the
+// rebuild that redoes them (croft run <asset> --rebuild) as a human's fix.
 //
 // Scheduling (§8, schedule.ts): `next` is the next fire time for a scheduled ingest while scheduling is on
 // ("scheduling off" or "paused" otherwise), "manual" for an ingest without a schedule and "after inputs" for a
@@ -490,12 +491,15 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       } else if (cat?.lastRunId) {
         lastRun = { runId: cat.lastRunId, at: zoned(cat.lastLoadedAt, tz) ?? "", status: "ok", code: null };
       }
+      // croft delete's step (reason "deleted") dropped the whole table and its mirror entry: the asset is never built
+      // again until it runs, although that step is ok.
+      const deleted = !cat && step?.reason === "deleted";
       let status: StatusAsset["status"];
       if (!file) status = "no_asset_file";
       else if (stepStatus === "running") status = "running";
       else if (stepStatus && FAILED.has(stepStatus)) status = stepStatus as StatusAsset["status"];
       else if (stepStatus === "skipped") status = "skipped";
-      else if (cat || stepStatus === "ok" || stepStatus === "unchanged") status = missing ? "unknown" : "ok";
+      else if (cat || (!deleted && (stepStatus === "ok" || stepStatus === "unchanged"))) status = missing ? "unknown" : "ok";
       else status = "never_run";
 
       // Staleness: nothing for a table without an asset file (no run updates it) or one being updated now.
@@ -504,7 +508,7 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       if (file && status !== "running") {
         reasons = view ? staleReasons(view) : cat ? [] : ["never_built"];
         // A step that committed while its mirror entry was not written yet (reconcile rewrites it) built the table.
-        if (!cat && (stepStatus === "ok" || stepStatus === "unchanged")) reasons = reasons.filter((r) => r !== "never_built");
+        if (!cat && !deleted && (stepStatus === "ok" || stepStatus === "unchanged")) reasons = reasons.filter((r) => r !== "never_built");
       }
 
       // Edited: the code differs from what its last run used; the file's time since that run when a hash is unknown.

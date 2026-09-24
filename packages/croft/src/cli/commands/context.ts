@@ -36,7 +36,7 @@ import {
 import { agoText, clockText, fireText } from "./schedule.ts";
 import {
   ago, collectStatus, effectiveStatus, INSPECT_IMPORT_TIMEOUT_MS, type LastRun, type RunningEntry, type Scheduling, type StatusAsset,
-  type StatusDeps, statusText, zoned,
+  renamedRows, type StatusDeps, statusText, zoned,
 } from "./status.ts";
 
 export const CONTEXT_CAP_BYTES = 20 * 1024;
@@ -187,7 +187,7 @@ export function capContext(d: ContextData, cap = CONTEXT_CAP_BYTES): ContextData
 export const context: CommandImpl<ContextData> = {
   run: (ctx) => runContext(ctx),
   human(result, ctx) {
-    return formatContext(result.data, ctx.now(), ctx.project.timezone);
+    return formatContext(result.data, ctx.now(), ctx.project.timezone, result.problems);
   },
 };
 
@@ -282,7 +282,9 @@ function schedulingWords(s: Scheduling, now: Date, tz: string): string {
   return `scheduling on (${s.lastTickAt ? `last tick ${agoText(s.lastTickAt, now)}` : "no tick yet"}${s.stale ? ", stale" : ""})`;
 }
 
-export function formatContext(d: ContextData, now: Date, tz = d.project.timezone): string {
+export function formatContext(d: ContextData, now: Date, tz = d.project.timezone, problems: readonly Problem[] = []): string {
+  // An ASSET_RENAMED pair's rows say `croft rename`, never `croft run` (status.ts statusText).
+  const renamed = renamedRows(problems);
   const lines = [`${d.project.root} · ${d.project.database} · ${d.project.timezone} · ${d.project.assets} asset${d.project.assets === 1 ? "" : "s"} · ${schedulingWords(d.project.scheduling, now, tz)}`];
   for (const a of d.assets) {
     const status: StatusAsset = {
@@ -293,7 +295,7 @@ export function formatContext(d: ContextData, now: Date, tz = d.project.timezone
     };
     lines.push("");
     const rows = a.rows !== null ? `${formatCount(a.rows)} rows` : a.status === "unknown" || a.lastLoadedAt ? "rows unknown" : "not built";
-    lines.push(`${a.asset} · ${a.kind ?? "unknown kind"} · ${a.file ?? "(no asset file)"} · ${rows} · ${statusText(status, now)}`);
+    lines.push(`${a.asset} · ${a.kind ?? "unknown kind"} · ${a.file ?? "(no asset file)"} · ${rows} · ${statusText(status, now, renamed.get(a.asset))}`);
     if (a.description) lines.push(`  ${a.description}`);
     if (a.schedule) {
       const when = a.next === "schedule" ? (a.nextFireAt ? `next ${fireText(a.nextFireAt, tz, now)}` : "next fire unknown")
