@@ -170,6 +170,26 @@ export default ingest({ async *rows() {} });
     expect(r.graph.order).not.toContain("a");
   });
 
+  test("an ingest's schedule is its text and cron (§8); an invalid phrase is the asset's SCHEDULE_INVALID", async () => {
+    const root = makeProject({
+      "assets/hourly_thing.ts": INGEST(`schedule: " every hour ",`),
+      "assets/weekday_thing.ts": INGEST(`schedule: "weekdays at 9am",`),
+      "assets/cron_thing.ts": INGEST(`schedule: "*/10  9-17 * * mon-fri",`),
+      "assets/plain_thing.ts": INGEST(),
+      "assets/typo_thing.ts": INGEST(`schedule: "evry hour",`),
+      "assets/derived.sql": "SELECT * FROM hourly_thing\n",
+    });
+    const a = byName((await resolveProject({ root, timezone: "America/Los_Angeles" })).assets);
+    expect(a.hourly_thing!.schedule).toEqual({ text: "every hour", cron: "0 * * * *" });
+    expect(a.weekday_thing!.schedule).toEqual({ text: "weekdays at 9am", cron: "0 9 * * 1-5" });
+    expect(a.cron_thing!.schedule).toEqual({ text: "*/10  9-17 * * mon-fri", cron: "*/10 9-17 * * mon-fri" });
+    expect(a.plain_thing!.schedule).toBeUndefined();
+    expect(a.derived!.schedule).toBeUndefined();
+    expect(a.typo_thing).toMatchObject({ ok: false, kind: "ingest" });
+    expect(a.typo_thing!.schedule).toBeUndefined();
+    expect(a.typo_thing!.problems.map((p) => [p.code, p.hint])).toEqual([["SCHEDULE_INVALID", 'did you mean "every hour"?']]);
+  });
+
   test("keepOutput collects each TS asset's top-level output instead of printing it", async () => {
     const root = makeProject({
       "assets/noisy.ts": `import { ingest } from "@zabaca/croft";\nconsole.log("hello from noisy");\nexport default ingest({ async *rows() {} });\n`,

@@ -602,13 +602,50 @@ describe("validateDefinition: ingests", () => {
     expect(one(files({ format: ".parquet" })).hint).toBe('format: "parquet"');
   });
 
-  test("schedule must be a non-empty string (phrases are parsed later)", () => {
+  test("schedule must be a non-empty string", () => {
     for (const bad of ["", "   ", 60, ["every hour"]]) {
       const p = one(api({ schedule: bad }));
       expect(p.code).toBe("SCHEDULE_INVALID");
       expect(p.message).toStartWith("schedule must be a non-empty string, got ");
     }
-    expect(problemsOf(api({ schedule: "whenever you like" }))).toEqual([]);
+  });
+
+  test("a schedule is a phrase or a cron (schedule/phrase.ts); the spec keeps the text as written, trimmed", () => {
+    for (const ok of ["every 15 minutes", "hourly", "daily at 06:00", "weekdays at 9am", "every monday at 08:30", "monthly", "0 6 * * 1-5"]) {
+      const v = validateDefinition(api({ schedule: ` ${ok} ` }), O);
+      expect(v.problems).toEqual([]);
+      expect(v.spec?.schedule).toBe(ok);
+    }
+  });
+
+  test("a phrase croft does not read is SCHEDULE_INVALID on the schedule line, with a did-you-mean and its fix", () => {
+    const source = `import { ingest } from "@zabaca/croft";\nexport default ingest({\n  key: "id",\n  schedule: "evry hour",\n  async *rows() {},\n});\n`;
+    const p = one(api({ schedule: "evry hour" }), { source });
+    expect(p).toMatchObject({
+      code: "SCHEDULE_INVALID", severity: "error", asset: "things", file: "assets/things.ts", line: 4,
+      message: 'schedule "evry hour" is not a phrase croft knows, nor a 5-field cron',
+      hint: 'did you mean "every hour"?',
+      fix: { kind: "edit", description: 'schedule: "every hour"', file: "assets/things.ts", line: 4, replace: { from: "evry hour", to: "every hour" } },
+      details: { key: "schedule", suggestion: "every hour" },
+    });
+    expect(validateDefinition(api({ schedule: "evry hour" }), O).spec).toBeUndefined();
+  });
+
+  test("with nothing close, the hint lists what croft reads and the fix is to rewrite it", () => {
+    const p = one(api({ schedule: "whenever you like" }));
+    expect(p.code).toBe("SCHEDULE_INVALID");
+    expect(p.hint).toStartWith('write it as "every 15 minutes", "every hour", "daily at 06:00"');
+    expect(p.fix).toEqual({ kind: "edit", description: p.hint, file: "assets/things.ts" });
+    expect(p.details).toEqual({ key: "schedule" });
+  });
+
+  test("the precise reason reaches the message: N that does not divide 60, an ambiguous hour, a bad cron field", () => {
+    expect(one(api({ schedule: "every 7 minutes" }))).toMatchObject({
+      message: 'schedule "every 7 minutes": 7 does not divide 60, so cron cannot fire every 7 minutes (its minutes restart at :00 each hour)',
+      fix: { replace: { from: "every 7 minutes", to: "every 6 minutes" } },
+    });
+    expect(one(api({ schedule: "daily at 6" })).fix).toMatchObject({ replace: { from: "daily at 6", to: "daily at 06:00" } });
+    expect(one(api({ schedule: "0 25 * * *" })).message).toBe('schedule "0 25 * * *": hour 25 is out of range (0-23)');
   });
 });
 
