@@ -1,7 +1,8 @@
 // croft wait <run-id> [--timeout 100s] (DESIGN.md §4.1, §4.3 run/wait shapes, §8 "Large first loads").
 // Blocks until a run ends and prints its result exactly as `croft run` would have (exit 0, or the run's own
 // failure exit), or exits 6 while it is still running. It reads runs.sqlite and the run's events only, so it
-// never waits on the database. A run whose process died is marked crashed. Spec in commands/index.ts.
+// never waits on the database. A run whose process died is marked crashed, and so are its running steps (the
+// next writing command checks them against the warehouse). Spec in commands/index.ts.
 import { CroftError, isCode } from "../../core/errors.ts";
 import { isRunId, RunsDb } from "../../history/runs-db.ts";
 import { DEFAULT_FOLLOW_MS, detachedRunExists, followRun, parseWait, unknownRun } from "../../run/detach.ts";

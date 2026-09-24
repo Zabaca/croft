@@ -364,11 +364,10 @@ export default transform({
     expect(llm.total()).toBe(billed + 300);
   }, 120_000);
 
-  // BUG: `croft run` reports the crash (the detached child died), and marks the RUN crashed in runs.sqlite, but
-  // leaves its STEPS running (run/detach.ts followRun → markCrashed). status only turns a running step of a
-  // dead *running* run into crashed, so until some writing command reconciles, status shows the asset
-  // "running (r_…)" with 0 running, healthy: true, and `status --check` exits 0.
-  bugTest("b4. right after croft run reports a crash, status says the transform crashed, not running", async () => {
+  // `croft run` reports the crash (the detached child died) and marks the run crashed in runs.sqlite, steps
+  // included (RunsDb.markCrashed), so status shows the asset crashed at once, before any writing command
+  // reconciles; reconcile then checks the step against the warehouse like any other.
+  test("b4. right after croft run reports a crash, status says the transform crashed, not running", async () => {
     const { p, llm } = await setup("/b4", 800);
     p.write("assets/issue_labels.ts", labelsAsset({ llm: llm.url }));
     expect((await p.json(["run", "issues", "--only"])).code).toBe(0);

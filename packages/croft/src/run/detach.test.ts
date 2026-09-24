@@ -66,8 +66,9 @@ describe("reading a run back", () => {
       expect(sum.exit).toBe(1);
       expect(sum.data.status).toBe("crashed");
       expect(sum.data.steps).toHaveLength(1);
-      expect(sum.data.steps[0]).toMatchObject({ asset: "a", attempt: 2, status: "failed" });
-      expect(sum.problems.map((p) => p.code)).toContain("RUN_CRASHED");
+      expect(sum.data.steps[0]).toMatchObject({ asset: "a", attempt: 2, status: "failed", error: { code: "RUN_CRASHED" } });
+      expect(sum.problems.map((p) => p.code)).toEqual(["RUN_CRASHED"]);
+      expect(sum.problems[0]).toMatchObject({ asset: "a", runId: run.id });
     } finally {
       db.close();
     }
@@ -86,6 +87,52 @@ describe("followRun", () => {
     if (res.kind === "finished") {
       expect(res.summary.data.status).toBe("crashed");
       expect(res.summary.exit).toBe(1);
+    }
+  });
+
+  // status reads the step, not the run: a step left running in a run croft reported crashed showed as running.
+  test("croft wait: the dead run's running step is crashed too, with RUN_CRASHED", async () => {
+    const s = stateDir();
+    const db = RunsDb.open(s);
+    const dead = spawnSync(process.execPath, ["-e", "0"]).pid!;
+    const run = db.createRun({ trigger: "manual", human: true, argv: ["run"], identity: { pid: dead, procStart: "1", bootId: bootId() } });
+    db.startStep({ runId: run.id, asset: "labels", attempt: 1, reason: "requested" });
+    db.close();
+    const res = await followRun({ stateDir: s, runId: run.id, timeoutMs: 5000, pollMs: 20 });
+    expect(res.kind).toBe("finished");
+    const after = RunsDb.open(s);
+    try {
+      expect(after.getStep(run.id, "labels", 1)).toMatchObject({ status: "crashed", error: { code: "RUN_CRASHED", asset: "labels" } });
+      expect(after.danglingSteps().map((x) => x.asset)).toEqual(["labels"]);   // the next reconcile still checks it
+    } finally {
+      after.close();
+    }
+    if (res.kind === "finished") {
+      expect(res.summary.data.steps).toMatchObject([{ asset: "labels", status: "failed", error: { code: "RUN_CRASHED" } }]);
+      expect(res.summary.problems).toMatchObject([{ code: "RUN_CRASHED", asset: "labels", runId: run.id, fix: { command: "croft run labels" } }]);
+    }
+  });
+
+  test("croft run's parent: a child killed mid-step leaves its run and its step crashed", async () => {
+    const s = stateDir();
+    const script = join(s, "kill.ts");
+    writeFileSync(script, `
+      import { RunsDb } from ${JSON.stringify(join(import.meta.dir, "../history/runs-db.ts"))};
+      const db = RunsDb.open(${JSON.stringify(s)});
+      db.createRun({ id: "r_0101_0000_kill", trigger: "manual", human: false, argv: ["run"] });
+      db.startStep({ runId: "r_0101_0000_kill", asset: "labels", attempt: 1, reason: "requested" });
+      db.close();
+      process.kill(process.pid, "SIGKILL");
+    `);
+    const spawned = spawnDetachedRun({ root: s, stateDir: s, args: [], runId: "r_0101_0000_kill", env: { PATH: process.env.PATH }, entry: script });
+    const res = await followRun({ stateDir: s, runId: "r_0101_0000_kill", timeoutMs: 10_000, pollMs: 20, spawned });
+    expect(res).toMatchObject({ kind: "finished", summary: { exit: 1, data: { status: "crashed" } } });
+    const db = RunsDb.open(s);
+    try {
+      expect(db.getRun("r_0101_0000_kill")?.status).toBe("crashed");
+      expect(db.getStep("r_0101_0000_kill", "labels", 1)).toMatchObject({ status: "crashed", error: { code: "RUN_CRASHED" } });
+    } finally {
+      db.close();
     }
   });
 

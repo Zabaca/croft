@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CroftError } from "../core/errors.ts";
+import { CroftError, problem } from "../core/errors.ts";
 import { currentIdentity } from "../core/proc.ts";
 import type { StepResult } from "../core/types.ts";
 import { isRunId, newRunId, RunsDb, SCHEMA_VERSION } from "./runs-db.ts";
@@ -262,7 +262,7 @@ describe("steps", () => {
     expect(db.lastCheckSources("orders")).toBeNull();
   });
 
-  test("danglingSteps lists running steps of ended runs only", () => {
+  test("danglingSteps lists the unchecked steps of ended runs only", () => {
     const live = db.createRun({ trigger: "manual", human: true, argv: [] });
     db.startStep({ runId: live.id, asset: "a", attempt: 1, reason: "requested" });
     const dead = db.createRun({ trigger: "manual", human: true, argv: [] });
@@ -271,6 +271,60 @@ describe("steps", () => {
     db.finishStep(dead.id, "c", 1, { status: "ok" });
     db.markCrashed(dead.id);
     expect(db.danglingSteps().map((s) => [s.runId, s.asset])).toEqual([[dead.id, "b"]]);
+    // A step an older croft left running in a run that ended is dangling too.
+    clock += 1000;
+    const old = db.createRun({ trigger: "manual", human: true, argv: [] });
+    db.startStep({ runId: old.id, asset: "d", attempt: 1, reason: "requested" });
+    db.sqlite.query("UPDATE runs SET status = 'crashed' WHERE id = ?").run(old.id);
+    expect(db.danglingSteps().map((s) => [s.runId, s.asset])).toEqual([[dead.id, "b"], [old.id, "d"]]);
+    // Once reconcile has checked a step, it is not dangling any more.
+    const lost = problem("RUN_CRASHED", { message: "lost", hint: "run it again" });
+    expect(db.settleStep(dead.id, "b", 1, { status: "crashed", error: lost })).toBe(true);
+    expect(db.settleStep(old.id, "d", 1, { status: "ok", reason: "requested (recovered)" })).toBe(true);
+    expect(db.danglingSteps()).toEqual([]);
+    expect(db.getStep(dead.id, "b", 1)).toMatchObject({ status: "crashed", error: { message: "lost" } });
+  });
+
+  // A detached run's parent (and croft wait) marks a dead run crashed as soon as it sees the child die. Its steps
+  // must say crashed at once too: status reads a running step of an ended run as running, not crashed.
+  test("markCrashed crashes the run's running steps too, unchecked until reconcile settles them", () => {
+    const run = db.createRun({ trigger: "manual", human: true, argv: ["run"], identity: { ...currentIdentity(), pid: 4242 } });
+    db.startStep({ runId: run.id, asset: "orders", attempt: 1, reason: "requested" });
+    db.finishStep(run.id, "orders", 1, { status: "ok" });
+    db.startStep({ runId: run.id, asset: "labels", attempt: 1, reason: "input orders has new rows" });
+    const other = db.createRun({ trigger: "manual", human: true, argv: ["run"] });
+    db.startStep({ runId: other.id, asset: "refs", attempt: 1, reason: "requested" });
+    clock += 5000;
+
+    expect(db.markCrashed(run.id)).toBe(true);
+    expect(db.getRun(run.id)).toMatchObject({ status: "crashed", finishedAt: "2026-09-22T17:00:05.000Z" });
+    expect(db.getStep(run.id, "orders", 1)?.status).toBe("ok");
+    const crashed = db.getStep(run.id, "labels", 1)!;
+    // No finish time yet: reconcile() has not checked the warehouse for a commit that landed before the crash.
+    expect(crashed).toMatchObject({ status: "crashed", reason: "input orders has new rows", finishedAt: null });
+    expect(crashed.error).toMatchObject({
+      code: "RUN_CRASHED", asset: "labels", runId: run.id, retryable: true,
+      fix: { kind: "command", command: "croft run labels" },
+    });
+    expect(crashed.error!.message).toContain("pid 4242");
+    expect(db.latestStep("labels", { failed: true })?.runId).toBe(run.id);
+    expect(db.getStep(other.id, "refs", 1)?.status).toBe("running");
+    expect(db.danglingSteps().map((s) => [s.runId, s.asset, s.status])).toEqual([[run.id, "labels", "crashed"]]);
+
+    // A late finish from a process wrongly thought dead cannot overwrite it; only reconcile's check settles it.
+    expect(db.finishStep(run.id, "labels", 1, { status: "ok" })).toBe(false);
+    clock += 1000;
+    expect(db.settleStep(run.id, "labels", 1, { status: "ok", reason: "input orders has new rows (recovered)", rows: { in: 3, added: 3 } })).toBe(true);
+    expect(db.getStep(run.id, "labels", 1)).toMatchObject({
+      status: "ok", reason: "input orders has new rows (recovered)", added: 3, error: null, finishedAt: "2026-09-22T17:00:06.000Z",
+    });
+    expect(db.settleStep(run.id, "labels", 1, { status: "crashed" })).toBe(false);
+    expect(db.danglingSteps()).toEqual([]);
+
+    // A run that was not running changes nothing, steps included.
+    db.startStep({ runId: run.id, asset: "late", attempt: 1, reason: "requested" });
+    expect(db.markCrashed(run.id)).toBe(false);
+    expect(db.getStep(run.id, "late", 1)?.status).toBe("running");
   });
 });
 

@@ -1,6 +1,6 @@
 // reconcile() (DESIGN.md §5 "Crash recovery"). Every command that writes, and every tick, starts
-// here. Runs whose process died become `crashed`; DuckDB, which is authoritative, says which of
-// their steps committed before the crash; their leases are released; their staging is handed back
+// here. Runs whose process died become `crashed`, running steps included; DuckDB, which is authoritative, says
+// which of their steps committed before the crash; their leases are released; their staging is handed back
 // for deletion; write intents of dead processes are deleted. Cursors move only on commit, so a lost
 // step is simply extracted again next run. A recovered step's catalog mirror entry is refreshed from
 // the warehouse, so status and context show what committed.
@@ -23,8 +23,8 @@ export interface StepRef { runId: string; asset: string; attempt: number }
 export interface ReconcileResult {
   crashed: string[];                              // runs newly marked crashed
   recovered: (StepRef & { commits: number })[];   // their commit landed: now `ok (recovered)`
-  lost: StepRef[];                                // died before committing: now `crashed`
-  unresolved: StepRef[];                          // warehouse unreadable: still running, retried next time
+  lost: StepRef[];                                // died before committing: now `crashed` (checked)
+  unresolved: StepRef[];                          // warehouse unreadable: `crashed`, unchecked, retried next time
   releasedLeases: string[];
   stagingDirs: string[];                          // existing .croft/staging/<run> folders to delete
   purgedIntents: string[];                        // write-intent files of dead processes, now deleted
@@ -108,7 +108,7 @@ function asWarning(e: unknown, pending: number): Problem {
   return {
     ...base, severity: "warning",
     message: `could not check which steps of crashed runs committed: ${base.message}`,
-    effect: `${pending} step(s) stay marked running until the next command checks again`,
+    effect: `${pending} step(s) show as crashed, unchecked, until the next command checks again`,
   };
 }
 
@@ -116,10 +116,14 @@ export async function reconcile(o: ReconcileOptions): Promise<ReconcileResult> {
   const { db } = o;
   const out: ReconcileResult = { crashed: [], recovered: [], lost: [], unresolved: [], releasedLeases: [], stagingDirs: [], purgedIntents: [], problems: [] };
 
-  // 1. Runs marked running whose process is gone become crashed.
+  // 1. Runs marked running whose process is gone become crashed, and so do their running steps, unchecked until
+  //    step 2 (as when croft run's parent or croft wait saw the process die first). A step an older croft left
+  //    running in an ended run is crashed the same way, so no step of an ended run says running, even when the
+  //    warehouse cannot be read below.
   for (const run of db.runningRuns()) {
     if (!runAlive(run) && db.markCrashed(run.id)) out.crashed.push(run.id);
   }
+  db.crashStaleSteps();
 
   // 3 (early). Their leases are released, along with any other lease whose holder died; this
   //    needs no warehouse, so it happens even when DuckDB is busy.
@@ -143,9 +147,10 @@ export async function reconcile(o: ReconcileOptions): Promise<ReconcileResult> {
     out.purgedIntents = purgeDead(db.stateDir).map((i) => i.file).sort();
   } catch {}
 
-  // 2. Steps left running by ended runs (these and any a busy warehouse left unresolved before)
-  //    are matched against _croft.writes (run id, asset and attempt) under a short read lease. The same lease
-  //    reads those assets' catalog entries, so a recovered step's mirror shows what committed.
+  // 2. The unchecked steps of ended runs (these, those croft run's parent or croft wait crashed, and any a busy
+  //    warehouse left unresolved before) are matched against _croft.writes (run id, asset and attempt) under a
+  //    short read lease. The same lease reads those assets' catalog entries, so a recovered step's mirror shows
+  //    what committed.
   const dangling = db.danglingSteps();
   if (dangling.length === 0) return out;
   let writes: CommitRow[];
@@ -169,12 +174,12 @@ export async function reconcile(o: ReconcileOptions): Promise<ReconcileResult> {
       // next run continues after the last one).
       const recovered = c.commits > 1 ? `recovered: ${c.commits} commits` : "recovered";
       const reason = s.reason ? `${s.reason} (${recovered})` : recovered;
-      if (db.finishStep(s.runId, s.asset, s.attempt, { status: "ok", reason, rows: { in: c.rowsIn, added: c.added, updated: c.updated } })) {
+      if (db.settleStep(s.runId, s.asset, s.attempt, { status: "ok", reason, rows: { in: c.rowsIn, added: c.added, updated: c.updated } })) {
         out.recovered.push({ ...ref, commits: c.commits });
         const entry = entries.get(s.asset);
         if (entry) putCatalog(db, entry, "run");
       }
-    } else if (db.finishStep(s.runId, s.asset, s.attempt, { status: "crashed", error: lostProblem(s, db.getRun(s.runId)) })) {
+    } else if (db.settleStep(s.runId, s.asset, s.attempt, { status: "crashed", error: lostProblem(s, db.getRun(s.runId)) })) {
       out.lost.push(ref);
     }
   }

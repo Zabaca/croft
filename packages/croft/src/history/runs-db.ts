@@ -5,7 +5,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { randomInt } from "node:crypto";
-import { CroftError } from "../core/errors.ts";
+import { CroftError, problem } from "../core/errors.ts";
 import { currentIdentity, type ProcessIdentity } from "../core/proc.ts";
 import type { LockHolder, Problem } from "../core/types.ts";
 
@@ -86,6 +86,7 @@ interface RunRow { id: string; trigger: string; human: number; argv: string | nu
 interface StepRow { run_id: string; asset: string; attempt: number; status: string; reason: string | null;
   started_at: string; finished_at: string | null; rows_in: number | null; added: number | null;
   updated: number | null; error: string | null; code_hash: string | null; log_path: string | null }
+interface StaleStep { run_id: string; asset: string; attempt: number; pid: number | null }
 
 const RUN_ID = /^r_\d{4}_\d{4}_[0-9a-z]{4}$/;
 const ID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz";
@@ -118,6 +119,26 @@ function parseJson(text: string | null): unknown {
   } catch {
     return text;   // written by hand or by an older build: surface it rather than crash `logs`
   }
+}
+
+/**
+ * A step reconcile() has yet to check against the warehouse, once its run has ended: one crashed with no finish
+ * time (markCrashed, crashStaleSteps; a step that ends any other way always gets one), or one still marked running.
+ * `t` is the steps table's alias with its dot, or "".
+ */
+function dangling(t: string): string {
+  return `(${t}status = 'running' OR (${t}status = 'crashed' AND ${t}finished_at IS NULL))`;
+}
+
+/** The error of a step crashed before reconcile() checked it: the process died, and whether the step committed
+ *  anything is not known yet. reconcile() replaces it with what it finds. */
+export function uncheckedCrash(asset: string, runId: string, pid: number | null): Problem {
+  return problem("RUN_CRASHED", {
+    message: `the process running ${asset} (pid ${pid ?? "?"}) died before the step finished; the next croft command that writes checks whether it committed anything`,
+    hint: `croft run ${asset} checks that first, keeps what the step committed and runs it again; cursors move only on commit, so no data is skipped`,
+    asset, runId, retryable: true,
+    fix: { kind: "command", description: "run the asset again", command: `croft run ${asset}` },
+  });
 }
 
 function toRun(r: RunRow): RunRecord {
@@ -269,12 +290,52 @@ export class RunsDb {
     this.sqlite.query("UPDATE runs SET summary = ? WHERE id = ? AND status = 'running'").run(JSON.stringify({ progress }), id);
   }
 
-  /** running → crashed. Returns false when the run was not running. */
+  /**
+   * running → crashed, together with the run's steps still marked running: they become `crashed` too, unchecked
+   * (see crashStaleSteps), so status and describe show the crash at once. Returns false when the run was not
+   * running; nothing changes then.
+   */
   markCrashed(id: string): boolean {
-    const res = this.sqlite
-      .query("UPDATE runs SET status = 'crashed', finished_at = ? WHERE id = ? AND status = 'running'")
-      .run(this.nowIso(), id);
-    return res.changes === 1;
+    return this.transaction(() => {
+      const res = this.sqlite
+        .query("UPDATE runs SET status = 'crashed', finished_at = ? WHERE id = ? AND status = 'running'")
+        .run(this.nowIso(), id);
+      if (res.changes !== 1) return false;
+      this.crashSteps(this.staleSteps(id));
+      return true;
+    });
+  }
+
+  /**
+   * Steps still marked running in a run that has ended (one an older croft marked crashed, say) become `crashed`,
+   * unchecked: RUN_CRASHED with no finish time, because only reconcile() can tell from the warehouse whether the
+   * step committed before its process died. danglingSteps lists them until settleStep records what it found.
+   * Returns how many changed.
+   */
+  crashStaleSteps(): number {
+    // Every writing command calls this, and there is usually nothing to do: no write lock is taken then.
+    const stale = this.staleSteps(null);
+    return stale.length === 0 ? 0 : this.transaction(() => this.crashSteps(stale));
+  }
+
+  /** Steps still marked running in ended runs (of one run, or of all), with their run's pid. */
+  private staleSteps(runId: string | null): StaleStep[] {
+    return this.sqlite
+      .query(`SELECT s.run_id, s.asset, s.attempt, r.pid FROM steps s JOIN runs r ON r.id = s.run_id
+              WHERE s.status = 'running' AND r.status <> 'running'${runId === null ? "" : " AND r.id = ?"}`)
+      .all(...(runId === null ? [] : [runId])) as StaleStep[];
+  }
+
+  /** Each update is guarded by status = 'running', so a step that finished meanwhile keeps its finish. */
+  private crashSteps(stale: StaleStep[]): number {
+    const crash = this.sqlite.query(
+      "UPDATE steps SET status = 'crashed', error = ? WHERE run_id = ? AND asset = ? AND attempt = ? AND status = 'running'",
+    );
+    let n = 0;
+    for (const s of stale) {
+      n += crash.run(JSON.stringify(uncheckedCrash(s.asset, s.run_id, s.pid)), s.run_id, s.asset, s.attempt).changes;
+    }
+    return n;
   }
 
   runningRuns(): RunRecord[] {
@@ -333,10 +394,21 @@ export class RunsDb {
   /** Ends a running step. Only a step still marked running changes, so a late finish cannot
    *  overwrite what reconcile decided. Returns whether the step changed. */
   finishStep(runId: string, asset: string, attempt: number, f: StepFinish): boolean {
+    return this.endStep("status = 'running'", runId, asset, attempt, f);
+  }
+
+  /** Records what reconcile() found for a dangling step (danglingSteps). Only a step still dangling changes, so
+   *  two reconciles cannot both settle it, and a late finishStep cannot overwrite what it found. */
+  settleStep(runId: string, asset: string, attempt: number, f: StepFinish): boolean {
+    return this.endStep(`${dangling("")} AND EXISTS (SELECT 1 FROM runs r WHERE r.id = steps.run_id AND r.status <> 'running')`,
+      runId, asset, attempt, f);
+  }
+
+  private endStep(when: string, runId: string, asset: string, attempt: number, f: StepFinish): boolean {
     const res = this.sqlite
       .query(`UPDATE steps SET status = ?, reason = coalesce(?, reason), finished_at = ?, rows_in = ?, added = ?,
                 updated = ?, error = ?
-              WHERE run_id = ? AND asset = ? AND attempt = ? AND status = 'running'`)
+              WHERE run_id = ? AND asset = ? AND attempt = ? AND ${when}`)
       .run(f.status, f.reason ?? null, this.nowIso(), f.rows?.in ?? null, f.rows?.added ?? null,
         f.rows?.updated ?? null, f.error ? JSON.stringify(f.error) : null, runId, asset, attempt);
     return res.changes === 1;
@@ -375,11 +447,12 @@ export class RunsDb {
     return step.checks.flatMap((c) => (typeof (c as { check?: unknown } | null)?.check === "string" ? [(c as { check: string }).check] : []));
   }
 
-  /** Steps still marked running whose run has ended: what reconcile has left to resolve. */
+  /** Steps of ended runs that reconcile has left to check against the warehouse: those markCrashed or
+   *  crashStaleSteps crashed (no finish time yet), and any still marked running. */
   danglingSteps(): StepRecord[] {
     return (this.sqlite
       .query(`SELECT s.* FROM steps s JOIN runs r ON r.id = s.run_id
-              WHERE s.status = 'running' AND r.status <> 'running' ORDER BY s.started_at`)
+              WHERE ${dangling("s.")} AND r.status <> 'running' ORDER BY s.started_at`)
       .all() as StepRow[]).map(toStep);
   }
 
