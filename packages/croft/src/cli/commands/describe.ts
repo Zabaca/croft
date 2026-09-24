@@ -22,6 +22,10 @@
 // and attempt (runs.sqlite schedule_state), with the project's scheduling setting, since nothing fires while it
 // is off or paused.
 //
+// ASSET_RENAMED (§6): when the asset is either name of a file renamed outside croft (or of a croft rename that
+// stopped), describe reports it with the fix `croft rename <old> <new>`: in place of ORPHAN_TABLE for the old name,
+// and in place of the `croft run` next step for the new one, which would fetch everything again.
+//
 // This file also holds what the other read-only commands (context, query, secrets) share: loading asset
 // configs without failing on one broken file, the read-only warehouse, and value capping with redaction.
 import { readFileSync } from "node:fs";
@@ -45,7 +49,7 @@ import type { Row } from "../../types.ts";
 import type { CommandImpl, Ctx } from "../command.ts";
 import { formatCount, formatDuration, table, toJsonLine, truncate, VALUE_WIDTH } from "../render.ts";
 import { clockText, nextFireOf, SCHEDULING_OFF, schedulingOf, type SchedulingRecord } from "./schedule.ts";
-import { type AssetNext, effectiveStatus, nextOf, openRunsDb, resolveAssets, runningEntries, zoned } from "./status.ts";
+import { type AssetNext, effectiveStatus, nextOf, openRunsDb, renamedProblems, resolveAssets, runningEntries, zoned } from "./status.ts";
 
 // ---------------------------------------------------------------------------------------------------------
 // Asset configs, read from the files
@@ -762,10 +766,16 @@ export const describe: CommandImpl<DescribeData> = {
     };
     if (source === "catalog" && catalogRefreshedAt) data.catalogRefreshedAt = zoned(catalogRefreshedAt, tz)!;
     if (samples.redacted) data.redactedValues = true;
+    // A file renamed outside croft (or a croft rename that stopped): both names say so, with `croft rename` as the
+    // fix; a run of the new name would fetch everything again, so it is not suggested (ASSET_RENAMED, §6).
+    const renamed = (await renamedProblems(project, discovery.assets, catalogAll, resolved ? new Map(resolved.assets.map((a) => [a.name, a])) : null))
+      .find((p) => p.details?.from === name || p.details?.to === name);
+    if (renamed) problems.push(renamed);
     // An orphan (its asset file is gone) is a warning with a manual fix. Deleting the table is destructive, so
     // it never appears in next (§4.3): only the user decides that.
-    if (!found) problems.push(orphanTable(name, kind, data.rows));
-    else if (!wh?.tableExists && source !== "catalog" && !cat) next.push({ command: `croft run ${name}`, reason: "build the table" });
+    if (!found) {
+      if (!renamed) problems.push(orphanTable(name, kind, data.rows));
+    } else if (!renamed && !wh?.tableExists && source !== "catalog" && !cat) next.push({ command: `croft run ${name}`, reason: "build the table" });
     if (samples.cut > 0) next.push({ command: `croft describe ${name} --full-values`, reason: "sample values were cut to 80 characters" });
     return { data, problems, next };
   },

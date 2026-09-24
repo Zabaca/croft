@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { allCatalog, type CatalogAsset, putCatalog } from "../../history/catalog.ts";
 import { resolveProject } from "../../project/resolve.ts";
@@ -827,5 +827,33 @@ describe("croft status: the read copy (R32-11)", () => {
     const [line, hint] = await copyLines(p);
     expect(line).toStartWith("Read copy warehouse.read.duckdb · as of 10:00 (2 h ago), older than the last run that wrote data (r_");
     expect(hint).toBe("  hint: the next croft run that writes data refreshes the copy; no refresh followed that run (readCopy was off then, or the refresh was cut short; .croft/readcopy.log has each failure)");
+  });
+});
+
+describe("ASSET_RENAMED: a file renamed outside croft (§6)", () => {
+  test("the problem has croft rename as its fix, and both rows say so instead of croft run", async () => {
+    const p = await scenario();
+    // github_issues.ts renamed outside croft: a new, never-built asset with the code that built github_issues.
+    renameSync(join(p.root, "assets/github_issues.ts"), join(p.root, "assets/issues.ts"));
+    const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+    expect(r.exit).toBe(0);
+    expect(r.json.problems.filter((x: { code: string }) => x.code === "ASSET_RENAMED")).toEqual([expect.objectContaining({
+      severity: "error", asset: "issues", file: "assets/issues.ts",
+      fix: { kind: "command", description: "adopt github_issues's table and state as issues", command: "croft rename github_issues issues" },
+      details: { from: "github_issues", to: "issues", rows: 18_556, unfinished: false },
+    })]);
+    expect(byAsset(r.json.data).issues.status).toBe("never_run");
+    const human = await cli(["status"], { cwd: p.root, env: ENV });
+    const row = (asset: string) => human.stdout.split("\n").find((l) => l.startsWith(`${asset} `)) ?? "";
+    expect(row("issues")).toContain("never run: looks like github_issues renamed (croft rename github_issues issues)");
+    expect(row("github_issues")).toContain("no asset file: looks renamed to issues (croft rename github_issues issues)");
+    expect(human.stdout).not.toContain("croft run issues");
+  });
+
+  test("an asset of other code is no rename", async () => {
+    const p = await scenario();
+    writeFileSync(join(p.root, "assets/fresh.sql"), "SELECT 1 AS id\n");
+    const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+    expect(r.json.problems.filter((x: { code: string }) => x.code === "ASSET_RENAMED")).toEqual([]);
   });
 });
