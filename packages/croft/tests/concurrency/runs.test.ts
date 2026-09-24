@@ -324,7 +324,7 @@ ${gatedAsset(`${api.url}/c4b/feed`, { schedule: "every hour" }).replace('import 
   // through the CLI (the e2e journeys included). Repro, in a project: CROFT_FORBID_OS_JOBS=1 HOME=$(mktemp -d)
   // CROFT_HOME=$HOME/.croft croft schedule on --no-os-job --json → "refusing to change the scheduler of the real
   // user (<the temp HOME>)".
-  bugTest("croft schedule on --no-os-job works with a temp HOME and CROFT_HOME under the test tripwire", async () => {
+  test("croft schedule on --no-os-job works with a temp HOME and CROFT_HOME under the test tripwire", async () => {
     const { project: p } = await initProject();
     const home = realpathSync(mkdtempSync(join(tmpdir(), "croft-cc-home-")));
     homes.push(home);

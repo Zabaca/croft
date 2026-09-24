@@ -240,7 +240,7 @@ export async function startServe(p: { root: string; stateDir: string }, o: { env
     async engine() {
       const res = await fetch(`${url}/status`, { headers: auth() });
       const body = await res.json() as { data: { engine: EngineStatus } };
-      return body.data.engine;
+      return body.data.serve.engine;
     },
     async query(sql, q = {}) {
       const t0 = performance.now();
