@@ -474,6 +474,56 @@ describe("croft validate (the command)", () => {
     expect(r.stdout.match(/UNKNOWN_COLUMN/g)).toHaveLength(1);
   });
 
+  test("a scheduled ingest shows its cron form and next three fire times in the project time zone (§8)", async () => {
+    const p = makeProject({
+      files: {
+        "assets/github_issues.ts": `import { ingest } from "@zabaca/croft";
+export default ingest({ key: "id", schedule: "daily at 02:30", async *rows() { yield []; } });
+`,
+        "assets/stripe_charges.ts": CHARGES_TS,
+        "assets/open_issues.sql": "SELECT id FROM github_issues\n",
+      },
+    });
+    // The day before Los Angeles springs forward: 02:30 on 2026-03-08 does not exist, so it fires at 03:00.
+    const env = { CROFT_NOW: "2026-03-07T12:00:00-08:00" };
+    const r = await cli(["validate", "--json"], { cwd: p.root, env });
+    const byName = (name: string) => r.json.data.assets.find((a: { name: string }) => a.name === name);
+    expect(byName("github_issues").schedule).toEqual({
+      text: "daily at 02:30", cron: "30 2 * * *",
+      next: ["2026-03-08T03:00:00-07:00", "2026-03-09T02:30:00-07:00", "2026-03-10T02:30:00-07:00"],
+    });
+    expect(byName("stripe_charges").schedule).toBeUndefined();
+    expect(byName("open_issues").schedule).toBeUndefined();
+    const human = await cli(["validate"], { cwd: p.root, env });
+    expect(human.stdout.split("\n")[1]).toBe("github_issues: daily at 02:30 (cron 30 2 * * *); next 2026-03-08 03:00, 2026-03-09 02:30, 2026-03-10 02:30");
+
+    // Several fires a day write the date once.
+    const q = makeProject({ files: { "assets/stripe_charges.ts": CHARGES_TS.replace('key: "id",', 'key: "id", schedule: "every hour",') } });
+    const hourly = await cli(["validate"], { cwd: q.root, env });
+    expect(hourly.stdout).toContain("stripe_charges: every hour (cron 0 * * * *); next 2026-03-07 13:00, 14:00, 15:00");
+  });
+
+  test("a schedule croft does not read is SCHEDULE_INVALID with the phrase it is closest to as an edit", async () => {
+    const p = makeProject({
+      files: {
+        "assets/github_issues.ts": `import { ingest } from "@zabaca/croft";
+export default ingest({
+  key: "id",
+  schedule: "weekdays at 9",
+  async *rows() { yield []; },
+});
+`,
+      },
+    });
+    const r = await cli(["validate", "--json"], { cwd: p.root });
+    expect(r.exit).toBe(2);
+    expect(r.json.problems).toMatchObject([{
+      code: "SCHEDULE_INVALID", asset: "github_issues", file: "assets/github_issues.ts", line: 4,
+      message: 'schedule "weekdays at 9": 9 could be 09:00 or 21:00', hint: 'did you mean "weekdays at 09:00"?',
+      fix: { kind: "edit", replace: { from: "weekdays at 9", to: "weekdays at 09:00" } },
+    }]);
+  });
+
   test("human() on its own: a clean project, and --types", () => {
     const ctx = { startedAt: performance.now(), render: { color: false } } as never;
     const clean = validate.human!({ data: { order: ["a"], assets: [{ name: "a", kind: "sql", inputs: [], outputColumns: [], behavior: "replace", codeChanged: false }] }, problems: [], next: [] }, ctx);

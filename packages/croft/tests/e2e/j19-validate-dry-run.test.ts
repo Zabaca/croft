@@ -234,7 +234,13 @@ test("journey 19a: before the first run, validate reports INPUT_NOT_BUILT and th
   expect(v.json).toMatchObject({ ok: true, command: "validate" });
   expect(v.json.data.order).toEqual(ORDER);
   expect(v.json.data.assets.map((a: Obj) => a.name)).toEqual(ORDER);
-  expect(assetOf(v.json, "github_issues")).toEqual({ name: "github_issues", kind: "ingest", inputs: [], outputColumns: null, behavior: "merge by id", codeChanged: false });
+  expect(assetOf(v.json, "github_issues")).toEqual({
+    name: "github_issues", kind: "ingest", inputs: [], outputColumns: null, behavior: "merge by id", codeChanged: false,
+    schedule: { text: "every hour", cron: "0 * * * *", next: expect.any(Array) },
+  });
+  // §8: the next three fire times, on the hour in the project time zone.
+  expect(assetOf(v.json, "github_issues").schedule.next).toHaveLength(3);
+  for (const t of assetOf(v.json, "github_issues").schedule.next) expect(t).toMatch(/^\d{4}-\d\d-\d\dT\d\d:00:00-0[78]:00$/);
   expect(assetOf(v.json, "issue_triage")).toMatchObject({ kind: "ts", inputs: ["github_issues"], outputColumns: null, behavior: "merge by issue_id" });
   expect(assetOf(v.json, "open_issues")).toEqual({ name: "open_issues", kind: "sql", inputs: ["github_issues"], outputColumns: null, behavior: "replace; key id", codeChanged: false });
   // Nothing has run: the SQL over the ingests (and over them, transitively) cannot be bound yet.

@@ -29,6 +29,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
 import { probeSql } from "../../checks/parse.ts";
 import { type Code, CroftError, CODES, isCode, problem } from "../../core/errors.ts";
+import { formatInstant } from "../../core/time.ts";
 import type { Check, Problem, ValidateAsset, ValidateData } from "../../core/types.ts";
 import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
 import { RUNS_DB_FILE, RunsDb } from "../../history/runs-db.ts";
@@ -40,6 +41,7 @@ import type { Project } from "../../project/root.ts";
 import type { LoadedSqlAsset } from "../../project/sql-asset.ts";
 import { didYouMean } from "../../project/suggest.ts";
 import { previewDirectory } from "../../run/preview.ts";
+import { nextFires } from "../../schedule/types.ts";
 import { ShadowCatalog, type ShadowColumn } from "../../sql/bind.ts";
 import type { CommandImpl, Next } from "../command.ts";
 import { formatDuration, formatProblems, problemSummary } from "../render.ts";
@@ -50,6 +52,8 @@ const TSC_TIMEOUT_MS = 180_000;
 const TSC_SHOWN = 50;
 /** Assets named in one `croft preview` next step. */
 const PREVIEW_NEXT = 10;
+/** Fire times shown for each schedule (§8). */
+const NEXT_FIRES = 3;
 
 export interface ValidateInput {
   project: Pick<Project, "root" | "timezone" | "paths">;
@@ -63,6 +67,8 @@ export interface ValidateInput {
   importTimeoutMs?: number;
   /** The shell environment tsc runs with (PATH, HOME); nothing from .env. */
   processEnv?: Readonly<Record<string, string | undefined>>;
+  /** The current time, for each schedule's next fire times (default: the clock). */
+  now?: Date;
 }
 
 export interface ValidateReport {
@@ -77,6 +83,7 @@ export const validate: CommandImpl<ValidateData> = {
     const project = ctx.project;
     const report = await validateProject({
       project, env: ctx.env, selectors: ctx.positionals, types: ctx.values.types === true, processEnv: ctx.processEnv,
+      now: ctx.now(),
     });
     return { data: report.data, problems: report.problems, next: nextSteps(report) };
   },
@@ -90,11 +97,25 @@ export const validate: CommandImpl<ValidateData> = {
         : d.types.status === "skipped" ? "types not checked"
           : `types: ${d.types.errors} error${d.types.errors === 1 ? "" : "s"} (tsc --noEmit)`);
     }
+    for (const a of d.assets) {
+      if (a.schedule) lines.push(`${a.name}: ${a.schedule.text} (cron ${a.schedule.cron}); next ${fireTimes(a.schedule.next)}`);
+    }
     if (result.problems.length) lines.push(formatProblems(result.problems, ctx.render.color));
     lines.push(problemSummary(result.problems));
     return lines.join("\n");
   },
 };
+
+/** "2026-09-24 11:00, 12:00, 13:00": fire times in the project time zone, each date written once. */
+function fireTimes(next: readonly string[]): string {
+  let day = "";
+  return next.map((t) => {
+    const [date, time] = [t.slice(0, 10), t.slice(11, 16)];
+    const s = date === day ? time : `${date} ${time}`;
+    day = date;
+    return s;
+  }).join(", ");
+}
 
 /** What to do after validate: re-check after fixing an error or warning; with none, preview the assets whose
  *  code changed since their last build; in an empty project, a template. */
@@ -114,6 +135,7 @@ export function nextSteps(r: ValidateReport): Next[] {
  */
 export async function validateProject(i: ValidateInput): Promise<ValidateReport> {
   const { root, timezone } = i.project;
+  const now = i.now ?? new Date();
   const catalog = readCatalog(i.project.paths.stateDir);
   const live = new Map(catalog.map((c) => [c.asset, c]));
   // The column cache holds previews too (§6): an input never built but previewed binds against the columns the
@@ -165,6 +187,10 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
       behavior: a.behavior,
       // A time zone change alone is no code change (project/resolve.ts timeZoneChanged).
       codeChanged: !!(a.codeHash && built?.codeHash && a.codeHash !== built.codeHash && !a.timeZoneChanged),
+      // §8: the cron form and the next fire times, in the project time zone.
+      ...(a.schedule ? {
+        schedule: { ...a.schedule, next: nextFires(a.schedule.cron, timezone, now, NEXT_FIRES).map((t) => formatInstant(t, timezone)) },
+      } : {}),
     });
   }
 

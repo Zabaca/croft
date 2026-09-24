@@ -89,6 +89,9 @@ export interface ValidateAsset {
   /** Its code differs from the code its table was last built with (the catalog's codeHash). false when it was
    *  never built, or its code does not load: there is nothing to compare. */
   codeChanged: boolean;
+  /** Scheduled ingests (§8): the schedule as written, its cron form, and its next three fire times in the project
+   *  time zone. Absent for transforms and for ingests without a schedule. */
+  schedule?: { text: string; cron: string; next: string[] };
 }
 
 /** `croft validate [asset…] [--types]`: `{order, assets}` (§4.3). Every finding is a problem of the envelope. */
