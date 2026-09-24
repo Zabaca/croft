@@ -4,9 +4,10 @@
 // writeBatch runs inside the write transaction, after cast.ts left a typed TEMP table (TypedBatch):
 //
 //   read state   _croft.assets/columns, the real table; OUT_OF_BAND_CHANGE, TABLE_MODIFIED_OUTSIDE_CROFT
-//   KEY_NULL     before anything is written
-//   drift        COLUMN_STOPPED_ARRIVING and JSON_KIND_CHANGED need the table as it was
-//   evolve       all DDL (CREATE / ADD COLUMN / ALTER TYPE) before any DML on the table
+//   KEY_NULL     before anything is written; transforms (sql, ts): a duplicate key is CHECK_FAILED unique(key)
+//   drift        COLUMN_STOPPED_ARRIVING and JSON_KIND_CHANGED need the table as it was (not for sql)
+//   evolve       all DDL (CREATE / ADD COLUMN / ALTER TYPE) before any DML on the table; a SQL transform's
+//                SELECT defines its table instead (see "SQL transforms" below)
 //   source       the batch aligned to the table's columns, deduplicated by key: highest typed cursor,
 //                then highest _croft_seq (MERGE mishandles duplicate source keys both ways [V])
 //   guards       SHRINK_GUARD
@@ -33,6 +34,18 @@
 // never loaded on their own: one of them is used only for a key whose row belongs to a reloaded file that no
 // longer has it, taken from the most recently loaded such file (_croft.files.loaded_at, then read order), and
 // it replaces the row in full (it is that file's row now). Only a key no file has any more is deleted.
+//
+// SQL transforms (kind "sql", DESIGN.md §5 "Transforms", §7 "SQL transforms"). The SELECT defines the table's
+// shape: its data columns, in order, with the types it gave them (table-batch.ts). The same shape is diffed
+// like any replace; any other shape (a column added, removed, retyped, renamed or moved) recreates the table in
+// one CREATE OR REPLACE ... AS SELECT ... LIMIT 0 (which keeps STRUCT, MAP and other types no pin could spell,
+// and rolls back cleanly [V]), so every row gets the new stamp, and the write reports SchemaChange "recreate".
+// Nothing about the old shape is a drift warning: dropping a column is the SQL's decision. A column's type
+// comes from the SQL, so it is never pending.
+//
+// Transform keys. A key is what a transform says identifies a row, and its implied unique(key) is a check: a
+// duplicate key in a SQL or TS transform's batch fails CHECK_FAILED with samples before anything is written.
+// Only ingests keep deduplicating (an API sends a changed row twice; the last one wins).
 import { CroftError, problem } from "../core/errors.ts";
 import type { AssetKind, ColumnPlan, CursorType, Problem, SchemaChange, Sql, StepResult, ValueKind } from "../core/types.ts";
 import { type InstantInput, now as clockNow, toEpochMicros } from "../core/time.ts";
@@ -41,8 +54,8 @@ import { assertNoShrink, detectOutOfBand, type ExtractInfo, isoMicros, readStore
   compareSchema } from "../safety/guards.ts";
 import { RESERVED, type TypedBatch, type WriteTarget } from "./contract.ts";
 import { detectSinceIgnored, nextCursor, resolveCursorType } from "./cursor.ts";
-import { currentDatabase, evolveTable, isReservedColumn, quoteIdent, quoteLiteral, type RealColumn, readTableSchema, tableRef,
-  tempRef } from "./evolve.ts";
+import { currentDatabase, type EvolveResult, evolveTable, isReservedColumn, normalizeType, quoteIdent, quoteLiteral, type RealColumn,
+  readTableSchema, tableRef, tempRef } from "./evolve.ts";
 
 /**
  * BOOLEAN column files.ts adds to a typed batch that carries rows of unchanged files ("Overlapping files" above).
@@ -91,8 +104,12 @@ export interface WriteBatchInput {
   target: WriteTarget;
   /** The clock; default core/time now() (CROFT_NOW freezes it). */
   now?: InstantInput;
-  /** Recorded in _croft.assets.kind; the shrink guard applies to ingests only. Default "ingest". */
+  /** Recorded in _croft.assets.kind; the shrink guard applies to ingests only. Default: the kind already
+   *  recorded, else "ingest". "sql": the batch defines the table's shape (a different one recreates it); "sql"
+   *  and "ts": a duplicate key is CHECK_FAILED unique(key) rather than deduplicated. */
   kind?: AssetKind;
+  /** The asset's file, root-relative ("assets/open_issues.sql"), for the location and fix of problems. */
+  file?: string;
   codeHash?: string;
   behaviorHash?: string;
   /** Pins from the asset's `columns` (for _croft.columns.pinned and format). */
@@ -126,7 +143,7 @@ export interface WriteResult {
   loadedAt: string;
   /** Whether any row was added, updated or deleted. */
   changed: boolean;
-  /** The table was created by this write. */
+  /** The table was created by this write (a SQL transform's recreated table is a "recreate" schema change). */
   created: boolean;
   /** batch.warnings plus what this write found. */
   warnings: Problem[];
@@ -202,19 +219,31 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
   const fallbackCol = inBatch(FALLBACK)?.name;
   const rowsIn = fallbackCol ? await countLoaded(tx, batch.temp, fallbackCol) : batch.rows;
 
-  if (target.key.length > 0 && batch.rows > 0) await assertKeys(tx, asset, batch.temp, target.key, batchCols);
+  const at = { asset, kind, ...(input.file ? { file: input.file } : {}) };
+  // A SQL transform's output columns are known even without rows: a key it does not return is refused at once.
+  if (target.key.length > 0 && (batch.rows > 0 || kind === "sql")) await assertKeys(tx, at, batch.temp, target.key, batchCols);
   if (target.write === "merge" && target.key.length === 0) {
     throw new CroftError("INTERNAL_ERROR", { message: `${asset}: a merge needs a key`, hint: "report this croft bug", asset });
   }
-
-  // Drift that needs the table as it was.
-  if (before.exists && before.rowCount > 0 && rowsIn >= 100) {
-    warnings.push(...(await stoppedArriving(tx, ref, asset, before, present, rowsIn, input.readBy ?? {})));
+  if ((kind === "sql" || kind === "ts") && target.key.length > 0 && batch.rows > 0) {
+    await assertUniqueKey(tx, { ...at, temp: batch.temp, key: target.key, rows: rowsIn, rowsBefore: before.rowCount, fallbackCol,
+      columns: batchCols.filter((c) => batch.columns.some((p) => sameName(p.column, c.name))).map((c) => c.name) });
   }
-  warnings.push(...jsonKindChanges(asset, batch.columns, stored, before.columns));
 
-  // 3g: every ALTER before any DML.
-  const evo = await evolveTable(tx, { table: asset, plans: batch.columns, batchColumns: batchCols });
+  let evo: EvolveResult;
+  let recreated = false;
+  if (kind === "sql") {
+    // The SELECT defines the table: create it, keep it, or recreate it with the new shape (DDL, before any DML).
+    ({ evo, recreated } = await sqlShape(tx, { ref, db, asset, temp: batch.temp, plans: batch.columns, existed: before.exists }));
+  } else {
+    // Drift that needs the table as it was.
+    if (before.exists && before.rowCount > 0 && rowsIn >= 100) {
+      warnings.push(...(await stoppedArriving(tx, ref, asset, before, present, rowsIn, input.readBy ?? {})));
+    }
+    warnings.push(...jsonKindChanges(asset, batch.columns, stored, before.columns));
+    // 3g: every ALTER before any DML.
+    evo = await evolveTable(tx, { table: asset, plans: batch.columns, batchColumns: batchCols });
+  }
   for (const c of evo.changes) {
     if (c.kind === "widen" && !warned("TYPE_WIDENED", c.column)) {
       warnings.push(problem("TYPE_WIDENED", {
@@ -240,7 +269,9 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
 
   const stampUs = await nextStamp(tx, asset, state, before, input.now);
   const stamp = isoMicros(stampUs);
-  const counts = await apply(tx, { ref, src, n, dataCols, present, target, srcRows, fallbacks, rowsBefore: before.rowCount, stamp });
+  const counts = await apply(tx, { ref, src, n, dataCols, present, target, srcRows, fallbacks, rowsBefore: recreated ? 0 : before.rowCount, stamp });
+  // A recreated table starts empty: every earlier row is gone, and every row of the batch is new.
+  if (recreated) counts.deleted = before.rowCount;
 
   const after = await tableStats(tx, asset, db);
   const rows = { in: rowsIn, ...counts, total: after.rowCount };
@@ -292,7 +323,10 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
       changed ? stamp : us(state?.last_loaded_us ?? null), oob ? stamp : us(state?.last_replaced_us ?? null),
       after.rowCount, us(after.maxLoadedAtUs), stamp],
   );
-  await writeColumns(tx, { asset, columns: evo.columns, plans: batch.columns, stored, present, pins: input.pins, formats: input.formats, stamp });
+  await writeColumns(tx, {
+    asset, columns: evo.columns, plans: batch.columns, stored: recreated ? [] : stored, present, pins: input.pins, formats: input.formats, stamp,
+    typedBySql: kind === "sql",
+  });
   await tx.exec(
     `INSERT INTO _croft.writes (asset, loaded_at, run_id, mode, rows_in, added, updated, unchanged, deleted, cursor_before, cursor_after,
        since_used, inputs, schema_changes, code_hash, attempt)
@@ -315,7 +349,11 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
 
 // ---------------------------------------------------------------------------------------------------------
 
-async function assertKeys(tx: Sql, asset: string, temp: string, key: string[], batchCols: RealColumn[]): Promise<void> {
+/** Who a key problem is about: the asset, its kind (the wording differs), and its file (the fix). */
+interface KeyOwner { asset: string; kind: AssetKind; file?: string }
+
+async function assertKeys(tx: Sql, o: KeyOwner, temp: string, key: string[], batchCols: RealColumn[]): Promise<void> {
+  const { asset } = o;
   const missing = key.filter((k) => !batchCols.some((c) => sameName(c.name, k)));
   const [row] = missing.length
     ? [{ n: -1 }]
@@ -330,16 +368,103 @@ async function assertKeys(tx: Sql, asset: string, temp: string, key: string[], b
     )).map((r) => JSON.parse(json(r)) as Record<string, unknown>);
   }
   const keyText = key.join(", ");
+  const sql = o.kind === "sql";
+  const fixText = sql ? `leave rows without ${keyText} out of the SELECT, or change its -- key: line` : `skip rows without ${keyText} in rows()/map(), or change key`;
   throw new CroftError("KEY_NULL", {
-    asset,
+    asset, ...(o.file ? { file: o.file } : {}),
     message: missing.length
-      ? `${asset}: the key ${missing.join(", ")} is missing from every row of the batch`
+      ? sql ? `${asset}: the key ${missing.join(", ")} is not a column its SELECT returns` : `${asset}: the key ${missing.join(", ")} is missing from every row of the batch`
       : `${asset}: ${nulls} row${nulls === 1 ? "" : "s"} have no value for the key ${keyText}`,
-    hint: `a key is never empty; drop or fix such rows in rows() or map(), or choose a key that is always set`,
+    hint: sql
+      ? `a key is never empty; leave such rows out of the SELECT (WHERE ${key.map((k) => `${k} IS NOT NULL`).join(" AND ")}), or choose a key that is always set`
+      : `a key is never empty; drop or fix such rows in rows() or map(), or choose a key that is always set`,
     effect: "nothing was written",
-    fix: { kind: "manual", description: `skip rows without ${keyText} in rows()/map(), or change key` },
+    fix: o.file ? { kind: "edit", description: fixText, file: o.file } : { kind: "manual", description: fixText },
     details: { key, rows: missing.length ? null : nulls, missing, samples },
   });
+}
+
+/** Rows CHECK_FAILED details carry, and how many of them its message shows (checks/run.ts does the same). */
+const CHECK_SAMPLES = 20;
+const CHECK_SHOWN = 3;
+
+/** How a sample value reads in a message: text quoted, NULL as NULL. */
+function shown(v: unknown): string {
+  if (v === null || v === undefined) return "NULL";
+  return typeof v === "string" ? JSON.stringify(v) : typeof v === "object" ? json(v) : String(v);
+}
+
+/**
+ * A transform's key identifies one row (its implied unique(key) check): a duplicate in the batch is CHECK_FAILED
+ * with up to 20 sample rows (every row of the first duplicated keys, in key then batch order), before anything
+ * is written. Runs after assertKeys, so no key is NULL.
+ */
+async function assertUniqueKey(tx: Sql, o: KeyOwner & {
+  temp: string; key: string[]; rows: number; rowsBefore: number; columns: string[]; fallbackCol?: string;
+}): Promise<void> {
+  const part = o.key.map(quoteIdent).join(", ");
+  const loaded = o.fallbackCol ? ` WHERE NOT coalesce(${quoteIdent(o.fallbackCol)}, false)` : "";
+  const groups = await tx.all<Record<string, unknown> & { __n: number | bigint }>(
+    `SELECT ${part}, count(*) AS __n FROM ${tempRef(o.temp)}${loaded} GROUP BY ALL HAVING count(*) > 1 ORDER BY ${part}`);
+  if (groups.length === 0) return;
+  const failing = groups.reduce((n, g) => n + Number(g.__n), 0);
+  const sample = (await tx.all<Record<string, unknown>>(
+    `SELECT ${o.columns.map(quoteIdent).join(", ")} FROM ${tempRef(o.temp)}${loaded}
+     QUALIFY count(*) OVER (PARTITION BY ${part}) > 1 ORDER BY ${part}, ${quoteIdent(RESERVED.seq)} LIMIT ${CHECK_SAMPLES}`,
+  )).map((r) => JSON.parse(json(r)) as Record<string, unknown>);
+  const keyText = o.key.join(", ");
+  const keyOf = (g: Record<string, unknown>) => {
+    const pairs = o.key.map((k) => `${k}=${shown(Object.entries(g).find(([c]) => sameName(c, k))?.[1])}`);
+    return pairs.length === 1 ? pairs[0]! : `(${pairs.join(", ")})`;
+  };
+  const eg = groups.slice(0, CHECK_SHOWN).map((g) => `${keyOf(JSON.parse(json(g)) as Record<string, unknown>)} ×${Number(g.__n)}`).join(", ");
+  const check = `unique(${keyText})`;
+  const sql = o.kind === "sql";
+  const fixText = sql
+    ? `make the SELECT return one row per ${keyText}, or change its -- key: line`
+    : `make rows() return one row per ${keyText}, or change key`;
+  throw new CroftError("CHECK_FAILED", {
+    asset: o.asset, ...(o.file ? { file: o.file } : {}),
+    message: `${check}: ${failing} of ${o.rows} rows share their key with another row, e.g. ${eg}`,
+    hint: sql
+      ? `a key identifies one row: aggregate to one row per ${keyText} (GROUP BY ${keyText}), keep one of each (QUALIFY row_number() OVER (PARTITION BY ${keyText} ORDER BY …) = 1), or change its -- key: line`
+      : `a key identifies one row: return one row per ${keyText} from rows(), or change key`,
+    effect: `nothing was written; ${o.asset} keeps its previous ${o.rowsBefore} rows`,
+    fix: o.file ? { kind: "edit", description: fixText, file: o.file } : { kind: "manual", description: fixText },
+    details: { check, failing, sample },
+  });
+}
+
+/** Columns as duckdb_columns() spells their types, unnormalized (a STRUCT's field names keep their case). */
+async function rawColumns(tx: Sql, database: string, table: string): Promise<RealColumn[]> {
+  return tx.all<RealColumn>(
+    `SELECT column_name AS name, data_type AS type FROM duckdb_columns()
+     WHERE database_name = $1 AND schema_name = 'main' AND table_name = $2 ORDER BY column_index`, [database, table]);
+}
+
+/**
+ * A SQL transform's table takes the shape of its SELECT: the batch's data columns (those with a plan), in batch
+ * order, with their exact types. The same shape keeps the table; none creates it, any other recreates it. Both
+ * copy the batch's column definitions (LIMIT 0) and add _loaded_at, so no type is spelled out as text.
+ */
+async function sqlShape(tx: Sql, o: { ref: string; db: string; asset: string; temp: string; plans: ColumnPlan[]; existed: boolean }):
+  Promise<{ evo: EvolveResult; recreated: boolean }> {
+  const want = (await rawColumns(tx, "temp", o.temp)).filter((c) => !isReservedColumn(c.name) && o.plans.some((p) => sameName(p.column, c.name)));
+  if (o.existed) {
+    // Exactly the columns a create would make: the SELECT's, then _loaded_at (a stray _file, or a _loaded_at
+    // that is not last, as an ingest's table may have, is another shape).
+    const have = await rawColumns(tx, o.db, o.asset);
+    const stamp = have.at(-1);
+    const same = have.length === want.length + 1 && stamp?.name === RESERVED.loadedAt && normalizeType(stamp.type) === "TIMESTAMPTZ"
+      && want.every((c, k) => c.name === have[k]!.name && c.type === have[k]!.type);
+    if (same) return { evo: { created: false, changes: [], columns: (await readTableSchema(tx, o.asset, o.db))! }, recreated: false };
+  }
+  await tx.exec(`CREATE OR REPLACE TABLE ${o.ref} AS SELECT ${[...want.map((c) => quoteIdent(c.name)), `CAST(NULL AS TIMESTAMPTZ) AS ${quoteIdent(RESERVED.loadedAt)}`].join(", ")}
+    FROM ${tempRef(o.temp)} LIMIT 0`);
+  const columns = (await readTableSchema(tx, o.asset, o.db))!;
+  return o.existed
+    ? { evo: { created: false, changes: [{ kind: "recreate", reason: "shape_changed" }], columns }, recreated: true }
+    : { evo: { created: true, changes: [], columns }, recreated: false };
 }
 
 /** Non-reserved columns set in ≥95% of earlier rows and absent from a whole batch of ≥100 rows. */
@@ -605,6 +730,8 @@ async function diffByContent(tx: Sql, o: ApplyInput): Promise<Counts> {
 interface ColumnsInput {
   asset: string; columns: RealColumn[]; plans: ColumnPlan[]; stored: StoredColumn[]; present: Set<string>;
   pins?: Record<string, { type: string; format?: string }>; formats?: Record<string, string>; stamp: string;
+  /** A SQL transform's columns: the SELECT typed them, so none is a pending placeholder. */
+  typedBySql?: boolean;
 }
 
 /** Make _croft.columns describe the table as it now is: one row per non-reserved column. */
@@ -622,7 +749,7 @@ async function writeColumns(tx: Sql, o: ColumnsInput): Promise<void> {
     const incoming = plan?.incoming ?? [];
     const nonNull = incoming.some((k) => k !== "null");
     // Pending: holds only NULLs so far. It starts with a new column and ends at its first real value.
-    const pending = !pinned && (had ? had.pending === true : plan !== undefined) && !nonNull;
+    const pending = !o.typedBySql && !pinned && (had ? had.pending === true : plan !== undefined) && !nonNull;
     const kinds = [...new Set([...(had?.kinds ?? []), ...incoming.filter((k) => k !== "null")])];
     const format = find(o.formats, col.name) ?? pin?.format ?? had?.format ?? null;
     await tx.exec(
