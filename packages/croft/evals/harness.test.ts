@@ -6,7 +6,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  AGENT_TIMEOUT_MS, agentEnv, AWAY_NOTE, claudeArgs, croftEnv, findClaude, Fixture, FIXTURE_TZ, MAX_TURNS, mockApi, runAgent, runTask, taskPrompt, writeShims,
+  AGENT_TIMEOUT_MS, agentEnv, AWAY_NOTE, claudeArgs, croftEnv, findClaude, Fixture, FIXTURE_SETTINGS, FIXTURE_TZ, fixtureSettings, MAX_TURNS, mockApi, runAgent, runTask, taskPrompt, writeShims,
 } from "./harness.ts";
 import { parseOptions, resultLine, resultsBase, summarize } from "./run.ts";
 import { TASKS } from "./tasks/index.ts";
@@ -63,9 +63,12 @@ describe("the session's command line and environment", () => {
   test("claudeArgs: the prompt right after -p, stream-json, max turns, project settings only, no MCP servers, no prompts", () => {
     expect(claudeArgs("do the thing")).toEqual([
       "-p", "do the thing", "--output-format", "stream-json", "--verbose", "--max-turns", String(MAX_TURNS),
-      "--setting-sources", "project", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+      "--setting-sources", "project",
+      "--allowedTools", "Bash(croft:*),Bash(bun:*),Read,Edit,Write,Glob,Grep", "--disallowedTools", "Read(./.env*)",
+      "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
       "--permission-prompts", "none", "--no-session-persistence",
     ]);
+    expect(claudeArgs("x", { userSettings: true })).toEqual(expect.arrayContaining(["--setting-sources", "user,project"]));
     expect(claudeArgs("x", { model: "opus", maxTurns: 5 })).toEqual(expect.arrayContaining(["--max-turns", "5", "--model", "opus"]));
     expect(MAX_TURNS).toBe(60);
     expect(AGENT_TIMEOUT_MS).toBe(20 * 60_000);
@@ -242,5 +245,19 @@ describe("agentEnv with CROFT_EVAL_INHERIT_ENV=1", () => {
 
   test("without it, nothing outside the list is inherited", () => {
     expect(agentEnv("/bin-dir", { HOME: "/h", SOME_PROXY_TOKEN: "t" }).SOME_PROXY_TOKEN).toBeUndefined();
+  });
+});
+
+describe("user-settings mode", () => {
+  test("the fixture turns off every plugin the user enabled", () => {
+    const home = mkdtempSync(join(tmpdir(), "croft-usersettings-"));
+    try {
+      mkdirSync(join(home, ".claude"));
+      writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ enabledPlugins: { "a@m": true, "b@m": true } }));
+      expect(fixtureSettings({ HOME: home })).toEqual(FIXTURE_SETTINGS);
+      expect(fixtureSettings({ HOME: home, CROFT_EVAL_USER_SETTINGS: "1" })).toEqual({ ...FIXTURE_SETTINGS, enabledPlugins: { "a@m": false, "b@m": false } });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

@@ -216,6 +216,26 @@ export function findClaude(env: ParentEnv = process.env): string | null {
   return first;
 }
 
+/**
+ * CROFT_EVAL_USER_SETTINGS=1: load the user's settings too (--setting-sources user,project), for machines whose
+ * Claude Code login lives in settings `env` (a sandbox proxy's token, say). The fixture then turns off every
+ * plugin the user enabled, so the session sees croft's files and nothing of the user's setup.
+ */
+export function userSettingsMode(env: ParentEnv = process.env): boolean {
+  return env.CROFT_EVAL_USER_SETTINGS === "1";
+}
+
+/** The fixture's .claude/settings.json: FIXTURE_SETTINGS, plus the user's plugins turned off in user-settings mode. */
+export function fixtureSettings(env: ParentEnv = process.env): Record<string, unknown> {
+  if (!userSettingsMode(env)) return FIXTURE_SETTINGS;
+  let plugins: string[] = [];
+  try {
+    const user = JSON.parse(readFileSync(join(env.CLAUDE_CONFIG_DIR ?? join(env.HOME ?? "", ".claude"), "settings.json"), "utf8")) as { enabledPlugins?: Record<string, unknown> };
+    plugins = Object.keys(user.enabledPlugins ?? {});
+  } catch { /* no user settings: nothing to turn off */ }
+  return { ...FIXTURE_SETTINGS, enabledPlugins: Object.fromEntries(plugins.map((p) => [p, false])) };
+}
+
 export interface AgentOptions {
   /** The claude executable (default: `claude` found on the caller's PATH). */
   claudeBin?: string;
@@ -237,12 +257,17 @@ export interface AgentOptions {
  * fixture's `ask` rule on `croft confirm` relies on; `--no-session-persistence` keeps temp projects out of the
  * user's session list.
  */
-export function claudeArgs(prompt: string, o: { model?: string; maxTurns?: number } = {}): string[] {
+export function claudeArgs(prompt: string, o: { model?: string; maxTurns?: number; userSettings?: boolean } = {}): string[] {
   return [
     "-p", prompt,
     "--output-format", "stream-json", "--verbose",
     "--max-turns", String(o.maxTurns ?? MAX_TURNS),
-    "--setting-sources", "project",
+    "--setting-sources", o.userSettings ? "user,project" : "project",
+    // Claude Code ignores a project's allow rules until someone accepts the folder's trust dialog, which never
+    // happens in a fresh temp folder: the rules go on the command line too. Nothing else is allowed, so with
+    // --permission-prompts none `croft confirm` (the fixture's one `ask` rule) is denied, as the file intends.
+    "--allowedTools", FIXTURE_SETTINGS.permissions.allow.join(","),
+    "--disallowedTools", FIXTURE_SETTINGS.permissions.deny.join(","),
     "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
     "--permission-prompts", "none",
     "--no-session-persistence",
@@ -420,7 +445,7 @@ export async function setupFixture(task: EvalTask, o: { keep?: boolean; tmpRoot?
     mkdirSync(join(root, "node_modules", ".bin"), { recursive: true });
     symlinkSync(join("..", "@zabaca", "croft", "bin", "croft.mjs"), join(root, "node_modules", ".bin", "croft"));
     for (const rel of INIT_EXAMPLE) rmSync(f.path(rel), { force: true });
-    f.write(".claude/settings.json", `${JSON.stringify(FIXTURE_SETTINGS, null, 2)}\n`);
+    f.write(".claude/settings.json", `${JSON.stringify(fixtureSettings(), null, 2)}\n`);
     await task.setup(f);
     const run = await f.croft(["run", "--json"]);
     f.setupRun = run;
@@ -458,7 +483,7 @@ export async function runAgent(f: Fixture, prompt: string, o: AgentOptions = {})
   const bin = o.claudeBin ?? findClaude();
   if (!bin) throw new Error("claude is not on PATH: install Claude Code, or pass the executable's path");
   const started = performance.now();
-  const proc = Bun.spawn([bin, ...claudeArgs(prompt, o)], {
+  const proc = Bun.spawn([bin, ...claudeArgs(prompt, { ...o, userSettings: userSettingsMode(o.parentEnv) })], {
     cwd: f.root, env: agentEnv(f.binDir, o.parentEnv), stdin: "ignore", stdout: "pipe", stderr: "pipe",
   });
   let timedOut = false;
