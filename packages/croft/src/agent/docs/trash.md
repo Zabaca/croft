@@ -60,3 +60,9 @@ path, the assets that read the table) and a token:
 Show the user the impact and run croft confirm <token> only after their explicit yes in this conversation. confirm
 counts the impact again first: when it changed meanwhile (the scheduler added rows, say) it stops with
 CONFIRMATION_STALE and changes nothing; run the command again for a new token. A token works once, for 15 minutes.
+
+## Backups before an engine upgrade
+
+When a croft upgrade brings a newer DuckDB, croft copies warehouse.duckdb (and warehouse.duckdb.wal, when there is
+one) whole to .croft/backups/ before the newer engine opens it for the first time. A backup is a plain DuckDB file
+of the warehouse as it was; ask the user before deleting one.
