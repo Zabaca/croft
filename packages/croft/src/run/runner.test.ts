@@ -1267,6 +1267,49 @@ export default ingest({ secrets: ["VAULT_KEY"], key: "id", async *rows({ secret 
   });
 });
 
+describe("a detached run's process", () => {
+  test("exits once its run is recorded, even when asset code left a timer running; its parent returns at once", async () => {
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({
+      "assets/leaky.ts": `import { ingest } from "@zabaca/croft";
+export default ingest({
+  async *rows({ http }) {
+    // A client's keep-alive timer, never cleared.
+    setInterval(() => {}, 1000);
+    yield (await http.get("${api.url}/zones")).json<Record<string, unknown>[]>();
+  },
+});
+`,
+    });
+    const started = Date.now();
+    const r = await cli(root, ["run", "leaky", "--json"]);
+    const returned = Date.now();
+    expect(r.code, r.stderr).toBe(0);
+    const runId = r.json!.data.runId as string;
+    const db = runsDb(root);
+    const finishedAt = Date.parse(db.getRun(runId)!.finishedAt!);
+    db.close();
+    expect(finishedAt).toBeGreaterThanOrEqual(started - 1000);
+    expect(returned - finishedAt).toBeLessThan(1000);
+    const pid = (JSON.parse(readFileSync(join(root, ".croft", "logs", runId, "_process.json"), "utf8")) as { pid: number }).pid;
+    const gone = () => {
+      try {
+        process.kill(pid, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    };
+    try {
+      const deadline = Date.now() + 2000;
+      while (!gone() && Date.now() < deadline) await new Promise((res) => setTimeout(res, 20));
+      expect(gone()).toBe(true);
+    } finally {
+      if (!gone()) process.kill(pid, "SIGKILL");
+    }
+  });
+});
+
 describe("the project clock", () => {
   // runs.sqlite follows the project clock (CROFT_NOW in tests), like run ids, _loaded_at and the scheduler's fires, so
   // a run by hand at 11:05 counts as having handled the 11:00 fire.
