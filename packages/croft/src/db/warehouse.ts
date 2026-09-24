@@ -56,6 +56,8 @@ export interface WarehouseOptions {
   /** Describe a PID that holds the file (runs.sqlite: run id, asset, since). null when unknown. */
   lookupHolder?: (pid: number) => Partial<LockHolder> | null | Promise<Partial<LockHolder> | null>;
   register?: boolean;                    // set globalThis[Symbol.for("croft.warehouse")]; default true
+  /** How messages name the file: "the warehouse" (default), or "the preview database" for preview.duckdb. */
+  label?: string;
 }
 
 export interface WriteOptions {
@@ -297,6 +299,11 @@ export class DuckWarehouse implements Warehouse {
     this.closeNow();
   }
 
+  /** How messages name the file (WarehouseOptions.label). */
+  private get label(): string {
+    return this.o.label ?? "the warehouse";
+  }
+
   private renderCtx(): RenderContext {
     return { mode: this.o.render ?? "ts", timezone: this.o.timezone };
   }
@@ -363,7 +370,7 @@ export class DuckWarehouse implements Warehouse {
   private async open(kind: "read" | "write", waitMs: number, runId?: string, signal?: AbortSignal): Promise<DuckDBInstance> {
     if (this.mode === "read_only" && !existsSync(this.path)) {
       throw new CroftError("DB_NOT_FOUND", {
-        message: `the warehouse ${this.path} does not exist yet`,
+        message: `${this.label} ${this.path} does not exist yet`,
         hint: "run an asset first: croft run",
         fix: { kind: "command", description: "build the assets", command: "croft run" },
       });
@@ -529,7 +536,7 @@ export class DuckWarehouse implements Warehouse {
     if (!croft) {
       const who = `${holder.program ?? "another program"}${holder.pid !== null ? ` (PID ${holder.pid})` : ""}`;
       return new CroftError("DB_HELD_BY_OTHER_PROGRAM", {
-        message: `the warehouse is held by ${who}; waited ${secs} s`,
+        message: `${this.label} is held by ${who}; waited ${secs} s`,
         hint: `close ${who}, then retry; apps should open the file only per query (@zabaca/croft/read does)`,
         retryable: true,
         details,
@@ -542,7 +549,7 @@ export class DuckWarehouse implements Warehouse {
       who = `croft run ${holder.runId}${holder.asset ? `, writing ${holder.asset}` : ""}${since}`;
     } else who = `croft (pid ${holder.pid})`;
     return new CroftError("DB_BUSY", {
-      message: `the warehouse is busy: ${who}; waited ${secs} s`,
+      message: `${this.label} is busy: ${who}; waited ${secs} s`,
       hint: "retry when it finishes (croft status shows running work), or pass a longer wait",
       retryable: true,
       details,

@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { cleanup as cleanupChildren, spawnHolder } from "../../read/testkit.ts";
 import { putCatalog } from "../../history/catalog.ts";
@@ -227,12 +227,40 @@ describe("croft query: the gate and the sandbox", () => {
 });
 
 describe("croft query: usage and state", () => {
-  test("--preview is refused clearly until croft preview exists", async () => {
+  test("--preview without a preview is DB_NOT_FOUND, naming croft preview; no file is created", async () => {
     const p = await issues();
     const r = await cli(["query", "select 1", "--preview", "--json"], { cwd: p.root });
     expect(r.exit).toBe(2);
-    expect(r.json.problems[0]).toMatchObject({ code: "USAGE_ERROR" });
-    expect(r.json.problems[0].message).toContain("--preview");
+    expect(r.json.problems[0]).toMatchObject({ code: "DB_NOT_FOUND" });
+    expect(r.json.problems[0].hint).toContain("croft preview <asset>");
+    expect(existsSync(join(p.stateDir, "preview.duckdb"))).toBe(false);
+  });
+
+  test("--preview reads the preview database, through its views over the snapshots in the state folder", async () => {
+    const p = await issues();
+    const dir = join(p.stateDir, "preview");
+    mkdirSync(dir, { recursive: true });
+    const snap = join(dir, "github_issues.parquet");
+    await seed(join(p.stateDir, "preview.duckdb"), [
+      `COPY (SELECT 1 AS id, 'from the snapshot' AS title) TO '${snap}' (FORMAT parquet)`,
+      `CREATE VIEW github_issues AS SELECT * FROM read_parquet('${snap}')`,
+      `CREATE TABLE open_issues AS SELECT 7 AS id, 'built by the preview' AS title`,
+    ]);
+    const r = await cli(["query", "select o.title AS built, g.title AS read from open_issues o, github_issues g", "--preview", "--json"], { cwd: p.root });
+    expect(r.exit).toBe(0);
+    expect(r.json.data.rows).toEqual([{ built: "built by the preview", read: "from the snapshot" }]);
+    // The live warehouse is not what --preview reads.
+    const live = await cli(["query", "select count(*) AS n from github_issues", "--json"], { cwd: p.root });
+    expect(live.json.data.rows).toEqual([{ n: 3 }]);
+    // The SQL itself still cannot name a file in the state folder.
+    const denied = await cli(["query", `select * from read_parquet('${snap}')`, "--preview", "--json"], { cwd: p.root });
+    expect(denied.exit).toBe(2);
+    expect(denied.json.problems[0].code).toBe("QUERY_PATH_DENIED");
+    // A table the preview does not hold: UNKNOWN_TABLE, listing what it holds.
+    const unknown = await cli(["query", "select * from nope", "--preview", "--json"], { cwd: p.root });
+    expect(unknown.exit).toBe(2);
+    expect(unknown.json.problems[0]).toMatchObject({ code: "UNKNOWN_TABLE", details: { preview: ["github_issues", "open_issues"] } });
+    expect(unknown.json.problems[0].hint).toContain("the preview holds github_issues, open_issues");
   });
 
   test("no SQL is a usage error", async () => {

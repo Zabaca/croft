@@ -448,6 +448,24 @@ describe("lock conflicts", () => {
     expect(await w.write("after", (tx) => tx.all("SELECT a FROM foreign_t"), { runId: "r", waitMs: 5000 })).toEqual([{ a: 1 }]);
   });
 
+  test("a file opened with a label (the preview database) is named by it, and without a write intent none is announced", async () => {
+    const p = project();
+    const path = join(p.stateDir, "preview.duckdb");
+    const foreign = spawnForeign(path);
+    await foreign.waitFor("acquired");
+    const w = wh({ ...p, path }, { label: "the preview database", writeIntent: false, waits: { offTtyMs: 300 } });
+    const e = await rejection(w.write("blocked", async () => {}, { runId: "r_p" }));
+    expect(e.code).toBe("DB_HELD_BY_OTHER_PROGRAM");
+    expect(e.message).toStartWith("the preview database is held by");
+    expect(listIntents(p.stateDir)).toHaveLength(0);
+    foreign.proc.kill("SIGKILL");
+    await foreign.exited;
+    const r = openWarehouse({ path: join(p.stateDir, "nothing.duckdb"), mode: "read_only", timezone: "UTC", root: p.root, stateDir: p.stateDir, register: false, label: "the preview database" });
+    const missing = await rejection(r.read(async () => {}, { purpose: "t" }));
+    expect(missing.code).toBe("DB_NOT_FOUND");
+    expect(missing.message).toStartWith("the preview database ");
+  });
+
   test("against a lasting foreign holder the intent is withdrawn and periodically announced again", async () => {
     const p = project();
     const foreign = spawnForeign(p.path);
