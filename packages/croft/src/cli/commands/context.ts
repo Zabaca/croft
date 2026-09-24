@@ -1,19 +1,22 @@
 // croft context [--asset NAME…] (DESIGN.md §4.1, §4.3 "context", §9): the whole project in one payload, for
 // an agent's first look: every asset as a compact describe (kind, file, behavior, key, cursor, rows, columns
-// with JSON keys, checks, status, last run), what is running, recent failures and recent schema changes.
+// with JSON keys, checks, status, staleness, last run, what it reads), what is running, recent failures and
+// recent schema changes with the assets that read the changed one.
 //
 // It never waits on DuckDB (§5): asset facts come from the catalog mirror in runs.sqlite, and runs from
 // runs.sqlite. When the catalog lists tables but the warehouse file is gone, the problems carry DB_NOT_FOUND
-// and those assets show rows: null and status "unknown" (collectStatus in status.ts). Schema changes of the last 7 days come from _croft.writes when the warehouse can be opened at
-// once (no write intent announced and no lock held), and otherwise from what runs recorded in their
-// summaries. Asset files are imported (as validate does) for descriptions, checks and declared secrets.
+// and those assets show rows: null and status "unknown" (collectStatus in status.ts). Schema changes of the
+// last 7 days come from _croft.writes when the warehouse can be opened at once (no write intent announced and
+// no lock held), and otherwise from what runs recorded in their summaries. The asset files are resolved once,
+// as status and validate resolve them (project/resolve.ts), for staleness, descriptions, inputs, checks and
+// declared secrets; their problems (a file that does not load, CHECK_INVALID) and EDITED_SINCE_LAST_RUN are
+// the payload's problems.
 //
 // The payload is capped at 20 KB (§9.6). Past that it sheds detail in order: JSON keys, then column lists,
 // then whole assets from the end (listed in data.omitted), and says truncated: true. --asset narrows it.
 import { existsSync } from "node:fs";
 import { CroftError, problem } from "../../core/errors.ts";
-import { CHECKS_ENFORCED, CHECKS_NOT_ENFORCED } from "../../core/phase.ts";
-import type { AssetKind, Problem } from "../../core/types.ts";
+import type { AssetKind, Problem, Reason } from "../../core/types.ts";
 import { liveIntents } from "../../db/intent.ts";
 import { hasState } from "../../db/state.ts";
 import type { CatalogAsset } from "../../history/catalog.ts";
@@ -22,8 +25,12 @@ import { didYouMean } from "../../project/suggest.ts";
 import type { Row } from "../../types.ts";
 import type { CommandImpl } from "../command.ts";
 import { formatCount, toJsonLine } from "../render.ts";
-import { type AssetConfig, behaviorOf, checksOf, columnsText, declareProjectSecrets, isBusy, loadConfigs, readOnlyWarehouse } from "./describe.ts";
-import { ago, collectStatus, effectiveStatus, type LastRun, type RunningEntry, type StatusAsset, statusText, zoned } from "./status.ts";
+import {
+  type AssetConfig, behaviorOf, checksOf, columnsText, configOf, declareProjectSecrets, isBusy, loadConfigs, readersOf, readOnlyWarehouse, readsOf,
+} from "./describe.ts";
+import {
+  ago, collectStatus, effectiveStatus, INSPECT_IMPORT_TIMEOUT_MS, type LastRun, type RunningEntry, type StatusAsset, statusText, zoned,
+} from "./status.ts";
 
 export const CONTEXT_CAP_BYTES = 20 * 1024;
 const DAY_MS = 86_400_000;
@@ -41,6 +48,10 @@ export interface CompactAsset {
   status: StatusAsset["status"];
   lastRun: LastRun | null;
   next: string;
+  /** Why a bare `croft run` would update it (status's staleReasons); empty when fresh. */
+  staleReasons: Reason[];
+  /** Present when its code differs from the code its last run used. */
+  edited?: true;
   reads: string[];
   checks: string[];
   columns?: { name: string; type: string; jsonKeys?: string[] }[];
@@ -70,8 +81,6 @@ export interface ContextData {
     scheduling: { state: "on" | "off" | "paused"; via: "os-job" | "serve" | null };
   };
   assets: CompactAsset[];
-  /** false in phase 1: the assets' checks are listed, not run (core/phase.ts). */
-  checksEnforced: boolean;
   running: RunningEntry[];
   held: string[];
   recentFailures: FailureEntry[];
@@ -118,13 +127,14 @@ async function warehouseChanges(ctx: Parameters<CommandImpl["run"]>[0], since: D
   }
 }
 
-function compact(s: StatusAsset, config: AssetConfig | null, cat: CatalogAsset | null, tz: string): CompactAsset {
+function compact(s: StatusAsset, config: AssetConfig | null, cat: CatalogAsset | null, reads: readonly string[], tz: string): CompactAsset {
   const b = behaviorOf(config, cat);
   const out: CompactAsset = {
     asset: s.asset, kind: s.kind, file: s.file, description: config?.description ?? null, behavior: b.words, key: b.key,
     cursor: b.incremental?.kind === "cursor" ? { field: b.incremental.field, value: b.incremental.cursorValue } : null,
     rows: s.rows, lastLoadedAt: zoned(cat?.lastLoadedAt ?? null, tz), status: s.status, lastRun: s.lastRun,
-    next: s.next.reason, reads: config?.inputs ?? [], checks: checksOf(config, b.key).map((c) => (c.blocking ? c.check : `warn ${c.check}`)),
+    next: s.next.reason, staleReasons: [...s.staleReasons], ...(s.edited ? { edited: true as const } : {}), reads: [...reads],
+    checks: checksOf(config, b.key).map((c) => (c.blocking ? c.check : `warn ${c.check}`)),
   };
   if (s.filesGone) out.filesGone = s.filesGone;
   if (s.schemaChangedAt) out.schemaChangedAt = s.schemaChangedAt;
@@ -166,18 +176,12 @@ export const context: CommandImpl<ContextData> = {
     const now = ctx.now();
     const since = new Date(now.getTime() - 7 * DAY_MS);
     const state = await collectStatus(project, now);
-    const configs = await declareProjectSecrets(ctx, project, await loadConfigs(project, state.discovered, { importTimeoutMs: 5000 }));
+    const configs = await declareProjectSecrets(ctx, project, state.resolved
+      ? state.resolved.assets.map(configOf)
+      : await loadConfigs(project, state.discovered, { importTimeoutMs: INSPECT_IMPORT_TIMEOUT_MS }));
     const byConfig = new Map(configs.map((c) => [c.name, c]));
     const byCatalog = new Map(state.catalog.map((c) => [c.asset, c]));
-
-    // Kinds known from the configs win over a look at the text.
-    for (const a of state.data.assets) {
-      const k = byConfig.get(a.asset)?.kind;
-      if (k && !byCatalog.has(a.asset)) {
-        a.kind = k;
-        a.next = { at: null, reason: k === "ingest" ? "manual" : "after inputs" };
-      }
-    }
+    const reads = readsOf(state.resolved, state.catalog);
 
     let filter: Set<string> | null = null;
     const wanted = ctx.values.asset;
@@ -217,7 +221,8 @@ export const context: CommandImpl<ContextData> = {
       schemaChangesFrom = "runs";
       recentSchemaChanges = state.summaryChanges.map((c) => changeEntry(c.asset, zoned(c.at, tz)!, c.runId, c.change));
     }
-    recentSchemaChanges = recentSchemaChanges.filter((c) => keep(c.asset)).slice(0, 50);
+    recentSchemaChanges = recentSchemaChanges.filter((c) => keep(c.asset)).slice(0, 50)
+      .map((c) => ({ ...c, readBy: readersOf(c.asset, reads) }));
 
     let data: ContextData = {
       project: {
@@ -225,8 +230,7 @@ export const context: CommandImpl<ContextData> = {
         scheduling: { state: state.data.scheduling.state, via: state.data.scheduling.via },
       },
       assets: state.data.assets.filter((a) => keep(a.asset))
-        .map((a) => compact(a, byConfig.get(a.asset) ?? null, byCatalog.get(a.asset) ?? null, tz)),
-      checksEnforced: CHECKS_ENFORCED,
+        .map((a) => compact(a, byConfig.get(a.asset) ?? null, byCatalog.get(a.asset) ?? null, reads.get(a.asset) ?? [], tz)),
       running: state.data.running.filter((r) => r.asset === null || keep(r.asset)),
       held: [],
       recentFailures,
@@ -236,7 +240,10 @@ export const context: CommandImpl<ContextData> = {
     };
     data = capContext(data);
 
-    const problems: Problem[] = [...state.problems, ...configs.filter((c) => keep(c.name)).flatMap((c) => c.problems), ...warehouseProblems];
+    const problems: Problem[] = [
+      ...state.problems, ...configs.filter((c) => keep(c.name)).flatMap((c) => c.problems),
+      ...state.edited.filter((p) => p.asset === undefined || keep(p.asset)), ...warehouseProblems,
+    ];
     const next = data.truncated
       ? [{ command: "croft context --asset <name>", reason: "the payload was capped at 20 KB; narrow it to the assets you work on" }]
       : [];
@@ -253,7 +260,8 @@ export function formatContext(d: ContextData, now: Date): string {
   for (const a of d.assets) {
     const status: StatusAsset = {
       asset: a.asset, kind: a.kind, file: a.file, status: a.status, rows: a.rows, lastRun: a.lastRun,
-      next: { at: null, reason: a.next as StatusAsset["next"]["reason"] }, stale: false, staleReasons: [], held: false, edited: false,
+      next: { at: null, reason: a.next as StatusAsset["next"]["reason"] }, stale: a.staleReasons.length > 0, staleReasons: a.staleReasons,
+      held: false, edited: a.edited === true,
       ...(a.filesGone ? { filesGone: a.filesGone } : {}), ...(a.schemaChangedAt ? { schemaChangedAt: a.schemaChangedAt } : {}),
     };
     lines.push("");
@@ -266,7 +274,6 @@ export function formatContext(d: ContextData, now: Date): string {
     if (a.columns?.length) lines.push(`  columns   ${columnsText(a.columns)}`);
     if (a.checks.length) lines.push(`  checks    ${a.checks.join(" · ")}`);
   }
-  if (d.checksEnforced === false && d.assets.some((a) => a.checks.length)) lines.push("", CHECKS_NOT_ENFORCED);
   if (d.omitted?.length) lines.push("", `(${d.omitted.length} more assets not shown: ${d.omitted.join(", ")}; croft context --asset <name>)`);
   if (d.running.length) {
     lines.push("", "Running");

@@ -1,32 +1,44 @@
 // croft describe <asset> (DESIGN.md §4.1, §4.2, §4.3 "describe"): one asset in words and numbers. Its
 // behavior in plain words, the saved cursor, the table's columns with the keys seen inside JSON columns,
-// what it reads and what reads it, its checks, recent writes (_croft.writes) and three sample rows.
+// what it reads and what reads it, what it has seen of each input, its checks, recent writes (_croft.writes)
+// and three sample rows.
 //
-// The config comes from the asset file itself (a TS asset is imported in isolation, as validate does; an
-// SQL asset's header is read). Table facts come from the warehouse under a short read-only lease (§5:
-// describe waits only for the current write step). When a run holds the file longer than that, describe
-// falls back to the catalog mirror in runs.sqlite and says so (data.source "catalog"); samples and recent
-// writes need the warehouse itself and are left empty.
+// The config comes from the asset files themselves, resolved as the planner resolves them (project/resolve.ts:
+// a TS asset imported in isolation, an SQL asset's header parsed with project/sql-asset.ts parseSqlHeader and
+// its SELECT on a private in-memory DuckDB); every file is resolved, since what reads the asset (readBy) is
+// in the others. Table facts come from the warehouse under a short read-only lease (§5: describe waits only
+// for the current write step). When a run holds the file longer than that, describe falls back to the catalog
+// mirror in runs.sqlite and says so (data.source "catalog"); samples, recent writes and the count of input rows
+// not processed yet need the warehouse itself and are left empty.
+//
+// inputsSeen (§3e, §5): per input, the transform's composite position (seenLoadedAt, with the key of the last row
+// processed at that stamp), the input's version it last read in full (inputLastLoadedAt, what staleness compares:
+// history/catalog.ts InputSeen) and pendingRows, the input rows after that position (newRows()'s count, the
+// rows of the position's own stamp whose key comes after it included). Declared inputs it has not read yet are
+// listed with every row pending.
 //
 // This file also holds what the other read-only commands (context, query, secrets) share: loading asset
 // configs without failing on one broken file, the read-only warehouse, and value capping with redaction.
 import { readFileSync } from "node:fs";
 import { CroftError, problem } from "../../core/errors.ts";
-import { CHECKS_ENFORCED, CHECKS_NOT_ENFORCED } from "../../core/phase.ts";
 import type { AssetKind, CursorType, Incremental, LockHolder, Problem, WriteMode } from "../../core/types.ts";
 import { hasState } from "../../db/state.ts";
 import { type DuckWarehouse, type LeaseSql, openWarehouse } from "../../db/warehouse.ts";
-import type { CatalogAsset } from "../../history/catalog.ts";
+import { type CatalogAsset, readInputsSeen } from "../../history/catalog.ts";
 import type { StepRecord } from "../../history/runs-db.ts";
+import { RESERVED } from "../../load/contract.ts";
 import { quoteIdent } from "../../load/evolve.ts";
 import { discoverAssets, type DiscoveredAsset, NAME_PATTERN } from "../../project/discover.ts";
+import { type ResolvedAsset, type ResolvedProject, sniffKind } from "../../project/resolve.ts";
 import type { Project } from "../../project/root.ts";
+import { parseSqlHeader } from "../../project/sql-asset.ts";
 import { didYouMean } from "../../project/suggest.ts";
 import { loadTsAsset } from "../../project/ts-asset.ts";
+import { countAfter, readInputFacts } from "../../run/snapshot.ts";
 import type { Row } from "../../types.ts";
 import type { CommandImpl, Ctx } from "../command.ts";
 import { formatCount, formatDuration, table, toJsonLine, truncate, VALUE_WIDTH } from "../render.ts";
-import { effectiveStatus, nextOf, openRunsDb, runningEntries, sniffKind, zoned } from "./status.ts";
+import { effectiveStatus, nextOf, openRunsDb, resolveAssets, runningEntries, zoned } from "./status.ts";
 
 // ---------------------------------------------------------------------------------------------------------
 // Asset configs, read from the files
@@ -50,26 +62,6 @@ export interface AssetConfig {
   problems: Problem[];
 }
 
-/** An SQL asset's header: the `-- name: value` lines at the top (plain comments and blank lines may sit between). */
-export function sqlHeader(text: string): { description: string | null; key: string[]; checks: string[]; warnings: string[] } {
-  const out = { description: null as string | null, key: [] as string[], checks: [] as string[], warnings: [] as string[] };
-  for (const line of text.replace(/^﻿/, "").split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (trimmed === "") continue;
-    if (!trimmed.startsWith("--")) break;
-    const m = /^--\s*([A-Za-z_]+)\s*:\s*(.*?)\s*$/.exec(trimmed);
-    if (!m) continue;
-    const [, name, value] = m as unknown as [string, string, string];
-    switch (name.toLowerCase()) {
-      case "description": out.description = value; break;
-      case "key": out.key = value.split(",").map((k) => k.trim()).filter(Boolean); break;
-      case "check": if (value) out.checks.push(value); break;
-      case "warn": if (value) out.warnings.push(value); break;
-    }
-  }
-  return out;
-}
-
 /** Secret names a TS file declares, read from its text: `secrets: ["A", 'B']` lists and `secret("C")` calls.
  *  The fallback for a file that does not import, so its secrets are still known (and redacted). */
 export function staticSecrets(source: string): string[] {
@@ -82,10 +74,27 @@ export function staticSecrets(source: string): string[] {
   return [...names].sort();
 }
 
-function emptyConfig(a: DiscoveredAsset, kind: AssetKind | null): AssetConfig {
+function emptyConfig(a: Pick<DiscoveredAsset, "name" | "file" | "path">, kind: AssetKind | null): AssetConfig {
   return {
     name: a.name, file: a.file, path: a.path, kind, description: null, schedule: null, key: [], write: null,
     incremental: { kind: "none" }, inputs: [], checks: [], warnings: [], secrets: [], loaded: false, problems: [],
+  };
+}
+
+function readSource(path: string): string {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+/** An SQL asset's config: its header (project/sql-asset.ts parseSqlHeader). */
+function sqlConfig(a: Pick<DiscoveredAsset, "name" | "file" | "path">, h: { description?: string; key: string[]; checks: string[]; warnings: string[] },
+  problems: Problem[], inputs: string[] = []): AssetConfig {
+  return {
+    ...emptyConfig(a, "sql"), description: h.description ?? null, key: [...h.key], write: "replace", inputs,
+    checks: [...h.checks], warnings: [...h.warnings], loaded: true, problems,
   };
 }
 
@@ -96,13 +105,10 @@ function emptyConfig(a: DiscoveredAsset, kind: AssetKind | null): AssetConfig {
 export async function loadConfigs(project: Project, assets: readonly DiscoveredAsset[], o: { importTimeoutMs?: number } = {}): Promise<AssetConfig[]> {
   const out: AssetConfig[] = [];
   for (const a of assets) {
-    let source = "";
-    try {
-      source = readFileSync(a.path, "utf8");
-    } catch {}
+    const source = readSource(a.path);
     if (a.kind === "sql") {
-      const h = sqlHeader(source);
-      out.push({ ...emptyConfig(a, "sql"), description: h.description, key: h.key, write: "replace", checks: h.checks, warnings: h.warnings, loaded: true });
+      const h = parseSqlHeader(source, a.file);
+      out.push(sqlConfig(a, h.header, h.problems));
       continue;
     }
     const loaded = await loadTsAsset(a, { root: project.root, timezone: project.timezone },
@@ -122,6 +128,47 @@ export async function loadConfigs(project: Project, assets: readonly DiscoveredA
     });
   }
   return out;
+}
+
+/**
+ * An asset's config from the project resolved (project/resolve.ts), as loadConfigs would read it: an SQL asset's
+ * header, a TS asset's validated config, or for a TS file that does not load its problems, its kind (from the
+ * text) and the secrets its text names. Its problems are resolveProject's: loading, the SELECT's own checks
+ * and CHECK_INVALID.
+ */
+export function configOf(r: ResolvedAsset): AssetConfig {
+  if (r.kind === "sql") {
+    const header = r.sql?.header ?? parseSqlHeader(readSource(r.path), r.file).header;
+    return sqlConfig(r, header, [...r.problems], [...r.inputs]);
+  }
+  const spec = r.ts?.spec;
+  const definition = r.ts?.definition;
+  if (!spec || !definition) return { ...emptyConfig(r, r.kind), secrets: staticSecrets(readSource(r.path)), problems: [...r.problems] };
+  const config = definition.config as { description?: unknown };
+  return {
+    name: r.name, file: r.file, path: r.path, kind: spec.role === "ingest" ? "ingest" : "ts",
+    description: typeof config.description === "string" ? config.description : null,
+    schedule: spec.schedule ?? null, key: [...spec.key], write: spec.write ?? null, incremental: spec.incremental,
+    inputs: [...spec.inputs], checks: [...spec.checks], warnings: [...spec.warnings], secrets: [...spec.secrets],
+    loaded: true, problems: [...r.problems],
+  };
+}
+
+/** What each asset reads: its definition's inputs when it loaded, else what its last build recorded
+ *  (CatalogAsset.reads); a table without an asset file keeps what the catalog says. */
+export function readsOf(resolved: ResolvedProject | null, catalog: readonly CatalogAsset[]): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const c of catalog) if (c.reads) out.set(c.asset, [...c.reads]);
+  for (const a of resolved?.assets ?? []) {
+    if (a.kind === "sql" || a.ts?.spec) out.set(a.name, [...a.inputs]);
+  }
+  return out;
+}
+
+/** The assets that read `name`, by name (asset names are table names: compared without regard to case). */
+export function readersOf(name: string, reads: ReadonlyMap<string, readonly string[]>): string[] {
+  const lower = name.toLowerCase();
+  return [...reads].filter(([asset, inputs]) => asset !== name && inputs.some((i) => i.toLowerCase() === lower)).map(([asset]) => asset).sort();
 }
 
 /** Declared secrets per asset, for ProjectEnv.listSecrets and declare(). */
@@ -305,7 +352,7 @@ export interface WarehouseAsset {
   tableExists: boolean;
   rows: number | null;
   columns: DescribeColumn[];
-  inputsSeen: Record<string, { seenLoadedAt: string | null; inputLastLoadedAt: string | null; pendingRows: number | null }>;
+  inputsSeen: Record<string, SeenInput>;
   recentWrites: RecentWrite[];
   samples: Row[];
 }
@@ -332,8 +379,45 @@ export async function jsonKeys(db: LeaseSql, table: string, column: string): Pro
   return rows.map((r) => String(r.k));
 }
 
-/** What the warehouse knows about one asset. Call inside a read lease. */
-export async function readWarehouseAsset(db: LeaseSql, asset: string, o: { samples: number; keys?: boolean } = { samples: 3 }): Promise<WarehouseAsset> {
+/** One input as a transform has seen it (§4.3 describe inputsSeen). Instants are ISO-8601 UTC as the state
+ *  holds them until the command puts them in the project zone. */
+export interface SeenInput {
+  /** The composite position's stamp: every input row stamped before it was processed. null: nothing yet. */
+  seenLoadedAt: string | null;
+  /** The input's last_loaded_at when the transform last read all of it (history/catalog.ts InputSeen). */
+  inputLastLoadedAt: string | null;
+  /** Input rows after the position (all of them when there is none); null when unknown (no table, no
+   *  _loaded_at column, or the warehouse was busy). */
+  pendingRows: number | null;
+}
+
+/**
+ * What `asset` has seen of each input (its _croft.inputs rows, and each of `declared` it has no row for yet):
+ * the position, the version it last read in full, and how many input rows come after the position. The count
+ * is newRows()'s (run/snapshot.ts countAfter): later stamps, and at the position's own stamp the rows whose key
+ * comes after the position's key. Call inside a read lease.
+ */
+export async function inputsSeenOf(db: LeaseSql, asset: string, declared: readonly string[]): Promise<Record<string, SeenInput>> {
+  const seen = await readInputsSeen(db, asset);
+  const out: Record<string, SeenInput> = {};
+  for (const input of [...new Set([...Object.keys(seen), ...declared])].sort()) {
+    const s = Object.hasOwn(seen, input) ? seen[input]! : null;
+    const facts = await readInputFacts(db, input);
+    if (!s && !facts) continue;                      // declared, but no such table: nothing to say yet
+    let pendingRows: number | null = null;
+    if (facts?.columns.some((c) => c.name === RESERVED.loadedAt)) {
+      const position = s?.seenLoadedAt ? { stamp: s.seenLoadedAt, key: Array.isArray(s.seenKey) ? s.seenKey.map(String) : null } : null;
+      pendingRows = await countAfter(db, input, facts, position);
+    }
+    out[input] = { seenLoadedAt: s?.seenLoadedAt ?? null, inputLastLoadedAt: s?.inputLastLoadedAt ?? null, pendingRows };
+  }
+  return out;
+}
+
+/** What the warehouse knows about one asset. Call inside a read lease. `inputs`: the inputs its definition
+ *  declares, listed in inputsSeen even before it has read them. */
+export async function readWarehouseAsset(db: LeaseSql, asset: string,
+  o: { samples: number; keys?: boolean; inputs?: readonly string[] } = { samples: 3 }): Promise<WarehouseAsset> {
   const out: WarehouseAsset = { state: null, tableExists: false, rows: null, columns: [], inputsSeen: {}, recentWrites: [], samples: [] };
   const withState = await hasState(db);
   if (withState) {
@@ -381,23 +465,7 @@ export async function readWarehouseAsset(db: LeaseSql, asset: string, o: { sampl
     }
   }
   if (withState) {
-    for (const r of await rowsOf(db,
-      `SELECT i.input, i.seen_loaded_at, a.last_loaded_at FROM _croft.inputs i LEFT JOIN _croft.assets a ON a.name = i.input
-       WHERE i.asset = $1 ORDER BY i.input`, [asset])) {
-      const input = String(r.input);
-      let pendingRows: number | null = null;
-      const has = await rowsOf(db,
-        `SELECT count(*) AS n FROM duckdb_columns() WHERE database_name = current_database() AND schema_name = 'main'
-         AND table_name = $1 AND column_name = '_loaded_at'`, [input]);
-      if (num(has[0]?.n)) {
-        const [p] = await rowsOf(db,
-          `SELECT count(*) AS n FROM main.${quoteIdent(input)}
-           WHERE _loaded_at > coalesce((SELECT seen_loaded_at FROM _croft.inputs WHERE asset = $1 AND input = $2), '-infinity'::TIMESTAMPTZ)`,
-          [asset, input]);
-        pendingRows = num(p?.n);
-      }
-      out.inputsSeen[input] = { seenLoadedAt: str(r.seen_loaded_at), inputLastLoadedAt: str(r.last_loaded_at), pendingRows };
-    }
+    out.inputsSeen = await inputsSeenOf(db, asset, o.inputs ?? []);
     out.recentWrites = (await rowsOf(db,
       `SELECT run_id, loaded_at, mode, rows_in, added, updated, unchanged, deleted, cursor_before, cursor_after, schema_changes
        FROM _croft.writes WHERE asset = $1 ORDER BY loaded_at DESC LIMIT 5`, [asset])).map((w) => ({
@@ -481,15 +549,16 @@ export interface DescribeData {
   description: string | null;
   next: { at: string | null; reason: string };
   behavior: Behavior;
+  /** The assets it reads (its definition's inputs; for a table without an asset file, what it last read). */
   reads: string[];
+  /** The assets that read it. */
   readBy: string[];
   rows: number | null;
   columns: DescribeColumn[];
-  inputsSeen: WarehouseAsset["inputsSeen"];
+  /** Per input, instants in the project zone; pendingRows null when the warehouse was busy (source "catalog"). */
+  inputsSeen: Record<string, SeenInput>;
   builtWithCodeHash: string | null;
   checks: { check: string; blocking: boolean; implied: boolean }[];
-  /** false in phase 1: the checks above are listed, not run (core/phase.ts). */
-  checksEnforced: boolean;
   recentWrites: RecentWrite[];
   recentRuns: { runId: string; status: string; at: string; durationMs: number | null; code: string | null }[];
   samples: Row[];
@@ -519,6 +588,7 @@ export const describe: CommandImpl<DescribeData> = {
     const found = discovery.assets.find((a) => a.name === name) ?? null;
     const runs = openRunsDb(project.paths.stateDir);
     let catalog: CatalogAsset | null = null;
+    let catalogAll: CatalogAsset[] = [];
     let catalogRefreshedAt: string | null = null;
     let steps: StepRecord[] = [];
     let dead = new Set<string>();
@@ -527,6 +597,7 @@ export const describe: CommandImpl<DescribeData> = {
         const entry = runs.catalogGet<CatalogAsset>(name);
         catalog = entry?.value ?? null;
         catalogRefreshedAt = entry?.refreshedAt ?? null;
+        catalogAll = runs.catalogAll<CatalogAsset>().map((e) => e.value);
         steps = runs.sqlite.query("SELECT run_id, asset, attempt FROM steps WHERE asset = ? ORDER BY started_at DESC, attempt DESC LIMIT 5")
           .all(name).map((r) => { const x = r as { run_id: string; asset: string; attempt: number }; return runs.getStep(x.run_id, x.asset, x.attempt)!; });
         dead = runningEntries(runs, tz).dead;
@@ -547,15 +618,21 @@ export const describe: CommandImpl<DescribeData> = {
     // Asset names are table names; anything else cannot name one.
     if (!found && !catalog && !NAME_PATTERN.test(name)) throw unknown();
 
-    const configs = await declareProjectSecrets(ctx, project, await loadConfigs(project, discovery.assets, { importTimeoutMs: 5000 }));
+    // Every asset file is resolved: their secrets are redacted in samples, and what reads this asset is in them.
+    const resolution = await resolveAssets(project);
+    const resolved = resolution.resolved;
+    const configs = await declareProjectSecrets(ctx, project,
+      resolved ? resolved.assets.map(configOf) : await loadConfigs(project, discovery.assets, { importTimeoutMs: 5000 }));
     const config = configs.find((c) => c.name === name) ?? null;
-    const problems = config ? config.problems : [];
+    const problems = [...(config ? config.problems : []), ...resolution.problems];
+    const reads = readsOf(resolved, catalogAll);
+    const inputs = config?.loaded ? config.inputs : catalog?.reads ?? [];
 
     let wh: WarehouseAsset | null = null;
     let source: DescribeData["source"] = "none";
     const next: { command: string; reason: string }[] = [];
     try {
-      wh = await readOnlyWarehouse(ctx, project).read((db) => readWarehouseAsset(db, name, { samples: 3 }),
+      wh = await readOnlyWarehouse(ctx, project).read((db) => readWarehouseAsset(db, name, { samples: 3, inputs }),
         { purpose: `describe ${name}`, waitMs: DESCRIBE_TIMING.busyWaitMs });
       source = "warehouse";
     } catch (e) {
@@ -584,6 +661,12 @@ export const describe: CommandImpl<DescribeData> = {
       name: c.name, type: c.type, pinned: c.pinned, pending: c.pending, sourceName: c.sourceName, format: c.format, addedAt: null,
       jsonKeys: c.jsonKeys ?? null, kinds: null,
     }));
+    // The warehouse's own record when it could be read; the catalog's copy of it (nothing counted) otherwise.
+    const seen: Record<string, SeenInput> = source === "warehouse" ? wh!.inputsSeen
+      : Object.fromEntries(Object.entries(cat?.inputsSeen ?? {}).map(([input, s]) => [input, { seenLoadedAt: s.seenLoadedAt, inputLastLoadedAt: s.inputLastLoadedAt, pendingRows: null }]));
+    const inputsSeen = Object.fromEntries(Object.entries(seen).map(([input, s]) => [input, {
+      seenLoadedAt: zoned(s.seenLoadedAt, tz), inputLastLoadedAt: zoned(s.inputLastLoadedAt, tz), pendingRows: s.pendingRows,
+    }]));
     const data: DescribeData = {
       asset: name,
       kind,
@@ -591,14 +674,13 @@ export const describe: CommandImpl<DescribeData> = {
       description: config?.description ?? null,
       next: nextOf(kind, !!found),
       behavior,
-      reads: config?.inputs ?? [],
-      readBy: [],
+      reads: [...inputs],
+      readBy: readersOf(name, reads),
       rows: source === "warehouse" ? wh!.rows : cat?.rows ?? null,
       columns,
-      inputsSeen: wh?.inputsSeen ?? {},
+      inputsSeen,
       builtWithCodeHash: wh?.state?.codeHash ?? cat?.codeHash ?? null,
       checks: checksOf(config, behavior.key),
-      checksEnforced: CHECKS_ENFORCED,
       recentWrites: wh?.recentWrites ?? [],
       recentRuns: steps.map((s) => ({
         runId: s.runId, status: effectiveStatus(s, dead), at: zoned(s.finishedAt ?? s.startedAt, tz)!,
@@ -659,6 +741,14 @@ function cursorText(b: Behavior, tz: string): string | null {
   return `${inc.field} = ${value}${extra}`;
 }
 
+/** "2 new rows since 2026-09-22T10:00:00-07:00", "3 rows, none read yet", "? new rows since …" (catalog). */
+function inputText(s: SeenInput): string {
+  const n = s.pendingRows;
+  const count = n === null ? "?" : formatCount(n);
+  if (s.seenLoadedAt === null) return n === null ? "not read yet" : `${count} row${n === 1 ? "" : "s"}, none read yet`;
+  return `${count} new row${n === 1 ? "" : "s"} since ${s.seenLoadedAt}`;
+}
+
 export function columnsText(columns: readonly { name: string; type: string; pending?: boolean; jsonKeys?: string[] | null }[], max = 12): string {
   const parts = columns.filter((c) => c.name !== "_loaded_at").map((c) => {
     let t = `${c.name} ${c.type}`;
@@ -692,12 +782,9 @@ export function formatDescribe(d: DescribeData, tz: string, bold: (s: string) =>
     lines.push(`${label("Table")} ${d.rows === null ? "?" : formatCount(d.rows)} rows · ${d.columns.filter((c) => c.name !== "_loaded_at").length} columns${last}${from}`);
     if (d.columns.length) lines.push(`${label("Columns")} ${columnsText(d.columns)}`);
   }
-  for (const [input, s] of Object.entries(d.inputsSeen)) {
-    lines.push(`${label("Input")} ${input}: ${s.pendingRows === null ? "?" : formatCount(s.pendingRows)} new rows since ${s.seenLoadedAt ?? "never"}`);
-  }
+  for (const [input, s] of Object.entries(d.inputsSeen)) lines.push(`${label("Input")} ${input}: ${inputText(s)}`);
   if (d.checks.length) {
     lines.push(`${label("Checks")} ${d.checks.map((c) => (c.blocking ? c.check : `warn ${c.check}`)).join(" · ")}`);
-    if (d.checksEnforced === false) lines.push(`${" ".repeat(11)}${CHECKS_NOT_ENFORCED}`);
   }
   if (d.recentRuns.length) {
     lines.push(`${label("Recent")} ${d.recentRuns.map((r) => `${r.runId} ${r.status}${r.code ? ` ${r.code}` : ""}${r.durationMs !== null ? ` ${formatDuration(r.durationMs)}` : ""}`).join(" · ")}`);

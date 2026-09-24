@@ -1,12 +1,13 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { utimesSync } from "node:fs";
+import { utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { putCatalog } from "../../history/catalog.ts";
+import { allCatalog, putCatalog } from "../../history/catalog.ts";
+import { resolveProject } from "../../project/resolve.ts";
 import { cleanup as cleanupChildren, spawnHolder, spawnIdle, writeIntent } from "../../read/testkit.ts";
 import { toJsonLine } from "../render.ts";
 import { capContext, CONTEXT_CAP_BYTES, type ContextData } from "./context.ts";
 import {
-  busyScenario, cleanup, cli, ISSUES_CATALOG, ISSUES_SEED, makeProject, NOW, runsDb, SCENARIO_FILES, seed, shape,
+  busyScenario, cleanup, cli, ISSUES_CATALOG, ISSUES_SEED, makeProject, NOW, OPEN_SQL, runsDb, SCENARIO_FILES, seed, shape,
 } from "./inspect-testkit.ts";
 
 afterAll(async () => {
@@ -16,11 +17,23 @@ afterAll(async () => {
 
 const ENV = { CROFT_NOW: NOW };
 
-async function scenario(o: { warehouse?: boolean } = {}) {
-  const p = makeProject({ files: SCENARIO_FILES });
+/** The busy scenario, each asset built with the code its file has now (as a run of it records). */
+async function scenario(o: { warehouse?: boolean; files?: Record<string, string> } = {}) {
+  const files = { ...SCENARIO_FILES, ...o.files };
+  const p = makeProject({ files });
   const t = new Date("2026-09-22T18:00:00Z");
-  for (const f of Object.keys(SCENARIO_FILES)) utimesSync(join(p.root, f), t, t);
+  for (const f of Object.keys(files)) utimesSync(join(p.root, f), t, t);
   busyScenario(p.stateDir);
+  const resolved = await resolveProject({ root: p.root, timezone: "America/Los_Angeles" });
+  const db = runsDb(p.stateDir);
+  try {
+    for (const c of allCatalog(db)) {
+      const hash = resolved.assets.find((a) => a.name === c.asset)?.codeHash;
+      if (hash) putCatalog(db, { ...c, codeHash: hash });
+    }
+  } finally {
+    db.close();
+  }
   if (o.warehouse !== false) await seed(p.database, ISSUES_SEED);
   return p;
 }
@@ -34,20 +47,22 @@ describe("croft context --json", () => {
     expect(r.exit).toBe(0);
     expect(r.json).toMatchObject({ ok: true, command: "context", problems: [], next: [] });
     const d = r.json.data as ContextData;
-    expect(Object.keys(d)).toEqual(["project", "assets", "checksEnforced", "running", "held", "recentFailures", "recentSchemaChanges", "schemaChangesFrom", "truncated"]);
-    expect(d.checksEnforced).toBe(false);
+    expect(Object.keys(d)).toEqual(["project", "assets", "running", "held", "recentFailures", "recentSchemaChanges", "schemaChangesFrom", "truncated"]);
     expect(d.project).toEqual({ root: p.root, database: "warehouse.duckdb", timezone: "America/Los_Angeles", assets: 6, scheduling: { state: "off", via: null } });
     expect(byAsset(d).github_issues).toEqual({
       asset: "github_issues", kind: "ingest", file: "assets/github_issues.ts", description: "Issues of oven-sh/bun",
       behavior: ISSUES_CATALOG.behavior, key: ["id"], cursor: { field: "updated_at", value: "2026-09-22T17:58:03Z" }, rows: 18556,
       lastLoadedAt: "2026-09-22T11:55:00-07:00", status: "ok",
       lastRun: { runId: "r_0922_1155_ok01", at: "2026-09-22T11:55:00-07:00", status: "ok", code: null },
-      next: "manual", reads: [], checks: ["unique(id)", "not_null(id)", "not_null(title)", "state IN ('open', 'closed')"],
+      next: "manual", staleReasons: [], reads: [], checks: ["unique(id)", "not_null(id)", "not_null(title)", "state IN ('open', 'closed')"],
       schemaChangedAt: "2026-09-22T11:55:00-07:00",
       columns: [{ name: "id", type: "BIGINT" }, { name: "title", type: "VARCHAR" }, { name: "user", type: "JSON", jsonKeys: ["id", "login"] }],
     });
     expect(byAsset(d).taxi_zones.filesGone).toEqual(["files/zones/2025.csv", "files/zones/2024.csv"]);
-    expect(byAsset(d).open_issues).toMatchObject({ kind: "sql", status: "never_run", rows: null, next: "after inputs", checks: ["unique(id)", "not_null(id)", "not_null(author)", "warn id > 0"] });
+    expect(byAsset(d).open_issues).toMatchObject({
+      kind: "sql", status: "never_run", rows: null, next: "after inputs", staleReasons: ["never_built"], reads: ["github_issues"],
+      checks: ["unique(id)", "not_null(id)", "not_null(author)", "warn id > 0"],
+    });
     expect(byAsset(d).sales).toMatchObject({ kind: "ingest", status: "running", behavior: "loads only new and changed files; updates rows by order_id" });
     expect(d.running).toEqual([{ runId: "r_0922_1157_live", asset: "sales", pid: process.pid, since: "2026-09-22T11:56:00-07:00", phase: "extract", rowsFetched: 61200 }]);
     expect(d.held).toEqual([]);
@@ -56,11 +71,44 @@ describe("croft context --json", () => {
       { asset: "stripe_charges", runId: "r_0922_1156_bad1", at: "2026-09-22T11:55:00-07:00", status: "failed", code: "CHECK_FAILED", message: "amount >= 0: 2 rows fail" },
     ]);
     expect(d.schemaChangesFrom).toBe("warehouse");
+    // readBy: the assets that read the changed one (open_issues.sql selects from github_issues).
     expect(d.recentSchemaChanges).toEqual([
-      { asset: "github_issues", at: "2026-09-22T11:00:00-07:00", runId: "r_0922_1100_bbbb", kind: "add_column", column: "updated_at", from: null, to: "TIMESTAMPTZ", readBy: [] },
+      { asset: "github_issues", at: "2026-09-22T11:00:00-07:00", runId: "r_0922_1100_bbbb", kind: "add_column", column: "updated_at", from: null, to: "TIMESTAMPTZ", readBy: ["open_issues"] },
     ]);
     expect(d.truncated).toBe(false);
-    expect(shape(d.recentSchemaChanges)).toEqual([{ asset: "string", at: "string", runId: "string", kind: "string", column: "string", from: "null", to: "string", readBy: [] }]);
+    expect(shape(d.recentSchemaChanges)).toEqual([{ asset: "string", at: "string", runId: "string", kind: "string", column: "string", from: "null", to: "string", readBy: ["string"] }]);
+  });
+
+  test("staleness and edits: an SQL transform edited since it was built, and the warning that says so", async () => {
+    const p = await scenario();
+    const db = runsDb(p.stateDir);
+    try {
+      putCatalog(db, {
+        ...ISSUES_CATALOG, asset: "open_issues", kind: "sql", cursor: null, codeHash: "older-code", reads: ["github_issues"], lastRunId: "r_0922_1155_ok01",
+        inputsSeen: { github_issues: { seenLoadedAt: ISSUES_CATALOG.lastLoadedAt, seenKey: null, inputLastLoadedAt: ISSUES_CATALOG.lastLoadedAt } },
+      });
+    } finally {
+      db.close();
+    }
+    const r = await cli(["context", "--json"], { cwd: p.root, env: ENV });
+    expect(r.exit).toBe(0);
+    expect(byAsset(r.json.data).open_issues).toMatchObject({ status: "ok", staleReasons: ["code_changed"], edited: true });
+    expect(byAsset(r.json.data).github_issues.edited).toBeUndefined();
+    expect(r.json.problems).toEqual([expect.objectContaining({
+      code: "EDITED_SINCE_LAST_RUN", asset: "open_issues", fix: expect.objectContaining({ command: "croft run open_issues" }),
+    })]);
+    // --asset keeps the warnings about the assets it names.
+    const other = await cli(["context", "--asset", "github_issues", "--json"], { cwd: p.root, env: ENV });
+    expect(other.json.problems).toEqual([]);
+    const human = await cli(["context"], { cwd: p.root, env: ENV });
+    expect(human.stdout).toContain("open_issues · sql · assets/open_issues.sql · 18,556 rows · ok · stale: code changed (croft run open_issues) · edited since its last run");
+  });
+
+  test("a broken SQL asset's problems come with it, as croft validate would report them", async () => {
+    const p = await scenario({ files: { "assets/open_issues.sql": OPEN_SQL.replace("-- warn: id > 0", "-- warn: id >") } });
+    const r = await cli(["context", "--json"], { cwd: p.root, env: ENV });
+    expect(r.exit).toBe(0);
+    expect(r.json.problems).toEqual([expect.objectContaining({ code: "CHECK_INVALID", asset: "open_issues", file: "assets/open_issues.sql" })]);
   });
 
   test("schema changes older than 7 days are left out", async () => {
@@ -138,7 +186,7 @@ describe("croft context never waits on DuckDB", () => {
     expect(took).toBeLessThan(2000);
     expect(r.json.data.schemaChangesFrom).toBe("runs");
     expect(r.json.data.recentSchemaChanges).toEqual([
-      { asset: "github_issues", at: "2026-09-22T11:55:00-07:00", runId: "r_0922_1155_ok01", kind: "add_column", column: "milestone", from: null, to: "JSON", readBy: [] },
+      { asset: "github_issues", at: "2026-09-22T11:55:00-07:00", runId: "r_0922_1155_ok01", kind: "add_column", column: "milestone", from: null, to: "JSON", readBy: ["open_issues"] },
     ]);
     expect(r.json.data.assets).toHaveLength(6);
   });
@@ -193,12 +241,12 @@ describe("the 20 KB cap", () => {
   test("capContext sheds JSON keys first, then column lists, then assets", () => {
     const asset = (i: number) => ({
       asset: `a${i}`, kind: "ingest" as const, file: null, description: null, behavior: "b", key: [], cursor: null, rows: 1, lastLoadedAt: null,
-      status: "ok" as const, lastRun: null, next: "manual", reads: [], checks: [],
+      status: "ok" as const, lastRun: null, next: "manual", staleReasons: [], reads: [], checks: [],
       columns: [{ name: "c", type: "JSON", jsonKeys: Array.from({ length: 50 }, (_, k) => `k${k}`) }],
     });
     const d: ContextData = {
       project: { root: "/p", database: "w", timezone: "UTC", assets: 3, scheduling: { state: "off", via: null } },
-      assets: [asset(1), asset(2), asset(3)], checksEnforced: false, running: [], held: [], recentFailures: [], recentSchemaChanges: [], schemaChangesFrom: "warehouse", truncated: false,
+      assets: [asset(1), asset(2), asset(3)], running: [], held: [], recentFailures: [], recentSchemaChanges: [], schemaChangesFrom: "warehouse", truncated: false,
     };
     const size = Buffer.byteLength(toJsonLine(d));
     expect(capContext(d, size)).toBe(d);
@@ -230,6 +278,8 @@ describe("croft context: human output", () => {
     expect(r.stdout).toContain("taxi_zones · ingest · assets/taxi_zones.ts · 265 rows · crashed (croft logs taxi_zones --failed) · 2 files gone");
     // A running step with the progress the run engine reports (§4.3 running[]: phase, rowsFetched).
     expect(r.stdout).toContain("Running\n  r_0922_1157_live sales since 4 min ago · extract · 61,200 rows fetched");
-    expect(r.stdout.split("\n")).toContain("checks: not enforced until phase 2");
+    expect(r.stdout).toContain("open_issues · sql · assets/open_issues.sql · not built · never run (croft run open_issues)");
+    expect(r.stdout).toContain("  reads     github_issues");
+    expect(r.stdout).not.toContain("not enforced");
   });
 });
