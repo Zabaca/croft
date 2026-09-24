@@ -258,6 +258,70 @@ describe("serve profile", () => {
   test("still applies the one-SELECT rule first", async () => {
     expect((await code("copy t to 'x.csv'", { profile: "serve" })).code).toBe("QUERY_NOT_SELECT");
   });
+
+  test("SHOW lists only the main schema's names: SHOW ALL TABLES, a bare DESCRIBE or SHOW, SHOW databases and the like are refused", async () => {
+    await conn.run("CREATE SCHEMA IF NOT EXISTS _croft");
+    await conn.run("CREATE TABLE IF NOT EXISTS _croft.meta (key VARCHAR, value VARCHAR)");
+    for (const sql of [
+      "show all tables",
+      "SHOW ALL TABLES",
+      "describe",
+      "show",
+      "show databases",
+      "show schemas",
+      "show variables",
+      "select * from (show all tables)",
+      "from (describe)",
+      "select name from t, (show all tables) s",
+      "with x as (from (show databases)) select * from x",
+    ]) {
+      const e = await code(sql, { profile: "serve" });
+      expect([sql, e.code]).toEqual([sql, "QUERY_PATH_DENIED"]);
+      expect(e.problem.hint).toContain("SHOW TABLES");
+    }
+    // What stays: the main schema's table names, and one table's columns or summary.
+    for (const sql of ["show tables", "select * from (show tables)", "describe t", "show t", "summarize t", "select * from (describe t)"]) {
+      await assertOneSelect(conn, sql, { profile: "serve" });
+    }
+    // Elsewhere SHOW is unchanged (croft query runs on the user's own machine).
+    await assertOneSelect(conn, "show all tables");
+    await assertOneSelect(conn, "show databases");
+  });
+
+  test("range() and generate_series() as values: literal bounds past 10,000,000 values are refused; tables and small lists pass", async () => {
+    for (const sql of [
+      "select list_sort(range(150000000))[1] as x",
+      "select range(-20000000, 0)",
+      "select len(generate_series(0, 9999999999))",
+      "select range(1, 200000001, 2)",
+      "select range(1.5e8)",
+      "select range(0::BIGINT, 50000000::BIGINT)",
+      "select list_reduce(range(20000000), (a, b) -> a + b)",
+      "select a from t where a in (select unnest(range(100000000)))",
+      "select range(170141183460469231731687303715884105727)",
+    ]) {
+      const e = await code(sql, { profile: "serve" });
+      expect([sql, e.code]).toEqual([sql, "QUERY_PATH_DENIED"]);
+      expect(e.message).toMatch(/range|generate_series/);
+      expect(e.message).toContain("10,000,000");
+      expect(e.problem.hint).toContain("FROM range");
+    }
+    for (const sql of [
+      "select range(10)",
+      "select range(10000000)",
+      "select range(0, 20000000, 2)",
+      "select generate_series(5, 1, -1)",
+      "select * from range(1000000000000)",
+      "select count(*) from generate_series(1, 100000000)",
+      "select range(a) from t",
+      "select range(0)",
+      "select range(-20000000)",
+    ]) {
+      await assertOneSelect(conn, sql, { profile: "serve" });
+    }
+    // croft query (a local CLI with no writer to hand the file to) keeps them.
+    await assertOneSelect(conn, "select range(150000000)");
+  });
 });
 
 describe("every profile: functions with side effects or SQL the gate cannot see", () => {

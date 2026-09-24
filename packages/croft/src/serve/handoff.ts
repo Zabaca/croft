@@ -11,6 +11,8 @@
 // - drain(): running queries may finish for graceMs (2 s); then each one still running is interrupted every
 //   20 ms until it settles (queue.ts Flight.stop). Only after that may connections be disconnected: a connection
 //   disconnected while its interrupted query had not settled kept the lock, and that query never settled [V].
+//   A query that interrupts cannot stop is abandoned killAfterMs after its first interrupt (Flight.stop): the
+//   engine kills the worker process it runs in (worker.ts), which settles it, so drain() always ends.
 import { type FSWatcher, mkdirSync, rmSync, watch } from "node:fs";
 import { sameBoot } from "../core/proc.ts";
 import { intentDir, type IntentEntry, isHolderAlive, listIntents, purgeDead } from "../db/intent.ts";
@@ -111,7 +113,8 @@ export class IntentWatch {
 
 /**
  * Let the flights in `a` finish for `graceMs`, then stop each one still running for `reason` (interrupted every
- * 20 ms until it settles), and resolve once none holds a slot. Admission must already be paused.
+ * 20 ms until it settles, abandoned when it has not settled after the admission's stuckAfterMs), and resolve once
+ * none holds a slot. Admission must already be paused.
  */
 export async function drain(a: Pick<Admission, "active" | "idle">, o: { graceMs: number; reason: StopReason }): Promise<{ interrupted: number }> {
   if (a.active.size === 0) return { interrupted: 0 };

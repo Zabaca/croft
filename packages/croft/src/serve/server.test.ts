@@ -3,7 +3,7 @@
 // the envelopes, and serve.json.
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
@@ -31,6 +31,8 @@ afterAll(async () => {
 });
 
 const TOKEN = "s3cret-token-value";
+/** Extra time CPU-starved CI runners get on timing budgets. */
+const SLACK_MS = process.env.CROFT_CI === "1" ? 600 : 0;
 
 interface FakeEngine extends ServeEngine {
   calls: ServeQuery[];
@@ -405,14 +407,101 @@ describe("envelopes", () => {
     expect((await raw(s.port, "GET", "/health", { Host: `127.0.0.1:${s.port}` })).status).toBe(401);
   });
 
-  test("GET /status: an envelope with the server and the engine's state", async () => {
-    const s = serve(fakeEngine());
+  test("GET /status: the status envelope of §4.3 (never importing asset code), with the server and engine under data.serve", async () => {
+    const p = await makeProject({ seed: ["CREATE TABLE t AS SELECT 1 AS n"] });
+    // An asset whose top-level code would announce itself if croft serve ever imported it.
+    const marker = join(p.root, "imported.txt");
+    mkdirSync(join(p.root, "assets"), { recursive: true });
+    writeFileSync(join(p.root, "assets", "orders.ts"), `import { writeFileSync } from "node:fs";\nimport { ingest } from "@zabaca/croft";\n`
+      + `writeFileSync(${JSON.stringify(marker)}, "imported");\nexport default ingest({ async *rows() { yield []; } });\n`);
+    const s = serve(fakeEngine(), { root: p.root });
     const r = await raw(s.port, "GET", "/status", authed(s.port));
     expect(r.status).toBe(200);
     expect(r.json).toMatchObject({
       ok: true, command: "status",
-      data: { url: s.url, pid: process.pid, engine: { state: "open", inFlight: 0, queued: 0, openConnections: 1 } },
+      data: {
+        healthy: expect.any(Boolean), running: [], scheduling: { state: "off" },
+        serve: { url: s.url, pid: process.pid, engine: { state: "open", inFlight: 0, queued: 0, openConnections: 1 } },
+      },
     });
+    expect(r.json.data.assets.map((a: { asset: string }) => a.asset)).toEqual(["orders"]);
+    expect(r.json.data.assets[0]).toMatchObject({ asset: "orders", status: "never_run", stale: true });
+    expect(existsSync(marker)).toBe(false);
+    // A folder that is no project: the problem, not a crash.
+    const bare = serve(fakeEngine());
+    const b = await raw(bare.port, "GET", "/status", authed(bare.port));
+    expect(b.json.ok).toBe(false);
+    expect(b.json.problems[0].hint).not.toBe("");
+  });
+
+  test("a keep-alive connection is closed after the idle timeout once its query is answered; so is one whose body never comes", async () => {
+    const errors: unknown[] = [];
+    const s = serve(fakeEngine(async () => {
+      await Bun.sleep(1200);
+      return data([{ a: 1 }]);
+    }), { idleTimeoutS: 1, onError: (e) => errors.push(e) });
+    const hold = (request: string) => new Promise<{ answeredAt: number; closedAt: number | null }>((resolve) => {
+      const t0 = Date.now();
+      let answeredAt = -1;
+      const socket = connect({ host: "127.0.0.1", port: s.port }, () => socket.write(request));
+      socket.on("data", () => {
+        if (answeredAt < 0) answeredAt = Date.now() - t0;
+      });
+      socket.on("error", () => {});
+      const timer = setTimeout(() => {
+        socket.destroy();
+        resolve({ answeredAt, closedAt: null });
+      }, 9000 + SLACK_MS);
+      socket.on("close", () => {
+        clearTimeout(timer);
+        resolve({ answeredAt, closedAt: Date.now() - t0 });
+      });
+    });
+    const body = '{"sql":"SELECT 1"}';
+    const head = (length: number) => `POST /query HTTP/1.1\r\nHost: 127.0.0.1:${s.port}\r\nAuthorization: Bearer ${TOKEN}\r\nContent-Type: application/json\r\nContent-Length: ${length}\r\n\r\n`;
+    const [answered, stalled] = await Promise.all([hold(head(body.length) + body), hold(`${head(1000)}{"sql":`)]);
+    // Answered after the idle timeout had passed (the query is exempt), then closed once idle.
+    expect(answered.answeredAt).toBeGreaterThanOrEqual(1100);
+    expect(answered.closedAt).not.toBeNull();
+    expect(answered.closedAt! - answered.answeredAt).toBeLessThan(6000 + SLACK_MS);
+    expect(stalled.closedAt).not.toBeNull();
+    // A client that went away before its body came is no bug of croft's: nothing for the server's log.
+    await Bun.sleep(50);
+    expect(errors).toEqual([]);
+  }, 30_000);
+
+  test("Connection: close on the request is answered with Connection: close", async () => {
+    const s = serve(fakeEngine());
+    const r = await postQuery(s, { sql: "SELECT 1" });
+    expect(r.status).toBe(200);
+    expect(r.headers.connection).toBe("close");
+  });
+
+  test("bodies waiting for the engine are bounded: past maxPendingBodyBytes a /query is 503 at once, before its body is read", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const engine = fakeEngine(async () => {
+      await gate;
+      return data([{ a: 1 }]);
+    });
+    const s = serve(engine, { maxBodyBytes: 512 * 1024, maxPendingBodyBytes: 1024 * 1024 });
+    const big = JSON.stringify({ sql: `SELECT 1 -- ${"x".repeat(400 * 1024)}` });
+    const first = [postQuery(s, big), postQuery(s, big)];
+    const end = Date.now() + 5000;
+    while (engine.calls.length < 2 && Date.now() < end) await Bun.sleep(5);
+    expect(engine.calls).toHaveLength(2);
+    // The third sends its headers and only part of its body: the answer comes anyway, at once.
+    const start = Date.now();
+    const third = await rawLines(s.port, `POST /query HTTP/1.1\r\nHost: 127.0.0.1:${s.port}\r\nAuthorization: Bearer ${TOKEN}\r\nContent-Type: application/json\r\nContent-Length: ${big.length}\r\n\r\n${big.slice(0, 1000)}`);
+    expect(Date.now() - start).toBeLessThan(1000 + SLACK_MS);
+    expect(third.status).toBe(503);
+    expect(third.headers["retry-after"]).toBe("1");
+    expect(third.json.problems[0]).toMatchObject({ code: "SERVE_UNAVAILABLE", retryable: true });
+    expect(third.json.problems[0].hint).not.toBe("");
+    expect(engine.calls).toHaveLength(2);
+    release();
+    for (const r of await Promise.all(first)) expect(r.status).toBe(200);
+    expect((await postQuery(s, big)).status).toBe(200);
   });
 
   test("an unexpected engine failure is 500 INTERNAL_ERROR without a stack; problem text is redacted", async () => {

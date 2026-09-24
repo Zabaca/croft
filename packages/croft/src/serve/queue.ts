@@ -8,15 +8,22 @@
 //   query settles: DuckDB can miss an interrupt that lands between two tasks, and a connection must never be
 //   disconnected while its interrupted query has not settled (the lock stayed held in that case [V]). The first
 //   reason wins, so the error a client sees names what actually stopped its query.
+// - Interrupts cannot stop every query: DuckDB checks for them between tasks, and a query can spend seconds inside
+//   one expression. A stopped flight that has not settled within stuckAfterMs is abandoned: its connection's
+//   abandon() ends it the hard way (the engine kills the worker process the query runs in, serve/worker.ts).
+// - The wait queue is bounded (maxQueued): past it a query is refused at once, so a burst of requests while a
+//   writer holds the file cannot pile up without limit.
 import type { CroftError } from "../core/errors.ts";
 
 /** Why a running query was stopped: a writer needed the file, its deadline passed, its request went away, or
  *  the server is stopping. */
 export type StopReason = "write" | "timeout" | "abort" | "stop";
 
-/** What stop() needs from a connection (DuckDBConnection has it). */
+/** What stop() needs from the query's connection. */
 export interface Interruptible {
   interrupt(): void;
+  /** The query did not settle within stuckAfterMs of being stopped: end it however it takes. */
+  abandon?(): void;
 }
 
 /** Thrown by Flight.checkpoint() when the flight was stopped before its next DuckDB step. */
@@ -32,23 +39,35 @@ export class Flight {
   reason: StopReason | null = null;
   readonly admittedAt = Date.now();
   private timer: ReturnType<typeof setInterval> | null = null;
+  private stuck: ReturnType<typeof setTimeout> | null = null;
+  private abandoned = false;
   private done = false;
 
-  constructor(private readonly leave: (f: Flight) => void, private readonly everyMs: number) {}
+  constructor(private readonly leave: (f: Flight) => void, private readonly everyMs: number, private readonly stuckAfterMs: number) {}
 
-  /** The query got its connection. A flight stopped before this is interrupted at once. */
+  /** The query got its connection. A flight stopped before this is interrupted at once (or abandoned, when its
+   *  time to settle is already over). */
   attach(conn: Interruptible): void {
     this.conn = conn;
-    if (this.reason && !this.done) conn.interrupt();
+    if (!this.reason || this.done) return;
+    conn.interrupt();
+    if (this.abandoned) conn.abandon?.();
   }
 
-  /** Interrupt the query now and every `everyMs` until it is released. The first reason is kept. */
+  /** Interrupt the query now and every `everyMs` until it is released, and abandon it if it has not been released
+   *  stuckAfterMs from now. The first reason is kept. */
   stop(reason: StopReason): void {
     if (this.done || this.reason) return; // already being interrupted
     this.reason = reason;
     this.conn?.interrupt();
     this.timer = setInterval(() => this.conn?.interrupt(), this.everyMs);
     (this.timer as { unref?: () => void }).unref?.();
+    this.stuck = setTimeout(() => {
+      if (this.done) return;
+      this.abandoned = true;
+      this.conn?.abandon?.();
+    }, this.stuckAfterMs);
+    (this.stuck as { unref?: () => void }).unref?.();
   }
 
   /** Throw FlightStopped when the flight was stopped: called between the query's DuckDB steps, so a query
@@ -67,7 +86,9 @@ export class Flight {
     if (this.done) return;
     this.done = true;
     if (this.timer) clearInterval(this.timer);
+    if (this.stuck) clearTimeout(this.stuck);
     this.timer = null;
+    this.stuck = null;
     this.leave(this);
   }
 }
@@ -76,10 +97,16 @@ export interface AdmissionOptions {
   maxConcurrent: number;
   /** Interval of repeated interrupts once a flight is stopped (20 ms). */
   interruptEveryMs?: number;
+  /** How long a stopped flight may take to settle before it is abandoned (Interruptible.abandon). Default 500. */
+  stuckAfterMs?: number;
+  /** Queries that may wait; one more is refused at once with full(). Default unbounded. */
+  maxQueued?: number;
   /** The error for a query not admitted by its deadline; the engine knows why (a writer, or a full house). */
   unavailable(waitedMs: number): CroftError;
   /** The error for a query whose request went away while it waited. */
   aborted(): CroftError;
+  /** The error for a query refused because maxQueued already wait (unavailable(0) when not given). */
+  full?(): CroftError;
 }
 
 export interface EnterOptions {
@@ -119,6 +146,7 @@ export class Admission {
     if (this.closedWith) return Promise.reject(this.closedWith);
     if (o.signal?.aborted) return Promise.reject(this.o.aborted());
     if (this.admitting && this.waiting.length === 0 && this.active.size < this.o.maxConcurrent) return Promise.resolve(this.admit());
+    if (this.waiting.length >= (this.o.maxQueued ?? Infinity)) return Promise.reject(this.o.full?.() ?? this.o.unavailable(0));
     return new Promise<Flight>((resolve, reject) => {
       const since = Date.now();
       const timer = setTimeout(() => {
@@ -176,7 +204,7 @@ export class Admission {
   }
 
   private admit(): Flight {
-    const f = new Flight((x) => this.leave(x), this.o.interruptEveryMs ?? 20);
+    const f = new Flight((x) => this.leave(x), this.o.interruptEveryMs ?? 20, this.o.stuckAfterMs ?? 500);
     this.active.add(f);
     return f;
   }

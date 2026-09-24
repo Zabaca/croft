@@ -3,12 +3,13 @@
 //
 // 1. Refuse while a live croft serve is recorded for the project (<state>/serve.json).
 // 2. The token: CROFT_SERVE_TOKEN (the shell, then the project's .env), else 32 random bytes.
-// 3. Open the engine (serve/instance.ts: the read-only instance and the write-intent handoff), listen
-//    (serve/server.ts), record serve.json (0600), and start the loop that spawns `croft tick` every minute
-//    while scheduling is on (serve/loop.ts).
+// 3. Open the engine (serve/instance.ts: the read-only instance, held in a query worker process it can kill, and
+//    the write-intent handoff), listen (serve/server.ts), record serve.json (0600), and start the loop that spawns
+//    `croft tick` every minute while scheduling is on (serve/loop.ts).
 // 4. Print the banner (--json: one envelope with the address), then run until SIGINT, SIGTERM or SIGHUP.
 // 5. Stop: no more ticks, remove serve.json (apps fall back to reading the file), stop listening, close the
-//    engine (which interrupts what still runs), exit 0.
+//    engine (which interrupts what still runs and kills its workers), exit 0. A worker whose croft serve dies
+//    without stopping (kill -9) exits by itself, so the file is never left locked.
 //
 // Off a TTY it runs all the same (servers, containers). Agents are told to ask the user to start it in their own
 // terminal (SKILL.md), since it never returns by itself.
