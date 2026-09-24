@@ -37,9 +37,10 @@ const doctor = lazyCommand({
 const run = lazyCommand({
   name: "run",
   summary: "update assets and the stale transforms downstream (off a terminal the run detaches; croft wait follows it)",
-  usage: "croft run [selector…] [--dry-run] [--only] [--upstream] [--from <date|ISO|-90d>] [--allow-shrink] [--foreground] [--follow 100s] [--no-wait] [--events]",
+  usage: "croft run [selector…] [--dry-run] [--only] [--upstream] [--rebuild] [--from <date|ISO|-90d>] [--allow-shrink] [--foreground] [--follow 100s] [--no-wait] [--events]",
   options: {
     "dry-run": { type: "boolean", description: "show what would run and why (windows, confirmations) without running; reads only runs.sqlite and never waits" },
+    rebuild: { type: "boolean", description: "build the named assets from scratch (an ingest refetches; its table goes to the trash first, after confirmation)" },
     only: { type: "boolean", description: "run only the named assets, not the stale assets downstream of them" },
     upstream: { type: "boolean", description: "also refresh the stale assets the named ones read, first" },
     from: { type: "string", value: "<when>", description: "backfill a merge ingest from a date, an ISO time or a relative value (-90d, -12h, today)" },
@@ -191,7 +192,35 @@ const tick = lazyCommand({
   hidden: true,
 }, async () => (await import("./tick.ts")).tick);
 
+const rename = lazyCommand({
+  name: "rename",
+  summary: "rename an asset: its file, table and state together; lists the references to update",
+  usage: "croft rename <old> <new>",
+  options: {},
+  maxPositionals: 2,
+}, async () => (await import("./rename.ts")).rename);
+
+const del = lazyCommand({
+  name: "delete",
+  summary: "move a whole table, or the rows matching --where, to the trash (needs confirmation)",
+  usage: `croft delete <asset> [--where "<expr>"]`,
+  options: {
+    where: { type: "string", value: "<expr>", description: "delete only the rows where this SQL expression is true" },
+  },
+  maxPositionals: 1,
+}, async () => (await import("./delete.ts")).del);
+
+const restore = lazyCommand({
+  name: "restore",
+  summary: "list the trash, or bring a version of an asset back (needs confirmation)",
+  usage: "croft restore [asset] [--at <time>]",
+  options: {
+    at: { type: "string", value: "<time>", description: "the version to restore: its time as croft restore lists it (default: the latest)" },
+  },
+  maxPositionals: 1,
+}, async () => (await import("./restore.ts")).restore);
+
 export const COMMANDS: readonly Command[] = [
   docs, help, version, init, doctor, validate, preview, run, wait, status, query, describe, context, logs, secrets, confirm,
-  schedule, serve, tick,
+  schedule, serve, tick, rename, del, restore,
 ];

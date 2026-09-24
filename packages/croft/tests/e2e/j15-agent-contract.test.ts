@@ -60,7 +60,7 @@ describe("the agent contract", () => {
     }
     expect(skill).toContain("croft run <asset> --dry-run --from -90d");
     // The version section names what this build lacks, so the agent does not try it.
-    expect(skill).toContain("Not in this version, so never call them (each exits 2): rename, delete, restore");
+    expect(skill).toContain("Not in this version, so never call them (each exits 2): new, validate --hook, init --with-hook");
 
     // The skill's pointers answer: the template pages, and the backfill recipe (a file ingest refuses --from with
     // BACKFILL_UNSUPPORTED, in the dry run as in the run; neither is an unknown flag).

@@ -425,6 +425,11 @@ function interruptedError(message = "the run was interrupted"): CroftError {
 const ACTION_WORDS: Record<ConfirmRequest["action"], string> = {
   allow_shrink: "--allow-shrink would shrink it",
   large_reprocess: "LARGE_REPROCESS: it would process many input rows and make requests for them",
+  rebuild: "--rebuild would move its table to the trash and build it from scratch",
+  delete: "deleting would move rows to the trash",
+  restore: "restoring would replace the current table",
+  convert_key: "the new key would deduplicate its rows in place",
+  pin_change: "the new pin would change stored values",
 };
 
 function nextSteps(steps: StepResult[], problems: Problem[], deferred: ReadonlyMap<string, ConfirmRequest>): Next[] {

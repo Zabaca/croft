@@ -184,9 +184,17 @@ export interface DryRunWindow {
   lookback?: string;
 }
 
+/**
+ * What a confirmation is for (§6 "Destructive operations need confirmation"): allow_shrink (a replace ingest's
+ * --allow-shrink), large_reprocess (the cost guard), rebuild (run --rebuild of an ingest or an incremental TS
+ * transform), delete (a table or rows), restore (overwrites the current table), convert_key (an append ingest
+ * gaining a key, deduplicated in place), pin_change (a lossy pin retypes stored values).
+ */
+export type ConfirmAction = "allow_shrink" | "large_reprocess" | "rebuild" | "delete" | "restore" | "convert_key" | "pin_change";
+
 /** A confirmation a real run would stop for. A dry run never issues a token. */
 export interface DryRunConfirmation {
-  action: "allow_shrink" | "large_reprocess";
+  action: ConfirmAction;
   /** What `croft confirm` would carry out: "croft run taxi_zones --allow-shrink". */
   command: string;
   /** allow_shrink: the rows that would go to the trash. large_reprocess: the pending input rows, and the
