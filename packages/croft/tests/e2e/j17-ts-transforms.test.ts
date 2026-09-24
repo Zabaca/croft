@@ -693,7 +693,7 @@ describe("journey 17: R2.1 findings, end to end", () => {
   // R2.1 (run/transform.ts pendingCounts): the cost guard counts every keyed input's rows after its position,
   // including a lookup read only with rows(), which never gets a position. With 10 lookup rows and
   // confirmAbove 4, every run asks again (LARGE_REPROCESS for 10 rows) even with no new issue to process.
-  bugTest("g. a keyed lookup read with rows() does not count toward the cost guard", async () => {
+  test("g. a keyed lookup read with rows() does not count toward the cost guard", async () => {
     const { p, llm } = await setup("/g", 3);
     p.write("assets/teams.sql", "-- key: id\nSELECT range AS id, 'team ' || range AS team FROM range(10)\n");
     p.write("assets/team_labels.ts", `import { transform } from "@zabaca/croft";
@@ -733,7 +733,7 @@ export default transform({
 
   // R2.1 (project/ts-asset.ts detectRequests): the Vercel AI SDK (`ai`, `@ai-sdk/*`) is not a known request
   // package, so a transform calling generateText() per row runs its whole backlog with no LARGE_REPROCESS.
-  bugTest("h. a transform that calls an LLM through the ai SDK is held by the cost guard", async () => {
+  test("h. a transform that calls an LLM through the ai SDK is held by the cost guard", async () => {
     const { p, llm } = await setup("/h", 6);
     p.write("node_modules/ai/package.json", JSON.stringify({ name: "ai", version: "5.0.0", type: "module", exports: { ".": "./index.js" } }));
     p.write("node_modules/ai/index.js", `export async function generateText({ prompt, id }) {
@@ -769,7 +769,7 @@ export default transform({
   // R2.1 (run/transform.ts stagedChunk): a chunk that failed CHECK_FAILED is re-committed on every later run while
   // the code hash and positions are unchanged, even after the input row it came from was corrected; the code
   // never runs again for it, so the fix the error names ("correct … the data") cannot work.
-  bugTest("i. after the input row itself is corrected, the next run recomputes it instead of re-committing the stale staged chunk", async () => {
+  test("i. after the input row itself is corrected, the next run recomputes it instead of re-committing the stale staged chunk", async () => {
     const { p, state, llm } = await setup("/i", 4, { label: ({ title }) => (title.endsWith("?") ? "question" : "bug") });
     state.issues[1] = { id: 2, title: "Why?" };
     p.write("assets/issue_labels.ts", labelsAsset({ llm: llm.url, checks: ["label IN ('bug', 'feature')"] }));
@@ -786,7 +786,7 @@ export default transform({
 
   // R2.1 (checks/run.ts): min_rows is a whole-table check evaluated at every chunk commit, so a first build larger
   // than one chunk fails min_rows(n > 500) at its first 500-row chunk, on every attempt.
-  bugTest("j. min_rows on a chunked first build is judged on the finished table, not on the first chunk", async () => {
+  test("j. min_rows on a chunked first build is judged on the finished table, not on the first chunk", async () => {
     const { p, llm } = await setup("/j", 800);
     p.write("assets/issue_labels.ts", labelsAsset({ llm: llm.url, checks: ["min_rows(600)"] }));
     const r = await p.json(["run"]);
