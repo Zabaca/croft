@@ -100,7 +100,11 @@ describe("croft doctor --json", () => {
     expect(env).toMatchObject({ schemaVersion: 1, ok: true, command: "doctor", database: "warehouse.duckdb", timezone: "Asia/Tokyo", problems: [], next: [] });
     expect(env.durationMs).toBeLessThan(1000);
     const checks: DoctorCheck[] = env.data.checks;
-    expect(checks.map((c) => c.id)).toEqual(["bun", "croft", "duckdb", "warehouse", "serve", "config", "storage", "writable", "env", "claude"]);
+    expect(checks.map((c) => c.id)).toEqual(["bun", "croft", "duckdb", "warehouse", "serve", "config", "assets", "storage", "writable", "env", "claude"]);
+    // The example asset, validated as croft validate does (and within the second).
+    expect(check(checks, "assets")).toMatchObject({
+      status: "ok", text: "1 asset · 0 errors, 0 warnings (details: croft validate)", details: { assets: 1, errors: 0, warnings: 0, info: 0 },
+    });
     for (const c of checks) {
       expect(Object.keys(c).every((k) => ["id", "section", "status", "text", "code", "details"].includes(k))).toBe(true);
       expect(["ok", "warn", "error", "info"]).toContain(c.status);
@@ -232,12 +236,51 @@ describe("environment checks", () => {
 });
 
 describe("doctor names only commands this version has", () => {
-  test("the config line points at croft context for asset details, and no line or fix names a later command", async () => {
+  test("the assets line points at croft validate for details, and no line or fix names a later command", async () => {
     const root = await project();
+    installed(root);
     const { data, problems } = await runDoctor(root, deps());
-    expect(check(data.checks, "config").text).toMatch(/1 asset file \(details: croft context\)$/);
+    expect(check(data.checks, "config").text).toBe("croft.json · timezone Asia/Tokyo");
+    expect(check(data.checks, "assets").text).toBe("1 asset · 0 errors, 0 warnings (details: croft validate)");
     const texts = [...data.checks.map((c) => c.text), ...problems.flatMap((p) => [p.hint, p.fix?.description ?? "", p.fix?.kind === "command" ? p.fix.command : ""])];
     expect(texts.flatMap((t) => scan("croft doctor", t))).toEqual([]);
+  });
+});
+
+/** node_modules/@zabaca/croft as bun install leaves it: this package. */
+function installed(root: string): void {
+  mkdirSync(join(root, "node_modules", "@zabaca"), { recursive: true });
+  symlinkSync(SELF_ROOT, join(root, "node_modules", "@zabaca", "croft"));
+}
+
+describe("the assets line (croft validate's counts)", () => {
+  test("an asset with an error makes the line an error; the problems stay validate's", async () => {
+    const root = await project();
+    installed(root);
+    writeFileSync(join(root, "assets", "open_issues.sql"), "SELECT id FROM example_sales; SELECT 2\n");
+    writeFileSync(join(root, "assets", "stamped.sql"), "SELECT now() AS at\n");
+    const { data, problems } = await runDoctor(root, deps());
+    expect(check(data.checks, "assets")).toMatchObject({
+      status: "error", text: "3 assets · 1 error, 1 warning (details: croft validate)", details: { assets: 3, errors: 1, warnings: 1 },
+    });
+    expect(problems).toEqual([]);
+    let out = "";
+    const exit = await main(["doctor"], { cwd: root, env: {}, stdout: (t) => { out += t; }, stderr: () => {}, stdoutTTY: false });
+    expect(exit).toBe(1);
+    expect(out).toContain("  error 3 assets · 1 error, 1 warning (details: croft validate)");
+  });
+
+  test("before bun install, and without a DuckDB binding, the files are counted, not validated", async () => {
+    const root = await project();
+    const before = await runDoctor(root, deps());
+    expect(check(before.data.checks, "assets")).toMatchObject({
+      status: "info", text: "1 asset file, not validated until the project's packages are installed (bun install)",
+    });
+    installed(root);
+    const broken = await runDoctor(root, deps({ probeDuckdb: () => ({ ok: false, message: "simulated" }) }));
+    expect(check(broken.data.checks, "assets")).toMatchObject({
+      status: "info", text: "1 asset file, not validated (validating needs the DuckDB binding)",
+    });
   });
 });
 
