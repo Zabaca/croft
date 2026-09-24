@@ -1,6 +1,6 @@
 // croft doctor (DESIGN.md §2 "Install-time failures", §4.1): the environment plus a project summary,
 // in under a second, with no writes except the one write test the design asks for (a temp file in the
-// state folder, removed at once).
+// state folder, removed at once) and the trash's retention (checkTrash deletes expired trashed versions).
 //
 // DuckDB is never imported statically here. The binding is checked in a child process first (a missing
 // or foreign-arch binding must be reported, not crash doctor), and only then is db/warehouse.ts imported
@@ -176,6 +176,7 @@ export async function runDoctor(cwd: string, d: DoctorDeps): Promise<{ data: Doc
     await checkAssets(r, d, project, probe.ok);
     checkStorage(r, d, project);
     checkWritable(r, project);
+    await checkTrash(r, d, project);
   }
   if (root) checkEnvFiles(r, root);
   if (project) await checkSecrets(r, d, project, probe.ok);
@@ -762,6 +763,38 @@ function checkWritable(r: Report, project: Project): void {
     });
     r.add("project", "writable", "error", `${shown}/ is not writable (${code})`, p, { dir });
   }
+}
+
+/**
+ * The trash (§6 "Trash, restore and delete"): what it holds, once doctor has pruned the versions retention lets go
+ * (older than 30 days, beyond each table's 5 newest). Deleting those files is doctor's one write besides the write
+ * test, as the trash itself does at every trash. No line while the trash is empty. safety/trash.ts's listing and
+ * pruning load no DuckDB binding; it is imported here all the same, so a broken install cannot stop doctor.
+ */
+async function checkTrash(r: Report, d: DoctorDeps, project: Project): Promise<void> {
+  let trash: typeof import("../../safety/trash.ts");
+  try {
+    trash = await import("../../safety/trash.ts");
+  } catch {
+    return;
+  }
+  const stateDir = project.paths.stateDir;
+  let pruned = 0;
+  try {
+    pruned = trash.pruneTrash(stateDir, { now: now(d.env) }).length;
+  } catch {
+    // A bad CROFT_NOW or an unwritable folder: listed as it is; the writable line says why.
+  }
+  const versions = trash.listTrash(stateDir);
+  if (versions.length === 0 && pruned === 0) return;
+  const tables = new Set(versions.map((v) => v.asset)).size;
+  const bytes = versions.reduce((sum, v) => sum + v.bytes, 0);
+  const plural = (n: number, word: string) => `${formatCount(n)} ${word}${n === 1 ? "" : "s"}`;
+  const { days, versions: keep } = trash.TRASH_RETENTION;
+  r.add("project", "trash", "ok",
+    `trash: ${plural(versions.length, "version")} of ${plural(tables, "table")}, ${formatBytes(bytes)}${pruned ? `; removed ${formatCount(pruned)} older than ${days} days` : ""}`
+      + ` (kept: ${days} days, and the ${keep} newest of each table; croft restore lists them)`,
+    undefined, { versions: versions.length, tables, bytes, pruned });
 }
 
 function checkEnvFiles(r: Report, root: string): void {
