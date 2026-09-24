@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { CroftError, problem } from "../core/errors.ts";
 import type { AssetKind, Problem } from "../core/types.ts";
 import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/warehouse.ts";
-import { getCatalog } from "../history/catalog.ts";
+import { getCatalog, readCatalogEntry } from "../history/catalog.ts";
 import { openLog } from "../history/logs.ts";
 import { RunsDb } from "../history/runs-db.ts";
 import { quoteIdent } from "../load/evolve.ts";
@@ -14,6 +14,7 @@ import type { LoadedSqlAsset } from "../project/sql-asset.ts";
 import { StepProgress } from "./ingest.ts";
 import { behaviorHash, behaviorLabel, behaviorWords, type PlannedStep } from "./plan.ts";
 import { runSqlStep } from "./sql.ts";
+import { type StaleView, staleReasons } from "./staleness.ts";
 import type { StepInput, StepOutcome } from "./step.ts";
 import { cleanupProjects, makeProject } from "./testkit.ts";
 
@@ -43,11 +44,11 @@ const T2 = "2026-09-22T12:00:00.000000Z";
 const T3 = "2026-09-22T13:00:00.000000Z";
 
 /** Write an upstream asset the way its own step would: rows from a SELECT, through writeBatch. */
-async function seed(e: Env, asset: string, select: string, o: { now: string; kind?: AssetKind; key?: string[] }): Promise<void> {
+async function seed(e: Env, asset: string, select: string, o: { now: string; kind?: AssetKind; key?: string[]; write?: "replace" | "merge" }): Promise<void> {
   await e.warehouse.write(`seed ${asset}`, async (tx) => {
     await tx.exec(`CREATE OR REPLACE TEMP TABLE seed_batch AS SELECT *, row_number() OVER () AS _croft_seq FROM (${select})`);
     const batch = await tableBatch(tx, { temp: "seed_batch", asset });
-    await writeBatch(tx, { batch, target: { asset, write: "replace", key: o.key ?? [], runId: "r_seed" }, kind: o.kind ?? "ingest", now: o.now });
+    await writeBatch(tx, { batch, target: { asset, write: o.write ?? "replace", key: o.key ?? [], runId: "r_seed" }, kind: o.kind ?? "ingest", now: o.now });
     await tx.exec(`DROP TABLE temp.main.seed_batch`);
   }, { runId: "r_seed" });
 }
@@ -314,6 +315,50 @@ describe("runSqlStep failures", () => {
     // Either a result for the check, or a warning that it could not run; never an error.
     expect(out.result.checks.length + out.warnings.length).toBeGreaterThan(0);
     expect(out.warnings.every((w) => w.severity !== "error")).toBe(true);
+  });
+
+  test("a failing warning names the asset's file; one no earlier ok run ran covers the whole table", async () => {
+    const e = setup();
+    await seed(e, "issues", ISSUES, { now: T0 });
+    const step = sqlStep("open_issues", "SELECT id, title FROM issues", { key: ["id"], inputs: ["issues"] });
+    step.checks = [{ source: "id > 1", kind: "rule", blocking: false, scope: "batch", sql: "id > 1", reads: [] }];
+    const first = await run(e, step, { at: T1 });
+    expect(first.warnings.map((w) => [w.code, w.severity, w.asset, w.file])).toEqual([["CHECK_FAILED", "warning", "open_issues", "assets/open_issues.sql"]]);
+    expect(first.result.checks).toEqual([expect.objectContaining({ check: "id > 1", ok: false, failing: 1 })]);
+    // Nothing changed, so the write stamps no row; the warning is new to runs.sqlite, so it looks at every row.
+    const again = await run(e, step, { at: T2 });
+    expect(again.result.rows).toMatchObject({ added: 0, updated: 0, unchanged: 3 });
+    expect(again.result.checks).toEqual([expect.objectContaining({ check: "id > 1", ok: false, failing: 1 })]);
+  });
+
+  test("after an out-of-band change that no written row followed, a rebuild clears input_replaced (R2.1)", async () => {
+    const e = setup();
+    const view = async (): Promise<StaleView> => {
+      const [entry, input] = await e.warehouse.read(async (db) => [
+        await readCatalogEntry(db, { asset: "issue_count", behavior: "", cursorField: null, lastRunId: null, kind: "sql" }),
+        await readCatalogEntry(db, { asset: "issues", behavior: "", cursorField: null, lastRunId: null }),
+      ], { purpose: "test" });
+      return { asset: "issue_count", file: "assets/issue_count.sql", kind: "sql", incremental: false, inputs: ["issues"], codeHash: "code_issue_count", entry, inputEntries: { issues: input } };
+    };
+    await seed(e, "issues", ISSUES, { now: T0, key: ["id"], write: "merge" });
+    const step = sqlStep("issue_count", "SELECT count(*) AS n FROM issues", { inputs: ["issues"] });
+    await run(e, step, { at: T1 });
+    expect(staleReasons(await view())).toEqual([]);
+    // Someone deletes a row with the duckdb CLI; the next fetch brings nothing new, and folds the change in.
+    await e.warehouse.write("out of band", (tx) => tx.exec("DELETE FROM issues WHERE id = 3"), { runId: "r_oob" });
+    await seed(e, "issues", `SELECT * FROM (VALUES (1, 'crash', 'open'), (2, 'docs', 'closed')) AS v(id, title, state)`, { now: T2, key: ["id"], write: "merge" });
+    const before = await view();
+    expect(before.inputEntries.issues).toMatchObject({ lastLoadedAt: T0, lastReplacedAt: T2 });
+    expect(staleReasons(before)).toEqual(["input_replaced"]);
+
+    const out = await run(e, step, { at: T3 });
+    expect(await rows(e, "issue_count", "n")).toEqual([{ n: 2 }]);
+    expect(staleReasons(await view())).toEqual([]);
+    // The position stays at the input's last_loaded_at; the version seen is the later of it and last_replaced_at.
+    expect(await inputsOf(e, "issue_count")).toEqual([{ input: "issues", seen: T0, k: null, last: T2 }]);
+    expect(out.result.inputs).toEqual([{ input: "issues", seenBefore: T0, seenAfter: T0, rows: 2 }]);
+    await run(e, step, { at: T3 });
+    expect(staleReasons(await view())).toEqual([]);
   });
 
   test("a duplicate key is CHECK_FAILED unique(key) in the asset's file, never a silent dedupe", async () => {

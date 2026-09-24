@@ -2,7 +2,8 @@
 // dependencies from the AST, and the fingerprint.
 //
 // Loading an asset runs these checks, in this order, and collects every problem instead of stopping at one:
-// 1. The header: `-- name: value` lines at the top. An unknown name is HEADER_UNKNOWN_KEY (did-you-mean).
+// 1. The header: `-- name: value` lines at the top. An unknown name is HEADER_UNKNOWN_KEY (did-you-mean), and
+//    so is a `-- key:`, `-- check:` or `-- warn:` line below the header, which croft would otherwise ignore.
 // 2. PIVOT without an IN list (PIVOT_NEEDS_VALUES). DuckDB rewrites it into two statements whose columns depend
 //    on the data [V], so the gate would only say "found 2 statements". It is told apart by counting statements
 //    twice: DuckDB's extractStatements, and a lexer that knows strings, quoted names and comments. More
@@ -55,6 +56,12 @@ const HEADER_LINE = /^(\s*--\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:(?!\/\/)\s*(.*?)\s*$
  * case, plain comments may sit between header lines (as in describe's reading of the header), and the first
  * other line starts the body. `key` values accumulate across lines, repeated descriptions are joined with a
  * space, and empty values are ignored. A byte-order mark is dropped.
+ *
+ * Header lines must come first. A `-- key:`, `-- check:` or `-- warn:` line in the body (a whole-line `--`
+ * comment, outside strings, quoted names and block comments) would be a plain comment, so the asset would
+ * silently lose its key or checks: it is HEADER_UNKNOWN_KEY at its line instead, and is not applied. That
+ * includes a header written below a leading `/* ... *\/` comment, which ends the header like any SQL line.
+ * A `-- description:` there, which only documents, is left alone.
  * @param text the whole file.
  * @param file root-relative, for problem locations.
  */
@@ -95,7 +102,92 @@ export function parseSqlHeader(text: string, file: string): { header: SqlHeader;
     }
   }
   if (descriptions.length) header.description = descriptions.join(" ");
-  return { header, body: src.slice(offset), problems };
+  const body = src.slice(offset);
+  for (const c of bodyCommentLines(body)) {
+    const m = HEADER_LINE.exec(c.text);
+    const name = m?.[2]!.toLowerCase();
+    if (!m || !name || !LATE_HEADER_KEYS.has(name)) continue;
+    problems.push(lateHeaderProblem(name, c.text.trim(), file, header.lines + c.line, Array.from(m[1]!).length + 1, header.lines + 1));
+  }
+  return { header, body, problems };
+}
+
+/** Header names that change what croft does with the asset: below the header, they would be lost silently. */
+const LATE_HEADER_KEYS: ReadonlySet<string> = new Set(["key", "check", "warn"]);
+
+function lateHeaderProblem(name: string, written: string, file: string, line: number, column: number, bodyStartsAt: number): Problem {
+  return problem("HEADER_UNKNOWN_KEY", {
+    message: `line ${line}: -- ${name}: comes after the header, which ends at line ${bodyStartsAt}, so croft ignores it; header lines must come first`,
+    hint: `move ${written} to the top of the file, above the first line that is not a -- comment (a /* */ comment ends the header)`,
+    file, line, column,
+    fix: {
+      kind: "edit", file, line,
+      description: `move it into the header (the -- lines at the top of the file, before any SQL or /* */ comment), or reword the comment without "${name}:"`,
+    },
+    details: { name, bodyStartsAt },
+  });
+}
+
+/** The whole-line `--` comments of an SQL text: each line whose first non-blank characters start a comment
+ *  outside strings ('…', E'…', $tag$…$tag$), quoted names ("…") and block comments, with its 1-based line. */
+function bodyCommentLines(sql: string): { line: number; text: string }[] {
+  const out: { line: number; text: string }[] = [];
+  let line = 1;
+  let blank = true;                                   // only blanks since the line began
+  let i = 0;
+  const n = sql.length;
+  // Advance to `to`, counting the newlines passed; `blank` is false after anything but whitespace.
+  const skip = (to: number) => {
+    for (; i < Math.min(to, n); i++) {
+      if (sql[i] === "\n") line++;
+    }
+    blank = false;
+  };
+  while (i < n) {
+    const c = sql[i]!;
+    if (c === "\n") {
+      line++;
+      blank = true;
+      i++;
+    } else if (/\s/.test(c)) {
+      i++;
+    } else if (c === "-" && sql[i + 1] === "-") {
+      const end = sql.indexOf("\n", i);
+      const stop = end < 0 ? n : end;
+      if (blank) out.push({ line, text: sql.slice(sql.lastIndexOf("\n", i) + 1, stop).replace(/\r$/, "") });
+      i = stop;
+      blank = false;
+    } else if (c === "/" && sql[i + 1] === "*") {
+      let nest = 1;
+      let j = i + 2;
+      while (j < n && nest > 0) {
+        if (sql.startsWith("/*", j)) { nest++; j += 2; } else if (sql.startsWith("*/", j)) { nest--; j += 2; } else j++;
+      }
+      skip(j);
+    } else if (c === "'" || ((c === "E" || c === "e") && sql[i + 1] === "'" && !/[A-Za-z0-9_$\u0080-\uffff]/.test(sql[i - 1] ?? " "))) {
+      const escapes = c !== "'";
+      let j = escapes ? i + 2 : i + 1;
+      while (j < n) {
+        if (escapes && sql[j] === "\\") j += 2;
+        else if (sql[j] === "'" && sql[j + 1] === "'") j += 2;
+        else if (sql[j] === "'") break;
+        else j++;
+      }
+      skip(j + 1);
+    } else if (c === '"') {
+      let j = i + 1;
+      while (j < n && !(sql[j] === '"' && sql[j + 1] !== '"')) j += sql[j] === '"' ? 2 : 1;
+      skip(j + 1);
+    } else if (c === "$" && dollarTag(sql, i)) {
+      const tag = dollarTag(sql, i)!;
+      const close = sql.indexOf(tag, i + tag.length);
+      skip(close < 0 ? n : close + tag.length);
+    } else {
+      i++;
+      blank = false;
+    }
+  }
+  return out;
 }
 
 /** `"Order ID"` → `Order ID` (a quoted key column); anything else as written. */
@@ -457,18 +549,16 @@ const lineOf = (w: { line?: number }) => (w.line !== undefined ? { line: w.line 
 interface FileRead { shown: string; paths: string[]; at?: number }
 
 /** Where the statement reads files: a path in FROM (`FROM 'files/x.csv'`, a replacement scan), a file table
- *  function (read_csv, read_parquet, glob, ...; the gate's "path" kind), or a table-kind function given a path. */
+ *  function (read_csv, read_parquet, glob, ...; the gate's "path" kind), or a table macro given a path
+ *  (`histogram('files/x.csv', a)`: collect() reports its table as a relation `via` the macro). */
 function fileReads(ast: unknown): FileRead[] {
   const out: FileRead[] = [];
   for (const u of collect(ast).uses) {
     if (u.kind === "relation" && looksLikePath(u.name)) {
-      out.push({ shown: `'${u.name}'`, paths: [u.name], ...(u.at !== undefined ? { at: u.at } : {}) });
-    } else if (u.kind === "table_function") {
-      const kind = TABLE_FUNCTIONS.get(asciiLower(u.name));
+      out.push({ shown: u.via ? `${u.via}('${u.name}')` : `'${u.name}'`, paths: [u.name], ...(u.at !== undefined ? { at: u.at } : {}) });
+    } else if (u.kind === "table_function" && TABLE_FUNCTIONS.get(asciiLower(u.name)) === "path") {
       const paths = literalStrings((u.fn.children as AstNode[] | undefined)?.[0]);
-      if (kind === "path" || (kind === "table" && paths.length && paths.every(looksLikePath))) {
-        out.push({ shown: `${u.name}(${paths.map((p) => `'${p}'`).join(", ")})`, paths, ...(u.at !== undefined ? { at: u.at } : {}) });
-      }
+      out.push({ shown: `${u.name}(${paths.map((p) => `'${p}'`).join(", ")})`, paths, ...(u.at !== undefined ? { at: u.at } : {}) });
     }
   }
   return out;

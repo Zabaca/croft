@@ -145,6 +145,11 @@ describe("lexicalReads: the tables a rule's subqueries name", () => {
     ["(SELECT count(*) FROM t WHERE extract(year FROM d) > 1) > 0", ["t"]],
     ["'FROM nowhere' <> x AND \"from\" > 1", []],
     ["x IN (SELECT id FROM t1 UNION SELECT id FROM t2 EXCEPT SELECT id FROM t1)", ["t1", "t2"]],
+    // A table macro names its table in its first argument.
+    ["(SELECT count(*) FROM histogram(labels, x)) > 0", ["labels"]],
+    ["(SELECT count(*) FROM Histogram_Values('Labels', x) h) > 0", ["labels"]],
+    ["(SELECT count(*) FROM histogram(main.labels, x)) > 0", ["labels"]],
+    ["(SELECT count(*) FROM histogram('files/x.csv', x)) > 0 AND x IN (SELECT id FROM histogram(other.t, id))", []],
   ];
   for (const [text, want] of cases) test(text, () => expect(reads(text)).toEqual(want));
 });
@@ -230,6 +235,59 @@ describe("validateChecks: DuckDB's parser, on any connection", () => {
     expect(await invalidOf("amount > ?")).toContain("parameter");
     // Harmless table functions are fine.
     expect(await validateChecks(conn, "orders", [rule("n IN (SELECT range FROM range(10))")])).toEqual([]);
+  });
+
+  test("a table macro reads a table, never a file: a path, a quoted path, source := or a computed name is refused", async () => {
+    // R2.1: histogram_values reads any file through query_table, even in the state folder the gate protects.
+    expect(await invalidOf("error((SELECT min(bin) FROM histogram_values('/project/.croft/leak.csv', a))) IS NULL"))
+      .toContain("reads the file /project/.croft/leak.csv; a check reads tables only");
+    expect(await invalidOf('(SELECT count(*) FROM histogram_values("files/x.csv", a)) > 0')).toContain("reads the file files/x.csv");
+    expect(await invalidOf("(SELECT count(*) FROM histogram(a, source := 'files/x.csv')) > 0")).toContain("reads the file files/x.csv");
+    expect(await invalidOf("(SELECT count(*) FROM histogram(col_name := a, source := 'files/x.csv')) > 0")).toContain("reads the file files/x.csv");
+    expect(await invalidOf("(SELECT count(*) FROM histogram_values('lea' || 'k.csv', a)) > 0"))
+      .toContain("calls histogram_values(), which must name its table directly");
+    expect(await invalidOf("(SELECT count(*) FROM histogram(col_name := a)) > 0")).toContain("calls histogram(), which must name its table directly");
+    // Naming a table is fine, and orders the asset after it.
+    const r = await analyzeChecks(conn, "orders", [rule("(SELECT count(*) FROM histogram(customers, id)) > 0"), rule("x IN (SELECT bin FROM histogram_values('Refunds', x))")]);
+    expect(r.problems).toEqual([]);
+    expect(r.checks.map((c) => c.reads)).toEqual([["customers"], ["refunds"]]);
+  });
+
+  test("other table functions: a path-like string argument is refused where DuckDB takes names", async () => {
+    expect(await invalidOf("x IN (SELECT name FROM pragma_table_info('files/x.csv'))")).toContain("calls pragma_table_info(), which is given the path files/x.csv");
+    expect(await invalidOf("x IN (SELECT suggestion FROM sql_auto_complete('SELECT * FROM ''/etc/'))")).toContain("calls sql_auto_complete(), which is given the path");
+    // Values, never paths: unnest, json_each and the like do not open files.
+    expect(await validateChecks(conn, "orders", [rule("x IN (SELECT unnest(['a.csv', 'b/c']))"), rule("x IN (SELECT key FROM json_each('{\"a.b\": 1}'))")])).toEqual([]);
+    expect(await validateChecks(conn, "orders", [rule("x IN (SELECT name FROM pragma_table_info('customers'))")])).toEqual([]);
+  });
+
+  test("tables outside the project's main schema are refused: croft's state, other catalogs, information_schema", async () => {
+    for (const [sql, shown] of [
+      ["id IN (SELECT row_count FROM _croft.assets)", "_croft.assets"],
+      ["id IN (SELECT id FROM warehouse.main.orders)", "warehouse.main.orders"],
+      ["id IN (SELECT id FROM memory.customers)", "memory.customers"],
+      ["id IN (SELECT 1 FROM information_schema.tables)", "information_schema.tables"],
+      ["(SELECT count(*) FROM histogram(_croft.inputs, asset)) > 0", "_croft.inputs"],
+    ] as const) {
+      const message = await invalidOf(sql);
+      expect([sql, message]).toEqual([sql, `orders: the check ${JSON.stringify(sql)} reads ${shown}, which is not one of the project's tables; a check reads those only, by plain name`]);
+    }
+    const ps = await validateChecks(conn, "orders", [rule("id IN (SELECT id FROM warehouse.main.customers)")]);
+    expect(ps[0]!.hint).toBe("name the table without a prefix: customers");
+    // main. is the project's schema.
+    const r = await analyzeChecks(conn, "orders", [rule("id IN (SELECT id FROM main.customers)")]);
+    expect(r.problems).toEqual([]);
+    expect(r.checks[0]!.reads).toEqual(["customers"]);
+  });
+
+  test("a DOUBLE constant beyond range (json_serialize_sql writes Infinity) is a valid check", async () => {
+    expect(await validateChecks(conn, "orders", [rule("amount < 1e400"), rule("amount > -1e400 AND amount <> 'NaN'::DOUBLE")])).toEqual([]);
+  });
+
+  test("reads follow DuckDB's CTE scopes", async () => {
+    const sql = "id IN (SELECT id FROM customers WHERE id IN (WITH customers AS (SELECT 1 AS id) SELECT id FROM customers))";
+    const r = await analyzeChecks(conn, "orders", [rule(sql)]);
+    expect(r.checks[0]!.reads).toEqual(["customers"]);
   });
 
   test("croft-made forms are checked for their documented shape", async () => {

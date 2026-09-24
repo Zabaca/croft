@@ -55,6 +55,9 @@ describe("passes exactly one SELECT", () => {
     "show tables",
     "values (1), (2)",
     "pivot t on b in ('x') using sum(a)",
+    // json_serialize_sql writes a DOUBLE constant beyond range as a bare Infinity.
+    "select a from t where a < 1e400",
+    "select 1e400, -1e400",
   ]) {
     test(sql, async () => {
       const ast = await assertOneSelect(conn, sql);
@@ -192,6 +195,9 @@ describe("serve profile", () => {
       // A CTE of the same name must not open the door to the view in another scope.
       ["with duckdb_databases as (select 1 as path) select * from (select * from duckdb_databases), (from duckdb_databases)", "duckdb_databases"],
       ["select * from (with pg_settings as (select 1) select * from pg_settings), pg_settings", "pg_settings"],
+      // A CTE is in scope in its own query only: another query naming it reaches the catalog.
+      ["select * from (with x as (select 1 as a) select * from x), x", "x"],
+      ["with a as (select * from x), x as (select 1 as a) select * from a", "x"],
     ] as const) {
       const e = await code(sql, { profile: "serve" });
       expect([sql, e.code]).toEqual([sql, "QUERY_PATH_DENIED"]);
@@ -417,6 +423,8 @@ describe("file paths", () => {
       "select * from t, lateral read_csv(t.p)",
       "select * from read_csv(['files/a.csv', 'files/' || 'a.csv'])",
       "select * from histogram((select 't'), a)",
+      "select * from histogram(col_name := a, source := 'files/' || 'a.csv')",
+      "select * from histogram(col_name := a)",
     ]) {
       const e = await denied(sql);
       expect(e.problem.hint).toContain("string");
@@ -434,6 +442,9 @@ describe("file paths", () => {
       "select * from read_text('/etc/hosts')",
       "select * from 'files/leak.csv'",
       "select * from histogram('files/leak.csv', x)",
+      "select * from histogram(\"files/leak.csv\", x)",
+      "select * from histogram(x, source := 'files/leak.csv')",
+      "select * from histogram(col_name := x, source := 'files/leak.csv')",
       "select * from glob('files/up/*')",
     ]) await denied(sql);
   });

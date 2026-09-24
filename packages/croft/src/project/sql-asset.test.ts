@@ -122,6 +122,43 @@ describe("parseSqlHeader", () => {
     expect(problems[0]!.hint).toContain("leave out the colon");
     expect(problems[0]!.fix).toMatchObject({ kind: "edit", line: 1 });
   });
+
+  describe("key, check and warn lines after the header ends", () => {
+    test("after a leading /* */ comment: HEADER_UNKNOWN_KEY on each, and they are not applied", () => {
+      const text = "/* Revenue per day */\n-- key: day\n-- check: net <= gross\nSELECT 1 AS day, 2 AS net, 3 AS gross\n";
+      const { header, problems } = parseSqlHeader(text, "assets/rev.sql");
+      expect(header).toMatchObject({ key: [], checks: [], lines: 0 });
+      expect(problems.map((p) => [p.code, p.severity, p.line, p.column])).toEqual([["HEADER_UNKNOWN_KEY", "error", 2, 4], ["HEADER_UNKNOWN_KEY", "error", 3, 4]]);
+      expect(problems[0]).toMatchObject({
+        file: "assets/rev.sql",
+        message: "line 2: -- key: comes after the header, which ends at line 1, so croft ignores it; header lines must come first",
+        fix: { kind: "edit", file: "assets/rev.sql", line: 2 },
+        details: { name: "key", bodyStartsAt: 1 },
+      });
+      expect(problems[0]!.hint).toBe("move -- key: day to the top of the file, above the first line that is not a -- comment (a /* */ comment ends the header)");
+      expect(problems[0]!.fix!.description).toContain("move it into the header");
+    });
+
+    test("at the bottom of the file, or between the body's lines", () => {
+      const { header, problems } = parseSqlHeader("-- key: day\nSELECT 1 AS day, 2 AS net\n  -- WARN: net > 0\nFROM t\n-- check: net <= gross", "a.sql");
+      expect(header).toMatchObject({ key: ["day"], checks: [], warnings: [], lines: 1 });
+      expect(problems.map((p) => [p.line, p.details?.name])).toEqual([[3, "warn"], [5, "check"]]);
+    });
+
+    test("plain comments, comments after code, and text in strings or block comments are not header lines", () => {
+      const body = [
+        "SELECT id, -- key: not a header line, code comes first on this line",
+        "  -- note: plain comments are fine anywhere",
+        "  -- description: so is a description (it only documents)",
+        "  '", "-- check: inside a string", "' AS s,",
+        "  /*", "-- check: inside a block comment", "*/",
+        "  $$", "-- warn: inside a dollar-quoted string", "$$ AS d,",
+        '  "', "-- key: inside a quoted name", '" AS q',
+        "FROM t",
+      ].join("\n");
+      expect(parseSqlHeader(`-- key: id\n${body}`, "a.sql").problems).toEqual([]);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------------------------------------
@@ -260,6 +297,32 @@ JOIN (PIVOT refunds ON order_id) AS r ON true`);
       expect(p.hint).toBe("read the table instead: FROM orders");
       expect(p.fix).toMatchObject({ kind: "edit", file: "assets/open_issues.sql", line: 1 });
     });
+
+    test("a table macro given a path, as a string, a quoted name or source :=, once each", async () => {
+      for (const [sql, shown] of [
+        ["SELECT * FROM histogram('files/sales.csv', amount)", "histogram('files/sales.csv')"],
+        ['SELECT * FROM histogram_values("files/sales.csv", amount)', "histogram_values('files/sales.csv')"],
+        ["SELECT * FROM histogram(col_name := amount, source := 'files/sales.csv')", "histogram('files/sales.csv')"],
+      ] as const) {
+        const p = only(await load(sql), "SQL_READS_FILES");
+        expect([sql, p.details?.files, p.message]).toEqual([sql, ["files/sales.csv"], `open_issues reads ${shown} directly; croft cannot tell when a file changed, so the table would go stale`]);
+      }
+    });
+  });
+
+  test("a DOUBLE constant beyond range (json_serialize_sql writes Infinity) loads", async () => {
+    const a = await load("-- key: id\nSELECT id, amount FROM orders WHERE amount < 1e400 AND amount > -1e400");
+    expect(a.problems).toEqual([]);
+    expect(a.ok).toBe(true);
+    expect(a.astInputs).toEqual(["orders"]);
+    expect(a.codeHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("a key or check line after the header is an error of the asset", async () => {
+    const a = await load("/* Revenue per day */\n-- key: id\nSELECT id FROM orders");
+    expect(codes(a)).toEqual(["HEADER_UNKNOWN_KEY"]);
+    expect(a.ok).toBe(false);
+    expect(a.problems[0]).toMatchObject({ asset: "open_issues", line: 2 });
   });
 
   describe("CATALOG_PREFIX", () => {
@@ -277,6 +340,12 @@ JOIN (PIVOT refunds ON order_id) AS r ON true`);
         line: 3, column: 7, hint: "drop the prefix: FROM orders", details: { table: "Other.Main.orders" },
         fix: { kind: "edit", line: 3, replace: { from: 'Other . "Main".orders', to: "orders" } },
       });
+    });
+
+    test("a table macro's table with a prefix, as written", async () => {
+      const p = only(await load("SELECT * FROM histogram(other.main.orders, amount)"), "CATALOG_PREFIX");
+      expect(p).toMatchObject({ line: 1, column: 25, fix: { kind: "edit", replace: { from: "other.main.orders", to: "orders" } } });
+      expect(codes(await load("SELECT * FROM histogram_values(_croft.assets, row_count)"))).toEqual(["CATALOG_PREFIX"]);
     });
 
     test("a table outside the project gets no replacement", async () => {

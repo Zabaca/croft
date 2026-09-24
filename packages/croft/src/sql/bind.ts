@@ -21,18 +21,20 @@
 //   moves on, and the quoted body parses in the end; so `ORDER BY` stays a keyword.
 // - NULL_ONLY_COLUMN (warning): an error that goes away when a pending column (all NULL so far, typed from its
 //   name) gets another type. The type that binds is the pin in the edit fix.
-// - DUPLICATE_OUTPUT_COLUMN: two output columns with one name, which the SQL step's view would rename to x_1;
-//   `SELECT *` over two assets repeats _loaded_at, and the step would keep the copy as _loaded_at_1.
+// - DUPLICATE_OUTPUT_COLUMN: two output columns with one name, which the SQL step's view would rename to x_1.
+//   Reserved names (_loaded_at, _file, _croft_seq) do not count: the step drops every copy of them, so
+//   `SELECT *` over a join of two assets, which repeats _loaded_at, binds and runs.
 import { type DuckDBConnection, StatementType } from "@duckdb/node-api";
 import { CroftError, problem } from "../core/errors.ts";
 import type { Fix, Problem } from "../core/types.ts";
 import { openMemory } from "../db/connect.ts";
+import { RESERVED } from "../load/contract.ts";
 import { normalizeType, quoteIdent } from "../load/evolve.ts";
 import { jsKey } from "../load/types.ts";
 import type { LoadedSqlAsset } from "../project/sql-asset.ts";
 import { didYouMean } from "../project/suggest.ts";
 import { mapQueryError } from "../read/select.ts";
-import { asciiLower, location } from "./ast.ts";
+import { asciiLower, finiteJson, location } from "./ast.ts";
 import { planScans } from "./deps.ts";
 import { lineColumn } from "./gate.ts";
 
@@ -55,8 +57,8 @@ export interface BindOptions {
 
 export interface BindResult {
   /** The asset's output columns in order (define() them as its shadow table for the assets that read it);
-   *  null when it did not bind. Reserved columns (_loaded_at, _file) are left out, as the SQL step leaves them
-   *  out; with DUPLICATE_OUTPUT_COLUMN, the first column of each name is kept. */
+   *  null when it did not bind. Reserved columns (_loaded_at, _file, _croft_seq, in any case) are left out, as
+   *  the SQL step leaves them out; with DUPLICATE_OUTPUT_COLUMN, the first column of each name is kept. */
   outputColumns: ShadowColumn[] | null;
   /** UNKNOWN_COLUMN (candidate bindings as an edit fix), UNKNOWN_TABLE, QUOTE_IDENTIFIER, NULL_ONLY_COLUMN,
    *  DUPLICATE_OUTPUT_COLUMN, or another DuckDB error (QUERY_FAILED), located in the asset's file. Also
@@ -69,8 +71,10 @@ export interface BindResult {
 
 type MemoryDb = Awaited<ReturnType<typeof openMemory>>;
 
-/** Columns the SQL step drops from an asset's output: `COLUMNS(c -> c NOT IN ('_loaded_at', '_file'))` (§3c). */
-const DROPPED_OUTPUT = new Set(["_loaded_at", "_file"]);
+/** Columns the SQL step drops from an asset's output, every copy of each and in any case (run/sql.ts
+ *  materialize, §3c): an input's _loaded_at and _file, and _croft_seq, which the step adds itself. */
+const DROPPED_OUTPUT: ReadonlySet<string> = new Set([RESERVED.loadedAt, RESERVED.file, RESERVED.seq]);
+const dropped = (name: string) => DROPPED_OUTPUT.has(asciiLower(name));
 /** Every croft table has it; an SQL asset's output does not list it. */
 const STAMP: ShadowColumn = { name: "_loaded_at", type: "TIMESTAMPTZ" };
 /** Types tried for a pending column, in the order a pin is suggested: numbers before text (a text placeholder
@@ -185,7 +189,7 @@ export class ShadowCatalog {
       const k = asciiLower(name);
       if (seen.has(k)) return;
       seen.add(k);
-      if (!DROPPED_OUTPUT.has(name)) outputColumns.push({ name, type: typeName(view[i]!.type) });
+      if (!dropped(name)) outputColumns.push({ name, type: typeName(view[i]!.type) });
     });
     return { outputColumns, problems, planInputs: await planScans(this.conn, asset.body) };
   }
@@ -356,10 +360,13 @@ export class ShadowCatalog {
   }
 
   /** DUPLICATE_OUTPUT_COLUMN for each name the output has more than once (ASCII case-insensitive, as DuckDB
-   *  compares names), located on the line of the repeat when the select list shows it. */
+   *  compares names), located on the line of the repeat when the select list shows it. A reserved name
+   *  (DROPPED_OUTPUT) is not one: the SQL step drops every copy of it (`SELECT *` over a join of two assets
+   *  repeats _loaded_at), as it drops the renamed copies the view makes of it. */
   private async duplicates(asset: LoadedSqlAsset, names: readonly string[], viewNames: readonly string[]): Promise<Problem[]> {
     const groups = new Map<string, number[]>();
     names.forEach((n, i) => {
+      if (dropped(n)) return;
       const k = asciiLower(n);
       groups.set(k, [...(groups.get(k) ?? []), i]);
     });
@@ -370,14 +377,9 @@ export class ShadowCatalog {
       const name = names[g[0]!]!;
       const copies = g.slice(1).map((i) => viewNames[i]!);
       const line = lines?.[g[1]!];
-      const stamp = DROPPED_OUTPUT.has(name);
       return problem("DUPLICATE_OUTPUT_COLUMN", {
-        message: stamp
-          ? `the output has ${g.length} columns named ${name}; croft drops ${name}, but the table would keep ${copies.join(", ")}`
-          : `the output has ${g.length} columns named ${name}; the table would get ${[name, ...copies].join(", ")}`,
-        hint: stamp
-          ? "select the columns instead of * over several tables (for example a.*, b.amount)"
-          : `name each output column once: rename the repeat of ${name} with AS`,
+        message: `the output has ${g.length} columns named ${name}; the table would get ${[name, ...copies].join(", ")}`,
+        hint: `name each output column once: rename the repeat of ${name} with AS`,
         asset: asset.name, file: asset.file, ...(line !== undefined ? { line: line + asset.headerLines } : {}),
         details: { column: name, count: g.length, renamedTo: copies },
       });
@@ -388,7 +390,8 @@ export class ShadowCatalog {
    *  output (no *, no set operation); null otherwise. */
   private async selectItemLines(body: string, count: number): Promise<(number | undefined)[] | null> {
     const [row] = await this.rows<{ j: string }>("SELECT json_serialize_sql($1::VARCHAR) AS j", [body]);
-    const parsed = JSON.parse(row?.j ?? "{}") as { error?: boolean; statements?: { node?: Record<string, unknown> }[] };
+    // finiteJson: a DOUBLE constant beyond range (`x < 1e400`) comes back as a bare Infinity.
+    const parsed = JSON.parse(finiteJson(row?.j ?? "{}")) as { error?: boolean; statements?: { node?: Record<string, unknown> }[] };
     const node = parsed.statements?.[0]?.node;
     const list = node?.select_list;
     if (parsed.error || node?.type !== "SELECT_NODE" || !Array.isArray(list) || list.length !== count) return null;

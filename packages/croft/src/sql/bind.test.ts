@@ -351,12 +351,24 @@ describe("ShadowCatalog.bind", () => {
     expect(r.planInputs).toEqual(["github_issues"]);
   });
 
-  test("DUPLICATE_OUTPUT_COLUMN: SELECT * over two assets repeats their _loaded_at", async () => {
+  test("SELECT * over two assets repeats their _loaded_at, which the SQL step drops: no DUPLICATE_OUTPUT_COLUMN", async () => {
+    // run/sql.ts materialize drops every copy of a reserved name, renamed ones (_loaded_at_1) included (R2.1).
     await cat.define("issue_triage", [{ name: "id", type: "BIGINT" }, { name: "priority", type: "VARCHAR" }]);
     const r = await cat.bind(asset("a", "SELECT * FROM open_issues JOIN issue_triage USING (id)"));
-    expect(r.problems.map((p) => [p.code, p.details?.column, p.line])).toEqual([["DUPLICATE_OUTPUT_COLUMN", "_loaded_at", undefined]]);
-    expect(r.problems[0]!.message).toContain("_loaded_at_1");
+    expect(r.problems).toEqual([]);
     expect(r.outputColumns?.map((c) => c.name)).toEqual(["id", "number", "title", "author", "label_names", "comments", "created_at", "priority"]);
+  });
+
+  test("reserved names repeated in any case are dropped, _croft_seq too; other repeats are still DUPLICATE_OUTPUT_COLUMN", async () => {
+    const r = await cat.bind(asset("a",
+      "SELECT g.id, g._loaded_at, c._LOADED_AT, c._file, c._file AS _FILE, 1 AS _croft_seq, 2 AS _Croft_Seq, g.title, c.status AS TITLE\nFROM github_issues g, stripe_charges c"));
+    expect(r.problems.map((p) => [p.code, p.details?.column])).toEqual([["DUPLICATE_OUTPUT_COLUMN", "title"]]);
+    expect(r.outputColumns?.map((c) => c.name)).toEqual(["id", "title"]);
+  });
+
+  test("a DOUBLE constant beyond range (json_serialize_sql writes Infinity) still locates a duplicate", async () => {
+    const r = await cat.bind(asset("a", "SELECT id,\n  number AS id\nFROM github_issues WHERE comments < 1e400", { headerLines: 1 }));
+    expect(r.problems.map((p) => [p.code, p.line])).toEqual([["DUPLICATE_OUTPUT_COLUMN", 3]]);
   });
 
   test("parameters are refused; a body that is not one SELECT binds to nothing (the loader says why)", async () => {
