@@ -11,7 +11,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { statSync } from "node:fs";
 import { join } from "node:path";
 import { at, githubAsset, githubRoute, issue, type Issue, TOKEN } from "./fixtures.ts";
-import { bugTest, cleanupAll, codes, initProject, type MockApi, mockApi, type Project, show } from "./harness.ts";
+import { cleanupAll, codes, initProject, type MockApi, mockApi, type Project, show } from "./harness.ts";
 
 let api: MockApi;
 const llm = { calls: 0, previews: [] as boolean[] };
@@ -210,12 +210,12 @@ SELECT id, title FROM github_issues
   expect(q.json.data.rows).toEqual([{ id: 2 }]);
 }, 120_000);
 
-// BUG (reported): DESIGN §6 says "The column cache is filled by runs, by previews and by `columns` pins", and
+// FIXED (reported): DESIGN §6 says "The column cache is filled by runs, by previews and by `columns` pins", and
 // validate's INPUT_NOT_BUILT says the columns are unknown "until it has run or been previewed", with the next step
-// `croft preview github_issues`. validate reads only the live catalog mirror, and a preview writes its catalog to
-// .croft/preview/runs.sqlite, so after that preview validate still skips the bind and points at the same preview:
-// an agent following the hints loops.
-bugTest("journey 18f: after previewing a never-built input, validate binds the SQL on it (the column cache holds previews)", async () => {
+// `croft preview github_issues`. validate read only the live catalog mirror, and a preview writes its catalog to
+// .croft/preview/runs.sqlite, so after that preview validate still skipped the bind and pointed at the same
+// preview: an agent following the hints looped.
+test("journey 18f: after previewing a never-built input, validate binds the SQL on it (the column cache holds previews)", async () => {
   const p = await project([issue(1, 1), issue(2, 2)]);
   const before = await p.json(["validate"]);
   expect(before.code, show(before)).toBe(0);

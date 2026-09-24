@@ -18,6 +18,13 @@
 // Unknowns never make an asset stale on their own: an input that is not built, an entry without a code hash
 // (none was recorded), an asset whose code does not load. They are for validate and the planner to report;
 // here they would only make every run rebuild.
+//
+// A time zone change (§8): every code hash includes croft.json's timezone, so changing it changes every hash.
+// The transforms rebuild (code_changed: ::DATE days move), but no file was edited, so there is no
+// EDITED_SINCE_LAST_RUN. resolveProject finds such a change by hashing the unchanged code in the other zones
+// (ResolvedAsset.timeZoneChanged), and notes it here by hash pair (noteTimeZoneChange), so a view made without it
+// (status, the runner's re-check) knows too. A pair of hashes proves the fact for good: sha256 of the same code in
+// two zones.
 import { problem } from "../core/errors.ts";
 import { parseInstant } from "../core/time.ts";
 import type { AssetKind, Problem, Reason } from "../core/types.ts";
@@ -40,6 +47,24 @@ export interface StaleView {
   entry: CatalogAsset | null;
   /** The catalog entry of each input, by name; null for an input never built. */
   inputEntries: Readonly<Record<string, CatalogAsset | null>>;
+  /** The code is what its last build ran, and only the project time zone changed since: the zone it was built in
+   *  (ResolvedAsset.timeZoneChanged.from). Optional: a change noted by resolveProject counts too. */
+  builtInZone?: string;
+}
+
+/** Time zone changes resolveProject found, by `${codeHash now}\n${codeHash built with}`: the zone of the build. */
+const zoneChanges = new Map<string, string>();
+
+/** Note that `codeHash` and `builtWith` are the same code hashed in the project's zone now and in `zone`. */
+export function noteTimeZoneChange(codeHash: string, builtWith: string, zone: string): void {
+  zoneChanges.set(`${codeHash}\n${builtWith}`, zone);
+}
+
+/** The zone the asset was built in when its code changed only by the project time zone; null otherwise (unchanged
+ *  code, an edit, or unknown). */
+export function timeZoneChange(v: Pick<StaleView, "codeHash" | "entry" | "builtInZone">): string | null {
+  if (!codeChanged(v)) return null;
+  return v.builtInZone ?? zoneChanges.get(`${v.codeHash}\n${v.entry!.codeHash}`) ?? null;
 }
 
 /** Why the asset is stale, in the order of core/types.ts Reason; empty when it is fresh. */
@@ -64,9 +89,9 @@ export function staleReasons(v: StaleView): Reason[] {
 }
 
 /** EDITED_SINCE_LAST_RUN when the asset's code changed since it was built; for an incremental TS transform it
- *  says how many rows older code built. null when unedited, or never built. */
+ *  says how many rows older code built. null when unedited, never built, or when only the time zone changed. */
 export function editedProblem(v: StaleView): Problem | null {
-  if (!v.entry || !codeChanged(v)) return null;
+  if (!v.entry || !codeChanged(v) || timeZoneChange(v) !== null) return null;
   const details = { codeHash: v.codeHash, builtWith: v.entry.codeHash, rows: v.entry.rows };
   const base = { asset: v.asset, file: v.file, details };
   if (v.kind === "ts" && v.incremental) {
@@ -95,7 +120,7 @@ export function editedProblem(v: StaleView): Problem | null {
 }
 
 /** The code now differs from the code it was built with. Unknown on either side is not a change. */
-function codeChanged(v: StaleView): boolean {
+function codeChanged(v: Pick<StaleView, "codeHash" | "entry">): boolean {
   return v.codeHash !== undefined && v.entry !== null && v.entry.codeHash !== null && v.entry.codeHash !== v.codeHash;
 }
 

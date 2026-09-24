@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { CatalogAsset, InputSeen } from "../history/catalog.ts";
-import { editedProblem, type StaleView, staleReasons } from "./staleness.ts";
+import { editedProblem, noteTimeZoneChange, type StaleView, staleReasons, timeZoneChange } from "./staleness.ts";
 
 // Stamps: microseconds apart matter (a Date would lose them).
 const S1 = "2026-09-22T10:00:00.000001Z";
@@ -143,5 +143,32 @@ describe("editedProblem", () => {
   test("ingests: the next run fetches with the new code", () => {
     const p = editedProblem(view({ asset: "charges", kind: "ingest", inputs: [], codeHash: "h2", entry: entry("charges", { kind: "ingest" }) }))!;
     expect(p).toMatchObject({ message: "charges edited since its last run", fix: { kind: "command", command: "croft run charges" } });
+  });
+});
+
+describe("time zone changes", () => {
+  // The code hash includes croft.json's timezone (§8), so changing it changes every hash: the transform rebuilds
+  // (code_changed), but nothing was edited.
+  test("a hash that differs only by the project time zone still rebuilds, and is no edit", () => {
+    const v = view({ codeHash: "h2", builtInZone: "America/Los_Angeles" });
+    expect(timeZoneChange(v)).toBe("America/Los_Angeles");
+    expect(staleReasons(v)).toEqual(["code_changed"]);
+    expect(editedProblem(v)).toBeNull();
+    expect(editedProblem({ ...v, kind: "ts", incremental: true })).toBeNull();
+    expect(editedProblem({ ...v, kind: "ingest", inputs: [] })).toBeNull();
+    expect(timeZoneChange(view({ codeHash: "h2" }))).toBeNull();
+    // Unchanged code has no time zone change to report.
+    expect(timeZoneChange(view({ builtInZone: "America/Los_Angeles" }))).toBeNull();
+  });
+
+  test("what resolveProject found is noted by hash pair, so a view made without it (status) knows too", () => {
+    noteTimeZoneChange("tz-now", "tz-then", "Asia/Tokyo");
+    const v = view({ codeHash: "tz-now", entry: entry("daily_revenue", { codeHash: "tz-then", inputsSeen: { charges: seen(S1) } }) });
+    expect(timeZoneChange(v)).toBe("Asia/Tokyo");
+    expect(editedProblem(v)).toBeNull();
+    // The same code hash against another build's hash is an edit.
+    const edited = view({ codeHash: "tz-now", entry: entry("daily_revenue", { codeHash: "tz-other", inputsSeen: { charges: seen(S1) } }) });
+    expect(timeZoneChange(edited)).toBeNull();
+    expect(editedProblem(edited)?.code).toBe("EDITED_SINCE_LAST_RUN");
   });
 });

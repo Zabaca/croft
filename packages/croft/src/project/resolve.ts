@@ -11,12 +11,15 @@
 // 3. parse its checks and warnings (checks/parse.ts parseChecks) and vet them with DuckDB's parser
 //    (analyzeChecks), which also gives the tables a check reads;
 // 4. orderAfter = inputs ∪ the tables its checks read, and buildGraph (project/graph.ts): the run order, reads,
-//    readBy, downstream, upstream and CYCLE.
+//    readBy, downstream, upstream and CYCLE;
+// 5. an asset whose code hash differs from the one it was built with only because croft.json's timezone changed
+//    gets timeZoneChanged (see "Time zone changes" below).
 //
 // With selectors, a TS file whose text calls ingest() only (sniffKind) is imported when it is selected or
-// upstream of the selection, and left unimported otherwise (`loaded: false`): an ingest reads no asset, so the
-// graph does not need its code, and `croft run x` never runs the top-level code of unrelated ingests. Every
-// SQL asset and every TS file that may be a transform is always loaded, since the graph needs their inputs.
+// needed before the selection (upstream of it, or read by its checks: neededBy), and left unimported otherwise
+// (`loaded: false`): an ingest reads no asset, so the graph does not need its code, and `croft run x` never runs
+// the top-level code of unrelated ingests. Every SQL asset and every TS file that may be a transform is always
+// loaded, since the graph needs their inputs.
 //
 // bindProject then binds every SQL asset in run order against empty tables with the columns the catalog mirror
 // has (sql/bind.ts ShadowCatalog): output columns, bind problems, and the unoptimized plan's scans, which it adds
@@ -24,22 +27,30 @@
 //
 // Also here, because resolving an asset decides them: selection (selectAssets) and write behavior (resolveWrite,
 // behaviorLabel, behaviorWords, behaviorHash). run/plan.ts re-exports them.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { join } from "node:path";
 import type { DuckDBConnection } from "@duckdb/node-api";
 import { analyzeChecks, parseChecks } from "../checks/parse.ts";
 import { CroftError, isCode } from "../core/errors.ts";
 import { captureImport, collectingSink, defaultOutputRedactor } from "../core/output.ts";
 import type { AssetKind, Check, CursorType, Incremental, Problem, WriteMode } from "../core/types.ts";
 import { openMemory } from "../db/connect.ts";
+import { allCatalog } from "../history/catalog.ts";
+import { RUNS_DB_FILE, RunsDb } from "../history/runs-db.ts";
+import { losslessReviver } from "../load/stage.ts";
 import type { StepKind } from "../run/plan.ts";
+import { noteTimeZoneChange } from "../run/staleness.ts";
+import { finiteJson } from "../sql/ast.ts";
 import { type BindResult, ShadowCatalog } from "../sql/bind.ts";
+import type { SelectAst } from "../sql/gate.ts";
 import { type DiscoveredAsset, discoverAssets } from "./discover.ts";
 import { ProjectEnv } from "./env.ts";
 import { buildGraph, type Graph } from "./graph.ts";
-import { type LoadedSqlAsset, loadSqlAsset } from "./sql-asset.ts";
+import { loadProject } from "./root.ts";
+import { type LoadedSqlAsset, loadSqlAsset, sqlFingerprint } from "./sql-asset.ts";
 import { didYouMean } from "./suggest.ts";
-import { type LoadedTsAsset, loadTsAsset, type TsAssetSpec } from "./ts-asset.ts";
+import { bundleTs, fingerprintOf, type LoadedTsAsset, loadTsAsset, normalizeBundle, type TsAssetSpec } from "./ts-asset.ts";
 
 export interface ResolveInput {
   root: string;
@@ -54,6 +65,13 @@ export interface ResolveInput {
   /** Keep each TS asset's top-level console output in ResolvedAsset.output (a run's step log) instead of
    *  printing it on stderr, prefixed with the file and redacted (every other command). */
   keepOutput?: boolean;
+  /** The code hash each asset was last built with (CatalogAsset.codeHash), or null: an asset whose hash differs
+   *  only because croft.json's timezone changed gets ResolvedAsset.timeZoneChanged. Default: the catalog mirror's
+   *  (runs.sqlite), when the project has one. */
+  builtHashes?: (asset: string) => string | null;
+  /** The command that was typed, again with other selectors: the did-you-mean fix of a mistyped name
+   *  (selectAssets). Default: `croft run <selectors>`. */
+  retry?: (selectors: readonly string[]) => string;
 }
 
 export interface ResolvedProject {
@@ -106,6 +124,9 @@ export interface ResolvedAsset {
   pins: Record<string, { type: string; format?: string }>;
   /** Includes the project time zone. Absent when the code does not parse or bundle. */
   codeHash?: string;
+  /** The code is the code its last build ran, and only croft.json's timezone changed since: `from` is the zone it
+   *  was built in, `to` the project's now. It still rebuilds (code_changed), but nothing was edited. */
+  timeZoneChanged?: { from: string; to: string };
   description?: string;
   /** TS: calls ctx.http, fetch or an HTTP package (TRANSFORM_MAKES_REQUESTS, the cost guard). */
   usesHttp?: boolean;
@@ -130,7 +151,7 @@ export async function resolveProject(i: ResolveInput): Promise<ResolvedProject> 
   const discovery = await discoverAssets(i.root);
   const names = discovery.assets.map((a) => a.name);
   const selectors = i.selectors ?? [];
-  const selected = selectAssets(names, selectors, discovery.problems);
+  const selected = selectAssets(names, selectors, discovery.problems, i.retry ? { retry: i.retry } : {});
   // Asset output that escapes its import (a timer started at top level) reaches stderr redacted (core/output.ts).
   if (i.keepOutput) defaultOutputRedactor(() => (t) => ProjectEnv.load(i.root, {}).redact(t));
 
@@ -150,15 +171,16 @@ export async function resolveProject(i: ResolveInput): Promise<ResolvedProject> 
       if (everything || chosen.has(a.name) || sniffKind(a) !== "ingest") await load(a);
       else byName.set(a.name, notLoaded(a));
     }
-    // What the selection reads, through other assets, is loaded too (--upstream runs it). A file sniffed as an
-    // ingest that turns out to read assets brings its own inputs in on the next round.
+    // What the selection needs first, through other assets, is loaded too (--upstream runs it): what it reads,
+    // and the tables its checks read. A file sniffed as an ingest that turns out to read assets (or to have
+    // checks that do) brings them in on the next round.
     while (!everything) {
-      const graph = buildGraph(nodesOf(discovery.assets.map((a) => byName.get(a.name)!))).graph;
-      const missing = graph.upstream(selected).filter((n) => byName.get(n)?.loaded === false);
+      const missing = neededBy(selected, (n) => byName.get(n)?.orderAfter ?? []).filter((n) => byName.get(n)?.loaded === false);
       if (missing.length === 0) break;
       for (const n of missing) await load(discovery.assets.find((a) => a.name === n)!);
     }
     const assets = discovery.assets.map((a) => byName.get(a.name)!);
+    await findTimeZoneChanges(assets, i, connection);
     const { graph, problems: cycles } = buildGraph(nodesOf(assets));
     return {
       assets,
@@ -176,6 +198,102 @@ export async function resolveProject(i: ResolveInput): Promise<ResolvedProject> 
 
 function nodesOf(assets: readonly ResolvedAsset[]) {
   return assets.map((a) => ({ name: a.name, inputs: a.inputs, orderAfter: a.orderAfter, file: a.file }));
+}
+
+/**
+ * Every name that must run before any of `names`, directly or through others, by `after` (an asset's
+ * orderAfter: its inputs and the tables its checks read, §3f; Graph.upstream follows inputs only). `names`
+ * excluded, in no particular order. Names `after` gives that are not assets come along; callers look them up.
+ */
+export function neededBy(names: readonly string[], after: (name: string) => readonly string[]): string[] {
+  const seen = new Set<string>();
+  const stack = [...names];
+  while (stack.length) {
+    for (const x of after(stack.pop()!)) {
+      if (seen.has(x)) continue;
+      seen.add(x);
+      stack.push(x);
+    }
+  }
+  for (const n of names) seen.delete(n);
+  return [...seen];
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Time zone changes (§8: "Changing timezone in croft.json rebuilds every transform")
+//
+// Every code hash includes the project time zone, and the zone an asset was built in is recorded nowhere. So
+// when an asset's hash differs from the one it was built with, its code is hashed again in every zone Intl
+// knows: a match proves the code is unchanged and only the zone moved. That costs a few milliseconds per asset
+// whose hash differs (an SQL AST serialized once and hashed ~450 times, a TS asset bundled again), and nothing
+// for the others. When the hash cannot be reproduced in the current zone, nothing is claimed.
+
+/** The zones a project can have been built in: the IANA names Intl knows, and the spellings of UTC. */
+let zones: string[] | undefined;
+function candidateZones(): string[] {
+  zones ??= [...new Set([...Intl.supportedValuesOf("timeZone"), "UTC", "Etc/UTC", "GMT", "Etc/GMT"])];
+  return zones;
+}
+
+/** Each loaded asset's code hash as the catalog mirror records it: the default of ResolveInput.builtHashes. */
+function mirrorHashes(root: string): (asset: string) => string | null {
+  const hashes = new Map<string, string>();
+  try {
+    const stateDir = loadProject({ root }).paths.stateDir;
+    if (existsSync(join(stateDir, RUNS_DB_FILE))) {
+      const db = RunsDb.open(stateDir);
+      try {
+        for (const c of allCatalog(db)) if (c.codeHash) hashes.set(c.asset, c.codeHash);
+      } finally {
+        db.close();
+      }
+    }
+  } catch {
+    // No readable project or runs.sqlite: no build to compare with.
+  }
+  return (asset) => hashes.get(asset) ?? null;
+}
+
+/** Set timeZoneChanged on each asset whose code hash differs from its build's only by the time zone, and note
+ *  it for run/staleness.ts (views made without the asset, as status makes them). */
+async function findTimeZoneChanges(assets: readonly ResolvedAsset[], i: ResolveInput, connection: () => Promise<DuckDBConnection>): Promise<void> {
+  const built = i.builtHashes ?? mirrorHashes(i.root);
+  for (const a of assets) {
+    const was = built(a.name);
+    if (!a.loaded || !a.codeHash || !was || was === a.codeHash) continue;
+    const hashIn = await rehasher(a, connection);
+    if (!hashIn || hashIn(i.timezone) !== a.codeHash) continue;
+    const from = candidateZones().find((z) => z !== i.timezone && hashIn(z) === was);
+    if (from === undefined) continue;
+    a.timeZoneChanged = { from, to: i.timezone };
+    noteTimeZoneChange(a.codeHash, was, from);
+  }
+}
+
+/** The asset's code hash in another zone: the fingerprint loadSqlAsset or loadTsAsset computes, of the same code.
+ *  null when the code cannot be read again. */
+async function rehasher(a: ResolvedAsset, connection: () => Promise<DuckDBConnection>): Promise<((timezone: string) => string) | null> {
+  try {
+    if (a.kind === "sql" && a.sql) {
+      // As loadSqlAsset serializes the body: one statement, integers beyond 2^53 kept.
+      const reader = await (await connection()).runAndReadAll("SELECT json_serialize_sql($1::VARCHAR)", [a.sql.body]);
+      const parsed = JSON.parse(finiteJson(String(reader.getRowsJS()[0]?.[0] ?? "{}")),
+        losslessReviver as (this: unknown, key: string, value: unknown) => unknown) as { error?: boolean; statements?: SelectAst[] };
+      const ast = !parsed.error && parsed.statements?.length === 1 ? parsed.statements[0]! : null;
+      const header = a.sql.header;
+      return ast ? (timezone) => sqlFingerprint(ast, header, timezone) : null;
+    }
+    if (a.ts) {
+      const bundle = await bundleTs(a.path);
+      if (!bundle.ok) return null;
+      const code = normalizeBundle(bundle.code, a.path);
+      const packages = a.ts.packages;
+      return (timezone) => fingerprintOf(code, packages, timezone);
+    }
+  } catch {
+    // Unreadable now (the file changed under us, say): nothing is claimed.
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -386,12 +504,20 @@ function discoveryError(p: Problem): CroftError {
   return new CroftError(isCode(code) ? code : "USAGE_ERROR", init);
 }
 
+/** Selectors as a command line takes them: a glob quoted, so the shell does not expand it. */
+export function selectorWords(selectors: readonly string[]): string[] {
+  return selectors.map((s) => (isGlob(s) ? `'${s}'` : s));
+}
+
 /**
  * The asset names a list of selectors picks, in name order: exact names or globs ('github_*'). An empty list
  * selects every asset. An unknown name or a glob that matches nothing is USAGE_ERROR, with a did-you-mean,
- * unless it names a file discovery refused (`order.ts`: NAME_RESERVED): then that file's own problem.
+ * unless it names a file discovery refused (`order.ts`: NAME_RESERVED): then that file's own problem. The
+ * did-you-mean fix repeats the command that was typed (`retry`, default `croft run …`) with the name corrected,
+ * so following it never runs what a dry run or validate only looked at.
  */
-export function selectAssets(names: readonly string[], selectors: readonly string[], problems: readonly Problem[] = []): string[] {
+export function selectAssets(names: readonly string[], selectors: readonly string[], problems: readonly Problem[] = [],
+  o: { retry?: (selectors: readonly string[]) => string } = {}): string[] {
   if (selectors.length === 0) return [...names].sort();
   const picked = new Set<string>();
   for (const sel of selectors) {
@@ -413,10 +539,12 @@ export function selectAssets(names: readonly string[], selectors: readonly strin
     if (!names.includes(sel)) {
       if (broken[0]) throw discoveryError(broken[0]);
       const guess = didYouMean(sel, names);
+      const fixed = selectors.map((s) => (s === sel && guess ? guess : s));
+      const command = o.retry ? o.retry(fixed) : ["croft run", ...selectorWords(fixed)].join(" ");
       throw new CroftError("USAGE_ERROR", {
         message: `there is no asset named ${JSON.stringify(sel)}`,
         hint: guess ? `did you mean ${guess}?` : names.length ? `assets are named after their files in assets/: ${names.slice(0, 20).join(", ")}` : "assets/ has no assets yet; croft docs ingest shows templates",
-        ...(guess ? { fix: { kind: "command" as const, description: `run ${guess}`, command: `croft run ${guess}` } } : {}),
+        ...(guess ? { fix: { kind: "command" as const, description: `the same command with ${guess}`, command } } : {}),
         details: { selector: sel, ...(guess ? { suggestion: guess } : {}) },
       });
     }

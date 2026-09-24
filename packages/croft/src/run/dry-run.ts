@@ -8,9 +8,11 @@
 //                   --from converted to the cursor's type, echoed as an instant with the project offset
 //   confirmations   --allow-shrink on a replace ingest (its current rows would go to the trash), and the cost
 //                   guard of an incremental TS transform that makes requests (LARGE_REPROCESS), with the pending
-//                   input rows estimated from the mirror and the steps runs.sqlite recorded for each input
+//                   rows of the inputs it reads with newRows() estimated from the mirror and the steps
+//                   runs.sqlite recorded for each input
 //   skips           an asset downstream of one that would fail before it runs (a static error) is skipped, as
-//                   the runner skips it; --from skips what it does not apply to in a bare run or a glob
+//                   the runner skips it; --from skips every transform, and in a bare run or a glob the ingests
+//                   it does not apply to (run/plan.ts)
 //   holds           an asset another run holds the lease of: the run would wait for it
 //
 // Nothing is created: without runs.sqlite the project has never run, and everything is "never built". A dry
@@ -24,11 +26,11 @@ import { allCatalog, type CatalogAsset } from "../history/catalog.ts";
 import { listLeases } from "../history/leases.ts";
 import { RUNS_DB_FILE, RunsDb } from "../history/runs-db.ts";
 import { effectiveLookbackMs, renderSince } from "../load/cursor.ts";
-import { lookbackWords } from "../project/resolve.ts";
+import { lookbackWords, selectorWords } from "../project/resolve.ts";
 import type { Project } from "../project/root.ts";
 import { cursorTypeOfPin } from "../project/ts-asset.ts";
 import { croftError, fromSince, shrinkImpact } from "./ingest.ts";
-import { cursorTypesOf, FROM_ONLY_MERGE, isGlob, loadErrors, type PlannedStep, planRun, type RunPlan } from "./plan.ts";
+import { cursorTypesOf, FROM_ONLY_MERGE, loadErrors, type PlannedStep, planRun, type RunPlan } from "./plan.ts";
 import { checkRunFlags, shrinkCommand } from "./runner.ts";
 import { DEFAULT_CONFIRM_ABOVE, REPROCESS_ACTION } from "./transform.ts";
 
@@ -100,6 +102,8 @@ export async function dryRun(i: DryRunInput): Promise<DryRunOutcome> {
     root: project.root, timezone: project.timezone, selectors: i.selectors, catalog: history.catalog,
     cursorTypes: cursorTypesOf(history.catalog), only: i.only === true, upstream: i.upstream === true,
     ...(i.from !== undefined ? { from: i.from } : {}), ...(i.importTimeoutMs !== undefined ? { importTimeoutMs: i.importTimeoutMs } : {}),
+    // A mistyped name's fix is this dry run again, never a real run.
+    retry: (selectors) => [...runWords({ ...i, selectors }), "--dry-run"].join(" "),
   });
   checkRunFlags(plan, { selectors: i.selectors, ...(i.from !== undefined ? { from: i.from } : {}), allowShrink: i.allowShrink === true });
   const now = i.now ?? clockNow();
@@ -111,13 +115,14 @@ export async function dryRun(i: DryRunInput): Promise<DryRunOutcome> {
 
   for (const step of plan.steps) {
     const entry = entries.get(step.asset) ?? null;
-    const errors = loadErrors(step);
+    // A step the plan skips (--from) never gets to its problems, in the run either.
+    const errors = step.action === "skip" ? [] : loadErrors(step);
     const out: DryRunStep = {
       asset: step.asset, file: step.file, kind: step.kind, action: step.action, reasons: [...step.reasons],
       // As the run output shows it: "requested" goes without saying once there is more to say.
       reason: step.reason.replace(/^requested; /, ""), behavior: step.behavior, problems: errors,
     };
-    problems.push(...step.problems.map((p) => ({ ...p, asset: p.asset ?? step.asset })));
+    if (step.action !== "skip") problems.push(...step.problems.map((p) => ({ ...p, asset: p.asset ?? step.asset })));
     const ingest = step.kind === "rows" || step.kind === "file";
 
     // An input that would fail or be skipped: the runner skips this step too.
@@ -265,12 +270,16 @@ function confirmationOf(step: PlannedStep, entry: CatalogAsset | null, c: Confir
 /**
  * The input rows an incremental transform would process, from runs.sqlite: all of an input's rows when it has
  * not read that input yet; otherwise the rows the input's steps added or updated since the position it saved,
- * at most the input's rows. Inputs without a key are not counted (the transform's own count skips them too), and
- * neither is an input never built (it has no rows yet; the run builds it first).
+ * at most the input's rows. As the run's cost guard (run/transform.ts), only the inputs the code reads with
+ * newRows() count (LoadedTsAsset.readsNewRows; every input when the scan cannot tell): a lookup read with rows()
+ * never gets a position, and is no work to process. Inputs without a key are not counted (the transform's own
+ * count skips them too), and neither is an input never built (it has no rows yet; the run builds it first).
  */
 export function pendingEstimate(step: PlannedStep, entry: CatalogAsset | null, c: Pick<ConfirmContext, "entries" | "history">): number {
+  const reads = step.loaded?.readsNewRows;
   let total = 0;
   for (const input of step.inputs) {
+    if (reads && !reads.includes(input)) continue;
     const e = c.entries.get(input);
     if (!e || e.key.length === 0 || e.rows === 0) continue;
     const seen = entry?.inputsSeen?.[input];
@@ -312,14 +321,19 @@ function nextOf(steps: readonly DryRunStep[], i: DryRunInput): Next[] {
   // --allow-shrink is destructive: it never appears in next (§4.3); the user runs it themselves.
   const runnable = steps.some((s) => s.action !== "skip" && s.problems.length === 0);
   if (runnable && !i.allowShrink) {
-    const args = [
-      ...i.selectors.map((s) => (isGlob(s) ? `'${s}'` : s)), ...(i.only ? ["--only"] : []), ...(i.upstream ? ["--upstream"] : []),
-      ...(i.from !== undefined ? [`--from ${i.from}`] : []),
-    ];
     const waits = steps.some((s) => s.confirmation);
-    next.push({ command: ["croft run", ...args].join(" "), reason: waits ? "run it; it stops to ask before the steps that need confirmation" : "run it" });
+    next.push({ command: runWords(i).join(" "), reason: waits ? "run it; it stops to ask before the steps that need confirmation" : "run it" });
   }
   return next;
+}
+
+/** `croft run` with the dry run's selectors and flags, less --dry-run (and --allow-shrink, which is destructive:
+ *  it never appears in next or a fix, §4.3). */
+function runWords(i: Pick<DryRunInput, "selectors" | "only" | "upstream" | "from">): string[] {
+  return [
+    "croft run", ...selectorWords(i.selectors), ...(i.only ? ["--only"] : []), ...(i.upstream ? ["--upstream"] : []),
+    ...(i.from !== undefined ? [`--from ${i.from}`] : []),
+  ];
 }
 
 /** Words for a confirmation, as the dry run shows it under its step. */

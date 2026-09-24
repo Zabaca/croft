@@ -1,7 +1,9 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { cleanupProjects, makeProject } from "../run/testkit.ts";
+import { putCatalog } from "../history/catalog.ts";
+import { RunsDb } from "../history/runs-db.ts";
+import { cleanupProjects, makeProject, writeFiles } from "../run/testkit.ts";
 import { bindProject, type ResolvedAsset, resolveProject, sniffKind, stepKindOf } from "./resolve.ts";
 
 afterAll(() => cleanupProjects());
@@ -94,9 +96,53 @@ export default ingest({ async *rows() {} });
     expect(existsSync(join(root, "imported_stripe_charges"))).toBe(true);
   });
 
+  test("selectors: an ingest only a check of the selection reads is imported too (--upstream may build it, §3f)", async () => {
+    const root = makeProject({
+      "assets/regions.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ key: "region", async *rows() {} });\n`,
+      "assets/other.ts": INGEST(),
+      "assets/report.sql": "-- check: region IN (SELECT region FROM regions)\nSELECT 'East' AS region\n",
+    });
+    const a = byName((await resolveProject({ root, timezone: "UTC", selectors: ["report"] })).assets);
+    expect(a.report!.orderAfter).toEqual(["regions"]);
+    expect(a.regions).toMatchObject({ loaded: true, ok: true, key: ["region"] });
+    expect(a.other!.loaded).toBe(false);
+  });
+
   test("unknown selectors are usage errors, as for croft run", async () => {
     const root = makeProject(PROJECT);
     await expect(resolveProject({ root, timezone: "UTC", selectors: ["open_issuse"] })).rejects.toMatchObject({ code: "USAGE_ERROR" });
+    // The fix repeats the command the caller says was typed.
+    await expect(resolveProject({ root, timezone: "UTC", selectors: ["open_issuse"], retry: (s) => `croft validate ${s.join(" ")}` }))
+      .rejects.toMatchObject({ problem: { fix: { command: "croft validate open_issues" } } });
+  });
+
+  // Every code hash includes croft.json's timezone (§8), so a new zone rebuilds every transform. That is no edit:
+  // resolveProject tells the two apart by hashing the same code in the other zones.
+  test("a code hash that differs only by the project time zone names the zone the asset was built in", async () => {
+    const root = makeProject(PROJECT);
+    const la = byName((await resolveProject({ root, timezone: "America/Los_Angeles" })).assets);
+    const builtHashes = (name: string) => la[name]?.codeHash ?? null;
+    const utc = byName((await resolveProject({ root, timezone: "UTC", builtHashes })).assets);
+    const moved = { from: "America/Los_Angeles", to: "UTC" };
+    for (const name of ["github_issues", "open_issues", "issue_triage", "priorities"]) {
+      expect(utc[name]!.codeHash, name).not.toBe(la[name]!.codeHash);
+      expect(utc[name]!.timeZoneChanged, name).toEqual(moved);
+    }
+    // Same zone: nothing changed. An edit (in any zone) is an edit.
+    expect(byName((await resolveProject({ root, timezone: "America/Los_Angeles", builtHashes })).assets).open_issues!.timeZoneChanged).toBeUndefined();
+    writeFiles(root, { "assets/priorities.sql": "SELECT 2 AS p\n" });
+    const edited = byName((await resolveProject({ root, timezone: "UTC", builtHashes })).assets);
+    expect(edited.priorities!.timeZoneChanged).toBeUndefined();
+    expect(edited.open_issues!.timeZoneChanged).toEqual(moved);
+    // Without builtHashes, the catalog mirror's code hashes (runs.sqlite), when there is one.
+    const db = RunsDb.open(join(root, ".croft"));
+    try {
+      putCatalog(db, { asset: "open_issues", kind: "sql", behavior: "", write: "replace", key: ["id"], rows: 1, columns: [], cursor: null,
+        lastLoadedAt: null, lastReplacedAt: null, lastRunId: null, codeHash: la.open_issues!.codeHash! });
+    } finally {
+      db.close();
+    }
+    expect(byName((await resolveProject({ root, timezone: "UTC" })).assets).open_issues!.timeZoneChanged).toEqual(moved);
   });
 
   test("each asset carries its own problems; a broken asset is still listed; cycles are project problems", async () => {

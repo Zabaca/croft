@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tsconfigJson } from "../../agent/templates.ts";
 import { type CatalogAsset, type CatalogColumn, putCatalog } from "../../history/catalog.ts";
 import { ProjectEnv } from "../../project/env.ts";
+import { resolveProject } from "../../project/resolve.ts";
 import type { Command } from "../command.ts";
 import { COMMANDS } from "./index.ts";
 import { cleanup, cli, makeProject, PKG, runsDb, type TestProject, writeFiles } from "./inspect-testkit.ts";
@@ -135,6 +136,37 @@ describe("the bind check", () => {
     const out = await cli(["validate", "--json"], { cwd: p.root });
     expect(out.exit).toBe(0);
     expect(out.json).toMatchObject({ ok: true, command: "validate" });
+  });
+
+  test("an input never built but previewed binds against the preview's columns (the column cache holds previews)", async () => {
+    const p = makeProject({
+      files: {
+        "assets/stripe_charges.ts": CHARGES_TS,
+        "assets/daily_revenue.sql": "SELECT created::DATE AS day, sum(amount) AS revenue FROM stripe_charges GROUP BY 1\n",
+      },
+    });
+    expect(codes((await check(p)).problems)).toEqual(["INPUT_NOT_BUILT"]);
+    // `croft preview stripe_charges` wrote its catalog entry to .croft/preview/runs.sqlite, with source "preview".
+    const previewed: CatalogAsset = {
+      asset: "stripe_charges", kind: "ingest", behavior: "replaces the table's contents", write: "replace", key: ["id"], rows: 2,
+      columns: [col("id", "VARCHAR"), col("created", "TIMESTAMPTZ"), col("amount", "DOUBLE"), col("_loaded_at", "TIMESTAMPTZ", { sourceName: null })],
+      cursor: null, lastLoadedAt: "2026-09-22T18:55:00.000000Z", lastReplacedAt: null, lastRunId: "p_0922_1155_ok01", codeHash: "preview-hash",
+    };
+    const db = runsDb(join(p.stateDir, "preview"));
+    try {
+      putCatalog(db, previewed, "preview");
+    } finally {
+      db.close();
+    }
+    const after = await check(p);
+    expect(after.problems).toEqual([]);
+    expect(after.data.assets.find((a) => a.name === "daily_revenue")!.outputColumns).toEqual([{ name: "day", type: "DATE" }, { name: "revenue", type: "DOUBLE" }]);
+    // A preview is no build: codeChanged still compares with the live catalog only.
+    expect(after.data.assets.find((a) => a.name === "stripe_charges")!.codeChanged).toBe(false);
+    // A live entry wins over the preview's.
+    catalog(p, [{ ...previewed, lastRunId: "r_0922_1200_live", columns: previewed.columns.map((c) => (c.name === "amount" ? col("amount_cents", "BIGINT") : c)) }]);
+    const live = await check(p);
+    expect(codes(live.problems)).toEqual(["UNKNOWN_COLUMN"]);
   });
 
   test("an input with errors: its readers skip the bind and say why", async () => {
@@ -330,6 +362,12 @@ describe("croft validate (the command)", () => {
     const bad = await cli(["validate", "by_titel", "--json"], { cwd: p.root });
     expect(bad.exit).toBe(2);
     expect(bad.json.problems[0]).toMatchObject({ code: "USAGE_ERROR", hint: "did you mean by_title?" });
+    // The did-you-mean fix repeats the command typed: validate touches no data, and neither does its fix.
+    expect(bad.json.problems[0].fix).toMatchObject({ kind: "command", command: "croft validate by_title" });
+    const typed = await cli(["validate", "open_issues", "by_titel", "--types", "--json"], { cwd: p.root });
+    expect(typed.json.problems[0].fix.command).toBe("croft validate open_issues by_title --types");
+    const glob = await cli(["validate", "open_*", "by_titel", "--json"], { cwd: p.root });
+    expect(glob.json.problems[0].fix.command).toBe("croft validate 'open_*' by_title");
   });
 
   test("codeChanged against the catalog's code hash, and croft preview of what changed as the next step", async () => {
@@ -343,6 +381,18 @@ describe("croft validate (the command)", () => {
     expect(hash("open_issues")!.codeChanged).toBe(false);         // never built
     const r = await cli(["validate", "--json"], { cwd: p.root });
     expect(r.json.next).toEqual([{ command: "croft preview github_issues", reason: "see what the changed code builds before running it" }]);
+  });
+
+  test("a code hash that changed only because croft.json's timezone did is no code change", async () => {
+    const p = makeProject({ timezone: "UTC", files: { "assets/github_issues.ts": ISSUES_TS, "assets/open_issues.sql": "SELECT id, title FROM github_issues\n" } });
+    const inLA = await resolveProject({ root: p.root, timezone: "America/Los_Angeles" });
+    const hashIn = (name: string) => inLA.assets.find((a) => a.name === name)!.codeHash!;
+    catalog(p, [
+      { ...ISSUES_BUILT, codeHash: hashIn("github_issues") },
+      { ...ISSUES_BUILT, asset: "open_issues", kind: "sql", codeHash: hashIn("open_issues"), columns: [col("id", "BIGINT"), col("title", "VARCHAR")] },
+    ]);
+    const r = await check(p);
+    expect(r.data.assets.map((a) => [a.name, a.codeChanged])).toEqual([["github_issues", false], ["open_issues", false]]);
   });
 
   test("never opens the warehouse or creates anything: a file that is no database, and a locked one", async () => {

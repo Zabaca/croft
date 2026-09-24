@@ -9,7 +9,7 @@ import {
   planRun, type RunPlan, resolveWrite, selectAssets, staleViewOf,
 } from "./plan.ts";
 import { staleReasons } from "./staleness.ts";
-import { cleanupProjects, makeProject } from "./testkit.ts";
+import { cleanupProjects, makeProject, writeFiles } from "./testkit.ts";
 
 afterAll(() => cleanupProjects());
 
@@ -35,6 +35,19 @@ describe("selectAssets", () => {
     }
     expect(() => selectAssets(names, ["shopify_*"])).toThrow(/no asset matches "shopify_\*"/);
     expect(() => selectAssets([], ["x"])).toThrow(/there is no asset named "x"/);
+  });
+
+  test("the did-you-mean fix repeats the command typed, with the name corrected and the other selectors kept", () => {
+    const fixOf = (selectors: string[], retry?: (s: readonly string[]) => string) => {
+      try {
+        selectAssets(names, selectors, [], retry ? { retry } : {});
+      } catch (e) {
+        return (e as { problem: { fix?: { command?: string } } }).problem.fix?.command;
+      }
+      throw new Error("expected a usage error");
+    };
+    expect(fixOf(["taxi_zones", "stripe_chargse"])).toBe("croft run taxi_zones stripe_charges");
+    expect(fixOf(["stripe_chargse"], (s) => `croft validate ${s.join(" ")}`)).toBe("croft validate stripe_charges");
   });
 
   test("isGlob", () => {
@@ -227,6 +240,59 @@ describe("planRun: what a run takes", () => {
     expect((await plan([], { only: true, catalog: staleOpen })).order).toEqual(["api", "open_issues"]);
   });
 
+  // §3f: a table read only in a check's subquery orders the steps. It is no input (nothing downstream follows it),
+  // but the check cannot run until the table exists.
+  test("--upstream builds the never-built tables its checks read; without it, the step names that table before it runs", async () => {
+    const root = makeProject({
+      ...PROJECT,
+      "assets/regions.sql": "SELECT 'open' AS state\n",
+      "assets/report.sql": "-- key: id\n-- check: title IN (SELECT state FROM regions)\nSELECT id, title FROM open_issues\n",
+    });
+    const catalog = await builtCatalog(root);
+    const plan = (selectors: string[], o: { only?: boolean; upstream?: boolean } = {}) =>
+      planRun({ root, timezone: "America/Los_Angeles", selectors, catalog, ...o });
+
+    const up = await plan(["report"], { upstream: true });
+    expect(up.order).toEqual(["regions", "report"]);
+    expect(by(up).regions).toMatchObject({ action: "rebuild", reasons: ["never_built"], reason: "never built" });
+    expect(by(up).report!.problems).toEqual([]);
+    // Built and fresh, the table a check reads is left alone, as a built input is.
+    const withRegions = [...catalog, entry("regions", { kind: "sql", codeHash: by(up).regions!.codeHash! })];
+    expect((await planRun({ root, timezone: "America/Los_Angeles", selectors: ["report"], catalog: withRegions, upstream: true })).order).toEqual(["report"]);
+
+    // Not built, and not in the run: the step fails before it runs, naming the table and how to build it.
+    const alone = by(await plan(["report"]));
+    expect(codes(alone.report)).toEqual(["CHECK_INVALID"]);
+    const p = alone.report!.problems[0]!;
+    expect(p).toMatchObject({
+      severity: "error", asset: "report", file: "assets/report.sql", line: 2,
+      message: `report: the check "title IN (SELECT state FROM regions)" reads regions, which has never been built`,
+      hint: "build regions first (croft run regions), or both in one run: croft run report --upstream",
+      fix: { kind: "command", command: "croft run report --upstream" },
+      details: { check: "title IN (SELECT state FROM regions)", table: "regions" },
+    });
+    expect(p.hint).not.toContain("correct the check");
+    // Named too, or in a bare run, it is built first: no problem.
+    expect(by(await plan(["regions", "report"])).report!.problems).toEqual([]);
+    expect(by(await plan([])).report!.problems).toEqual([]);
+    // Once built, the check reads it as it is.
+    expect(by(await planRun({ root, timezone: "America/Los_Angeles", selectors: ["report"], catalog: withRegions })).report!.problems).toEqual([]);
+  });
+
+  test("only croft.json's timezone changed: the transforms rebuild, the reason names the zone, and nothing is 'edited'", async () => {
+    const root = makeProject(PROJECT);
+    const catalog = await builtCatalog(root);          // built in America/Los_Angeles
+    const s = by(await planRun({ root, timezone: "UTC", selectors: [], catalog }));
+    expect(s.consts).toMatchObject({ action: "rebuild", reasons: ["code_changed"], reason: "time zone changed (America/Los_Angeles → UTC)" });
+    expect(s.open_issues).toMatchObject({ reasons: ["code_changed", "input_changed"], reason: "time zone changed (America/Los_Angeles → UTC); input api may have new rows" });
+    // An incremental TS transform is forward-only, and gets no EDITED_SINCE_LAST_RUN for a zone change.
+    expect(s.triage!.problems).toEqual([]);
+    expect(s.triage!.reason).toBe("input open_issues may have new rows (time zone changed from America/Los_Angeles: the new zone applies to new input rows only)");
+    // An edit made with the zone change is still an edit.
+    writeFiles(root, { "assets/consts.sql": "SELECT 2 AS x\n" });
+    expect(by(await planRun({ root, timezone: "UTC", selectors: ["consts"], catalog })).consts!.reason).toBe("requested; SQL changed (assets/consts.sql)");
+  });
+
   test("without a catalog it reads the mirror in runs.sqlite, and creates nothing when there is none", async () => {
     const root = makeProject(PROJECT);
     const bare = await planRun({ root, timezone: "America/Los_Angeles", selectors: [] });
@@ -364,22 +430,27 @@ describe("the --from matrix (§8)", () => {
     expect(backfillUnsupported(step({ kind: "transform" }))?.code).toBe("BACKFILL_UNSUPPORTED");
   });
 
-  test("in a bare run or a glob, what --from does not apply to is skipped; what reads a backfilled ingest still runs", async () => {
+  // The runner's rule: under --from only fetches run (a merge ingest backfills); every transform is skipped, what
+  // reads a backfilled ingest included, and a bare `croft run` updates them afterwards.
+  test("in a bare run or a glob, what --from does not apply to is skipped, and so is every transform, as the runner skips it", async () => {
     const root = makeProject({
       ...PROJECT,
       "assets/zones.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ async *rows() {} });\n`,
       "assets/zone_report.sql": "SELECT count(*) AS n FROM zones\n",
+      "assets/broken.ts": `import { transform } from "@zabaca/croft";\nexport default transform({ inputs: [ });\n`,
     });
     const catalog = await builtCatalog(root);
     const s = by(await planRun({ root, timezone: "UTC", selectors: [], catalog: withEntry(catalog, "consts", { codeHash: "old" }), from: "-7d" }));
     expect(s.api).toMatchObject({ action: "fetch" });
     expect(s.zones).toMatchObject({ action: "skip", reason: FROM_ONLY_MERGE });
-    // zone_report reads only zones, which does not run; consts is stale but reads nothing.
     expect(s.zone_report).toMatchObject({ action: "skip", reason: FROM_ONLY_MERGE });
     expect(s.consts).toMatchObject({ action: "skip", reason: FROM_ONLY_MERGE });
-    expect(s.open_issues).toMatchObject({ action: "rebuild" });
-    expect(s.triage).toMatchObject({ action: "update" });
-    // Named exactly, nothing is skipped here: the runner refuses the command (BACKFILL_UNSUPPORTED) instead.
-    expect(by(await planRun({ root, timezone: "UTC", selectors: ["consts"], catalog, from: "-7d" })).consts!.action).toBe("rebuild");
+    expect(s.open_issues).toMatchObject({ action: "skip", reason: FROM_ONLY_MERGE });
+    expect(s.triage).toMatchObject({ action: "skip", reason: FROM_ONLY_MERGE });
+    // A transform that does not load is skipped too: the runner never gets to its errors.
+    expect(s.broken).toMatchObject({ action: "skip", reason: FROM_ONLY_MERGE });
+    expect(by(await planRun({ root, timezone: "UTC", selectors: ["api"], catalog, from: "-7d" })).open_issues).toMatchObject({ action: "skip", reason: FROM_ONLY_MERGE });
+    // Named exactly, a transform is refused by the runner's checkRunFlags (BACKFILL_UNSUPPORTED) before anything runs.
+    expect(by(await planRun({ root, timezone: "UTC", selectors: ["consts"], catalog, from: "-7d" })).consts!.action).toBe("skip");
   });
 });
