@@ -165,7 +165,10 @@ export async function reconcile(o: ReconcileOptions): Promise<ReconcileResult> {
     const ref = { runId: s.runId, asset: s.asset, attempt: s.attempt };
     const c = commitOf(writes, s);
     if (c) {
-      const reason = s.reason ? `${s.reason} (recovered)` : "recovered";
+      // A chunked TS transform may have committed several chunks before the crash: the reason says how many (its
+      // next run continues after the last one).
+      const recovered = c.commits > 1 ? `recovered: ${c.commits} commits` : "recovered";
+      const reason = s.reason ? `${s.reason} (${recovered})` : recovered;
       if (db.finishStep(s.runId, s.asset, s.attempt, { status: "ok", reason, rows: { in: c.rowsIn, added: c.added, updated: c.updated } })) {
         out.recovered.push({ ...ref, commits: c.commits });
         const entry = entries.get(s.asset);

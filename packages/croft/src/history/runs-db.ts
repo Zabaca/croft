@@ -356,6 +356,25 @@ export class RunsDb {
     return row ? toStep(row) : null;
   }
 
+  /**
+   * The sources of the checks and warnings the asset's last successful write ran: StepResult.checks of its
+   * latest `ok` step, from that run's stored summary (checks/run.ts ChecksHookOptions.previous). A check not
+   * among them is new or edited and covers the whole table once. null when unknown: no ok step, or its run left
+   * no summary (it crashed, or is still going); every check then covers the whole table, which is always safe.
+   */
+  lastCheckSources(asset: string): string[] | null {
+    const row = this.sqlite
+      .query(`SELECT r.summary AS summary FROM steps s JOIN runs r ON r.id = s.run_id
+              WHERE s.asset = ? AND s.status = 'ok' ORDER BY s.started_at DESC, s.attempt DESC LIMIT 1`)
+      .get(asset) as { summary: string | null } | null;
+    if (!row) return null;
+    const steps = (parseJson(row.summary) as { data?: { steps?: unknown } } | null)?.data?.steps;
+    if (!Array.isArray(steps)) return null;
+    const step = steps.find((s) => (s as { asset?: unknown } | null)?.asset === asset) as { status?: unknown; checks?: unknown } | undefined;
+    if (!step || step.status !== "ok" || !Array.isArray(step.checks)) return null;
+    return step.checks.flatMap((c) => (typeof (c as { check?: unknown } | null)?.check === "string" ? [(c as { check: string }).check] : []));
+  }
+
   /** Steps still marked running whose run has ended: what reconcile has left to resolve. */
   danglingSteps(): StepRecord[] {
     return (this.sqlite

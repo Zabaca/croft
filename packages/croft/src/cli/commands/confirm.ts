@@ -1,6 +1,7 @@
 // croft confirm <token> (DESIGN.md §4.2, §6 "How confirmation works"). Off a TTY a destructive command stops
 // with exit 5 and a token instead of acting; the action then runs only through this command, which every
-// Claude Code permission rule can gate with one prefix ("ask": ["Bash(croft confirm:*)"]).
+// Claude Code permission rule can gate with one prefix ("ask": ["Bash(croft confirm:*)"]). The cost guard
+// (§5, LARGE_REPROCESS) works the same way: its token is for `croft run <transform>`, the one transform named.
 //
 // confirm refuses a token that does not exist (USAGE_ERROR), was used or has expired (CONFIRMATION_STALE)
 // before anything runs. Otherwise it runs the stored command again, in this process, through the CLI

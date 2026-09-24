@@ -9,9 +9,10 @@
 //   after     the catalog mirror in runs.sqlite, staging deleted
 //
 // File ingests use load/files.ts for the extract and the typed batch, and the same writeBatch.
-// A SHRINK_GUARD with --allow-shrink asks the caller's decider: granted → the table goes to the trash (its own
-// commit), then the write runs again with the guard off; pending → a confirmation token, nothing written. An asset
-// with allowShrink: true skips the question (the user decided in code) but not the trash.
+// A SHRINK_GUARD with --allow-shrink asks the caller's ConfirmDecider (StepInput.confirm, action "allow_shrink";
+// the runner passes one only with --allow-shrink): granted → the table goes to the trash (its own commit), then the
+// write runs again with the guard off; pending → a confirmation token, nothing written; declined → SHRINK_GUARD. An
+// asset with allowShrink: true skips the question (the user decided in code) but not the trash.
 // CROFT_FAULT=after_stage|before_commit|after_commit_before_sqlite|between_trash_and_drop kills the process at
 // that point (crash tests, DESIGN.md §10 "Crash tests").
 import { rmSync } from "node:fs";
@@ -39,7 +40,7 @@ import { type ExtractInfo, isoMicros, readStoredColumns } from "../safety/guards
 import { plannedTrashPath, trashFailed, trashTable, type TrashEntry } from "../safety/trash.ts";
 import { backfillUnsupported, backfillWouldDuplicate, type PlannedStep } from "./plan.ts";
 import { OwnTableQuery } from "./snapshot.ts";
-import type { ConfirmDecision, StepInput } from "./step.ts";
+import type { StepInput } from "./step.ts";
 
 export type Phase = "extract" | "write" | "checks";
 
@@ -149,17 +150,12 @@ export class StepProgress {
 // ---------------------------------------------------------------------------------------------------------
 // --allow-shrink
 
-export interface ShrinkRequest {
-  asset: string;
-  rowsBefore: number;
-  rowsAfter: number;
-  impact: Impact;
-  error: CroftError;
-}
-export type ShrinkDecision = ConfirmDecision;
-export type ShrinkDecider = (r: ShrinkRequest) => Promise<ShrinkDecision>;
-
 export const SHRINK_ACTION = "replace ingest; SHRINK_GUARD override";
+
+/** The confirmation command for --allow-shrink on one asset; `croft confirm` re-runs exactly this. */
+export function shrinkCommand(asset: string): string {
+  return `croft run ${asset} --allow-shrink`;
+}
 
 /** The impact of overriding the shrink guard: every current row goes to the trash first. Its hash covers the
  *  asset, the action and the rows at stake, so a table that changed since the token was made is stale. */
@@ -169,13 +165,12 @@ export function shrinkImpact(stateDir: string, asset: string, rowsBefore: number
 
 // ---------------------------------------------------------------------------------------------------------
 
-/** An ingest step's input: the step contract (step.ts) plus the flags only ingests take. Ingests do not use
- *  `confirm` (a SHRINK_GUARD override asks `shrink`) or, until `croft preview` lands, `preview`. */
+/** An ingest step's input: the step contract (step.ts) plus --from. `confirm`, when present, decides a SHRINK_GUARD
+ *  override (action "allow_shrink"): the runner passes it with --allow-shrink only, so without the flag the guard
+ *  fails the step. Ingests do not use `preview` until `croft preview` lands. */
 export interface IngestInput extends StepInput {
   /** --from, as typed. */
   from?: string;
-  /** Present with --allow-shrink: decides whether a SHRINK_GUARD may be overridden. */
-  shrink?: ShrinkDecider;
 }
 
 export interface IngestOutcome {
@@ -187,6 +182,9 @@ export interface IngestOutcome {
   confirmation?: Confirmation;
   /** The table's state after the write, as mirrored into runs.sqlite. */
   catalog?: CatalogAsset;
+  /** The stamp of the rows the step's (one) write changed, when it wrote: the runner's warnings after the commit
+   *  cover the rows stamped with it. Absent when nothing was written, or the step committed more than once. */
+  loadedAt?: string;
 }
 
 interface IngestState {
@@ -230,14 +228,14 @@ export function codeError(e: unknown, step: PlannedStep, root: string): CroftErr
 }
 
 /** The reason a signal was aborted with, when it is croft's (INTERRUPTED, TIMEOUT). */
-function abortReason(signal: AbortSignal, asset: string): CroftError {
+export function abortReason(signal: AbortSignal, asset: string): CroftError {
   const r = croftError(signal.reason);
   if (r) return r;
   return new CroftError("INTERRUPTED", { asset, message: `${asset} was interrupted`, hint: "nothing was saved from this step; run it again" });
 }
 
 /** An Sql that refuses every statement once the step is aborted, so Ctrl-C discards a running transaction. */
-function abortable(sql: Sql, signal: AbortSignal, asset: string): Sql {
+export function abortable(sql: Sql, signal: AbortSignal, asset: string): Sql {
   const check = () => {
     if (signal.aborted) throw abortReason(signal, asset);
   };
@@ -288,7 +286,7 @@ function counted(source: unknown, progress: StepProgress): unknown {
 
 /** ctx.http with the step's counters: requests, the last status and body excerpt (SHRINK_GUARD details),
  *  all redacted, since they end up in problems. */
-function trackedHttp(http: HttpClient, progress: StepProgress, redact: (text: string) => string): HttpClient {
+export function trackedHttp(http: HttpClient, progress: StepProgress, redact: (text: string) => string): HttpClient {
   const wrap = <A extends unknown[]>(method: string, fn: (url: string, ...a: A) => ReturnType<HttpClient["get"]>) =>
     async (url: string, ...a: A) => {
       try {
@@ -353,7 +351,7 @@ export async function savedCursors(warehouse: DuckWarehouse, assets: readonly st
   return out;
 }
 
-function toKnown(stored: Awaited<ReturnType<typeof readStoredColumns>>): KnownColumn[] {
+export function toKnown(stored: Awaited<ReturnType<typeof readStoredColumns>>): KnownColumn[] {
   return stored.map((c) => ({
     name: c.name, type: c.type, sourceName: c.source_name, format: c.format, pinned: c.pinned, pending: c.pending, kinds: c.kinds,
   }));
@@ -443,7 +441,7 @@ function sinceFor(i: IngestInput, state: IngestState): Since {
 }
 
 /** Keys seen in the batch's JSON columns, merged with the ones already known, capped at 50. */
-async function jsonKeys(tx: Sql, batch: TypedBatch, previous: CatalogAsset | null): Promise<Record<string, string[]>> {
+export async function jsonKeys(tx: Sql, batch: TypedBatch, previous: CatalogAsset | null): Promise<Record<string, string[]>> {
   const out: Record<string, string[]> = {};
   const cols = (await readTableSchema(tx, batch.temp, "temp")) ?? [];
   for (const c of cols) {
@@ -629,14 +627,14 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
       let replaceFiles: string[] | undefined;
       let formats: Record<string, string> | undefined;
       if (files) {
-        const fb = await buildFileBatch(tx, { extract: files, knownColumns: known, pins: spec.pins, timezone: project.timezone, readBy: [] });
+        const fb = await buildFileBatch(tx, { extract: files, knownColumns: known, pins: spec.pins, timezone: project.timezone, readBy: [...step.readBy] });
         batch = fb;
         replaceFiles = fb.replaceFiles;
         formats = fb.formats;
       } else {
         const inc = step.incremental;
         batch = await buildTypedBatch(tx, {
-          manifest: manifest!, knownColumns: known, pins: spec.pins,
+          manifest: manifest!, knownColumns: known, pins: spec.pins, readBy: [...step.readBy],
           ...(inc.kind === "cursor" ? { cursor: { field: inc.field, ...(inc.unit ? { unit: inc.unit } : {}), ...(state.cursorType ? { type: state.cursorType } : {}) } } : {}),
         });
       }
@@ -677,7 +675,7 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
     out = await write(false);
   } catch (e) {
     const err = croftError(e);
-    if (!err || err.code !== "SHRINK_GUARD" || (!standing && !i.shrink)) throw e;
+    if (!err || err.code !== "SHRINK_GUARD" || (!standing && !i.confirm)) throw e;
     const rowsBefore = Number(err.problem.details?.rowsBefore ?? 0);
     const rowsAfter = Number(err.problem.details?.rowsAfter ?? 0);
     let why: string;
@@ -685,7 +683,9 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
       log.write(`allowShrink: true: moving the current ${rowsBefore} rows of ${asset} to the trash first; it will have ${rowsAfter}`);
       why = `allowShrink: true (${runId})`;
     } else {
-      const decision = await i.shrink!({ asset, rowsBefore, rowsAfter, impact: shrinkImpact(stateDir, asset, rowsBefore), error: err });
+      const decision = await i.confirm!({
+        asset, action: "allow_shrink", command: shrinkCommand(asset), impact: shrinkImpact(stateDir, asset, rowsBefore), problem: err.problem,
+      });
       if (decision.kind === "declined") throw err;
       if (decision.kind === "pending") {
         rmSync(stageDir, { recursive: true, force: true });
@@ -734,7 +734,7 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
     ...(r.created && files ? csvHeaderOf(files, out.catalog.columns) : {}),
     durationMs: Date.now() - started,
   };
-  return { result, warnings, problems: [], catalog: out.catalog };
+  return { result, warnings, problems: [], catalog: out.catalog, loadedAt: r.loadedAt };
 }
 
 /** The write's SHRINK_GUARD_DISABLED after a shrink, with where the rows it removed went. */
