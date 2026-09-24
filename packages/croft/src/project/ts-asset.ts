@@ -62,6 +62,9 @@ export interface LoadedTsAsset {
   codeHash?: string;
   /** Calls ctx.http, fetch or an HTTP client package (TRANSFORM_MAKES_REQUESTS, the cost guard). */
   usesHttp: boolean;
+  /** The inputs the code reads with newRows() (detectNewRows), which the cost guard counts; null when the
+   *  scan cannot tell, and every keyed input counts. Present when the asset bundles. */
+  readsNewRows?: string[] | null;
   /** Project files the asset imports, root-relative, the asset first. */
   localFiles: string[];
   /** Packages in the bundle and their installed versions (null when not found). */
@@ -129,6 +132,7 @@ export async function loadTsAsset(asset: Pick<DiscoveredAsset, "name" | "file" |
   out.codeHash = fingerprintOf(normalizeBundle(bundle.code, path), out.packages, project.timezone);
   const requests = detectRequests(bundle.code, bundle.imports);
   out.usesHttp = requests.length > 0;
+  out.readsNewRows = detectNewRows(bundle.code);
 
   if (graph.opensDatabase.length > 0) return finish();
 
@@ -401,11 +405,23 @@ function buildProblem(errors: BuildError[], asset: string, file: string, root: s
 // ---------------------------------------------------------------------------------------------------
 // ctx.http detection (TRANSFORM_MAKES_REQUESTS and the cost guard)
 
-// HTTP clients and paid-API SDKs: a call through one of these costs the same as a ctx.http call.
+// HTTP clients and paid-API SDKs: a call through one of these costs the same as a ctx.http call. Bundling keeps
+// packages external, so a request an SDK makes inside itself is never seen in the bundle: the import is the sign.
 const REQUEST_PACKAGES = new Set([
   "http", "https", "http2", "undici", "axios", "node-fetch", "got", "ky", "superagent",
-  "openai", "@anthropic-ai/sdk", "@google/genai", "@google/generative-ai", "@mistralai/mistralai", "cohere-ai", "groq-sdk", "ollama",
+  "openai", "@anthropic-ai/sdk", "@google/genai", "@google/generative-ai", "cohere-ai", "groq-sdk", "ollama", "replicate",
+  // The Vercel AI SDK (`ai` with a provider from @ai-sdk/*), LangChain and other LLM clients.
+  "ai", "langchain", "llamaindex", "together-ai", "voyageai", "@huggingface/inference", "@azure/openai", "@google-cloud/vertexai",
 ]);
+
+/** Scopes whose every package calls a paid API (@ai-sdk/openai, @langchain/anthropic, @mistralai/mistralai, …). */
+const REQUEST_SCOPES = ["@ai-sdk/", "@langchain/", "@mistralai/", "@anthropic-ai/"];
+/** Package-name prefixes of paid-API clients inside broader scopes (@aws-sdk/client-bedrock-runtime, …). */
+const REQUEST_PREFIXES = ["@aws-sdk/client-bedrock"];
+
+function requestPackage(name: string): boolean {
+  return REQUEST_PACKAGES.has(name) || REQUEST_SCOPES.some((s) => name.startsWith(s)) || REQUEST_PREFIXES.some((p) => name.startsWith(p));
+}
 
 /** How a bundle makes requests: "ctx.http", "fetch" or "package <name>". Empty when it makes none.
  *  Runs on the bundle, so helpers in lib/ count, and code tree-shaken away does not. String, template
@@ -417,16 +433,68 @@ export function detectRequests(code: string, imports: readonly string[] = []): s
   if (/(?<![\w$])http(?![\w$])/.test(bare)) out.push("ctx.http");
   if (/(?<![\w$.])fetch\s*\(|globalThis\s*\.\s*fetch(?![\w$])/.test(bare)) out.push("fetch");
   for (const s of new Set(imports.map((i) => (i.startsWith("node:") ? i.slice(5) : i)).map(packageName))) {
-    if (REQUEST_PACKAGES.has(s)) out.push(`package ${s}`);
+    if (requestPackage(s)) out.push(`package ${s}`);
   }
   return out;
+}
+
+const NEW_ROWS = /(?<![\w$])newRows(?![\w$])/g;
+
+/**
+ * The inputs a bundle reads with newRows(), by a lexical scan like detectRequests': the cost guard (§5) counts
+ * the pending rows of these inputs only, since the rows() or query() of a lookup table is not paid for per row.
+ * Every mention of `newRows` must be a call whose first argument is a plain string (`newRows("issues")`,
+ * `ctx.newRows('issues')`) or a destructured binding (`{ newRows }` in parameters or a declaration). Anything
+ * else (a computed name, a rename, newRows handed to other code, the word in a string or a comment) returns
+ * null: croft cannot tell, and every keyed input counts. At run time transform.ts still counts an input the
+ * scan missed before its first row is handed over.
+ */
+export function detectNewRows(code: string): string[] | null {
+  const literals: (string | null)[] = [];
+  const bare = stripLiterals(code, literals);
+  const found = new Set<string>();
+  let calls = 0;
+  for (const m of bare.matchAll(NEW_ROWS)) {
+    calls++;
+    const at = m.index + m[0].length;
+    const call = /^\s*\(\s*"(\d+)"\s*[,)]/.exec(bare.slice(at));
+    if (call) {
+      const name = literals[Number(call[1])];
+      if (name === null || name === undefined) return null;
+      found.add(name);
+      continue;
+    }
+    if (bindingPattern(bare, m.index, at)) continue;
+    return null;
+  }
+  // A mention the scan above did not see (inside a string, a template or a comment) is something to follow.
+  if ((code.match(NEW_ROWS)?.length ?? 0) !== calls) return null;
+  return [...found].sort();
+}
+
+/** Whether the `newRows` at [start, end) is a shorthand in a destructuring pattern, `({ newRows, rows }) {` or
+ *  `=> `, or `let { newRows } = ctx`, rather than an object literal that hands newRows to other code. */
+function bindingPattern(bare: string, start: number, end: number): boolean {
+  if (!/[{,]\s*$/.test(bare.slice(Math.max(0, start - 64), start)) || !/^\s*[,}]/.test(bare.slice(end))) return false;
+  let depth = 0;
+  for (let i = end; i < bare.length; i++) {
+    const c = bare[i];
+    if (c === "{" || c === "[" || c === "(") depth++;
+    else if (c === "}" || c === "]" || c === ")") {
+      if (depth === 0) return c === "}" && /^\s*(\)\s*(\{|=>)|=(?![=>]))/.test(bare.slice(i + 1));
+      depth--;
+    }
+  }
+  return false;
 }
 
 const REGEX_AFTER_WORD = new Set(["return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case", "do", "else", "yield", "await"]);
 
 /** Blank out comments and the contents of string, template and regex literals, keeping template
- *  `${...}` expressions as code. A lexer, not a parser: good enough to lint Bun's own output. */
-export function stripLiterals(code: string): string {
+ *  `${...}` expressions as code. A lexer, not a parser: good enough to lint Bun's own output.
+ *  With `literals`, each quoted string becomes `"<n>"` instead, where literals[n] is its text (null when it has
+ *  an escape, which the caller cannot read as is). */
+export function stripLiterals(code: string, literals?: (string | null)[]): string {
   let out = "";
   let i = 0;
   const n = code.length;
@@ -465,10 +533,16 @@ export function stripLiterals(code: string): string {
       continue;
     }
     if (c === '"' || c === "'") {
-      i++;
+      const from = ++i;
       while (i < n && code[i] !== c && code[i] !== "\n") i += code[i] === "\\" ? 2 : 1;
+      const text = code.slice(from, Math.min(i, n));
       i++;
-      out += `${c}${c}`;
+      if (literals) {
+        out += `"${literals.length}"`;
+        literals.push(text.includes("\\") ? null : text);
+      } else {
+        out += `${c}${c}`;
+      }
       last = c;
       continue;
     }

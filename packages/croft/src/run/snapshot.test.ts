@@ -173,7 +173,7 @@ describe("TS transform input snapshots (§3e)", () => {
     const facts = await w.read((db) => readInputFacts(db, "ev"));
     expect(facts).toEqual({
       columns: [{ name: "id", type: "BIGINT" }, { name: "region", type: "VARCHAR" }, { name: "h", type: "HUGEINT" }, { name: "_loaded_at", type: "TIMESTAMPTZ" }],
-      key: [{ name: "id", type: "BIGINT" }], lastLoadedAt: S2, rows: 5,
+      key: [{ name: "id", type: "BIGINT" }], lastLoadedAt: S2, version: S2, rows: 5,
     });
     expect(await w.read((db) => readInputFacts(db, "missing"))).toBeNull();
   });
@@ -189,6 +189,36 @@ describe("TS transform input snapshots (§3e)", () => {
     expect(rows.map((r) => r.id)).toEqual([9, 10, 100, 1, 3]);
     expect(rows[0]).toMatchObject({ h: -BigInt(HUGE), _loaded_at: S1 });
     expect(rows[1]).toMatchObject({ h: BigInt(HUGE) });
+  });
+
+  test("a HUGEINT key orders the snapshot by its value, as positions compare it, not by its text", async () => {
+    const { w, state } = warehouse();
+    await w.write("seed", async (tx) => {
+      await ensureState(tx);
+      await tx.exec(`CREATE TABLE big (h HUGEINT, title VARCHAR, _loaded_at TIMESTAMPTZ)`);
+      // In text order ("10" < "100" < "2" < "9"), all at one stamp.
+      await tx.exec(`INSERT INTO big VALUES (10, 'a', '${S1}'), (100, 'b', '${S1}'), (2, 'c', '${S1}'), (9, 'd', '${S1}'), (-${HUGE}, 'e', '${S1}')`);
+      await tx.exec(`INSERT INTO _croft.assets (name, kind, key_columns, last_loaded_at, row_count) VALUES ('big', 'ingest', ['h'], '${S1}', 5)`);
+    }, { runId: "r_test" });
+    const dir = join(state, "staging", "r1", "t", "in", "big");
+    const ids = async (o: { kind: "all" | "new"; after?: { stamp: string; key: string[] }; limit?: number }) =>
+      (await read(state, (await snapshotInput(w, { input: "big", dir, ...o }))!.path)).slice(0, o.limit ?? 99).map((r) => String(r.h));
+    expect(await ids({ kind: "all" })).toEqual([`-${HUGE}`, "2", "9", "10", "100"]);
+    // The rows after key 9 are 10 and 100, in the order newRows() hands them over.
+    expect(await ids({ kind: "new", after: { stamp: S1, key: ["9"] } })).toEqual(["10", "100"]);
+    // A row cap keeps the first rows in position order.
+    expect(await ids({ kind: "all", limit: 2 })).toEqual([`-${HUGE}`, "2"]);
+    expect(await w.read(async (db) => countAfter(db, "big", (await readInputFacts(db, "big"))!, { stamp: S1, key: ["9"] }))).toBe(2);
+  });
+
+  test("an input's version is its newest change: last_loaded_at, or a later out-of-band change", async () => {
+    const { w } = warehouse();
+    await input(w);
+    expect((await w.read((db) => readInputFacts(db, "ev")))!.version).toBe(S2);
+    await w.write("oob", (tx) => tx.exec(`UPDATE _croft.assets SET last_replaced_at = '2026-03-02T00:00:00Z' WHERE name = 'ev'`), { runId: "r_test" });
+    const facts = (await w.read((db) => readInputFacts(db, "ev")))!;
+    expect(facts.lastLoadedAt).toBe(S2);
+    expect(facts.version).toBe("2026-03-02T00:00:00.000000Z");
   });
 
   test("a new.parquet snapshot starts after a composite position; keys compare by their own type", async () => {

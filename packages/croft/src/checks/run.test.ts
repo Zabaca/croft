@@ -7,9 +7,9 @@ import type { Check, ColumnPlan, Sql, ValueKind } from "../core/types.ts";
 import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/warehouse.ts";
 import type { TypedBatch } from "../load/contract.ts";
 import { quoteIdent, readTableSchema } from "../load/evolve.ts";
-import { type WriteBatchInput, type WriteResult, writeBatch } from "../load/write.ts";
+import { type CheckContext, type WriteBatchInput, type WriteResult, writeBatch } from "../load/write.ts";
 import { parseChecks } from "./parse.ts";
-import { checksHook, renderRow, runWarnings, SAMPLE_ROWS } from "./run.ts";
+import { checksHook, renderRow, runWarnings, SAMPLE_ROWS, unfinishedChunk } from "./run.ts";
 
 afterAll(() => closeAllWarehouses());
 
@@ -220,6 +220,28 @@ describe("checksHook: blocking checks in the write transaction", () => {
     expect(e.problem.details).toMatchObject({ check: "min_rows(5)", failing: 2, sample: [] });
     const r = await load(w, "orders", people(5), { checks: hook(checksOf({ checks: ["min_rows(5)"] })) });
     expect(r.checks).toEqual([{ check: "min_rows(5)", ok: true, failing: 0 }]);
+  });
+
+  test("a chunk that is not its run's last skips min_rows (the table is not finished); every other check runs", async () => {
+    const w = warehouse();
+    const checks = checksOf({ key: ["id"], checks: ["min_rows(5)", "amount >= 0"] });
+    const base = hook(checks);
+    const chunk = (tx: Sql, ctx: CheckContext) => base(tx, unfinishedChunk(ctx));
+    // The first chunk of a first build: 2 rows of 5.
+    const r = await load(w, "orders", people(2), { key: ["id"], write: "merge", checks: chunk });
+    expect(r.checks).toEqual([
+      { check: "unique(id)", ok: true, failing: 0 },
+      { check: "not_null(id)", ok: true, failing: 0 },
+      { check: "amount >= 0", ok: true, failing: 0 },
+    ]);
+    // Row checks still block a chunk.
+    const e = await rejection(load(w, "orders", people(3, (i) => (i === 3 ? { amount: -1 } : {})), { key: ["id"], write: "merge", checks: chunk }));
+    expect(e.problem.details).toMatchObject({ check: "amount >= 0", failing: 1 });
+    // The last chunk counts the finished table.
+    const last = await rejection(load(w, "orders", people(3), { key: ["id"], write: "merge", checks: base }));
+    expect(last.problem.message).toStartWith("min_rows(5): the table has 3 rows");
+    const done = await load(w, "orders", people(5), { key: ["id"], write: "merge", checks: base });
+    expect(done.checks.map((c) => c.check)).toContain("min_rows(5)");
   });
 
   test("a rule may read other tables in a subquery", async () => {

@@ -5,11 +5,13 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Server } from "bun";
+import { parseChecks } from "../checks/parse.ts";
+import { checksHook } from "../checks/run.ts";
 import { CroftError } from "../core/errors.ts";
 import type { Problem, Sql } from "../core/types.ts";
 import { ensureState } from "../db/state.ts";
 import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/warehouse.ts";
-import { getCatalog } from "../history/catalog.ts";
+import { getCatalog, readCatalogEntry } from "../history/catalog.ts";
 import { openLog } from "../history/logs.ts";
 import { RunsDb } from "../history/runs-db.ts";
 import type { CheckContext, CheckHookResult } from "../load/write.ts";
@@ -17,8 +19,11 @@ import { discoverAssets } from "../project/discover.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { loadProject, type Project } from "../project/root.ts";
 import { loadTsAsset } from "../project/ts-asset.ts";
+import { markOutOfBand } from "../safety/guards.ts";
 import { StepProgress } from "./ingest.ts";
+import { POSITIONS } from "./inputs.ts";
 import { behaviorHash, behaviorLabel, behaviorWords, DEFAULT_RETRIES, DEFAULT_TIMEOUT_MS, type PlannedStep, resolveWrite } from "./plan.ts";
+import { staleReasons } from "./staleness.ts";
 import type { ConfirmDecision, ConfirmRequest, StepInput, StepOutcome } from "./step.ts";
 import { cleanupProjects, makeProject, PKG, writeFiles } from "./testkit.ts";
 import { CHUNK, pendingChunkDir, runTransform } from "./transform.ts";
@@ -30,6 +35,7 @@ const servers: Server<undefined>[] = [];
 afterEach(() => {
   CHUNK.rows = 500;
   CHUNK.ms = 60_000;
+  POSITIONS.maxPending = 100_000;
   for (const k of Object.keys(g)) if (k.startsWith("__t_")) delete g[k];
 });
 
@@ -203,6 +209,30 @@ describe("full-refresh transforms", () => {
     expect(cat.reads).toEqual(["issues"]);
     expect(cat.inputsSeen).toEqual({ issues: { seenLoadedAt: S1, seenKey: null, inputLastLoadedAt: S1 } });
     expect(out.catalog).toEqual(cat);
+  });
+
+  test("after an out-of-band change of an input, re-reading it clears input_replaced (full-refresh and incremental)", async () => {
+    const h = harness({ "assets/loud.ts": fullRefresh, "assets/t.ts": incremental() });
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2], S1) });
+    const OOB = "2026-03-02T00:00:00.000000Z";
+    const reasons = async (name: string, incr: boolean) => {
+      const input = await h.w.read((db) => readCatalogEntry(db, { asset: "issues", behavior: "", cursorField: null, lastRunId: null }), { purpose: "test" });
+      return staleReasons({ asset: name, file: `assets/${name}.ts`, kind: "ts", incremental: incr, inputs: ["issues"], entry: getCatalog(h.runs, name), inputEntries: { issues: input } });
+    };
+    for (const [name, incr] of [["loud", false], ["t", true]] as const) {
+      const s = await plan(h, name);
+      await step(h, s);
+      expect(await reasons(name, incr)).toEqual([]);
+    }
+    // doctor found a change made outside croft; no write followed, so only last_replaced_at moved.
+    await tx(h, (db) => markOutOfBand(db, "issues", OOB));
+    expect(await reasons("loud", false)).toEqual(["input_replaced"]);
+    for (const [name, incr] of [["loud", false], ["t", true]] as const) {
+      await step(h, await plan(h, name));
+      // What the transform saw is the input's version: the out-of-band change, not the older last_loaded_at.
+      expect(getCatalog(h.runs, name)?.inputsSeen?.issues?.inputLastLoadedAt).toBe(OOB);
+      expect(await reasons(name, incr)).toEqual([]);
+    }
   });
 
   test("a rebuild replaces the table; unchanged rows keep their _loaded_at", async () => {
@@ -462,7 +492,8 @@ describe("newRows() positions never skip rows (§3e)", () => {
     g.__t_stop = 3;
     const err = await failure(step(h, s));
     expect(err.code).toBe("ASSET_CODE_ERROR");
-    expect(err.problem.effect).toBe("2 rows from 1 earlier chunk were saved; the next run continues after them");
+    expect(err.problem.effect).toBe(`2 rows from 1 earlier chunk were saved; the next run continues after the input position saved with them (issues: id=2 at ${S1})`);
+    expect(err.problem.details).toMatchObject({ savedRows: 2, savedChunks: 1, positions: [{ input: "issues", seenLoadedAt: S1, seenKey: ["2"] }] });
     expect(g.__t_seen).toEqual(["1", "2"]);
     expect(await all(h, `SELECT issue_id FROM t ORDER BY issue_id`)).toEqual([{ issue_id: 1 }, { issue_id: 2 }]);
     expect(await all(h, `SELECT seen_loaded_at::VARCHAR AS s, seen_key::VARCHAR AS k, input_last_loaded_at AS l FROM _croft.inputs WHERE asset = 't'`))
@@ -522,6 +553,104 @@ export default transform({
     await step(h, s);
     expect(g.__t_seen).toEqual(["a100", "b9", "b10"]);
     expect(await all(h, `SELECT seen_key::VARCHAR AS k FROM _croft.inputs WHERE asset = 't'`)).toEqual([{ k: `["b","10"]` }]);
+  });
+
+  test("a HUGEINT key resumes in numeric order: nothing skipped after a stop, nothing re-read after a full run", async () => {
+    CHUNK.rows = 1;
+    const h = harness({ "assets/t.ts": incremental("big") });
+    await seed(h, "big", { columns: { id: "HUGEINT", title: "VARCHAR" }, key: ["id"], rows: ["10", "100", "2", "9"].map((id) => ({ id, title: `t${id}`, _loaded_at: S1 })) });
+    const s = await plan(h, "t");
+    g.__t_stop = "10";
+    await failure(step(h, s));
+    expect(g.__t_seen).toEqual(["2", "9"]);
+    expect(await all(h, `SELECT seen_key::VARCHAR AS k FROM _croft.inputs WHERE asset = 't'`)).toEqual([{ k: `["9"]` }]);
+    delete g.__t_stop;
+    g.__t_seen = [];
+    await step(h, s);
+    expect(g.__t_seen).toEqual(["10", "100"]);
+    // One new row: only it is read.
+    await seed(h, "big", { columns: { id: "HUGEINT", title: "VARCHAR" }, key: ["id"], rows: [{ id: "5", title: "t5", _loaded_at: S2 }] });
+    g.__t_seen = [];
+    await step(h, s);
+    expect(g.__t_seen).toEqual(["5"]);
+    expect(await all(h, `SELECT issue_id::VARCHAR AS id FROM t ORDER BY issue_id`)).toEqual(["2", "5", "9", "10", "100"].map((id) => ({ id })));
+  });
+
+  test("calls kept in flight (read ahead): a chunk never commits a position past a row whose output is pending", async () => {
+    CHUNK.rows = 2;
+    const h = harness({
+      "assets/t.ts": `import { transform } from "@zabaca/croft";
+const g = globalThis as any;
+const classify = async (r: { id: number; title: string }) => ({ issue_id: r.id, label: r.title.toUpperCase() });
+export default transform({
+  inputs: ["issues"],
+  key: "issue_id",
+  incremental: true,
+  async *rows({ newRows }) {
+    const inflight: Promise<{ issue_id: number; label: string }>[] = [];
+    for await (const r of newRows<{ id: number; title: string }>("issues")) {
+      if (String(g.__t_stop) === String(r.id)) throw new Error("rate limited at " + r.id);
+      (g.__t_seen ??= []).push(r.id);
+      inflight.push(classify(r));
+      if (inflight.length >= 3) yield await inflight.shift()!;
+    }
+    for (const p of inflight) yield await p;
+  },
+});
+`,
+    });
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2, 3, 4, 5, 6], S1) });
+    const s = await plan(h, "t");
+    g.__t_stop = 6;
+    const err = await failure(step(h, s));
+    expect(err.code).toBe("ASSET_CODE_ERROR");
+    // Rows 1 and 2 were saved with the position after row 2, although the code had asked for rows up to 5.
+    expect(await all(h, `SELECT issue_id FROM t ORDER BY issue_id`)).toEqual([{ issue_id: 1 }, { issue_id: 2 }]);
+    expect(await all(h, `SELECT seen_key::VARCHAR AS k FROM _croft.inputs WHERE asset = 't'`)).toEqual([{ k: `["2"]` }]);
+    expect(err.problem.effect).toBe(`2 rows from 1 earlier chunk were saved; the next run continues after the input position saved with them (issues: id=2 at ${S1})`);
+    delete g.__t_stop;
+    g.__t_seen = [];
+    await step(h, s);
+    expect(g.__t_seen).toEqual([3, 4, 5, 6]);
+    expect(await all(h, `SELECT issue_id FROM t ORDER BY issue_id`)).toEqual([1, 2, 3, 4, 5, 6].map((issue_id) => ({ issue_id })));
+  });
+
+  test("rows that yield nothing: a chunk's position waits for the outputs (re-read, never skipped); a finished run's is exact", async () => {
+    CHUNK.rows = 2;
+    const odd = incremental().replace(`(g.__t_seen ??= []).push(String(r.id));`, `(g.__t_seen ??= []).push(String(r.id));\n      if (r.id % 2 === 0) continue;`);
+    const h = harness({ "assets/t.ts": odd });
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2, 3, 4, 5, 6, 7], S1) });
+    const s = await plan(h, "t");
+    g.__t_stop = 6;
+    await failure(step(h, s));
+    // Outputs 1 and 3 committed; croft cannot tell that row 3 had its output, so the position is after row 2.
+    expect(await all(h, `SELECT issue_id FROM t ORDER BY issue_id`)).toEqual([{ issue_id: 1 }, { issue_id: 3 }]);
+    expect(await all(h, `SELECT seen_key::VARCHAR AS k FROM _croft.inputs WHERE asset = 't'`)).toEqual([{ k: `["2"]` }]);
+    delete g.__t_stop;
+    g.__t_seen = [];
+    await step(h, s);
+    expect(g.__t_seen).toEqual(["3", "4", "5", "6", "7"]);
+    expect(await all(h, `SELECT issue_id FROM t ORDER BY issue_id`)).toEqual([1, 3, 5, 7].map((issue_id) => ({ issue_id })));
+    // The code finished: every row it asked past is processed, the ones that yielded nothing included.
+    expect(await all(h, `SELECT seen_key::VARCHAR AS k, input_last_loaded_at IS NOT NULL AS whole FROM _croft.inputs WHERE asset = 't'`)).toEqual([{ k: `["7"]`, whole: true }]);
+  });
+
+  test("more rows waiting for outputs than croft keeps positions for: the position waits, and nothing is skipped", async () => {
+    CHUNK.rows = 1;
+    POSITIONS.maxPending = 2;
+    const third = incremental().replace(`(g.__t_seen ??= []).push(String(r.id));`, `(g.__t_seen ??= []).push(String(r.id));\n      if (r.id % 3 !== 0) continue;`);
+    const h = harness({ "assets/t.ts": third });
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2, 3, 4, 5, 6, 7, 8], S1) });
+    const s = await plan(h, "t");
+    g.__t_stop = 7;
+    await failure(step(h, s));
+    expect(await all(h, `SELECT issue_id FROM t ORDER BY issue_id`)).toEqual([{ issue_id: 3 }, { issue_id: 6 }]);
+    expect(await all(h, `SELECT seen_loaded_at FROM _croft.inputs WHERE asset = 't'`)).toEqual([{ seen_loaded_at: null }]);
+    delete g.__t_stop;
+    g.__t_seen = [];
+    await step(h, s);
+    expect(g.__t_seen).toEqual(["1", "2", "3", "4", "5", "6", "7", "8"]);
+    expect(await all(h, `SELECT seen_key::VARCHAR AS k FROM _croft.inputs WHERE asset = 't'`)).toEqual([{ k: `["8"]` }]);
   });
 
   test("a timestamp key with microseconds resumes exactly", async () => {
@@ -690,6 +819,46 @@ describe("chunked commits (§3e)", () => {
     expect(await all(h, `SELECT issue_id FROM t ORDER BY issue_id`)).toEqual([{ issue_id: 1 }, { issue_id: 2 }]);
   });
 
+  test("min_rows is checked once the run has finished: a first build larger than one chunk is not refused at its first chunk", async () => {
+    CHUNK.rows = 2;
+    const h = harness({ "assets/t.ts": incremental("issues", `\n  checks: ["min_rows(3)", "issue_id > 0"],`) });
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2, 3, 4, 5], S1) });
+    const s = await plan(h, "t", {});
+    const parsed = parseChecks({ asset: "t", file: s.file, key: s.key, checks: s.spec!.checks, warnings: s.spec!.warnings });
+    expect(parsed.problems).toEqual([]);
+    const checks = checksHook(parsed.checks, { file: s.file });
+    const out = await step(h, { ...s, checks: parsed.checks }, { checks });
+    expect(out.result.rows.total).toBe(5);
+    expect(out.result.checks.map((c) => [c.check, c.ok])).toEqual([["unique(issue_id)", true], ["not_null(issue_id)", true], ["issue_id > 0", true], ["min_rows(3)", true]]);
+    // Still enforced, on the finished table: 2 rows are too few.
+    const h2 = harness({ "assets/t.ts": incremental("issues", `\n  checks: ["min_rows(3)"],`) });
+    await seed(h2, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2], S1) });
+    const s2 = await plan(h2, "t");
+    const c2 = parseChecks({ asset: "t", file: s2.file, key: s2.key, checks: ["min_rows(3)"], warnings: [] }).checks;
+    const err = await failure(step(h2, { ...s2, checks: c2 }, { checks: checksHook(c2, { file: s2.file }) }));
+    expect(err.code).toBe("CHECK_FAILED");
+    expect(err.problem.message).toStartWith("min_rows(3): the table has 2 rows");
+  });
+
+  test("a duplicate key in a chunk names the asset's file", async () => {
+    const h = harness({
+      "assets/t.ts": `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["issues"],
+  key: "label",
+  async *rows({ rows }) {
+    for await (const r of rows<{ id: number; title: string }>("issues")) yield { label: r.title, id: r.id };
+  },
+});
+`,
+    });
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2], S1, () => "same") });
+    const err = await failure(step(h, await plan(h, "t")));
+    expect(err.code).toBe("CHECK_FAILED");
+    expect(err.problem.file).toBe("assets/t.ts");
+    expect(err.problem.fix).toMatchObject({ file: "assets/t.ts" });
+  });
+
   test("an unserializable row names its row in the whole run, not in its chunk", async () => {
     CHUNK.rows = 2;
     const h = harness({ "assets/t.ts": incremental().replace("yield { issue_id: r.id, title: r.title };", "yield { issue_id: r.id, title: r.id === 4 ? new Map() : r.title };") });
@@ -762,6 +931,66 @@ export default transform({
     expect(out.logText()).toContain("computed once already");
     expect(await all(h, `SELECT issue_id, label FROM t ORDER BY issue_id`)).toEqual([1, 2, 3, 4, 5].map((i) => ({ issue_id: i, label: `label ${i}` })));
     expect(existsSync(pendingChunkDir(h.stateDir, "t"))).toBe(false);
+  });
+
+  test("a chunk a check refused is thrown away once the input data changes, and the code runs on the corrected rows", async () => {
+    CHUNK.rows = 2;
+    const api = counter();
+    const h = harness({ "assets/t.ts": paid(api.url).replace("label: res.json<{ label: string }>().label", "label: res.json<{ label: string }>().label, title: r.title") });
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: [...issues([1], S1, () => "ok"), ...issues([2], S1, () => "bad"), ...issues([3], S1, () => "ok")] });
+    const parsed = parseChecks({ asset: "t", file: "assets/t.ts", key: ["issue_id"], checks: ["title <> 'bad'"], warnings: [] }).checks;
+    const s = { ...(await plan(h, "t")), checks: parsed };
+    const checks = checksHook(parsed, { file: s.file });
+    const e1 = await failure(step(h, s, { checks }));
+    expect(e1.code).toBe("CHECK_FAILED");
+    expect(api.calls()).toBe(2);
+    // Nothing changed: the same chunk is committed again (no new calls), and refused again.
+    const e2 = await failure(step(h, s, { checks }));
+    expect(e2.code).toBe("CHECK_FAILED");
+    expect(api.calls()).toBe(2);
+    expect(e2.problem.hint).toContain("computed by an earlier run");
+    // The user corrects the data, as the fix says: the chunk is computed again from the corrected rows.
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([2], S2, () => "fixed") });
+    const out = await step(h, s, { checks });
+    expect(out.result.status).toBe("ok");
+    expect(api.calls()).toBe(5);
+    expect(await all(h, `SELECT issue_id, title FROM t ORDER BY issue_id`)).toEqual([
+      { issue_id: 1, title: "ok" }, { issue_id: 2, title: "fixed" }, { issue_id: 3, title: "ok" },
+    ]);
+  });
+
+  test("a staged chunk is thrown away when the checks change, and kept across input changes after a busy database", async () => {
+    CHUNK.rows = 2;
+    const api = counter();
+    const h = harness({ "assets/t.ts": paid(api.url) });
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2, 3], S1) });
+    const s = await plan(h, "t");
+    await failure(step(h, s, { checks: failOnce() }));
+    expect(api.calls()).toBe(2);
+    // A check was added since: the staged rows were not made for it.
+    const parsed = parseChecks({ asset: "t", file: s.file, key: ["issue_id"], checks: ["issue_id > 0"], warnings: [] }).checks;
+    await step(h, { ...s, checks: parsed }, { checks: checksHook(parsed, { file: s.file }) });
+    expect(api.calls()).toBe(5);
+
+    // A busy database is not about the chunk's rows: it is committed as it is, even after its input grew.
+    const h2 = harness({ "assets/t.ts": paid(api.url) });
+    await seed(h2, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2, 3], S1) });
+    const s2 = await plan(h2, "t");
+    let busy = true;
+    const busyOnce = async (): Promise<Problem[]> => {
+      if (busy) {
+        busy = false;
+        throw new CroftError("DB_BUSY", { message: "busy", hint: "wait" });
+      }
+      return [];
+    };
+    expect((await failure(step(h2, s2, { checks: busyOnce }))).code).toBe("DB_BUSY");
+    expect(api.calls()).toBe(7);
+    await seed(h2, "issues", { columns: ISSUES, key: ["id"], rows: issues([4], S2) });
+    const out = await step(h2, s2, { checks: busyOnce });
+    expect(out.result.reason).toContain("2 rows from a chunk staged earlier");
+    expect(api.calls()).toBe(9);
+    expect(await all(h2, `SELECT issue_id FROM t ORDER BY issue_id`)).toEqual([1, 2, 3, 4].map((issue_id) => ({ issue_id })));
   });
 
   test("a staged chunk from other code, or from other positions, is thrown away", async () => {
@@ -848,6 +1077,70 @@ export default transform({
     // After the first build only the new rows count.
     await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([6, 7], S2) });
     expect((await step(h, s)).result.rows.total).toBe(7);
+  });
+
+  test("only inputs read with newRows() count: a keyed lookup read with rows() is not paid per row", async () => {
+    const h = harness({
+      "assets/triage.ts": `import { transform } from "@zabaca/croft";
+const g = globalThis as any;
+export default transform({
+  inputs: ["issues", "labels"],
+  key: "issue_id",
+  incremental: true,
+  confirmAbove: 3,
+  async *rows({ newRows, rows, http }) {
+    const names = new Map<number, string>();
+    for await (const l of rows<{ id: number; name: string }>("labels")) names.set(l.id, l.name);
+    for await (const r of newRows<{ id: number; title: string }>("issues")) {
+      if (g.__t_api) await http.get(g.__t_api);
+      yield { issue_id: r.id, label: names.get(r.id) ?? null };
+    }
+  },
+});
+`,
+    });
+    await seed(h, "labels", { columns: { id: "BIGINT", name: "VARCHAR" }, key: ["id"], rows: Array.from({ length: 10 }, (_, i) => ({ id: String(i), name: `l${i}`, _loaded_at: S1 })) });
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2], S1) });
+    const s = await plan(h, "triage");
+    expect(s.usesHttp).toBe(true);
+    expect(s.loaded?.readsNewRows).toEqual(["issues"]);
+    // 2 new issues and 10 labels: under confirmAbove 3, since the labels are not processed row by row.
+    expect((await step(h, s)).result.rows.total).toBe(2);
+    expect((await step(h, s)).result.status).toBe("ok");
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([3, 4, 5, 6], S2) });
+    const err = await failure(step(h, s));
+    expect(err.code).toBe("LARGE_REPROCESS");
+    expect(err.problem.details).toEqual({ pending: 4, confirmAbove: 3, inputs: { issues: 4 } });
+  });
+
+  test("an input croft could not tell is read with newRows() is counted before its first row is handed over", async () => {
+    const h = harness({
+      "assets/t.ts": `import { transform } from "@zabaca/croft";
+const g = globalThis as any;
+const method = ["new", "Rows"].join("");
+export default transform({
+  inputs: ["issues"],
+  key: "issue_id",
+  incremental: true,
+  confirmAbove: 3,
+  async *rows(ctx) {
+    for await (const r of (ctx as any)[method]("issues")) {
+      await ctx.http.get(g.__t_api ?? "http://127.0.0.1:9/");
+      (g.__t_seen ??= []).push(r.id);
+      yield { issue_id: r.id };
+    }
+  },
+});
+`,
+    });
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2, 3, 4, 5], S1) });
+    const s = await plan(h, "t");
+    expect(s.loaded?.readsNewRows).toEqual([]);
+    const err = await failure(step(h, s, { confirm: async () => ({ kind: "granted" }) }));
+    expect(err.code).toBe("LARGE_REPROCESS");
+    expect(err.problem.message).toContain("t would process 5 input rows (issues 5)");
+    expect(err.problem.hint).toContain(`newRows("issues")`);
+    expect(g.__t_seen).toBeUndefined();
   });
 
   test("no guard for code that makes no requests, for full-refresh transforms, or under preview", async () => {

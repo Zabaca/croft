@@ -157,6 +157,14 @@ export interface InputFacts {
   key: RealColumn[];
   /** _croft.assets.last_loaded_at, when the input's rows last changed; null when croft recorded no write. */
   lastLoadedAt: string | null;
+  /**
+   * The input's version: the newer of last_loaded_at and last_replaced_at. An out-of-band change that no write
+   * followed (doctor, or a write that found one and changed no row) moves last_replaced_at alone, past
+   * last_loaded_at. A transform that read all of the input records this as InputPosition.inputLastLoadedAt,
+   * which staleness compares last_replaced_at with (input_replaced), so the reason clears once it has re-read
+   * the input. Null when croft recorded no write.
+   */
+  version: string | null;
   /** _croft.assets.row_count. */
   rows: number | null;
 }
@@ -165,16 +173,20 @@ export interface InputFacts {
 export async function readInputFacts(db: Sql, input: string): Promise<InputFacts | null> {
   const columns = await readTableSchema(db, input);
   if (!columns) return null;
-  if (!(await hasState(db))) return { columns, key: [], lastLoadedAt: null, rows: null };
-  const [a] = await db.all<{ key_columns: unknown; ll: number | bigint | null; row_count: number | bigint | null }>(
-    `SELECT key_columns, epoch_us(last_loaded_at) AS ll, row_count FROM _croft.assets WHERE name = $1`, [input]);
+  if (!(await hasState(db))) return { columns, key: [], lastLoadedAt: null, version: null, rows: null };
+  // greatest() skips NULLs: an input with no out-of-band change has its last_loaded_at as its version.
+  const [a] = await db.all<{ key_columns: unknown; ll: number | bigint | null; v: number | bigint | null; row_count: number | bigint | null }>(
+    `SELECT key_columns, epoch_us(last_loaded_at) AS ll, epoch_us(greatest(last_loaded_at, last_replaced_at)) AS v, row_count
+       FROM _croft.assets WHERE name = $1`, [input]);
   const declared = Array.isArray(a?.key_columns) ? a.key_columns.map(String) : [];
   const key = declared.map((k) => columns.find((c) => c.name.toLowerCase() === k.toLowerCase()));
+  const us = (v: number | bigint | null | undefined) => (v === null || v === undefined ? null : isoMicros(BigInt(v)));
   return {
     columns,
     // A key column the table no longer has cannot order positions: without it every read is in full.
     key: key.every((c): c is RealColumn => c !== undefined) ? key : [],
-    lastLoadedAt: a?.ll === null || a?.ll === undefined ? null : isoMicros(BigInt(a.ll)),
+    lastLoadedAt: us(a?.ll),
+    version: us(a?.v),
     rows: a?.row_count === null || a?.row_count === undefined ? null : Number(a.row_count),
   };
 }
@@ -200,10 +212,18 @@ export function afterPosition(pos: SeenPosition, key: readonly RealColumn[], fir
   return { sql: `${stamp} > ${s} OR (${stamp} = ${s} AND (${expr}))`, params: [pos.stamp, ...pos.key!] };
 }
 
-/** The order of an input snapshot, which is the order positions advance in (§3e). */
-export function positionOrder(columns: readonly RealColumn[], key: readonly RealColumn[]): string {
+/** The alias of the input table in a snapshot's COPY: ORDER BY names its columns through it. */
+const SOURCE = "__croft_src";
+
+/**
+ * The order of an input snapshot, which is the order positions advance in (§3e): (_loaded_at, key), by the
+ * input's own column values. The columns are qualified with the table's alias because an ORDER BY name binds a
+ * SELECT alias first, and the COPY's SELECT writes HUGEINT keys as text under their own names: unqualified,
+ * keys 2, 9, 10, 100 would be ordered "10" < "100" < "2" < "9", while positions compare them as numbers.
+ */
+export function positionOrder(columns: readonly RealColumn[], key: readonly RealColumn[], source = SOURCE): string {
   const stamp = columns.find((c) => c.name === RESERVED.loadedAt);
-  const cols = [...(stamp ? [stamp] : []), ...key].map((c) => quoteIdent(c.name));
+  const cols = [...(stamp ? [stamp] : []), ...key].map((c) => `${source}.${quoteIdent(c.name)}`);
   return cols.length ? ` ORDER BY ${cols.join(", ")}` : "";
 }
 
@@ -255,11 +275,13 @@ export async function snapshotInput(warehouse: DuckWarehouse, o: InputSnapshotOp
     const hasStamp = facts.columns.some((c) => c.name === RESERVED.loadedAt);
     const after = o.kind === "new" && o.after && hasStamp ? o.after : null;
     const where = after ? afterPosition(after, facts.key) : null;
-    const select = facts.columns.map((c) => AS_TEXT.has(c.type) ? `CAST(${quoteIdent(c.name)} AS VARCHAR) AS ${quoteIdent(c.name)}` : quoteIdent(c.name));
+    const col = (c: RealColumn) => `${SOURCE}.${quoteIdent(c.name)}`;
+    const select = facts.columns.map((c) => AS_TEXT.has(c.type) ? `CAST(${col(c)} AS VARCHAR) AS ${quoteIdent(c.name)}` : `${col(c)} AS ${quoteIdent(c.name)}`);
     // One row past the cap tells a capped copy from an input with exactly `limit` rows; readers stop at the cap.
     const limit = o.limit !== undefined ? ` LIMIT ${Math.max(0, Math.floor(o.limit)) + 1}` : "";
+    // WHERE binds the table's own (typed) columns; ORDER BY names them through the alias (positionOrder).
     const [row] = await db.all<{ Count: number | bigint }>(
-      `COPY (SELECT ${select.join(", ")} FROM main.${quoteIdent(o.input)}${where ? ` WHERE ${where.sql}` : ""}${positionOrder(facts.columns, facts.key)}${limit})
+      `COPY (SELECT ${select.join(", ")} FROM main.${quoteIdent(o.input)} AS ${SOURCE}${where ? ` WHERE ${where.sql}` : ""}${positionOrder(facts.columns, facts.key)}${limit})
        TO ${quoteLiteral(path)} (FORMAT parquet)`, where?.params ?? []);
     const copied = Number(row?.Count ?? 0);
     const capped = o.limit !== undefined && copied > o.limit;
