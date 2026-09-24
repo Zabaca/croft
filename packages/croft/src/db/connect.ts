@@ -12,6 +12,7 @@
 // - A closed and reopened instance comes back unconfigured, so configuration is checked per connection.
 import { DuckDBConnection, DuckDBInstance } from "@duckdb/node-api";
 import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
+import { availableParallelism, totalmem } from "node:os";
 import { physicalPath } from "../project/root.ts";
 import { basename, dirname, join, resolve } from "node:path";
 import { CroftError } from "../core/errors.ts";
@@ -27,6 +28,17 @@ export interface SandboxSpec {
   fileDirs?: string[];      // directories of declared file ingests ("warehouse" only)
   memoryLimit?: string;     // e.g. "4GB"; set before locking (serve)
   threads?: number;
+}
+
+/**
+ * The serve profile's instance limits (DESIGN.md §5 "Query limits"): memory_limit is 25% of RAM, so a burst of
+ * big queries cannot take the machine, and threads is one per core, above serve.maxConcurrent. Both are set on
+ * the instance's first connection, before it is locked.
+ */
+export function serveResources(o: { totalBytes?: number; cpus?: number } = {}): { memoryLimit: string; threads: number } {
+  const total = o.totalBytes ?? totalmem();
+  const cpus = o.cpus ?? availableParallelism();
+  return { memoryLimit: `${Math.max(64, Math.floor(total / 4 / 1024 ** 2))}MiB`, threads: Math.max(1, Math.floor(cpus)) };
 }
 
 /** Instance options every croft instance uses. Only access_mode varies, and only between processes. */

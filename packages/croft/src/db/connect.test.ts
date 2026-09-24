@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import {
   allowedDirectories, canonicalPath, connect, instanceConfig, isSandboxDenial, lockConflict, mapSandboxError,
-  openInstance, openMemory, type SandboxSpec,
+  openInstance, openMemory, type SandboxSpec, serveResources,
 } from "./connect.ts";
 
 const cleanup: (() => void)[] = [];
@@ -130,6 +130,17 @@ describe("sandbox (warehouse profile)", () => {
     expect(mapped).toBeInstanceOf(CroftError);
     expect((mapped as CroftError).code).toBe("QUERY_PATH_DENIED");
     expect(mapSandboxError(new Error("Binder Error: x"), "query")).toBeInstanceOf(Error);
+  });
+
+  test("serve resources: memory_limit is 25% of RAM, threads one per core; the instance takes them", async () => {
+    expect(serveResources({ totalBytes: 16 * 1024 ** 3, cpus: 8 })).toEqual({ memoryLimit: "4096MiB", threads: 8 });
+    expect(serveResources({ totalBytes: 100 * 1024 ** 2, cpus: 0 })).toEqual({ memoryLimit: "64MiB", threads: 1 });
+    const real = serveResources();
+    expect(real.threads).toBeGreaterThanOrEqual(1);
+    const p = project();
+    const db = await open(join(p.root, "serve-limits.duckdb"), { profile: "serve", timezone: "UTC", ...serveResources({ totalBytes: 8 * 1024 ** 3, cpus: 3 }) });
+    const c = await db.connect();
+    expect(await run(c, "SELECT current_setting('memory_limit'), current_setting('threads')")).toEqual([["2.0 GiB", 3n]]);
   });
 
   test("serve profile reads tables but no files", async () => {
