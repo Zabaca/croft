@@ -3,8 +3,10 @@
 // which of their steps committed before the crash; their leases are released; their staging is handed back
 // for deletion; write intents of dead processes are deleted. Cursors move only on commit, so a lost
 // step is simply extracted again next run. A recovered step's catalog mirror entry is refreshed from
-// the warehouse, so status and context show what committed.
-import { existsSync } from "node:fs";
+// the warehouse, so status and context show what committed. A cursor ingest killed after it committed parts of an
+// extraction that had not finished (§8 "Large first loads") is recovered as ok too, and its reason says the
+// extraction did not finish and where the next run continues (recoveredWords).
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CroftError, problem } from "../core/errors.ts";
 import { recordAlive } from "../core/proc.ts";
@@ -92,6 +94,48 @@ function commitOf(rows: CommitRow[], s: StepRecord): Commit | null {
   return c;
 }
 
+/**
+ * Whether an ingest step's attempt had finished extracting when its process died: after that attempt's first line in
+ * the step log (runner.ts: "<time> <asset> attempt <n> of <m> (run <id>): …"), the ingest writes "extracted …" once
+ * its rows are staged (run/ingest.ts), before its last write. null when the log is missing or unreadable.
+ */
+function extractionEnded(s: StepRecord): boolean | null {
+  if (!s.logPath) return null;
+  let lines: string[];
+  try {
+    lines = readFileSync(s.logPath, "utf8").split("\n");
+  } catch {
+    return null;
+  }
+  const head = ` ${s.asset} attempt ${s.attempt} of `;
+  const run = `(run ${s.runId})`;
+  let at = -1;
+  lines.forEach((l, n) => {
+    if (l.includes(head) && l.includes(run)) at = n;
+  });
+  if (at < 0) return null;
+  return lines.slice(at + 1).some((l) => /^extracted \d+ (rows in|file)/.test(l));
+}
+
+/**
+ * The words of a recovered step's reason. A chunked TS transform may have committed several chunks: "recovered: N
+ * commits" (its next run continues after the last one). A cursor ingest commits parts while its cursor values arrive
+ * in order (§8 "Large first loads"): when its log shows the extraction had not finished, the reason says so, what was
+ * saved, and where the next run continues (the saved cursor, which a broken order may have moved back); after
+ * several commits, where the next run continues. A single commit that landed at the end stays "recovered".
+ */
+function recoveredWords(s: StepRecord, c: Commit, entry: CatalogAsset | null): string {
+  const commits = `recovered: ${c.commits} commit${c.commits === 1 ? "" : "s"}`;
+  const cursor = entry?.kind === "ingest" ? entry.cursor : null;
+  if (!cursor) return c.commits > 1 ? commits : "recovered";
+  const next = cursor.value === null ? "the next run fetches from the start again" : `the next run continues from ${cursor.field} ${cursor.value}`;
+  if (extractionEnded(s) === false) {
+    const rows = `${c.rowsIn} row${c.rowsIn === 1 ? " was" : "s were"} saved`;
+    return `${commits}; the extraction did not finish: ${rows}, and ${next}`;
+  }
+  return c.commits > 1 ? `${commits}; ${next}` : "recovered";
+}
+
 function lostProblem(s: StepRecord, run: RunRecord | null): Problem {
   return problem("RUN_CRASHED", {
     message: `the process running ${s.asset} (pid ${run?.pid ?? "?"}) died before its write committed; nothing from this step was saved`,
@@ -170,13 +214,11 @@ export async function reconcile(o: ReconcileOptions): Promise<ReconcileResult> {
     const ref = { runId: s.runId, asset: s.asset, attempt: s.attempt };
     const c = commitOf(writes, s);
     if (c) {
-      // A chunked TS transform may have committed several chunks before the crash: the reason says how many (its
-      // next run continues after the last one).
-      const recovered = c.commits > 1 ? `recovered: ${c.commits} commits` : "recovered";
+      const entry = entries.get(s.asset);
+      const recovered = recoveredWords(s, c, entry ?? getCatalog(db, s.asset));
       const reason = s.reason ? `${s.reason} (${recovered})` : recovered;
       if (db.settleStep(s.runId, s.asset, s.attempt, { status: "ok", reason, rows: { in: c.rowsIn, added: c.added, updated: c.updated } })) {
         out.recovered.push({ ...ref, commits: c.commits });
-        const entry = entries.get(s.asset);
         if (entry) putCatalog(db, entry, "run");
       }
     } else if (db.settleStep(s.runId, s.asset, s.attempt, { status: "crashed", error: lostProblem(s, db.getRun(s.runId)) })) {

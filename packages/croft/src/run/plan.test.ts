@@ -6,8 +6,8 @@ import { type CatalogAsset, type CatalogColumn, putCatalog } from "../history/ca
 import { RunsDb } from "../history/runs-db.ts";
 import { tsFingerprint } from "../project/ts-asset.ts";
 import {
-  backfillUnsupported, behaviorHash, behaviorLabel, behaviorWords, type DuePlanning, FROM_ONLY_MERGE, fileDirsOf, isGlob, loadErrors, type PlannedStep,
-  planRun, rebuildCommand, rebuildSelectors, type RunPlan, resolveWrite, selectAssets, staleViewOf,
+  backfillUnsupported, behaviorHash, behaviorLabel, behaviorWords, type BehaviorSide, type DuePlanning, FROM_ONLY_MERGE, fileDirsOf, isGlob, loadErrors,
+  pendingBehavior, pendingPins, type PlannedStep, planRun, rebuildCommand, rebuildSelectors, type RunPlan, resolveWrite, selectAssets, skipProblem, staleViewOf,
 } from "./plan.ts";
 import { staleReasons } from "./staleness.ts";
 import { cleanupProjects, makeProject, writeFiles } from "./testkit.ts";
@@ -730,5 +730,155 @@ describe("planRun --due: code nobody ran by hand is never imported", () => {
     // A run by hand imports as always.
     await planRun({ root, timezone: "UTC", selectors: ["triage"], catalog });
     expect(marked(root)).toEqual(["api", "fresh", "triage"]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// What the catalog mirror shows before the run: behavior and pin changes (§6), renamed files (ASSET_RENAMED)
+
+describe("pendingBehavior: a behavior change the catalog mirror shows before a run (INGEST_CONFIG_CHANGED)", () => {
+  const seq: Incremental = { kind: "cursor", field: "seq", lookbackMs: 0 };
+  const side = (o: Partial<BehaviorSide> = {}): BehaviorSide => {
+    const write = o.write ?? "append";
+    const key = o.key ?? [];
+    const incremental = o.incremental ?? seq;
+    return { asset: "events", file: "assets/events.ts", kind: "rows", codeHash: "new-code", write, key, incremental, behaviorHash: behaviorHash(write, key, incremental), ...o };
+  };
+  const built = (o: Partial<CatalogAsset> = {}) =>
+    entry("events", { write: "append", key: [], rows: 1200, cursor: { field: "seq", value: "9", type: "integer", unit: null }, codeHash: "old-code", ...o });
+  const rebuild = "croft run events --rebuild refetches everything under the new rules (its table goes to the trash first, and it asks for confirmation)";
+
+  test("an append ingest gaining a key, with the same cursor: a run asks to convert it in place; a warning with the run's three fixes", () => {
+    const p = pendingBehavior(side({ write: "merge", key: ["id"] }), built());
+    expect(p).toMatchObject({ convertible: true, rows: 1200, change: { changed: ["write", "key"], from: { write: "append", key: [] }, to: { write: "merge", key: ["id"] } } });
+    expect(p!.problem).toMatchObject({
+      code: "INGEST_CONFIG_CHANGED", severity: "warning", asset: "events", file: "assets/events.ts",
+      message: "events now has the key id, but its 1200 stored rows were appended without one: croft run events counts the stored rows with the same id and asks before converting them in place (it keeps the latest row of each id, and the table goes to the trash first)",
+      hint: `ask the user; if they agree, croft run events asks for the conversion and they confirm it. Otherwise remove the key again, or ${rebuild}`,
+      effect: "croft run events stops to ask before it fetches anything",
+      fix: { kind: "edit", description: "put the write mode and key back as it was (write: append → merge; key: none → id)", file: "assets/events.ts" },
+    });
+    expect(p!.problem.details).toMatchObject({ changed: ["write", "key"], rows: 1200, convertible: true, pending: true });
+    expect(p!.problem.details!.fixes).toEqual([
+      { kind: "edit", description: "put the write mode and key back as it was (write: append → merge; key: none → id)", file: "assets/events.ts" },
+      { kind: "manual", requiresHuman: true, description: `ask the user whether to refetch from the source: ${rebuild}` },
+      { kind: "manual", requiresHuman: true, description: "ask the user whether to convert in place: croft run events asks for confirmation, moves the table to the trash first, then keeps the latest row of each id" },
+    ]);
+    // A keyed append (write stays append) converts in place too.
+    expect(pendingBehavior(side({ key: ["id"] }), built())).toMatchObject({ convertible: true, change: { changed: ["key"] } });
+  });
+
+  test("another key, write mode or cursor field: a run fails before it fetches; an error with the run's fixes and words", () => {
+    const merged = built({ write: "merge", key: ["id"] });
+    const key = pendingBehavior(side({ write: "merge", key: ["uuid"] }), merged)!;
+    expect(key).toMatchObject({ convertible: false });
+    expect(key.problem).toMatchObject({
+      code: "INGEST_CONFIG_CHANGED", severity: "error",
+      message: "events's 1200 stored rows were written as merge by id, but its code now says merge by uuid (key: id → uuid); croft does not rewrite stored rows on its own",
+      hint: `put the key back as it was in assets/events.ts, or ${rebuild}`,
+      effect: "croft run events fails before it fetches anything",
+      fix: { kind: "edit", description: "put the key back as it was (key: id → uuid)", file: "assets/events.ts" },
+    });
+    expect(key.problem.details!.fixes).toHaveLength(2);
+    // The cursor field, from the mirror's saved cursor.
+    const field = pendingBehavior(side({ write: "merge", key: ["id"], incremental: { kind: "cursor", field: "created", lookbackMs: 0 } }), merged)!;
+    expect(field.problem.message).toBe("events's 1200 stored rows were written as merge by id, but its code now says merge by id (incremental: seq → created); croft does not rewrite stored rows on its own");
+    expect(field.problem.severity).toBe("error");
+    // An append ingest gaining a key AND a new cursor field is not converted in place.
+    expect(pendingBehavior(side({ write: "merge", key: ["id"], incremental: { kind: "cursor", field: "created", lookbackMs: 0 } }), built())).toMatchObject({ convertible: false });
+    // A cursor added to a replace ingest: "incremental: now created".
+    const replaced = built({ write: "replace", key: ["id"], cursor: null });
+    const added = pendingBehavior(side({ write: "merge", key: ["id"], incremental: { kind: "cursor", field: "created", lookbackMs: 0 } }), replaced)!;
+    expect(added.problem.message).toContain("(write: replace → merge; incremental: now created)");
+  });
+
+  test("nothing when the code is the code that built it, the table is empty, it is no ingest, or nothing that counts changed", () => {
+    const merge = side({ write: "merge", key: ["id"] });
+    expect(pendingBehavior(merge, built({ codeHash: "new-code" }))).toBeNull();
+    expect(pendingBehavior(merge, built({ codeHash: null }))).toBeNull();
+    expect(pendingBehavior({ ...merge, codeHash: undefined }, built())).toBeNull();
+    expect(pendingBehavior(merge, built({ rows: 0 }))).toBeNull();
+    expect(pendingBehavior(merge, null)).toBeNull();
+    expect(pendingBehavior(merge, built({ kind: "sql" }))).toBeNull();
+    expect(pendingBehavior({ ...merge, kind: "sql" }, built())).toBeNull();
+    // A reordered or re-cased key, and a lookback, are no change.
+    const two = built({ write: "merge", key: ["a", "b"] });
+    expect(pendingBehavior(side({ write: "merge", key: ["B", "a"] }), two)).toBeNull();
+    expect(pendingBehavior(side({ write: "merge", key: ["a", "b"], incremental: { kind: "cursor", field: "seq", lookbackMs: 86_400_000 } }), two)).toBeNull();
+    // A file ingest's incremental setting is not in the mirror: only its write mode and key are compared.
+    const files = built({ write: "merge", key: ["order_id"], cursor: null });
+    expect(pendingBehavior(side({ kind: "file", write: "merge", key: ["order_id"], incremental: { kind: "files" } }), files)).toBeNull();
+    expect(pendingBehavior(side({ kind: "file", write: "merge", key: ["sku"], incremental: { kind: "files" } }), files)).toMatchObject({ change: { changed: ["key"] } });
+  });
+});
+
+describe("pendingPins: pins that differ from the stored type, as the catalog mirror has it", () => {
+  const pinCol = (name: string, type: string, o: Partial<CatalogColumn> = {}): CatalogColumn => ({ ...col(name, type), ...o });
+  const stored = entry("events", {
+    rows: 10, codeHash: "old-code",
+    columns: [pinCol("zip", "VARCHAR"), pinCol("amount", "DOUBLE"), pinCol("note", "VARCHAR", { pending: true }), pinCol("n", "INTEGER"), pinCol("_loaded_at", "TIMESTAMPTZ")],
+  });
+  const side = (pins: Record<string, { type: string; format?: string }>): BehaviorSide => ({
+    asset: "events", file: "assets/events.ts", kind: "rows", codeHash: "new-code", write: "replace", key: [], incremental: { kind: "none" },
+    behaviorHash: behaviorHash("replace", [], { kind: "none" }), pins,
+  });
+
+  test("a pin to another type is listed; an alias, a pending column, a column not stored and an unchanged code are not", () => {
+    expect(pendingPins(side({ zip: { type: "BIGINT" }, amount: { type: "decimal(18, 2)" } }), stored)).toEqual([
+      { column: "zip", from: "VARCHAR", to: "BIGINT" }, { column: "amount", from: "DOUBLE", to: "DECIMAL(18,2)" },
+    ]);
+    expect(pendingPins(side({ zip: { type: "text" }, n: { type: "INT" }, note: { type: "BIGINT" }, gone: { type: "DATE" } }), stored)).toEqual([]);
+    expect(pendingPins(side({ zip: { type: "BIGINT" } }), { ...stored, codeHash: "new-code" })).toEqual([]);
+    expect(pendingPins(side({ zip: { type: "BIGINT" } }), { ...stored, rows: 0 })).toEqual([]);
+    // A pin that is no plain type is the run's ASSET_INVALID, not a pin change.
+    expect(pendingPins(side({ zip: { type: "VARCHAR; DROP TABLE x" } }), stored)).toEqual([]);
+  });
+});
+
+describe("planRun: an asset ASSET_RENAMED reports is never fetched from scratch (§6)", () => {
+  test("named exactly, it fails before it runs with the rename as its fix; a bare run or a glob skips it, and what reads it", async () => {
+    const root = makeProject({ "assets/purchases.ts": INGEST, "assets/by_day.sql": "SELECT id FROM purchases\n", "assets/consts.sql": "SELECT 1 AS x\n" });
+    const hash = by(await planRun({ root, timezone: "UTC", selectors: ["purchases"], catalog: [] })).purchases!.codeHash!;
+    // orders.ts was renamed to purchases.ts outside croft: its table is an orphan with the same code.
+    const catalog = [entry("orders", { write: "merge", key: ["id"], rows: 1130, columns: API_COLUMNS, codeHash: hash })];
+
+    const named = by(await planRun({ root, timezone: "UTC", selectors: ["purchases"], catalog }));
+    expect(named.purchases!.renamed).toEqual({ from: "orders", to: "purchases", unfinished: false });
+    expect(loadErrors(named.purchases!)).toMatchObject([{
+      code: "ASSET_RENAMED", severity: "error", asset: "purchases", file: "assets/purchases.ts",
+      fix: { kind: "command", description: "adopt orders's table and state as purchases", command: "croft rename orders purchases" },
+    }]);
+    // What reads it is planned: the runner skips it when purchases fails, as for any failed input.
+    expect(named.by_day!.action).toBe("rebuild");
+
+    const bare = by(await planRun({ root, timezone: "UTC", selectors: [], catalog }));
+    const why = "looks like orders renamed outside croft: croft rename orders purchases adopts its table and state (a run would fetch everything again)";
+    expect(bare.purchases).toMatchObject({ action: "skip", reason: why, renamed: { from: "orders", to: "purchases" } });
+    expect(loadErrors(bare.purchases!)).toEqual([]);
+    expect(skipProblem(bare.purchases!)).toMatchObject({ code: "ASSET_RENAMED", severity: "warning", fix: { command: "croft rename orders purchases" } });
+    expect(bare.by_day).toMatchObject({
+      action: "skip", reason: "input purchases has never been built: it looks like orders renamed outside croft (croft rename orders purchases adopts its table)",
+      renamed: { from: "orders", to: "purchases" },
+    });
+    expect(skipProblem(bare.by_day!)).toBeUndefined();
+    expect(bare.consts!.action).toBe("rebuild");
+    // A glob is not a name: skipped too.
+    expect(by(await planRun({ root, timezone: "UTC", selectors: ["purch*"], catalog })).purchases!.action).toBe("skip");
+    // Without the orphan it is a first build.
+    const fresh = by(await planRun({ root, timezone: "UTC", selectors: ["purchases"], catalog: [] })).purchases!;
+    expect(fresh.problems).toEqual([]);
+    expect(fresh.renamed).toBeUndefined();
+  });
+
+  test("a croft rename that did not finish: neither name runs until `croft rename <old> <new>` finishes it", async () => {
+    const root = makeProject({ "assets/orders.ts": INGEST, "assets/consts.sql": "SELECT 1 AS x\n" });
+    writeFiles(root, { ".croft/rename.json": JSON.stringify({ from: "orders", to: "purchases", fileFrom: "assets/orders.ts", fileTo: "assets/purchases.ts", mode: "file" }) });
+    const catalog = [entry("orders", { write: "merge", key: ["id"], rows: 1130, columns: API_COLUMNS })];
+    const named = by(await planRun({ root, timezone: "UTC", selectors: ["orders"], catalog }));
+    expect(named.orders!.renamed).toEqual({ from: "orders", to: "purchases", unfinished: true });
+    expect(loadErrors(named.orders!)).toMatchObject([{ code: "ASSET_RENAMED", asset: "orders", fix: { command: "croft rename orders purchases" } }]);
+    const bare = by(await planRun({ root, timezone: "UTC", selectors: [], catalog }));
+    expect(bare.orders).toMatchObject({ action: "skip", reason: "croft rename orders purchases did not finish: orders does not run until the same command finishes it" });
+    expect(bare.consts!.action).toBe("rebuild");
   });
 });

@@ -7,7 +7,10 @@
 //    transform's newRows() input without a key (INPUT_NEEDS_KEY) and declared secrets that are not set
 //    (SECRET_MISSING, a warning: nothing fails until the asset runs, as in doctor). An asset never built whose code
 //    built an orphan table (a file renamed outside croft), or a croft rename that stopped, is ASSET_RENAMED, with
-//    `croft rename <old> <new>` as the fix (project/rename.ts findRenamed; the catalog mirror and code hashes).
+//    `croft rename <old> <new>` as the fix (project/rename.ts findRenamed; the catalog mirror and code hashes). An
+//    ingest whose code now says another key, write mode or cursor field than its stored rows were written with is
+//    INGEST_CONFIG_CHANGED with the run's fixes (run/plan.ts pendingBehavior, from the mirror): an error when the run
+//    would fail before it fetches, a warning when it would ask to convert in place. Any error exits 2.
 // 2. The bind check (sql/bind.ts ShadowCatalog), over empty tables in an in-memory DuckDB:
 //    - every table the catalog mirror (runs.sqlite) knows is defined from its cached columns, _loaded_at and
 //      _file included, and its pending columns (all NULL so far) are passed for NULL_ONLY_COLUMN; a table never
@@ -30,7 +33,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
 import { probeSql } from "../../checks/parse.ts";
-import { type Code, CroftError, CODES, isCode, problem } from "../../core/errors.ts";
+import { type Code, CroftError, CODES, EXIT, isCode, problem } from "../../core/errors.ts";
 import { formatInstant } from "../../core/time.ts";
 import type { Check, Problem, ValidateAsset, ValidateData } from "../../core/types.ts";
 import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
@@ -42,6 +45,7 @@ import { type ResolvedAsset, resolveProject, selectorWords } from "../../project
 import type { Project } from "../../project/root.ts";
 import type { LoadedSqlAsset } from "../../project/sql-asset.ts";
 import { didYouMean } from "../../project/suggest.ts";
+import { pendingBehavior, resolvedSide } from "../../run/plan.ts";
 import { previewDirectory } from "../../run/preview.ts";
 import { nextFires } from "../../schedule/types.ts";
 import { ShadowCatalog, type ShadowColumn } from "../../sql/bind.ts";
@@ -87,7 +91,10 @@ export const validate: CommandImpl<ValidateData> = {
       project, env: ctx.env, selectors: ctx.positionals, types: ctx.values.types === true, processEnv: ctx.processEnv,
       now: ctx.now(),
     });
-    return { data: report.data, problems: report.problems, next: nextSteps(report) };
+    // Every error validate finds is in the project as it is now (§4 "Exit codes": 2), a run's code among them: a
+    // pending INGEST_CONFIG_CHANGED means the run would fail, not that it did.
+    const invalid = report.problems.some((p) => p.severity === "error");
+    return { data: report.data, problems: report.problems, next: nextSteps(report), exit: invalid ? EXIT.INVALID : EXIT.OK };
   },
 
   human(result, ctx) {
@@ -183,9 +190,10 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
     const a = byName.get(name);
     if (!a || !selected.has(name)) continue;
     const own = a.problems.filter((p) => !(bound.quoted.has(name) && p.code === "SQL_SYNTAX"));
-    problems.push(...[...own, ...renamed.filter((p) => p.asset === name), ...staticProblems(a, byName, root, i.env), ...(bound.problems.get(name) ?? [])]
-      .map((p) => (p.asset ? p : { ...p, asset: name })));
     const built = live.get(name);
+    problems.push(...[...own, ...renamed.filter((p) => p.asset === name), ...staticProblems(a, byName, root, i.env), ...(bound.problems.get(name) ?? []),
+      ...behaviorProblems(a, built ?? null)]
+      .map((p) => (p.asset ? p : { ...p, asset: name })));
     assets.push({
       name, kind: a.kind, inputs: inputsOf(a),
       outputColumns: a.kind === "sql" ? bound.outputs.get(name)?.map((c) => ({ name: c.name, type: c.type })) ?? null : null,
@@ -240,6 +248,18 @@ async function renamedAssets(project: ValidateInput["project"], catalog: readonl
   } catch {
     return [];   // a detection that cannot read the project reports nothing; the checks above still stand
   }
+}
+
+/**
+ * INGEST_CONFIG_CHANGED (§6 "Behavior changes"), from the catalog mirror (run/plan.ts pendingBehavior): an ingest whose
+ * code now says another key, write mode or cursor field than the one its stored rows were written with. An error when
+ * the run would fail before it fetches; a warning when the run asks to convert in place (an append ingest gaining a
+ * key). The fixes are the run's. Only an ingest whose definition loaded: a broken one keeps default settings.
+ */
+function behaviorProblems(a: ResolvedAsset, built: CatalogAsset | null): Problem[] {
+  const side = resolvedSide(a);
+  const pending = side ? pendingBehavior(side, built) : null;
+  return pending ? [pending.problem] : [];
 }
 
 /** The graph's order, then the assets it leaves out (on or after a cycle) by name. */

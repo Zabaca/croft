@@ -2,7 +2,7 @@
 // shrink guard, big integers, type drift, cursors, --from, ctx.query, the catalog mirror and leases.
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DuckDBInstance } from "@duckdb/node-api";
 import { closeAllWarehouses } from "../db/warehouse.ts";
@@ -600,6 +600,11 @@ export default transform({
     const step = out.data.steps[0]!;
     expect(step).toMatchObject({ status: "failed", trashed: { rows: 2 }, error: { code: "HTTP_ERROR" } });
     expect(step.error!.effect).toStartWith(`flaky was reset for --rebuild before this failure: its previous 2 rows are in the trash (${step.trashed!.path}); croft run flaky builds it again`);
+    // The way back is croft restore, which asks first: in the hint, never in next (§4.3).
+    expect(step.error!.hint).toEndWith("; flaky is never built now: croft run flaky fetches it again, or croft restore flaky brings the previous table back (it asks first)");
+    expect(step.error!.details).toMatchObject({ rebuild: { reset: true, trashPath: step.trashed!.path, trashedRows: 2 } });
+    expect(out.problems.find((p) => p.code === "HTTP_ERROR")!.hint).toContain("croft restore flaky");
+    expect(JSON.stringify(out.next)).not.toContain("restore");
     expect(await rows(root, "select count(*)::INT n from duckdb_tables() where table_name = 'flaky'")).toEqual([{ n: 0 }]);
     const db = runsDb(root);
     try {
@@ -627,6 +632,43 @@ export default transform({
       + `croft asks for one at a time, so run it after confirmation ${out.confirmation!.token} is settled: croft run ${other} --rebuild`);
     expect(out.next.some((n) => n.command.includes("--rebuild"))).toBe(false);
     expect(listTrash(join(root, ".croft"))).toEqual([]);
+  });
+});
+
+// §6 "Renaming a file outside croft creates a new, never-built asset whose code hash matches the orphan's": a run of it
+// would fetch everything again into a new table, next to the orphan. croft rename adopts the table instead.
+describe("ASSET_RENAMED: a file renamed outside croft is never fetched from scratch", () => {
+  test("named exactly, the step fails before it fetches, with croft rename as its fix and next; a bare run skips it, and what reads it", async () => {
+    api.state.issues = [1, 2].map((id) => ({ id, title: `t${id}`, updated_at: `2026-09-0${id}T10:00:00Z` }));
+    const root = makeProject({ "assets/issues.ts": keysetIssues(api.url) });
+    expect((await runIn(root, ["issues"])).exit).toBe(0);
+    renameSync(join(root, "assets/issues.ts"), join(root, "assets/tickets.ts"));
+    writeFileSync(join(root, "assets/by_ticket.sql"), "select id from tickets\n");
+    api.state.log.length = 0;
+
+    const named = await runIn(root, ["tickets"]);
+    expect(named.exit).toBe(2);
+    expect(named.data.steps.find((s) => s.asset === "tickets")).toMatchObject({
+      status: "failed", error: { code: "ASSET_RENAMED", fix: { kind: "command", command: "croft rename issues tickets" } },
+    });
+    // What reads it is skipped, as for any input that failed.
+    expect(named.data.steps.find((s) => s.asset === "by_ticket")).toMatchObject({ status: "skipped" });
+    expect(named.next[0]).toEqual({ command: "croft rename issues tickets", reason: "adopt issues's table and state as tickets" });
+    expect(named.next.map((n) => n.command)).not.toContain("croft logs tickets --failed");
+    expect(api.state.log).toEqual([]);
+
+    const bare = await runIn(root, []);
+    expect(bare.exit).toBe(0);
+    expect(bare.data.steps.find((s) => s.asset === "tickets")).toMatchObject({
+      status: "skipped", skippedBecause: "looks like issues renamed outside croft: croft rename issues tickets adopts its table and state (a run would fetch everything again)",
+    });
+    expect(bare.data.steps.find((s) => s.asset === "by_ticket")).toMatchObject({
+      status: "skipped", skippedBecause: "input tickets has never been built: it looks like issues renamed outside croft (croft rename issues tickets adopts its table)",
+    });
+    expect(bare.problems.filter((p) => p.code === "ASSET_RENAMED")).toEqual([expect.objectContaining({ severity: "warning", asset: "tickets" })]);
+    expect(bare.next).toContainEqual({ command: "croft rename issues tickets", reason: "adopt issues's table and state as tickets" });
+    expect(api.state.log).toEqual([]);
+    expect(await rows(root, "select count(*)::INT n from duckdb_tables() where table_name = 'tickets'")).toEqual([{ n: 0 }]);
   });
 });
 

@@ -6,6 +6,7 @@ import { tryAcquire } from "../history/leases.ts";
 import { RunsDb } from "../history/runs-db.ts";
 import { loadProject } from "../project/root.ts";
 import { dryRun, formatDryRun, type DryRunInput } from "./dry-run.ts";
+import { planRun } from "./plan.ts";
 import { cleanupProjects, makeProject } from "./testkit.ts";
 
 afterAll(() => cleanupProjects());
@@ -355,6 +356,93 @@ export default transform({
       "skip     last             input after is skipped (input typo would fail (UNKNOWN_COLUMN))",
       "dry run: 0 of 3 steps would run; nothing ran",
     ]);
+  });
+
+  // §6 "Behavior changes": a changed key, write mode or cursor field fails the run's step before it fetches, and an
+  // append ingest gaining a key asks to convert in place. The dry run says the same, from the catalog mirror.
+  test("INGEST_CONFIG_CHANGED: a changed key fails the step before it runs, and what reads it is skipped, as in the run", async () => {
+    const { run } = setup({
+      ...FILES, "assets/issues.ts": ingest(`key: "uuid", incremental: "updated_at",`), "assets/issue_count.sql": "SELECT count(*) AS n FROM issues\n",
+    }, [...CATALOG.filter((c) => c.asset !== "issues"), { ...CATALOG[1]!, codeHash: "older-code" }]);
+    const out = await run({ selectors: ["issues"] });
+    const s = stepsOf(out.data);
+    expect(s.issues.problems).toMatchObject([{
+      code: "INGEST_CONFIG_CHANGED", severity: "error",
+      message: "issues's 5000 stored rows were written as merge by id, but its code now says merge by uuid (key: id → uuid); croft does not rewrite stored rows on its own",
+      fix: { kind: "edit", description: "put the key back as it was (key: id → uuid)", file: "assets/issues.ts" },
+    }]);
+    expect(s.issues.window).toBeUndefined();
+    expect(s.issue_count).toMatchObject({ action: "skip", skippedBecause: "input issues would fail (INGEST_CONFIG_CHANGED)" });
+    expect(out.problems.map((p) => p.code)).toEqual(["INGEST_CONFIG_CHANGED"]);
+    expect(out.exit).toBe(0);
+    expect(formatDryRun(out.data)).toContain("fails before it runs: INGEST_CONFIG_CHANGED issues's 5000 stored rows were written as merge by id");
+    // No code hash recorded: unknown, so nothing to say (the run checks _croft itself).
+    const same = setup(FILES, CATALOG);
+    expect(stepsOf((await same.run({ selectors: ["issues"] })).data).issues.problems).toEqual([]);
+  });
+
+  test("a key added to an append ingest, or a pin that differs: the confirmation the run would ask for, and no token", async () => {
+    const built = entry("events", {
+      write: "append", rows: 1200, codeHash: "older-code", cursor: { field: "seq", value: "5", type: "integer", unit: null },
+      columns: [col("seq", "BIGINT"), col("zip", "VARCHAR"), col("_loaded_at", "TIMESTAMPTZ")],
+    });
+    const keyed = ingest(`key: "id", write: "append", incremental: "seq",`);
+    const { run, project } = setup({ ...FILES, "assets/events.ts": keyed, "assets/event_count.sql": "SELECT count(*) AS n FROM events\n" }, [...CATALOG, built]);
+    const out = await run({ selectors: ["events"] });
+    const s = stepsOf(out.data);
+    expect(s.events.problems).toEqual([]);
+    expect(s.events.confirmation).toMatchObject({
+      action: "convert_key", command: "croft run events",
+      impact: { asset: "events", action: "append ingest gains key id; duplicates removed in place", rows: 1200, downstream: ["event_count"] },
+    });
+    expect(s.events.confirmation.impact.trashPath).toContain(join(".croft", "trash", "events"));
+    expect(out.problems).toMatchObject([{ code: "INGEST_CONFIG_CHANGED", severity: "warning", asset: "events" }]);
+    expect(formatDryRun(out.data)).toContain("needs confirmation if stored rows repeat a key: its 1,200 rows go to the trash first (append ingest gains key id; duplicates removed in place)");
+    // The run only asks: it is not destructive in itself, so it is offered.
+    expect(out.next).toEqual([{ command: "croft run events", reason: "run it; it stops to ask before the steps that need confirmation" }]);
+    const db = RunsDb.open(project.paths.stateDir);
+    try {
+      expect(db.sqlite.query("SELECT count(*) AS n FROM confirmations").get()).toEqual({ n: 0 });
+    } finally {
+      db.close();
+    }
+
+    // A pin to another type: the run tests the stored values, and asks only when some would change.
+    const pinned = setup({ ...FILES, "assets/events.ts": ingest(`write: "append", incremental: "seq", columns: { zip: "BIGINT" },`) }, [...CATALOG, built]);
+    const p = stepsOf((await pinned.run({ selectors: ["events"] })).data).events;
+    expect(p.confirmation).toMatchObject({ action: "pin_change", command: "croft run events", impact: { action: "pin change: zip VARCHAR → BIGINT", rows: 1200 } });
+    expect(formatDryRun({ dryRun: true, order: ["events"], steps: [p] }))
+      .toContain("needs confirmation if the pin would change stored values: its 1,200 rows go to the trash first (pin change: zip VARCHAR → BIGINT)");
+    // Both: one question, as the run asks one.
+    const both = setup({ ...FILES, "assets/events.ts": ingest(`key: "id", write: "append", incremental: "seq", columns: { zip: "BIGINT" },`) }, [...CATALOG, built]);
+    expect(stepsOf((await both.run({ selectors: ["events"] })).data).events.confirmation).toMatchObject({
+      action: "convert_key", impact: { action: "append ingest gains key id; duplicates removed in place; pin change: zip VARCHAR → BIGINT" },
+    });
+    // --rebuild has no change to settle: only the rebuild's own confirmation.
+    const rebuild = stepsOf((await both.run({ selectors: ["events"], rebuild: true })).data).events;
+    expect(rebuild.confirmation.action).toBe("rebuild");
+  });
+
+  test("a file renamed outside croft (ASSET_RENAMED): named, it would fail before it runs; bare, it is skipped; next is the rename", async () => {
+    // charges.ts renamed to payments.ts outside croft: the mirror's charges entry has the code hash of payments.ts.
+    const files = { ...Object.fromEntries(Object.entries(FILES).filter(([k]) => k !== "assets/charges.ts")), "assets/payments.ts": FILES["assets/charges.ts"] };
+    const renamed = setup(files, CATALOG);
+    const code = (await planRun({ root: renamed.root, timezone: renamed.project.timezone, selectors: ["payments"], catalog: [] })).steps[0]!.codeHash!;
+    const db = RunsDb.open(renamed.project.paths.stateDir);
+    try {
+      putCatalog(db, { ...CATALOG[0]!, codeHash: code });
+    } finally {
+      db.close();
+    }
+    const named = await renamed.run({ selectors: ["payments"] });
+    expect(stepsOf(named.data).payments.problems).toMatchObject([{ code: "ASSET_RENAMED", fix: { command: "croft rename charges payments" } }]);
+    expect(named.next[0]).toEqual({ command: "croft rename charges payments", reason: "adopt charges's table and state as payments" });
+    const bare = await renamed.run();
+    expect(stepsOf(bare.data).payments).toMatchObject({
+      action: "skip", skippedBecause: "looks like charges renamed outside croft: croft rename charges payments adopts its table and state (a run would fetch everything again)",
+    });
+    expect(bare.problems).toContainEqual(expect.objectContaining({ code: "ASSET_RENAMED", severity: "warning", asset: "payments" }));
+    expect(bare.next[0]).toEqual({ command: "croft rename charges payments", reason: "adopt charges's table and state as payments" });
   });
 
   test("an asset another run holds: the run would wait for it", async () => {

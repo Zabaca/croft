@@ -27,6 +27,13 @@
 // file was renamed outside croft), or a croft rename that stopped, is a problem with the fix `croft rename <old>
 // <new>`, and both rows say so instead of "never run (croft run …)", since a run would fetch everything again.
 //
+// INGEST_CONFIG_CHANGED (§6 "Behavior changes", run/plan.ts pendingBehavior): an ingest whose code now says another
+// key, write mode or cursor field than its stored rows were written with (the catalog mirror's) is a problem with the
+// run's fixes: an error when the run would fail before it fetches, a warning when it would ask to convert in place.
+// Its row says which. An incremental TS transform whose input was replaced since it read it (input_replaced) says
+// "input x restored; croft run y --rebuild redoes it" (§6 "Restore"; StatusAsset.replaced): a plain run processes new
+// input rows only, so its older rows are redone by the rebuild alone, which a human decides on.
+//
 // `status` exits 0 because the command worked; `--check` exits 1 when anything is failed, crashed, held or
 // stale (the scheduler included), which makes it a health probe. In JSON, ok always means "the command worked" and data.healthy
 // carries health.
@@ -100,6 +107,9 @@ export interface StatusAsset {
   edited: boolean;
   filesGone?: string[];
   schemaChangedAt?: string;
+  /** An incremental TS transform whose input was replaced since it read it (input_replaced): each such input, and
+   *  whether `croft restore` replaced it. A plain run processes new input rows only; `--rebuild` redoes every row. */
+  replaced?: { input: string; restored: boolean }[];
 }
 
 /**
@@ -464,6 +474,8 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
   const resolution = o.resolved !== undefined ? { resolved: o.resolved, problems: [] } : await resolveAssets(project);
   const resolved = resolution.resolved;
   const { sniffKind } = await import("../../project/resolve.ts");
+  // INGEST_CONFIG_CHANGED from the mirror (run/plan.ts pendingBehavior), for the ingests whose definitions loaded.
+  const { pendingBehavior, resolvedSide } = await import("../../run/plan.ts");
   const definitions = new Map((resolved?.assets ?? []).map((a) => [a.name, a]));
   const db = openRunsDb(project.paths.stateDir);
   try {
@@ -478,6 +490,7 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
     const names = [...new Set([...discovery.assets.map((a) => a.name), ...catalog.map((c) => c.asset)])].sort();
     const files = new Map(discovery.assets.map((a) => [a.name, a]));
     const edits: Problem[] = [];
+    const configChanges: Problem[] = [];
     const assets: StatusAsset[] = names.map((name) => {
       const file = files.get(name) ?? null;
       const cat = byName.get(name) ?? null;
@@ -530,6 +543,11 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
         const warning = editedProblem(view);
         if (warning) edits.push(warning);
       }
+      // An ingest whose code now writes its rows another way than the stored ones were written: the run fails before
+      // it fetches, or asks to convert in place (§6 "Behavior changes"), with the run's fixes.
+      const side = file && def ? resolvedSide(def) : null;
+      const pending = side ? pendingBehavior(side, cat) : null;
+      if (pending) configChanges.push(pending.problem);
 
       // When it runs next: the scheduler's view while scheduling is on, else the schedule's own next fire.
       const sv = scheduler.byAsset.get(name) ?? null;
@@ -543,6 +561,12 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
         stale: reasons.length > 0, staleReasons: reasons, held: !!file && hold !== null && HUMAN_HOLDS.has(hold.code), edited,
       };
       if (file && hold) out.hold = { code: hold.code, reason: hold.reason };
+      // §6 "Restore": an incremental TS transform processes new input rows only, so a replaced input's older rows
+      // are redone by `--rebuild` alone; the row says which input, and whether a restore replaced it.
+      if (view?.incremental && reasons.includes("input_replaced")) {
+        const replaced = replacedInputs(db, view);
+        if (replaced.length) out.replaced = replaced;
+      }
       if (cat?.filesGone?.length) out.filesGone = [...cat.filesGone];
       const changed = summaryChanges.filter((c) => c.asset === name).map((c) => c.at).sort().pop();
       if (changed) out.schemaChangedAt = zoned(changed, tz)!;
@@ -566,7 +590,7 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       if (copy) data.readCopy = copy;
     }
     // resolveProject's problems are discovery's (all of them: no selectors) and CYCLE.
-    const problems = [...(missing ? [missing] : []), ...(resolved ? resolved.problems : discovery.problems), ...resolution.problems, ...renamed];
+    const problems = [...(missing ? [missing] : []), ...(resolved ? resolved.problems : discovery.problems), ...resolution.problems, ...renamed, ...configChanges];
     // The scheduler: stale (the diagnosis reads files only: no launchctl or crontab here), then the held assets.
     const schedulingProblems: Problem[] = [];
     if (rec.stale) {
@@ -601,6 +625,63 @@ export async function renamedProblems(project: Project, discovered: readonly Dis
   } catch {
     return [];
   }
+}
+
+/** Whether instant `a` is later than `b` (microseconds count; text order when either does not parse). */
+function later(a: string, b: string): boolean {
+  try {
+    return parseInstant(a) > parseInstant(b);
+  } catch {
+    return a > b;
+  }
+}
+
+/**
+ * The inputs an incremental TS transform has not read since they were replaced (staleness's input_replaced: an
+ * input's lastReplacedAt is later than the version the transform last read of it), each with whether `croft restore`
+ * replaced it since (a "restored" step of the input in runs.sqlite, delete.ts and restore.ts).
+ */
+function replacedInputs(db: RunsDb | null, view: StaleView): { input: string; restored: boolean }[] {
+  const out: { input: string; restored: boolean }[] = [];
+  const entry = (name: string) => view.inputEntries[name] ?? Object.entries(view.inputEntries).find(([k]) => k.toLowerCase() === name.toLowerCase())?.[1] ?? null;
+  for (const input of view.inputs) {
+    const replacedAt = entry(input)?.lastReplacedAt ?? null;
+    const seen = view.entry?.inputsSeen?.[input]?.inputLastLoadedAt ?? null;
+    if (!replacedAt || !seen || !later(replacedAt, seen)) continue;
+    const restores = db
+      ? db.sqlite.query("SELECT finished_at FROM steps WHERE asset = ? AND status = 'ok' AND reason = 'restored' AND finished_at IS NOT NULL")
+        .all(input) as { finished_at: string }[]
+      : [];
+    out.push({ input, restored: restores.some((r) => later(r.finished_at, seen)) });
+  }
+  return out;
+}
+
+/** The words for an incremental TS transform's replaced inputs (StatusAsset.replaced): which, how, and that only
+ *  `--rebuild` redoes the rows it built from them (§6 "Restore"). */
+function replacedText(a: Pick<StatusAsset, "asset" | "replaced">): string | null {
+  const list = a.replaced ?? [];
+  if (list.length === 0) return null;
+  const inputs = (xs: readonly { input: string }[]) => `${xs.length === 1 ? "input" : "inputs"} ${xs.map((x) => x.input).join(", ")}`;
+  const restored = list.filter((x) => x.restored);
+  const other = list.filter((x) => !x.restored);
+  const what = [
+    ...(restored.length ? [`${inputs(restored)} restored`] : []),
+    ...(other.length ? [`${inputs(other)} replaced (rows deleted or changed)`] : []),
+  ];
+  return `${what.join("; ")}; croft run ${a.asset} --rebuild redoes it`;
+}
+
+/** A pending INGEST_CONFIG_CHANGED as a status row says it (run/plan.ts pendingBehavior's problem), by asset. */
+export function configRows(problems: readonly Problem[] | undefined): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const p of problems ?? []) {
+    if (p.code !== "INGEST_CONFIG_CHANGED" || p.details?.pending !== true || !p.asset) continue;
+    out.set(p.asset, p.severity === "error"
+      ? `its code changes how its rows are written: croft run ${p.asset} fails until that is settled (INGEST_CONFIG_CHANGED)`
+      : `its code adds a key: croft run ${p.asset} asks to convert its stored rows in place (INGEST_CONFIG_CHANGED)`);
+  }
+  return out;
 }
 
 /** A renamed asset as a row of `croft status` shows it (both its names), from the ASSET_RENAMED problems. */
@@ -679,8 +760,9 @@ export function statusNext(assets: readonly StatusAsset[]): Next[] {
 }
 
 /** The STATUS column: the state plus the notes that matter (§4.2). `renamed`: the asset is one name of an
- *  ASSET_RENAMED pair, whose row says `croft rename`, never `croft run` (a run would fetch everything again). */
-export function statusText(a: StatusAsset, now: Date, renamed?: RenamedRow): string {
+ *  ASSET_RENAMED pair, whose row says `croft rename`, never `croft run` (a run would fetch everything again).
+ *  `config`: a pending INGEST_CONFIG_CHANGED in words (configRows). */
+export function statusText(a: StatusAsset, now: Date, renamed?: RenamedRow, config?: string): string {
   const notes: string[] = [];
   let head: string;
   const rename = renamed ? `croft rename ${renamed.from} ${renamed.to}` : "";
@@ -721,12 +803,16 @@ export function statusText(a: StatusAsset, now: Date, renamed?: RenamedRow): str
     if (head === "ok") head = a.hold.reason.includes("croft run") ? held : `${held} (croft run ${a.asset})`;
     else notes.push(held);
   }
-  const stale = staleText(a.staleReasons);
+  // An incremental TS transform's replaced input is redone by --rebuild alone (§6 "Restore"): its own words.
+  const replaced = replacedText(a);
+  const stale = staleText(replaced ? a.staleReasons.filter((r) => r !== "input_replaced") : a.staleReasons);
   // The command goes on a healthy row only: a failed or held one already names what to do first.
   if (stale) notes.push(head === "ok" ? `${stale} (croft run ${a.asset})` : stale);
+  if (replaced) notes.push(stale ? replaced : `stale: ${replaced}`);
   if (a.filesGone?.length) notes.push(`${a.filesGone.length} file${a.filesGone.length === 1 ? "" : "s"} gone`);
   if (a.schemaChangedAt) notes.push(`schema changed ${ago(a.schemaChangedAt, now)}`);
   if (a.edited) notes.push("edited since its last run");
+  if (config) notes.push(config);
   return [head, ...notes].join(" · ");
 }
 
@@ -755,12 +841,13 @@ export function formatStatus(d: StatusData, now: Date, o: { tz?: string; problem
     return ["No assets yet: add one to assets/ (croft docs ingest has templates), then croft run <asset>.", schedulingLine(d, now, tz), ...tail].join("\n");
   }
   const renamed = renamedRows(o.problems);
+  const config = configRows(o.problems);
   const rows = d.assets.map((a) => [
     a.asset,
     a.rows === null ? "—" : formatCount(a.rows),
     a.lastRun ? ago(a.lastRun.at, now) : "—",
     nextText(a.next, tz, now),
-    statusText(a, now, renamed.get(a.asset)),
+    statusText(a, now, renamed.get(a.asset), config.get(a.asset)),
   ]);
   const lines = [table(["ASSET", "ROWS", "LAST RUN", "NEXT", "STATUS"], rows, { limit: Infinity, maxWidth: 200 }).text];
   for (const r of d.running) {
