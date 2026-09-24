@@ -294,7 +294,7 @@ function flagError(cmd: Command, all: Record<string, OptionSpec>, args: string[]
 }
 
 function unknownCommand(name: string, argv: readonly string[], index: number, commands: readonly Command[]): CroftError {
-  const guess = didYouMean(name, commands.map((c) => c.name));
+  const guess = didYouMean(name, commands.filter((c) => !c.hidden).map((c) => c.name));
   const corrected = guess ? ["croft", ...argv.map((a, i) => (i === index ? guess : a))].map(shellQuote).join(" ") : "";
   return new CroftError("USAGE_ERROR", {
     message: `unknown command "${name}"`,

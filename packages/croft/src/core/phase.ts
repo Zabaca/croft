@@ -1,5 +1,5 @@
 // What this build ships (DESIGN.md §11 "Phases"), so the text croft gives an agent only names commands and
-// flags that exist. DESIGN.md §4.1 describes all of v1; this build is phase 2 ("Transform and trust").
+// flags that exist. DESIGN.md §4.1 describes all of v1; this build is phase 3 ("Keep it fresh").
 //
 // - The command manifest below lists every command, and each run, validate and init flag DESIGN.md §4.1 gives a
 //   phase after 1, with the phase that ships it. The registry (cli/commands/index.ts) must register exactly the
@@ -21,7 +21,11 @@ export function phaseStub(what: string): never {
 }
 
 /** The phase of DESIGN.md §11 this build implements. */
-export const PHASE: number = 2;
+export const PHASE: number = 3;
+
+/** Whether PHASE is finished. False while its waves are being built: its error codes may still be unraised
+ *  (core/codes-raised.test.ts). Set to true when the phase ends; a release requires it. */
+export const PHASE_COMPLETE: boolean = false;
 
 /** Every command DESIGN.md §4.1 names (and the internal `tick`), with the phase that ships it. */
 export const COMMAND_PHASE = {
@@ -79,9 +83,8 @@ export function laterConfigKey(key: string): { phase: number; feature: string } 
   return hit && hit.phase > PHASE ? { phase: hit.phase, feature: hit.feature } : null;
 }
 
-/** What phase 2 does not do yet, in words, for SKILL.md. */
+/** What phase 3 does not do yet, in words, for SKILL.md. */
 export const PHASE_LIMITS = [
-  "Nothing runs on a schedule: assets run when you run them, and transforms update in the same run as their inputs.",
   "There is no rebuild from scratch: an incremental TS transform applies new code to new input rows only.",
 ];
 
@@ -93,7 +96,7 @@ export function versionNotes(version: string): string {
     return fs.length ? [`${c} ${fs.map((f) => `--${f}`).join("/")}`] : [];
   });
   return [
-    `croft ${version} (phase ${PHASE}) has these commands: ${SHIPPED_COMMANDS.join(", ")}.`,
+    `croft ${version} (phase ${PHASE}) has these commands: ${SHIPPED_COMMANDS.filter((c) => c !== "tick").join(", ")}.`,
     `Not in this version, so never call them (each exits 2): ${[...LATER_COMMANDS, ...flags].join(", ")}.`,
     ...PHASE_LIMITS,
   ].join("\n");

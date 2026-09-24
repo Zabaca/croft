@@ -88,9 +88,11 @@ describe("the phase manifest matches the registry", () => {
   test("SKILL.md says what this version has and lacks, from the manifest", () => {
     const notes = versionNotes(CROFT_VERSION);
     expect(skillMd()).toContain(notes);
-    for (const c of SHIPPED_COMMANDS) expect(notes).toContain(c);
+    for (const c of SHIPPED_COMMANDS) if (c !== "tick") expect(notes).toContain(c);
+    expect(notes).not.toMatch(/\btick\b/);   // internal: croft runs it, an agent never does
     for (const c of LATER_COMMANDS) expect(notes).toContain(c);
-    expect(notes).toContain("run --rebuild/--due");
+    expect(notes).toContain("run --rebuild");
+    expect(notes).not.toContain("--due");
     expect(notes).toContain("validate --hook");
     expect(notes).not.toContain("--dry-run");
   });
@@ -98,8 +100,9 @@ describe("the phase manifest matches the registry", () => {
 
 describe("croft tells the agent to use only what this build has", () => {
   test("the scanner catches what it is meant to", () => {
-    expect(scan("t", "Loop: edit → `croft schedule on` → `croft run <asset>`").map((f) => f.problem))
-      .toEqual(["croft schedule is phase 3; this build is phase 2"]);
+    expect(scan("t", "Loop: edit → `croft rename a b` → `croft run <asset>`").map((f) => f.problem))
+      .toEqual(["croft rename is phase 4; this build is phase 3"]);
+    expect(scan("t", "croft schedule on, then croft serve --port 7447")).toEqual([]);
     expect(scan("t", "Redo: croft run <asset> --rebuild --from -90d, then the same with --with-hook.").map((f) => f.problem))
       .toEqual(["croft run --rebuild comes in a later phase", "no command of this build has --with-hook"]);
     expect(scan("t", "croft validate --hook").map((f) => f.problem)).toEqual(["croft validate --hook comes in a later phase"]);

@@ -8,6 +8,7 @@ import { randomInt } from "node:crypto";
 import { CroftError, problem } from "../core/errors.ts";
 import { currentIdentity, type ProcessIdentity } from "../core/proc.ts";
 import type { LockHolder, Problem } from "../core/types.ts";
+import type { SchedulingSetting } from "../schedule/os.ts";
 
 export const RUNS_DB_FILE = "runs.sqlite";
 export const BUSY_TIMEOUT_MS = 5000;
@@ -34,6 +35,8 @@ const MIGRATIONS: readonly string[] = [
    CREATE TABLE IF NOT EXISTS catalog (asset TEXT PRIMARY KEY, json TEXT, source TEXT, refreshed_at TEXT);
    CREATE INDEX IF NOT EXISTS steps_by_asset ON steps (asset, started_at);
    CREATE INDEX IF NOT EXISTS runs_by_status ON runs (status);`,
+  // 2 (phase 3): per-project settings, such as scheduling on/off/paused.
+  `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);`,
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 
@@ -518,6 +521,35 @@ export class RunsDb {
     const row = this.sqlite.query("SELECT approved_code_hash FROM schedule_state WHERE asset = ?").get(asset) as
       { approved_code_hash: string | null } | null;
     return row?.approved_code_hash ?? null;
+  }
+
+  // ---- settings (per project) ----
+
+  /** A setting's JSON value, or null when unset. */
+  getSetting<T = unknown>(key: string): T | null {
+    const row = this.sqlite.query("SELECT value FROM settings WHERE key = ?").get(key) as { value: string | null } | null;
+    return row ? (parseJson(row.value) as T) : null;
+  }
+
+  setSetting(key: string, value: unknown): void {
+    this.sqlite.query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value")
+      .run(key, JSON.stringify(value));
+  }
+
+  /** Scheduling for this project (§8): off until `croft schedule on`. A pause whose pausedUntil has passed reads
+   *  as on. */
+  getScheduling(): SchedulingSetting {
+    const v = this.getSetting<SchedulingSetting>("scheduling");
+    if (!v || (v.state !== "on" && v.state !== "off" && v.state !== "paused")) return { state: "off", via: null };
+    const via = v.via === "os-job" || v.via === "serve" ? v.via : null;
+    if (v.state === "paused" && typeof v.pausedUntil === "string" && Date.parse(v.pausedUntil) <= this.now().getTime()) {
+      return { state: "on", via };
+    }
+    return v.state === "paused" ? { state: "paused", via, pausedUntil: v.pausedUntil ?? null } : { state: v.state, via };
+  }
+
+  setScheduling(s: SchedulingSetting): void {
+    this.setSetting("scheduling", s);
   }
 
   // ---- catalog mirror of _croft.* (DuckDB wins on disagreement) ----

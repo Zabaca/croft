@@ -42,6 +42,8 @@ export interface CommandSpec {
   /** human() prints every problem itself, next to what it is about (doctor puts each under its section,
    *  §2), so main.ts does not append the standard problem blocks. Next lines are still appended. */
   humanShowsProblems?: boolean;
+  /** An internal command croft runs itself (`tick`): it runs, but help and did-you-mean leave it out. */
+  hidden?: boolean;
 }
 
 export interface Command<T = unknown> extends CommandSpec {

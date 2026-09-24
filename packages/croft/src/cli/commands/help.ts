@@ -40,13 +40,13 @@ export const help: Command<HelpData> = {
     const globalOptions = optionHelp(GLOBAL_OPTIONS);
     const name = ctx.positionals[0];
     if (name === undefined) {
-      const commands = [...ctx.commands].sort((a, b) => a.name.localeCompare(b.name))
+      const commands = ctx.commands.filter((c) => !c.hidden).sort((a, b) => a.name.localeCompare(b.name))
         .map((c) => ({ name: c.name, summary: c.summary, usage: c.usage }));
       return { data: { commands, globalOptions }, problems: [], next: [] };
     }
     const cmd = ctx.commands.find((c) => c.name === name);
     if (!cmd) {
-      const guess = didYouMean(name, ctx.commands.map((c) => c.name));
+      const guess = didYouMean(name, ctx.commands.filter((c) => !c.hidden).map((c) => c.name));
       throw new CroftError("USAGE_ERROR", {
         message: `there is no command "${name}"`,
         hint: guess ? `did you mean "croft help ${guess}"?` : "croft help lists every command",

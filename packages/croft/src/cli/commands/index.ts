@@ -48,6 +48,7 @@ const run = lazyCommand({
     follow: { type: "string", value: "<dur>", description: "off a terminal: how long to follow the detached run before returning exit 6 (default 100s)" },
     "no-wait": { type: "boolean", description: "exit 4 at once when an asset or the database is busy, instead of waiting" },
     events: { type: "boolean", description: "NDJSON progress events on stderr" },
+    due: { type: "boolean", hidden: true, description: "only scheduled work that is due, skipping held assets (set by croft tick)" },
     "run-id": { type: "string", value: "<id>", hidden: true, description: "the run id a detached run was given (set by croft)" },
     detached: { type: "boolean", hidden: true, description: "marks the detached child of a run (set by croft)" },
     // No option carries a confirmation token: only `croft confirm <token>` carries one out (§6), handing it
@@ -159,6 +160,38 @@ const confirm = lazyCommand({
   maxPositionals: 1,
 }, async () => (await import("./confirm.ts")).confirm);
 
+const schedule = lazyCommand({
+  name: "schedule",
+  summary: "turn scheduled runs on or off, pause them, or show when each ingest runs next",
+  usage: "croft schedule on|off|status|pause [--for 2h] [--no-os-job]",
+  options: {
+    for: { type: "string", value: "<dur>", description: "with pause: resume on its own after this long (e.g. 2h, 30m)" },
+    "no-os-job": { type: "boolean", description: "with on: record scheduling as on without installing the per-user OS job (croft serve ticks instead)" },
+  },
+  maxPositionals: 1,
+}, async () => (await import("./schedule.ts")).schedule);
+
+const serve = lazyCommand({
+  name: "serve",
+  summary: "a read-only HTTP query server for apps that steps aside for every write, with the scheduler built in",
+  usage: "croft serve [--host 127.0.0.1] [--port 7447]",
+  options: {
+    host: { type: "string", value: "<host>", description: "the address to listen on (default 127.0.0.1; anything else needs an HTTPS proxy in front)" },
+    port: { type: "string", value: "<port>", description: "the port to listen on (default 7447)" },
+  },
+  maxPositionals: 0,
+}, async () => (await import("./serve.ts")).serve);
+
+const tick = lazyCommand({
+  name: "tick",
+  summary: "one scheduler tick for this project: start the due work, then exit (run every minute by croft itself)",
+  usage: "croft tick",
+  options: {},
+  maxPositionals: 0,
+  hidden: true,
+}, async () => (await import("./tick.ts")).tick);
+
 export const COMMANDS: readonly Command[] = [
   docs, help, version, init, doctor, validate, preview, run, wait, status, query, describe, context, logs, secrets, confirm,
+  schedule, serve, tick,
 ];

@@ -14,7 +14,7 @@ import { relative } from "node:path";
 import ts from "typescript";
 import { sourceFiles, SRC } from "../agent/contract-testkit.ts";
 import { CODES, type Code, isCode } from "./errors.ts";
-import { PHASE } from "./phase.ts";
+import { PHASE, PHASE_COMPLETE } from "./phase.ts";
 
 /** Codes no source raises yet, with the phase (DESIGN.md §11) that raises them. */
 const NOT_YET_RAISED: Partial<Record<Code, number>> = {
@@ -90,10 +90,12 @@ type T = "UNDECLARED_INPUT"; const m = { "QUOTE_IDENTIFIER": 1 };`;
     expect(missing).toEqual([]);
   });
 
-  test("a listed code is registered, and comes in a phase after this one", () => {
+  test("a listed code is registered, and comes in a phase after this one (or this one, while it is being built)", () => {
+    const first = PHASE_COMPLETE ? PHASE + 1 : PHASE;
     for (const [code, phase] of Object.entries(NOT_YET_RAISED)) {
       expect(isCode(code), code).toBe(true);
-      expect(phase, `${code} is listed for phase ${phase}, but this build is phase ${PHASE}: raise it`).toBeGreaterThan(PHASE);
+      expect(phase, `${code} is listed for phase ${phase}, but this build is phase ${PHASE}${PHASE_COMPLETE ? " (complete)" : ""}: raise it`)
+        .toBeGreaterThanOrEqual(first);
     }
   });
 

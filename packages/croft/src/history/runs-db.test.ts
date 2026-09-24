@@ -33,6 +33,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   tick: ["id", "pid", "proc_start", "heartbeat_at"],
   confirmations: ["token", "command", "impact", "impact_hash", "created_at", "expires_at", "used_at"],
   catalog: ["asset", "json", "source", "refreshed_at"],
+  settings: ["key", "value"],
 };
 
 describe("schema", () => {
@@ -383,5 +384,31 @@ describe("approved code (the scheduler hold, §6)", () => {
     expect(db.approvedCode("zones")).toBe("h2");
     expect(db.sqlite.query("SELECT phrase FROM schedule_state WHERE asset = 'zones'").get()).toEqual({ phrase: "every hour" });
     expect(db.approvedCode("other")).toBeNull();
+  });
+});
+
+describe("settings and scheduling (§8)", () => {
+  test("scheduling is off until set; a setting survives reopening", () => {
+    expect(db.getScheduling()).toEqual({ state: "off", via: null });
+    db.setScheduling({ state: "on", via: "os-job" });
+    expect(db.getScheduling()).toEqual({ state: "on", via: "os-job" });
+    db.close();
+    db = RunsDb.open(dir, { now: () => new Date(clock) });
+    expect(db.getScheduling()).toEqual({ state: "on", via: "os-job" });
+    expect(db.getSetting("nothing")).toBeNull();
+  });
+
+  test("a pause with an end reads as paused until then, and as on after", () => {
+    db.setScheduling({ state: "paused", via: "serve", pausedUntil: "2026-09-22T19:00:00.000Z" });
+    expect(db.getScheduling()).toEqual({ state: "paused", via: "serve", pausedUntil: "2026-09-22T19:00:00.000Z" });
+    clock = Date.parse("2026-09-22T19:00:00.000Z");
+    expect(db.getScheduling()).toEqual({ state: "on", via: "serve" });
+  });
+
+  test("an open-ended pause stays paused; junk reads as off", () => {
+    db.setScheduling({ state: "paused", via: "os-job" });
+    expect(db.getScheduling()).toEqual({ state: "paused", via: "os-job", pausedUntil: null });
+    db.setSetting("scheduling", { state: "sideways" });
+    expect(db.getScheduling()).toEqual({ state: "off", via: null });
   });
 });
