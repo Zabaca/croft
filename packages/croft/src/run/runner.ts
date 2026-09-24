@@ -28,6 +28,16 @@
 //                   discarded, the run marked interrupted, exit 130
 //   finishRun       the whole command result goes into runs.summary, so a detached run's parent and
 //                   `croft wait` print exactly what an in-process run prints
+//   after the run   a run that committed a write refreshes the read copy (db/readcopy.ts); a scheduled run with
+//                   failed steps notifies (schedule/notify.ts). Both are awaited and never fail the run
+//
+// A scheduled run (trigger "schedule", `croft run --due`, §8) differs: nobody is asked anything and no code is
+// approved (human false); the plan's holds (SCHEDULE_HELD, LARGE_REPROCESS, paused, leased) skip their steps, and
+// what reads them, even when their code does not load; an asset another run holds is skipped, not waited for
+// (overlaps skip; it stays due); the cost guard holds a transform (LARGE_REPROCESS, recorded so the tick leaves it
+// alone until a person runs it) instead of failing it; the database lock is waited for up to 30 min; and each
+// step's start records schedule_state.last_attempt_at, and the fire a due ingest handles as its last_fire_at, before
+// any of its work, so a crash never makes the scheduler start it again every minute.
 //
 // Every step writes <state>/logs/<run>/<asset>.log; the run writes <state>/logs/<run>/events.ndjson, which
 // --events copies to stderr and `croft wait` reads for progress.
@@ -41,7 +51,7 @@ import type { ExampleResult } from "../project/init.ts";
 import { Confirmations } from "../safety/confirm.ts";
 import { openWarehouse, type DuckWarehouse } from "../db/warehouse.ts";
 import { allCatalog, type CatalogAsset, getCatalog } from "../history/catalog.ts";
-import { acquire, release } from "../history/leases.ts";
+import { acquire, release, tryAcquire } from "../history/leases.ts";
 import { logDir, logPath, NOT_STARTED_RECORD, openLog, type LogWriter, writeRunRecord } from "../history/logs.ts";
 import { reconcile } from "../history/reconcile.ts";
 import { RunsDb, type RunStatus, type RunTrigger } from "../history/runs-db.ts";
@@ -52,6 +62,8 @@ import { currentDatabase, isReservedColumn, quoteIdent, tableRef } from "../load
 import type { CheckHookResult, WriteBatchInput } from "../load/write.ts";
 import { outsideCapture, setOutputRedactor } from "../core/output.ts";
 import { now as clockNow } from "../core/time.ts";
+import { refreshReadCopy } from "../db/readcopy.ts";
+import { notifyScheduledFailure, type ScheduledFailure } from "../schedule/notify.ts";
 import { discoverAssets } from "../project/discover.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { loadProject, type Project } from "../project/root.ts";
@@ -81,6 +93,15 @@ export function retryAfterOf(p: Problem): number | null {
 
 /** Lease waits: off a TTY every wait is capped at 90 s (§5 "Default waits"); on a TTY a run waits 10 min. */
 export const LEASE_WAIT_MS = { offTty: 90_000, tty: 600_000 } as const;
+
+/** A scheduled run waits this long for the database lock (§5 "Default waits": scheduled writes wait 30 min). */
+export const SCHEDULED_LOCK_WAIT_MS = 30 * 60_000;
+
+/** What happens after a run ends (both no-ops until their phase-3 builders land; tests replace them). */
+export interface RunHooks {
+  refreshReadCopy?: (root: string) => Promise<void>;
+  notifyScheduledFailure?: (root: string, failure: ScheduledFailure) => Promise<void>;
+}
 
 export interface Next { command: string; reason: string }
 
@@ -146,6 +167,8 @@ export interface RunnerOptions {
   fault?: string;
   plan?: RunPlan;
   now?: () => Date;
+  /** Replace the after-run hooks (tests). */
+  hooks?: RunHooks;
 }
 
 /**
@@ -418,6 +441,9 @@ function nextSteps(steps: StepResult[], problems: Problem[], deferred: ReadonlyM
   return next;
 }
 
+/** Codes whose warning a held step carries (the plan's --due holds). */
+const HOLD_CODES: ReadonlySet<string> = new Set(["SCHEDULE_HELD", "LARGE_REPROCESS"]);
+
 /** Why a held step does not run (PlannedStep.hold). */
 const HOLD_WORDS: Record<Hold, string> = {
   code_not_run_by_hand: "held: its code has not been run by hand yet",
@@ -437,6 +463,36 @@ const NO_ROWS_STAMP = "1970-01-01T00:00:00.000000Z";
  * for problems before the run exists (a broken croft.json, an unknown selector).
  */
 export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
+  const out = await runSteps(o);
+  await afterRun(o, out);
+  return out;
+}
+
+/**
+ * The hooks at the end of a run, once the warehouse is closed: the read copy after a run that committed a write, and
+ * a scheduled run's failure notification. Each is awaited; neither can fail the run.
+ */
+async function afterRun(o: RunnerOptions, out: RunOutcome): Promise<void> {
+  const root = o.project.root;
+  const quietly = async (fn: () => Promise<void>) => {
+    try {
+      await fn();
+    } catch {
+      // The run's result stands; a hook's trouble is the hook's.
+    }
+  };
+  if (out.data.steps.some((s) => s.status === "ok")) {
+    await quietly(() => (o.hooks?.refreshReadCopy ?? refreshReadCopy)(root));
+  }
+  if (o.trigger === "schedule") {
+    const failed = out.data.steps.filter((s) => s.status === "failed").map((s) => ({ asset: s.asset, error: s.error ?? null }));
+    if (failed.length > 0) {
+      await quietly(() => (o.hooks?.notifyScheduledFailure ?? notifyScheduledFailure)(root, { project: root, runId: out.data.runId, failed }));
+    }
+  }
+}
+
+async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
   const { project, env } = o;
   const paths = project.paths;
   // Asset output that escapes its step's scope reaches stderr redacted with this project's .env (core/output.ts).
@@ -446,6 +502,7 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
   let warehouse: DuckWarehouse | undefined;
   try {
     const interactive = o.interactive === true;
+    const scheduled = o.trigger === "schedule";
     // Everything that can refuse the command happens before the run exists: a refusal is never a run or a
     // failed step. A detached child records it for its parent and `croft wait` (recordNotStarted).
     let plan: RunPlan;
@@ -462,8 +519,9 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
       warehouse = openWarehouse({
         path: paths.database, mode: "read_write", timezone: project.timezone, root: project.root, stateDir: paths.stateDir,
         isTTY: interactive, ...(o.runId ? { runId: o.runId } : {}),
-        // --no-wait: a held database file is exit 4 at once, like a held asset.
-        ...(o.noWait ? { waits: { offTtyMs: 0, ttyReadMs: 0, ttyWriteMs: 0 } } : {}),
+        // --no-wait: a held database file is exit 4 at once, like a held asset. A scheduled run waits 30 min.
+        ...(o.noWait ? { waits: { offTtyMs: 0, ttyReadMs: 0, ttyWriteMs: 0 } }
+          : scheduled ? { waits: { offTtyMs: SCHEDULED_LOCK_WAIT_MS, ttyReadMs: SCHEDULED_LOCK_WAIT_MS, ttyWriteMs: SCHEDULED_LOCK_WAIT_MS } } : {}),
         lookupHolder: (pid) => {
           const h = runs.getLockHolder();
           return h && h.pid === pid ? h : null;
@@ -493,6 +551,10 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
 
     const problems: Problem[] = [...rec.problems, ...plan.problems];
     const results = new Map<string, StepResult>();
+    /** A scheduled run: assets another run held when this one took its leases (overlaps skip, §8), by holder. */
+    const leasedBy = new Map<string, string>();
+    /** A scheduled run: steps the cost guard held (LARGE_REPROCESS), instead of failing them. */
+    const heldByGuard = new Set<string>();
     const confirms = new ConfirmState();
     const order = runOrder(plan);
     const byName = new Map(plan.steps.map((s) => [s.asset, s]));
@@ -545,8 +607,17 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
     };
 
     try {
-      // Leases: all or nothing.
-      if (runnable.length > 0) {
+      // Leases: all or nothing. A scheduled run never waits: what another run holds is skipped and stays due, and
+      // the run takes the rest.
+      if (runnable.length > 0 && scheduled) {
+        let wanted = runnable.map((s) => s.asset);
+        for (;;) {
+          const r = tryAcquire(runs, wanted, runId);
+          if (r.ok) break;
+          for (const b of r.busy) leasedBy.set(b.asset, b.runId);
+          wanted = wanted.filter((a) => !leasedBy.has(a));
+        }
+      } else if (runnable.length > 0) {
         try {
           await acquire(runs, runnable.map((s) => s.asset), runId, {
             waitMs: interactive ? LEASE_WAIT_MS.tty : LEASE_WAIT_MS.offTty, noWait: o.noWait === true, signal: runSignal,
@@ -568,6 +639,7 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
         const asset = step.asset;
         const codeHash = codeHashOf(step);
         const log = openLog(paths.stateDir, runId, asset, { redact: (t) => env.redact(t) });
+        if (scheduled) recordAttempt(runs, step, attempt, (o.now ?? clockNow)());
         runs.startStep({ runId, asset, attempt, reason: step.reason, ...(codeHash ? { codeHash } : {}), logPath: logPath(paths.stateDir, runId, asset) });
         // What the asset's top-level code printed when the plan imported it (core/output.ts).
         if (attempt === 1) for (const line of step.output ?? []) log.write(line);
@@ -623,6 +695,22 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
         } catch (e) {
           const err = croftError(e) ?? internal(e);
           const p: Problem = { ...err.problem, asset: err.problem.asset ?? asset, runId };
+          // The cost guard in a scheduled run: nobody can say yes, so the transform is held until a person runs it.
+          // The step is recorded skipped with the guard's problem, which the tick reads (schedule/due.ts).
+          if (scheduled && p.code === "LARGE_REPROCESS") {
+            const held: Problem = { ...p, severity: "warning" };
+            const why = `held (LARGE_REPROCESS): ${p.message}; a person has to run it: croft run ${asset}`;
+            runs.finishStep(runId, asset, attempt, { status: "skipped", reason: why, error: redactValue(jsonSafe(held), env) });
+            log.write(`skipped: ${why}`);
+            heldByGuard.add(asset);
+            const result: StepResult = {
+              asset, status: "skipped", reason: step.reason, skippedBecause: why, behavior: step.behavior, attempt, maxAttempts,
+              rows: emptyRows(getCatalog(runs, asset)?.rows ?? 0), schemaChanges: [], checks: [], logsCommand: `croft logs ${asset}`,
+              durationMs: Date.now() - started,
+            };
+            events.emit({ type: "step", runId, asset, attempt, status: "skipped", result });
+            return { ok: true as const, out: { result, warnings: [held], problems: [] } };
+          }
           const interrupted = p.code === "INTERRUPTED";
           runs.finishStep(runId, asset, attempt, { status: interrupted ? "interrupted" : "failed", error: redactValue(jsonSafe(p), env) });
           log.write(`${p.code}: ${p.message}${p.hint ? `\nhint: ${p.hint}` : ""}`);
@@ -719,15 +807,21 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
           if (unbuilt) problems.push({ ...unbuilt, asset: unbuilt.asset ?? asset, runId });
           return null;
         }
+        // A held step runs nothing, even when its code does not load (the scheduler met an edit in progress): the
+        // hold is the news, with its problem as a warning.
+        if (step.hold || leasedBy.has(asset)) {
+          const hp = step.problems.find((p) => HOLD_CODES.has(p.code) && p.severity !== "error");
+          const held = hp ? `held (${hp.code}): ${step.reason.replace(/^held: /, "")}`
+            : step.hold ? (step.reason.startsWith("held: ") ? step.reason : HOLD_WORDS[step.hold] ?? `held: ${step.hold}`)
+            : `held: run ${leasedBy.get(asset)} holds it; it stays due`;
+          skipped(step, held);
+          if (hp) problems.push({ ...hp, asset: hp.asset ?? asset, runId });
+          return `input ${asset} is ${held}`;
+        }
         const errors = loadErrors(step);
         if (errors.length > 0) {
           failLoad(step, errors);
           return `input ${asset} failed (${runId})`;
-        }
-        if (step.hold) {
-          const held = HOLD_WORDS[step.hold] ?? `held: ${step.hold}`;
-          skipped(step, held);
-          return `input ${asset} is ${held}`;
         }
         const interrupted = () => {
           skipped(step, "the run was interrupted before this step started");
@@ -754,6 +848,7 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
         }
         const r = results.get(asset);
         if (!r || r.status === "failed") return `input ${asset} failed (${runId})`;
+        if (r.status === "skipped" && heldByGuard.has(asset)) return `input ${asset} is held (LARGE_REPROCESS)`;
         if (r.status === "skipped") {
           const pending = confirms.pending?.impact.asset === asset && !confirms.deferred.has(asset) ? confirms.pending : undefined;
           return pending ? `input ${asset} is waiting for confirmation ${pending.token}` : `input ${asset} needs a confirmation first`;
@@ -843,6 +938,21 @@ function readText(path: string): string {
 /** The code hash a step runs: the loaded TS module's, or the SQL file's fingerprint. */
 function codeHashOf(step: PlannedStep): string | undefined {
   return step.codeHash ?? step.sql?.codeHash;
+}
+
+/**
+ * A scheduled step's attempt starts (§8): last_attempt_at, and on its first attempt the fire a due ingest handles as
+ * last_fire_at (never moved back). Before any of its work, so a step that crashes is not started again every minute.
+ * runs.sqlite trouble never stops the step.
+ */
+function recordAttempt(runs: RunsDb, step: PlannedStep, attempt: number, now: Date): void {
+  try {
+    const had = runs.scheduleState(step.asset)?.lastFireAt ?? null;
+    const fire = attempt === 1 && step.fire && (had === null || step.fire > had) ? step.fire : undefined;
+    runs.putScheduleState(step.asset, { lastAttemptAt: now.toISOString(), ...(fire ? { lastFireAt: fire } : {}) });
+  } catch {
+    // The run goes ahead; the tick's own record of the fire stands.
+  }
 }
 
 /**
