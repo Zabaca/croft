@@ -152,7 +152,9 @@ export const PASS_THROUGH_ENV = [
   "USER", "LOGNAME", "LANG",
   "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR",
   "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "AWS_PROFILE", "AWS_REGION", "ANTHROPIC_VERTEX_PROJECT_ID", "CLOUD_ML_REGION",
-  "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy",
+  "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy",
+  // A TLS-inspecting proxy's CA: without it the session cannot reach the API through the proxy.
+  "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE",
 ] as const;
 
 type ParentEnv = Record<string, string | undefined>;
@@ -172,14 +174,46 @@ export function croftEnv(binDir: string, parent: ParentEnv = process.env): Recor
   };
 }
 
-/** The session's environment: croftEnv plus the pass-through list. Real HOME: Claude Code's login lives there. */
+/** Nested-session markers and croft's own settings: never inherited by a session. */
+const NEVER_INHERIT = /^(CLAUDECODE|CLAUDE_CODE_(ENTRYPOINT|SESSION_ID|CHILD_SESSION|SESSION_ATTENDED|EXECPATH|MESSAGING_.*)|CLAUDE_PID|CMUX_.*|CROFT_.*)$/;
+
+/**
+ * The session's environment: croftEnv plus the pass-through list. Real HOME: Claude Code's login lives there.
+ * CROFT_EVAL_INHERIT_ENV=1 starts from the whole calling environment instead (minus nested-session markers and
+ * CROFT_* settings), for machines whose Claude Code authenticates through something the list does not name,
+ * such as a sandbox proxy.
+ */
 export function agentEnv(binDir: string, parent: ParentEnv = process.env): Record<string, string> {
-  const env = croftEnv(binDir, parent);
+  const env: Record<string, string> = {};
+  if (parent.CROFT_EVAL_INHERIT_ENV === "1") {
+    for (const [k, v] of Object.entries(parent)) if (v !== undefined && !NEVER_INHERIT.test(k)) env[k] = v;
+  }
+  Object.assign(env, croftEnv(binDir, parent));
   for (const k of PASS_THROUGH_ENV) {
     const v = parent[k];
     if (v !== undefined && v !== "") env[k] = v;
   }
   return env;
+}
+
+/**
+ * The claude executable a session runs: CROFT_EVAL_CLAUDE when set, else the first `claude` on PATH that is not
+ * a shell-script wrapper. Terminal apps (cmux, for one) put a bash shim named claude first on PATH that looks
+ * `claude` up again, and the session's PATH (agentEnv) is too short for it to find the real one.
+ */
+export function findClaude(env: ParentEnv = process.env): string | null {
+  if (env.CROFT_EVAL_CLAUDE) return env.CROFT_EVAL_CLAUDE;
+  let first: string | null = null;
+  for (const dir of (env.PATH ?? "").split(":")) {
+    if (!dir) continue;
+    const p = join(dir, "claude");
+    if (!existsSync(p)) continue;
+    first ??= p;
+    let head = "";
+    try { head = readFileSync(p).subarray(0, 64).toString("latin1"); } catch { continue; }
+    if (!/^#!.*\b(ba|z)?sh\b/.test(head.split("\n")[0] ?? "")) return p;
+  }
+  return first;
 }
 
 export interface AgentOptions {
@@ -421,7 +455,7 @@ export function taskPrompt(task: EvalTask): string {
 
 /** Run one headless session in the fixture. Never throws for what the session does; throws if claude is missing. */
 export async function runAgent(f: Fixture, prompt: string, o: AgentOptions = {}): Promise<AgentRun> {
-  const bin = o.claudeBin ?? Bun.which("claude");
+  const bin = o.claudeBin ?? findClaude();
   if (!bin) throw new Error("claude is not on PATH: install Claude Code, or pass the executable's path");
   const started = performance.now();
   const proc = Bun.spawn([bin, ...claudeArgs(prompt, o)], {
@@ -487,7 +521,7 @@ export interface TaskResult {
 export async function runTask(task: EvalTask, o: AgentOptions & { keep?: boolean; tmpRoot?: string } = {}): Promise<TaskResult> {
   const empty: TaskResult = { task: task.name, pass: false, verdict: null, score: null, agent: null, apiRequests: 0, diff: null, transcript: null, fixture: null, error: null };
   // Before the fixture: a missing claude is a harness error, found without setting anything up.
-  const bin = o.claudeBin ?? Bun.which("claude");
+  const bin = o.claudeBin ?? findClaude();
   if (!bin || !existsSync(bin)) return { ...empty, error: `claude not found: ${bin ?? "no claude on PATH"}` };
   o = { ...o, claudeBin: bin };
   let f: Fixture;

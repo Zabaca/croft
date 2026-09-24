@@ -6,7 +6,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  AGENT_TIMEOUT_MS, agentEnv, AWAY_NOTE, claudeArgs, croftEnv, Fixture, MAX_TURNS, mockApi, runAgent, runTask, taskPrompt, writeShims,
+  AGENT_TIMEOUT_MS, agentEnv, AWAY_NOTE, claudeArgs, croftEnv, findClaude, Fixture, FIXTURE_TZ, MAX_TURNS, mockApi, runAgent, runTask, taskPrompt, writeShims,
 } from "./harness.ts";
 import { parseOptions, resultLine, resultsBase, summarize } from "./run.ts";
 import { TASKS } from "./tasks/index.ts";
@@ -203,5 +203,44 @@ describe("evals/run.ts options and results", () => {
     expect(resultsBase(out, "local", day)).toBe(join(out, "2026-09-24-local-2"));
     mkdirSync(join(out, "2026-09-24-local-2"));
     expect(resultsBase(out, "local", day)).toBe(join(out, "2026-09-24-local-3"));
+  });
+});
+
+describe("findClaude", () => {
+  test("skips a shell-script shim named claude for the real executable after it on PATH", () => {
+    const dir = mkdtempSync(join(tmpdir(), "croft-findclaude-"));
+    try {
+      const shim = join(dir, "shim"), real = join(dir, "real");
+      mkdirSync(shim); mkdirSync(real);
+      writeFileSync(join(shim, "claude"), "#!/usr/bin/env bash\nexec claude \"$@\"\n", { mode: 0o755 });
+      writeFileSync(join(real, "claude"), "\x7fELF binary", { mode: 0o755 });
+      expect(findClaude({ PATH: `${shim}:${real}` })).toBe(join(real, "claude"));
+      expect(findClaude({ PATH: shim })).toBe(join(shim, "claude"));
+      expect(findClaude({ PATH: shim, CROFT_EVAL_CLAUDE: "/x/claude" })).toBe("/x/claude");
+      expect(findClaude({ PATH: "" })).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("agentEnv with CROFT_EVAL_INHERIT_ENV=1", () => {
+  test("inherits the calling environment minus session markers and croft settings; croft's own values win", () => {
+    const env = agentEnv("/bin-dir", {
+      CROFT_EVAL_INHERIT_ENV: "1", HOME: "/h", PATH: "/usr/local/bin", SOME_PROXY_TOKEN: "t", CLAUDECODE: "1",
+      CLAUDE_CODE_SESSION_ID: "s", CMUX_CLAUDE_PID: "9", CROFT_NOW: "2026-01-01T00:00:00Z", TZ: "UTC",
+    });
+    expect(env.SOME_PROXY_TOKEN).toBe("t");
+    expect(env.CLAUDECODE).toBeUndefined();
+    expect(env.CLAUDE_CODE_SESSION_ID).toBeUndefined();
+    expect(env.CMUX_CLAUDE_PID).toBeUndefined();
+    expect(env.CROFT_NOW).toBeUndefined();
+    expect(env.CROFT_FORBID_OS_JOBS).toBe("1");
+    expect(env.TZ).toBe(FIXTURE_TZ);
+    expect(env.PATH!.startsWith("/bin-dir:")).toBe(true);
+  });
+
+  test("without it, nothing outside the list is inherited", () => {
+    expect(agentEnv("/bin-dir", { HOME: "/h", SOME_PROXY_TOKEN: "t" }).SOME_PROXY_TOKEN).toBeUndefined();
   });
 });

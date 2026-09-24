@@ -18,7 +18,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { AGENT_TIMEOUT_MS, exec, MAX_TURNS, PKG, runTask, type TaskResult } from "./harness.ts";
+import { AGENT_TIMEOUT_MS, exec, findClaude, MAX_TURNS, PKG, runTask, type TaskResult } from "./harness.ts";
 import type { StreamEvent } from "./score.ts";
 import { TASKS, taskNamed } from "./tasks/index.ts";
 
@@ -162,7 +162,7 @@ export async function main(argv: string[]): Promise<number> {
     for (const t of TASKS) process.stdout.write(`${t.name.padEnd(16)} ${t.summary}\n`);
     return 0;
   }
-  const claude = o.claude ?? Bun.which("claude");
+  const claude = o.claude ?? findClaude();
   if (!claude) {
     process.stderr.write("claude is not on PATH: install Claude Code, or pass --claude <path>\n");
     return 2;
