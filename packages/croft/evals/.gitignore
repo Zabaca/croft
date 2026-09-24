@@ -1,0 +1,2 @@
+# Session transcripts (raw stream-json, large); the results/<date>-<tag>.json summaries stay trackable.
+results/*/
