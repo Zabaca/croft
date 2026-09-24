@@ -8,30 +8,39 @@
 //   changed or was replaced, its code changed), and every asset with a static error, so it fails visibly;
 // - named assets (names or globs): those, stale or not;
 // - --upstream: also what they need first, directly or not, that is stale (an ingest only when it was never
-//   built): what they read, and the tables their checks read (§3f); and the transforms among them whose own
-//   input the run refreshes;
+//   built): what they read, and the tables their blocking checks read (§3f); and the transforms among them whose
+//   own input the run refreshes;
+// - an SQL input of an SQL asset the run takes, when that input is stale and its new output differs from its
+//   table (or it was never built): validate binds SQL against the new output of the SQL it reads (§6), so the run
+//   rebuilds such an input first, and the reader reads what validate checked (an edit that adds a column upstream
+//   and uses it downstream). One whose columns did not change, or whose new SQL does not bind, is left as it is;
 // - then, unless --only, every transform downstream of an asset the run takes: its input may have new rows.
 //   The runner checks staleness again just before each transform, so one whose inputs did not change is left
 //   alone.
 //
 // Actions: fetch (an ingest), rebuild (an SQL or full-refresh TS transform), update (an incremental TS
 // transform), skip (with --from, as the runner skips: every transform, and in a bare run or a glob the ingests
-// it does not apply to). Reasons say why. A code hash that changed only because croft.json's timezone did is
-// "time zone changed", not an edit (project/resolve.ts timeZoneChanged).
+// it does not apply to; and a transform that reads an asset never built that the run does not build either, with
+// INPUT_NOT_BUILT naming the run that builds it, rather than a failure with "no table named …"). Reasons say
+// why. A code hash that changed only because croft.json's timezone did is "time zone changed", not an edit
+// (project/resolve.ts timeZoneChanged).
 //
 // A static error (a load error, CHECK_INVALID, CYCLE, a bind error) is a problem of its own step: that step
-// fails before it runs, and the rest of the run goes ahead. So is a check that reads a table never built that
-// the run does not build first (unbuiltCheckTables): it names the table. The bind check (project/resolve.ts
-// bindProject) binds each SQL asset against the columns the catalog mirror has for what it reads, or against the
-// output of an SQL input the run rebuilds first. When an input the run refreshes first (an ingest, a TS
-// transform) could still change those columns, only the errors a new column cannot fix count
-// (INPUT_INDEPENDENT); the step reports any other when it runs.
+// fails before it runs, and the rest of the run goes ahead. So is a blocking check that reads a table never built
+// that the run does not build first (unbuiltCheckTables): it names the table. A warning never blocks and does not
+// order the steps: one whose table will not exist when it runs (never built, or built later in this run) is left
+// out of the step, with an info note. The bind check (project/resolve.ts bindProject) binds each SQL asset
+// against the columns the catalog mirror has for what it reads, or against the output of an SQL input the run
+// rebuilds first. When an input the run refreshes first (an ingest, a TS transform) could still change those
+// columns, only the errors a new column cannot fix count (INPUT_INDEPENDENT); the step reports any other when it
+// runs.
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { CroftError, problem } from "../core/errors.ts";
 import type { Check, CursorType, Hold, Incremental, Problem, Reason, WriteMode } from "../core/types.ts";
 import { allCatalog, type CatalogAsset } from "../history/catalog.ts";
 import { RUNS_DB_FILE, RunsDb } from "../history/runs-db.ts";
+import { isReservedColumn } from "../load/evolve.ts";
 import type { Graph } from "../project/graph.ts";
 import {
   behaviorHash, behaviorLabel, bindProject, isGlob, neededBy, type ProjectBind, type ResolvedAsset, resolveProject, stepKindOf,
@@ -59,6 +68,9 @@ export interface PlannedStep {
   /** Why the step runs, or why it is skipped, in words: "requested", "requested; SQL changed (assets/x.sql)",
    *  "input github_issues may have new rows". Run output shows it under the step when it is not "requested". */
   reason: string;
+  /** An SQL input the run takes only because these SQL assets of the run read its new output (its columns
+   *  changed, or it was never built): it is rebuilt first, so they read what validate checked. */
+  neededBy?: string[];
   /** Load problems. Any error makes the step fail without running (the other steps still run). */
   problems: Problem[];
   loaded?: LoadedTsAsset;
@@ -67,11 +79,13 @@ export interface PlannedStep {
   sql?: LoadedSqlAsset;
   /** The assets it reads: an SQL asset's AST and plan dependencies, a TS transform's `inputs`. [] for ingests. */
   inputs: string[];
-  /** What runs before it: its inputs plus the tables its checks read in subqueries (they only order). */
+  /** What runs before it: its inputs plus the tables its blocking checks read in subqueries (they only order).
+   *  A warning's tables are not here: it runs after the commit, against the tables as they are. */
   orderAfter: string[];
   /** The assets that read it (project/graph.ts readBy). */
   readBy: string[];
-  /** Its checks and warnings, parsed (checks/parse.ts), a key's implied unique and not_null first. */
+  /** Its checks and warnings, parsed (checks/parse.ts), a key's implied unique and not_null first. A warning whose
+   *  table will not exist when it runs is left out (its INPUT_NOT_BUILT info note says so). */
   checks: Check[];
   /** TS transforms: the code makes requests (ctx.http, fetch, an HTTP or LLM package): the cost guard applies
    *  to incremental ones, TRANSFORM_MAKES_REQUESTS to full-refresh ones. */
@@ -208,8 +222,9 @@ export function fileDirsOf(root: string, config: Pick<FileIngest, "file">): stri
   return out;
 }
 
-/** Why the run takes an asset: the Reason codes, and the inputs that run before it in the same run. */
-interface Taken { reasons: Set<Reason>; feeding: string[] }
+/** Why the run takes an asset: the Reason codes, the inputs that run before it in the same run, and the SQL
+ *  assets that read its new output (it was taken for them: see reshaped). */
+interface Taken { reasons: Set<Reason>; feeding: string[]; readers: string[] }
 
 /** What choose() needs to know about the project. */
 interface Scope {
@@ -219,19 +234,23 @@ interface Scope {
   stale: (name: string) => Reason[];
   /** On a cycle: a static error that no load problem shows. */
   onCycle: ReadonlySet<string>;
+  /** An SQL asset that is stale, and whose new output (bound as validate binds it) differs from the columns of its
+   *  table, or that was never built: what reads it must read its new output. */
+  reshaped: (name: string) => boolean;
 }
 
 const isTransform = (a: ResolvedAsset) => a.kind === "sql" || a.kind === "ts";
 const hasErrors = (a: ResolvedAsset) => a.problems.some((p) => p.severity === "error");
 
 /** Which assets the run takes, and why (see the top of this file). Keys in no particular order. */
-function choose(s: Scope, selected: readonly string[], o: { bare: boolean; only: boolean; upstream: boolean }): Map<string, Taken> {
+function choose(s: Scope, selected: readonly string[], o: { bare: boolean; only: boolean; upstream: boolean; from: boolean }): Map<string, Taken> {
   const taken = new Map<string, Taken>();
   const take = (name: string, reasons: readonly Reason[], feeding: readonly string[] = []) => {
-    const t = taken.get(name) ?? { reasons: new Set<Reason>(), feeding: [] };
+    const t = taken.get(name) ?? { reasons: new Set<Reason>(), feeding: [], readers: [] };
     for (const r of reasons) t.reasons.add(r);
     for (const f of feeding) if (!t.feeding.includes(f)) t.feeding.push(f);
     taken.set(name, t);
+    return t;
   };
   const feedingOf = (name: string) => (s.inputs.get(name) ?? []).filter((x) => taken.has(x) && x !== name);
 
@@ -254,10 +273,17 @@ function choose(s: Scope, selected: readonly string[], o: { bare: boolean; only:
       }
     }
   }
-  if (!o.only) {
-    for (const name of s.graph.downstream([...taken.keys()])) {
-      const feeding = feedingOf(name);
-      if (feeding.length && s.byName.get(name)?.loaded) take(name, [...s.stale(name), "input_changed"], feeding);
+  // The SQL inputs whose new output an SQL asset the run takes must read (reshaped), then, unless --only, what
+  // reads anything taken; again until nothing more is taken, since an asset taken downstream may read another
+  // such input. A bare run takes every stale transform already, and under --from no transform runs.
+  for (let size = -1; size !== taken.size;) {
+    size = taken.size;
+    if (!o.bare && !o.from) pullReshaped(s, taken, take);
+    if (!o.only) {
+      for (const name of s.graph.downstream([...taken.keys()])) {
+        const feeding = feedingOf(name);
+        if (feeding.length && s.byName.get(name)?.loaded) take(name, [...s.stale(name), "input_changed"], feeding);
+      }
     }
   }
   // Every asset taken knows which of its inputs run before it (the --from rule, the reason's words); one that
@@ -269,8 +295,28 @@ function choose(s: Scope, selected: readonly string[], o: { bare: boolean; only:
   return taken;
 }
 
+/** Take the reshaped SQL inputs of every SQL asset taken, directly or through SQL taken for this reason, and note
+ *  which assets read their new output (the reason's words). */
+function pullReshaped(s: Scope, taken: Map<string, Taken>, take: (name: string, reasons: readonly Reason[]) => Taken): void {
+  const queue = [...taken.keys()];
+  while (queue.length) {
+    const reader = queue.pop()!;
+    if (s.byName.get(reader)?.kind !== "sql") continue;
+    for (const x of s.inputs.get(reader) ?? []) {
+      if (x === reader || !s.reshaped(x)) continue;
+      const had = taken.get(x);
+      if (had) {
+        if (had.readers.length && !had.readers.includes(reader)) had.readers.push(reader);
+        continue;
+      }
+      take(x, s.stale(x)).readers.push(reader);
+      queue.push(x);
+    }
+  }
+}
+
 /** What --upstream looks at: every asset the named ones need first, directly or not (what they read, and the
- *  tables their checks read, §3f: a check cannot run on a table never built), in run order. */
+ *  tables their blocking checks read, §3f: a check cannot run on a table never built), in run order. */
 function upstreamOf(s: Scope, selected: readonly string[]): string[] {
   const at = new Map(s.graph.order.map((n, i) => [n, i]));
   return neededBy(selected, (n) => [...(s.inputs.get(n) ?? []), ...(s.byName.get(n)?.orderAfter ?? [])].filter((x) => x !== n && s.byName.has(x)))
@@ -279,6 +325,11 @@ function upstreamOf(s: Scope, selected: readonly string[]): string[] {
 
 function sameKeys(a: ReadonlyMap<string, unknown>, b: ReadonlyMap<string, unknown>): boolean {
   return a.size === b.size && [...a.keys()].every((k) => b.has(k));
+}
+
+/** The same columns, in the same order, with the same types. */
+function sameColumns(a: readonly { name: string; type: string }[], b: readonly { name: string; type: string }[]): boolean {
+  return a.length === b.length && a.every((c, n) => c.name === b[n]!.name && c.type.toUpperCase() === b[n]!.type.toUpperCase());
 }
 
 /** Discover, resolve and bind the project, and decide what each asset the run takes does (see the top). Throws
@@ -293,25 +344,35 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
     ...(i.importTimeoutMs !== undefined ? { importTimeoutMs: i.importTimeoutMs } : {}), ...(i.retry ? { retry: i.retry } : {}),
   });
   const byName = new Map(project.assets.map((a) => [a.name, a]));
-  const flags = { bare: i.selectors.length === 0, only: i.only === true, upstream: i.upstream === true };
+  const flags = { bare: i.selectors.length === 0, only: i.only === true, upstream: i.upstream === true, from: i.from !== undefined };
+  const columns = (name: string) => entry(name)?.columns ?? null;
+  const bind = (taken: ReadonlyMap<string, Taken>) => bindProject(project, { timezone: i.timezone, columns, rebuilt: (n) => taken.has(n) });
+  // Every SQL asset bound as validate binds it, each against the new output of the SQL it reads: the columns an
+  // SQL input the run rebuilds will have (reshaped). A bare run takes every stale transform anyway.
+  const fresh = flags.bare || flags.from ? null : await bindProject(project, { timezone: i.timezone, columns });
 
   const scopeOf = (graph: Graph, inputs: ReadonlyMap<string, readonly string[]>): Scope => {
     const stale = new Map<string, Reason[]>();
+    const staleOf = (name: string) => {
+      let r = stale.get(name);
+      if (!r) {
+        const a = byName.get(name)!;
+        r = a.loaded ? staleReasons(viewOf(a, inputs.get(name) ?? a.inputs, entry)) : [];
+        stale.set(name, r);
+      }
+      return r;
+    };
     return {
-      byName, graph, inputs, onCycle: new Set(graph.cycles.flat()),
-      stale: (name) => {
-        let r = stale.get(name);
-        if (!r) {
-          const a = byName.get(name)!;
-          r = a.loaded ? staleReasons(viewOf(a, inputs.get(name) ?? a.inputs, entry)) : [];
-          stale.set(name, r);
-        }
-        return r;
+      byName, graph, inputs, onCycle: new Set(graph.cycles.flat()), stale: staleOf,
+      reshaped: (name) => {
+        const a = byName.get(name);
+        const out = fresh?.results.get(name)?.outputColumns;
+        if (a?.kind !== "sql" || !a.loaded || !out || staleOf(name).length === 0) return false;
+        const built = entry(name)?.columns.filter((c) => !isReservedColumn(c.name));
+        return !built || !sameColumns(out, built);
       },
     };
   };
-  const columns = (name: string) => entry(name)?.columns ?? null;
-  const bind = (taken: ReadonlyMap<string, Taken>) => bindProject(project, { timezone: i.timezone, columns, rebuilt: (n) => taken.has(n) });
 
   // Choose over the resolved graph, bind (which adds the unoptimized plans' scans to the inputs), and choose
   // again over the graph with them; bind once more only when that changed what the run takes.
@@ -331,18 +392,39 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
   ];
   const uncertain = uncertainty(byName, bound.inputs, taken);
   const exact = new Set(i.selectors.filter((sel) => !isGlob(sel)));
-  // A table exists when the step runs: it was built, or this run builds it first.
-  const exists = (n: string) => entry(n) !== null || (taken.has(n) && !hasErrors(byName.get(n)!));
+  /** Steps skipped because an input will not exist (INPUT_NOT_BUILT), with the never-built assets at the root of
+   *  it: running those builds the rest. */
+  const notBuilding = new Map<string, string[]>();
+  // This run builds it: taken, with nothing that fails it before it runs, and not skipped for a missing input.
+  const builds = (n: string) => taken.has(n) && !hasErrors(byName.get(n)!) && !notBuilding.has(n);
+  // A table a blocking check reads exists when the step runs: it was built, or this run builds it first (it is in
+  // the step's orderAfter). A warning does not wait for the tables it reads: one this run builds exists for it
+  // only when it is built before the asset anyway, through what the asset must run after.
+  const exists = (n: string) => entry(n) !== null || builds(n);
+  const before = (name: string) => new Set(neededBy([name], (n) => [...(bound.inputs.get(n) ?? []), ...(byName.get(n)?.orderAfter ?? [])]));
+  // The never-built assets at the root of a missing input: itself, unless it reads never-built assets in turn.
+  // `croft run <roots>` builds them and then, downstream, the input and the step.
+  const rootsOf = (x: string, seen: Set<string> = new Set()): string[] => {
+    const known = notBuilding.get(x);
+    if (known) return known;
+    seen.add(x);
+    const deeper = (bound.inputs.get(x) ?? []).filter((y) => !seen.has(y) && byName.has(y) && entry(y) === null);
+    return deeper.length ? [...new Set(deeper.flatMap((y) => rootsOf(y, seen)))] : [x];
+  };
   const steps: PlannedStep[] = [];
   const fileDirs = new Set<string>();
   for (const name of order) {
     const a = byName.get(name)!;
     const t = taken.get(name)!;
+    let first: Set<string> | undefined;
+    const checkTables = unbuiltCheckTables(a, byName, {
+      exists, existsForWarning: (n) => entry(n) !== null || (builds(n) && (first ??= before(name)).has(n)), builtLater: builds,
+    });
     const step = stepOf(a, t, {
       inputs: bound.inputs.get(name) ?? a.inputs, readBy: graph.readBy(name), entry,
       bind: bound, uncertain: uncertain(name),
       cycle: graph.cycles.findIndex((c) => c.includes(name)),
-      checkTables: unbuiltCheckTables(a, byName, exists),
+      checkTables,
     });
     // --from: only fetches run (the runner skips every other step). A transform is skipped, whatever reads a
     // backfilled ingest included; in a bare run or a glob, so is an ingest --from cannot apply to (one named
@@ -352,6 +434,17 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
       if (!ingest || (!exact.has(name) && loadErrors(step).length === 0 && backfillUnsupported(step) !== null)) {
         step.action = "skip";
         step.reason = FROM_ONLY_MERGE;
+      }
+    }
+    // An input that will not exist when the step runs: never built, and not built by this run (not taken, or
+    // skipped for the same reason). The step would fail with "no table named ..."; it is skipped instead, naming
+    // the run that builds the input. An input the run takes that fails is the runner's news: it skips the step.
+    if (step.action !== "skip" && loadErrors(step).length === 0) {
+      const missing = step.inputs.filter((x) => x !== name && byName.has(x) && entry(x) === null && (!taken.has(x) || notBuilding.has(x)));
+      if (missing.length) {
+        const roots = [...new Set(missing.flatMap((x) => rootsOf(x)))];
+        notBuilding.set(name, roots);
+        skipForInputs(step, missing, roots);
       }
     }
     if (step.kind === "file" && step.action !== "skip" && a.ts?.definition) {
@@ -408,8 +501,8 @@ interface StepContext {
   uncertain: boolean;
   /** Index of the cycle it is on in graph.cycles (and bind.problems), or -1. */
   cycle: number;
-  /** Its checks that read a table no build has made yet (unbuiltCheckTables). */
-  checkTables: Problem[];
+  /** Its checks and warnings that read a table that will not exist when they run (unbuiltCheckTables). */
+  checkTables: CheckTables;
 }
 
 function stepOf(a: ResolvedAsset, t: Taken, c: StepContext): PlannedStep {
@@ -430,7 +523,7 @@ function stepOf(a: ResolvedAsset, t: Taken, c: StepContext): PlannedStep {
     const cycle = c.bind.problems[c.cycle];
     if (cycle) problems.push({ ...cycle, asset: a.name, file: a.file });
   }
-  problems.push(...c.checkTables);
+  problems.push(...c.checkTables.problems);
   const view = viewOf(a, c.inputs, c.entry);
   if (kind === "transform" && a.incremental.kind === "new-rows") {
     const edited = editedProblem(view);
@@ -439,8 +532,10 @@ function stepOf(a: ResolvedAsset, t: Taken, c: StepContext): PlannedStep {
   const reasons = [...t.reasons];
   return {
     asset: a.name, file: a.file, path: a.path, kind, action, reasons, reason: reasonText(a, t, view), problems,
+    ...(t.readers.length ? { neededBy: [...t.readers] } : {}),
     ...(a.ts ? { loaded: a.ts } : {}), ...(spec ? { spec } : {}), ...(a.sql ? { sql: a.sql } : {}),
-    inputs: [...c.inputs], orderAfter: [...new Set([...a.orderAfter, ...c.inputs])], readBy: c.readBy, checks: a.checks,
+    inputs: [...c.inputs], orderAfter: [...new Set([...a.orderAfter, ...c.inputs])], readBy: c.readBy,
+    checks: a.checks.filter((x) => !c.checkTables.skipped.has(x)),
     ...(a.usesHttp !== undefined ? { usesHttp: a.usesHttp } : {}), ...(a.confirmAbove !== undefined ? { confirmAbove: a.confirmAbove } : {}),
     write: a.write, key: a.key, incremental: a.incremental,
     behavior: a.behavior || behaviorLabel(a.write, a.key), words: a.words,
@@ -451,33 +546,87 @@ function stepOf(a: ResolvedAsset, t: Taken, c: StepContext): PlannedStep {
   };
 }
 
+/** What unbuiltCheckTables finds: the step's problems, and the warnings left out of it. */
+interface CheckTables { problems: Problem[]; skipped: Set<Check> }
+
 /**
- * A check (or warning) reading a table that will not exist when the step runs: an asset never built that this
- * run does not build first. The check could only fail with "Table … does not exist" and a hint to correct a
- * check that is right, so the step names the table instead: a blocking check fails it before it runs
- * (CHECK_INVALID), a warning warns (as it would when it cannot run). `--upstream` builds such a table first.
+ * Checks and warnings reading a table that will not exist when they run. The check could only fail with
+ * "Table ... does not exist" and a hint to correct a check that is right, so the step names the table instead:
+ * - a blocking check (its table is ordered first): an asset never built that this run does not build either.
+ *   It fails the step before it runs (CHECK_INVALID); `--upstream` builds such a table first;
+ * - a warning (its table is not ordered first, §3f): also a table this run builds that is not built before the
+ *   asset anyway (downstream of it, say). A warning never blocks, so it is left out of this run, with an info
+ *   note (INPUT_NOT_BUILT); once its table is built it reads it as it is.
  */
-function unbuiltCheckTables(a: ResolvedAsset, byName: ReadonlyMap<string, ResolvedAsset>, exists: (name: string) => boolean): Problem[] {
-  const out: Problem[] = [];
+function unbuiltCheckTables(a: ResolvedAsset, byName: ReadonlyMap<string, ResolvedAsset>,
+  o: { exists: (name: string) => boolean; existsForWarning: (name: string) => boolean; builtLater: (name: string) => boolean }): CheckTables {
+  const out: CheckTables = { problems: [], skipped: new Set() };
   let text: string | undefined;
+  const lineOf = (c: Check) => {
+    text ??= readText(a.path);
+    const at = text.split("\n").findIndex((l) => l.includes(c.source));
+    return at >= 0 ? { line: at + 1 } : {};
+  };
   for (const c of a.checks) {
     for (const read of new Set(c.reads)) {
       const table = assetNamed(byName, read);
-      if (!table || table === a.name || exists(table)) continue;
-      text ??= readText(a.path);
-      const at = text.split("\n").findIndex((l) => l.includes(c.source));
-      const label = c.blocking ? "check" : "warning";
-      const p = problem("CHECK_INVALID", {
-        asset: a.name, file: a.file, ...(at >= 0 ? { line: at + 1 } : {}),
-        message: `${a.name}: the ${label} ${JSON.stringify(c.source)} reads ${table}, which has never been built`,
-        hint: `build ${table} first (croft run ${table}), or both in one run: croft run ${a.name} --upstream`,
-        fix: { kind: "command", description: `build ${table}, then ${a.name}`, command: `croft run ${a.name} --upstream` },
-        details: { check: c.source, blocking: c.blocking, table },
-      });
-      out.push(c.blocking ? p : { ...p, severity: "warning" });
+      if (!table || table === a.name) continue;
+      if (c.blocking) {
+        if (o.exists(table)) continue;
+        out.problems.push(problem("CHECK_INVALID", {
+          asset: a.name, file: a.file, ...lineOf(c),
+          message: `${a.name}: the check ${JSON.stringify(c.source)} reads ${table}, which has never been built`,
+          hint: `build ${table} first (croft run ${table}), or both in one run: croft run ${a.name} --upstream`,
+          fix: { kind: "command", description: `build ${table}, then ${a.name}`, command: `croft run ${a.name} --upstream` },
+          details: { check: c.source, blocking: true, table },
+        }));
+        continue;
+      }
+      if (o.existsForWarning(table) || out.skipped.has(c)) continue;
+      out.skipped.add(c);
+      out.problems.push(problem("INPUT_NOT_BUILT", {
+        asset: a.name, file: a.file, ...lineOf(c),
+        message: `${a.name}: the warning ${JSON.stringify(c.source)} reads ${table}, which has not been built yet, so it is skipped in this run`,
+        hint: o.builtLater(table)
+          ? `this run builds ${table}, but a warning does not wait for the tables it reads; it runs from the next run on`
+          : `a warning never blocks; it runs once ${table} has been built (croft run ${table})`,
+        details: { check: c.source, table },
+      }));
     }
   }
   return out;
+}
+
+/** Skip a step whose inputs will not exist when it runs (planRun): INPUT_NOT_BUILT, with the run that builds
+ *  `roots` (the never-built assets at the root of the missing inputs), and so the missing inputs and the step. */
+function skipForInputs(step: PlannedStep, missing: readonly string[], roots: readonly string[]): void {
+  const one = missing.length === 1;
+  const them = listed(missing);
+  const build = `croft run ${roots.join(" ")}`;
+  step.action = "skip";
+  // The runner shows the reason as the step's skippedBecause, so it carries the command that builds the input.
+  step.reason = `input ${them} ${one ? "has" : "have"} never been built, and this run does not build ${one ? "it" : "them"} (${build} does)`;
+  step.problems.push({
+    ...problem("INPUT_NOT_BUILT", {
+      asset: step.asset, file: step.file,
+      message: `${step.asset} reads ${them}, which ${one ? "has" : "have"} never been built, and this run does not build ${one ? "it" : "them"}`,
+      hint: `build ${listed(roots)} first (${build}), or both in one run: croft run ${step.asset} --upstream`,
+      fix: { kind: "command", description: `build ${listed(roots)}, then what reads ${roots.length === 1 ? "it" : "them"}`, command: build },
+      details: { input: missing[0]!, inputs: [...missing], notBuilt: [...roots] },
+    }),
+    // The asset the run was asked for is not built: more than a note.
+    severity: "warning",
+  });
+}
+
+/** The INPUT_NOT_BUILT a step was skipped with (skipForInputs), if it was. */
+export function inputNotBuilt(step: Pick<PlannedStep, "action" | "problems">): Problem | undefined {
+  return step.action === "skip" ? step.problems.find((p) => p.code === "INPUT_NOT_BUILT" && Array.isArray(p.details?.inputs)) : undefined;
+}
+
+/** "a", "a and b", "a, b and c". */
+function listed(list: readonly string[]): string {
+  return list.length <= 1 ? list.join("") : `${list.slice(0, -1).join(", ")} and ${list.at(-1)}`;
 }
 
 /** The asset a check's table names: exactly, else the one that matches without regard to case. */
@@ -529,6 +678,10 @@ function reasonText(a: ResolvedAsset, t: Taken, view: StaleView): string {
   // What an input the run refreshes first may bring (a transform never built reads all of it anyway).
   const fresh = t.feeding.filter((x) => !changed.includes(x));
   if (fresh.length && !t.reasons.has("never_built")) parts.push(are(fresh, "may have new rows", "may have new rows"));
+  // Taken for the SQL that reads its new output (pullReshaped): why a run that did not name it rebuilds it.
+  if (t.readers.length) {
+    parts.push(`${names(t.readers)} ${t.readers.length === 1 ? "reads" : "read"} ${t.reasons.has("never_built") ? "it" : "its new columns"}`);
+  }
   if (a.kind === "ts" && a.incremental.kind === "new-rows" && entry?.codeHash && a.codeHash) {
     parts.push(entry.codeHash === a.codeHash ? "(TS code unchanged)"
       : zone ? `(time zone changed from ${zone.from}: the new zone applies to new input rows only)`

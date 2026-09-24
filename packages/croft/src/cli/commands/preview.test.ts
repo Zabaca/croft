@@ -4,7 +4,8 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { PreviewData } from "../../core/types.ts";
-import { cleanup, cli, ISSUES_SEED, ISSUES_TS, makeProject, OPEN_SQL, seed } from "./inspect-testkit.ts";
+import { type CatalogColumn, putCatalog } from "../../history/catalog.ts";
+import { cleanup, cli, ISSUES_SEED, ISSUES_TS, makeProject, OPEN_SQL, runsDb, seed } from "./inspect-testkit.ts";
 import { formatPreview, parseRows } from "./preview.ts";
 
 afterAll(async () => {
@@ -14,6 +15,21 @@ afterAll(async () => {
 async function issues(files: Record<string, string> = {}) {
   const p = makeProject({ files: { "assets/github_issues.ts": ISSUES_TS, "assets/open_issues.sql": OPEN_SQL, ...files } });
   await seed(p.database, ISSUES_SEED);
+  // As a run leaves it: runs.sqlite mirrors the table's catalog entry. The planner reads the mirror, never the
+  // warehouse, so without it github_issues would be an input never built (INPUT_NOT_BUILT).
+  const col = (name: string, type: string): CatalogColumn => ({ name, type, sourceName: name, pinned: false, pending: false, format: null });
+  const db = runsDb(p.stateDir);
+  try {
+    putCatalog(db, {
+      asset: "github_issues", kind: "ingest", behavior: "updates rows by id", write: "merge", key: ["id"], rows: 3,
+      columns: [col("id", "BIGINT"), col("title", "VARCHAR"), col("state", "VARCHAR"), col("labels", "JSON"), col("user", "JSON"),
+        col("updated_at", "TIMESTAMPTZ"), { ...col("_loaded_at", "TIMESTAMPTZ"), sourceName: null }],
+      cursor: { field: "updated_at", value: "2026-09-22T10:00:00Z", type: "timestamp", unit: null },
+      lastLoadedAt: "2026-09-22T18:00:00.000000Z", lastReplacedAt: null, lastRunId: "r_0922_1100_bbbb", codeHash: null,
+    });
+  } finally {
+    db.close();
+  }
   return p;
 }
 

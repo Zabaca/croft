@@ -269,6 +269,25 @@ describe("static checks", () => {
     expect(r.data.assets.map((x) => x.name)).toEqual(["github_issues", "enriched", "opener", "stamped", "a", "b"]);
   });
 
+  // R2.2: DESIGN §3c's own warn example, with issue_triage reading open_issues, was reported as a CYCLE, and both
+  // assets were left out of the order. A warning's subquery does not order the steps (§3f: it runs after commit).
+  test("a warning that reads a downstream table is no cycle; a blocking check that does is", async () => {
+    const files = {
+      "assets/github_issues.ts": ISSUES_TS,
+      "assets/open_issues.sql": "-- key: id\n-- warn: id IN (SELECT issue_id FROM issue_triage)\nSELECT id, title FROM github_issues\n",
+      "assets/issue_triage.ts": `import { transform } from "@zabaca/croft";\nexport default transform({ inputs: ["open_issues"], key: "issue_id", incremental: true, async *rows() { yield []; } });\n`,
+    };
+    const p = makeProject({ files });
+    catalog(p, [ISSUES_BUILT]);
+    const r = await check(p);
+    expect(codes(r.problems)).toEqual([]);
+    expect(r.data.order).toEqual(["github_issues", "open_issues", "issue_triage"]);
+    writeFiles(p.root, { "assets/open_issues.sql": files["assets/open_issues.sql"].replace("-- warn:", "-- check:") });
+    const blocking = await check(p);
+    expect(codes(blocking.problems)).toEqual(["CYCLE"]);
+    expect(blocking.problems[0]!.hint).toContain("a check in assets/open_issues.sql reads issue_triage");
+  });
+
   test("INPUT_NEEDS_KEY: an incremental transform's newRows() input without a key, at the call", async () => {
     const p = makeProject({
       files: {

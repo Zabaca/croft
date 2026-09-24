@@ -136,7 +136,15 @@ describe("cycles", () => {
     const { graph, problems } = buildGraph([node("a", ["b"]), node("b", [], ["a"])]);
     expect(graph.cycles).toEqual([["a", "b", "a"]]);
     expect(graph.order).toEqual([]);
-    expect(problems[0]!.hint).toBe("remove one of these reads: assets/a.sql reads b; a check in assets/b.sql reads a");
+    expect(problems[0]!.hint).toBe("remove one of these reads: assets/a.sql reads b; a check in assets/b.sql reads a "
+      + "(a blocking check runs before its write commits, so the table it reads is built first; a warning's is not)");
+  });
+
+  // What a run does with a cycle (R2.2): its assets fail before they run, and what reads them is skipped.
+  test("the effect says what a run does with the assets on a cycle", () => {
+    const { problems } = buildGraph([node("a", ["b"]), node("b", ["a"])]);
+    expect(problems[0]!.effect).toBe("the assets on the cycle fail before they run, and the assets that read them are skipped; the others still run");
+    expect(problems[0]!.hint).toBe("remove one of these reads: assets/a.sql reads b; assets/b.sql reads a");
   });
 
   test("an asset reading itself is a cycle; a check reading its own asset is not", () => {
