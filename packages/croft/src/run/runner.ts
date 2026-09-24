@@ -84,9 +84,6 @@ export interface RunData {
   status: RunStatus;
   progress?: ProgressSnapshot;
   steps: StepResult[];
-  /** Phase 1's "checks are not enforced" note (core/phase.ts CHECKS_ENFORCED). The runner never sets it and
-   *  runs.summary does not store it; it goes when cli/commands/run.ts stops adding it. */
-  checksEnforced?: boolean;
 }
 
 /** A run's whole command result: what `croft run` prints, stored in runs.summary for `croft wait`. */

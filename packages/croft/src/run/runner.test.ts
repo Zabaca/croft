@@ -813,7 +813,7 @@ describe("a lock wait and Ctrl-C", () => {
 });
 
 describe("planning", () => {
-  test("transforms are skipped with a note; a broken asset fails alone; unknown names are usage errors", async () => {
+  test("a SQL transform runs after its input; a broken asset fails alone; unknown names are usage errors", async () => {
     api.state.zones = [{ zone: 1 }];
     const root = makeProject({
       "assets/zones.ts": simpleGet(api.url, "/zones"),
@@ -824,8 +824,8 @@ describe("planning", () => {
     expect(out.exit).toBe(2); // ASSET_INVALID is a project problem
     const by = Object.fromEntries(out.data.steps.map((s) => [s.asset, s]));
     expect(by.zones!.status).toBe("ok");
-    expect(by.report).toMatchObject({ status: "skipped" });
-    expect(by.report!.skippedBecause).toContain("ingests only");
+    expect(by.report).toMatchObject({ status: "ok" });
+    expect(out.data.steps.findIndex((s) => s.asset === "report")).toBeGreaterThan(-1);
     expect(by.bad!.status).toBe("failed");
     expect(by.bad!.error?.code).toBe("ASSET_INVALID");
     await expect(runIn(root, ["zonez"])).rejects.toMatchObject({ code: "USAGE_ERROR", problem: { hint: "did you mean zones?" } });

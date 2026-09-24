@@ -125,6 +125,7 @@ const validate = lazyCommand({
   options: {
     types: { type: "boolean", description: "also type-check the project's TypeScript with its own tsc --noEmit" },
   },
+  humanShowsProblems: true,
 }, async () => (await import("./validate.ts")).validate);
 
 const preview = lazyCommand({
