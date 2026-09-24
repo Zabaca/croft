@@ -3,13 +3,18 @@
 // change does") and the public types in §10.
 //
 // Loading one asset, in order:
-//   1. Import scan (Bun.Transpiler over the asset and every project file it imports, lib/ included).
+//   1. Import scan (Bun.Transpiler over the asset and every project file it imports, lib/ included, and the
+//      files of the local packages it imports, see below).
 //      Importing @duckdb/node-api or @zabaca/croft/read is ASSET_OPENS_DATABASE, and such an asset is
 //      never imported: a second DuckDB instance on the warehouse in croft's own process would release
 //      croft's file lock the moment it closed (§5).
 //   2. Bun.build of the asset with packages external. Its output is the code fingerprint (with the
 //      imported package versions and the project time zone) and the input to the ctx.http detector.
 //      Identifier minification stays off: with it on, a comment-only edit changed the hash [V].
+//      A local package is bundled like lib/ instead: a package installed as a link whose real files lie outside
+//      every node_modules folder (a workspace package, `bun link`, a "file:" or "link:" dependency). It is the
+//      user's own code, and an edit to it never changes its version, so counting its version would let the
+//      scheduler run an edit nobody ran (§6). croft itself stays external, linked or not.
 //   3. import() in isolation: a file that throws or does not parse fails only its own asset.
 //   4. Hand-written validation of the default export against the public types, so every message names
 //      the key, what was expected and what was found.
@@ -66,7 +71,8 @@ export interface LoadedTsAsset {
   /** The inputs the code reads with newRows() (detectNewRows), which the cost guard counts; null when the
    *  scan cannot tell, and every keyed input counts. Present when the asset bundles. */
   readsNewRows?: string[] | null;
-  /** Project files the asset imports, root-relative, the asset first. */
+  /** The files the asset's code comes from, root-relative, the asset first: the project files it imports, and the
+   *  files of the local packages it imports (a linked package outside the project as "../…"). */
   localFiles: string[];
   /** Packages in the bundle and their installed versions (null when not found). */
   packages: Record<string, string | null>;
@@ -120,7 +126,7 @@ export async function loadTsAsset(asset: Pick<DiscoveredAsset, "name" | "file" |
 
   // 1. Import scan, before anything runs the code.
   const graph = scanImportGraph(path, root);
-  out.localFiles = graph.files.map((f) => rel(root, f));
+  out.localFiles = graph.files.map((f) => fromRoot(root, f));
   for (const ref of graph.opensDatabase) out.problems.push(opensDatabaseProblem(ref, name, root));
 
   // 2. Bundle: syntax errors with positions, the fingerprint, and request detection.
@@ -129,7 +135,7 @@ export async function loadTsAsset(asset: Pick<DiscoveredAsset, "name" | "file" |
     out.problems.push(buildProblem(bundle.errors, name, file, root));
     return finish();
   }
-  out.packages = packageVersions(bundle.imports, path);
+  out.packages = packageVersions(bundle.imports, path, bundle.importedFrom);
   out.codeHash = fingerprintOf(normalizeBundle(bundle.code, path), out.packages, project.timezone);
   const requests = detectRequests(bundle.code, bundle.imports);
   out.usesHttp = requests.length > 0;
@@ -195,7 +201,8 @@ const LOADERS: Record<string, "ts" | "tsx" | "js" | "jsx"> = {
   ".ts": "ts", ".mts": "ts", ".cts": "ts", ".tsx": "tsx", ".js": "js", ".mjs": "js", ".cjs": "js", ".jsx": "jsx",
 };
 
-/** Follow the asset's imports through project files (lib/ and anything else outside node_modules).
+/** Follow the asset's imports through project files (lib/ and anything else outside node_modules), and through
+ *  the files of local packages (linkedPackageFile), which are the user's code too.
  *  Type-only imports are skipped by the transpiler; dynamic import() and require() of string
  *  literals are included [verified]. */
 export function scanImportGraph(entry: string, root: string): ImportGraph {
@@ -225,12 +232,68 @@ export function scanImportGraph(entry: string, root: string): ImportGraph {
       const line = lineOfSpecifier(text, specifier);
       if (line !== undefined) ref.line = line;
       if (opensDatabase(specifier)) graph.opensDatabase.push(ref);
-      const local = resolveLocal(specifier, file, roots);
+      let local = resolveLocal(specifier, file, roots);
+      if (!local && !isRelative(specifier)) {
+        const dir = linkedPackageDir(specifier, file);
+        local = dir ? linkedPackageFile(specifier, file) : null;
+        // The package's own relative imports are followed like lib/'s.
+        if (local && dir && !roots.includes(dir)) roots.push(dir);
+      }
       if (local) queue.push(local);
       else if (!isRelative(specifier)) graph.packages.push(ref);
     }
   }
   return graph;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Local packages: code of the user's own, installed as a link
+
+function inNodeModules(path: string): boolean {
+  return path.split(sep).includes("node_modules");
+}
+
+/** node_modules/<name> as code in `dir` finds it: the first one up from `dir` (Node's lookup), or null. */
+function installedDir(name: string, dir: string): string | null {
+  for (let cur = dir; ; cur = dirname(cur)) {
+    const p = join(cur, "node_modules", name);
+    if (existsSync(p)) return p;
+    if (dirname(cur) === cur) return null;
+  }
+}
+
+/** The real folder of a local package that `importer` imports by `specifier` (see linkedPackageFile), or null. */
+function linkedPackageDir(specifier: string, importer: string): string | null {
+  if (isBuiltin(specifier) || isRelative(specifier) || opensDatabase(specifier)) return null;
+  const name = packageName(specifier);
+  if (FINGERPRINT_IGNORED_PACKAGES.has(name)) return null;
+  const dir = installedDir(name, dirname(importer));
+  if (!dir) return null;
+  try {
+    const real = realpathSync(dir);
+    return inNodeModules(real) ? null : real;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The file a bare import of a local package loads, or null. A local package is installed as a link (a workspace
+ * package, `bun link`, a "file:" or "link:" dependency) whose real files lie outside every node_modules folder: its
+ * code is the user's, and editing it never changes its version, so it is bundled and hashed like lib/.
+ * A registry install is not one, even when a symlink puts it there (isolated installs link node_modules/<name> to
+ * node_modules/.bun/…): its real path is inside node_modules. Neither is croft itself, linked or not (an upgrade
+ * must not mark every asset edited), a package that opens the database (ASSET_OPENS_DATABASE), nor anything not
+ * installed (resolving that could make Bun install it).
+ */
+export function linkedPackageFile(specifier: string, importer: string): string | null {
+  if (!linkedPackageDir(specifier, importer)) return null;
+  try {
+    const file = realpathSync(Bun.resolveSync(specifier, dirname(importer)));
+    return inNodeModules(file) ? null : file;
+  } catch {
+    return null;
+  }
 }
 
 function projectRoots(root: string): string[] {
@@ -293,7 +356,14 @@ function opensDatabaseProblem(ref: ImportRef, asset: string, root: string): Prob
 // 2. Bundle and fingerprint
 
 export interface BuildError { message: string; file?: string; line?: number; column?: number; lineText?: string }
-export type BundleResult = { ok: true; code: string; imports: string[] } | { ok: false; errors: BuildError[] };
+export type BundleResult =
+  | {
+    ok: true; code: string; imports: string[];
+    /** Where each external package is first imported from (a folder): a package only a local package imports is
+     *  looked up from that package, as Bun finds it at run time. */
+    importedFrom: Record<string, string>;
+  }
+  | { ok: false; errors: BuildError[] };
 
 // The one Bun.build configuration for fingerprints. identifiers: false is load-bearing (see the header).
 const BUILD = {
@@ -304,11 +374,26 @@ const BUILD = {
   throw: false,
 } as const;
 
-/** Bundle one asset with its project imports. Packages stay external, so only project code is hashed. */
+/** Bundle one asset with its project imports and its local packages (linkedPackageFile). Registry packages stay
+ *  external, so only the user's own code is hashed; their versions count instead. */
 export async function bundleTs(entry: string): Promise<BundleResult> {
+  const importedFrom: Record<string, string> = {};
+  const local: Bun.BunPlugin = {
+    name: "croft-local-packages",
+    setup(build) {
+      build.onResolve({ filter: /^[^./]/ }, (args) => {
+        if (args.kind === "entry-point" || isBuiltin(args.path)) return undefined;
+        const file = linkedPackageFile(args.path, args.importer);
+        if (file) return { path: file };
+        importedFrom[packageName(args.path)] ??= dirname(args.importer);
+        // Anything else as without the plugin: a tsconfig alias is bundled, a package stays external.
+        return undefined;
+      });
+    },
+  };
   let result: Awaited<ReturnType<typeof Bun.build>>;
   try {
-    result = await Bun.build({ entrypoints: [entry], ...BUILD });
+    result = await Bun.build({ entrypoints: [entry], ...BUILD, plugins: [local] });
   } catch (e) {
     // With throwing on, Bun.build rejects with an AggregateError of BuildMessages [verified]; keep the
     // same result shape should it ever do so with throw: false.
@@ -321,7 +406,7 @@ export async function bundleTs(entry: string): Promise<BundleResult> {
   }
   const code = await result.outputs[0]!.text();
   const imports = new Bun.Transpiler({ loader: "js" }).scanImports(code).map((i) => i.path);
-  return { ok: true, code, imports };
+  return { ok: true, code, imports, importedFrom };
 }
 
 function buildError(e: unknown): BuildError {
@@ -347,13 +432,14 @@ export function normalizeBundle(code: string, entry: string): string {
 // "edited" (and hold it from the scheduler) after a croft upgrade.
 const FINGERPRINT_IGNORED_PACKAGES = new Set(["@zabaca/croft"]);
 
-/** Installed versions of the packages a bundle imports, found by walking up node_modules folders. */
-export function packageVersions(imports: readonly string[], from: string): Record<string, string | null> {
+/** Installed versions of the packages a bundle imports, found by walking up node_modules folders from where the
+ *  code imports them (`importedFrom`, BundleResult), else from the asset's folder. */
+export function packageVersions(imports: readonly string[], from: string, importedFrom: Readonly<Record<string, string>> = {}): Record<string, string | null> {
   const names = [...new Set(imports.filter((s) => !isBuiltin(s) && !isRelative(s)).map(packageName))]
     .filter((n) => !FINGERPRINT_IGNORED_PACKAGES.has(n))
     .sort();
   const out: Record<string, string | null> = {};
-  for (const name of names) out[name] = installedVersion(name, dirname(from));
+  for (const name of names) out[name] = installedVersion(name, importedFrom[name] ?? dirname(from));
   return out;
 }
 
@@ -386,7 +472,7 @@ export async function tsFingerprint(entry: string, project: TsProject): Promise<
     const { severity: _s, code: _c, docs: _d, ...init } = buildProblem(bundle.errors, name, rel(project.root, entry), project.root);
     throw new CroftError("ASSET_INVALID", init);
   }
-  return fingerprintOf(normalizeBundle(bundle.code, entry), packageVersions(bundle.imports, entry), project.timezone);
+  return fingerprintOf(normalizeBundle(bundle.code, entry), packageVersions(bundle.imports, entry, bundle.importedFrom), project.timezone);
 }
 
 function buildProblem(errors: BuildError[], asset: string, file: string, root: string): Problem {
@@ -1319,6 +1405,13 @@ function rel(root: string, path: string): string {
     if (path.startsWith(r + sep)) return relative(r, path).split(sep).join("/");
   }
   return path;
+}
+
+/** Root-relative like rel(), and a file outside the project (a linked package's) as "../…", so join(root, f) still
+ *  names it. */
+function fromRoot(root: string, path: string): string {
+  if (projectRoots(root).some((r) => path.startsWith(r + sep))) return rel(root, path);
+  return relative(root, path).split(sep).join("/");
 }
 
 function escapeRegExp(s: string): string {
