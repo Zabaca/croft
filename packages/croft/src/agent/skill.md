@@ -1,8 +1,8 @@
 ---
 name: croft
 description: Build and operate this project's data pipelines with the croft CLI (DuckDB). Use when adding a data
-  source, writing SQL or TypeScript transforms, adding checks, debugging a failed run, backfilling, or answering
-  a question from project data.
+  source, writing SQL or TypeScript transforms, adding checks, scheduling, debugging a failed run, backfilling,
+  or answering a question from project data.
 ---
 <!-- croft {{version}} -->
 croft is not dbt, dlt, SQLMesh or Dagster; do not assume their behavior. Ask the CLI: `croft docs <topic>`,
@@ -13,8 +13,8 @@ croft is not dbt, dlt, SQLMesh or Dagster; do not assume their behavior. Ask the
 {{phase}}
 
 ## Orient
-croft context --json        # assets, columns, behavior, reads, staleness, running, recent failures and schema changes
-croft status                # failed, stale, never run, edited since its last run, no asset file
+croft context --json        # assets, columns, behavior, schedules, running, held, recent failures and schema changes
+croft status                # failed, stale, held, never run, edited since its last run, no asset file
 
 ## Loop (always)
 1. New asset: start from the closest template in `croft docs ingest` (API or file), `croft docs sql` or
@@ -26,7 +26,7 @@ croft status                # failed, stale, never run, edited since its last ru
 ## Conventions
 - One file in assets/ = one table with that name; SQL says `FROM github_issues`. Shared code goes in lib/.
 - SQL assets: `-- name: value` header lines (description, key, check, warn), then ONE SELECT (a trailing `;` is fine).
-  SQL transforms are always rebuilt in full; there is no incremental SQL.
+  SQL transforms are always rebuilt in full; there is no incremental SQL. Only ingests have schedules.
 - SQL assets read assets, never files: to use a file, make a file ingest (`file: "files/x.csv"`, see `croft docs ingest`);
   `croft query "from 'files/x.csv'"` looks at one first.
 - PIVOT needs an IN list: `PIVOT t ON cat IN ('a', 'b') USING sum(x)`, or use `sum(x) FILTER (WHERE cat = 'a')`.
@@ -37,7 +37,9 @@ croft status                # failed, stale, never run, edited since its last ru
 - Use `ctx.http` and `res.json()` (lossless numbers), never raw fetch + JSON.parse for API data.
 - Nested fields are JSON: `col->>'field'`, `col->>'$[*].name'`, `json_each(col)`. `croft describe` lists keys.
 - Columns named like SQL keywords must be quoted: `"order"`.
-- Apps read with `import { query } from "@zabaca/croft/read"` (it opens the file briefly per query). Never open the .duckdb files directly, in code or in a GUI (DuckDB UI, DBeaver): a program holding warehouse.duckdb blocks every run.
+- Apps read with `import { query } from "@zabaca/croft/read"`. It talks to `croft serve` when one is running (found via CROFT_URL or .croft/serve.json), otherwise opens the file briefly. Never open the .duckdb files directly.
+- `croft serve` runs until stopped: ask the user to start it in their own terminal instead of running it in your shell.
+- For a GUI (DuckDB UI, DBeaver), set "readCopy": true in croft.json and open warehouse.read.duckdb, never warehouse.duckdb.
 
 ## APIs
 - Keyset paging (re-query with since = newest value seen) ONLY if the API sorts ascending by that field.
@@ -51,13 +53,15 @@ croft status                # failed, stale, never run, edited since its last ru
   replace ingest's current rows to the trash before it writes fewer, and large paid reprocessing, LARGE_REPROCESS).
 - Adding `allowShrink: true`; changing key/write/incremental of an ingest that has data.
 - Raising `confirmAbove` of a transform that makes requests (more paid calls would run without asking).
-- Renaming or deleting files in assets/ (the table stays under the old name; this version cannot rename or drop it).
+- Renaming or deleting files in assets/ (the table stays under the old name; this version cannot rename or drop it); `croft schedule on|off|pause`.
+- `croft serve` (it runs scheduled work unattended, and a `--host` other than 127.0.0.1 exposes data beyond this machine).
 - Deleting .croft/ or warehouse*.duckdb, or `git clean -X` (the trash lives in .croft/).
 - Weakening or deleting a failing check.
 
 ## Recipes
 - Failed run: croft status --json → croft logs <asset> --failed → fix → croft validate --json → croft preview <asset>
   → croft run <asset> → croft status.
+- Held asset: it was edited and not run by hand; run it by hand once (croft run <asset>) after checking the preview.
 - Backfill: croft run <asset> --dry-run --from -90d, then the same without --dry-run. Merge ingests only.
   A date works too (--from 2026-06-24); a text cursor takes a value in its own format. The saved cursor never moves back.
 - Wrong number: croft describe <asset> --json → croft preview <asset> --rebuild (drift) → query the upstream
