@@ -4,11 +4,16 @@ import { join } from "node:path";
 import { allCatalog, putCatalog } from "../../history/catalog.ts";
 import { resolveProject } from "../../project/resolve.ts";
 import { cleanup as cleanupChildren, spawnHolder, spawnIdle, writeIntent } from "../../read/testkit.ts";
+import type { AssetScheduleView } from "../../schedule/due.ts";
+import type { Command } from "../command.ts";
 import { toJsonLine } from "../render.ts";
-import { capContext, CONTEXT_CAP_BYTES, type ContextData } from "./context.ts";
+import { capContext, context as contextImpl, CONTEXT_CAP_BYTES, type ContextData, runContext } from "./context.ts";
+import { COMMANDS } from "./index.ts";
 import {
-  busyScenario, cleanup, cli, ISSUES_CATALOG, ISSUES_SEED, makeProject, NOW, OPEN_SQL, runsDb, SCENARIO_FILES, seed, shape,
+  busyScenario, cleanup, cli, ISSUES_CATALOG, ISSUES_SEED, ISSUES_TS, makeProject, NOW, OPEN_SQL, runsDb, SCENARIO_FILES, seed, shape,
 } from "./inspect-testkit.ts";
+import { SINCE_KEY } from "./schedule.ts";
+import type { StatusDeps } from "./status.ts";
 
 afterAll(async () => {
   cleanupChildren();
@@ -48,7 +53,7 @@ describe("croft context --json", () => {
     expect(r.json).toMatchObject({ ok: true, command: "context", problems: [], next: [] });
     const d = r.json.data as ContextData;
     expect(Object.keys(d)).toEqual(["project", "assets", "running", "held", "recentFailures", "recentSchemaChanges", "schemaChangesFrom", "truncated"]);
-    expect(d.project).toEqual({ root: p.root, database: "warehouse.duckdb", timezone: "America/Los_Angeles", assets: 6, scheduling: { state: "off", via: null } });
+    expect(d.project).toEqual({ root: p.root, database: "warehouse.duckdb", timezone: "America/Los_Angeles", assets: 6, scheduling: { state: "off", via: null, lastTickAt: null } });
     expect(byAsset(d).github_issues).toEqual({
       asset: "github_issues", kind: "ingest", file: "assets/github_issues.ts", description: "Issues of oven-sh/bun",
       behavior: ISSUES_CATALOG.behavior, key: ["id"], cursor: { field: "updated_at", value: "2026-09-22T17:58:03Z" }, rows: 18556,
@@ -245,7 +250,7 @@ describe("the 20 KB cap", () => {
       columns: [{ name: "c", type: "JSON", jsonKeys: Array.from({ length: 50 }, (_, k) => `k${k}`) }],
     });
     const d: ContextData = {
-      project: { root: "/p", database: "w", timezone: "UTC", assets: 3, scheduling: { state: "off", via: null } },
+      project: { root: "/p", database: "w", timezone: "UTC", assets: 3, scheduling: { state: "off", via: null, lastTickAt: null } },
       assets: [asset(1), asset(2), asset(3)], running: [], held: [], recentFailures: [], recentSchemaChanges: [], schemaChangesFrom: "warehouse", truncated: false,
     };
     const size = Buffer.byteLength(toJsonLine(d));
@@ -281,5 +286,69 @@ describe("croft context: human output", () => {
     expect(r.stdout).toContain("open_issues · sql · assets/open_issues.sql · not built · never run (croft run open_issues)");
     expect(r.stdout).toContain("  reads     github_issues");
     expect(r.stdout).not.toContain("not enforced");
+  });
+});
+
+// Scheduling (phase 3, §8): the setting, each asset's schedule and next run, and what is held. The scheduler's
+// view (schedule/due.ts, another builder's) is a fake.
+describe("croft context: scheduling", () => {
+  const SCHEDULED_TS = ISSUES_TS.replace('key: "id",', 'key: "id",\n  schedule: "every hour",');
+  const VIEW: AssetScheduleView[] = [
+    { asset: "github_issues", kind: "ingest", schedule: { text: "every hour", cron: "0 * * * *" }, nextFireAt: "2026-09-22T20:00:00.000Z",
+      lastFireAt: null, lastAttemptAt: null, due: false, dueReason: null, held: null },
+    { asset: "open_issues", kind: "sql", schedule: null, nextFireAt: null, lastFireAt: null, lastAttemptAt: null, due: true,
+      dueReason: "never built", held: { code: "SCHEDULE_HELD", reason: "new asset, not run by hand yet" } },
+  ];
+
+  function contextCommand(d: StatusDeps): Command {
+    const spec = COMMANDS.find((c) => c.name === "context")!;
+    const { load: _load, ...rest } = spec;
+    return { ...rest, run: (ctx) => runContext(ctx, d), human: contextImpl.human!.bind(contextImpl) };
+  }
+
+  async function scheduled() {
+    const p = await scenario({ files: { "assets/github_issues.ts": SCHEDULED_TS } });
+    const db = runsDb(p.stateDir);
+    db.setScheduling({ state: "on", via: "os-job" });
+    db.setSetting(SINCE_KEY, "2026-09-22T18:00:00.000Z");
+    db.heartbeat("2026-09-22T18:59:48.000Z");
+    db.close();
+    return p;
+  }
+
+  test("the setting, each asset's schedule and next run, and the held assets with SCHEDULE_HELD", async () => {
+    const p = await scheduled();
+    const r = await cli(["context", "--json"], { cwd: p.root, env: ENV, commands: [contextCommand({ scheduleView: async () => VIEW })] });
+    expect(r.exit).toBe(0);
+    const d = r.json.data as ContextData;
+    expect(d.project.scheduling).toEqual({ state: "on", via: "os-job", lastTickAt: "2026-09-22T11:59:48-07:00", stale: false });
+    expect(byAsset(d).github_issues).toMatchObject({ next: "schedule", schedule: "every hour", nextFireAt: "2026-09-22T13:00:00-07:00" });
+    expect(byAsset(d).github_issues).not.toHaveProperty("hold");
+    expect(byAsset(d).open_issues).toMatchObject({ next: "after inputs", hold: { code: "SCHEDULE_HELD", reason: "new asset, not run by hand yet" } });
+    expect(byAsset(d).sales).not.toHaveProperty("schedule");
+    expect(d.held).toEqual(["open_issues"]);
+    expect(r.json.problems).toEqual([expect.objectContaining({ code: "SCHEDULE_HELD", asset: "open_issues", severity: "warning" })]);
+
+    // --asset keeps the held problems of the assets asked for only.
+    const one = await cli(["context", "--asset", "github_issues", "--json"], { cwd: p.root, env: ENV, commands: [contextCommand({ scheduleView: async () => VIEW })] });
+    expect(one.json.data.held).toEqual([]);
+    expect(one.json.problems).toEqual([]);
+
+    const human = await cli(["context"], { cwd: p.root, env: ENV, commands: [contextCommand({ scheduleView: async () => VIEW })] });
+    expect(human.stdout).toContain(`${p.root} · warehouse.duckdb · America/Los_Angeles · 6 assets · scheduling on (last tick 12 s ago)`);
+    expect(human.stdout).toContain("  schedule  every hour · next in 60 min");
+    expect(human.stdout).toContain("open_issues · sql · assets/open_issues.sql · not built · never run (croft run open_issues) · held: new asset, not run by hand yet");
+  });
+
+  test("off: a scheduled ingest's schedule is listed as off, and the view is not read", async () => {
+    const p = await scenario({ files: { "assets/github_issues.ts": SCHEDULED_TS } });
+    const never = async () => {
+      throw new Error("not while off");
+    };
+    const r = await cli(["context", "--json"], { cwd: p.root, env: ENV, commands: [contextCommand({ scheduleView: never })] });
+    expect(r.json.problems).toEqual([]);
+    expect(byAsset(r.json.data).github_issues).toMatchObject({ next: "scheduling off", schedule: "every hour", nextFireAt: null });
+    const human = await cli(["context"], { cwd: p.root, env: ENV, commands: [contextCommand({ scheduleView: never })] });
+    expect(human.stdout).toContain("  schedule  every hour · scheduling is off (croft schedule on)");
   });
 });
