@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import type { DuckDBConnection, DuckDBInstance } from "@duckdb/node-api";
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
@@ -350,8 +350,11 @@ describe("one warehouse per path and mode", () => {
     symlinkSync(p.root, p.root + "-alias");
     const b = wh({ ...p, path: p.root + "-alias/warehouse.duckdb" });
     expect(b).toBe(a);
-    const upper = wh({ ...p, path: join(p.root, "WAREHOUSE.duckdb") });
-    expect(upper).toBe(a);
+    // Case variants name the same file only on a case-insensitive file system (APFS by default; not ext4).
+    if (existsSync(join(p.root, "WAREHOUSE.duckdb"))) {
+      const upper = wh({ ...p, path: join(p.root, "WAREHOUSE.duckdb") });
+      expect(upper).toBe(a);
+    }
     expect(() => wh(p, { mode: "read_only" })).toThrow(/one access mode/);
   });
 

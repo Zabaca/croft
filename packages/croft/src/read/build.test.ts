@@ -1,6 +1,7 @@
 // scripts/build-read.ts and the built @zabaca/croft/read: it builds, its declarations match the source's
 // public surface, and dist/read.js runs under Node in direct and server mode (DESIGN.md §2, §10 test 7).
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { realNode } from "../node-testkit.ts";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
@@ -14,7 +15,7 @@ const DIST = join(PKG, "dist");
 // Inside the package (dist/ is git-ignored), so Node resolves "@zabaca/croft/read" by self-reference
 // through package.json "exports", exactly as an app resolves it from node_modules.
 const CHECK = join(DIST, `.check-${process.pid}`);
-const NODE = Bun.which("node");
+const NODE = realNode();
 
 const mocks: MockServe[] = [];
 let built: { code: number | null; out: string };

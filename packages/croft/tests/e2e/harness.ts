@@ -55,6 +55,8 @@ export function baseEnv(extra: Record<string, string> = {}): Record<string, stri
     HOME: process.env.HOME ?? "/tmp",
     TMPDIR: process.env.TMPDIR ?? "/tmp",
     NO_COLOR: "1",
+    // init detects the project time zone from the machine; journeys assume Los Angeles (CI runners are UTC).
+    TZ: "America/Los_Angeles",
     CROFT_RETRY_DELAYS: "50,100",
     ...extra,
   };

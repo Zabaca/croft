@@ -1,6 +1,7 @@
 // bin/croft.mjs, the file package.json "bin" names: plain JavaScript, so that Node can parse it and say
 // NEEDS_BUN (§2 "Install-time failures") instead of failing on TypeScript syntax deep in src/.
 import { afterAll, describe, expect, test } from "bun:test";
+import { realNode } from "../node-testkit.ts";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,7 +12,7 @@ import { CROFT_VERSION } from "./version.ts";
 
 const BIN = fileURLToPath(new URL("../../bin/croft.mjs", import.meta.url));
 const PKG = JSON.parse(readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8"));
-const NODE = Bun.which("node");
+const NODE = realNode();
 const base = realpathSync(mkdtempSync(join(tmpdir(), "croft-bin-")));
 afterAll(() => rmSync(base, { recursive: true, force: true }));
 

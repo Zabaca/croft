@@ -562,9 +562,16 @@ function servePid(stateDir: string): number | null {
 
 /** Whether a PID runs croft: the bin (`croft …`), the package (`@zabaca/croft`) or its source tree. */
 export function isCroftCommand(pid: number): boolean {
-  const out = spawnSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
-  const cmd = (out.stdout ?? "").trim();
-  return /(^|[\/\s])croft(\s|$)|@zabaca\/croft|\/croft\/src\//.test(cmd);
+  return /(^|[\/\s])croft(\s|$)|@zabaca\/croft|\/croft\/src\//.test(commandLine(pid));
+}
+
+/** A process's command line: /proc on Linux (minimal containers ship no `ps`), `ps` elsewhere. */
+function commandLine(pid: number): string {
+  if (process.platform === "linux") {
+    try { return readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim(); } catch { /* fall back to ps */ }
+  }
+  const out = spawnSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LC_ALL: "C" } });
+  return (out.stdout ?? "").trim();
 }
 
 let exitHooked = false;

@@ -160,7 +160,9 @@ describe("environment checks", () => {
     const foreign = await runDoctor(dir, deps({ platform: "linux", arch: "s390x", probeDuckdb: () => ({ ok: false, code: "MODULE_NOT_FOUND", message: "Cannot find module '@duckdb/node-bindings-linux-s390x/duckdb.node'" }) }));
     const fp = foreign.problems.find((x) => x.code === "DUCKDB_BINDING_MISSING")!;
     expect(fp.details!.bindingsPresent).toContain(here);
-    expect(fp.message).toBe(`the DuckDB binding for linux-s390x is not installed (node_modules has ${here}: installed on another machine or by another Bun?)`);
+    // Linux installs both the glibc and the musl binding; the message lists what is really there.
+    const present = (fp.details!.bindingsPresent as string[]).join(", ");
+    expect(fp.message).toBe(`the DuckDB binding for linux-s390x is not installed (node_modules has ${present}: installed on another machine or by another Bun?)`);
     // Outside a project the fix reinstalls croft itself.
     const out = join(base, `bare${n++}`);
     mkdirSync(out);
