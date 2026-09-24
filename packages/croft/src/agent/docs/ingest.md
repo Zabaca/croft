@@ -3,7 +3,9 @@
 An ingest is one file in assets/ that makes one table with the file's name (lowercase letters, digits and
 _; assets/github_issues.ts makes github_issues). It default-exports ingest({...}) from "@zabaca/croft".
 Start from the closest template below and change only what the source needs; do not invent options.
-Then run it with croft run <name>, and look at the result with croft describe <name> and croft query.
+Then check it with croft validate, try it with croft preview <name> (it fetches at most 1,000 rows, changes no
+real table and does not move the saved cursor), run it with croft run <name>, and look at the result with
+croft describe <name> and croft query.
 
 How rows are written follows from key and incremental (croft describe says it in words):
   no key, no incremental   each run replaces the table
@@ -151,5 +153,7 @@ export default ingest({
 - signal: aborted on timeout or Ctrl-C.
 
 Other options: columns (type pins, e.g. { amount: "DECIMAL(18,2)" }), write ("replace", "append" or "merge"),
-retries, timeout (no-progress timeout, default "10m"), csv: { header, delimiter, skip, encoding }. checks and
-warnings are listed by croft describe but not enforced in this version.
+retries, timeout (no-progress timeout, default "10m"), csv: { header, delimiter, skip, encoding }, checks
+(rules every load must pass, such as ["not_null(email)", "amount >= 0"]) and warnings (the same rules, reported
+without blocking); croft docs checks. A failing check writes nothing: the table keeps its previous rows and the
+cursor does not move.
