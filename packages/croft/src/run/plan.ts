@@ -5,15 +5,14 @@
 //
 // Phase 1 builds ingests only. SQL and TS transforms are planned as `skip` steps with a note saying so, so a
 // bare `croft run` still lists them. Staleness, downstream and --dry-run arrive with transforms (phase 2).
-import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { CroftError, isCode } from "../core/errors.ts";
+import { CroftError } from "../core/errors.ts";
 import { captureImport, collectingSink, defaultOutputRedactor } from "../core/output.ts";
 import type { Check, CursorType, Hold, Incremental, Problem, Reason, WriteMode } from "../core/types.ts";
 import type { FileIngest } from "../types.ts";
 import { type DiscoveredAsset, discoverAssets } from "../project/discover.ts";
 import { ProjectEnv } from "../project/env.ts";
-import { didYouMean } from "../project/suggest.ts";
+import { behaviorHash, behaviorLabel, behaviorWords, isGlob, problemsNamed, resolveWrite, selectAssets } from "../project/resolve.ts";
 import type { LoadedSqlAsset } from "../project/sql-asset.ts";
 import { type LoadedTsAsset, loadTsAsset, type TsAssetSpec } from "../project/ts-asset.ts";
 
@@ -97,119 +96,9 @@ export const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 const TRANSFORM_NOTE = "transforms are built from croft's next phase; this version runs ingests only";
 
 // ---------------------------------------------------------------------------------------------------------
-// Selection
+// Selection and behavior live in project/resolve.ts (resolving an asset decides them); re-exported here.
 
-const GLOB_CHARS = /[*?[\]{}]/;
-
-export function isGlob(selector: string): boolean {
-  return GLOB_CHARS.test(selector);
-}
-
-/** Discovery problems (NAME_RESERVED, NAME_INVALID, NAME_CONFLICT) about files a selector names, by exact name
- *  or glob: each carries the file's base name in details.name. */
-export function problemsNamed(selector: string, problems: readonly Problem[]): Problem[] {
-  const glob = isGlob(selector) ? new Bun.Glob(selector) : null;
-  return problems.filter((p) => {
-    const name = p.details?.name;
-    return typeof name === "string" && (glob ? glob.match(name) : name === selector);
-  });
-}
-
-/** A discovery problem as the error a selector that names that file fails with. */
-function discoveryError(p: Problem): CroftError {
-  const { severity: _s, docs: _d, code, ...init } = p;
-  return new CroftError(isCode(code) ? code : "USAGE_ERROR", init);
-}
-
-/**
- * The asset names a list of selectors picks, in name order: exact names or globs ('github_*'). An empty list
- * selects every asset. An unknown name or a glob that matches nothing is USAGE_ERROR, with a did-you-mean,
- * unless it names a file discovery refused (`order.ts`: NAME_RESERVED): then that file's own problem.
- */
-export function selectAssets(names: readonly string[], selectors: readonly string[], problems: readonly Problem[] = []): string[] {
-  if (selectors.length === 0) return [...names].sort();
-  const picked = new Set<string>();
-  for (const sel of selectors) {
-    const broken = problemsNamed(sel, problems);
-    if (isGlob(sel)) {
-      const glob = new Bun.Glob(sel);
-      const hits = names.filter((n) => glob.match(n));
-      if (hits.length === 0) {
-        if (broken[0]) throw discoveryError(broken[0]);
-        throw new CroftError("USAGE_ERROR", {
-          message: `no asset matches ${JSON.stringify(sel)}`,
-          hint: names.length ? `assets are named after their files in assets/: ${names.slice(0, 20).join(", ")}` : "assets/ has no assets yet; croft docs ingest shows templates",
-          details: { selector: sel },
-        });
-      }
-      for (const h of hits) picked.add(h);
-      continue;
-    }
-    if (!names.includes(sel)) {
-      if (broken[0]) throw discoveryError(broken[0]);
-      const guess = didYouMean(sel, names);
-      throw new CroftError("USAGE_ERROR", {
-        message: `there is no asset named ${JSON.stringify(sel)}`,
-        hint: guess ? `did you mean ${guess}?` : names.length ? `assets are named after their files in assets/: ${names.slice(0, 20).join(", ")}` : "assets/ has no assets yet; croft docs ingest shows templates",
-        ...(guess ? { fix: { kind: "command" as const, description: `run ${guess}`, command: `croft run ${guess}` } } : {}),
-        details: { selector: sel, ...(guess ? { suggestion: guess } : {}) },
-      });
-    }
-    picked.add(sel);
-  }
-  return [...picked].sort();
-}
-
-// ---------------------------------------------------------------------------------------------------------
-// Behavior
-
-/** Write behavior from key and incremental (§1), unless `write` overrides it. */
-export function resolveWrite(spec: Pick<TsAssetSpec, "write" | "key" | "incremental">): WriteMode {
-  if (spec.write) return spec.write;
-  const incremental = spec.incremental.kind !== "none";
-  if (!incremental) return "replace";
-  return spec.key.length > 0 ? "merge" : "append";
-}
-
-export function behaviorLabel(write: WriteMode, key: readonly string[]): string {
-  const by = key.length ? ` by ${key.join(", ")}` : "";
-  if (write === "merge") return `merge${by}`;
-  if (write === "append") return "append";
-  return key.length ? `replace; key ${key.join(", ")}` : "replace";
-}
-
-function lookbackWords(ms: number): string {
-  const units: [number, string][] = [[86_400_000, "day"], [3_600_000, "hour"], [60_000, "minute"], [1000, "second"]];
-  for (const [size, name] of units) {
-    if (ms >= size && ms % size === 0) {
-      const n = ms / size;
-      return `${n} ${name}${n === 1 ? "" : "s"}`;
-    }
-  }
-  return `${ms} ms`;
-}
-
-/** The behavior in plain words (§1 "Write behavior is inferred"). */
-export function behaviorWords(write: WriteMode, key: readonly string[], incremental: Incremental): string {
-  const keyText = key.join(", ");
-  let what: string;
-  if (incremental.kind === "cursor") {
-    const unit = incremental.unit ? ` (${incremental.field} is epoch ${incremental.unit === "s" ? "seconds" : "milliseconds"})` : "";
-    const lb = incremental.lookbackMs > 0 ? `, re-reading the last ${lookbackWords(incremental.lookbackMs)}` : "";
-    what = `fetches ${incremental.field} newer than the saved position${lb}${unit}`;
-  } else if (incremental.kind === "files") {
-    what = "loads new and changed files only; rows of deleted files are kept";
-  } else what = "";
-  if (write === "merge") return `updates rows by ${keyText}${what ? `; ${what}` : ""}`;
-  if (write === "append") return `adds the new rows${what ? `; ${what}` : ""}`;
-  const base = key.length ? `replaces the table's contents (key ${keyText}, which must be unique)` : "replaces the table's contents";
-  return `${base}; unchanged rows keep their _loaded_at${what ? `; ${what}` : ""}`;
-}
-
-export function behaviorHash(write: WriteMode, key: readonly string[], incremental: Incremental): string {
-  const inc = incremental.kind === "cursor" ? { kind: "cursor", field: incremental.field } : { kind: incremental.kind };
-  return createHash("sha256").update(JSON.stringify({ write, key, incremental: inc })).digest("hex").slice(0, 16);
-}
+export { behaviorHash, behaviorLabel, behaviorWords, isGlob, problemsNamed, resolveWrite, selectAssets } from "../project/resolve.ts";
 
 // ---------------------------------------------------------------------------------------------------------
 // The plan
@@ -221,7 +110,7 @@ export function fileDirsOf(root: string, config: Pick<FileIngest, "file">): stri
   for (const f of list) {
     if (typeof f !== "string" || /^[a-z][a-z0-9+.-]*:\/\//i.test(f)) continue;
     const parts = f.split(/[\\/]/);
-    const firstGlob = parts.findIndex((p) => GLOB_CHARS.test(p));
+    const firstGlob = parts.findIndex((p) => isGlob(p));
     const fixed = firstGlob < 0 ? dirname(f) : parts.slice(0, firstGlob).join("/") || ".";
     out.push(isAbsolute(fixed) ? fixed : resolve(root, fixed));
   }

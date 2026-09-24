@@ -42,7 +42,7 @@ describe("the agent contract", () => {
     }
     expect(skill).toContain("croft run <asset> --from -90d");
     // The version section names what this build lacks, so the agent does not try it.
-    expect(skill).toContain("Not in this version, so never call them (each exits 2): validate, preview");
+    expect(skill).toContain("Not in this version, so never call them (each exits 2): schedule, serve");
 
     // The skill's pointers answer: the templates page and the backfill flag (refused for a file ingest, not unknown).
     const ingestDocs = await p.json(["docs", "ingest"]);

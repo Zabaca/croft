@@ -66,9 +66,17 @@ describe("the phase manifest matches the registry", () => {
     for (const c of LATER_COMMANDS) expect(registered.has(c)).toBe(false);
   });
 
-  test("no later-phase flag is registered, except query --preview, which refuses", async () => {
+  test("no later-phase flag is registered", async () => {
     const leaks = COMMANDS.flatMap((c) => laterFlags(c.name).filter((f) => f in c.options).map((f) => `${c.name} --${f}`));
-    expect(leaks).toEqual(["query --preview"]);
+    expect(leaks).toEqual([]);
+  });
+
+  test("this phase's flags are registered", () => {
+    const flags = (name: string) => Object.keys(registered.get(name)?.options ?? {});
+    expect(flags("run")).toEqual(expect.arrayContaining(["dry-run", "only", "upstream"]));
+    expect(flags("query")).toContain("preview");
+    expect(flags("validate")).toEqual(["types"]);
+    expect(flags("preview")).toEqual(["rows", "rebuild"]);
   });
 
   test("SKILL.md says what this version has and lacks, from the manifest", () => {
@@ -76,19 +84,24 @@ describe("the phase manifest matches the registry", () => {
     expect(skillMd()).toContain(notes);
     for (const c of SHIPPED_COMMANDS) expect(notes).toContain(c);
     for (const c of LATER_COMMANDS) expect(notes).toContain(c);
-    expect(notes).toContain("run --dry-run");
+    expect(notes).toContain("run --rebuild/--due");
+    expect(notes).toContain("validate --hook");
+    expect(notes).not.toContain("--dry-run");
   });
 });
 
 describe("croft tells the agent to use only what this build has", () => {
   test("the scanner catches what it is meant to", () => {
-    expect(scan("t", "Loop: edit → `croft validate --json` → `croft run <asset>`").map((f) => f.problem))
-      .toEqual(["croft validate is phase 2; this build is phase 1"]);
-    expect(scan("t", "Backfill: croft run <asset> --dry-run --from -90d, then the same without --dry-run.").map((f) => f.problem))
-      .toEqual(["croft run --dry-run comes in a later phase", "no command of this build has --dry-run"]);
-    expect(scan("t", "croft query --preview").map((f) => f.problem)).toEqual(["croft query --preview comes in a later phase"]);
+    expect(scan("t", "Loop: edit → `croft schedule on` → `croft run <asset>`").map((f) => f.problem))
+      .toEqual(["croft schedule is phase 3; this build is phase 2"]);
+    expect(scan("t", "Redo: croft run <asset> --rebuild --from -90d, then the same with --with-hook.").map((f) => f.problem))
+      .toEqual(["croft run --rebuild comes in a later phase", "no command of this build has --with-hook"]);
+    expect(scan("t", "croft validate --hook").map((f) => f.problem)).toEqual(["croft validate --hook comes in a later phase"]);
+    expect(scan("t", "croft preview x --rows 10 --dry-run").map((f) => f.problem)).toEqual(["croft preview has no option --dry-run"]);
     expect(scan("t", "croft logs x --failed → croft run x --from 2026-01-01; croft status --check")).toEqual([]);
+    expect(scan("t", "`croft validate --json` → `croft preview x --rebuild` → croft run x --dry-run --upstream; croft query --preview \"from x\"")).toEqual([]);
     expect(scan("t", "croft is not dbt; croft keeps its own logs")).toEqual([]);
+    expect(scan("t", "the project's own tsc --noEmit; croft validate --types")).toEqual([]);
   });
 
   test("CLAUDE.md (project and app) and SKILL.md", () => {

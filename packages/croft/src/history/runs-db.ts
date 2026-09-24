@@ -410,6 +410,24 @@ export class RunsDb {
     return this.sqlite.query("SELECT 1 FROM lock_waiters WHERE pid <> ? LIMIT 1").get(pid) !== null;
   }
 
+  // ---- the scheduler hold (§6 "The scheduler only runs code a human has run") ----
+
+  /** Record the code hash a human-initiated run or preview of `asset` ran successfully, which releases the
+   *  scheduler hold for that code. Other schedule_state columns are kept. */
+  approveCode(asset: string, codeHash: string): void {
+    this.sqlite.query(
+      `INSERT INTO schedule_state (asset, approved_code_hash) VALUES (?, ?)
+       ON CONFLICT (asset) DO UPDATE SET approved_code_hash = excluded.approved_code_hash`,
+    ).run(asset, codeHash);
+  }
+
+  /** The code hash a human last ran for `asset`, or null (never run by hand). */
+  approvedCode(asset: string): string | null {
+    const row = this.sqlite.query("SELECT approved_code_hash FROM schedule_state WHERE asset = ?").get(asset) as
+      { approved_code_hash: string | null } | null;
+    return row?.approved_code_hash ?? null;
+  }
+
   // ---- catalog mirror of _croft.* (DuckDB wins on disagreement) ----
 
   catalogGet<T = unknown>(asset: string): CatalogEntry<T> | null {

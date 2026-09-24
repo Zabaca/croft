@@ -281,3 +281,16 @@ describe("catalog", () => {
     expect(db.catalogDelete("orders")).toBe(false);
   });
 });
+
+describe("approved code (the scheduler hold, §6)", () => {
+  test("approveCode records the hash a human ran, replacing the previous one; other schedule_state columns stay", () => {
+    expect(db.approvedCode("zones")).toBeNull();
+    db.approveCode("zones", "h1");
+    expect(db.approvedCode("zones")).toBe("h1");
+    db.sqlite.query("UPDATE schedule_state SET phrase = 'every hour' WHERE asset = 'zones'").run();
+    db.approveCode("zones", "h2");
+    expect(db.approvedCode("zones")).toBe("h2");
+    expect(db.sqlite.query("SELECT phrase FROM schedule_state WHERE asset = 'zones'").get()).toEqual({ phrase: "every hour" });
+    expect(db.approvedCode("other")).toBeNull();
+  });
+});

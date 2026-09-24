@@ -20,8 +20,10 @@ export const optionsOf = (name: string): Set<string> => new Set([
 // Hidden options exist (a hint may say "leave --run-id out"); they are never valid in a suggested command.
 const everyFlag = new Set([...COMMANDS.flatMap((c) => Object.keys(c.options)), ...Object.keys(GLOBAL_OPTIONS)]);
 
-// Flags of other programs that croft's texts quote (bun, git, curl).
+// Flags of other programs that croft's texts quote (bun, git, curl). A camelCase flag (tsc --noEmit) is never
+// croft's: FLAG matches only whole lower-case kebab words.
 const FOREIGN_FLAGS = new Set(["no-env-file"]);
+const FLAG = /(?<![\w-])--([a-z][a-z-]*)(?![\w])/g;
 
 /** Where a command's span ends: the next backtick, arrow, clause break or command. */
 const SPAN_END = /`|→|;|\n|\(|\)|, | then | and | or | with | until |: |\. |\.$|croft (?=[a-z])/;
@@ -45,14 +47,14 @@ export function scan(where: string, text: string): Finding[] {
     const end = rest.search(SPAN_END);
     const span = end === -1 ? rest : rest.slice(0, end);
     const allowed = optionsOf(word);
-    for (const f of span.matchAll(/(?<![\w-])--([a-z][a-z-]*)/g)) {
+    for (const f of span.matchAll(FLAG)) {
       seen.add(start + f.index!);
       const flag = f[1]!;
       if (laterFlags(word).includes(flag)) out.push({ where, text: line, problem: `croft ${word} --${flag} comes in a later phase` });
       else if (!allowed.has(flag)) out.push({ where, text: line, problem: `croft ${word} has no option --${flag}` });
     }
   }
-  for (const f of text.matchAll(/(?<![\w-])--([a-z][a-z-]*)/g)) {
+  for (const f of text.matchAll(FLAG)) {
     if (seen.has(f.index!) || FOREIGN_FLAGS.has(f[1]!)) continue;
     if (!everyFlag.has(f[1]!)) {
       const line = text.slice(text.lastIndexOf("\n", f.index) + 1).split("\n")[0]!.trim();

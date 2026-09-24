@@ -314,6 +314,19 @@ describe("--allow-shrink through the CLI", () => {
 });
 
 describe("in-process command", () => {
+  // The phase-2 contract registers these flags with their final specs; builder P replaces the stub (and this test).
+  test("--dry-run, --only and --upstream refuse as PHASE_STUB until built, and nothing runs", async () => {
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    for (const flag of ["--dry-run", "--only", "--upstream"]) {
+      const r = await inProcess(root, ["run", "zones", flag, "--foreground", "--json"]);
+      expect(r.json.problems[0], flag).toMatchObject({ code: "INTERNAL_ERROR" });
+      expect(r.json.problems[0].message).toStartWith("PHASE_STUB");
+    }
+    expect(withRuns(root, (db) => db.listRuns())).toEqual([]);
+    expect(api.state.log).toEqual([]);
+  });
+
   test("human output on a TTY-less foreground run", async () => {
     api.state.zones = [{ zone: 1, name: "a" }, { zone: 2, name: "b" }];
     const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });

@@ -1,9 +1,9 @@
 // What this build ships (DESIGN.md §11 "Phases"), so the text croft gives an agent only names commands and
-// flags that exist. DESIGN.md §4.1 describes all of v1; this build is phase 1 ("Load and look").
+// flags that exist. DESIGN.md §4.1 describes all of v1; this build is phase 2 ("Transform and trust").
 //
-// - The command manifest below lists every command and run/query/init flag DESIGN.md §4.1 names, with the phase
-//   that ships it. The registry (cli/commands/index.ts) must register exactly the commands of this phase and
-//   no flag of a later one except `query --preview`, which is registered to refuse clearly (a test checks both).
+// - The command manifest below lists every command, and each run, validate and init flag DESIGN.md §4.1 gives a
+//   phase after 1, with the phase that ships it. The registry (cli/commands/index.ts) must register exactly the
+//   commands of this phase and no flag of a later one (a test checks both).
 // - SKILL.md renders its "This version" section from the manifest (agent/templates.ts), and a test scans
 //   CLAUDE.md, SKILL.md, every `croft docs` page, and every string in the source (this file aside) for a
 //   `croft <command>` or `--flag` this build does not have (agent/contract.test.ts).
@@ -13,7 +13,8 @@
 // through to the write, but nothing evaluates them until phase 2. So the output says so, rather than let
 // "Checks unique(id) · not_null(id)" read as a promise. To remove when phase 2 runs checks: delete
 // CHECKS_ENFORCED and every use of it (grep CHECKS_ENFORCED): the `checksEnforced` field of run, wait,
-// describe and context data, and the human lines in run.ts, describe.ts and context.ts.
+// describe and context data, and the human lines in run.ts, describe.ts and context.ts. Phase 2's runner and
+// inspect commands remove the uses as they start running checks; then the constants go.
 //
 // phaseStub() is what a module of the next wave throws until it is built: the contract commit gives each one
 // its final signature, so builders code against it in parallel (the phase-2 execution spec). grep PHASE_STUB
@@ -27,7 +28,7 @@ export function phaseStub(what: string): never {
 }
 
 /** The phase of DESIGN.md §11 this build implements. */
-export const PHASE: number = 1;
+export const PHASE: number = 2;
 
 /** Every command DESIGN.md §4.1 names (and the internal `tick`), with the phase that ships it. */
 export const COMMAND_PHASE = {
@@ -42,10 +43,10 @@ export const COMMAND_PHASE = {
 
 export type CommandName = keyof typeof COMMAND_PHASE;
 
-/** Flags of this build's commands that DESIGN.md §4.1 gives them in a later phase. */
+/** Flags DESIGN.md §4.1 gives a phase after 1, by command, with that phase (laterFlags() keeps those after PHASE). */
 export const LATER_FLAGS: Partial<Record<CommandName, Record<string, number>>> = {
   run: { "dry-run": 2, only: 2, upstream: 2, rebuild: 4, due: 3 },
-  query: { preview: 2 },
+  validate: { hook: 5 },
   init: { "with-hook": 5 },
 };
 
@@ -85,10 +86,10 @@ export function laterConfigKey(key: string): { phase: number; feature: string } 
   return hit && hit.phase > PHASE ? { phase: hit.phase, feature: hit.feature } : null;
 }
 
-/** What phase 1 does not do yet, in words, for SKILL.md. */
+/** What phase 2 does not do yet, in words, for SKILL.md. */
 export const PHASE_LIMITS = [
-  "It builds ingests only (API rows and files): .sql files and transform() assets are listed but skipped by",
-  "croft run. Checks are listed but not enforced, and nothing runs on a schedule: assets run when you run them.",
+  "Nothing runs on a schedule: assets run when you run them, and transforms update in the same run as their inputs.",
+  "There is no rebuild from scratch: an incremental TS transform applies new code to new input rows only.",
 ];
 
 /** SKILL.md's "This version" section: the commands that exist, the ones that do not, and what is not built.

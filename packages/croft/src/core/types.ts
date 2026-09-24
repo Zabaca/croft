@@ -1,5 +1,5 @@
 // Internal types shared by every module. Source of truth: DESIGN.md §10.
-import type { AssetDefinition, Row } from "../types.ts";
+import type { Row } from "../types.ts";
 
 export type AssetKind = "ingest" | "sql" | "ts";
 export type WriteMode = "replace" | "append" | "merge";
@@ -11,18 +11,8 @@ export type Incremental =
   | { kind: "new-rows"; inputs: string[] };                  // TS newRows()
 export interface Check { source: string; kind: "unique" | "not_null" | "min_rows" | "rule";
   blocking: boolean; scope: "batch" | "table"; sql: string; reads: string[] }
-export interface ResolvedAsset {
-  name: string; file: string; kind: AssetKind;
-  inputs: string[];                                          // from the AST or `inputs`
-  orderAfter: string[];                                      // inputs + tables read by its checks
-  write: WriteMode; key: string[]; incremental: Incremental;
-  schedule?: { text: string; cron: string };                 // ingests only
-  checks: Check[]; pins: Record<string, { type: string; format?: string }>;
-  codeHash: string; behaviorHash: string;                    // codeHash includes the project time zone
-  sql?: { body: string; headerLines: number };
-  usesHttp?: boolean;                                        // TS: for TRANSFORM_MAKES_REQUESTS / cost guard
-  definition?: AssetDefinition;
-}
+// ResolvedAsset (§10) is project/resolve.ts's: it carries the loaded TS and SQL modules, whose types core/ does
+// not import (src/read.ts's declarations are type-checked against this file without them).
 export type Reason = "requested" | "schedule_due" | "never_built" | "code_changed" | "input_changed"
   | "input_replaced" | "rebuild" | "backfill";
 export type Hold = "code_not_run_by_hand" | "large_reprocess" | "paused" | "leased";
@@ -81,3 +71,151 @@ export interface Warehouse {
   holder(): Promise<LockHolder | null>;
 }
 
+
+// ---------------------------------------------------------------------------------------------------------
+// Phase-2 command data (§4.3): validate, preview, run --dry-run
+
+/** One asset `croft validate` checked. */
+export interface ValidateAsset {
+  name: string;
+  kind: AssetKind | null;
+  /** The assets it reads (ResolvedAsset.inputs, plus the plan scans the bind check found). */
+  inputs: string[];
+  /** SQL assets: the columns prepare() gives (the bind check), which the next asset can use. null for TS assets
+   *  and when the bind was skipped (an input not built, an error before the bind). */
+  outputColumns: { name: string; type: string }[] | null;
+  /** The behavior label: "replace; key id", "merge by id". */
+  behavior: string;
+  /** Its code differs from the code its table was last built with (the catalog's codeHash). false when it was
+   *  never built, or its code does not load: there is nothing to compare. */
+  codeChanged: boolean;
+}
+
+/** `croft validate [asset…] [--types]`: `{order, assets}` (§4.3). Every finding is a problem of the envelope. */
+export interface ValidateData {
+  /** Every asset of the project in run order (project/graph.ts order). */
+  order: string[];
+  /** The assets checked (every asset, or those named), in `order`. */
+  assets: ValidateAsset[];
+  /** --types only: the project's own `tsc --noEmit`. skipped: no tsc in the project's node_modules (an info
+   *  problem says so; croft never installs it). */
+  types?: { status: "ok" | "failed" | "skipped"; errors: number };
+}
+
+/** A column that differs between the preview table and the live table. */
+export interface PreviewColumnChange {
+  column: string;
+  change: "added" | "removed" | "retyped";
+  /** The preview's type (added, retyped), or the live type (removed). */
+  type: string;
+  /** retyped: the live type. */
+  from?: string;
+  /** "no values yet; typed from its name", and the like. */
+  note?: string;
+}
+
+/** One asset of `croft preview`. */
+export interface PreviewAsset {
+  asset: string;
+  kind: AssetKind | null;
+  /** skipped: not built (downstream of an ingest preview, or an input failed); `reason` says why. */
+  status: "ok" | "failed" | "skipped";
+  /** How it was built, or why not, in words ("downstream of an ingest preview: not built from a partial sample"). */
+  reason: string;
+  /** Rows the preview built (an ingest: fetched); null when it did not build. */
+  rows: number | null;
+  /** Rows of the live table; null when it was never built. */
+  liveRows: number | null;
+  /** Only part of the table was built: an input or a fetch stopped at --rows, or an incremental TS transform
+   *  processed its pending rows only. The diff then covers only the keys the preview produced. */
+  partial: boolean;
+  /** An ingest's fetch, or a TS transform's input, stopped at --rows. */
+  capped: boolean;
+  /** Ingests: HTTP requests made. */
+  requests?: number;
+  /** Ingests: the saved position the preview fetched from (ISO with the project offset, or the cursor's own
+   *  value); it does not move. */
+  since?: string;
+  /** Against the live table, by key (`by`), or by whole rows when the asset has no key. A partial preview counts
+   *  only the keys it produced and never reports the others as removed. null when it did not build. */
+  diff: { by: string[]; added: number; removed: number; changed: number; unchanged: number } | null;
+  columns: PreviewColumnChange[];
+  /** Every check and warning evaluated on the preview table (StepResult.checks). */
+  checks: StepResult["checks"];
+  /** A few rows of the preview table, redacted and cut like query output. */
+  sample: Row[];
+  /** Ingests: the assets that would update downstream (not built in an ingest preview). */
+  downstream: string[];
+  durationMs: number;
+  error?: Problem;
+}
+
+/** `croft preview <asset…> [--rows N] [--rebuild]` (§6 "Ways to try a change" 2): built in .croft/preview.duckdb
+ *  from snapshots of the live inputs; nothing real changes. */
+export interface PreviewData {
+  /** The named assets, then the SQL built downstream of them, in run order. */
+  assets: PreviewAsset[];
+  /** Any asset is partial. */
+  partial: boolean;
+  /** When the live inputs were copied to .croft/preview/ (ISO with the project offset); null when no input was
+   *  snapshotted. `croft query --preview` reads the same snapshot. */
+  inputsSnapshotAt: string | null;
+  /** --rebuild: each asset was built from scratch and compared with the live table (drift, out-of-band edits). */
+  rebuild: boolean;
+  /** --rows N (default 1,000): the input rows a TS transform receives, the rows an ingest fetches. */
+  rowCap: number;
+}
+
+/** The window of a cursor ingest in a dry run: what ctx.since would be (§8, "echoes the conversion"). */
+export interface DryRunWindow {
+  /** The value ctx.since gets, in the cursor's own JSON type. */
+  sinceValue: string | number;
+  sinceType: CursorType;
+  /** sinceValue as an instant with the project offset, when it is a time (an epoch cursor included). */
+  sinceAt?: string;
+  /** saved: the saved position minus the lookback; from: --from. */
+  source: "saved" | "from";
+  /** The saved position, before the lookback. */
+  saved?: string | number;
+  /** The lookback subtracted, in words ("30 days"). */
+  lookback?: string;
+}
+
+/** A confirmation a real run would stop for. A dry run never issues a token. */
+export interface DryRunConfirmation {
+  action: "allow_shrink" | "large_reprocess";
+  /** What `croft confirm` would carry out: "croft run taxi_zones --allow-shrink". */
+  command: string;
+  /** allow_shrink: the rows that would go to the trash. large_reprocess: the pending input rows, and the
+   *  requests they would cost, estimated from the catalog mirror. */
+  impact: Impact;
+}
+
+/** One asset of `croft run --dry-run`: PlanStep (§10) with what the run line shows (§4.2). */
+export interface DryRunStep {
+  asset: string;
+  file: string;
+  kind: "rows" | "file" | "transform" | "sql";
+  action: "fetch" | "rebuild" | "update" | "skip";
+  reasons: Reason[];
+  /** The line's words: "merge by id, since 2026-09-22T17:58:03Z", "SQL changed (assets/open_issues.sql)",
+   *  "input github_issues will have new rows (TS code unchanged)". */
+  reason: string;
+  behavior: string;
+  hold?: Hold;
+  /** skip: the failed or held asset it depends on. */
+  skippedBecause?: string;
+  /** Cursor ingests that have loaded before, or run with --from. Absent: a full fetch. */
+  window?: DryRunWindow;
+  confirmation?: DryRunConfirmation;
+  /** Static errors that would fail this step before it runs (a load error, CHECK_INVALID, a bind error). */
+  problems: Problem[];
+}
+
+/** `croft run --dry-run`: what would run and why, from runs.sqlite alone; never waits on the database. */
+export interface DryRunData {
+  dryRun: true;
+  /** The steps' assets in the order they would run. */
+  order: string[];
+  steps: DryRunStep[];
+}

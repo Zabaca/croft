@@ -36,9 +36,12 @@ const doctor = lazyCommand({
 
 const run = lazyCommand({
   name: "run",
-  summary: "update assets: fetch ingests (off a terminal the run detaches; croft wait follows it)",
-  usage: "croft run [selector…] [--from <date|ISO|-90d>] [--allow-shrink] [--foreground] [--follow 100s] [--no-wait] [--events]",
+  summary: "update assets and the stale transforms downstream (off a terminal the run detaches; croft wait follows it)",
+  usage: "croft run [selector…] [--dry-run] [--only] [--upstream] [--from <date|ISO|-90d>] [--allow-shrink] [--foreground] [--follow 100s] [--no-wait] [--events]",
   options: {
+    "dry-run": { type: "boolean", description: "show what would run and why (windows, confirmations) without running; reads only runs.sqlite and never waits" },
+    only: { type: "boolean", description: "run only the named assets, not the stale assets downstream of them" },
+    upstream: { type: "boolean", description: "also refresh the stale assets the named ones read, first" },
     from: { type: "string", value: "<when>", description: "backfill a merge ingest from a date, an ISO time or a relative value (-90d, -12h, today)" },
     "allow-shrink": { type: "boolean", description: "override SHRINK_GUARD for one replace ingest: the current rows go to the trash first, after confirmation" },
     foreground: { type: "boolean", description: "run in this process even off a terminal (no detaching)" },
@@ -110,10 +113,29 @@ const query = lazyCommand({
   options: {
     limit: { type: "string", value: "N", description: "rows to show (default 50)" },
     "full-values": { type: "boolean", description: "show whole values instead of cutting them at 80 characters" },
-    preview: { type: "boolean", description: "query the preview database (a later croft version; refused in this one)" },
+    preview: { type: "boolean", description: "query the preview database that croft preview built (.croft/preview.duckdb) instead of the warehouse" },
   },
   maxPositionals: 1,
 }, async () => (await import("./query.ts")).query);
+
+const validate = lazyCommand({
+  name: "validate",
+  summary: "static checks and a bind check of every SQL asset (with its output columns); never touches the warehouse",
+  usage: "croft validate [asset…] [--types]",
+  options: {
+    types: { type: "boolean", description: "also type-check the project's TypeScript with its own tsc --noEmit" },
+  },
+}, async () => (await import("./validate.ts")).validate);
+
+const preview = lazyCommand({
+  name: "preview",
+  summary: "build assets in a sandbox and diff them against the live tables; changes nothing real",
+  usage: "croft preview <asset…> [--rows N] [--rebuild]",
+  options: {
+    rows: { type: "string", value: "N", description: "the input rows a TS transform receives, and the rows an ingest fetches (default 1000)" },
+    rebuild: { type: "boolean", description: "build from scratch and compare with the live table (finds incremental drift and out-of-band edits)" },
+  },
+}, async () => (await import("./preview.ts")).preview);
 
 const logs = lazyCommand({
   name: "logs",
@@ -137,5 +159,5 @@ const confirm = lazyCommand({
 }, async () => (await import("./confirm.ts")).confirm);
 
 export const COMMANDS: readonly Command[] = [
-  docs, help, version, init, doctor, run, wait, status, query, describe, context, logs, secrets, confirm,
+  docs, help, version, init, doctor, validate, preview, run, wait, status, query, describe, context, logs, secrets, confirm,
 ];

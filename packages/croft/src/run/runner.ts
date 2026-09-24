@@ -254,14 +254,6 @@ async function pool<T>(items: readonly T[], limit: number, fn: (item: T) => Prom
   await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
 }
 
-/** Record the code a human ran, which releases the scheduler hold (§6 "The scheduler only runs code a human has run"). */
-function approveCode(runs: RunsDb, asset: string, codeHash: string): void {
-  runs.sqlite.query(
-    `INSERT INTO schedule_state (asset, approved_code_hash) VALUES (?, ?)
-     ON CONFLICT (asset) DO UPDATE SET approved_code_hash = excluded.approved_code_hash`,
-  ).run(asset, codeHash);
-}
-
 function cursorTypes(runs: RunsDb): Record<string, CursorType> {
   const out: Record<string, CursorType> = {};
   for (const c of allCatalog(runs)) if (c.cursor?.type) out[c.asset] = c.cursor.type;
@@ -475,7 +467,7 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
             ...(o.fault ? { fault: o.fault } : {}), ...(o.now ? { now: o.now } : {}),
           });
           runs.finishStep(runId, asset, attempt, { status: out.result.status, reason: out.result.reason, rows: out.result.rows });
-          if (out.result.status === "ok" && (o.human ?? true) && step.codeHash) approveCode(runs, asset, step.codeHash);
+          if (out.result.status === "ok" && (o.human ?? true) && step.codeHash) runs.approveCode(asset, step.codeHash);
           events.emit({ type: "step", runId, asset, attempt, status: out.result.status, result: out.result });
           return { ok: true as const, out };
         } catch (e) {

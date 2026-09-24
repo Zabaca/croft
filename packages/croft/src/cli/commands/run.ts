@@ -18,7 +18,7 @@ import { CONFIRM_GRANT_ENV, Confirmations, grantDetached, redeemGrant } from "..
 import { DEFAULT_FOLLOW_MS, followRun, parseWait, pickRunId, spawnDetachedRun } from "../../run/detach.ts";
 import { loadErrors, planRun } from "../../run/plan.ts";
 import { checkRunFlags, executeRun, type RunData, type RunEvent, type RunSummary } from "../../run/runner.ts";
-import { CHECKS_ENFORCED, CHECKS_NOT_ENFORCED } from "../../core/phase.ts";
+import { CHECKS_ENFORCED, CHECKS_NOT_ENFORCED, phaseStub } from "../../core/phase.ts";
 import type { CommandImpl, CommandResult, Ctx } from "../command.ts";
 import { dispatchOf } from "../main.ts";
 import { formatCount, formatDuration } from "../render.ts";
@@ -96,8 +96,12 @@ function croftFrom(p: Problem): CroftError {
 
 export const run: CommandImpl<RunData> = {
   async run(ctx) {
-    const project = ctx.project;
     const v = ctx.values;
+    // PHASE 2 STUB: these flags are registered with their final specs; builder P implements them. Until then
+    // they refuse, rather than run what the flag was meant to preview or narrow.
+    if (v["dry-run"] === true) phaseStub("croft run --dry-run (run/dry-run.ts)");
+    if (v.only === true || v.upstream === true) phaseStub("croft run --only and --upstream (run/plan.ts)");
+    const project = ctx.project;
     const selectors = [...ctx.positionals];
     const from = str(v.from);
     const allowShrink = v["allow-shrink"] === true;
