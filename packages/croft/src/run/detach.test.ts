@@ -172,6 +172,33 @@ describe("followRun", () => {
     sp2.child.kill("SIGKILL");
   });
 
+  test("croft run's parent process exits as soon as it has followed the child: nothing it waited with keeps it alive", () => {
+    // The grace for the child's exit was a 3 s sleep raced against the exit; the exit won, and the sleep then held the
+    // parent's event loop (and `croft run`) for the rest of the 3 s.
+    const s = stateDir();
+    const child = join(s, "child.ts");
+    writeFileSync(child, `
+      import { RunsDb } from ${JSON.stringify(join(import.meta.dir, "../history/runs-db.ts"))};
+      const db = RunsDb.open(${JSON.stringify(s)});
+      db.createRun({ id: "r_0101_0000_prnt", trigger: "manual", human: false, argv: ["run"] });
+      db.finishRun("r_0101_0000_prnt", "succeeded", { data: { runId: "r_0101_0000_prnt", status: "succeeded", steps: [] }, problems: [], next: [], exit: 0, ok: true });
+      db.close();
+      await Bun.sleep(300);
+    `);
+    const parent = join(s, "parent.ts");
+    writeFileSync(parent, `
+      import { followRun, spawnDetachedRun } from ${JSON.stringify(join(import.meta.dir, "detach.ts"))};
+      const spawned = spawnDetachedRun({ root: ${JSON.stringify(s)}, stateDir: ${JSON.stringify(s)}, args: [], runId: "r_0101_0000_prnt", env: { PATH: process.env.PATH }, entry: ${JSON.stringify(child)} });
+      const res = await followRun({ stateDir: ${JSON.stringify(s)}, runId: "r_0101_0000_prnt", timeoutMs: 10_000, pollMs: 20, spawned });
+      console.log(res.kind, Date.now());
+    `);
+    const r = spawnSync(process.execPath, [parent], { encoding: "utf8", env: { PATH: process.env.PATH } });
+    const exitedAt = Date.now();
+    const [kind, followedAt] = r.stdout.trim().split(" ");
+    expect(kind, r.stderr).toBe("finished");
+    expect(exitedAt - Number(followedAt)).toBeLessThan(1000);
+  });
+
   test("an unknown run with no process log is not_started; with one it is still starting", async () => {
     const s = stateDir();
     const none = await followRun({ stateDir: s, runId: "r_0101_0000_abcd", timeoutMs: 50, pollMs: 10 });

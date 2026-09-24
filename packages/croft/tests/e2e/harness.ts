@@ -290,3 +290,138 @@ export const RUN_ID = /^r_\d{4}_\d{4}_[0-9a-z]{4}$/;
 export function envelopeKeys(env: Envelope): string[] {
   return Object.keys(env).sort();
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Scheduling and serving (phase 3)
+
+let labels = 0;
+
+/**
+ * The environment for a journey that turns scheduling on: a temp HOME with its own croft folder (the registry,
+ * projects.json, and the per-user tick log live there) and a job label no other test uses. Every journey also runs
+ * with the tripwires of baseEnv(), and turns scheduling on with `croft schedule on --no-os-job`, so no OS job is
+ * ever installed; the real ~/.croft is never read or written.
+ */
+export function schedulerEnv(): { HOME: string; CROFT_HOME: string; CROFT_JOB_LABEL: string } {
+  const home = tempDir("croft-home-");
+  mkdirSync(join(home, ".croft"), { recursive: true });
+  return { HOME: home, CROFT_HOME: join(home, ".croft"), CROFT_JOB_LABEL: `dev.croft.e2e.${process.pid}.${++labels}` };
+}
+
+/**
+ * CROFT_NOW for a wall-clock time on one day in the project zone (America/Los_Angeles, -07:00 in June).
+ *
+ * The day is years away from the real clock on purpose: runs.sqlite (runs, steps), fire times, heartbeats and
+ * last_fire_at all follow CROFT_NOW, so a stamp taken from the real clock by mistake stands out.
+ */
+export function laTime(hour: number, minute = 0): string {
+  return `2036-06-10T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00-07:00`;
+}
+
+/** The JSON lines of a file ([] when it does not exist). */
+export function ndjson(path: string): Envelope[] {
+  if (!existsSync(path)) return [];
+  return readFileSync(path, "utf8").split("\n").filter((l) => l.trim() !== "").map((l) => JSON.parse(l) as Envelope);
+}
+
+/** @duckdb/node-api, for programs that are not croft (a GUI holding a file, a notebook reading one). */
+export const DUCKDB_API = Bun.fileURLToPath(import.meta.resolve("@duckdb/node-api"));
+
+const DUCKDB_READ = `const { DuckDBInstance } = require(process.env.DUCKDB_API);
+(async () => {
+  const db = await DuckDBInstance.create(process.env.DB_PATH, { access_mode: "READ_ONLY" });
+  const c = await db.connect();
+  const out = {};
+  for (const [name, sql] of JSON.parse(process.env.QUERIES)) out[name] = (await c.runAndReadAll(sql)).getRowObjectsJson();
+  c.disconnectSync();
+  db.closeSync();
+  process.stdout.write(JSON.stringify(out));
+})().catch((e) => { console.error(e.message); process.exit(1); });`;
+
+/**
+ * Open a DuckDB file read-only in a separate process (not croft), run named queries and close it: rows as
+ * @duckdb/node-api's getRowObjectsJson() gives them (integers as strings).
+ */
+export function readDuckDb(path: string, queries: Record<string, string>): Record<string, Record<string, unknown>[]> {
+  const r = Bun.spawnSync([process.execPath, "-e", DUCKDB_READ], {
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", TMPDIR: process.env.TMPDIR ?? "/tmp", DUCKDB_API, DB_PATH: path, QUERIES: JSON.stringify(Object.entries(queries)) },
+    stdout: "pipe", stderr: "pipe", timeout: 30_000,
+  });
+  if (r.exitCode !== 0) throw new Error(`reading ${path} failed: ${r.stderr.toString()}`);
+  return JSON.parse(r.stdout.toString()) as Record<string, Record<string, unknown>[]>;
+}
+
+// Holds the file open (read-write, as the DuckDB UI or DBeaver do) and answers one SQL line on stdin with a JSON
+// line on stdout. The instance stays referenced from globalThis: an unreferenced instance is collected, which
+// releases the file. It exits by itself after 90 s, so a test that times out leaves nothing behind.
+const DUCKDB_HOLDER = `const { DuckDBInstance } = require(process.env.DUCKDB_API);
+setTimeout(() => process.exit(0), 90000);
+(async () => {
+  const db = await DuckDBInstance.create(process.env.DB_PATH);
+  const c = await db.connect();
+  globalThis.keep = [db, c];
+  let buffer = "";
+  process.stdin.on("data", async (chunk) => {
+    buffer += chunk;
+    for (let nl = buffer.indexOf("\\n"); nl !== -1; nl = buffer.indexOf("\\n")) {
+      const sql = buffer.slice(0, nl);
+      buffer = buffer.slice(nl + 1);
+      try {
+        console.log(JSON.stringify({ rows: (await c.runAndReadAll(sql)).getRowObjectsJson() }));
+      } catch (e) {
+        console.log(JSON.stringify({ error: e.message }));
+      }
+    }
+  });
+  console.log(JSON.stringify({ held: true }));
+})().catch((e) => { console.error(e.message); process.exit(1); });`;
+
+export interface FileHolder {
+  proc: ReturnType<typeof Bun.spawn>;
+  /** Run one SQL statement on the holder's own connection. */
+  query(sql: string): Promise<Record<string, unknown>[]>;
+  close(): Promise<void>;
+}
+
+/** A program that is not croft holding a DuckDB file open (read-write), until close(). */
+export async function holdDuckDb(path: string): Promise<FileHolder> {
+  const proc = Bun.spawn([process.execPath, "-e", DUCKDB_HOLDER], {
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", TMPDIR: process.env.TMPDIR ?? "/tmp", DUCKDB_API, DB_PATH: path },
+    stdin: "pipe", stdout: "pipe", stderr: "pipe",
+  });
+  spawned.add(proc);
+  const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  const line = async (): Promise<Envelope> => {
+    const deadline = Date.now() + 20_000;
+    for (let nl = text.indexOf("\n"); nl === -1; nl = text.indexOf("\n")) {
+      if (Date.now() > deadline) throw new Error(`the holder of ${path} did not answer: ${text}`);
+      const { value, done } = await reader.read();
+      if (done) throw new Error(`the holder of ${path} exited: ${text}${await new Response(proc.stderr as ReadableStream).text()}`);
+      text += decoder.decode(value);
+    }
+    const nl = text.indexOf("\n");
+    const out = JSON.parse(text.slice(0, nl)) as Envelope;
+    text = text.slice(nl + 1);
+    return out;
+  };
+  const first = await line();
+  if (!first.held) throw new Error(`the holder of ${path} said ${JSON.stringify(first)}`);
+  const stdin = proc.stdin as import("bun").FileSink;
+  return {
+    proc,
+    async query(sql) {
+      stdin.write(`${sql.replace(/\n/g, " ")}\n`);
+      await stdin.flush();
+      const r = await line();
+      if (r.error) throw new Error(r.error as string);
+      return r.rows as Record<string, unknown>[];
+    },
+    async close() {
+      proc.kill();
+      await proc.exited;
+      spawned.delete(proc);
+    },
+  };
+}

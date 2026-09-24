@@ -7,7 +7,7 @@ import { DuckDBInstance } from "@duckdb/node-api";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { bootId } from "../core/proc.ts";
+import { bootId, currentIdentity } from "../core/proc.ts";
 import { formatInstant } from "../core/time.ts";
 import { RunsDb } from "../history/runs-db.ts";
 import { loadProject } from "../project/root.ts";
@@ -400,6 +400,115 @@ describe("errors are logged and recorded, never thrown", () => {
     expect(await refreshReadCopy(join(p.root, "no-such-folder"))).toMatchObject({ status: "skipped" });
   });
 });
+
+describe("readCopyStatus: how current the copy is, for doctor and status (R32-11)", () => {
+  /** A finished run that committed a write, finished at `at`, by a process that is gone (or this one, `alive`). */
+  function wrote(stateDir: string, at: string, alive = false): string {
+    const runs = RunsDb.open(stateDir, { now: () => new Date(at) });
+    try {
+      const identity = alive ? undefined : { pid: 2 ** 22 + 7, procStart: "12345", bootId: bootId() };
+      const run = runs.createRun({ trigger: "manual", human: true, argv: ["run", "t"], ...(identity ? { identity } : {}) });
+      runs.startStep({ runId: run.id, asset: "t", attempt: 1, reason: "never_built" });
+      runs.finishStep(run.id, "t", 1, { status: "ok", rows: { in: 1, added: 1 } });
+      runs.finishRun(run.id, "succeeded");
+      return run.id;
+    } finally {
+      runs.close();
+    }
+  }
+
+  function setState(stateDir: string, patch: Record<string, unknown>): void {
+    const runs = RunsDb.open(stateDir);
+    try {
+      runs.setSetting(READ_COPY_SETTING, { ...(runs.getSetting<Record<string, unknown>>(READ_COPY_SETTING) ?? {}), ...patch });
+    } finally {
+      runs.close();
+    }
+  }
+
+  test("ok: the last refresh came after the last run that wrote data", async () => {
+    const p = await seeded();
+    const run = wrote(p.stateDir, "2026-09-24T16:59:00.000Z");
+    process.env.CROFT_NOW = "2026-09-24T17:00:00Z";
+    refreshed(await refreshReadCopy(p.root));
+    expect(readCopyStatus(p.project)).toMatchObject({
+      enabled: true, exists: true, health: "ok", refreshing: false, lastError: null,
+      lastWrite: { runId: run, at: "2026-09-24T16:59:00.000Z" }, log: join(p.stateDir, READ_COPY_LOG),
+    });
+  });
+
+  test("behind: a run wrote data after the last refresh and no refresh followed; while that run is alive, refreshing", async () => {
+    const p = await seeded();
+    process.env.CROFT_NOW = "2026-09-24T17:00:00Z";
+    refreshed(await refreshReadCopy(p.root));
+    const run = wrote(p.stateDir, "2026-09-24T17:05:00.000Z");
+    expect(readCopyStatus(p.project)).toMatchObject({ health: "behind", refreshing: false, lastWrite: { runId: run, at: "2026-09-24T17:05:00.000Z" } });
+    // The run that wrote last is still finishing: its own refresh follows.
+    wrote(p.stateDir, "2026-09-24T17:06:00.000Z", true);
+    expect(readCopyStatus(p.project)).toMatchObject({ health: "refreshing", refreshing: true });
+    // The next refresh covers both.
+    refreshed(await refreshReadCopy(p.root));
+    expect(readCopyStatus(p.project)).toMatchObject({ health: "ok", refreshing: false });
+  });
+
+  test("behind is judged by run order, not by clocks: a refresh under a frozen CROFT_NOW in the past still covers a later run", async () => {
+    const p = await seeded();
+    wrote(p.stateDir, "2026-09-24T17:05:00.000Z");
+    process.env.CROFT_NOW = "2020-01-01T00:00:00Z";
+    refreshed(await refreshReadCopy(p.root));
+    expect(readCopyStatus(p.project).health).toBe("ok");
+  });
+
+  test("a copy with no record of the runs it covers (made by an older croft) is judged by its time", async () => {
+    const p = await seeded();
+    process.env.CROFT_NOW = "2026-09-24T17:00:00Z";
+    refreshed(await refreshReadCopy(p.root));
+    setState(p.stateDir, { covers: null });
+    wrote(p.stateDir, "2026-09-24T16:00:00.000Z");
+    expect(readCopyStatus(p.project).health).toBe("ok");
+    wrote(p.stateDir, "2026-09-24T18:00:00.000Z");
+    expect(readCopyStatus(p.project).health).toBe("behind");
+  });
+
+  test("failed: the last refresh failed, with its error; a refresh under way is refreshing", async () => {
+    const p = await seeded();
+    process.env.CROFT_NOW = "2026-09-24T17:00:00Z";
+    refreshed(await refreshReadCopy(p.root));
+    process.env.CROFT_NOW = "2026-09-24T18:00:00Z";
+    const out = await refreshReadCopy(p.root, { cp: [join(p.root, "no-such-cp")] });
+    if (out.status !== "failed") throw new Error(`expected a failure, got ${JSON.stringify(out)}`);
+    const s = readCopyStatus(p.project);
+    expect(s).toMatchObject({ health: "failed", lastError: { at: "2026-09-24T18:00:00.000Z", message: out.error.message } });
+    setState(p.stateDir, { holder: { pid: process.pid, procStart: currentIdentity().procStart, bootId: bootId() } });
+    expect(readCopyStatus(p.project)).toMatchObject({ health: "refreshing", refreshing: true });
+  });
+
+  test("missing: on, no copy yet, and nothing failed; off: health off", async () => {
+    const p = await seeded();
+    expect(readCopyStatus(p.project)).toMatchObject({ enabled: true, exists: false, health: "missing", lastWrite: null });
+    const off = await seeded(undefined, {});
+    expect(readCopyStatus(off.project)).toMatchObject({ enabled: false, health: "off" });
+  });
+
+  test("the module loads without DuckDB: doctor imports it, and a binding that does not load must not break doctor", () => {
+    const plugin = join(dirname(copyOfDir()), "no-duckdb-plugin.js");
+    writeFileSync(plugin, `Bun.plugin({ name: "no-duckdb", setup(build) {
+  build.onResolve({ filter: /^@duckdb\\// }, (args) => { throw new Error("simulated: no DuckDB binding for " + args.path); });
+} });\n`);
+    const url = new URL("./readcopy.ts", import.meta.url).href;
+    const r = spawnSync(process.execPath, ["--no-env-file", "--preload", plugin, "-e", `const m = await import(${JSON.stringify(url)}); process.stdout.write(typeof m.readCopyStatus);`], {
+      encoding: "utf8", env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+    });
+    expect(`${r.stdout}${r.stderr}`).toBe("function");
+  });
+});
+
+/** A temp folder for files a test writes outside any project. */
+function copyOfDir(): string {
+  const dir = join(process.env.TMPDIR ?? "/tmp", `croft-readcopy-${process.pid}`);
+  mkdirSync(dir, { recursive: true });
+  return join(dir, "x");
+}
 
 test("readCopyStatus renders the copy's time in the project offset", async () => {
   const p = await seeded();

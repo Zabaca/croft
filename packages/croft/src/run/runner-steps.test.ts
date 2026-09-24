@@ -459,6 +459,12 @@ export default transform({
 
   test("a scheduled run holds the transform instead (§5: until a person runs it), recorded for the tick", async () => {
     const root = project();
+    // Scheduling on, and every asset's code run by hand before (a scheduled step checks both as it starts).
+    const plan = await phase2Plan(root);
+    withRuns(root, (db) => {
+      db.setScheduling({ state: "on", via: "serve" });
+      for (const s of plan.steps) db.approveCode(s.asset, (s.codeHash ?? s.sql?.codeHash)!);
+    });
     const out = await run2(root, { human: false, trigger: "schedule" });
     expect(out.step("triage")).toMatchObject({ status: "skipped" });
     expect(out.step("triage").skippedBecause).toStartWith("held (LARGE_REPROCESS): ");

@@ -91,34 +91,89 @@ export const CRON_FIELDS_HINT = "a cron is minute (0-59) hour (0-23) day-of-mont
 /** Longest day of each month, Feb 29 included. */
 const MONTH_DAYS = [0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
-/** Parse a 5-field cron. Never throws. */
+/** How many problems a suggestion may fix one after another (one field item each). */
+const MAX_FIXES = 12;
+
+/**
+ * A cron that does not parse, before its suggestion is checked. `hint` is for when no suggestion is offered;
+ * `say` words the hint around the suggestion that is.
+ */
+type Refusal = { ok: false; problem: string; hint: string; suggestion?: string; say?: (suggestion: string) => string };
+
+/** Parse a 5-field cron. Never throws. A suggestion is offered only when it parses itself: one fix can leave
+ *  another problem ("0 0 * janury mnday"), so each is fixed in turn, and none is offered when one cannot be. */
 export function parseCron(input: string): CronParse {
+  const r = parseOnce(input);
+  if (r.ok) return r;
+  const suggestion = r.suggestion === undefined ? undefined : repaired(r.suggestion);
+  if (suggestion === undefined) return { ok: false, problem: r.problem, hint: r.hint };
+  return { ok: false, problem: r.problem, hint: r.say ? r.say(suggestion) : r.hint, suggestion };
+}
+
+/** `s` when it parses; else what fixing its problems one by one leads to, when that parses; else undefined. */
+function repaired(s: string): string | undefined {
+  for (let i = 0; i < MAX_FIXES; i++) {
+    const p = parseOnce(s);
+    if (p.ok) return s;
+    if (p.suggestion === undefined || p.suggestion === s) return undefined;
+    s = p.suggestion;
+  }
+  return undefined;
+}
+
+function parseOnce(input: string): { ok: true; cron: Cron } | Refusal {
   const text = input.trim().replace(/\s+/g, " ");
   const tokens = text === "" ? [] : text.split(" ");
   const quoted = JSON.stringify(text);
+  const count = {
+    ok: false as const, hint: CRON_FIELDS_HINT,
+    problem: `schedule ${quoted} has ${tokens.length} field${tokens.length === 1 ? "" : "s"}; a cron has 5: minute hour day-of-month month day-of-week`,
+  };
   if (tokens.length === 6) {
+    // Seconds first (Spring, node-cron), else a year last (AWS): whichever leaves a cron that parses.
+    const seconds = tokens.slice(1).join(" ");
+    const fixed = repaired(seconds);
+    if (fixed !== undefined) {
+      return {
+        ok: false, problem: `schedule ${quoted} has 6 fields; croft schedules to the minute, so there is no seconds field`,
+        hint: CRON_FIELDS_HINT, suggestion: fixed,
+        say: (s) => `drop the first (seconds) field${s === seconds ? "" : ", and fix the rest"}: ${s}`,
+      };
+    }
+    const year = tokens.slice(0, 5).join(" ");
+    const fixedYear = repaired(year);
+    if (fixedYear !== undefined) {
+      return {
+        ok: false,
+        problem: `schedule ${quoted} has 6 fields; a cron has 5 (minute hour day-of-month month day-of-week), with no year field`,
+        hint: CRON_FIELDS_HINT, suggestion: fixedYear,
+        say: (s) => `drop the last field${s === year ? "" : ", and fix the rest"}: ${s}`,
+      };
+    }
+    return count;
+  }
+  if (tokens.length === 7) {
+    // Quartz: seconds first and a year last.
+    const five = tokens.slice(1, 6).join(" ");
+    const fixed = repaired(five);
+    if (fixed === undefined) return count;
     return {
-      ok: false, problem: `schedule ${quoted} has 6 fields; croft schedules to the minute, so there is no seconds field`,
-      hint: `drop the first (seconds) field: ${tokens.slice(1).join(" ")}`, suggestion: tokens.slice(1).join(" "),
+      ok: false, problem: `schedule ${quoted} has 7 fields; croft schedules to the minute and has no year field`,
+      hint: CRON_FIELDS_HINT, suggestion: fixed,
+      say: (s) => `drop the first (seconds) and last (year) fields${s === five ? "" : ", and fix the rest"}: ${s}`,
     };
   }
-  if (tokens.length !== 5) {
-    return {
-      ok: false, problem: `schedule ${quoted} has ${tokens.length} field${tokens.length === 1 ? "" : "s"}; a cron has 5: minute hour day-of-month month day-of-week`,
-      hint: CRON_FIELDS_HINT,
-    };
-  }
+  if (tokens.length !== 5) return count;
   // `?` (Quartz's "no value") in a day field means what `*` means.
   const fields = tokens.map((t, i) => (t === "?" && (i === 2 || i === 4) ? "*" : t));
   const sets: Set<number>[] = [];
   for (let i = 0; i < 5; i++) {
     const r = parseField(fields[i]!, FIELDS[i]!);
     if ("problem" in r) {
-      const suggestion = r.fixed !== undefined ? fields.map((f, j) => (j === i ? r.fixed : f)).join(" ") : undefined;
+      const suggestion = r.fixed !== undefined ? tokens.map((f, j) => (j === i ? r.fixed : f)).join(" ") : undefined;
       return {
-        ok: false, problem: `schedule ${quoted}: ${r.problem}`,
-        hint: suggestion !== undefined ? `did you mean ${suggestion}? (${CRON_FIELDS_HINT})` : CRON_FIELDS_HINT,
-        ...(suggestion !== undefined ? { suggestion } : {}),
+        ok: false, problem: `schedule ${quoted}: ${r.problem}`, hint: CRON_FIELDS_HINT,
+        ...(suggestion !== undefined ? { suggestion, say: (s: string) => `did you mean ${s}? (${CRON_FIELDS_HINT})` } : {}),
       };
     }
     sets.push(r.values);
@@ -223,9 +278,11 @@ function replaceItem(items: readonly string[], k: number, to: string): string {
   return items.map((x, i) => (i === k ? to : x)).join(",");
 }
 
-/** A backwards range a-b as the two ranges it means: a to the field's end, and its start to b. */
+/** A backwards range a-b as the two ranges it means: a to the field's end, and its start to b. A day of week
+ *  from 7 is Sunday's other number, so 7-mon is the plain range 0-1. */
 function wrapped(lo: number, hi: number, f: Field, stepText: string | undefined): string {
   const part = (a: number, b: number) => (a === b ? `${a}` : `${a}-${b}${stepText !== undefined ? `/${stepText}` : ""}`);
+  if (f.max === 7 && lo === 7) return part(0, hi);
   return `${part(lo, f.top)},${part(f.min, hi)}`;
 }
 

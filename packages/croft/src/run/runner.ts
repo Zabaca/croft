@@ -35,9 +35,11 @@
 // approved (human false); the plan's holds (SCHEDULE_HELD, LARGE_REPROCESS, paused, leased) skip their steps, and
 // what reads them, even when their code does not load; an asset another run holds is skipped, not waited for
 // (overlaps skip; it stays due); the cost guard holds a transform (LARGE_REPROCESS, recorded so the tick leaves it
-// alone until a person runs it) instead of failing it; the database lock is waited for up to 30 min; and each
-// step's start records schedule_state.last_attempt_at, and the fire a due ingest handles as its last_fire_at, before
-// any of its work, so a crash never makes the scheduler start it again every minute.
+// alone until a person runs it) instead of failing it; the database lock is waited for up to 30 min; each attempt
+// first waits for the file, then checks paused and SCHEDULE_HELD again against the code it loads now (holdAtStart:
+// the wait, earlier steps and retries come after the plan), and a step held then is skipped like one the plan held;
+// and each step's start records schedule_state.last_attempt_at, and the fire a due ingest handles as its
+// last_fire_at, before any of its work, so a crash never makes the scheduler start it again every minute.
 //
 // Every step writes <state>/logs/<run>/<asset>.log; the run writes <state>/logs/<run>/events.ndjson, which
 // --events copies to stderr and `croft wait` reads for progress.
@@ -46,7 +48,7 @@ import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { checksHook, runWarnings } from "../checks/run.ts";
 import { CroftError, exitCodeFor } from "../core/errors.ts";
-import type { Confirmation, CursorType, Hold, Problem, Reason, StepResult } from "../core/types.ts";
+import type { Confirmation, CursorType, Hold, LockHolder, Problem, Reason, StepResult } from "../core/types.ts";
 import type { ExampleResult } from "../project/init.ts";
 import { Confirmations } from "../safety/confirm.ts";
 import { openWarehouse, type DuckWarehouse } from "../db/warehouse.ts";
@@ -56,15 +58,17 @@ import { logDir, logPath, NOT_STARTED_RECORD, openLog, type LogWriter, writeRunR
 import { reconcile } from "../history/reconcile.ts";
 import { RunsDb, type RunStatus, type RunTrigger } from "../history/runs-db.ts";
 import type { HttpOptions } from "../http/http.ts";
-import { staticSecrets } from "../cli/commands/describe.ts";
+import { holderText, staticSecrets } from "../cli/commands/describe.ts";
 import { redactProblem } from "../cli/render.ts";
 import { currentDatabase, isReservedColumn, quoteIdent, tableRef } from "../load/evolve.ts";
 import type { CheckHookResult, WriteBatchInput } from "../load/write.ts";
 import { outsideCapture, setOutputRedactor } from "../core/output.ts";
 import { now as clockNow } from "../core/time.ts";
 import { refreshReadCopy } from "../db/readcopy.ts";
+import { scheduleHeld } from "../schedule/due.ts";
 import { notifyScheduledFailure, type ScheduledFailure } from "../schedule/notify.ts";
 import { discoverAssets } from "../project/discover.ts";
+import { tsFingerprint } from "../project/ts-asset.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { loadProject, type Project } from "../project/root.ts";
 import {
@@ -236,7 +240,7 @@ export function redactValue<T>(value: T, env: ProjectEnv): T {
 /** Events for one run: appended to events.ndjson and handed to the caller. */
 export class EventLog {
   readonly path: string;
-  constructor(stateDir: string, runId: string, private readonly onEvent?: (line: string, event: RunEvent) => void,
+  constructor(stateDir: string, readonly runId: string, private readonly onEvent?: (line: string, event: RunEvent) => void,
     private readonly redact: <T>(v: T) => T = (v) => v) {
     const dir = logDir(stateDir, runId);
     mkdirSync(dir, { recursive: true });
@@ -260,6 +264,19 @@ export class EventLog {
 
 export function eventsPath(stateDir: string, runId: string): string {
   return join(logDir(stateDir, runId), "events.ndjson");
+}
+
+/** A wait for the database file that has gone on for 2 s (§5 "Lock conflicts"): who holds it, in words too. */
+export function lockWaitEvent(holder: LockHolder, waitedMs: number, runId?: string): RunEvent {
+  return {
+    type: "waiting", ...(runId ? { runId } : {}), holder, waitedMs,
+    message: `waiting for the warehouse: ${holderText(holder)} holds it (${Math.round(waitedMs / 1000)} s so far)`,
+  };
+}
+
+/** The words of a lock-wait event (lockWaitEvent), or null for any other event. */
+export function lockWaitText(e: RunEvent): string | null {
+  return e.type === "waiting" && e.holder && typeof e.message === "string" ? e.message : null;
 }
 
 function jsonLine(v: unknown): string {
@@ -506,8 +523,26 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
   // Asset output that escapes its step's scope reaches stderr redacted with this project's .env (core/output.ts).
   setOutputRedactor((t) => env.redact(t));
   mkdirSync(paths.stateDir, { recursive: true });
-  const runs = RunsDb.open(paths.stateDir);
+  // runs.sqlite follows the project clock (CROFT_NOW), like run ids, _loaded_at and the scheduler's fires: a run by
+  // hand at 11:05 has handled the 11:00 fire.
+  const clock = o.now ?? (() => clockNow());
+  const runs = RunsDb.open(paths.stateDir, { now: clock });
   let warehouse: DuckWarehouse | undefined;
+  const redact = <T>(v: T): T => redactValue(v, env);
+  // Where the run's events go. A detached run's id is known before the run exists, so its first lock wait (reconcile
+  // opens the file) already reaches its events.ndjson, which its parent follows; a run in this process without an
+  // id hands such an early event to the caller only.
+  let eventLog: EventLog | undefined = o.runId ? new EventLog(paths.stateDir, o.runId, o.onEvent, redact) : undefined;
+  const onLockWait = (holder: LockHolder, waitedMs: number): void => {
+    // Fairness (§5 "Leases"): a writer that sees waiters yields between its write steps (ingest.ts).
+    runs.registerWaiter(`croft run${o.runId ? ` ${o.runId}` : ""}`);
+    // After 2 s the holder is printed (§5 "Lock conflicts"): the command prints the event's words.
+    const e = lockWaitEvent(holder, waitedMs, eventLog?.runId);
+    if (eventLog) return eventLog.emit(e);
+    const full = redact({ ...e, at: new Date().toISOString() });
+    const onEvent = o.onEvent;
+    if (onEvent) outsideCapture(() => onEvent(jsonLine(full), full));
+  };
   try {
     const interactive = o.interactive === true;
     const scheduled = o.trigger === "schedule";
@@ -534,8 +569,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
           const h = runs.getLockHolder();
           return h && h.pid === pid ? h : null;
         },
-        // Fairness (§5 "Leases"): a writer that sees waiters yields between its write steps (ingest.ts).
-        onWait: () => runs.registerWaiter(`croft run${o.runId ? ` ${o.runId}` : ""}`),
+        onWait: onLockWait,
       });
       rec = await reconcile({ db: runs, warehouse });
       for (const dir of rec.stagingDirs) rmSync(dir, { recursive: true, force: true });
@@ -550,7 +584,8 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
       ...(o.runId ? { id: o.runId } : {}), trigger: o.trigger ?? "manual", human: o.human ?? true, argv: [...o.argv], timeZone: project.timezone,
     });
     const runId = run.id;
-    const events = new EventLog(paths.stateDir, runId, o.onEvent, (v) => redactValue(v, env));
+    const events = eventLog ?? new EventLog(paths.stateDir, runId, o.onEvent, redact);
+    eventLog = events;
     const runAc = new AbortController();
     const onOuterAbort = () => runAc.abort(croftError(o.signal?.reason) ?? interruptedError());
     if (o.signal?.aborted) onOuterAbort();
@@ -563,6 +598,8 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
     const leasedBy = new Map<string, string>();
     /** A scheduled run: steps the cost guard held (LARGE_REPROCESS), instead of failing them. */
     const heldByGuard = new Set<string>();
+    /** A scheduled run: steps held as they started (holdAtStart), and why. */
+    const heldAtStart = new Map<string, string>();
     const confirms = new ConfirmState();
     const order = runOrder(plan);
     const byName = new Map(plan.steps.map((s) => [s.asset, s]));
@@ -645,9 +682,22 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
 
       const attemptStep = async (step: PlannedStep, attempt: number, maxAttempts: number) => {
         const asset = step.asset;
+        // A scheduled step first waits for the file (up to 30 min), then checks its holds again while it has it
+        // (holdAtStart), right before its code runs: the step then reads its state without a second wait (the
+        // warehouse stays open between leases). A wait that fails fails the attempt below, as the step's own would.
+        let beforeStart: unknown;
+        if (scheduled) {
+          try {
+            const held = await warehouse!.read(() => holdAtStart(step, runs, project, clock()),
+              { purpose: `check that ${asset} may still run`, signal: runSignal });
+            if (held) return { ok: null, held };
+          } catch (e) {
+            beforeStart = e ?? new Error("the wait for the warehouse failed");
+          }
+        }
         const codeHash = codeHashOf(step);
         const log = openLog(paths.stateDir, runId, asset, { redact: (t) => env.redact(t) });
-        if (scheduled) recordAttempt(runs, step, attempt, (o.now ?? clockNow)());
+        if (scheduled) recordAttempt(runs, step, attempt, clock());
         runs.startStep({ runId, asset, attempt, reason: step.reason, ...(codeHash ? { codeHash } : {}), logPath: logPath(paths.stateDir, runId, asset) });
         // What the asset's top-level code printed when the plan imported it (core/output.ts).
         if (attempt === 1) for (const line of step.output ?? []) log.write(line);
@@ -674,6 +724,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
         // The check sources of the asset's last ok step: a check not among them is new or edited (§3f).
         const previous = runs.lastCheckSources(asset);
         try {
+          if (beforeStart !== undefined) throw beforeStart;
           const input: StepInput = {
             step, project, env, warehouse: warehouse!, runs, runId, attempt, maxAttempts, signal, progress, log,
             ...withChecks(step, previous), ...withReadBy(step, getCatalog(runs, asset)),
@@ -740,6 +791,13 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
         const maxAttempts = step.retries + 1;
         for (let attempt = 1; ; attempt++) {
           const a = await attemptStep(step, attempt, maxAttempts);
+          if (a.ok === null) {
+            // Held as it started (holdAtStart): skipped like a step the plan held, with no attempt recorded (it stays due).
+            skipped(step, a.held.why);
+            heldAtStart.set(step.asset, a.held.why);
+            if (a.held.problem) problems.push({ ...a.held.problem, runId });
+            return;
+          }
           if (a.ok) {
             results.set(step.asset, a.out.result);
             problems.push(...a.out.warnings.map((w) => ({ ...w, asset: w.asset ?? step.asset, runId })), ...a.out.problems.map((p) => ({ ...p, runId })));
@@ -856,6 +914,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
         }
         const r = results.get(asset);
         if (!r || r.status === "failed") return `input ${asset} failed (${runId})`;
+        if (r.status === "skipped" && heldAtStart.has(asset)) return `input ${asset} is ${heldAtStart.get(asset)}`;
         if (r.status === "skipped" && heldByGuard.has(asset)) return `input ${asset} is held (LARGE_REPROCESS)`;
         if (r.status === "skipped") {
           const pending = confirms.pending?.impact.asset === asset && !confirms.deferred.has(asset) ? confirms.pending : undefined;
@@ -899,6 +958,12 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
       runs.unregisterWaiter();
     }
   } finally {
+    // A run refused before it existed may have waited for the file too.
+    try {
+      runs.unregisterWaiter();
+    } catch {
+      // runs.sqlite trouble: the next reconcile has the same table.
+    }
     runs.close();
     await warehouse?.close();
   }
@@ -946,6 +1011,33 @@ function readText(path: string): string {
 /** The code hash a step runs: the loaded TS module's, or the SQL file's fingerprint. */
 function codeHashOf(step: PlannedStep): string | undefined {
   return step.codeHash ?? step.sql?.codeHash;
+}
+
+/**
+ * A scheduled step's holds, again, as an attempt starts (§8, §6). The plan checked them before the run waited for the
+ * file (up to 30 min), and before earlier steps and retries. Held now:
+ * - scheduling paused or off since;
+ * - code that is not the code a person last ran (SCHEDULE_HELD): the code the plan loaded, and for a TS asset its
+ *   files as they are now, since code rows() imports as it runs is read then.
+ * null: the step may start.
+ */
+export async function holdAtStart(step: PlannedStep, runs: RunsDb, project: Pick<Project, "root" | "timezone">, now: Date): Promise<{ why: string; problem?: Problem } | null> {
+  const scheduling = runs.getScheduling();
+  if (scheduling.state === "paused") return { why: HOLD_WORDS.paused };
+  if (scheduling.state === "off") return { why: "held: scheduling is off" };
+  const approved = runs.approvedCode(step.asset);
+  const planned = codeHashOf(step);
+  const current = step.kind === "sql" ? planned
+    : await tsFingerprint(step.path, { root: project.root, timezone: project.timezone }).catch(() => undefined);
+  if (approved !== null && planned === approved && current === approved) return null;
+  let editedAt: number | null = null;
+  try {
+    editedAt = statSync(step.path).mtimeMs;
+  } catch {
+    // Gone: the hold says it does not load.
+  }
+  const h = scheduleHeld({ asset: step.asset, file: step.file, approved, editedAt, loads: current !== undefined, now });
+  return { why: `held (SCHEDULE_HELD): ${h.reason}`, problem: h.problem };
 }
 
 /**
@@ -1083,6 +1175,8 @@ export function pruneStaging(stateDir: string, runs: RunsDb, now: number = Date.
     return [];
   }
   const removed: string[] = [];
+  // A run's end is on the project clock (CROFT_NOW), a file's time on the real one: `now` is real.
+  const skew = runs.now().getTime() - Date.now();
   const drop = (dir: string) => {
     rmSync(dir, { recursive: true, force: true });
     removed.push(dir);
@@ -1099,7 +1193,7 @@ export function pruneStaging(stateDir: string, runs: RunsDb, now: number = Date.
       }
       const run = runs.getRun(name);
       if (run?.status === "running") continue;
-      const ended = run?.finishedAt ? Date.parse(run.finishedAt) : statSync(dir).mtimeMs;
+      const ended = run?.finishedAt ? Date.parse(run.finishedAt) - skew : statSync(dir).mtimeMs;
       if (now - ended < STAGING_KEEP_MS) continue;
       drop(dir);
     } catch {

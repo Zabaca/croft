@@ -2,15 +2,15 @@
 // unique CROFT_JOB_LABEL: nothing here touches the real ~/Library/LaunchAgents, launchd or crontab.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { croftHome, type CroftHome } from "./home.ts";
 import type { ExecOptions, ExecResult, OsRunner } from "./os.ts";
 import {
-  cronBlock, ensureJob, inspectJob, installedBunPath, isVersionManagedPath, jobPath, type JobOptions, pickBun, plistPath, plistXml,
-  removeJob, upsertCronBlock,
+  bunVersionOf, cronBlock, ensureJob, inspectJob, installedBunPath, isVersionManagedPath, jobPath, type JobOptions, pickBun, plistPath,
+  plistXml, removeJob, upsertCronBlock,
 } from "./register.ts";
 import { tickScriptSource } from "./user-tick.ts";
 
@@ -44,37 +44,106 @@ function fakeRunner(respond: (argv: string[], o: ExecOptions) => Partial<ExecRes
 
 const BUN = () => join(userHome, ".bun", "bin", "bun");
 
-/** Options for a Mac with Bun at ~/.bun/bin/bun. */
+/** Options for a Mac with Bun at ~/.bun/bin/bun; every other Bun found says it is 1.3.14, like the running one. */
 type Opts = JobOptions & { runner?: OsRunner };
 function mac(extra: Partial<Opts> = {}): Opts {
-  return { platform: "darwin", uid: 501, execPath: BUN(), exists: (p) => p === BUN(), env: {}, sleep: () => {}, ...extra };
+  return {
+    platform: "darwin", uid: 501, execPath: BUN(), exists: (p) => p === BUN(), env: {}, sleep: () => {},
+    runningVersion: "1.3.14", bunVersion: () => "1.3.14", ...extra,
+  };
 }
 function linux(extra: Partial<Opts> = {}): Opts {
-  return { platform: "linux", uid: 1000, execPath: BUN(), exists: (p) => p === BUN(), env: {}, sleep: () => {}, ...extra };
+  return {
+    platform: "linux", uid: 1000, execPath: BUN(), exists: (p) => p === BUN(), env: {}, sleep: () => {},
+    runningVersion: "1.3.14", bunVersion: () => "1.3.14", ...extra,
+  };
 }
 
 const NOT_LOADED = { status: 113, stderr: `Bad request.\nCould not find service "x" in domain for user gui: 501\n` };
 
 describe("pickBun", () => {
   const at = (...paths: string[]) => (p: string) => paths.includes(p);
+  /** A fake `<bun> --version`: each path's version, null for one that does not run. */
+  const versions = (v: Record<string, string | null>) => (p: string) => (p in v ? v[p]! : null);
+  const mise = () => join(userHome, ".local/share/mise/installs/bun/1.3.14/bin/bun");
 
   test("prefers ~/.bun/bin/bun, then /opt/homebrew/bin/bun, then /usr/local/bin/bun, over process.execPath", () => {
-    const mise = join(userHome, ".local/share/mise/installs/bun/1.3.14/bin/bun");
     const all = at(BUN(), "/opt/homebrew/bin/bun", "/usr/local/bin/bun");
-    expect(pickBun(home, { execPath: mise, exists: all, env: {} })).toEqual({ path: BUN(), stable: true });
-    expect(pickBun(home, { execPath: mise, exists: at("/opt/homebrew/bin/bun", "/usr/local/bin/bun"), env: {} }).path).toBe("/opt/homebrew/bin/bun");
-    expect(pickBun(home, { execPath: mise, exists: at("/usr/local/bin/bun"), env: {} }).path).toBe("/usr/local/bin/bun");
+    const o = { execPath: mise(), env: {}, runningVersion: "1.3.14", bunVersion: () => "1.3.14" };
+    expect(pickBun(home, { ...o, exists: all })).toEqual({ path: BUN(), stable: true, version: "1.3.14", skipped: [] });
+    expect(pickBun(home, { ...o, exists: at("/opt/homebrew/bin/bun", "/usr/local/bin/bun") }).path).toBe("/opt/homebrew/bin/bun");
+    expect(pickBun(home, { ...o, exists: at("/usr/local/bin/bun") }).path).toBe("/usr/local/bin/bun");
   });
 
   test("$BUN_INSTALL/bin/bun (a custom install folder) comes first", () => {
     const custom = join(tmp, "bun-home", "bin", "bun");
-    expect(pickBun(home, { execPath: BUN(), exists: at(BUN(), custom), env: { BUN_INSTALL: join(tmp, "bun-home") } }).path).toBe(custom);
+    const o = { runningVersion: "1.3.14", bunVersion: () => "1.3.14" };
+    expect(pickBun(home, { ...o, execPath: BUN(), exists: at(BUN(), custom), env: { BUN_INSTALL: join(tmp, "bun-home") } }).path).toBe(custom);
   });
 
   test("with no stable path, process.execPath: stable unless it is a version manager's", () => {
-    expect(pickBun(home, { execPath: "/usr/bin/bun", exists: at(), env: {} })).toEqual({ path: "/usr/bin/bun", stable: true });
+    const o = { runningVersion: "1.3.14", bunVersion: () => null };
+    expect(pickBun(home, { ...o, execPath: "/usr/bin/bun", exists: at(), env: {} }))
+      .toEqual({ path: "/usr/bin/bun", stable: true, version: "1.3.14", skipped: [] });
     const asdf = join(userHome, ".asdf/installs/bun/1.3.14/bin/bun");
-    expect(pickBun(home, { execPath: asdf, exists: at(), env: {} })).toEqual({ path: asdf, stable: false });
+    expect(pickBun(home, { ...o, execPath: asdf, exists: at(), env: {} })).toEqual({ path: asdf, stable: false, version: "1.3.14", skipped: [] });
+  });
+
+  test("an old stable Bun (a curl install left behind) is skipped for the running one (review R31-09)", () => {
+    const o = { exists: at(BUN()), env: {}, runningVersion: "1.3.14", bunVersion: versions({ [BUN()]: "1.0.0" }) };
+    expect(pickBun(home, { ...o, execPath: mise() })).toEqual({
+      path: mise(), stable: false, version: "1.3.14", skipped: [{ path: BUN(), version: "1.0.0" }],
+    });
+    expect(pickBun(home, { ...o, execPath: "/usr/bin/bun" })).toMatchObject({ path: "/usr/bin/bun", stable: true });
+  });
+
+  test("a stable Bun at least as new as the running one wins; an older one only over a version manager's path, and never below croft's floor", () => {
+    const all = at(BUN(), "/opt/homebrew/bin/bun", "/usr/local/bin/bun");
+    const base = { exists: all, env: {}, runningVersion: "1.4.2" };
+    // ~/.bun is older than the running Bun, Homebrew's is newer: Homebrew's.
+    expect(pickBun(home, { ...base, execPath: mise(), bunVersion: versions({ [BUN()]: "1.3.20", "/opt/homebrew/bin/bun": "1.5.0" }) }))
+      .toMatchObject({ path: "/opt/homebrew/bin/bun", stable: true, version: "1.5.0", skipped: [{ path: BUN(), version: "1.3.20" }] });
+    // None as new as the running Bun, which is a version manager's: the first stable one croft still runs on.
+    expect(pickBun(home, { ...base, execPath: mise(), bunVersion: versions({ [BUN()]: "1.2.0", "/opt/homebrew/bin/bun": "1.3.14" }) }))
+      .toMatchObject({ path: "/opt/homebrew/bin/bun", stable: true, version: "1.3.14" });
+    // …but the running Bun itself when its path is stable.
+    expect(pickBun(home, { ...base, execPath: "/usr/bin/bun", bunVersion: versions({ [BUN()]: "1.3.14" }) }))
+      .toMatchObject({ path: "/usr/bin/bun", stable: true, version: "1.4.2" });
+    // Below the floor (package.json engines.bun) nothing is taken, even over a version manager's path.
+    expect(pickBun(home, { ...base, execPath: mise(), bunVersion: versions({ [BUN()]: "1.3.13", "/opt/homebrew/bin/bun": "1.1.0", "/usr/local/bin/bun": null }) }))
+      .toMatchObject({ path: mise(), stable: false, version: "1.4.2" });
+  });
+
+  test("a Bun that does not run, or says no version, is skipped", () => {
+    const o = { exists: at(BUN(), "/opt/homebrew/bin/bun"), env: {}, runningVersion: "1.3.14", execPath: mise() };
+    expect(pickBun(home, { ...o, bunVersion: versions({ [BUN()]: null, "/opt/homebrew/bin/bun": "1.3.14" }) }))
+      .toMatchObject({ path: "/opt/homebrew/bin/bun", skipped: [{ path: BUN(), version: null }] });
+  });
+
+  test("the running Bun's own path is taken without running it; each other candidate is asked once", () => {
+    const asked: string[] = [];
+    const bunVersion = (p: string) => { asked.push(p); return "1.0.0"; };
+    expect(pickBun(home, { execPath: BUN(), exists: at(BUN()), env: {}, runningVersion: "1.3.14", bunVersion }).path).toBe(BUN());
+    expect(asked).toEqual([]);
+    pickBun(home, { execPath: mise(), exists: at(BUN(), "/usr/local/bin/bun"), env: {}, runningVersion: "1.3.14", bunVersion });
+    expect(asked).toEqual([BUN(), "/usr/local/bin/bun"]);
+  });
+
+  test("bunVersionOf runs `<bun> --version`: the real Bun, a fake old one, and ones that fail", () => {
+    expect(bunVersionOf(process.execPath)).toBe(Bun.version);
+    const dir = join(tmp, "fake-bins");
+    mkdirSync(dir, { recursive: true });
+    const script = (name: string, body: string) => {
+      const p = join(dir, name);
+      writeFileSync(p, `#!/bin/sh\n${body}\n`);
+      chmodSync(p, 0o755);
+      return p;
+    };
+    expect(bunVersionOf(script("old", "echo 1.0.0"))).toBe("1.0.0");
+    expect(bunVersionOf(script("canary", "echo 1.3.15-canary.1+abc123"))).toBe("1.3.15-canary.1+abc123");
+    expect(bunVersionOf(script("fails", "echo 1.3.14; exit 3"))).toBeNull();
+    expect(bunVersionOf(script("chatty", "echo hello"))).toBeNull();
+    expect(bunVersionOf(join(dir, "missing"))).toBeNull();
   });
 
   test("version-manager and versioned paths", () => {
@@ -162,7 +231,7 @@ describe("the LaunchAgent (macOS)", () => {
       ["/bin/launchctl", "bootout", `gui/501/${label}`],
       ["/bin/launchctl", "bootstrap", "gui/501", file],
     ]);
-    expect(r).toEqual({ kind: "launchd", label, file, bun: { path: BUN(), stable: true }, changed: true, tickScriptChanged: true });
+    expect(r).toEqual({ kind: "launchd", label, file, bun: { path: BUN(), stable: true, version: "1.3.14", skipped: [] }, changed: true, tickScriptChanged: true });
   });
 
   test("unchanged and loaded: nothing is rewritten or reloaded", () => {
@@ -175,6 +244,15 @@ describe("the LaunchAgent (macOS)", () => {
     expect(calls.map((c) => c.argv)).toEqual([["/bin/launchctl", "print", `gui/501/${label}`]]);
     expect(r.changed).toBe(false);
     expect(r.tickScriptChanged).toBe(false);
+  });
+
+  test("a tick script installed from an older template (1: the lock file alone) is rewritten, the job left as it is", () => {
+    ensureJob(fakeRunner().runner, home, mac());
+    writeFileSync(home.tickScript, "// croft-tick-template: 1\n");
+    const r = ensureJob(fakeRunner().runner, home, mac());
+    expect(r.tickScriptChanged).toBe(true);
+    expect(r.changed).toBe(false);
+    expect(readFileSync(home.tickScript, "utf8")).toBe(tickScriptSource());
   });
 
   test("unchanged but not loaded (booted out, a failed bootstrap): bootstrapped without rewriting", () => {
@@ -313,7 +391,7 @@ describe("the crontab block (Linux)", () => {
       { argv: ["crontab", "-"], input: `${block(userHome, label)}\n` },
     ]);
     expect(readFileSync(home.tickScript, "utf8")).toBe(tickScriptSource());
-    expect(r).toEqual({ kind: "crontab", label, file: null, bun: { path: BUN(), stable: true }, changed: true, tickScriptChanged: true });
+    expect(r).toEqual({ kind: "crontab", label, file: null, bun: { path: BUN(), stable: true, version: "1.3.14", skipped: [] }, changed: true, tickScriptChanged: true });
   });
 
   test("ensureJob keeps the user's other lines and replaces an old block", () => {

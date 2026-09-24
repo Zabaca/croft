@@ -235,6 +235,35 @@ describe("parseSchedule: SCHEDULE_INVALID", () => {
     expect(refused("0 9 * * mon-fir").suggestion).toBe("0 9 * * mon-fri");
   });
 
+  test("property: over a corpus of bad schedules, every suggestion parses (types.ts promises it)", () => {
+    const corpus = new Set<string>();
+    const days = ["mon", "tue", "sun", "sat", "7", "0", "6", "5", "1", "mno"];
+    for (const a of days) for (const b of days) { corpus.add(`0 0 * * ${a}-${b}`); corpus.add(`0 0 * * ${a}-${b}/2`); }
+    for (const a of ["23", "5", "59", "0"]) for (const b of ["0", "3", "22"]) { corpus.add(`${a}-${b} * * * *`); corpus.add(`0 ${a}-${b} * * *`); }
+    for (const a of ["dec", "12", "6", "decc"]) for (const b of ["jan", "1", "2", "jnu"]) corpus.add(`0 0 1 ${a}-${b} *`);
+    for (const a of ["31", "15"]) for (const b of ["1", "2"]) corpus.add(`0 0 ${a}-${b} * *`);
+    for (const c of [...corpus]) { corpus.add(`0 ${c}`); corpus.add(`${c} 2026`); corpus.add(`0 ${c} 2026`); }
+    for (const x of [
+      "0 6 * * * #x", "0 6 * * 1-5 2026", "0 18 ? * MON-FRI *", "0 0 6 * * ?", "0 0 6 * * ? 2026", "0 0 * * mnday", "0 0 * janury *",
+      "0 0 * janu mno", "0 0 * * mon-frii", "0 0 * * 7-mno", "0 25 * janu *",
+      "evry 15 minuts", "dayly at 9am", "daily 9", "daily 13", "weekdays 9am", "every mon 9am", "15 minutes", "every 7 minutes",
+      "every 7 hours", "every 45 hours", "@dayly", "@hourley", "every 3 days", "every 32 days", "every 2 months", "every 5 months",
+      "monthly at 24:00", "at 24:00", "24:00", "at 9", "every hour at :75", "every 500 minutes", "every 1440 minutes",
+      "every 180 minutes", "every 0 hours", "every 0 minutes", "weekly", "every 1 days", "every 1 weeks", "every 2 weeks",
+      "every 1 months", "0 0 * * 7-0", "0 0 * * 6-1/3", "59-0/5 * * * *", "weekdays at 13pm", "weekends at 0am", "every tuesdy at 9",
+      "mondays and fridays 8am", "every monday to friday at 25:00", "dialy at 6:30pm", "once a week", "twice daily", "nightly",
+    ]) corpus.add(x);
+    let offered = 0;
+    for (const text of corpus) {
+      const p = parseSchedule(text);
+      if (p.ok || p.suggestion === undefined) continue;
+      offered++;
+      const again = parseSchedule(p.suggestion);
+      expect(again.ok, `${JSON.stringify(text)} suggests ${JSON.stringify(p.suggestion)}: ${again.ok ? "" : again.problem}`).toBe(true);
+    }
+    expect(offered).toBeGreaterThan(100);
+  });
+
   test("never throws, whatever it is given", () => {
     for (const bad of [undefined, null, 5, {}, "\u0000", "every", "at", "every at", "every 99999999999999999999 minutes", "* * * * * * * *"]) {
       const p = parseSchedule(bad as string);

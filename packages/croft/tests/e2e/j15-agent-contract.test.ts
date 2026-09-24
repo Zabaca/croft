@@ -1,9 +1,9 @@
-// The agent's side of phase 2, through the real CLI: what CLAUDE.md, the skill, croft docs and next[] tell an
+// The agent's side of phases 2 and 3, through the real CLI: what CLAUDE.md, the skill, croft docs and next[] tell an
 // agent to run exists and works, and status, context and query tell one story when the warehouse file is gone.
 import { afterAll, describe, expect, test } from "bun:test";
 import { readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { cleanupAll, findProblem, initProject, show } from "./harness.ts";
+import { cleanupAll, findProblem, initProject, show, tempDir } from "./harness.ts";
 
 afterAll(async () => {
   await cleanupAll();
@@ -39,9 +39,24 @@ describe("the agent contract", () => {
     const skill = p.read(".claude/skills/croft/SKILL.md");
     const body = skill.slice(skill.indexOf("## Orient"));                 // after "This version", which lists them on purpose
     for (const text of [claude, body, p.read("assets/example_sales.ts")]) {
-      for (const missing of ["croft new", "croft rename", "croft delete", "croft restore", "croft schedule", "croft serve"]) {
+      for (const missing of ["croft new", "croft rename", "croft delete", "croft restore"]) {
         expect(text).not.toContain(missing);
       }
+    }
+    // Phase 3's commands are in the skill, and answer: scheduling (ask first), croft serve (the user starts it)
+    // and the read copy for GUIs.
+    expect(body).toContain("`croft schedule on|off|pause`");
+    expect(body).toContain("- `croft serve` runs until stopped: ask the user to start it in their own terminal");
+    expect(body).toContain('set "readCopy": true in croft.json and open warehouse.read.duckdb');
+    const home = tempDir("croft-home-");
+    const schedule = await p.json(["schedule", "status"], { env: { HOME: home, CROFT_HOME: join(home, ".croft") } });
+    expect(schedule.code, show(schedule)).toBe(0);
+    expect(schedule.json.data.scheduling).toMatchObject({ state: "off" });
+    for (const command of ["schedule", "serve"]) expect((await p.json(["help", command])).code).toBe(0);
+    for (const topic of ["scheduling", "serve", "read-copy"]) {
+      const page = await p.json(["docs", topic]);
+      expect(page.code, show(page)).toBe(0);
+      expect(page.json.data.source, topic).toBe("file");
     }
     expect(skill).toContain("croft run <asset> --dry-run --from -90d");
     // The version section names what this build lacks, so the agent does not try it.

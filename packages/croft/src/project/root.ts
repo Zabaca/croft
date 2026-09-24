@@ -15,7 +15,7 @@ export const CONFIG_FILE = "croft.json";
 
 export interface NotifyConfig { desktop: boolean; webhook: string | null }
 export interface ServeConfig {
-  port: number; host: string; queryTimeoutMs: number; maxConcurrent: number; maxBytes: number; allowOrigins: string[];
+  port: number; host: string; queryTimeoutMs: number; maxConcurrent: number; maxBytes: number; maxRows: number; allowOrigins: string[];
 }
 export interface CroftConfig {
   database: string;                  // as written: relative to the root, or absolute after relocation
@@ -32,7 +32,7 @@ export const DEFAULTS = {
   readCopy: false,
   notify: { desktop: true, webhook: null },
   concurrency: 4,
-  serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 30_000, maxConcurrent: 4, maxBytes: 64 * 1024 * 1024, allowOrigins: [] },
+  serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 30_000, maxConcurrent: 4, maxBytes: 64 * 1024 * 1024, maxRows: 100_000, allowOrigins: [] },
 } as const;
 
 /** One line per key, for `croft docs config`. */
@@ -48,13 +48,14 @@ export const CONFIG_KEYS: { key: string; type: string; default: string; descript
   { key: "serve.queryTimeoutMs", type: "integer", default: String(DEFAULTS.serve.queryTimeoutMs), description: "deadline for one query over HTTP" },
   { key: "serve.maxConcurrent", type: "integer", default: String(DEFAULTS.serve.maxConcurrent), description: "queries running in DuckDB at once; the rest queue" },
   { key: "serve.maxBytes", type: "integer", default: String(DEFAULTS.serve.maxBytes), description: "largest result in bytes; bigger results fail with QUERY_TOO_MANY_ROWS" },
+  { key: "serve.maxRows", type: "integer", default: String(DEFAULTS.serve.maxRows), description: "most rows one answer carries, whatever limit asks; more fail with QUERY_TOO_MANY_ROWS" },
   { key: "serve.allowOrigins", type: "string[]", default: "[]", description: "browser origins allowed to call the read server, e.g. \"http://localhost:3000\"" },
   { key: "stateDir", type: "string", default: "\".croft\"", description: "state folder; croft sets it when it moves state off a synced folder" },
 ];
 
 const TOP_KEYS = ["$schema", "database", "timezone", "readCopy", "notify", "concurrency", "serve", "stateDir"];
 const NOTIFY_KEYS = ["desktop", "webhook"];
-const SERVE_KEYS = ["port", "host", "queryTimeoutMs", "maxConcurrent", "maxBytes", "allowOrigins"];
+const SERVE_KEYS = ["port", "host", "queryTimeoutMs", "maxConcurrent", "maxBytes", "maxRows", "allowOrigins"];
 
 export interface ConfigIssue {
   path: string;                      // "" for the whole file, "serve.port", "serve.allowOrigins[0]"
@@ -198,6 +199,7 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined, p
     queryTimeoutMs: int(s, "serve.queryTimeoutMs", "queryTimeoutMs", DEFAULTS.serve.queryTimeoutMs, 100, 3_600_000),
     maxConcurrent: int(s, "serve.maxConcurrent", "maxConcurrent", DEFAULTS.serve.maxConcurrent, 1, 64),
     maxBytes: int(s, "serve.maxBytes", "maxBytes", DEFAULTS.serve.maxBytes, 1024, Number.MAX_SAFE_INTEGER),
+    maxRows: int(s, "serve.maxRows", "maxRows", DEFAULTS.serve.maxRows, 1, 10_000_000),
     allowOrigins: [],
   };
   if (s.allowOrigins !== undefined) {

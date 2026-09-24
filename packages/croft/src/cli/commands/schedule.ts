@@ -6,9 +6,11 @@
 //   the job really ticks this project. In that order, so the job's first run (RunAtLoad) already finds the
 //   project. When none comes, SCHEDULER_STALE names the likely cause with the tail of tick.log. If the job
 //   cannot be installed, the setting and the registry are put back as they were. With --no-os-job (servers,
-//   containers, WSL) nothing is installed and nothing is waited for: croft serve ticks while it runs.
+//   containers, WSL) nothing is installed and nothing is waited for: croft serve ticks while it runs. While
+//   paused, `on` resumes the project as it was ticked: one ticked by croft serve only stays so (no OS job).
 // - off: record it off, take the project out of the registry, and remove the OS job once no project needs it.
-// - pause [--for 2h]: ticks exit at once until the pause ends, or until `croft schedule on`.
+// - pause [--for 2h]: ticks exit at once until the pause ends, or until `croft schedule on` (`on --no-os-job`, which
+//   every resume hint names, for a project ticked by croft serve only).
 // - status (also a bare `croft schedule`): the setting, the last heartbeat, the job as installed, and each asset
 //   as the scheduler sees it (schedule/due.ts scheduleView: next fire, last fire, due, held).
 //
@@ -16,7 +18,8 @@
 // read it, the last heartbeat and whether it is stale (SCHEDULER_STALE, with the diagnosis), holds that need a
 // human (SCHEDULE_HELD), and fire times in words. doctor imports it, so it must never import DuckDB or asset code:
 // the scheduler's view of the assets is imported only when it is asked for.
-import { existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, realpathSync } from "node:fs";
 import { userInfo } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 import { CroftError, problem } from "../../core/errors.ts";
@@ -30,11 +33,12 @@ import type { AssetScheduleView, HoldCode, ScheduleViewInput } from "../../sched
 import { diagnose, type DiagnosisCause, HEARTBEAT_WAIT_MS, STALE_AFTER_MS, tickLogTail, waitForHeartbeat } from "../../schedule/heartbeat.ts";
 import { croftHome, type CroftHome, type Env } from "../../schedule/home.ts";
 import { type OsRunner, realRunner, type RegistryEntry, type SchedulingSetting } from "../../schedule/os.ts";
-import { ensureJob, inspectJob, type JobOptions, type JobResult, plistPath, removeJob } from "../../schedule/register.ts";
+import { bunVersionOf, ensureJob, inspectJob, type JobOptions, type JobResult, plistPath, removeJob } from "../../schedule/register.ts";
 import { addProject, canonicalRoot, listProjects, pruneRegistry, removeProject } from "../../schedule/registry.ts";
 import { nextFires } from "../../schedule/types.ts";
 import type { CommandImpl, CommandResult, Ctx, Next } from "../command.ts";
 import { table } from "../render.ts";
+import { BUN_FLOOR, versionAtLeast } from "../version.ts";
 
 // ---------------------------------------------------------------------------------------------------------
 // The setting and the heartbeat, as every surface shows them
@@ -124,6 +128,15 @@ function zonedOrNull(iso: string | null, tz: string): string | null {
   } catch {
     return iso;
   }
+}
+
+/**
+ * The command that resumes a paused project as it was: a project ticked by croft serve only (`on --no-os-job`) is
+ * told `croft schedule on --no-os-job`, so following the hint never installs the per-user OS job on a server, in a
+ * container or on WSL. (`croft schedule on` after a pause keeps the recorded via too; the flag says so plainly.)
+ */
+export function resumeCommand(via: SchedulingSetting["via"]): string {
+  return via === "serve" ? "croft schedule on --no-os-job" : "croft schedule on";
 }
 
 /** Who ticks the project, in words: "the per-user OS job", "croft serve (pid 4121)". */
@@ -372,9 +385,15 @@ export interface JobInfo {
   loaded: boolean | null;
   /** The Bun it runs. */
   bun: string | null;
+  /** That Bun's version (`<bun> --version`, or the running Bun's own); null when there is none, it is missing, or it
+   *  does not run. */
+  bunVersion: string | null;
   bunExists: boolean;
   /** on: false when the only Bun found is a version manager's, which may vanish on upgrade. */
   bunStable?: boolean;
+  /** on: stable Bun paths passed over (register.ts pickBun): older than croft needs or than the Bun running croft, or
+   *  not running at all (version null). */
+  bunSkipped?: SkippedBun[];
   /** on: written or (re)loaded now. */
   changed?: boolean;
   /** off: removed now. */
@@ -398,6 +417,9 @@ export interface ScheduleData {
   /** on: the scheduler's view could not be read, so `assets` is empty (a warning says why). */
   assetsUnavailable?: true;
 }
+
+/** A Bun the job does not run, and why. */
+export interface SkippedBun { path: string; version: string | null; reason: string }
 
 /** What tests replace. Everything defaults to the real thing. */
 export interface ScheduleDeps {
@@ -483,6 +505,22 @@ function jobEnv(env: Env): Env {
 }
 
 /**
+ * The home folder of the user this process runs as, from the password database. Bun's os.userInfo() answers with
+ * $HOME (Node's reads the password database), so under Bun a test that sets HOME to a temp folder would look like
+ * the real user: a Bun child started without HOME is asked instead. userInfo() when that child cannot answer.
+ */
+export function passwdHome(): string {
+  try {
+    const r = spawnSync(process.execPath, ["-e", "process.stdout.write(require('node:os').userInfo().homedir)"], {
+      env: {}, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"],
+    });
+    const home = r.status === 0 ? r.stdout.trim() : "";
+    if (home.startsWith("/")) return home;
+  } catch { /* fall back below */ }
+  return userInfo().homedir;
+}
+
+/**
  * Tests must never touch the real ~/.croft: with CROFT_FORBID_OS_JOBS=1 (tests/preload.ts), a croft folder or home
  * that is the real user's is refused before the registry or the job is written.
  */
@@ -490,7 +528,7 @@ export function guardRealHome(home: CroftHome, env: Env): void {
   if (env.CROFT_FORBID_OS_JOBS !== "1" && process.env.CROFT_FORBID_OS_JOBS !== "1") return;
   let real: string;
   try {
-    real = resolve(userInfo().homedir);
+    real = resolve(passwdHome());
   } catch {
     return;
   }
@@ -585,11 +623,41 @@ async function viewOrWarning(e: Invocation): Promise<{ assets: ScheduleAsset[]; 
   }
 }
 
-function jobInfo(r: JobResult): JobInfo {
+/** The Bun croft runs on now: pickBun wants the job's Bun at least as new. */
+function runningBun(o: JobOptions): string {
+  return o.runningVersion ?? Bun.version;
+}
+
+/** Why pickBun passed over a stable Bun: it does not run, or it is older than croft needs or than the running Bun. */
+function skippedReason(version: string | null, running: string): string {
+  if (version === null) return "does not run (it printed no version)";
+  return versionAtLeast(version, BUN_FLOOR) ? `older than the Bun running croft (${running})` : `older than croft needs (${BUN_FLOOR})`;
+}
+
+function jobInfo(r: JobResult, o: JobOptions): JobInfo {
+  const running = runningBun(o);
   return {
     kind: r.kind, label: r.label, file: r.file, installed: true, loaded: r.kind === "launchd" ? true : null,
-    bun: r.bun.path, bunExists: true, bunStable: r.bun.stable, changed: r.changed || r.tickScriptChanged,
+    bun: r.bun.path, bunVersion: r.bun.version, bunExists: true, bunStable: r.bun.stable,
+    bunSkipped: r.bun.skipped.map((b) => ({ path: b.path, version: b.version, reason: skippedReason(b.version, running) })),
+    changed: r.changed || r.tickScriptChanged,
   };
+}
+
+/** Whether two paths are the same file (the same path, or the same real file). */
+function sameFile(a: string, b: string): boolean {
+  if (resolve(a) === resolve(b)) return true;
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return false;
+  }
+}
+
+/** The installed job's Bun version: the running Bun's own when it is the same file, else `<bun> --version`. */
+function versionOfBun(path: string, o: JobOptions): string | null {
+  if (sameFile(path, o.execPath ?? process.execPath)) return runningBun(o);
+  return (o.bunVersion ?? bunVersionOf)(path);
 }
 
 function inspected(e: Invocation): JobInfo | null {
@@ -598,11 +666,23 @@ function inspected(e: Invocation): JobInfo | null {
     const kind = j.kind;
     return {
       kind, label: e.home.jobLabel, file: kind === "launchd" ? plistPath(e.home) : null,
-      installed: j.installed, loaded: j.loaded, bun: j.bun, bunExists: j.bunExists,
+      installed: j.installed, loaded: j.loaded, bun: j.bun,
+      bunVersion: j.bun !== null && j.bunExists ? versionOfBun(j.bun, e.jobOptions) : null, bunExists: j.bunExists,
     };
   } catch {
     return null;   // no launchctl or crontab here (or a test without a fake runner)
   }
+}
+
+/**
+ * How `on` ticks the project: croft serve with --no-os-job; while paused, as it was ticked before the pause, so
+ * resuming a project ticked by croft serve only never installs the OS job (R32-10); otherwise the OS job. A pause
+ * whose end has passed reads as on, as every surface shows it: `on` while on through croft serve asks for the job,
+ * which is how a project moves to it (the serve_not_running hint says so).
+ */
+function viaForOn(before: SchedulingRecord, noOsJob: boolean): "os-job" | "serve" {
+  if (noOsJob) return "serve";
+  return before.state === "paused" && before.via === "serve" ? "serve" : "os-job";
 }
 
 async function turnOn(e: Invocation, noOsJob: boolean): Promise<CommandResult<ScheduleData>> {
@@ -610,29 +690,31 @@ async function turnOn(e: Invocation, noOsJob: boolean): Promise<CommandResult<Sc
   const root = project.root;
   const stateDir = project.paths.stateDir;
   const tz = project.timezone;
-  const via: "os-job" | "serve" = noOsJob ? "serve" : "os-job";
   guardRealHome(home, e.env);
   const previousEntry = listProjects(home).find((x) => x.root === canonicalRoot(root)) ?? null;
 
   // The setting first, then the registry, then the job: the job's first run (RunAtLoad) must find the project.
   const db = RunsDb.open(stateDir, { now: () => now });
   let before: SchedulingRecord;
+  let via: "os-job" | "serve";
   const saved = { scheduling: null as unknown, since: null as unknown };
   try {
     saved.scheduling = db.getSetting("scheduling");
     saved.since = db.getSetting(SINCE_KEY);
     before = schedulingOf(db, now);
+    via = viaForOn(before, noOsJob);
     db.setScheduling({ state: "on", via });
     if (before.state !== "on" || before.via !== via) db.setSetting(SINCE_KEY, now.toISOString());
   } finally {
     db.close();
   }
+  const serveOnly = via === "serve";
 
   let job: JobInfo | null = null;
   let entries: RegistryEntry[];
   try {
     entries = addProject(home, { root, via }, { now }).entries;
-    if (!noOsJob) job = jobInfo(ensureJob(e.runner(), home, e.jobOptions));
+    if (!serveOnly) job = jobInfo(ensureJob(e.runner(), home, e.jobOptions), e.jobOptions);
   } catch (err) {
     // Put the setting and the registry back as they were: scheduling is not on when its job could not be installed.
     const back = RunsDb.open(stateDir, { now: () => now });
@@ -651,12 +733,12 @@ async function turnOn(e: Invocation, noOsJob: boolean): Promise<CommandResult<Sc
 
   const problems: Problem[] = [];
   // Serve only, and the OS job ticked nothing else: take it away (as off does).
-  if (noOsJob && before.via === "os-job" && !entries.some((x) => x.via === "os-job")) {
+  if (serveOnly && before.via === "os-job" && !entries.some((x) => x.via === "os-job")) {
     job = removeQuietly(e, problems, true, "this project is ticked by croft serve only: the job's ticks skip it");
   }
 
   let firstTick: ScheduleData["firstTick"] = null;
-  if (!noOsJob) {
+  if (!serveOnly) {
     const ticking = before.state === "on" && before.via === "os-job" && !job?.changed && before.heartbeatAt !== null
       && now.getTime() - Date.parse(before.heartbeatAt) <= TICKING_WITHIN_MS;
     if (ticking) {
@@ -722,7 +804,7 @@ function removeQuietly(e: Invocation, problems: Problem[], expected: boolean, ef
     const r = removeJob(e.runner(), e.home, e.jobOptions);
     return {
       kind: r.kind, label: e.home.jobLabel, file: r.kind === "launchd" ? plistPath(e.home) : null,
-      installed: false, loaded: r.kind === "launchd" ? false : null, bun: null, bunExists: false, removed: r.removed,
+      installed: false, loaded: r.kind === "launchd" ? false : null, bun: null, bunVersion: null, bunExists: false, removed: r.removed,
     };
   } catch (err) {
     if (expected) {
@@ -789,7 +871,7 @@ async function pause(e: Invocation, forMs: number | null): Promise<CommandResult
     action: "pause", root: project.root, scheduling: schedulingJson(readScheduling(stateDir, now), project.timezone), job: null,
     registry: registrySummary(e.home), serve: serveOf(stateDir), assets: [],
   };
-  return { data, problems: [], next: [{ command: "croft schedule on", reason: "resume scheduled runs now" }], ok: true, exit: 0 };
+  return { data, problems: [], next: [{ command: resumeCommand(before.via), reason: "resume scheduled runs now" }], ok: true, exit: 0 };
 }
 
 async function status(e: Invocation): Promise<CommandResult<ScheduleData>> {
@@ -867,6 +949,11 @@ export function formatSchedule(d: ScheduleData, problems: readonly Problem[], tz
       if (d.job?.removed) lines.push("Removed the per-user OS job (no other project uses it).");
     } else {
       lines.push(`Scheduling is on for ${where} (one job per user; checked every minute; survives restarts).`);
+      if (d.job?.bun) lines.push(`The job runs ${d.job.bunVersion ? `Bun ${d.job.bunVersion}` : "Bun"} from ${homeShort(d.job.bun, userHome)}.`);
+      for (const b of d.job?.bunSkipped ?? []) {
+        const what = b.version === null ? b.reason : `is Bun ${b.version}, ${b.reason}`;
+        lines.push(`note: ${homeShort(b.path, userHome)} ${what}, so the job does not run it`);
+      }
       if (d.job && d.job.bunStable === false) {
         lines.push(`note: the job runs Bun from ${d.job.bun}, a version manager's path that may vanish on upgrade; Bun's own installer (curl -fsSL https://bun.sh/install | bash) gives a stable one, then run croft schedule on again`);
       }
@@ -887,8 +974,9 @@ export function formatSchedule(d: ScheduleData, problems: readonly Problem[], tz
     return lines.join("\n");
   }
   if (d.action === "pause") {
-    const until = s.pausedUntil ? `until ${clockText(s.pausedUntil, tz, now)} (in ${spanText(Date.parse(s.pausedUntil) - now.getTime())})` : "until croft schedule on";
-    lines.push(`Scheduling is paused for ${where} ${until}; croft schedule on resumes it now.`);
+    const resume = resumeCommand(s.via);
+    const until = s.pausedUntil ? `until ${clockText(s.pausedUntil, tz, now)} (in ${spanText(Date.parse(s.pausedUntil) - now.getTime())})` : `until ${resume}`;
+    lines.push(`Scheduling is paused for ${where} ${until}; ${resume} resumes it now.`);
     return lines.join("\n");
   }
   // status
@@ -896,7 +984,14 @@ export function formatSchedule(d: ScheduleData, problems: readonly Problem[], tz
   if (d.job) {
     const j = d.job;
     const state = !j.installed ? "not installed" : j.loaded === false ? "installed, not loaded" : j.loaded ? "installed, loaded" : "installed";
-    lines.push(`Job: ${j.kind === "launchd" ? `launchd ${j.label}` : `crontab (${j.label})`} · ${state}${j.bun ? ` · bun ${j.bun}${j.bunExists ? "" : " (missing)"}` : ""}`);
+    const at = j.bun ? homeShort(j.bun, userHome) : "";
+    const bun = !j.bun ? "" : !j.bunExists ? ` · Bun at ${at} (missing)` : j.bunVersion ? ` · Bun ${j.bunVersion} at ${at}` : ` · Bun at ${at} (does not run)`;
+    lines.push(`Job: ${j.kind === "launchd" ? `launchd ${j.label}` : `crontab (${j.label})`} · ${state}${bun}`);
+    if (j.bun && j.bunExists && j.bunVersion === null) {
+      lines.push("note: the job's Bun does not run (it printed no version): croft schedule on points the job at one that does");
+    } else if (j.bunVersion && !versionAtLeast(j.bunVersion, BUN_FLOOR)) {
+      lines.push(`note: the job's Bun (${j.bunVersion}) is older than croft needs (${BUN_FLOOR}): croft schedule on points the job at a newer one`);
+    }
   }
   const stale = problems.find((p) => p.code === "SCHEDULER_STALE");
   if (stale) lines.push(...logTailLines(stale));
@@ -919,7 +1014,7 @@ export function formatSchedule(d: ScheduleData, problems: readonly Problem[], tz
 function statusHead(d: ScheduleData, now: Date, tz: string): string {
   const s = d.scheduling;
   const parts = [`Scheduling ${s.state}`];
-  if (s.state === "paused") parts.push(s.pausedUntil ? `until ${clockText(s.pausedUntil, tz, now)}` : "until croft schedule on");
+  if (s.state === "paused") parts.push(s.pausedUntil ? `until ${clockText(s.pausedUntil, tz, now)}` : `until ${resumeCommand(s.via)}`);
   if (s.state !== "off") parts.push(`ticks from ${tickerText(s, d.serve)}`);
   const stale = s.stale ? " (stale)" : "";
   parts.push(s.lastTickAt ? `last tick ${agoText(s.lastTickAt, now)}${stale}` : s.state === "on" ? `no tick yet${stale}` : "never ticked");

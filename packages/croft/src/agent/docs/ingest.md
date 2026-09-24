@@ -26,6 +26,7 @@ type Issue = { id: number; updated_at: string };
 
 export default ingest({
   description: "Issues and pull requests of oven-sh/bun",
+  schedule: "every hour",       // runs on its own once scheduling is on (croft docs scheduling)
   secrets: ["GITHUB_TOKEN"],
   key: "id",                    // a re-fetched issue replaces its old row
   incremental: "updated_at",    // croft remembers the newest updated_at it saved
@@ -64,6 +65,7 @@ type Page = { data: Charge[]; has_more: boolean };
 
 export default ingest({
   description: "Stripe charges; re-reads the last 30 days to pick up refunds and disputes",
+  schedule: "every hour",
   secrets: ["STRIPE_KEY"],
   key: "id",
   incremental: { field: "created", unit: "s", lookback: "30 days" },
@@ -129,12 +131,13 @@ export default ingest({
 ```
 
 ```ts
-// assets/taxi_zones.ts: a CSV from a URL
+// assets/taxi_zones.ts: a CSV from a URL, refreshed monthly
 import { ingest } from "@zabaca/croft";
 
 export default ingest({
   description: "NYC taxi zone lookup",
   file: "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv",
+  schedule: "monthly",
   key: "LocationID",
   csv: { header: true },
 });
@@ -152,7 +155,8 @@ export default ingest({
 - query(sql): one SELECT over this asset's own table, e.g. which ids it already has.
 - signal: aborted on timeout or Ctrl-C.
 
-Other options: columns (type pins, e.g. { amount: "DECIMAL(18,2)" }), write ("replace", "append" or "merge"),
+Other options: schedule (when it runs on its own: "every hour", "daily at 06:00", "weekdays at 9am", "monthly" or a
+cron; croft docs scheduling), columns (type pins, e.g. { amount: "DECIMAL(18,2)" }), write ("replace", "append" or "merge"),
 retries, timeout (no-progress timeout, default "10m"), csv: { header, delimiter, skip, encoding }, checks
 (rules every load must pass, such as ["not_null(email)", "amount >= 0"]) and warnings (the same rules, reported
 without blocking); croft docs checks. A failing check writes nothing: the table keeps its previous rows and the

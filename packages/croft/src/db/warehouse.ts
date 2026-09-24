@@ -514,7 +514,8 @@ export class DuckWarehouse implements Warehouse {
       ? { pid, program: "croft", runId: intent.runId ?? undefined, action: "write", since: intent.since }
       : { pid, program: c.program };
     let croft = Boolean(intent);
-    if (!croft && servePid(this.stateDir) === pid) {
+    // croft serve holds the file in its query worker, a child process (serve/worker.ts), not under its own pid.
+    if (!croft && (servePid(this.stateDir) === pid || isServeWorker(pid))) {
       base.program = "croft's read server";
       croft = true;
     }
@@ -570,6 +571,11 @@ function servePid(stateDir: string): number | null {
 /** Whether a PID runs croft: the bin (`croft …`), the package (`@zabaca/croft`) or its source tree. */
 export function isCroftCommand(pid: number): boolean {
   return /(^|[\/\s])croft(\s|$)|@zabaca\/croft|\/croft\/src\//.test(commandLine(pid));
+}
+
+/** Whether a PID is croft serve's query worker (serve/worker.ts), which holds the warehouse for the server. */
+export function isServeWorker(pid: number): boolean {
+  return /[\/\\]serve[\/\\]worker\.ts(\s|$)/.test(commandLine(pid));
 }
 
 /** A process's command line: /proc on Linux (minimal containers ship no `ps`), `ps` elsewhere. */

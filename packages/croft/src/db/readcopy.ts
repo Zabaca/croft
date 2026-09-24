@@ -25,16 +25,22 @@
 //
 // Errors are logged to <state>/readcopy.log and recorded in the setting (lastError), never thrown: the run has
 // already succeeded, and a copy that missed a refresh only shows older data, which croft serve marks with asOf.
+//
+//   status    readCopyStatus, for doctor and status (R32-11): the copy's path and asOf, the last good refresh, the
+//             last error, and its health. A refresh records which runs it covers (`covers`: the last finished run
+//             that committed a write, as runs.sqlite orders them), so a copy older than the last run that wrote data
+//             is found by run order, not by comparing clocks. A stat and runs.sqlite only: it never opens the copy,
+//             and this module imports DuckDB only when it refreshes, so doctor can import it before the binding
+//             check.
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, utimesSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative, sep } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { currentIdentity, type ProcessIdentity, recordAlive } from "../core/proc.ts";
-import { formatInstant, now } from "../core/time.ts";
+import { formatInstant, now, parseInstant, zonedParts } from "../core/time.ts";
 import { RunsDb } from "../history/runs-db.ts";
 import { loadProject, type Project } from "../project/root.ts";
-import { canonicalPath } from "./connect.ts";
-import { type DuckWarehouse, openWarehouse } from "./warehouse.ts";
+import type { DuckWarehouse } from "./warehouse.ts";
 
 /** The runs.sqlite setting that coordinates refreshes and records the last one. */
 export const READ_COPY_SETTING = "readCopy";
@@ -97,6 +103,9 @@ export interface ReadCopyOptions {
   hooks?: ReadCopyHooks;
 }
 
+/** A finished run that committed a write: its id, and when it finished (runs.finished_at, UTC ISO). */
+export interface RunMark { runId: string; at: string }
+
 /** The setting's value. */
 interface ReadCopyState {
   /** Bumped by every request; a refresher runs again while it grew during its round. */
@@ -107,9 +116,25 @@ interface ReadCopyState {
   refreshedAt: string | null;
   method: CloneMethod | null;
   heldMs: number | null;
+  /** The last finished run that wrote data when the last good refresh began (lastWrite): the copy holds its writes.
+   *  null when none had, or for a copy made before croft recorded it. */
+  covers: RunMark | null;
   /** The last refresh's error, until one succeeds. `at` is UTC ISO. */
   lastError: { at: string; code: string | null; message: string } | null;
 }
+
+/**
+ * How current the copy is:
+ * - off: readCopy is off;
+ * - ok: the last good refresh came after the last run that wrote data;
+ * - missing: no copy yet, and nothing failed (the next run that writes makes it);
+ * - refreshing: a refresh is under way, or the run that wrote last is still finishing (its refresh follows);
+ * - failed: the last refresh failed (lastError): the copy keeps older data;
+ * - behind: a run wrote data after the last good refresh, and no refresh followed (readCopy was off then, or the
+ *   refreshing process died).
+ * failed and behind are warnings in doctor and status.
+ */
+export type ReadCopyHealth = "off" | "ok" | "missing" | "refreshing" | "failed" | "behind";
 
 /** The read copy for doctor and status: whether it is on, where, and how current. */
 export interface ReadCopyStatus {
@@ -121,6 +146,13 @@ export interface ReadCopyStatus {
   refreshedAt: string | null;
   method: CloneMethod | null;
   lastError: ReadCopyState["lastError"];
+  /** The last finished run that committed a write (runs.sqlite), or null. */
+  lastWrite: RunMark | null;
+  /** A refresh is under way: another live process holds it, or the run that wrote last is still finishing. */
+  refreshing: boolean;
+  health: ReadCopyHealth;
+  /** <state>/readcopy.log, where refresh errors go. */
+  log: string;
 }
 
 /**
@@ -137,6 +169,7 @@ export async function refreshReadCopy(root: string, o: ReadCopyOptions = {}): Pr
   if (!project.config.readCopy) return { status: "disabled" };
   let key: string;
   try {
+    const { canonicalPath } = await import("./connect.ts");
     key = canonicalPath(project.paths.readCopy); // one key however the root was spelled
   } catch {
     key = project.paths.readCopy;
@@ -144,27 +177,207 @@ export async function refreshReadCopy(root: string, o: ReadCopyOptions = {}): Pr
   return coalesce(key, () => refreshLoop(project, o));
 }
 
-/** The read copy's state, from a stat of the copy and the runs.sqlite setting. Never opens the copy. */
+/** The last finished run that committed a write: a run whose status is final and one of whose steps is ok (the
+ *  runner refreshes the copy after each such run). Runs still running are left out: their refresh comes at their
+ *  end. */
+function lastWrite(runs: RunsDb): RunMark | null {
+  const row = runs.sqlite.query(`SELECT id, finished_at FROM runs
+      WHERE status <> 'running' AND finished_at IS NOT NULL
+        AND EXISTS (SELECT 1 FROM steps s WHERE s.run_id = runs.id AND s.status = 'ok')
+      ORDER BY finished_at DESC, id DESC LIMIT 1`).get() as { id: string; finished_at: string } | null;
+  return row ? { runId: row.id, at: row.finished_at } : null;
+}
+
+/** Whether the process of a run is alive (runs.sqlite's pid, start time and boot id). */
+function runAlive(runs: RunsDb, runId: string): boolean {
+  const r = runs.getRun(runId);
+  return !!r && recordAlive({ pid: r.pid, procStart: r.procStart, bootId: r.bootId });
+}
+
+/**
+ * The read copy's state, from a stat of the copy and runs.sqlite (the setting, and the last run that wrote data).
+ * Never opens the copy, never writes. `runs`: an open runs.sqlite to read (the caller's).
+ */
 export function readCopyStatus(project: Project, runs?: RunsDb): ReadCopyStatus {
   const path = project.paths.readCopy;
+  const log = join(project.paths.stateDir, READ_COPY_LOG);
   let mtimeMs: number | null = null;
   try {
     mtimeMs = statSync(path).mtimeMs;
   } catch {}
   let state: ReadCopyState = emptyState();
+  let written: RunMark | null = null;
+  let holderAlive = false;
+  let writerAlive = false;
   try {
     const db = runs ?? (existsSync(join(project.paths.stateDir, "runs.sqlite")) ? RunsDb.open(project.paths.stateDir) : null);
     try {
-      if (db) state = readState(db);
+      if (db) {
+        state = readState(db);
+        written = lastWrite(db);
+        holderAlive = state.holder !== null && recordAlive(state.holder);
+        const unsettled = state.lastError !== null || (written !== null && behindOf(state, written, mtimeMs));
+        if (unsettled && written && !holderAlive) writerAlive = runAlive(db, written.runId);
+      }
     } finally {
       if (!runs) db?.close();
     }
   } catch {}
+  const enabled = project.config.readCopy;
+  const exists = mtimeMs !== null;
+  const refreshing = holderAlive || writerAlive;
+  const health: ReadCopyHealth = !enabled ? "off"
+    : refreshing ? "refreshing"
+    : state.lastError ? "failed"
+    : !exists ? "missing"
+    : written && behindOf(state, written, mtimeMs) ? "behind"
+    : "ok";
   return {
-    enabled: project.config.readCopy, path, exists: mtimeMs !== null,
+    enabled, path, exists,
     asOf: mtimeMs === null ? null : formatInstant(Math.round(mtimeMs), project.timezone),
     refreshedAt: state.refreshedAt, method: state.method, lastError: state.lastError,
+    lastWrite: written, refreshing, health, log,
   };
+}
+
+/** Whether the copy misses the writes of `written`: by run order when the last refresh recorded what it covers,
+ *  else (a copy made before that) by the copy's time. */
+function behindOf(state: ReadCopyState, written: RunMark, mtimeMs: number | null): boolean {
+  if (mtimeMs === null) return false;
+  // lastWrite orders by finished_at, then id: the same order decides here.
+  if (state.covers) return written.at > state.covers.at || (written.at === state.covers.at && written.runId > state.covers.runId);
+  return Date.parse(written.at) > mtimeMs;
+}
+
+// ---- how doctor and status show it ------------------------------------------------------------------------
+
+/** The read copy in doctor's details and status's data.readCopy: instants in the project zone. */
+export interface ReadCopyView {
+  path: string;
+  exists: boolean;
+  asOf: string | null;
+  refreshedAt: string | null;
+  method: CloneMethod | null;
+  lastError: { at: string; code: string | null; message: string } | null;
+  lastWrite: { runId: string; at: string } | null;
+  health: Exclude<ReadCopyHealth, "off">;
+  log: string;
+}
+
+/** What doctor and status print: a line, and for failed and behind a warning with its hint. */
+export interface ReadCopyWords {
+  /** "warehouse.read.duckdb · as of 10:02 (3 min ago)". */
+  text: string;
+  warning: boolean;
+  hint: string | null;
+}
+
+/** readCopyWords with the view. */
+export interface ReadCopySummary extends ReadCopyWords {
+  view: ReadCopyView;
+}
+
+const NOT_REFRESHED = "the read copy was not refreshed: ";
+
+/** The read copy as JSON, instants in the project zone `tz`; null when readCopy is off. */
+export function readCopyView(s: ReadCopyStatus, tz: string): ReadCopyView | null {
+  if (!s.enabled || s.health === "off") return null;
+  const zoned = (iso: string | null) => (iso ? zonedOr(iso, tz) : null);
+  return {
+    path: s.path, exists: s.exists, asOf: s.asOf, refreshedAt: zoned(s.refreshedAt), method: s.method,
+    lastError: s.lastError ? { ...s.lastError, at: zoned(s.lastError.at)! } : null,
+    lastWrite: s.lastWrite ? { runId: s.lastWrite.runId, at: zoned(s.lastWrite.at)! } : null,
+    health: s.health, log: s.log,
+  };
+}
+
+/**
+ * A read copy in words, at `now`. Paths inside the project (`root`) are shown relative to it, so the hint of a
+ * warning names .croft/readcopy.log. `database`: the warehouse, which a program holding it keeps from being copied.
+ */
+export function readCopyWords(v: ReadCopyView, o: { root: string; database: string; tz: string; now: Date }): ReadCopyWords {
+  const shown = (p: string) => (p === o.root || p.startsWith(o.root + sep) ? relative(o.root, p) : p);
+  const log = shown(v.log);
+  const asOf = v.asOf ? `as of ${clock(v.asOf, o.tz, o.now)} (${ago(v.asOf, o.now)})` : null;
+  const parts = [shown(v.path)];
+  let hint: string | null = null;
+  switch (v.health) {
+    case "ok":
+      parts.push(asOf ?? "no copy");
+      break;
+    case "missing":
+      parts.push("not made yet: the next croft run that writes data makes it");
+      break;
+    case "refreshing":
+      parts.push(...(asOf ? [asOf] : []), "being refreshed now");
+      break;
+    case "failed": {
+      const e = v.lastError!;
+      const why = e.message.startsWith(NOT_REFRESHED) ? e.message.slice(NOT_REFRESHED.length) : e.message;
+      parts.push(asOf ?? "no copy yet", `the last refresh failed ${ago(e.at, o.now)}${e.code ? ` (${e.code})` : ""}: ${why}`);
+      hint = e.code === "DB_HELD_BY_OTHER_PROGRAM"
+        ? `close the program holding ${shown(o.database)} (GUIs open ${shown(v.path)} instead); the next croft run that writes data refreshes the copy (${log} has each failure)`
+        : `fix what ${log} says (free disk space, for example); the next croft run that writes data refreshes the copy`;
+      break;
+    }
+    case "behind":
+      parts.push(`${asOf ?? "no copy"}, older than the last run that wrote data (${v.lastWrite!.runId}, ${clock(v.lastWrite!.at, o.tz, o.now)})`);
+      hint = `the next croft run that writes data refreshes the copy; no refresh followed that run (readCopy was off then, or the refresh was cut short; ${log} has each failure)`;
+      break;
+  }
+  return { text: parts.join(" · "), warning: v.health === "failed" || v.health === "behind", hint };
+}
+
+/** The read copy of `project` (s: its readCopyStatus) as doctor shows it, at `at`; null when readCopy is off. */
+export function readCopySummary(s: ReadCopyStatus, project: Project, at: Date): ReadCopySummary | null {
+  const view = readCopyView(s, project.timezone);
+  if (!view) return null;
+  const words = readCopyWords(view, { root: project.root, database: project.paths.database, tz: project.timezone, now: at });
+  return { view, ...words };
+}
+
+function zonedOr(iso: string, tz: string): string {
+  try {
+    return formatInstant(iso, tz);
+  } catch {
+    return iso;
+  }
+}
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const pad2 = (n: number) => String(n).padStart(2, "0");
+
+/** Epoch milliseconds of an ISO instant (with an offset, and microseconds); NaN when it is not one. */
+function epochMs(iso: string): number {
+  try {
+    return Number(parseInstant(iso) / 1000n);
+  } catch {
+    return Date.parse(iso);
+  }
+}
+
+/** "10:02" on the same local day as `at`, else "Sep 23 10:02" (as schedule.ts clockText). */
+function clock(iso: string, tz: string, at: Date): string {
+  const t = epochMs(iso);
+  if (!Number.isFinite(t)) return iso;
+  const p = zonedParts(new Date(t), tz);
+  const n = zonedParts(at, tz);
+  const time = `${pad2(p.hour)}:${pad2(p.minute)}`;
+  if (p.year === n.year && p.month === n.month && p.day === n.day) return time;
+  return `${MONTHS[p.month - 1]} ${p.day}${p.year !== n.year ? ` ${p.year}` : ""} ${time}`;
+}
+
+/** "12 s ago", "14 min ago", "3 h ago", "2 days ago". */
+function ago(iso: string, at: Date): string {
+  const t = epochMs(iso);
+  if (!Number.isFinite(t)) return "at an unknown time";
+  const s = Math.round((at.getTime() - t) / 1000);
+  if (s < 0) return "just now";
+  if (s < 90) return `${s} s ago`;
+  if (s < 90 * 60) return `${Math.round(s / 60)} min ago`;
+  if (s < 36 * 3600) return `${Math.round(s / 3600)} h ago`;
+  const days = Math.round(s / 86_400);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
 }
 
 // ---- coalescing in this process ---------------------------------------------------------------------------
@@ -198,7 +411,7 @@ function start(slot: Slot, key: string, work: () => Promise<ReadCopyOutcome>): P
 // ---- coalescing across processes (runs.sqlite) ------------------------------------------------------------
 
 function emptyState(): ReadCopyState {
-  return { requested: 0, holder: null, refreshedAt: null, method: null, heldMs: null, lastError: null };
+  return { requested: 0, holder: null, refreshedAt: null, method: null, heldMs: null, covers: null, lastError: null };
 }
 
 function readState(runs: RunsDb): ReadCopyState {
@@ -211,6 +424,7 @@ function readState(runs: RunsDb): ReadCopyState {
   if (typeof v.refreshedAt === "string") s.refreshedAt = v.refreshedAt;
   if (v.method === "clone" || v.method === "reflink" || v.method === "copy") s.method = v.method;
   if (typeof v.heldMs === "number") s.heldMs = v.heldMs;
+  if (v.covers && typeof v.covers.runId === "string" && typeof v.covers.at === "string") s.covers = { runId: v.covers.runId, at: v.covers.at };
   if (v.lastError && typeof v.lastError.message === "string") s.lastError = v.lastError;
   return s;
 }
@@ -230,14 +444,16 @@ function claim(runs: RunsDb, me: ProcessIdentity): "mine" | "coalesced" {
 }
 
 /** Record a round's outcome. True when requests arrived during it (and another round may run); otherwise the
- *  refresh is given up in the same transaction, so a request made after it finds no holder and refreshes itself. */
-function endRound(runs: RunsDb, me: ProcessIdentity, target: number, out: ReadCopyOutcome, mayContinue: boolean): boolean {
+ *  refresh is given up in the same transaction, so a request made after it finds no holder and refreshes itself.
+ *  `covers`: the last run that wrote data when the round began, which a good refresh holds. */
+function endRound(runs: RunsDb, me: ProcessIdentity, target: number, out: ReadCopyOutcome, mayContinue: boolean, covers: RunMark | null): boolean {
   return runs.transaction(() => {
     const s = readState(runs);
     if (out.status === "refreshed") {
       s.refreshedAt = out.refreshedAt;
       s.method = out.method;
       s.heldMs = out.heldMs;
+      s.covers = covers;
       s.lastError = null;
     } else if (out.status === "failed") {
       s.lastError = { at: now().toISOString(), code: out.error.code, message: out.error.message };
@@ -261,11 +477,12 @@ async function refreshLoop(project: Project, o: ReadCopyOptions): Promise<ReadCo
     holding = true;
     for (;;) {
       rounds++;
-      // Requests made before this round's CHECKPOINT are covered by it.
+      // Requests made before this round's CHECKPOINT are covered by it, and so are the runs finished before it.
       const target = readState(runs).requested;
+      const covers = lastWrite(runs);
       const out = await refreshOnce(project, o, rounds);
       if (out.status === "failed") log(stateDir, `${out.error.code ? `${out.error.code}: ` : ""}${out.error.message}`);
-      const again = endRound(runs, me, target, out, rounds < READ_COPY_DEFAULTS.maxRounds);
+      const again = endRound(runs, me, target, out, rounds < READ_COPY_DEFAULTS.maxRounds, covers);
       if (!again) {
         holding = false;
         return out;
@@ -305,7 +522,8 @@ async function refreshOnce(project: Project, o: ReadCopyOptions, round: number):
   try {
     mkdirSync(dir, { recursive: true });
     removeTemps(path);
-    const w = o.warehouse ?? (own = openWarehouse({
+    // DuckDB is imported only here, when a refresh opens the warehouse itself (doctor imports this module).
+    const w = o.warehouse ?? (own = (await import("./warehouse.ts")).openWarehouse({
       path: database, mode: "read_write", timezone: project.timezone, root: project.root, stateDir, isTTY: false,
       ...(o.runId ? { runId: o.runId } : {}),
     }));

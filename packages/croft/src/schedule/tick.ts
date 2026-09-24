@@ -12,14 +12,20 @@
 //      holder, waiter or write intent) reconcile is not even loaded: it brings the database engine along;
 //   5. compute the due work from runs.sqlite (schedule/due.ts): no asset code is imported unless an asset file
 //      changed since the last tick;
-//   6. start one detached `croft run --due <assets…>` per group of due assets (run/detach.ts: absolute Bun, an
+//   6. settle the runs earlier ticks started that have ended (schedule/due.ts): a fire such a run did not attempt
+//      (it met another run's lease, a hold that appeared after the tick, or its child died or refused before it
+//      recorded the run) gets its previous last_fire_at back, so it stays due. A run that failed to start its assets
+//      is a problem of this tick, notified as a crashed scheduled run is when nothing else recorded it, and its
+//      assets wait RETRY_BACKOFF_MS before the next try (settings `schedule.failedStarts`);
+//   7. start one detached `croft run --due <assets…>` per group of due assets (run/detach.ts: absolute Bun, an
 //      explicit environment); the children take the leases. Each group's ingests get last_fire_at (the fire they
-//      handle) and last_attempt_at before the child starts, so a child that dies early is not started again every
-//      minute, and the run is noted (settings `schedule.spawned`) until it holds its leases or ends;
-//   7. release the singleton and exit, usually within a second. It never runs asset work itself: launchd runs one
+//      handle) and last_attempt_at before the child starts, together with the run, the fires and the values they
+//      replaced (settings `schedule.spawned`), so a child that is still starting is not started again, and one
+//      that never starts its assets gives the fire back. A spawn that fails is a failed start at once;
+//   8. release the singleton and exit, usually within a second. It never runs asset work itself: launchd runs one
 //      process per job, and a tick busy with a 40-minute transform would drop every later fire.
 import { existsSync, readdirSync, rmSync } from "node:fs";
-import { CroftError } from "../core/errors.ts";
+import { CroftError, problem } from "../core/errors.ts";
 import { currentIdentity, type ProcessIdentity, recordAlive } from "../core/proc.ts";
 import type { Problem, Warehouse } from "../core/types.ts";
 import { intentDir } from "../db/intent.ts";
@@ -27,7 +33,10 @@ import type { DuckWarehouse } from "../db/warehouse.ts";
 import { newRunId, RunsDb } from "../history/runs-db.ts";
 import type { Project } from "../project/root.ts";
 import { CONFIRM_GRANT_ENV } from "../safety/confirm.ts";
-import { type Alive, dueWork, type FactsResolver, type FireTimes, SPAWNED_SETTING, type SpawnedRun } from "./due.ts";
+import {
+  type Alive, clockWords, dueWork, type FactsResolver, FAILED_STARTS_SETTING, type FailedStart, type FireTimes, RETRY_BACKOFF_MS,
+  SPAWNED_SETTING, type SpawnedRun,
+} from "./due.ts";
 import { notifyScheduledFailure, type ScheduledFailure } from "./notify.ts";
 import type { TickResult } from "./os.ts";
 
@@ -101,38 +110,67 @@ export async function projectTick(i: TickInput): Promise<TickOutcome> {
       await i.onClaimed?.();
       const heartbeatAt = now.toISOString();
       runs.heartbeat(heartbeatAt);
-      const problems: Problem[] = [...await reconcileTick(project, runs, i.notify ?? notifyScheduledFailure)];
+      const notify = i.notify ?? notifyScheduledFailure;
+      const problems: Problem[] = [...await reconcileTick(project, runs, notify)];
       const work = await dueWork({
         project, runs, now, store: true, alive, ...(i.resolve ? { resolve: i.resolve } : {}), ...(i.fires ? { fires: i.fires } : {}),
       });
       problems.push(...work.problems);
+      // The runs earlier ticks started that ended: the fires they did not attempt stay due, and a run whose child
+      // never recorded it is notified here (nothing else knows of it).
+      runs.transaction(() => {
+        for (const r of work.rollbacks) if (runs.scheduleState(r.asset)?.lastFireAt === r.from) runs.putScheduleState(r.asset, { lastFireAt: r.to });
+      });
+      const failedStarts: FailedStart[] = work.failedStarts.map(({ fresh: _fresh, ...s }) => s);
+      for (const s of work.failedStarts) if (s.fresh && s.unrecorded) await notifyFailedStart(notify, project.root, s);
+
       const spawn = i.spawn ?? spawnDueRun;
       // A confirmation grant is one run's; a scheduled run never carries one.
       const env = { ...i.env, [CONFIRM_GRANT_ENV]: undefined };
       const started: SpawnedRun[] = [];
+      const noted: SpawnedRun[] = [...work.inFlight];
       for (const assets of work.groups) {
         const runId = newRunId(now, project.timezone);
-        // Recorded before the child starts: a child that dies before its first step must not be started again
-        // for the same fire.
+        const fires: NonNullable<SpawnedRun["fires"]> = {};
+        for (const a of assets) {
+          const fire = work.fires.get(a);
+          if (fire) fires[a] = { fire, before: runs.scheduleState(a)?.lastFireAt ?? null };
+        }
+        const entry: SpawnedRun = { runId, assets, at: heartbeatAt, ...(Object.keys(fires).length ? { fires } : {}) };
+        // Recorded before the child starts, with the run: a child that is starting is not started again for the
+        // same fire, and one that ends without attempting an asset gives its fire back (a later tick).
         runs.transaction(() => {
-          for (const a of assets) {
-            const fire = work.fires.get(a);
-            runs.putScheduleState(a, { lastAttemptAt: heartbeatAt, ...(fire ? { lastFireAt: fire } : {}) });
-          }
+          for (const a of assets) runs.putScheduleState(a, { lastAttemptAt: heartbeatAt, ...(fires[a] ? { lastFireAt: fires[a].fire } : {}) });
+          runs.setSetting(SPAWNED_SETTING, [...noted, entry]);
         });
         try {
           await spawn({ root: project.root, stateDir, runId, assets, env });
+          noted.push(entry);
           started.push({ runId, assets });
         } catch (e) {
+          const message = (e as Error)?.message ?? String(e);
+          const retry = clockWords(new Date(now.getTime() + RETRY_BACKOFF_MS), project.timezone, now);
           problems.push(new CroftError("INTERNAL_ERROR", {
-            message: `the scheduler could not start the run of ${assets.join(", ")}: ${(e as Error)?.message ?? String(e)}`,
+            message: `the scheduler could not start the run of ${assets.join(", ")}: ${message}`,
             hint: "check that Bun and the project's croft are installed (croft doctor), then look at .croft/logs/tick.log",
-            effect: "those assets were not run this minute; the next tick tries again at their next fire",
+            effect: `${assets.length === 1 ? "it stays" : "they stay"} due; the scheduler tries again after ${retry}`,
           }).problem);
+          // Never started: the fires stay due, and the assets wait before the next try.
+          runs.transaction(() => {
+            for (const [a, f] of Object.entries(fires)) if (runs.scheduleState(a)?.lastFireAt === f.fire) runs.putScheduleState(a, { lastFireAt: f.before });
+            runs.setSetting(SPAWNED_SETTING, noted);
+          });
+          const failed: FailedStart = { runId, assets, at: heartbeatAt, reason: `it could not be started: ${message}`, unrecorded: true };
+          failedStarts.push(failed);
+          await notifyFailedStart(notify, project.root, failed);
         }
       }
-      // Runs started earlier that still start or run, and these: a later tick treats their assets as taken.
-      runs.setSetting(SPAWNED_SETTING, [...work.inFlight, ...started]);
+      // Runs started earlier that still start or run, and these: a later tick treats their assets as taken, and
+      // settles them once they end.
+      runs.transaction(() => {
+        runs.setSetting(SPAWNED_SETTING, noted);
+        runs.setSetting(FAILED_STARTS_SETTING, failedStarts);
+      });
       return {
         result: result({ heartbeatAt, spawned: started, held: work.held, importedAssetCode: work.imported }),
         problems,
@@ -142,6 +180,20 @@ export async function projectTick(i: TickInput): Promise<TickOutcome> {
     }
   } finally {
     runs.close();
+  }
+}
+
+/** A scheduled run that never recorded itself failed as a crashed one does: the notification says which assets it
+ *  did not run. A notification never stops the tick. */
+async function notifyFailedStart(notify: NonNullable<TickInput["notify"]>, root: string, s: FailedStart): Promise<void> {
+  const error = s.problem ?? problem("RUN_CRASHED", {
+    message: `the scheduled run ${s.runId} did not start: ${s.reason}`,
+    hint: `croft tick starts it again after a wait; .croft/logs/${s.runId}/ has what it printed`,
+  });
+  try {
+    await notify(root, { project: root, runId: s.runId, failed: s.assets.map((asset) => ({ asset, error })) });
+  } catch {
+    // The tick's problems still say so.
   }
 }
 

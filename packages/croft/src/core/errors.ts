@@ -78,7 +78,7 @@ export const CODES = {
   DB_BUSY: { category: "coordination", severity: "error", exit: 4 },
   DB_HELD_BY_OTHER_PROGRAM: { category: "coordination", severity: "error", exit: 4 },
   ASSET_BUSY: { category: "coordination", severity: "error", exit: 4 },
-  SCHEDULE_HELD: { category: "coordination", severity: "error", exit: 4 },
+  SCHEDULE_HELD: { category: "coordination", severity: "warning", exit: 0 },
   SERVE_UNAVAILABLE: { category: "coordination", severity: "error", exit: 4 },
   SERVE_UNAUTHORIZED: { category: "coordination", severity: "error", exit: 2 },
   SERVE_UNSAFE_FILESYSTEM: { category: "coordination", severity: "error", exit: 4 },

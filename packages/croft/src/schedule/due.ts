@@ -14,27 +14,48 @@
 //
 // Held (not started, still due), in this order:
 // - paused: scheduling is paused (`croft schedule pause`);
-// - SCHEDULE_HELD: the code is not the code a human last ran (approved_code_hash), new assets included;
+// - SCHEDULE_HELD: the code is not the code a human last ran (approved_code_hash), new assets included. A hash
+//   that differs only because croft.json's timezone changed says so, rather than "code edited";
 // - LARGE_REPROCESS: a scheduled run met the cost guard, and no person has run the transform since;
 // - leased: another run holds it, or a run a tick started has not taken its leases yet (overlaps skip);
-// - backoff: a transform whose last attempt failed. A deterministic failure (TYPE_CONFLICT, CHECK_FAILED, an SQL
-//   error, ASSET_INVALID: not retryable) waits for a change to its code or inputs; a retryable one (after its own
-//   retries), a crash or an interruption waits RETRY_BACKOFF_MS, or the server's longer Retry-After. Never every
-//   minute. An ingest needs none of this: it is due again only at its next fire.
+// - backoff, one of:
+//   - a run a tick started that ended before it started the asset, abnormally: its child died or refused before it
+//     recorded the run, it could not be spawned, or the run crashed or was interrupted first. It waits
+//     RETRY_BACKOFF_MS, then runs once more; the fire it was for stays due;
+//   - a transform whose last attempt failed. A deterministic failure (TYPE_CONFLICT, CHECK_FAILED, an SQL error,
+//     ASSET_INVALID: not retryable) waits for a change to its code or inputs; a retryable one (after its own
+//     retries), a crash or an interruption waits RETRY_BACKOFF_MS, or the server's longer Retry-After. Never every
+//     minute. An ingest needs none of this: it is due again only at its next fire;
+//   - a transform whose last step was skipped for an input that is still held (any of the above, SCHEDULE_HELD
+//     included, or failed and backed off) and has not changed since: a run would only skip it again. It waits for
+//     that input, and is due again once the input changes or is released.
 //
-// What the scheduler knows of an asset without importing it (AssetFacts: kind, schedule, inputs, code hash) is
-// cached in runs.sqlite by file hash: schedule_state keeps phrase, cron and file_hash, and the settings row
-// `schedule.facts` the rest. The file hash covers the asset file and the project time zone, and for TS assets the
-// size and modification time of everything in lib/ and of package.json and the lockfile, which the TS code hash
-// depends on. Only an asset whose hash changed is imported again (project/resolve.ts), so a tick with nothing
-// changed imports no asset code.
+// Fires: a tick records the fire a due ingest handles as last_fire_at before it starts the run, and the run (with
+// the value it replaced) in the settings row `schedule.spawned`. Once that run has ended, a fire it did not attempt
+// (its step never started: another run's lease met after planning, a hold that appeared since, a child that died
+// or refused before it recorded the run) is not handled: last_fire_at goes back (the view does so in memory, the
+// tick for good), so the fire stays due.
+//
+// What the scheduler knows of an asset (AssetFacts: kind, schedule, inputs, code hash) is cached in runs.sqlite:
+// schedule_state keeps phrase, cron and file_hash, and the settings row `schedule.facts` the rest. The cache key
+// (fileHash) covers the asset file and the project time zone, and for a TS asset the size and modification time of
+// every file its bundle read (Bun.build's inputs: lib/, helpers anywhere, JSON, code outside the project) and the
+// versions of the packages it imports: everything its code hash covers. A tick with nothing changed reads no asset
+// code. When a key changes, an SQL asset is parsed again; a TS asset is bundled again, which gives its code hash
+// without running it. Only code a human has run (approved_code_hash) is imported, in the tick and in the runs it
+// starts (§6): an unapproved TS asset keeps the facts of the last approved code (or, never approved, what its
+// text shows: ingest( or transform( and a literal schedule), and is held anyway. An approval (a run by hand)
+// imports it on the next tick, with no file change; an approval of other code bundles it again. An import of
+// approved code that fails (network code at module scope, a package half installed, a busy machine) keeps the facts
+// it had and is tried again after LOAD_RETRY_MS. An asset a run the tick started ended without starting is bundled
+// again too, so a key that missed a change cannot keep the tick and the runs it starts disagreeing every minute.
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { CODES, isCode, problem } from "../core/errors.ts";
 import { recordAlive } from "../core/proc.ts";
 import { zonedParts } from "../core/time.ts";
-import type { Hold, Problem, Reason } from "../core/types.ts";
+import type { AssetKind, Hold, Incremental, Problem, Reason } from "../core/types.ts";
 import type { CatalogAsset } from "../history/catalog.ts";
 import { RUNS_DB_FILE, RunsDb, type ScheduleStateRow, type StepRecord } from "../history/runs-db.ts";
 import type { ResolvedAsset } from "../project/resolve.ts";
@@ -73,12 +94,13 @@ export interface ScheduleViewInput {
 }
 
 /** Every asset as the scheduler sees it now. Read-only: it never writes runs.sqlite (the tick refreshes the
- *  cache), and it imports only assets whose file changed since the last tick, unless `resolved` is given. */
+ *  cache), and it imports only assets whose facts changed since the last tick, unless `resolved` is given. It runs
+ *  for a person (status, `schedule status`), so it may import code nobody has run yet, as status does. */
 export async function scheduleView(i: ScheduleViewInput): Promise<AssetScheduleView[]> {
   const project = loadProject({ root: i.root });
   const runs = existsSync(join(project.paths.stateDir, RUNS_DB_FILE)) ? RunsDb.open(project.paths.stateDir, { now: () => i.now }) : null;
   try {
-    const work = await dueWork({ project, runs, now: i.now, store: false, ...(i.resolved ? { resolved: i.resolved } : {}) });
+    const work = await dueWork({ project, runs, now: i.now, store: false, importUnapproved: true, ...(i.resolved ? { resolved: i.resolved } : {}) });
     return work.views;
   } finally {
     runs?.close();
@@ -86,50 +108,129 @@ export async function scheduleView(i: ScheduleViewInput): Promise<AssetScheduleV
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Facts: what the scheduler knows of an asset without importing it
+// Facts: what the scheduler knows of an asset
 
 /** The settings row that caches AssetFacts by asset. */
 export const FACTS_SETTING = "schedule.facts";
-/** The settings row listing the runs ticks started that may not hold their leases yet: [{runId, assets}]. */
+/** The settings row listing the runs ticks started whose end was not looked at yet: SpawnedRun[]. */
 export const SPAWNED_SETTING = "schedule.spawned";
+/** The settings row listing runs a tick started that ended before they started some of their assets: FailedStart[]. */
+export const FAILED_STARTS_SETTING = "schedule.failedStarts";
 /** How long a transform waits after a retryable failure, a crash or an interruption before the scheduler tries
- *  it again (a server's longer Retry-After wins). */
+ *  it again (a server's longer Retry-After wins), and how long assets wait after a run a tick started failed to
+ *  start them. */
 export const RETRY_BACKOFF_MS = 15 * 60_000;
+/** How long the scheduler waits before it imports approved code again whose import failed. */
+export const LOAD_RETRY_MS = 5 * 60_000;
+/** A run a tick has just started may not have written its handshake yet. */
+const SPAWN_GRACE_MS = 10_000;
 
 export interface AssetFacts {
   asset: string;
   /** Root-relative. */
   file: string;
   kind: "ingest" | "sql" | "ts" | null;
-  /** fileHash(): what the cache is keyed by. */
+  /** keyOf(): what the cache is keyed by. */
   fileHash: string;
   schedule: Schedule | null;
   /** The assets it reads (transforms). */
   inputs: string[];
-  /** The code hash (includes the project time zone); null when the code does not parse. */
+  /** The code hash (includes the project time zone); null when the code does not parse or bundle. */
   codeHash: string | null;
   /** An incremental TS transform (newRows()): forward-only, so an edit is no reason to run it. */
   incremental: boolean;
-  /** Loaded with no error. */
+  /** Loaded with no error (or, not imported, it bundles). */
   ok: boolean;
+  /** The project time zone the facts were read in. */
+  timezone?: string;
+  /** TS assets: every file its bundle read, root-relative, the asset first. */
+  files?: string[];
+  /** TS assets: the packages its bundle imports, with their installed versions. */
+  packages?: Record<string, string | null>;
+  /** The code hash whose import gave kind, schedule, inputs and incremental. It differs from codeHash while the
+   *  current code is not approved (the scheduler does not import it: those are the facts of the last code it
+   *  imported, or what the file's text shows); null when no code of this asset was imported. */
+  readFrom?: string | null;
+  /** The import of the (approved) code failed at this instant: it is imported again after LOAD_RETRY_MS. */
+  failedAt?: string;
+  /** Why that import failed. */
+  failure?: Problem;
+  /** approved_code_hash when the facts were read: an approval since makes the scheduler look again. */
+  approved?: string | null;
+  /** The code hash differs from approved_code_hash only because croft.json's timezone changed. */
+  timeZoneChanged?: { from: string; to: string };
+  /** The file defines no asset (a name the naming rules refuse): not looked at again until it changes. */
+  notAsset?: boolean;
 }
 
-/** Refreshes the facts of `names` (whose files changed) by importing them. It may return more assets than it was
- *  asked for (resolveProject loads every transform); an asset it cannot resolve is left out. */
-export type FactsResolver = (i: { root: string; timezone: string; names: readonly string[] }) => Promise<ResolvedAsset[]>;
+/** What importing an asset tells the scheduler: ResolvedAsset has all of it. */
+export interface ImportedAsset {
+  name: string;
+  file: string;
+  kind: AssetKind | null;
+  /** false: resolveProject did not import it (ResolvedAsset.loaded). */
+  loaded?: boolean;
+  ok: boolean;
+  inputs: string[];
+  incremental: Incremental;
+  schedule?: Schedule;
+  codeHash?: string;
+  timeZoneChanged?: { from: string; to: string };
+  problems: Problem[];
+  ts?: { localFiles: string[]; packages: Record<string, string | null> };
+}
 
-/** The default resolver: project/resolve.ts, imported only when something changed. */
+/** Imports `names` (SQL assets whose file changed, TS assets whose code is approved) and returns what each
+ *  declares. An asset it cannot find (a name the naming rules refuse) is left out. */
+export type FactsResolver = (i: { root: string; timezone: string; names: readonly string[] }) => Promise<ImportedAsset[]>;
+
+const NONE: Incremental = { kind: "none" };
+
+/** The default resolver: each named asset loaded on its own (project/sql-asset.ts, project/ts-asset.ts), never the
+ *  whole project, which would import every TS transform. Loaded only when something changed. */
 export const resolveAssets: FactsResolver = async (i) => {
-  const [{ resolveProject }, { discoverAssets }] = await Promise.all([import("../project/resolve.ts"), import("../project/discover.ts")]);
-  // A name the naming rules refuse is not an asset (the tick lists files without DuckDB's keyword list).
-  const valid = new Set((await discoverAssets(i.root)).assets.map((a) => a.name));
-  const selectors = i.names.filter((n) => valid.has(n));
-  if (selectors.length === 0) return [];
-  const project = await resolveProject({ root: i.root, timezone: i.timezone, selectors });
-  return project.assets.filter((a) => a.loaded);
+  const { discoverAssets } = await import("../project/discover.ts");
+  const discovery = await discoverAssets(i.root);
+  const wanted = new Set(i.names);
+  const assets = discovery.assets.filter((a) => wanted.has(a.name));
+  const names = discovery.assets.map((a) => a.name);
+  const out: ImportedAsset[] = [];
+  const sql = assets.filter((a) => a.kind === "sql");
+  if (sql.length > 0) {
+    const [{ openMemory }, { loadSqlAsset }] = await Promise.all([import("../db/connect.ts"), import("../project/sql-asset.ts")]);
+    const memory = await openMemory({ timezone: i.timezone });
+    try {
+      const conn = await memory.connect();
+      for (const a of sql) {
+        const s = await loadSqlAsset(a, { root: i.root, timezone: i.timezone, conn, assetNames: names });
+        out.push({
+          name: a.name, file: a.file, kind: "sql", ok: s.ok, inputs: [...s.astInputs], incremental: NONE,
+          ...(s.codeHash ? { codeHash: s.codeHash } : {}), problems: s.problems,
+        });
+      }
+    } finally {
+      memory.close();
+    }
+  }
+  const ts = assets.filter((a) => a.kind === "ts");
+  if (ts.length > 0) {
+    const { loadTsAsset } = await import("../project/ts-asset.ts");
+    for (const a of ts) {
+      const t = await loadTsAsset(a, { root: i.root, timezone: i.timezone });
+      const spec = t.ok ? t.spec : undefined;
+      const parsed = spec?.schedule !== undefined ? parseSchedule(spec.schedule) : null;
+      out.push({
+        name: a.name, file: a.file, kind: spec ? (spec.role === "transform" ? "ts" : "ingest") : sniff(a.path).kind, ok: t.ok,
+        inputs: spec?.role === "transform" ? [...spec.inputs] : [], incremental: spec?.incremental ?? NONE,
+        ...(parsed?.ok ? { schedule: parsed.schedule } : {}), ...(t.codeHash ? { codeHash: t.codeHash } : {}),
+        problems: t.problems, ts: { localFiles: t.localFiles, packages: t.packages },
+      });
+    }
+  }
+  return out;
 };
 
-/** An asset file found in assets/ (the naming rules' pattern; NAME_RESERVED is the resolver's to apply). */
+/** An asset file found in assets/ (the naming rules' pattern; NAME_RESERVED is discovery's to apply). */
 interface AssetFile { name: string; file: string; path: string; sql: boolean }
 
 const NAME = /^[a-z][a-z0-9_]*$/;
@@ -145,37 +246,37 @@ function listAssetFiles(root: string, assetsDir: string): AssetFile[] {
     if (!NAME.test(name)) continue;
     const path = join(assetsDir, rel);
     const list = byName.get(name) ?? [];
-    list.push({ name, file: relative(root, path).split(sep).join("/"), path, sql });
+    list.push({ name, file: relPath(root, path), path, sql });
     byName.set(name, list);
   }
   // Two files for one name (NAME_CONFLICT) define no asset.
   return [...byName.values()].filter((l) => l.length === 1).map((l) => l[0]!).sort((a, b) => (a.name < b.name ? -1 : 1));
 }
 
-/** Size and modification time of what every TS code hash depends on besides the file: lib/ and the packages. */
-function sharedStamp(root: string, libDir: string): string {
-  const parts: string[] = [];
-  const stamp = (path: string) => {
-    try {
-      const st = statSync(path);
-      if (st.isFile()) parts.push(`${relative(root, path)}:${st.size}:${st.mtimeMs}`);
-    } catch {
-      // Gone: its absence is the stamp.
+const relPath = (root: string, path: string) => relative(root, path).split(sep).join("/");
+
+/** The installed version of a package, as ts-asset.ts packageVersions finds it (walking up node_modules). */
+function installedVersion(name: string, from: string): string | null {
+  for (let cur = dirname(from); ; cur = dirname(cur)) {
+    const pkg = join(cur, "node_modules", name, "package.json");
+    if (existsSync(pkg)) {
+      try {
+        const v = (JSON.parse(readFileSync(pkg, "utf8")) as { version?: unknown }).version;
+        return typeof v === "string" ? v : null;
+      } catch {
+        return null;
+      }
     }
-  };
-  for (const f of ["package.json", "bun.lock", "bun.lockb"]) stamp(join(root, f));
-  if (existsSync(libDir)) {
-    let entries: string[] = [];
-    try {
-      entries = readdirSync(libDir, { recursive: true }) as string[];
-    } catch {}
-    for (const rel of entries.sort()) if (!rel.split(sep).some((p) => p === "node_modules" || p.startsWith("."))) stamp(join(libDir, rel));
+    if (dirname(cur) === cur) return null;
   }
-  return parts.join("\n");
 }
 
-/** The cache key of an asset's facts (see the top of this file). "" when the file cannot be read. */
-export function fileHash(path: string, timezone: string, shared: string | null): string {
+/**
+ * The cache key of an asset's facts (see the top of this file): the asset file's bytes and the time zone, and for a
+ * TS asset the size and modification time of every other file its bundle read and the installed versions of the
+ * packages it imports. "" when the file cannot be read.
+ */
+export function keyOf(root: string, path: string, timezone: string, deps: { files?: readonly string[]; packages?: Record<string, string | null> } | null): string {
   let bytes: Buffer;
   try {
     bytes = readFileSync(path);
@@ -183,81 +284,328 @@ export function fileHash(path: string, timezone: string, shared: string | null):
     return "";
   }
   const h = createHash("sha256").update(bytes).update("\0").update(timezone);
-  if (shared !== null) h.update("\0").update(shared);
+  if (deps) {
+    for (const rel of [...new Set(deps.files ?? [])].sort()) {
+      const abs = resolve(root, rel);
+      if (abs === path) continue;
+      let stamp = "gone";
+      try {
+        const st = statSync(abs);
+        stamp = `${st.size}:${st.mtimeMs}`;
+      } catch {
+        // Gone: its absence is the stamp.
+      }
+      h.update("\0").update(`${rel}:${stamp}`);
+    }
+    for (const name of Object.keys(deps.packages ?? {}).sort()) h.update("\0").update(`${name}@${installedVersion(name, path) ?? "-"}`);
+  }
   return h.digest("hex");
 }
 
-function factsOf(a: ResolvedAsset, hash: string): AssetFacts {
-  return {
-    asset: a.name, file: a.file, kind: a.kind, fileHash: hash, schedule: a.schedule ?? null, inputs: [...a.inputs],
-    codeHash: a.codeHash ?? null, incremental: a.incremental.kind === "new-rows", ok: a.ok,
-  };
+/** What an asset's text shows without running it: ingest( or transform( (as resolve.ts sniffKind reads it), and an
+ *  ingest's schedule when it is a plain string. */
+function sniff(path: string): { kind: "ingest" | "ts" | null; schedule: Schedule | null } {
+  let text = "";
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return { kind: null, schedule: null };
+  }
+  const t = /\btransform\s*\(/.test(text);
+  const i = /\bingest\s*\(/.test(text);
+  const kind = t && !i ? "ts" : i && !t ? "ingest" : null;
+  let schedule: Schedule | null = null;
+  const m = kind === "ingest" ? /\bschedule\s*:\s*(["'`])((?:\\.|(?!\1)[^\\\r\n])*)\1/.exec(text) : null;
+  if (m && !m[2]!.includes("${")) {
+    const parsed = parseSchedule(m[2]!);
+    if (parsed.ok) schedule = parsed.schedule;
+  }
+  return { kind, schedule };
+}
+
+/** A TS asset bundled, not run: its code hash, in any zone, and what the cache key covers. */
+interface Bundled {
+  /** The code hash in a zone; null when it does not bundle. */
+  hashIn: ((timezone: string) => string) | null;
+  files: string[];
+  packages: Record<string, string | null>;
+}
+
+/** Bundle a TS asset as its fingerprint does (project/ts-asset.ts), and list every file the bundle read. The code
+ *  hash in the project zone is tsFingerprint's, the one a run computes, so the tick and the runs it starts agree. */
+async function bundle(root: string, path: string, timezone: string): Promise<Bundled> {
+  const ts = await import("../project/ts-asset.ts");
+  const b = await ts.bundleTs(path);
+  const files = new Set<string>([relPath(root, path)]);
+  // Bun.build's own inputs (anything the bundle includes, wherever it is), and the import scan's (JSON and the
+  // other files it follows, also when the bundle fails).
+  for (const f of (b as { inputs?: string[] }).inputs ?? await bundleInputs(path)) files.add(relPath(root, f));
+  try {
+    for (const f of ts.scanImportGraph(path, root).files) files.add(relPath(root, f));
+  } catch {
+    // The bundle's inputs stand.
+  }
+  if (!b.ok) return { hashIn: null, files: [...files], packages: {} };
+  let current: string;
+  try {
+    current = await ts.tsFingerprint(path, { root, timezone });
+  } catch {
+    return { hashIn: null, files: [...files], packages: {} };
+  }
+  const packages = ts.packageVersions(b.imports, path);
+  const code = ts.normalizeBundle(b.code, path);
+  // In another zone (a time zone change): the same fingerprint of the same bundle.
+  return { hashIn: (z) => (z === timezone ? current : ts.fingerprintOf(code, packages, z)), files: [...files], packages };
+}
+
+/** The files a bundle of `path` reads (Bun.build's metafile inputs), absolute. */
+async function bundleInputs(path: string): Promise<string[]> {
+  try {
+    const config = { entrypoints: [path], packages: "external", target: "bun", format: "esm", throw: false, metafile: true };
+    const r = await Bun.build(config as unknown as Parameters<typeof Bun.build>[0]);
+    const inputs = (r as { metafile?: { inputs?: Record<string, unknown> } }).metafile?.inputs ?? {};
+    return Object.keys(inputs).map((k) => resolve(process.cwd(), k)).filter((f) => {
+      try {
+        return statSync(f).isFile();
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return [];
+  }
+}
+
+/** An SQL asset's code hash in another zone (it parses the file again), or null. */
+async function sqlHashIn(root: string, a: AssetFile, zones: readonly string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (zones.length === 0) return out;
+  try {
+    const [{ openMemory }, { loadSqlAsset }] = await Promise.all([import("../db/connect.ts"), import("../project/sql-asset.ts")]);
+    const memory = await openMemory({ timezone: zones[0]! });
+    try {
+      const conn = await memory.connect();
+      for (const z of zones) {
+        const s = await loadSqlAsset({ name: a.name, file: a.file, path: a.path }, { root, timezone: z, conn, assetNames: [] });
+        if (s.codeHash) out.set(z, s.codeHash);
+      }
+    } finally {
+      memory.close();
+    }
+  } catch {
+    // Nothing is claimed.
+  }
+  return out;
+}
+
+/** The zones the approved code may have been hashed in: the ones earlier facts were read in. */
+function zonesBefore(prev: AssetFacts | undefined, timezone: string): string[] {
+  return [...new Set([prev?.timeZoneChanged?.from, prev?.timezone].filter((z): z is string => typeof z === "string" && z !== timezone))];
 }
 
 interface FactsOutcome { facts: AssetFacts[]; imported: boolean; problems: Problem[] }
 
 /**
- * The facts of every asset, from the cache where its file hash is unchanged; the others are imported once
- * (`resolve`) and, with `store`, cached again. `resolved` (a caller that already resolved the project) replaces the
+ * The facts of every asset, from the cache where its key is unchanged (see the top of this file); the others are
+ * read again and, with `store`, cached again. `resolved` (a caller that already resolved the project) replaces the
  * import.
  */
 async function loadFacts(o: {
-  project: Project; runs: RunsDb | null; store: boolean; resolve: FactsResolver; resolved?: readonly ResolvedAsset[];
+  project: Project; runs: RunsDb | null; now: Date; store: boolean; resolve: FactsResolver; resolved?: readonly ImportedAsset[];
+  importUnapproved: boolean;
+  /** TS assets to bundle again whatever their key says: a run the tick started ended without starting them, which
+   *  a code hash the key failed to refresh would explain (the run found them held); never twice for one run. */
+  recheck: ReadonlySet<string>;
 }): Promise<FactsOutcome> {
-  const { project } = o;
-  const files = listAssetFiles(project.root, project.paths.assetsDir);
-  const shared = files.some((f) => !f.sql) ? sharedStamp(project.root, project.paths.libDir) : "";
-  const hashes = new Map(files.map((f) => [f.name, fileHash(f.path, project.timezone, f.sql ? null : shared)]));
+  const { project, now } = o;
+  const { root, timezone } = project;
+  const files = listAssetFiles(root, project.paths.assetsDir);
   const cached = o.runs?.getSetting<Record<string, AssetFacts>>(FACTS_SETTING) ?? {};
   const state = new Map((o.runs?.allScheduleState() ?? []).map((s) => [s.asset, s]));
-  const current = (name: string): AssetFacts | null => {
-    const f = Object.hasOwn(cached, name) ? cached[name] : undefined;
-    const hash = hashes.get(name);
-    return f && hash && f.fileHash === hash && state.get(name)?.fileHash === hash ? f : null;
-  };
+  const approvedOf = (name: string) => state.get(name)?.approvedCodeHash ?? null;
+  const previous = (name: string): AssetFacts | undefined => (Object.hasOwn(cached, name) ? cached[name] : undefined);
+  const resolvedBy = new Map((o.resolved ?? []).filter((a) => a.loaded !== false).map((a) => [a.name, a]));
+
   const out = new Map<string, AssetFacts>();
-  const changed: string[] = [];
-  for (const f of files) {
-    const c = current(f.name);
-    if (c) out.set(f.name, c);
-    else if (hashes.get(f.name)) changed.push(f.name);
-  }
+  const fresh: AssetFacts[] = [];
+  const set = (f: AssetFacts) => {
+    out.set(f.asset, f);
+    fresh.push(f);
+  };
   const problems: Problem[] = [];
   let imported = false;
-  const fresh: AssetFacts[] = [];
-  if (o.resolved) {
-    for (const a of o.resolved) if (a.loaded && hashes.get(a.name)) fresh.push(factsOf(a, hashes.get(a.name)!));
-  } else if (changed.length > 0) {
+
+  // 1. What is current, and what must be read again: TS assets to bundle, assets to import.
+  const toBundle: AssetFile[] = [];
+  const toImport = new Map<string, { file: AssetFile; key: string; bundled?: Bundled; deps?: Pick<AssetFacts, "files" | "packages"> }>();
+  for (const f of files) {
+    const prev = previous(f.name);
+    const approved = approvedOf(f.name);
+    const r = resolvedBy.get(f.name);
+    if (r) {
+      const deps = f.sql ? null : { files: r.ts?.localFiles ?? [f.file], packages: r.ts?.packages ?? {} };
+      out.set(f.name, factsOf(r, f, keyOf(root, f.path, timezone, deps), timezone, approved, deps));
+      continue;
+    }
+    const key = keyOf(root, f.path, timezone, f.sql ? null : { files: prev?.files ?? [f.file], packages: prev?.packages ?? {} });
+    if (!key) continue;
+    const current = prev && prev.fileHash === key && state.get(f.name)?.fileHash === key ? prev : undefined;
+    if (!current) {
+      if (f.sql) toImport.set(f.name, { file: f, key });
+      else toBundle.push(f);
+      continue;
+    }
+    if (f.sql || current.notAsset) {
+      out.set(f.name, current);
+      continue;
+    }
+    if (o.recheck.has(f.name)) {
+      toBundle.push(f);
+      continue;
+    }
+    const code = current.codeHash;
+    const approvedNow = code !== null && code === approved;
+    const job = { file: f, key, deps: { files: current.files ?? [f.file], packages: current.packages ?? {} } };
+    // An import that failed is tried again after LOAD_RETRY_MS, not before.
+    const failed = !current.ok && typeof current.failedAt === "string";
+    const retry = failed && now.getTime() >= Date.parse(current.failedAt!) + LOAD_RETRY_MS;
+    if (approvedNow && (failed ? retry : current.readFrom !== code)) {
+      // Run by hand since the facts were read (with no file change): its code may be imported now.
+      toImport.set(f.name, job);
+    } else if (o.importUnapproved && code !== null && current.readFrom !== code) {
+      toImport.set(f.name, job);
+    } else if (!approvedNow && (current.approved ?? null) !== approved) {
+      // Approved since, and still not this code: bundle it again, in case something the key does not cover moved.
+      toBundle.push(f);
+    } else {
+      out.set(f.name, current);
+    }
+  }
+
+  // Which files are assets at all (a name the naming rules refuse is not), asked only when something changed.
+  let valid: Set<string> | null = null;
+  const isAsset = async (name: string): Promise<boolean> => {
+    if (!valid) {
+      try {
+        const { discoverAssets } = await import("../project/discover.ts");
+        valid = new Set((await discoverAssets(root, { assetsDir: project.paths.assetsDir })).assets.map((a) => a.name));
+      } catch {
+        valid = new Set(files.map((f) => f.name));
+      }
+    }
+    return valid.has(name);
+  };
+  const notAsset = (f: AssetFile, key: string): AssetFacts => ({
+    asset: f.name, file: f.file, kind: null, fileHash: key, schedule: null, inputs: [], codeHash: null, incremental: false, ok: false, timezone, readFrom: null,
+    notAsset: true,
+  });
+
+  // 2. TS assets whose key changed: bundled, never run. Approved code is imported; other code keeps the facts it had.
+  for (const f of toBundle) {
+    const prev = previous(f.name);
+    const approved = approvedOf(f.name);
+    if (!(await isAsset(f.name))) {
+      set(notAsset(f, keyOf(root, f.path, timezone, null)));
+      continue;
+    }
+    const b = await bundle(root, f.path, timezone);
+    const key = keyOf(root, f.path, timezone, { files: b.files, packages: b.packages });
+    const code = b.hashIn ? b.hashIn(timezone) : null;
+    const base = { files: b.files, packages: b.packages, fileHash: key, codeHash: code, approved, timezone };
+    if (code !== null && prev?.readFrom === code && prev.kind !== null && (prev.ok || !prev.failedAt || now.getTime() < Date.parse(prev.failedAt) + LOAD_RETRY_MS)) {
+      // The same code as the facts were read from (a comment edited, say): nothing to import.
+      const { timeZoneChanged: _was, ...same } = prev;
+      set({ ...same, ...base, ...tzShift(b, prev, timezone, approved, code) });
+    } else if (code !== null && (code === approved || o.importUnapproved)) {
+      toImport.set(f.name, { file: f, key, bundled: b, deps: { files: b.files, packages: b.packages } });
+    } else {
+      set({ ...carried(prev, f), ...base, ok: code !== null, ...tzShift(b, prev, timezone, approved, code) });
+    }
+  }
+
+  // 3. The imports.
+  if (toImport.size > 0) {
+    const names = [...toImport.keys()];
+    const wanted: string[] = [];
+    for (const n of names) {
+      if (await isAsset(n)) wanted.push(n);
+      else set(notAsset(toImport.get(n)!.file, toImport.get(n)!.key));
+    }
+    let got: ImportedAsset[] = [];
     try {
-      const got = await o.resolve({ root: project.root, timezone: project.timezone, names: changed });
+      got = wanted.length ? await o.resolve({ root, timezone, names: wanted }) : [];
       imported = got.length > 0;
-      for (const a of got) {
-        const hash = hashes.get(a.name);
-        if (hash) fresh.push(factsOf(a, hash));
-      }
-      // A file that is no asset after all (a name the naming rules refuse) is remembered as such, so it is not
-      // looked at again until it changes.
-      for (const name of changed) {
-        if (fresh.some((f) => f.asset === name)) continue;
-        const file = files.find((f) => f.name === name)!;
-        fresh.push({ asset: name, file: file.file, kind: null, fileHash: hashes.get(name)!, schedule: null, inputs: [], codeHash: null, incremental: false, ok: false });
-      }
     } catch (e) {
       const p = (e as { problem?: Problem }).problem;
       problems.push({
         ...(p ?? problem("INTERNAL_ERROR", { message: String((e as Error)?.message ?? e), hint: "report this croft bug" })),
         severity: "warning",
-        message: `the scheduler could not read ${changed.join(", ")}: ${p?.message ?? String((e as Error)?.message ?? e)}`,
+        message: `the scheduler could not read ${wanted.join(", ")}: ${p?.message ?? String((e as Error)?.message ?? e)}`,
         effect: "those assets are not scheduled until they load again",
       });
+      got = [];
+      for (const n of wanted) toImport.delete(n);
+    }
+    const byName = new Map(got.map((a) => [a.name, a]));
+    for (const n of wanted) {
+      const job = toImport.get(n);
+      if (!job) continue;
+      const f = job.file;
+      const a = byName.get(n);
+      const prev = previous(n);
+      const approved = approvedOf(n);
+      if (!a) {
+        // A file that is no asset after all is remembered as such, so it is not looked at again until it changes.
+        set(notAsset(f, job.key));
+        continue;
+      }
+      // What the key covers: the bundle's inputs (the import scan's files too), and the packages it imports.
+      const deps = f.sql ? null : {
+        files: [...new Set([...(job.deps?.files ?? [f.file]), ...(a.ts?.localFiles ?? [])])], packages: job.deps?.packages ?? a.ts?.packages ?? {},
+      };
+      const key = f.sql ? job.key : keyOf(root, f.path, timezone, deps);
+      let facts = factsOf(a, f, key, timezone, approved, deps);
+      const code = a.codeHash ?? job.bundled?.hashIn?.(timezone) ?? null;
+      if (!f.sql && !a.ok && approved !== null && code === approved) {
+        // Approved code that did not import this time (network code at module scope, a package half installed, a
+        // timeout): the facts it had stand, and it is imported again after LOAD_RETRY_MS.
+        const failure = a.problems.find((p) => p.severity === "error") ?? a.problems[0];
+        facts = {
+          ...carried(prev, f), ...(deps ?? {}), fileHash: key, codeHash: code, ok: false, timezone, approved,
+          failedAt: now.toISOString(), ...(failure ? { failure } : {}),
+        };
+        const retry = clockWords(new Date(now.getTime() + LOAD_RETRY_MS), timezone, now);
+        problems.push({
+          ...(failure ?? problem("ASSET_INVALID", { message: `${f.file} did not load`, hint: `croft validate ${n} shows why` })),
+          severity: "warning", asset: n,
+          message: `the scheduler could not load ${n}: ${failure?.message ?? "it did not load"}`,
+          effect: `the scheduler keeps what it knew of ${n} and tries again after ${retry}`,
+        });
+      } else if (facts.codeHash !== approved && !facts.timeZoneChanged) {
+        if (prev?.timeZoneChanged && prev.codeHash === facts.codeHash && (prev.approved ?? null) === approved) {
+          // The same code and the same approval as when it was found.
+          facts = { ...facts, timeZoneChanged: prev.timeZoneChanged };
+        } else {
+          const zones = zonesBefore(prev, timezone);
+          const hashIn = zones.length === 0 ? null : f.sql
+            ? await (async () => {
+                const m = await sqlHashIn(root, f, zones);
+                return (z: string) => m.get(z) ?? "";
+              })()
+            : (job.bundled ?? await bundle(root, f.path, timezone)).hashIn;
+          facts = { ...facts, ...tzShift({ hashIn }, prev, timezone, approved, facts.codeHash) };
+        }
+      }
+      set(facts);
     }
   }
+
+  // A file that no longer loads keeps the schedule it had, so it stays scheduled, and held (its code changed).
   for (const f of fresh) {
-    // A file that no longer loads keeps the schedule it had, so it stays scheduled, and held (its code changed).
     const prev = state.get(f.asset);
     if (!f.ok && !f.schedule && prev?.cron) f.schedule = { text: prev.phrase ?? prev.cron, cron: prev.cron };
-    out.set(f.asset, f);
   }
+
   if (o.store && o.runs && fresh.length > 0) {
     const runs = o.runs;
     const keep: Record<string, AssetFacts> = {};
@@ -272,6 +620,36 @@ async function loadFacts(o: {
     });
   }
   return { facts: [...out.values()].sort((a, b) => (a.asset < b.asset ? -1 : 1)), imported, problems };
+}
+
+/** The facts an import gave. */
+function factsOf(a: ImportedAsset, f: AssetFile, key: string, timezone: string, approved: string | null,
+  deps: { files: string[]; packages: Record<string, string | null> } | null): AssetFacts {
+  const code = a.codeHash ?? null;
+  return {
+    asset: a.name, file: f.file, kind: a.kind, fileHash: key, schedule: a.schedule ?? null, inputs: [...a.inputs], codeHash: code,
+    incremental: a.incremental.kind === "new-rows", ok: a.ok, timezone, ...(deps ?? {}), readFrom: code, approved,
+    ...(a.timeZoneChanged && code !== approved ? { timeZoneChanged: a.timeZoneChanged } : {}),
+  };
+}
+
+/** What the scheduler keeps of an asset whose current code it does not import: the facts of the code it last
+ *  imported, or, with none, what the file's text shows. */
+function carried(prev: AssetFacts | undefined, f: AssetFile): Pick<AssetFacts, "asset" | "file" | "kind" | "schedule" | "inputs" | "incremental" | "readFrom"> {
+  if (prev && prev.kind !== null && prev.readFrom) {
+    return { asset: f.name, file: f.file, kind: prev.kind, schedule: prev.schedule, inputs: [...prev.inputs], incremental: prev.incremental, readFrom: prev.readFrom };
+  }
+  const s = sniff(f.path);
+  return { asset: f.name, file: f.file, kind: s.kind, schedule: s.schedule, inputs: prev?.inputs ?? [], incremental: false, readFrom: null };
+}
+
+/** timeZoneChanged when the code, hashed in a zone the approved code may have been hashed in, is the approved
+ *  code (resolve.ts does the same against the built hash). */
+function tzShift(b: { hashIn: ((timezone: string) => string) | null }, prev: AssetFacts | undefined, timezone: string, approved: string | null,
+  code: string | null): { timeZoneChanged?: { from: string; to: string } } {
+  if (!b.hashIn || code === null || approved === null || code === approved) return {};
+  const from = zonesBefore(prev, timezone).find((z) => b.hashIn!(z) === approved);
+  return from ? { timeZoneChanged: { from, to: timezone } } : {};
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -309,8 +687,10 @@ export interface DueInput {
   now: Date;
   /** Write refreshed facts to runs.sqlite (the tick). */
   store: boolean;
+  /** Import code nobody has run by hand (a person asked: status, `schedule status`). Never in the tick. */
+  importUnapproved?: boolean;
   resolve?: FactsResolver;
-  resolved?: readonly ResolvedAsset[];
+  resolved?: readonly ImportedAsset[];
   fires?: FireTimes;
   /** Whether a recorded process still runs (core/proc.ts recordAlive). */
   alive?: Alive;
@@ -323,21 +703,50 @@ export interface HeldAsset { asset: string; code: HoldCode; reason: string }
 export interface DueWork {
   views: AssetScheduleView[];
   /** The due assets nothing holds, one group per run to start: the ingests that fired and the stale transforms, in
-   *  groups the graph connects (through what reads them), so two runs never want the same downstream asset. */
+   *  groups the graph connects (through anything that reads or is read, shared inputs included), so N stale
+   *  readers of one input are one run, and two runs never want the same asset. */
   groups: string[][];
   /** The fire each due ingest handles (ISO-8601 UTC): its last_fire_at once its run starts. */
   fires: Map<string, string>;
   /** Due assets the scheduler skips, and why. */
   held: HeldAsset[];
-  /** Whether asset code was imported to refresh the facts. */
+  /** Whether asset files were read (imported or parsed) to refresh the facts. */
   imported: boolean;
-  /** Runs earlier ticks started that are still starting or running: [{runId, assets}]. */
+  /** Runs earlier ticks started that are still starting or running. */
   inFlight: SpawnedRun[];
+  /** Runs earlier ticks started that ended before they started some of their assets, abnormally, and are waited
+   *  out (RETRY_BACKOFF_MS): the ones found just now (`fresh`) and the ones still waited out. */
+  failedStarts: FailedStart[];
+  /** Fires the runs that ended did not attempt: last_fire_at goes back to `to`, so the fire stays due. */
+  rollbacks: { asset: string; from: string; to: string | null }[];
   problems: Problem[];
 }
 
 /** A run a tick started (the settings row SPAWNED_SETTING). */
-export interface SpawnedRun { runId: string; assets: string[] }
+export interface SpawnedRun {
+  runId: string;
+  assets: string[];
+  /** When the tick started it (ISO-8601 UTC). */
+  at?: string;
+  /** The fire each due ingest of it handles, and the last_fire_at it replaced. */
+  fires?: Record<string, { fire: string; before: string | null }>;
+}
+
+/** A run a tick started that ended before it started `assets` (the settings row FAILED_STARTS_SETTING). */
+export interface FailedStart {
+  runId: string;
+  assets: string[];
+  /** When it was started (the backoff runs from here). */
+  at: string;
+  /** Why, in words: "its process ended before it recorded the run". */
+  reason: string;
+  /** Its child never recorded the run (nothing else reports it: the tick notifies). */
+  unrecorded: boolean;
+  /** The child's own refusal, when it left one. */
+  problem?: Problem;
+  /** Found by this look (not yet reported). */
+  fresh?: boolean;
+}
 
 /** What runs.sqlite says about one asset's history, read once per asset. */
 interface History {
@@ -407,20 +816,31 @@ export function clockWords(at: Date, timezone: string, now: Date): string {
   return p.year === n.year && p.month === n.month && p.day === n.day ? clock : `${MONTHS[p.month - 1]} ${p.day} ${clock}`;
 }
 
-/** SCHEDULE_HELD (§6): the asset's code is not the code a human last ran. The reason is what status shows. */
-export function scheduleHeld(o: { asset: string; file: string; approved: string | null; editedAt: number | null; loads: boolean; now: Date }): { reason: string; problem: Problem } {
+/** SCHEDULE_HELD (§6): the asset's code is not the code a human last ran. The reason is what status shows. A hash
+ *  that moved only with croft.json's timezone is said as such (§8), not as an edit. */
+export function scheduleHeld(o: {
+  asset: string; file: string; approved: string | null; editedAt: number | null; loads: boolean; now: Date;
+  timeZoneChanged?: { from: string; to: string } | null;
+}): { reason: string; problem: Problem } {
   const run = `croft run ${o.asset}`;
+  const zone = o.approved !== null && o.loads && o.timeZoneChanged ? o.timeZoneChanged : null;
   const edited = `${o.approved === null ? "new: " : ""}code edited${o.editedAt !== null ? ` ${ago(o.editedAt, o.now)} ago` : ""}`;
-  const reason = o.loads
-    ? `${edited}, not run by hand yet; ${run} releases it`
-    : `${edited} and it does not load; fix it, then ${run} releases it`;
+  const reason = zone
+    ? `the project time zone changed (${zone.from} → ${zone.to}) since it was last run by hand; ${run} releases it`
+    : o.loads
+      ? `${edited}, not run by hand yet; ${run} releases it`
+      : `${edited} and it does not load; fix it, then ${run} releases it`;
   const p = problem("SCHEDULE_HELD", {
     asset: o.asset, file: o.file,
-    message: `${o.asset} is held from the scheduler: ${o.approved === null ? "it has never been run by hand" : "its code changed since it was last run by hand"}`,
+    message: `${o.asset} is held from the scheduler: ${o.approved === null ? "it has never been run by hand"
+      : zone ? `the project time zone changed (${zone.from} → ${zone.to}) since it was last run by hand` : "its code changed since it was last run by hand"}`,
     hint: `the scheduler only runs code a person has run; check the change, then ${run} (a run from a terminal or Claude Code) releases it`,
     effect: "scheduled runs skip it, and it stays due",
     fix: { kind: "command", description: `run ${o.asset} by hand once`, command: run },
-    details: { approvedCodeHash: o.approved, ...(o.editedAt !== null ? { editedAt: new Date(o.editedAt).toISOString() } : {}) },
+    details: {
+      approvedCodeHash: o.approved,
+      ...(zone ? { timeZoneChanged: zone } : o.editedAt !== null ? { editedAt: new Date(o.editedAt).toISOString() } : {}),
+    },
   });
   // A hold is the scheduler's news, not a failure of the run that skips the asset.
   return { reason, problem: { ...p, severity: "warning" } };
@@ -453,7 +873,15 @@ export async function dueWork(i: DueInput): Promise<DueWork> {
   const tz = project.timezone;
   const fires = i.fires ?? defaultFires;
   const alive = i.alive ?? recordAlive;
-  const loaded = await loadFacts({ project, runs, store: i.store, resolve: i.resolve ?? resolveAssets, ...(i.resolved ? { resolved: i.resolved } : {}) });
+  // Runs earlier ticks started: those still starting or running, and how the others ended (the fires they did not
+  // attempt go back; the ones that failed to start their assets are waited out; what they did not start is looked at
+  // again).
+  const spawned = runs ? endedRuns(runs, project.paths.stateDir, alive, now) : { inFlight: [], rollbacks: [], failed: [], unstarted: [] };
+  const loaded = await loadFacts({
+    project, runs, now, store: i.store, resolve: i.resolve ?? resolveAssets, importUnapproved: i.importUnapproved ?? false,
+    recheck: new Set(spawned.unstarted), ...(i.resolved ? { resolved: i.resolved } : {}),
+  });
+  const problems = [...loaded.problems];
   const facts = loaded.facts.filter((f) => f.kind !== null);
   const byName = new Map(facts.map((f) => [f.asset, f]));
   const byLower = new Map(facts.map((f) => [f.asset.toLowerCase(), f.asset]));
@@ -473,7 +901,7 @@ export async function dueWork(i: DueInput): Promise<DueWork> {
     return seen;
   };
 
-  // Leases held by live runs, and runs earlier ticks started that may not hold theirs yet.
+  // Leases held by live runs.
   const leased = new Map<string, string>();
   if (runs) {
     for (const l of runs.sqlite.query("SELECT asset, run_id, pid, proc_start, boot_id FROM leases").all() as
@@ -481,19 +909,51 @@ export async function dueWork(i: DueInput): Promise<DueWork> {
       if (alive({ pid: l.pid, procStart: l.proc_start, bootId: l.boot_id })) leased.set(l.asset, l.run_id);
     }
   }
-  const inFlight = runs ? startingRuns(runs, project.paths.stateDir, alive) : [];
+  const inFlight = spawned.inFlight;
   const starting = new Map<string, string>();
   for (const s of inFlight) for (const a of [...s.assets, ...downstream(s.assets)]) if (!starting.has(a)) starting.set(a, s.runId);
+  const rolledBack = new Map(spawned.rollbacks.map((r) => [r.asset, r.to]));
+  const expired = (s: FailedStart) => now.getTime() >= Date.parse(s.at) + RETRY_BACKOFF_MS;
+  const failedStarts = [
+    ...(runs?.getSetting<FailedStart[]>(FAILED_STARTS_SETTING) ?? []).filter((s) => s && typeof s.at === "string" && Array.isArray(s.assets) && !expired(s))
+      .map((s) => ({ ...s, fresh: false })),
+    ...spawned.failed.map((s) => ({ ...s, fresh: true })),
+  ];
+  for (const s of spawned.failed) {
+    const retry = expired(s) ? "it runs again when it is next due" : `it runs again after ${clockWords(new Date(Date.parse(s.at) + RETRY_BACKOFF_MS), tz, now)}`;
+    problems.push({
+      ...problem("RUN_CRASHED", {
+        message: `the scheduled run ${s.runId} did not start ${s.assets.join(", ")}: ${s.reason}`,
+        hint: s.problem?.hint ?? `croft logs --runs shows the scheduled runs; ${s.unrecorded ? `.croft/logs/${s.runId}/process.log has what it printed` : `croft logs ${s.assets[0]} shows its last run`}`,
+        effect: `${s.assets.length === 1 ? "it stays" : "they stay"} due; ${retry}`,
+        details: { runId: s.runId, assets: s.assets },
+      }),
+      severity: "warning",
+    });
+  }
+  const failedStartOf = (asset: string, lastOk: string | null): FailedStart | null => {
+    let found: FailedStart | null = null;
+    for (const s of failedStarts) {
+      if (!s.assets.includes(asset) || expired(s)) continue;
+      // A successful run since (by hand, say) ends the wait.
+      if (lastOk !== null && Date.parse(lastOk) > Date.parse(s.at)) continue;
+      if (!found || s.at > found.at) found = s;
+    }
+    return found;
+  };
 
   const views: AssetScheduleView[] = [];
+  const histories = new Map<string, History>();
   const due = new Map<string, string>();          // primary due assets → why
   const fired = new Map<string, string>();
   const holds = new Map<string, { code: HoldCode; reason: string }>();
   for (const f of facts) {
     const h = historyOf(runs, f.asset);
+    histories.set(f.asset, h);
+    const lastFireAt = rolledBack.has(f.asset) ? rolledBack.get(f.asset)! : h.state?.lastFireAt ?? null;
     const view: AssetScheduleView = {
       asset: f.asset, kind: f.kind!, schedule: f.kind === "ingest" ? f.schedule : null, nextFireAt: null,
-      lastFireAt: h.state?.lastFireAt ?? null, lastAttemptAt: h.state?.lastAttemptAt ?? null, due: false, dueReason: null, held: null,
+      lastFireAt, lastAttemptAt: h.state?.lastAttemptAt ?? null, due: false, dueReason: null, held: null,
     };
     views.push(view);
     const transform = f.kind === "sql" || f.kind === "ts";
@@ -505,7 +965,7 @@ export async function dueWork(i: DueInput): Promise<DueWork> {
         const next = fires.next(cron, tz, now);
         view.nextFireAt = next ? isoOf(next) : null;
         const latest = fires.latest(cron, tz, now);
-        const handled = later(h.state?.lastFireAt ?? null, h.lastOk);
+        const handled = later(lastFireAt, h.lastOk);
         if (latest && (handled === null || isoOf(latest) > handled)) {
           const missed = handled === null ? 1 : missedFires(fires, cron, tz, new Date(handled), now);
           const when = `fired at ${clockWords(latest, tz, now)}`;
@@ -534,10 +994,49 @@ export async function dueWork(i: DueInput): Promise<DueWork> {
 
     const hold = holdOf(f, h, {
       project, now, scheduling, approved: h.state?.approvedCodeHash ?? null, leasedBy: leased.get(f.asset) ?? null,
-      startingRun: starting.get(f.asset) ?? null, primaryDue: due.has(f.asset), inputs: transform ? inputsOf(f) : [], entry,
+      startingRun: starting.get(f.asset) ?? null, failedStart: failedStartOf(f.asset, h.lastOk), primaryDue: due.has(f.asset),
+      inputs: transform ? inputsOf(f) : [], entry,
     });
     if (hold) holds.set(f.asset, hold);
     view.held = hold;
+  }
+
+  // A stale transform whose last step was skipped for an input that is still held, and unchanged since, waits for
+  // that input (holds are looked at inputs first: an input may itself wait for its own).
+  const waits = new Map<string, { code: HoldCode; reason: string } | null>();
+  const effective = (name: string, seen: Set<string>): { code: HoldCode; reason: string } | null => holds.get(name) ?? waitFor(name, seen);
+  const waitFor = (name: string, seen: Set<string>): { code: HoldCode; reason: string } | null => {
+    if (waits.has(name)) return waits.get(name)!;
+    if (seen.has(name)) return null;
+    seen.add(name);
+    const f = byName.get(name);
+    const h = histories.get(name);
+    let result: { code: HoldCode; reason: string } | null = null;
+    const s = h?.latest;
+    if (f && (f.kind === "sql" || f.kind === "ts") && due.has(name) && s && s.status === "skipped" && s.attempt === 0) {
+      const named = blockerOf(runs, s.runId, name);
+      const candidates = named !== null && byName.has(named) ? [named] : inputsOf(f);
+      const since = Date.parse(s.startedAt);
+      const newer = (t: string | null | undefined) => typeof t === "string" && Date.parse(t) > since;
+      for (const x of candidates) {
+        const hx = effective(x, seen);
+        if (!hx || hx.code === "paused") continue;
+        const e = entry(x);
+        if (newer(e?.lastLoadedAt) || newer(e?.lastReplacedAt)) continue;   // it changed since: try again
+        result = { code: "backoff", reason: `waits for its input ${x}: ${hx.code === "backoff" ? "" : `${hx.code}, `}${hx.reason}` };
+        break;
+      }
+    }
+    waits.set(name, result);
+    return result;
+  };
+  for (const v of views) {
+    if (holds.has(v.asset)) continue;
+    const w = waitFor(v.asset, new Set());
+    if (w) {
+      holds.set(v.asset, w);
+      v.held = w;
+    }
   }
 
   // What follows a due ingest the scheduler starts: its downstream runs in the same run.
@@ -558,10 +1057,22 @@ export async function dueWork(i: DueInput): Promise<DueWork> {
   const held: HeldAsset[] = views.filter((v) => v.due && v.held).map((v) => ({ asset: v.asset, code: v.held!.code, reason: v.held!.reason }));
   const ready = [...due.keys()].filter((a) => !holds.has(a)).sort();
   return {
-    views, groups: groupsOf(ready, facts, inputsOf, downstream),
+    views, groups: groupsOf(ready, facts, inputsOf),
     fires: new Map(ready.filter((a) => fired.has(a)).map((a) => [a, fired.get(a)!])),
-    held, imported: loaded.imported, inFlight, problems: loaded.problems,
+    held, imported: loaded.imported, inFlight, failedStarts, rollbacks: spawned.rollbacks, problems,
   };
+}
+
+/** The input a skipped step named as the reason (the run's stored summary: "input x is held …"), or null. */
+function blockerOf(runs: RunsDb | null, runId: string, asset: string): string | null {
+  try {
+    const summary = runs?.getRun(runId)?.summary as { data?: { steps?: { asset?: unknown; skippedBecause?: unknown }[] } } | null | undefined;
+    const step = summary?.data?.steps?.find((s) => s.asset === asset);
+    const m = typeof step?.skippedBecause === "string" ? /^input ([A-Za-z0-9_]+) /.exec(step.skippedBecause) : null;
+    return m ? m[1]! : null;
+  } catch {
+    return null;
+  }
 }
 
 interface HoldContext {
@@ -571,21 +1082,25 @@ interface HoldContext {
   approved: string | null;
   leasedBy: string | null;
   startingRun: string | null;
+  failedStart: FailedStart | null;
   /** Due on its own (a fire, or stale): only then can a failure hold it back. */
   primaryDue: boolean;
   inputs: string[];
   entry: (name: string) => CatalogAsset | null;
 }
 
-/** The first hold that applies (see the top of this file), or null. */
+/** The first hold that applies (see the top of this file), or null. Waiting for an input comes after (dueWork). */
 function holdOf(f: AssetFacts, h: History, c: HoldContext): { code: HoldCode; reason: string } | null {
   if (c.scheduling.state === "paused") {
     const until = c.scheduling.pausedUntil ? ` until ${clockWords(new Date(c.scheduling.pausedUntil), c.project.timezone, c.now)}` : "";
-    return { code: "paused", reason: `scheduling is paused${until}; croft schedule on resumes it` };
+    // A project ticked by croft serve only resumes with --no-os-job, so following the hint never installs the OS job (R32-10).
+    const resume = c.scheduling.via === "serve" ? "croft schedule on --no-os-job" : "croft schedule on";
+    return { code: "paused", reason: `scheduling is paused${until}; ${resume} resumes it` };
   }
   if (f.codeHash === null || f.codeHash !== c.approved) {
     return { code: "SCHEDULE_HELD", reason: scheduleHeld({
       asset: f.asset, file: f.file, approved: c.approved, editedAt: editedAt(c.project.root, f.file), loads: f.ok && f.codeHash !== null, now: c.now,
+      timeZoneChanged: f.timeZoneChanged ?? null,
     }).reason };
   }
   if (h.reprocess) {
@@ -593,6 +1108,10 @@ function holdOf(f: AssetFacts, h: History, c: HoldContext): { code: HoldCode; re
   }
   if (c.leasedBy) return { code: "leased", reason: `run ${c.leasedBy} holds it; it stays due` };
   if (c.startingRun) return { code: "leased", reason: `the scheduled run ${c.startingRun} is starting; it stays due` };
+  if (c.failedStart && (c.primaryDue || f.kind !== "ingest")) {
+    const until = clockWords(new Date(Date.parse(c.failedStart.at) + RETRY_BACKOFF_MS), c.project.timezone, c.now);
+    return { code: "backoff", reason: `the scheduled run ${c.failedStart.runId} did not start it (${c.failedStart.reason}); tries again after ${until}` };
+  }
   if (!c.primaryDue || f.kind === "ingest") return null;
   return backoff(f, h, c);
 }
@@ -618,38 +1137,93 @@ function backoff(f: AssetFacts, h: History, c: HoldContext): { code: HoldCode; r
   return { code: "backoff", reason: `${s.status === "failed" ? "failed" : s.status} at ${at} (${code}); tries again after ${clockWords(new Date(until), c.project.timezone, c.now)}` };
 }
 
-/** Group the ready assets: two share a group when the graph connects them through assets a run of either takes
- *  (they and their downstream). */
-function groupsOf(ready: readonly string[], facts: readonly AssetFacts[], inputsOf: (f: AssetFacts) => string[],
-  downstream: (names: Iterable<string>) => Set<string>): string[][] {
-  const closure = new Set([...ready, ...downstream(ready)]);
-  const parent = new Map([...closure].map((n) => [n, n]));
+/** Group the ready assets: two share a group when the graph connects them at all, through what reads them or what
+ *  they read (a shared input included). Every run waits for the one database writer anyway, so N stale readers of
+ *  one input become one process, not N. */
+function groupsOf(ready: readonly string[], facts: readonly AssetFacts[], inputsOf: (f: AssetFacts) => string[]): string[][] {
+  const parent = new Map<string, string>();
   const find = (n: string): string => {
     let r = n;
-    while (parent.get(r) !== r) r = parent.get(r)!;
+    while (parent.has(r) && parent.get(r) !== r) r = parent.get(r)!;
     parent.set(n, r);
     return r;
   };
-  for (const f of facts) {
-    if (!closure.has(f.asset)) continue;
-    for (const x of inputsOf(f)) if (closure.has(x)) parent.set(find(f.asset), find(x));
-  }
+  for (const f of facts) for (const x of inputsOf(f)) parent.set(find(f.asset), find(x));
   const groups = new Map<string, string[]>();
   for (const a of ready) groups.set(find(a), [...(groups.get(find(a)) ?? []), a]);
   return [...groups.values()].map((g) => g.sort()).sort((a, b) => (a[0]! < b[0]! ? -1 : 1));
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// Runs ticks started
+
 /** The runs earlier ticks started that are still starting or running (their process alive, their run not ended). */
-export function startingRuns(runs: RunsDb, stateDir: string, alive: Alive = recordAlive): SpawnedRun[] {
+export function startingRuns(runs: RunsDb, stateDir: string, alive: Alive = recordAlive, now: Date = new Date()): SpawnedRun[] {
+  return endedRuns(runs, stateDir, alive, now).inFlight;
+}
+
+/**
+ * The runs earlier ticks started (SPAWNED_SETTING): the ones still starting or running, and for the others, the
+ * fires they did not attempt (last_fire_at goes back, when nothing moved it since) and whether they failed to start
+ * assets: the child died or refused before it recorded the run, or the run crashed or was interrupted before it
+ * started them. A run that ended normally without starting an asset skipped it for a reason the scheduler sees
+ * too (another run's lease, a hold): its fire stays due, with no wait.
+ */
+function endedRuns(runs: RunsDb, stateDir: string, alive: Alive, now: Date): {
+  inFlight: SpawnedRun[]; rollbacks: { asset: string; from: string; to: string | null }[]; failed: FailedStart[];
+  /** The assets the ended runs did not start. */
+  unstarted: string[];
+} {
   const list = runs.getSetting<SpawnedRun[]>(SPAWNED_SETTING);
-  if (!Array.isArray(list)) return [];
-  return list.filter((s) => {
-    if (!s || typeof s.runId !== "string" || !Array.isArray(s.assets)) return false;
+  const inFlight: SpawnedRun[] = [];
+  const rollbacks: { asset: string; from: string; to: string | null }[] = [];
+  const failed: FailedStart[] = [];
+  const all: string[] = [];
+  if (!Array.isArray(list)) return { inFlight, rollbacks, failed, unstarted: all };
+  const attempted = (runId: string, asset: string) =>
+    runs.sqlite.query("SELECT 1 FROM steps WHERE run_id = ? AND asset = ? AND attempt >= 1 LIMIT 1").get(runId, asset) !== null;
+  for (const s of list) {
+    if (!s || typeof s.runId !== "string" || !Array.isArray(s.assets)) continue;
     const run = runs.getRun(s.runId);
-    if (run) return run.status === "running" && alive(run);
-    const child = readSpawnRecord(stateDir, s.runId);
-    return child !== null && alive(child);
-  });
+    let unstarted: string[];
+    let why: { reason: string; unrecorded: boolean; problem?: Problem } | null = null;
+    if (run) {
+      if (run.status === "running" && alive(run)) {
+        inFlight.push(s);
+        continue;
+      }
+      unstarted = s.assets.filter((a) => !attempted(s.runId, a));
+      if (run.status === "crashed" || run.status === "interrupted" || run.status === "running") {
+        why = { reason: `the run ${run.status === "interrupted" ? "was interrupted" : "crashed"} before it started ${unstarted.length === 1 ? "it" : "them"}`, unrecorded: false };
+      }
+    } else {
+      const refused = readNotStarted(stateDir, s.runId);
+      const child = readSpawnRecord(stateDir, s.runId);
+      if (!refused && child !== null && alive(child)) {
+        inFlight.push(s);
+        continue;
+      }
+      if (!refused && child === null && typeof s.at === "string" && Math.abs(now.getTime() - Date.parse(s.at)) < SPAWN_GRACE_MS) {
+        inFlight.push(s);
+        continue;
+      }
+      unstarted = [...s.assets];
+      why = refused
+        ? { reason: `it refused to start: ${refused.code}: ${refused.message}`, unrecorded: true, problem: refused }
+        : { reason: "its process ended before it recorded the run", unrecorded: true };
+    }
+    all.push(...unstarted);
+    for (const a of unstarted) {
+      const f = s.fires?.[a];
+      if (!f) continue;
+      // Not handled: the fire stays due (unless a later fire moved last_fire_at since).
+      if (runs.scheduleState(a)?.lastFireAt === f.fire) rollbacks.push({ asset: a, from: f.fire, to: f.before ?? null });
+    }
+    if (why && unstarted.length > 0) {
+      failed.push({ runId: s.runId, assets: unstarted, at: typeof s.at === "string" ? s.at : run?.startedAt ?? now.toISOString(), ...why });
+    }
+  }
+  return { inFlight, rollbacks, failed, unstarted: all };
 }
 
 /** The spawn handshake of a detached run (run/detach.ts _process.json), read without importing the run engine. */
@@ -658,6 +1232,16 @@ function readSpawnRecord(stateDir: string, runId: string): { pid: number; procSt
     const r = JSON.parse(readFileSync(join(stateDir, "logs", runId, "_process.json"), "utf8")) as { pid?: unknown; procStart?: unknown; bootId?: unknown };
     if (typeof r.pid !== "number" || typeof r.procStart !== "string") return null;
     return { pid: r.pid, procStart: r.procStart, bootId: typeof r.bootId === "string" ? r.bootId : "" };
+  } catch {
+    return null;
+  }
+}
+
+/** The refusal a detached child left before it recorded its run (run/detach.ts _not_started.json), or null. */
+function readNotStarted(stateDir: string, runId: string): Problem | null {
+  try {
+    const p = JSON.parse(readFileSync(join(stateDir, "logs", runId, "_not_started.json"), "utf8")) as Problem;
+    return p && typeof p.code === "string" && typeof p.message === "string" ? p : null;
   } catch {
     return null;
   }
@@ -674,6 +1258,7 @@ export function duePlanning(o: { project: Project; runs: RunsDb; now: Date; fire
   const alive = o.alive ?? recordAlive;
   const times = o.times ?? defaultFires;
   const scheduling = runs.getScheduling();
+  const facts = runs.getSetting<Record<string, AssetFacts>>(FACTS_SETTING) ?? {};
   return {
     hold(step: { asset: string; file: string; kind: StepKind; codeHash?: string; ok: boolean }) {
       if (scheduling.state === "paused") {
@@ -682,8 +1267,12 @@ export function duePlanning(o: { project: Project; runs: RunsDb; now: Date; fire
       if (scheduling.state === "off") return { hold: "paused" as Hold, reason: "held: scheduling is off" };
       const approved = runs.approvedCode(step.asset);
       if (step.codeHash === undefined || step.codeHash !== approved) {
+        // The tick found (and noted) whether only the time zone moved this code's hash.
+        const known = Object.hasOwn(facts, step.asset) ? facts[step.asset] : undefined;
+        const zone = known && known.codeHash === (step.codeHash ?? null) && known.approved === approved ? known.timeZoneChanged ?? null : null;
         const h = scheduleHeld({
           asset: step.asset, file: step.file, approved, editedAt: editedAt(project.root, step.file), loads: step.ok && step.codeHash !== undefined, now,
+          timeZoneChanged: zone,
         });
         return { hold: "code_not_run_by_hand" as Hold, reason: `held: ${h.reason}`, problem: h.problem };
       }

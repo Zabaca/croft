@@ -17,31 +17,35 @@ function designBlock(marker: string): string {
   return DESIGN.slice(open, DESIGN.indexOf("\n```\n", open) + 1);
 }
 
-// DESIGN.md §9 holds the v1 texts, for all five phases. This build ships phase 2, so its texts leave out or
-// reword every line that sends the agent to a command, flag or feature phase 2 lacks (agent/contract.test.ts
+// DESIGN.md §9 holds the v1 texts, for all five phases. This build ships phase 3, so its texts leave out or
+// reword every line that sends the agent to a command, flag or feature phase 3 lacks (agent/contract.test.ts
 // checks the commands and flags). Every other §9 line ships word for word, and each line that does not is
 // listed here with the reason, so no rule of §9 disappears unnoticed. Match: the start of the §9 line.
 const CUT_FROM_CLAUDE_MD: [string, string][] = [];
 const CUT_FROM_SKILL: [string, string][] = [
-  ["  source, writing SQL or TypeScript transforms, adding checks, scheduling,", "description: scheduling is phase 3"],
   ["  renaming, or answering", "description: rename is phase 4"],
   ["`croft docs <ERROR_CODE>`, `croft docs --list`, `croft new --list`.", "new is phase 5: croft help <command> instead"],
-  ["croft context --json        # assets, columns, behavior, schedules, running, held,", "no schedules or holds before phase 3"],
-  ["croft status                # failed, stale, held, edited, orphaned", "no holds before phase 3; orphaned is worded as status says it"],
+  ["croft status                # failed, stale, held, edited, orphaned", "worded as status says it: never run, edited since its last run, no asset file (orphaned)"],
   ["1. New asset: `croft new api|file|sql|transform <name>`", "new is phase 5: the templates are croft docs ingest, sql and transforms"],
-  ["  SQL transforms are always rebuilt in full", "schedules are phase 3: the sentence on them is left out"],
   ["- SQL assets read assets, never files", "new is phase 5: the file ingest template is in croft docs ingest"],
-  ["- Apps read with `import { query } from \"@zabaca/croft/read\"`. It talks to `croft serve`", "serve is phase 3: direct reads only"],
-  ["- `croft serve` runs until stopped", "serve is phase 3"],
-  ["- For a GUI (DuckDB UI, DBeaver), set \"readCopy\": true", "readCopy is phase 3: merged into the Apps line (never open the file)"],
   ["  (`croft new api x --pagination cursor`).", "new is phase 5: the cursor template in croft docs ingest"],
-  ["- `croft confirm <token>` (every destructive action ends here: rebuild of an ingest", "rebuild, delete, restore, pin changes and key conversion are phase 4: phase 2 confirms --allow-shrink and LARGE_REPROCESS"],
+  ["- `croft confirm <token>` (every destructive action ends here: rebuild of an ingest", "rebuild, delete, restore, pin changes and key conversion are phase 4: phase 3 confirms --allow-shrink and LARGE_REPROCESS"],
   ["  --allow-shrink, delete, restore, lossy pin changes,", "second line of the confirm rule"],
-  ["- Renaming or deleting files in assets/ (use `croft rename`); `croft schedule", "rename is phase 4, schedule phase 3"],
-  ["- `croft serve` (it runs scheduled work unattended", "serve is phase 3"],
+  ["- Renaming or deleting files in assets/ (use `croft rename`); `croft schedule", "rename is phase 4: the table stays under the old name; `croft schedule on|off|pause` ships as it is"],
   ["- Deleting .croft/ or warehouse*.duckdb, or `git clean -X` (the trash and backups live", "no pre-upgrade backups until phase 4"],
-  ["- Held asset:", "holds come with the scheduler (phase 3)"],
   ["- Rename: croft rename", "rename is phase 4"],
+];
+
+// Phase 3's lines: each ships word for word (a reworded one would be missing from SKILL.md, and checkCuts would
+// ask for a cut entry).
+const PHASE_3_LINES = [
+  "  source, writing SQL or TypeScript transforms, adding checks, scheduling, debugging a failed run, backfilling,",
+  "croft context --json        # assets, columns, behavior, schedules, running, held, recent failures and schema changes",
+  "  SQL transforms are always rebuilt in full; there is no incremental SQL. Only ingests have schedules.",
+  "- `croft serve` runs until stopped: ask the user to start it in their own terminal instead of running it in your shell.",
+  "- For a GUI (DuckDB UI, DBeaver), set \"readCopy\": true in croft.json and open warehouse.read.duckdb, never warehouse.duckdb.",
+  "- `croft serve` (it runs scheduled work unattended, and a `--host` other than 127.0.0.1 exposes data beyond this machine).",
+  "- Held asset: it was edited and not run by hand; run it by hand once (croft run <asset>) after checking the preview.",
 ];
 
 /** The §9 lines missing from `shipped`, each matched to exactly one entry of `cuts` (and each entry used). */
@@ -67,6 +71,26 @@ describe("the Claude files are DESIGN.md §9, cut to what this build ships", () 
     expect(skillMd()).toContain(`<!-- croft ${CROFT_VERSION} -->`);
     expect(skillMd()).not.toContain("{{version}}");
     expect(skillMd()).not.toContain("{{phase}}");
+  });
+
+  test("SKILL.md ships phase 3's lines of §9: schedules, holds, croft serve and the read copy", () => {
+    const design = designBlock("**2. `.claude/skills/croft/SKILL.md`:**").split("\n");
+    const lines = skillMd("0.1.0").split("\n");
+    for (const line of PHASE_3_LINES) {
+      expect(design, "a §9 line").toContain(line);
+      expect(lines).toContain(line);
+    }
+    // The Apps line, word for word: apps read through croft serve when it runs.
+    const apps = design.find((l) => l.startsWith("- Apps read with"))!;
+    expect(apps).toContain("`croft serve`");
+    expect(lines).toContain(apps);
+    // Reworded where phase 4 is missing, and only there.
+    expect(lines).toContain("croft status                # failed, stale, held, never run, edited since its last run, no asset file");
+    expect(lines).toContain("- Renaming or deleting files in assets/ (the table stays under the old name; this version cannot rename or drop it); `croft schedule on|off|pause`.");
+    expect(lines.find((l) => l.startsWith("  or answering"))).toBe("  or answering a question from project data.");
+    // Added to §9: how an ingest gets on a schedule, which the eval task "schedule hourly" needs in one place.
+    expect(lines).toContain("- Schedule: add `schedule: \"every hour\"` to the ingest (`croft docs scheduling`); `croft validate` shows the next fires;");
+    expect(lines).toContain("  run it by hand once (new code is held until then), then ask the user before `croft schedule on`.");
   });
 
   test("the app block differs from the project block only where the project lives in data/", () => {

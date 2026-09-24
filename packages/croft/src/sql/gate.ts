@@ -30,7 +30,7 @@ import { mapSandboxError, type Profile } from "../db/connect.ts";
 import { physicalPath } from "../project/root.ts";
 import {
   asciiLower, type AstNode, collect, finiteJson, literal, location, looksLikePath, positional, stringOf, TABLE_ARGUMENT_FUNCTIONS, tableArguments,
-  type Use,
+  type Use, walk,
 } from "./ast.ts";
 
 export interface GateOptions {
@@ -92,6 +92,21 @@ const SCALAR_DENIED = new Set(["write_log"]);
 const SERVE_SCALAR_DENIED = new Set(["current_setting", "getvariable", "sleep_ms"]);
 // SHOW forms that are not DESCRIBE: they list names, never paths.
 const SHOW_LISTS = new Set(["tables", "databases", "variables", "__show_tables_expanded"]);
+// Over HTTP only SHOW TABLES, which lists the main schema's names. SHOW ALL TABLES (also a bare DESCRIBE or SHOW,
+// which DuckDB parses as __show_tables_expanded) lists every schema's tables with their columns, _croft's
+// included, and SHOW databases/schemas/variables name catalogs and settings the serve gate refuses to read.
+const SERVE_SHOW_LISTS = new Set(["tables"]);
+const SHOW_NAMES: Record<string, string> = { __show_tables_expanded: "SHOW ALL TABLES (or a bare DESCRIBE or SHOW)" };
+
+/**
+ * The longest list range() or generate_series() may build as a value (not as a table) over HTTP. A scalar builds
+ * its whole list inside one expression, which DuckDB evaluates (and constant-folds while planning) without
+ * checking for interrupts: `list_sort(range(150000000))` ran 25 s past every interrupt. The serve engine's
+ * watchdog (serve/instance.ts) ends such a query by killing its worker process; this cap only refuses the
+ * literal cases up front. As a table (`FROM range(n)`) range() streams and stops at the next interrupt.
+ */
+export const SERVE_MAX_LIST_VALUES = 10_000_000;
+const LIST_BUILDERS = new Set(["range", "generate_series"]);
 
 /** 1-based line and column of a DuckDB position, which counts code points (verified with emoji). */
 export function lineColumn(sql: string, position: number): { line: number; column: number } {
@@ -198,6 +213,45 @@ function literalPaths(n: Node | undefined): string[] | null {
   return null;
 }
 
+const NUMERIC_TYPES = new Set(["TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT",
+  "FLOAT", "DOUBLE", "DECIMAL"]);
+
+/** A numeric literal's value (through casts to numeric types and a unary minus); null for anything else. A
+ *  HUGEINT constant comes as {upper, lower}: Infinity with its sign, since no list of that length fits. */
+function numericLiteral(n: Node | undefined): number | null {
+  if (!n) return null;
+  if (n.class === "CAST") {
+    const to = str((n.cast_type as { id?: unknown } | undefined)?.id);
+    return NUMERIC_TYPES.has(to) ? numericLiteral(n.child as Node | undefined) : null;
+  }
+  if (n.class === "FUNCTION" && str(n.function_name) === "-" && Array.isArray(n.children) && n.children.length === 1) {
+    const v = numericLiteral(n.children[0] as Node);
+    return v === null ? null : -v;
+  }
+  if (n.class !== "CONSTANT") return null;
+  const v = n.value as { type?: { id?: string; type_info?: { scale?: number } }; is_null?: boolean; value?: unknown } | undefined;
+  if (!v || v.is_null || !NUMERIC_TYPES.has(str(v.type?.id))) return null;
+  if (v.value && typeof v.value === "object") {
+    const upper = Number((v.value as { upper?: unknown }).upper);
+    return Number.isFinite(upper) ? (upper < 0 ? -Infinity : Infinity) : null;
+  }
+  const x = typeof v.value === "number" ? v.value : typeof v.value === "string" ? Number(v.value) : NaN;
+  if (!Number.isFinite(x)) return null;
+  return v.type?.id === "DECIMAL" ? x / 10 ** (v.type.type_info?.scale ?? 0) : x;
+}
+
+/** How many values range()/generate_series() with these arguments build; null unless every bound is a literal. */
+function listSize(name: string, args: Node[]): number | null {
+  const n = args.map(numericLiteral);
+  if (n.length === 0 || n.length > 3 || n.some((x) => x === null)) return null;
+  const [start, stop, step] = n.length === 1 ? [0, n[0]!, 1] : [n[0]!, n[1]!, n.length === 3 ? n[2]! : 1];
+  if (step === 0) return null; // DuckDB refuses it
+  const span = (stop - start) / step;
+  if (!Number.isFinite(span)) return span > 0 ? Infinity : 0;
+  const size = name === "generate_series" ? Math.floor(span) + 1 : Math.ceil(span);
+  return Math.max(0, size);
+}
+
 // ---- The checks -------------------------------------------------------------------------------------------
 
 interface ServeCatalog { current: string; userTables: Set<string>; others: Set<string> }
@@ -216,8 +270,38 @@ class Checker {
       if (u.kind === "scalar") await this.scalar(u.name, u.at);
       else if (u.kind === "table_function") await this.tableFunction(u.name, u.fn, u.at);
       else if (u.kind === "relation") await this.relation(u);
-      else if (this.serve && !SHOW_LISTS.has(lower(u.name))) throw this.serveDenied(`SHOW ${u.name}`, undefined, "is not available");
+      else if (this.serve) this.show(u.name);
     }
+    if (this.serve) this.lists(stmt);
+  }
+
+  /** SHOW forms over HTTP: SHOW TABLES only (the main schema's names). */
+  private show(name: string): void {
+    const n = lower(name);
+    if (SERVE_SHOW_LISTS.has(n)) return;
+    const shown = SHOW_NAMES[n] ?? `SHOW ${name}`;
+    throw this.serveDenied(shown, undefined,
+      SHOW_LISTS.has(n) ? "lists schemas, catalogs or settings beyond the project's tables; the read server shows those only" : "is not available",
+      "SHOW TABLES lists the project's tables, and DESCRIBE <table> the columns of one");
+  }
+
+  /** range() and generate_series() used as values with literal bounds past SERVE_MAX_LIST_VALUES. */
+  private lists(stmt: SelectAst): void {
+    // A table function's own node sits under its TABLE_FUNCTION's `function` key; every other call is a scalar.
+    const tables = new Set<Node>();
+    walk(stmt, (n) => {
+      if (n.type === "TABLE_FUNCTION" && n.function && typeof n.function === "object") tables.add(n.function as Node);
+    });
+    walk(stmt, (n) => {
+      if (typeof n.function_name !== "string" || tables.has(n) || !LIST_BUILDERS.has(lower(n.function_name))) return;
+      const size = listSize(lower(n.function_name), positional(n));
+      if (size === null || size <= SERVE_MAX_LIST_VALUES) return;
+      const values = Number.isFinite(size) ? `${size.toLocaleString("en-US")} values` : "more values than memory holds";
+      const cap = SERVE_MAX_LIST_VALUES.toLocaleString("en-US");
+      throw this.serveDenied(`${n.function_name}() as a value`, location(n),
+        `builds a list of ${values} in one expression, which DuckDB cannot interrupt; over HTTP such a list may hold at most ${cap} values`,
+        `use it as a table instead (SELECT ... FROM range(n)), which the query deadline can stop, or keep the list under ${cap} values`);
+    });
   }
 
   private async scalar(name: string, at?: number): Promise<void> {
@@ -313,12 +397,9 @@ class Checker {
     return { file: this.o.file, line: pos ? pos.line + (this.o.lineOffset ?? 0) : undefined, column: pos?.column };
   }
 
-  private serveDenied(what: string, at?: number, why = "is not available over HTTP; the read server reads the project's tables only"): CroftError {
-    return new CroftError("QUERY_PATH_DENIED", {
-      message: `${what} ${why}`,
-      hint: "query the project's tables by name; files come in through file ingests",
-      ...this.where(at),
-    });
+  private serveDenied(what: string, at?: number, why = "is not available over HTTP; the read server reads the project's tables only",
+    hint = "query the project's tables by name; files come in through file ingests"): CroftError {
+    return new CroftError("QUERY_PATH_DENIED", { message: `${what} ${why}`, hint, ...this.where(at) });
   }
 
   private notSelect(message: string, hint: string, at?: number): CroftError {

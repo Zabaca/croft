@@ -62,8 +62,8 @@ const VALID: unknown[] = [
   { ...tz, database: "~/.local/share/croft/sales-1a2b3c4d/warehouse.duckdb" },
   { ...tz, readCopy: true, concurrency: 1, notify: { desktop: false, webhook: null } },
   { ...tz, concurrency: 64, notify: { webhook: "https://hooks.slack.com/services/T0/B0/x" } },
-  { ...tz, serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 100, maxConcurrent: 64, maxBytes: 1024, allowOrigins: ["http://localhost:3000", "https://app.example.com"] } },
-  { ...tz, serve: { port: 1, host: "0.0.0.0", queryTimeoutMs: 3_600_000, maxConcurrent: 1, maxBytes: Number.MAX_SAFE_INTEGER, allowOrigins: [] } },
+  { ...tz, serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 100, maxConcurrent: 64, maxBytes: 1024, maxRows: 1, allowOrigins: ["http://localhost:3000", "https://app.example.com"] } },
+  { ...tz, serve: { port: 1, host: "0.0.0.0", queryTimeoutMs: 3_600_000, maxConcurrent: 1, maxBytes: Number.MAX_SAFE_INTEGER, maxRows: 10_000_000, allowOrigins: [] } },
   { ...tz, serve: { port: 65535 }, notify: {}, stateDir: null },
 ];
 const INVALID: unknown[] = [

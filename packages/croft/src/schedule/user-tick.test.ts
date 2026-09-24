@@ -1,14 +1,19 @@
 // The generated per-user tick script (~/.croft/tick.ts) imports nothing from croft, so it is tested the way
 // the OS job runs it: `bun --no-env-file <script>` against a fake CROFT_HOME and fake projects whose pinned
 // "croft" is a stub that records how it was started.
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { RunsDb } from "../history/runs-db.ts";
 import { croftHome, type CroftHome } from "./home.ts";
 import type { RegistryEntry, SchedulingSetting } from "./os.ts";
-import { addProject, listProjects, registryLockPath } from "./registry.ts";
+import {
+  addProject, listProjects, LOCK_DB_SUFFIX, MISSING_PRUNE_DAYS, MISSING_PRUNE_MS, registryLockDbPath, registryLockPath,
+} from "./registry.ts";
 import { MAX_TICK_LOG_BYTES, TICK_TEMPLATE_VERSION, tickScriptSource, writeTickScript } from "./user-tick.ts";
 
 let tmp: string;
@@ -39,6 +44,8 @@ interface FakeProject {
   stateDir?: string;
   /** package.json "bin" of the pinned copy. */
   bin?: string;
+  /** package.json "engines.bun" of the pinned copy. */
+  engines?: string;
 }
 
 /** A project folder with croft.json, runs.sqlite (written by the real RunsDb) and a pinned croft stub that
@@ -57,7 +64,9 @@ function project(name: string, o: FakeProject = {}): string {
     const copy = join(root, "node_modules", "@zabaca", "croft");
     const bin = o.bin ?? "bin/croft.mjs";
     mkdirSync(dirname(join(copy, bin)), { recursive: true });
-    writeFileSync(join(copy, "package.json"), JSON.stringify({ name: "@zabaca/croft", bin: { croft: bin } }));
+    writeFileSync(join(copy, "package.json"), JSON.stringify({
+      name: "@zabaca/croft", bin: { croft: bin }, ...(o.engines ? { engines: { bun: o.engines } } : {}),
+    }));
     writeFileSync(join(copy, bin), `
       import { appendFileSync } from "node:fs";
       console.log("stub croft " + process.argv.slice(2).join(" "));
@@ -115,6 +124,15 @@ describe("the generated script", () => {
     writeFileSync(home.tickScript, "// edited by hand\n");
     expect(writeTickScript(home).changed).toBe(true);
     expect(readFileSync(home.tickScript, "utf8")).toBe(tickScriptSource());
+  });
+
+  test("a script from template 1 (the lock file alone, which two writers could both break) is rewritten", () => {
+    expect(TICK_TEMPLATE_VERSION).toBeGreaterThanOrEqual(2);
+    writeFileSync(home.tickScript, "// croft's per-user scheduler tick\n// croft-tick-template: 1\nfunction withLock(fn) {}\n");
+    expect(writeTickScript(home).changed).toBe(true);
+    expect(readFileSync(home.tickScript, "utf8")).toBe(tickScriptSource());
+    expect(tickScriptSource()).toContain(`const LOCK_DB = REGISTRY + "${LOCK_DB_SUFFIX}"`);
+    expect(tickScriptSource()).toContain(`const MISSING_PRUNE_MS = ${MISSING_PRUNE_MS};`);
   });
 
   test("a script written by a newer croft (a later template) is left alone", () => {
@@ -213,6 +231,18 @@ describe("each minute", () => {
     expect(readInvocations()).toEqual([]);
   });
 
+  test("a pinned croft that needs a newer Bun than the job's is not started; the log says so, and how to fix it", async () => {
+    const future = project("needs-future-bun", { engines: ">=99.0.0" });
+    const fine = project("needs-old-bun", { engines: ">= 1.0.0" });
+    const r = runTick();
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(`${future}: its croft needs Bun 99.0.0 or newer, and the scheduler job runs Bun ${Bun.version} (${process.execPath})`);
+    expect(r.stdout).toContain("run croft schedule on in that folder to point the job at a newer Bun");
+    await invocations(1);
+    await Bun.sleep(300);
+    expect(readInvocations().map((i) => i.cwd)).toEqual([fine]);
+  });
+
   test("a project listed twice is ticked once", async () => {
     const root = project("twice");
     const entries = JSON.parse(readFileSync(home.registry, "utf8"));
@@ -280,6 +310,109 @@ describe("pruning", () => {
     expect(r.stdout).toContain(home.registry);
     expect(readFileSync(home.registry, "utf8")).toBe("[{ nope");
   });
+});
+
+describe("a project that is missing, not gone (review R31-10)", () => {
+  const T0 = "2026-09-24T18:45:00.000Z";
+  const daysAfter = (days: number) => new Date(Date.parse(T0) + days * 86_400_000).toISOString();
+
+  test(`a project on a disk that is not mounted is kept and marked missing, then dropped after ${MISSING_PRUNE_DAYS} days missing`, async () => {
+    const kept = project("kept");
+    const unplugged = `/Volumes/croft-test-${process.pid}-${Date.now()}/sales-pipeline`;
+    const added = { root: unplugged, addedAt: "2026-09-01T00:00:00.000Z", via: "os-job" as const };
+    writeFileSync(home.registry, JSON.stringify([...listProjects(home), added]));
+    const r = runTick({ CROFT_NOW: T0 });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(`${unplugged} is missing: its disk /Volumes/`);
+    expect(r.stdout).toContain(`is not mounted; it stays on the schedule, and is removed after ${MISSING_PRUNE_DAYS} days missing`);
+    expect(r.stdout).not.toContain("removed " + unplugged);
+    expect(listProjects(home).find((e) => e.root === unplugged)).toEqual({ ...added, missingSince: T0 });
+    expect((await invocations(1)).map((i) => i.cwd)).toEqual([kept]);
+    // Still missing a day short of the limit: kept, not logged again, the file not rewritten.
+    utimesSync(home.registry, new Date(0), new Date(0));
+    const r2 = runTick({ CROFT_NOW: daysAfter(MISSING_PRUNE_DAYS - 1) });
+    expect(r2.stdout).not.toContain(unplugged);
+    expect(statSync(home.registry).mtimeMs).toBe(0);
+    const r3 = runTick({ CROFT_NOW: daysAfter(MISSING_PRUNE_DAYS) });
+    expect(r3.stdout).toContain(`removed ${unplugged} from the schedule: missing since ${T0}`);
+    expect(listProjects(home).map((e) => e.root)).toEqual([kept]);
+  });
+
+  test("a project whose parent folder is gone too is missing: kept and marked", () => {
+    const root = project("client/sales");
+    rmSync(join(tmp, "client"), { recursive: true });
+    const r = runTick({ CROFT_NOW: T0 });
+    expect(r.stdout).toContain(`${root} is missing: neither it nor ${join(tmp, "client")} exists`);
+    expect(listProjects(home).map((e) => [e.root, e.missingSince])).toEqual([[root, T0]]);
+  });
+
+  test("a missing project that is back is unmarked, logged, and ticked", async () => {
+    const root = project("back");
+    writeFileSync(home.registry, JSON.stringify(listProjects(home).map((e) => ({ ...e, missingSince: T0 }))));
+    const r = runTick({ CROFT_NOW: daysAfter(3) });
+    expect(r.stdout).toContain(`${root} is back`);
+    expect(listProjects(home)[0]).not.toHaveProperty("missingSince");
+    expect((await invocations(1)).map((i) => i.cwd)).toEqual([root]);
+  });
+});
+
+describe("the lock protocol (review R31-03)", () => {
+  test("the tick takes the OS lock first: while another croft holds it, pruning waits for the next minute", async () => {
+    const kept = project("kept");
+    const gone = project("gone");
+    rmSync(gone, { recursive: true });
+    const db = new Database(registryLockDbPath(home), { create: true });
+    db.exec("BEGIN EXCLUSIVE");
+    try {
+      const r = runTick();
+      expect(r.stdout).toContain("pruning next minute");
+      expect(listProjects(home)).toHaveLength(2);
+      expect((await invocations(1)).map((i) => i.cwd)).toEqual([kept]);
+    } finally {
+      db.exec("ROLLBACK");
+      db.close();
+    }
+    const r = runTick();
+    expect(r.stdout).toContain(`removed ${gone} from the schedule`);
+    expect(listProjects(home).map((e) => e.root)).toEqual([kept]);
+    expect(existsSync(registryLockPath(home))).toBe(false);
+  });
+
+  test("a tick pruning while croft writers race over a lock file left by a dead pid: no writer's entry is lost", async () => {
+    const TRIALS = 5;
+    const N = 12;
+    const writer = join(tmp, "writer.ts");
+    writeFileSync(writer, `
+      import { addProject } from ${JSON.stringify(join(import.meta.dir, "registry.ts"))};
+      import { croftHome } from ${JSON.stringify(join(import.meta.dir, "home.ts"))};
+      const [dir, root, at] = process.argv.slice(2);
+      const home = croftHome({ HOME: ${JSON.stringify(userHome)}, CROFT_HOME: dir });
+      while (Date.now() < Number(at)) {}
+      addProject(home, { root, via: "serve" });
+    `);
+    const tickAt = join(tmp, "tick-at.ts");
+    writeFileSync(tickAt, "const at = Number(process.argv[2]);\nwhile (Date.now() < at) {}\nawait import(process.argv[3]);\n");
+    const env = { HOME: userHome, PATH: "/usr/bin:/bin", CROFT_FORBID_OS_JOBS: "1", CROFT_NOTIFY_DRY: "1" };
+    for (let t = 0; t < TRIALS; t++) {
+      const h = croftHome({ HOME: userHome, CROFT_HOME: join(tmp, `homes/t${t}`) });
+      writeTickScript(h);
+      const gone = join(tmp, `gone-${t}`);
+      writeFileSync(h.registry, JSON.stringify([{ root: gone, addedAt: "2026-09-01T00:00:00.000Z", via: "os-job" }]));
+      writeFileSync(registryLockPath(h), "999999999\n");
+      const roots = Array.from({ length: N }, (_, i) => join(tmp, `racers/p${i}`));
+      const at = String(Date.now() + (process.env.CROFT_CI === "1" ? 3000 : 1000));
+      const procs = [
+        Bun.spawn([process.execPath, "--no-env-file", tickAt, at, h.tickScript], { env, stdout: "pipe", stderr: "inherit" }),
+        ...roots.map((root) => Bun.spawn([process.execPath, "--no-env-file", writer, h.dir, root, at], { env, stdout: "inherit", stderr: "inherit" })),
+      ];
+      const codes = await Promise.all(procs.map((p) => p.exited));
+      expect(codes).toEqual(Array(N + 1).fill(0));
+      const log = await new Response(procs[0]!.stdout as ReadableStream).text();
+      expect(log).toContain(`removed ${gone} from the schedule`);
+      expect(listProjects(h).map((e) => e.root).sort()).toEqual([...roots].sort());
+      expect(existsSync(registryLockPath(h))).toBe(false);
+    }
+  }, 120_000);
 });
 
 describe("the tick log", () => {

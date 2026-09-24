@@ -213,6 +213,9 @@ const PHASE_2_CODES: Code[] = [
   "UNKNOWN_INPUT_COLUMN", "LARGE_REPROCESS", "TRANSFORM_MAKES_REQUESTS", "EDITED_SINCE_LAST_RUN",
 ];
 
+/** Phase 3's codes an agent meets in status, doctor or an app's error, each with a page of its own. */
+const PHASE_3_CODES: Code[] = ["SCHEDULE_INVALID", "SCHEDULE_HELD", "SCHEDULER_STALE", "SERVE_UNAUTHORIZED", "SERVE_UNAVAILABLE"];
+
 describe("croft docs pages", () => {
   test("every code phase 2 brings has a page of its own, titled with the code", async () => {
     for (const code of PHASE_2_CODES) {
@@ -227,6 +230,22 @@ describe("croft docs pages", () => {
       if (!isCode(p.name) || !p.page.startsWith("# ")) continue;
       expect(p.page.split("\n")[0]!.startsWith(`# ${p.name}: `), p.name).toBe(true);
     }
+  });
+
+  test("phase 3's features have topics, its codes that reach an agent have pages, and ingest templates show a schedule", async () => {
+    const list = (await docs.run({ positionals: [], values: { list: true } } as unknown as Ctx)).data as { topics: { name: string; summary: string; source: string }[] };
+    const topics = new Map(list.topics.map((t) => [t.name, t]));
+    for (const name of ["scheduling", "serve", "read-copy"]) {
+      expect(topics.get(name), name).toMatchObject({ source: "file" });
+      expect(topics.get(name)!.summary.length, name).toBeLessThanOrEqual(100);
+    }
+    for (const code of PHASE_3_CODES) {
+      const d = (await docs.run({ positionals: [code], values: {} } as unknown as Ctx)).data as { source: string; page: string };
+      expect(d.source, code).toBe("file");
+      expect(d.page, code).toMatch(new RegExp(`^# ${code}: \\S`));
+    }
+    const ingest = await docsPage("ingest");
+    for (const schedule of ['schedule: "every hour"', 'schedule: "monthly"']) expect(ingest).toContain(schedule);
   });
 
   test("the topics for writing assets are listed", async () => {

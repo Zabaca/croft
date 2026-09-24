@@ -2,7 +2,7 @@
 // which owns DuckDB (serve/instance.ts): this file only speaks HTTP.
 //
 //   POST /query   {sql, params?, limit?} → the `query` envelope of §4.3, exactly what read/server.ts expects
-//   GET  /status  → an envelope with the server and the engine's state
+//   GET  /status  → the `status` envelope of §4.3, with this server and its engine under data.serve
 //   GET  /health  → {ok, pid, version, database, writeIntent, queriesToday}
 //
 // Every request passes, in order: the Host check (DNS rebinding), the Origin check (serve.allowOrigins), then
@@ -14,6 +14,20 @@
 // - 422 QUERY_TOO_MANY_ROWS; 400 for usage and gate errors (exit-2 codes); 413/415 for the body; 500 otherwise.
 // Rows are sent exactly as the engine rendered them (json mode, like direct mode), never truncated.
 //
+// Bounds (a burst of requests while a writer holds the file must not take croft serve down):
+// - The bodies of /query requests that are being read or wait for the engine may add up to maxPendingBodyBytes
+//   (64 MB). Past that a /query gets 503 + Retry-After at once, before its body is read (the engine itself refuses
+//   more than 64 waiting queries the same way).
+// - A connection's idle timeout applies while a body is read, so a body that never comes does not hold a socket.
+//   While the query queues and runs the timeout is lifted to the query's own budget (queue wait + serve.
+//   queryTimeoutMs + the kill of a stuck query), and set back to the idle timeout before the answer goes out: Bun
+//   keeps a request's timeout on its keep-alive socket, so without that the socket would never be reaped.
+//
+// GET /status is `croft status --json` without importing asset code (croft serve runs none, §5): the status data
+// from runs.sqlite, the catalog mirror and the asset files as text (cli/commands/status.ts collectStatus with no
+// resolved assets). Staleness that only the asset code can tell (code_changed: its code hash) is therefore not
+// reported here; `croft status` reports it.
+//
 // serve.json (<state>/serve.json, mode 0600) is how apps and croft itself find a running server; it is written
 // here too, atomically, and never over a live server's record.
 import { closeSync, fchmodSync, fsyncSync, linkSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
@@ -23,8 +37,10 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { CODES, CroftError, problem } from "../core/errors.ts";
 import type { Problem } from "../core/types.ts";
-import { buildEnvelope, redactProblem } from "../cli/render.ts";
+import { buildEnvelope, type Next, redactProblem } from "../cli/render.ts";
+import { collectStatus, type StatusData, statusNext } from "../cli/commands/status.ts";
 import { CROFT_VERSION } from "../cli/version.ts";
+import { now } from "../core/time.ts";
 import { didYouMean } from "../project/suggest.ts";
 import { loadProject } from "../project/root.ts";
 import { liveServer, type ServeRecord } from "../read/locate.ts";
@@ -33,13 +49,18 @@ import {
   type Binding, canonicalOrigin, checkContentType, checkHost, checkOrigin, checkToken, isLoopbackHost, isUnspecifiedHost,
   type Refusal, urlHost,
 } from "./auth.ts";
+import { SERVE_DEFAULTS } from "./instance.ts";
 import type { ServeEngine, ServeHealth, ServeJson, ServeQueryData } from "./types.ts";
 
 export const SERVE_FILE = "serve.json";
 /** Largest request body accepted (SQL plus params). */
 export const DEFAULT_MAX_BODY_BYTES = 8 * 1024 * 1024;
-/** Seconds an idle connection stays open. /query requests are exempt: a query may queue and run for longer. */
+/** The bodies of /query requests being read or waiting for the engine, all together. */
+export const DEFAULT_MAX_PENDING_BODY_BYTES = 64 * 1024 * 1024;
+/** Seconds an idle connection stays open. /query requests are exempt while their query queues and runs. */
 export const DEFAULT_IDLE_TIMEOUT_S = 30;
+/** The longest socket timeout Bun.serve takes (idleTimeout's own cap). */
+const MAX_SOCKET_TIMEOUT_S = 255;
 
 export interface ServerOptions {
   engine: ServeEngine;
@@ -63,7 +84,11 @@ export interface ServerOptions {
   /** When the server started, for /status (default now). */
   startedAt?: string;
   maxBodyBytes?: number;
+  maxPendingBodyBytes?: number;
   idleTimeoutS?: number;
+  /** How long one /query may take once its body is read (queue wait, the query, the kill of a stuck one). Default:
+   *  from serve.queryTimeoutMs in croft.json. */
+  requestTimeoutS?: number;
 }
 
 export interface RunningServer {
@@ -120,11 +145,14 @@ export function startServer(o: ServerOptions): RunningServer {
   const maxBody = o.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const redact = o.redact ?? ((t: string) => t);
   const startedAt = o.startedAt ?? new Date().toISOString();
+  const idleTimeoutS = o.idleTimeoutS ?? DEFAULT_IDLE_TIMEOUT_S;
   let binding: Binding = { host: bindHost, port: o.port };
   let url = "";
 
   const handler = new Handler({
-    engine: o.engine, token: o.token, allowOrigins: o.allowOrigins, maxBody, redact, envelopeMeta,
+    engine: o.engine, token: o.token, allowOrigins: o.allowOrigins, maxBody, redact, envelopeMeta, root: o.root,
+    maxPendingBody: Math.max(o.maxPendingBodyBytes ?? DEFAULT_MAX_PENDING_BODY_BYTES, maxBody), idleTimeoutS,
+    requestTimeoutS: () => o.requestTimeoutS ?? requestBudgetS(o.root),
     binding: () => binding, url: () => url, startedAt, onError: o.onError ?? (() => {}),
   });
 
@@ -133,7 +161,7 @@ export function startServer(o: ServerOptions): RunningServer {
     server = Bun.serve({
       hostname: bindHost,
       port: o.port,
-      idleTimeout: o.idleTimeoutS ?? DEFAULT_IDLE_TIMEOUT_S,
+      idleTimeout: idleTimeoutS,
       development: false, // never Bun's own error pages: every answer is croft's envelope
       // Explicitly off: with development false, Bun 1.3.14 otherwise binds with SO_REUSEPORT, and a second server
       // on the same port took over its connections (verified). No other process may share the token's port.
@@ -157,13 +185,32 @@ export function startServer(o: ServerOptions): RunningServer {
   };
 }
 
+/** Seconds one /query may take once its body is read: the longest queue wait, serve.queryTimeoutMs, the kill of a
+ *  query interrupts cannot stop, and a margin. */
+export function requestBudgetS(root: string): number {
+  let queryTimeoutMs: number = SERVE_DEFAULTS.queryTimeoutMs;
+  try {
+    queryTimeoutMs = loadProject({ root }).config.serve.queryTimeoutMs;
+  } catch {}
+  return Math.ceil((SERVE_DEFAULTS.queueMs + queryTimeoutMs + SERVE_DEFAULTS.killAfterMs + SERVE_DEFAULTS.disconnectWaitMs) / 1000) + 10;
+}
+
+/** What Handler.handle needs from Bun's server: the per-request timeout. */
+interface TimeoutControl {
+  timeout(req: Request, seconds: number): void;
+}
+
 interface HandlerInit {
   engine: ServeEngine;
   token: string;
   allowOrigins: readonly string[];
   maxBody: number;
+  maxPendingBody: number;
+  idleTimeoutS: number;
+  requestTimeoutS: () => number;
   redact: (text: string) => string;
   envelopeMeta: () => { database: string; timezone: string };
+  root: string;
   binding: () => Binding;
   url: () => string;
   startedAt: string;
@@ -179,9 +226,20 @@ const ROUTES: Record<string, { route: Route; method: "GET" | "POST" }> = {
 const QUERY_KEYS = ["sql", "params", "limit"];
 
 class Handler {
+  /** Bytes of /query bodies being read or waiting for the engine (Content-Length, or maxBody when unknown). */
+  private pendingBody = 0;
+  private budget: number | null = null;
+
   constructor(private readonly o: HandlerInit) {}
 
-  async handle(req: Request, srv: { timeout(req: Request, seconds: number): void }): Promise<Response> {
+  async handle(req: Request, srv: TimeoutControl): Promise<Response> {
+    const res = await this.route(req, srv);
+    // Bun keeps answering a keep-alive connection after the handler awaited the body, whatever the client asked.
+    if (asksToClose(req)) res.headers.set("Connection", "close");
+    return res;
+  }
+
+  private async route(req: Request, srv: TimeoutControl): Promise<Response> {
     const started = performance.now();
     const path = pathOf(req);
     const known = ROUTES[path.replace(/\/+$/, "") || "/"];
@@ -217,10 +275,8 @@ class Handler {
         }, started, cors);
       }
       if (known.route === "health") return json(200, this.health(), cors);
-      if (known.route === "status") return json(200, this.envelope("status", this.status(), started), cors);
-      // A query may queue for a writer and then run up to serve.queryTimeoutMs: no idle timeout while it does.
-      srv.timeout(req, 0);
-      return await this.query(req, started, cors);
+      if (known.route === "status") return await this.status(started, cors);
+      return await this.query(req, srv, started, cors);
     } catch (e) {
       return this.internal(command, e, started, cors);
     }
@@ -231,23 +287,45 @@ class Handler {
     return c !== null && this.o.allowOrigins.some((a) => canonicalOrigin(a) === c);
   }
 
-  private async query(req: Request, started: number, cors: Record<string, string>): Promise<Response> {
+  private async query(req: Request, srv: TimeoutControl, started: number, cors: Record<string, string>): Promise<Response> {
     const type = checkContentType(req.headers.get("content-type"));
     if (type) return this.refusal("query", type, started, cors);
-    const declared = Number(req.headers.get("content-length") ?? "0");
-    const text = declared > this.o.maxBody ? null : await req.text();
-    if (text === null || Buffer.byteLength(text, "utf8") > this.o.maxBody) {
-      return this.refusal("query", {
-        status: 413,
-        problem: problem("USAGE_ERROR", {
-          message: `the request body is larger than croft serve accepts (${this.o.maxBody.toLocaleString("en-US")} bytes)`,
-          hint: "send shorter SQL, or fewer or smaller params",
-          details: { status: 413, maxBytes: this.o.maxBody },
-        }),
-      }, started, cors);
+    const length = req.headers.get("content-length");
+    const declared = length === null ? NaN : Number(length);
+    if (declared > this.o.maxBody) return this.tooLarge(started, cors);
+    // Room for this body among the others still being read or waiting: otherwise 503 before reading it.
+    const reserved = Number.isSafeInteger(declared) && declared >= 0 ? declared : this.o.maxBody;
+    if (this.pendingBody > 0 && this.pendingBody + reserved > this.o.maxPendingBody) return this.bodiesFull(started, cors);
+    this.pendingBody += reserved;
+    try {
+      // Read under the idle timeout: a body that never comes does not hold the connection.
+      let text: string;
+      try {
+        text = await req.text();
+      } catch (e) {
+        // The client went away (or was timed out) before its body came: nobody reads an answer, and it is no bug.
+        if (req.signal.aborted) return new Response(null, { status: 499 });
+        throw e;
+      }
+      if (Buffer.byteLength(text, "utf8") > this.o.maxBody) return this.tooLarge(started, cors);
+      const body = parseQueryBody(text);
+      if ("status" in body) return this.refusal("query", body, started, cors);
+      // The query may queue for a writer and then run up to serve.queryTimeoutMs: its own budget meanwhile, then the
+      // idle timeout again, before the answer goes out (Bun keeps a request's timeout on its keep-alive socket).
+      // Bun's socket timeouts go up to 255 s; a longer budget lifts the timeout while the query runs.
+      this.budget ??= this.o.requestTimeoutS();
+      srv.timeout(req, this.budget > MAX_SOCKET_TIMEOUT_S ? 0 : this.budget);
+      try {
+        return await this.answer(req, body, started, cors);
+      } finally {
+        srv.timeout(req, this.o.idleTimeoutS);
+      }
+    } finally {
+      this.pendingBody -= reserved;
     }
-    const body = parseQueryBody(text);
-    if ("status" in body) return this.refusal("query", body, started, cors);
+  }
+
+  private async answer(req: Request, body: { sql: string; params: unknown[]; limit: number }, started: number, cors: Record<string, string>): Promise<Response> {
     try {
       const data = await this.o.engine.query({ ...body, signal: req.signal });
       // Never pass on more rows than asked for: the client would refuse them anyway.
@@ -258,10 +336,37 @@ class Handler {
       // The client went away and the engine gave up on its query: nobody reads this answer, and it is no bug.
       if (req.signal.aborted && !(e instanceof CroftError)) return new Response(null, { status: 499 });
       if (!(e instanceof CroftError)) throw e;
-      const status = httpStatus(e);
-      const headers: Record<string, string> = status === 503 ? { "Retry-After": String(retryAfterSeconds(e.problem)) } : {};
-      return this.refusal("query", { status, problem: e.problem, headers }, started, cors);
+      return this.problemResponse("query", e, started, cors);
     }
+  }
+
+  /** A CroftError as an answer, with the status (and Retry-After) the read client expects. */
+  private problemResponse(command: string, e: CroftError, started: number, cors: Record<string, string>): Response {
+    const status = httpStatus(e);
+    const headers: Record<string, string> = status === 503 ? { "Retry-After": String(retryAfterSeconds(e.problem)) } : {};
+    return this.refusal(command, { status, problem: e.problem, headers }, started, cors);
+  }
+
+  private tooLarge(started: number, cors: Record<string, string>): Response {
+    return this.refusal("query", {
+      status: 413,
+      problem: problem("USAGE_ERROR", {
+        message: `the request body is larger than croft serve accepts (${this.o.maxBody.toLocaleString("en-US")} bytes)`,
+        hint: "send shorter SQL, or fewer or smaller params",
+        details: { status: 413, maxBytes: this.o.maxBody },
+      }),
+    }, started, cors);
+  }
+
+  /** Too many request bodies are being read or wait for the engine already. */
+  private bodiesFull(started: number, cors: Record<string, string>): Response {
+    const mb = (n: number) => `${Math.max(1, Math.round(n / 1024 / 1024))} MB`;
+    return this.problemResponse("query", new CroftError("SERVE_UNAVAILABLE", {
+      message: `croft serve is holding ${mb(this.pendingBody)} of queries that wait for an answer (at most ${mb(this.o.maxPendingBody)}); this one was not read`,
+      hint: "retry after Retry-After; send fewer queries at once, or smaller ones (large IN lists belong in a table)",
+      retryable: true,
+      details: { reason: "busy", retryAfterMs: SERVE_DEFAULTS.retryAfterMs, pendingBytes: this.pendingBody, maxPendingBytes: this.o.maxPendingBody },
+    }), started, cors);
   }
 
   private health(): ServeHealth {
@@ -269,13 +374,28 @@ class Handler {
     return { ok: true, pid: process.pid, version: CROFT_VERSION, database: this.o.envelopeMeta().database, writeIntent: s.writeIntent, queriesToday: s.queriesToday };
   }
 
-  private status() {
+  /** This server and its engine: data.serve of GET /status. */
+  private serveInfo() {
     const b = this.o.binding();
-    return { url: this.o.url(), host: b.host, port: b.port, pid: process.pid, version: CROFT_VERSION, startedAt: this.o.startedAt, engine: this.o.engine.status() };
+    return { url: this.o.url(), pid: process.pid, host: b.host, port: b.port, version: CROFT_VERSION, startedAt: this.o.startedAt, engine: this.o.engine.status() };
   }
 
-  private envelope<T>(command: string, data: T, started: number, problems: Problem[] = []) {
-    return buildEnvelope({ command, data, problems, next: [], ...this.o.envelopeMeta(), durationMs: performance.now() - started });
+  /** GET /status: `croft status --json`'s envelope, built from files and runs.sqlite without importing asset code. */
+  private async status(started: number, cors: Record<string, string>): Promise<Response> {
+    let state: Awaited<ReturnType<typeof collectStatus>>;
+    try {
+      state = await collectStatus(loadProject({ root: this.o.root }), now(), { resolved: null });
+    } catch (e) {
+      if (!(e instanceof CroftError)) throw e;
+      return this.problemResponse("status", e, started, cors);
+    }
+    const data: StatusData & { serve: ReturnType<Handler["serveInfo"]> } = { ...state.data, serve: this.serveInfo() };
+    const problems = [...state.problems, ...state.edited, ...state.scheduling].map((p) => redactProblem(p, this.o.redact));
+    return json(200, this.envelope("status", data, started, problems, statusNext(state.data.assets)), cors);
+  }
+
+  private envelope<T>(command: string, data: T, started: number, problems: Problem[] = [], next: Next[] = []) {
+    return buildEnvelope({ command, data, problems, next, ...this.o.envelopeMeta(), durationMs: performance.now() - started });
   }
 
   private refusal(command: string, r: Refusal, started: number, cors: Record<string, string>): Response {
@@ -299,6 +419,11 @@ class Handler {
       return new Response('{"ok":false}', { status: 500, headers: { "Content-Type": "application/json" } });
     }
   }
+}
+
+/** Whether the request asked to close the connection after the answer. */
+function asksToClose(req: Request): boolean {
+  return (req.headers.get("connection") ?? "").toLowerCase().split(",").some((t) => t.trim() === "close");
 }
 
 function pathOf(req: Request): string {

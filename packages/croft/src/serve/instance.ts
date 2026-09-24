@@ -1,56 +1,60 @@
-// croft serve's query engine (DESIGN.md §5 "Server mode, apps and GUIs"): one read-only DuckDB instance on the
+// croft serve's query engine (DESIGN.md §5 "Server mode, apps and GUIs"): the read-only DuckDB instance on the
 // live warehouse, admission (queue.ts) and the write-intent handoff (handoff.ts). server.ts only speaks HTTP.
 //
 // Owning the file:
-// - One instance at a time, through connect.ts openInstance (DuckDBInstance.fromCache), read-only, with the serve
-//   sandbox: allowed_directories = [], memory_limit 25% of RAM and threads (connect.ts serveResources). The
-//   instance cache keeps only a weak reference, so the instance, and with it the OS lock, lives exactly as long
-//   as something references it: the engine's one handle, a connection, a prepared statement or a streaming
-//   result. So the engine keeps the only handle, makes every connection itself (the Pool below), destroys each
-//   statement as its query settles, reads only materialized results, and disconnects every connection before
-//   closeSync(). It never takes a second handle for the path while one is open: two instances on one file in one
-//   process lose data, and closing a second one drops the first one's lock (§5, "Owning the DuckDB file").
-// - It runs no user code and opens the file no other way (no fs calls on it, no ATTACH): the serve gate
-//   (sql/gate.ts, profile "serve") admits only the project's tables, CTEs and range/generate_series/unnest/
-//   json_each/json_tree.
+// - The instance lives in a query worker (worker.ts), a child process this engine spawns and owns
+//   (query-worker.ts), never in croft serve itself: one worker per open of the file, read-only, with the serve
+//   sandbox (allowed_directories = [], memory_limit 25% of RAM and threads: connect.ts serveResources). croft serve
+//   opens no DuckDB file at all, so its own descriptors can never drop a lock (§5, "Owning the DuckDB file").
+// - The file is released by killing the worker (SIGKILL): the kernel drops the process's locks as it exits,
+//   whatever DuckDB's objects are doing. That is what bounds a handoff. DuckDB checks for interrupts only between
+//   tasks, and a SELECT can spend many seconds in one scalar or list expression (list_sort(range(n)),
+//   list_reduce over a big range, a big constant folded while planning), which no interrupt stops, and closing an
+//   instance while its query runs keeps the lock.
+// - It runs no user code: the serve gate (sql/gate.ts, profile "serve", applied in the worker) admits only the
+//   project's tables, CTEs and range/generate_series/unnest/json_each/json_tree.
 //
 // Stepping aside (states open → stepping_aside → closed_for_write → reopening → open):
 // 1. A live intent appears in write-intent.d (polled every 50 ms, woken earlier by fs.watch): stop admitting.
 // 2. Running queries may finish for graceMs (2 s); then each is interrupted every 20 ms until it settles. Their
-//    clients get SERVE_UNAVAILABLE (503) with retryAfterMs.
-// 3. Each query destroyed its prepared statement as it settled; its result was materialized, so no reader holds
-//    the file.
-// 4. Every connection is disconnected, idle ones included (no pool survives a handoff).
-// 5. closeSync(): the writer can lock the file.
-// When no intent is proven live any more (dead writers' intents are removed), the file is reopened, and queries
-// that queued meanwhile run, each within its own queueMs (10 s) of arriving.
+//    clients get SERVE_UNAVAILABLE (503) with retryAfterMs. One that has not settled killAfterMs (500 ms) after
+//    its first interrupt is abandoned: the worker is killed, which ends it (and any query beside it).
+// 3. Every connection is disconnected, idle ones included (no pool survives a handoff).
+// 4. The worker is killed and its exit awaited: the writer can lock the file. So the writer waits at most
+//    graceMs + killAfterMs + the few milliseconds a kill takes, whatever the queries do.
+// A fresh worker is started meanwhile, so when no intent is proven live any more (dead writers' intents are
+// removed), the file is reopened in milliseconds, and queries that queued meanwhile run, each within its own
+// queueMs (10 s) of arriving.
+//
+// Deadlines hold the same way: at queryTimeoutMs a query is interrupted, and one that has not settled
+// killAfterMs later is abandoned. A worker that dies while serving (killed for a stuck query, the OOM killer, a
+// crash) is replaced at once; the queries it ran beside the stuck one get SERVE_UNAVAILABLE (retryable), which the
+// read client retries.
+//
+// Limits (§5 "Query limits"): at most maxConcurrent queries run, at most maxQueued wait (more are refused at once:
+// a burst of requests during a write step cannot pile up), and a result is streamed chunk by chunk in the worker
+// and fails with QUERY_TOO_MANY_ROWS as soon as it passes `limit` (capped at maxRows) or serve.maxBytes.
 //
 // The read copy (readCopy in croft.json, db/readcopy.ts): while the engine steps aside or stays closed for a writer
 // and <database stem>.read.duckdb exists, queries are answered from it instead of waiting, their data marked
 // `stale: true` with `asOf`, the copy's mtime (its checkpoint) in the project offset. That covers queries that
 // arrive then, queries already waiting in the queue when the engine steps aside, and queries interrupted for the
-// writer after graceMs. The copy is another file (a clone renamed into place, so another inode): its own read-only
-// instance, with the same sandbox, gate and limits, and its own admission of maxConcurrent. It is opened for the
-// queries that need it and closed 100 ms after the last one, so a GUI can open the copy between writes and a
+// writer after graceMs. The copy is another file (a clone renamed into place, so another inode): its own worker,
+// with the same sandbox, gate and limits, and its own admission of maxConcurrent. It is opened for the queries that
+// need it and its worker is killed 100 ms after the last one, so a GUI can open the copy between writes and a
 // refreshed copy is picked up by the next open. A copy that cannot be opened leaves the query waiting as before.
-import type { DuckDBConnection, DuckDBInstance, DuckDBPreparedStatement } from "@duckdb/node-api";
 import { existsSync, statSync } from "node:fs";
 import { CroftError } from "../core/errors.ts";
 import { formatInstant, now, zonedParts } from "../core/time.ts";
-import type { Sql } from "../core/types.ts";
-import { canonicalPath, connect, lockConflict, openInstance, type SandboxSpec, serveResources } from "../db/connect.ts";
+import { canonicalPath, type SandboxSpec, serveResources } from "../db/connect.ts";
 import { assertSafeFilesystem, type FsProbe, realProbe } from "../db/fs-kind.ts";
 import type { IntentEntry } from "../db/intent.ts";
-import { checkFormat } from "../db/state.ts";
 import { backoffMs } from "../db/warehouse.ts";
-import { renderRows, resultColumns } from "../db/values.ts";
 import { loadProject, type Project } from "../project/root.ts";
-import { mapQueryError, toDuck, wireSafe } from "../read/select.ts";
-import { tooManyRows } from "../read/wire.ts";
-import type { Row } from "../types.ts";
-import { assertOneSelect } from "../sql/gate.ts";
+import { mapQueryError } from "../read/select.ts";
 import { drain, IntentWatch } from "./handoff.ts";
 import { Admission, type Flight, type StopReason } from "./queue.ts";
+import { QueryWorker, WorkerConflict, WorkerGone, WorkerStopped } from "./query-worker.ts";
 import type { ServeEngine, ServeEngineOptions, ServeEngineStatus, ServeQuery, ServeQueryData } from "./types.ts";
 
 export const SERVE_DEFAULTS = {
@@ -61,29 +65,38 @@ export const SERVE_DEFAULTS = {
   graceMs: 2000,
   /** Repeated interrupts of a stopped query. */
   interruptEveryMs: 20,
+  /** A stopped query that has not settled this long after its first interrupt is ended by killing its worker. */
+  killAfterMs: 500,
+  /** Queries that may wait for a slot; more are refused at once (503). */
+  maxQueued: 64,
+  /** The most rows one answer carries, whatever `limit` asks for. */
+  maxRows: 100_000,
+  /** How long a worker may take to disconnect its connections before it is killed anyway. */
+  disconnectWaitMs: 250,
   /** What a 503 tells the client to wait: a write step usually takes seconds. */
   retryAfterMs: 1000,
-  /** The read copy's instance stays open this long after its last query. */
+  /** The read copy's worker stays up this long after its last query. */
   copyLingerMs: 100,
 } as const;
 
-/** The data of an answer from the read copy. serve/types.ts ServeQueryData declares stale and asOf as optional
- *  fields (orchestrator change requested); until then this type carries them. */
+/** The data of an answer from the read copy. */
 type StaleQueryData = ServeQueryData & { stale: true; asOf: string };
 
 /** Instrumentation points (tests, diagnostics). Each gets the wall-clock time it happened. */
 export interface ServeEngineHooks {
   /** A live intent appeared: admission stopped. */
   steppingAside?(e: { intent: IntentEntry; at: number }): void;
-  /** Right before the instance's closeSync(): connections still open (0 unless a disconnect failed). */
+  /** Right before the worker is killed: connections still open (0 unless a disconnect failed or it hung). */
   beforeClose?(e: { openConnections: number; reason: CloseReason; at: number }): void;
-  /** closeSync() returned: the file is free. `intent` is the writer it was released for. */
+  /** The worker has exited: the file is free. `intent` is the writer it was released for. */
   released?(e: { intent: IntentEntry | null; reason: CloseReason; at: number }): void;
   /** The file was (re)opened and queries are admitted again. */
   opened?(e: { at: number }): void;
+  /** A query ended (answered or not) on a worker: its pid and peak resident set, in bytes. */
+  queryEnded?(e: { workerPid: number; workerPeakRss: number; at: number }): void;
 }
 
-/** Why the instance was closed: a writer, the server stopping, or a check that failed right after opening. */
+/** Why the file was released: a writer, the server stopping, or a check that failed right after opening. */
 export type CloseReason = "write" | "stop" | "error";
 
 /** Options the command does not pass: tests and diagnostics. */
@@ -93,6 +106,12 @@ export interface ServeEngineInternals {
   fs?: FsProbe;
   /** serve.maxBytes by default. */
   maxBytes?: number;
+  /** SERVE_DEFAULTS.maxRows by default. */
+  maxRows?: number;
+  /** SERVE_DEFAULTS.maxQueued by default. */
+  maxQueued?: number;
+  /** SERVE_DEFAULTS.killAfterMs by default. */
+  killAfterMs?: number;
   /** serveResources() by default. */
   resources?: Partial<{ memoryLimit: string; threads: number }>;
   interruptEveryMs?: number;
@@ -110,69 +129,35 @@ export async function openServeEngine(o: ServeEngineOptions & ServeEngineInterna
   return engine;
 }
 
-/** The connections of the current instance. `open` counts every connection made and not yet disconnected. */
-class Pool {
-  private readonly idle: DuckDBConnection[] = [];
-  private readonly all = new Set<DuckDBConnection>();
-
-  constructor(private readonly maxIdle: number) {}
-
-  get open(): number {
-    return this.all.size;
-  }
-
-  async take(instance: DuckDBInstance, spec: SandboxSpec, key: string): Promise<DuckDBConnection> {
-    const reuse = this.idle.pop();
-    if (reuse) return reuse;
-    const conn = await connect(instance, spec, key);
-    this.all.add(conn);
-    return conn;
-  }
-
-  /** Back from a settled query: kept for the next one while the instance stays open, else disconnected. */
-  give(conn: DuckDBConnection, keep: boolean): void {
-    if (!this.all.has(conn)) return;
-    if (keep && this.idle.length < this.maxIdle) this.idle.push(conn);
-    else this.drop(conn);
-  }
-
-  /** Disconnect every connection, idle or not. disconnectSync() also destroys the statements it still tracks. */
-  dropAll(): void {
-    this.idle.length = 0;
-    for (const c of [...this.all]) this.drop(c);
-  }
-
-  private drop(conn: DuckDBConnection): void {
-    const i = this.idle.indexOf(conn);
-    if (i >= 0) this.idle.splice(i, 1);
-    try {
-      conn.disconnectSync();
-      this.all.delete(conn);
-    } catch {
-      // Counted as still open: beforeClose reports it.
-    }
-  }
-}
-
 const secs = (ms: number) => Math.round(ms / 100) / 10;
 
+/** What a file is opened with in a worker. */
+interface OpenSpec { path: string; spec: SandboxSpec; protect: string[] }
+
 /**
- * The read copy as a second, read-only source, used only while the live file is closed for a writer. Its instance
- * is opened for the queries that need it and closed copyLingerMs after the last one. The copy is replaced by a
- * rename (db/readcopy.ts): an instance on the old file keeps reading it, consistently, and the first query after
- * that instance closed opens the new file. Connections are made per query and disconnected when it settles.
+ * The read copy as a second, read-only source, used only while the live file is closed for a writer. Its worker is
+ * started for the queries that need it and killed copyLingerMs after the last one. The copy is replaced by a rename
+ * (db/readcopy.ts): a worker on the old file keeps reading it, consistently, and the first query after that worker
+ * went away opens the new file. While the live file stays closed, a spare worker waits, so a query after the linger
+ * only pays for the open.
  */
 class ReadCopySource {
-  private instance: DuckDBInstance | null = null;
-  private opening: Promise<DuckDBInstance> | null = null;
-  /** The file the open instance reads (inode and mtime), and its mtime in the project offset. */
+  private worker: QueryWorker | null = null;
+  private spare: QueryWorker | null = null;
+  private opening: Promise<QueryWorker> | null = null;
+  /** The file the worker reads (inode and mtime), and its mtime in the project offset. */
   private file: { ino: number; mtimeMs: number } | null = null;
   private asOf = "";
   private refs = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
-  private readonly conns = new Set<DuckDBConnection>();
+  private warm = false;
 
-  constructor(readonly path: string, private readonly spec: SandboxSpec, private readonly timezone: string, private readonly lingerMs: number) {}
+  constructor(private readonly open: OpenSpec, private readonly timezone: string, private readonly lingerMs: number,
+    private readonly spawn: () => QueryWorker) {}
+
+  get path(): string {
+    return this.open.path;
+  }
 
   /** Whether there is a copy to answer from: a stat, never an open. */
   exists(): boolean {
@@ -183,83 +168,83 @@ class ReadCopySource {
     }
   }
 
-  /** A connection on the copy and the copy's asOf. Throws when the copy cannot be opened or served. */
-  async take(): Promise<{ conn: DuckDBConnection; asOf: string }> {
+  /** Keep a spare worker ready (the live file is closed for a writer), or stop keeping one. */
+  keepWarm(on: boolean): void {
+    this.warm = on;
+    if (on) {
+      if (this.exists()) this.spare ??= this.spawn();
+    } else {
+      void this.spare?.kill();
+      this.spare = null;
+    }
+  }
+
+  /** The worker on the copy and the copy's asOf. Throws when the copy cannot be opened or served. */
+  async take(): Promise<{ worker: QueryWorker; asOf: string }> {
     this.refs++;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     try {
-      const instance = await this.open();
-      const conn = await connect(instance, this.spec, this.path);
-      this.conns.add(conn);
-      return { conn, asOf: this.asOf };
+      const worker = await this.ready();
+      return { worker, asOf: this.asOf };
     } catch (e) {
       this.leave();
       throw e;
     }
   }
 
-  /** The query on `conn` settled (its statement is destroyed). */
-  give(conn: DuckDBConnection): void {
-    if (this.conns.delete(conn)) {
-      try {
-        conn.disconnectSync();
-      } catch {}
-    }
+  /** A query on the copy settled. */
+  give(): void {
     this.leave();
   }
 
-  /** Close now if no query uses the copy (the engine stops); otherwise the last one closes it. */
-  close(): void {
+  /** Kill the worker now if no query uses the copy (the engine stops); otherwise the last one does. */
+  close(): Promise<void> {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
-    if (this.refs > 0 || this.opening) return;
-    this.drop();
+    if (this.refs > 0 || this.opening) return Promise.resolve();
+    return this.drop();
   }
 
-  /** Disconnect every connection, then close the instance. */
-  private drop(): void {
-    for (const c of this.conns) {
-      try {
-        c.disconnectSync();
-      } catch {}
-    }
-    this.conns.clear();
-    const instance = this.instance;
-    this.instance = null;
+  /** Stop for good: the worker and the spare. */
+  async stop(): Promise<void> {
+    this.keepWarm(false);
+    await this.close();
+  }
+
+  private drop(): Promise<void> {
+    const w = this.worker;
+    this.worker = null;
     this.file = null;
-    instance?.closeSync();
+    if (this.warm) this.spare ??= this.spawn();
+    return w ? w.kill() : Promise.resolve();
   }
 
   private leave(): void {
     if (--this.refs > 0) return;
-    this.timer = setTimeout(() => this.close(), this.lingerMs);
+    this.timer = setTimeout(() => void this.close(), this.lingerMs);
     (this.timer as { unref?: () => void }).unref?.();
   }
 
-  private async open(): Promise<DuckDBInstance> {
-    // A copy renamed into place since the instance opened: reopen, unless a query still reads the old one.
-    if (this.instance && this.refs === 1 && !this.opening && this.replaced()) this.drop();
-    if (this.instance) return this.instance;
+  private async ready(): Promise<QueryWorker> {
+    // A worker that died, or a copy renamed into place since it opened (unless a query still reads the old one).
+    if (this.worker && (!this.worker.alive || (this.refs === 1 && !this.opening && this.replaced()))) void this.drop();
+    if (this.worker) return this.worker;
     this.opening ??= (async () => {
       // The stat comes first: if a rename lands in between, asOf is older than the data, never newer.
       const st = statSync(this.path);
-      const { instance } = await openInstance(this.path, "read_only");
+      const w = this.spare?.alive ? this.spare : this.spawn();
+      this.spare = null;
       try {
-        const conn = await connect(instance, this.spec, this.path);
-        try {
-          await checkFormat(sqlOn(conn, this.timezone)); // DB_NEWER_FORMAT, as for the live file
-        } finally {
-          conn.disconnectSync();
-        }
+        await w.open(this.open); // DB_NEWER_FORMAT, as for the live file
       } catch (e) {
-        instance.closeSync();
+        void w.kill();
         throw e;
       }
-      this.instance = instance;
+      this.worker = w;
       this.file = { ino: st.ino, mtimeMs: st.mtimeMs };
       this.asOf = formatInstant(Math.round(st.mtimeMs), this.timezone);
-      return instance;
+      return w;
     })().finally(() => (this.opening = null));
     return this.opening;
   }
@@ -276,12 +261,15 @@ class ReadCopySource {
 
 class Engine implements ServeEngine {
   private state: ServeEngineStatus["state"] = "reopening";
-  private instance: DuckDBInstance | null = null;
-  private readonly pool: Pool;
+  /** The worker with the live file open (state open or stepping aside), else null. */
+  private worker: QueryWorker | null = null;
+  /** A worker started ahead, with no file open, for the next open. */
+  private spare: QueryWorker | null = null;
+  /** The worker a reopen is opening the file in. */
+  private opening: QueryWorker | null = null;
   private readonly admission: Admission;
   private readonly watch: IntentWatch;
-  private readonly spec: SandboxSpec;
-  private readonly path: string;
+  private readonly live: OpenSpec;
   private readonly hooks: ServeEngineHooks;
   private readonly maxConcurrent: number;
   private readonly queueMs: number;
@@ -289,6 +277,8 @@ class Engine implements ServeEngine {
   private readonly graceMs: number;
   private readonly pollMs: number;
   private readonly maxBytes: number;
+  private readonly maxRows: number;
+  private readonly maxQueued: number;
   /** The read copy (readCopy on), and admission to it; null when readCopy is off. */
   private readonly copy: ReadCopySource | null;
   private readonly copyAdmission: Admission;
@@ -305,6 +295,7 @@ class Engine implements ServeEngine {
   private attempts = 0;
   private stopped = false;
   private closing: Promise<void> | null = null;
+  private seq = 0;
   private day = "";
   private count = 0;
 
@@ -316,26 +307,28 @@ class Engine implements ServeEngine {
     this.graceMs = o.graceMs ?? SERVE_DEFAULTS.graceMs;
     this.pollMs = o.pollMs ?? SERVE_DEFAULTS.pollMs;
     this.maxBytes = o.maxBytes ?? serve.maxBytes;
+    this.maxRows = o.maxRows ?? (serve as { maxRows?: number }).maxRows ?? SERVE_DEFAULTS.maxRows;
+    this.maxQueued = o.maxQueued ?? SERVE_DEFAULTS.maxQueued;
+    const killAfterMs = o.killAfterMs ?? SERVE_DEFAULTS.killAfterMs;
     this.hooks = guarded(o.hooks ?? {});
-    this.path = canonicalPath(project.paths.database);
-    this.spec = { profile: "serve", timezone: project.timezone, root: project.root, stateDir: project.paths.stateDir, ...serveResources(), ...o.resources };
-    this.pool = new Pool(this.maxConcurrent);
-    this.admission = new Admission({
+    const spec: SandboxSpec = { profile: "serve", timezone: project.timezone, root: project.root, stateDir: project.paths.stateDir, ...serveResources(), ...o.resources };
+    const protect = [project.paths.stateDir];
+    this.live = { path: canonicalPath(project.paths.database), spec, protect };
+    const admissionOf = (unavailable: (waitedMs: number) => CroftError, copy: boolean) => new Admission({
       maxConcurrent: this.maxConcurrent,
+      maxQueued: this.maxQueued,
       interruptEveryMs: o.interruptEveryMs ?? SERVE_DEFAULTS.interruptEveryMs,
-      unavailable: (waitedMs) => this.notAdmitted(waitedMs),
+      stuckAfterMs: killAfterMs,
+      unavailable,
       aborted: () => this.stopError("abort"),
+      full: () => this.queueFull(copy),
     });
+    this.admission = admissionOf((waitedMs) => this.notAdmitted(waitedMs), false);
     this.watch = new IntentWatch({ stateDir: project.paths.stateDir, pollMs: this.pollMs, onTick: () => this.tick(), watch: o.watch });
     this.copy = project.config.readCopy
-      ? new ReadCopySource(canonicalPath(project.paths.readCopy), this.spec, project.timezone, SERVE_DEFAULTS.copyLingerMs)
+      ? new ReadCopySource({ path: canonicalPath(project.paths.readCopy), spec, protect }, project.timezone, SERVE_DEFAULTS.copyLingerMs, () => QueryWorker.spawn())
       : null;
-    this.copyAdmission = new Admission({
-      maxConcurrent: this.maxConcurrent,
-      interruptEveryMs: o.interruptEveryMs ?? SERVE_DEFAULTS.interruptEveryMs,
-      unavailable: (waitedMs) => this.copyBusy(waitedMs),
-      aborted: () => this.stopError("abort"),
-    });
+    this.copyAdmission = admissionOf((waitedMs) => this.copyBusy(waitedMs), true);
     this.copyAdmission.resume();
     this.toCopy = new CroftError("SERVE_UNAVAILABLE", {
       message: "croft's read server stepped aside for a writer; the query moves to the read copy",
@@ -352,6 +345,8 @@ class Engine implements ServeEngine {
     if (live.length > 0) {
       this.intent = live[0]!;
       this.state = "closed_for_write";
+      this.spare = this.spawn();
+      this.copy?.keepWarm(true);
     } else {
       await this.reopen();
       if (this.blocked && this.blocked.code !== "DB_NOT_FOUND") {
@@ -371,7 +366,7 @@ class Engine implements ServeEngine {
       writeIntent: i ? { pid: i.pid, runId: i.runId, since: i.since } : null,
       inFlight: this.admission.inFlight + this.copyAdmission.inFlight,
       queued: this.admission.queued + this.copyAdmission.queued,
-      openConnections: this.pool.open,
+      openConnections: this.worker?.conns ?? 0,
       queriesToday: this.dayKey() === this.day ? this.count : 0,
     };
   }
@@ -417,19 +412,17 @@ class Engine implements ServeEngine {
     const timer = setTimeout(() => flight.stop("timeout"), this.queryTimeoutMs);
     const onAbort = () => flight.stop("abort");
     q.signal?.addEventListener("abort", onAbort, { once: true });
-    let conn: DuckDBConnection | null = null;
+    // Admitted only while open; the worker may have died since (it is being replaced), and then query() fails.
+    const worker = this.worker;
     try {
-      const instance = this.instance;
-      if (!instance) throw this.stopError("stop"); // admitted only while open; defensive
-      conn = await this.pool.take(instance, this.spec, this.path);
-      return await this.answer(conn, flight, q, arrived);
+      if (!worker) throw this.restarted(null);
+      return await this.answer(worker, flight, q, arrived);
     } catch (e) {
-      if (flight.reason) throw this.stopError(flight.reason);
-      throw mapQueryError(e, "serve");
+      throw this.queryError(e, flight);
     } finally {
       clearTimeout(timer);
       q.signal?.removeEventListener("abort", onAbort);
-      if (conn) this.pool.give(conn, this.state === "open" && !this.stopped);
+      this.ended(worker);
       this.countQuery();
       flight.release();
     }
@@ -453,56 +446,50 @@ class Engine implements ServeEngine {
     const timer = setTimeout(() => flight.stop("timeout"), left);
     const onAbort = () => flight.stop("abort");
     q.signal?.addEventListener("abort", onAbort, { once: true });
-    let lease: { conn: DuckDBConnection; asOf: string } | null = null;
+    let lease: { worker: QueryWorker; asOf: string } | null = null;
     try {
       try {
         lease = await copy.take();
       } catch {
         return null;
       }
-      const data = await this.answer(lease.conn, flight, q, arrived);
+      const data = await this.answer(lease.worker, flight, q, arrived);
       return { ...data, stale: true, asOf: lease.asOf };
     } catch (e) {
-      if (flight.reason) throw this.stopError(flight.reason);
-      throw mapQueryError(e, "serve");
+      throw this.queryError(e, flight);
     } finally {
       clearTimeout(timer);
       q.signal?.removeEventListener("abort", onAbort);
       if (lease) {
-        copy.give(lease.conn);
+        copy.give();
+        this.ended(lease.worker);
         if (count) this.countQuery();
       }
       flight.release();
     }
   }
 
-  /** The gate, then the statement, fully materialized and rendered; the statement is destroyed as it settles. */
-  private async answer(conn: DuckDBConnection, flight: Flight, q: ServeQuery, arrived: number): Promise<ServeQueryData> {
-    flight.attach(conn);
+  /** The query in `worker`: the gate, the statement streamed within the limits, the rows as the client parses them.
+   *  A flight that cannot be stopped by interrupts is ended by killing the worker (Flight.stop, stuckAfterMs). */
+  private async answer(worker: QueryWorker, flight: Flight, q: ServeQuery, arrived: number): Promise<ServeQueryData> {
+    const id = ++this.seq;
+    flight.attach({ interrupt: () => worker.interrupt(id), abandon: () => void worker.kill() });
     flight.checkpoint();
-    await assertOneSelect(conn, q.sql, { profile: "serve", protect: [this.project.paths.stateDir] });
-    flight.checkpoint();
-    let stmt: DuckDBPreparedStatement;
-    try {
-      stmt = await conn.prepare(q.sql);
-    } catch (e) {
-      throw mapQueryError(e, "serve");
-    }
-    try {
-      flight.checkpoint();
-      if (q.params.length) stmt.bind(q.params.map(toDuck));
-      // Materialized, never streamed: a partly read stream keeps the file locked [V]. At most limit + 1 rows are
-      // converted to JavaScript; more than `limit` is an error, never a partial result.
-      const reader = await stmt.runAndReadUntil(q.limit + 1);
-      if (reader.currentRowCount > q.limit) throw tooManyRows(q.limit, { via: "read server" });
-      const columns = resultColumns(reader);
-      const rows = this.wireRows(renderRows(reader, { mode: "json", timezone: this.project.timezone }), q.limit);
-      return { columns, rows, rowCount: rows.length, tookMs: Math.round(performance.now() - arrived) };
-    } finally {
-      try {
-        stmt.destroySync();
-      } catch {}
-    }
+    const a = await worker.query(id, { sql: q.sql, params: q.params, limit: q.limit, maxRows: this.maxRows, maxBytes: this.maxBytes });
+    const rows = JSON.parse(a.rowsJson) as ServeQueryData["rows"];
+    return { columns: a.columns, rows, rowCount: a.rowCount, tookMs: Math.round(performance.now() - arrived) };
+  }
+
+  /** What a failed query reports: why it was stopped, if it was; the worker going away under it; or its own error. */
+  private queryError(e: unknown, flight: Flight): unknown {
+    if (flight.reason) return this.stopError(flight.reason);
+    if (e instanceof WorkerGone) return this.restarted(e);
+    if (e instanceof WorkerStopped) return this.stopError("stop"); // never asked for; defensive
+    return mapQueryError(e, "serve");
+  }
+
+  private ended(worker: QueryWorker | null): void {
+    if (worker) this.hooks.queryEnded?.({ workerPid: worker.pid, workerPeakRss: worker.peakRss, at: Date.now() });
   }
 
   close(): Promise<void> {
@@ -511,12 +498,16 @@ class Engine implements ServeEngine {
       this.watch.stop();
       this.admission.close(this.stopError("stop"));
       this.copyAdmission.close(this.stopError("stop"));
-      // No grace: the server is going away.
+      // No grace: the server is going away. Queries that interrupts cannot stop are ended with their worker.
       for (const f of [...this.admission.active, ...this.copyAdmission.active]) f.stop("stop");
       await Promise.all([this.admission.idle(), this.copyAdmission.idle()]);
-      this.copy?.close();
-      await this.transition; // an open or a step-aside in progress sees `stopped` and leaves the rest to us
-      this.release("stop");
+      await this.copy?.stop();
+      void this.opening?.kill(); // an open in progress fails and leaves the rest to us
+      await this.transition;
+      await this.release("stop");
+      const spare = this.spare;
+      this.spare = null;
+      await spare?.kill();
       this.state = "stopped";
       this.intent = null;
     })();
@@ -560,74 +551,87 @@ class Engine implements ServeEngine {
     this.admission.pause();
     // Queries waiting for a slot go to the read copy rather than wait out the write.
     if (this.copyServes()) this.admission.fail(this.toCopy);
+    this.copy?.keepWarm(true);
     this.hooks.steppingAside?.({ intent, at: Date.now() });
+    // Stuck queries are ended with the worker after killAfterMs (Flight.stop), so this always finishes.
     await drain(this.admission, { graceMs: this.graceMs, reason: "write" });
     if (this.stopped) return; // close() releases the file
-    this.release("write");
+    await this.release("write");
     this.state = "closed_for_write";
+    this.spare ??= this.spawn(); // the next open only has to open the file
   }
 
-  /** Steps 3–5: every statement is already destroyed (each query destroys its own as it settles); disconnect
-   *  every connection, then close the one handle. */
-  private release(reason: CloseReason): void {
-    this.pool.dropAll();
-    const instance = this.instance;
-    if (!instance) return;
-    this.instance = null;
-    this.hooks.beforeClose?.({ openConnections: this.pool.open, reason, at: Date.now() });
-    instance.closeSync();
+  /** Steps 3–4: disconnect every connection, then kill the worker and wait for its exit. */
+  private async release(reason: CloseReason): Promise<void> {
+    const worker = this.worker;
+    if (!worker) return;
+    this.worker = null;
+    const open = await worker.disconnect(SERVE_DEFAULTS.disconnectWaitMs);
+    this.hooks.beforeClose?.({ openConnections: open, reason, at: Date.now() });
+    await worker.kill();
     this.hooks.released?.({ intent: reason === "write" ? this.intent : null, reason, at: Date.now() });
   }
 
   private async reopen(): Promise<void> {
     this.state = "reopening";
-    if (!existsSync(this.path)) { // a stat: never opens the file
+    if (!existsSync(this.live.path)) { // a stat: never opens the file
       this.block(this.notFound());
       this.retryAt = Date.now() + this.pollMs;
       return;
     }
-    let instance: DuckDBInstance;
+    const worker = this.spare?.alive ? this.spare : this.spawn();
+    this.spare = null;
+    this.opening = worker;
     try {
-      instance = (await openInstance(this.path, "read_only")).instance;
+      await worker.open(this.live);
     } catch (e) {
-      const conflict = lockConflict(e);
-      if (conflict) {
+      this.opening = null;
+      if (this.stopped) {
+        void worker.kill();
+        return;
+      }
+      if (e instanceof WorkerConflict) {
         // A program without an intent holds it: a GUI, or a writer that withdrew its intent because of one.
-        // The file exists and will open once it lets go: queries wait rather than fail.
-        this.foreign = { program: conflict.program, pid: conflict.pid };
+        // The file exists and will open once it lets go: queries wait rather than fail. The worker opened
+        // nothing, so it tries again.
+        this.spare = worker;
+        this.foreign = { program: e.program, pid: e.pid };
         this.blocked = null;
         this.retryAt = Date.now() + backoffMs(this.attempts++);
         return;
       }
-      this.block(this.unreadable(e));
+      void worker.kill();
+      this.block(e instanceof CroftError ? e : e instanceof WorkerGone ? this.workerFailed(e) : this.unreadable(e));
       this.retryAt = Date.now() + 1000;
       return;
     }
-    this.instance = instance;
+    this.opening = null;
+    this.worker = worker;
     this.foreign = null;
     this.attempts = 0;
     if (this.stopped) return; // close() releases it
-    try {
-      // Refuse a database from a newer croft before serving it (DB_NEWER_FORMAT), as every croft read does.
-      const conn = await this.pool.take(instance, this.spec, this.path);
-      try {
-        await checkFormat(sqlOn(conn, this.project.timezone));
-      } finally {
-        this.pool.give(conn, true);
-      }
-    } catch (e) {
-      if (this.stopped) return;
-      this.release("error");
-      this.block(e instanceof CroftError ? e : this.unreadable(e));
-      this.retryAt = Date.now() + 1000;
-      return;
-    }
-    if (this.stopped) return;
     this.blocked = null;
     this.state = "open";
+    this.copy?.keepWarm(false);
     this.hooks.opened?.({ at: Date.now() });
     // A writer that announced itself while the file opened goes first: the next tick steps aside at once.
     if (this.watch.candidates().length === 0) this.admission.resume();
+  }
+
+  private spawn(): QueryWorker {
+    return QueryWorker.spawn({ onExit: (w) => this.exited(w) });
+  }
+
+  /** A worker exited. While it served (a stuck query's kill, the OOM killer, a crash), the file is reopened in a
+   *  new one; its queries have failed already. A handoff or a stop releases its worker itself. */
+  private exited(w: QueryWorker): void {
+    if (w === this.spare) this.spare = null;
+    if (w !== this.worker || this.state !== "open" || this.stopped) return;
+    this.worker = null;
+    this.admission.pause();
+    this.state = "reopening";
+    this.retryAt = 0;
+    this.tick();
   }
 
   private block(err: CroftError): void {
@@ -636,27 +640,6 @@ class Engine implements ServeEngine {
   }
 
   // ---- results ------------------------------------------------------------------------------------------
-
-  /**
-   * Rows exactly as the client will parse them (-0 is 0, as direct mode returns them: read/select.ts wireSafe),
-   * within serve.maxBytes of JSON. A bigger result is QUERY_TOO_MANY_ROWS, never a truncated one.
-   */
-  private wireRows(rows: Row[], limit: number): Row[] {
-    let bytes = 0;
-    for (let i = 0; i < rows.length; i++) {
-      const r = wireSafe(rows[i]) as Row;
-      bytes += Buffer.byteLength(JSON.stringify(r)) + 1;
-      if (bytes > this.maxBytes) {
-        throw new CroftError("QUERY_TOO_MANY_ROWS", {
-          message: `the result is larger than serve.maxBytes (${this.maxBytes.toLocaleString("en-US")} bytes); croft never returns a partial result`,
-          hint: "select fewer or smaller columns, filter or aggregate in SQL, or raise serve.maxBytes in croft.json",
-          retryable: false,
-          details: { maxBytes: this.maxBytes, limit, rowsWithinMaxBytes: i, via: "read server" },
-        });
-      }
-    }
-    return rows;
-  }
 
   private countQuery(): void {
     const key = this.dayKey();
@@ -726,6 +709,27 @@ class Engine implements ServeEngine {
     });
   }
 
+  /** A query refused because maxQueued already wait. */
+  private queueFull(copy: boolean): CroftError {
+    if (this.stopped) return this.stopError("stop");
+    return new CroftError("SERVE_UNAVAILABLE", {
+      message: `${this.maxQueued} queries are already waiting for croft's read server${copy ? " (answering from the read copy)" : this.intent ? ` (${this.writer(this.intent)} is writing)` : ""}; this one was not queued`,
+      hint: "retry after Retry-After; send fewer queries at once, or make them cheaper (filter or aggregate in SQL) so the slots free up sooner",
+      retryable: true,
+      details: { reason: "busy", retryAfterMs: SERVE_DEFAULTS.retryAfterMs, maxQueued: this.maxQueued, maxConcurrent: this.maxConcurrent },
+    });
+  }
+
+  /** A query that ran in a worker which went away under it (killed for another, stuck query, or crashed). */
+  private restarted(e: WorkerGone | null): CroftError {
+    return new CroftError("SERVE_UNAVAILABLE", {
+      message: "croft's read server restarted its query worker while this query ran (to end another query that interrupts could not stop, or after a crash); it returned nothing",
+      hint: "retry after Retry-After; if it keeps failing, the query itself may be too heavy: filter or aggregate in SQL",
+      retryable: true,
+      details: { reason: "restarted", retryAfterMs: SERVE_DEFAULTS.retryAfterMs, worker: e?.message ?? null },
+    });
+  }
+
   /** What a stopped query (or a request refused because the server stops) reports. */
   private stopError(reason: StopReason): CroftError {
     const retryAfterMs = SERVE_DEFAULTS.retryAfterMs;
@@ -780,6 +784,16 @@ class Engine implements ServeEngine {
       details: { database: this.project.paths.database, duckdb: first },
     });
   }
+
+  /** The query worker could not start (or died while opening the file). */
+  private workerFailed(e: WorkerGone): CroftError {
+    return new CroftError("INTERNAL_ERROR", {
+      message: `croft serve could not start its query worker: ${e.message}`,
+      hint: "run croft doctor to check the installation; croft serve retries every second; if it keeps failing, report this croft bug with the message",
+      fix: { kind: "command", description: "check croft's installation", command: "croft doctor" },
+      details: { database: this.project.paths.database, worker: e.message },
+    });
+  }
 }
 
 /** Hooks that cannot break the engine: one that throws is ignored (a handoff must always finish). */
@@ -795,16 +809,4 @@ function guarded(h: ServeEngineHooks): ServeEngineHooks {
     }
   }
   return out;
-}
-
-/** A minimal Sql over one connection, for db/state.ts's format check. */
-function sqlOn(conn: DuckDBConnection, timezone: string): Sql {
-  return {
-    async all<T>(sql: string, params: unknown[] = []): Promise<T[]> {
-      return renderRows(await conn.runAndReadAll(sql, params.map(toDuck)), { mode: "ts", timezone }) as T[];
-    },
-    async exec(sql: string, params: unknown[] = []): Promise<void> {
-      await conn.run(sql, params.map(toDuck));
-    },
-  };
 }

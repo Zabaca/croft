@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import type { Problem } from "../core/types.ts";
 import { ingest, transform } from "../index.ts";
@@ -479,6 +479,89 @@ describe("fingerprint", () => {
     write(root,{ "node_modules/leftpad/package.json": JSON.stringify({ name: "leftpad", version: "1.0.1", main: "index.js" }) });
     const b = await tsFingerprint(join(root, "assets/padded.ts"), { root, timezone: TZ });
     expect(b).not.toBe(a.codeHash);
+  });
+
+  // A local package (a workspace package, `bun link`, a "file:" or "link:" dependency) is a symlink in node_modules to
+  // code of the user's own. Its version never changes with an edit, so its code counts, as lib/'s does (R32-04).
+  const SHARED_INDEX = `// shared helpers
+import pad from "leftpad";
+import { tag } from "./tag.ts";
+export async function* fetchIssues() { yield [{ id: 1, title: pad(tag("real issue 1"), 3) }]; }
+`;
+  const SHARED_TAG = `export const tag = (s: string) => s.trim();\n`;
+  const USES_SHARED = `import { ingest } from "@zabaca/croft";\nimport { fetchIssues } from "@acme/shared";\nexport default ingest({ key: "id", rows: fetchIssues });\n`;
+  const LEFTPAD = {
+    "node_modules/leftpad/package.json": JSON.stringify({ name: "leftpad", version: "1.0.0", main: "index.js" }),
+    "node_modules/leftpad/index.js": "module.exports = (s, n) => s.padStart(n);\n",
+  };
+
+  /** A project whose node_modules/@acme/shared links to `shared` (outside the project, as in a monorepo, or inside). */
+  function linkedProject(where: "outside" | "inside"): { root: string; shared: string } {
+    const root = project({ "assets/issues.ts": USES_SHARED, ...LEFTPAD });
+    const ws = join(base, `ws${n++}`);
+    const shared = where === "inside" ? join(root, "shared") : join(ws, "packages", "shared");
+    // Outside, the package finds its own dependencies in its workspace's node_modules.
+    if (where === "outside") write(ws, LEFTPAD);
+    mkdirSync(shared, { recursive: true });
+    writeFileSync(join(shared, "package.json"), JSON.stringify({ name: "@acme/shared", version: "1.0.0", type: "module", main: "index.ts" }));
+    writeFileSync(join(shared, "index.ts"), SHARED_INDEX);
+    writeFileSync(join(shared, "tag.ts"), SHARED_TAG);
+    mkdirSync(join(root, "node_modules", "@acme"), { recursive: true });
+    symlinkSync(shared, join(root, "node_modules", "@acme", "shared"));
+    return { root, shared };
+  }
+
+  for (const where of ["outside", "inside"] as const) {
+    test(`a linked local package (${where} the project) counts by its code: an edit changes the hash, a comment does not`, async () => {
+      const { root, shared } = linkedProject(where);
+      const entry = join(root, "assets/issues.ts");
+      const before = await tsFingerprint(entry, { root, timezone: TZ });
+      const a = await load(root, "issues");
+      expect(a.problems).toEqual([]);
+      expect(a.codeHash).toBe(before);
+      // The package is the project's code: no version of it; the registry package it imports keeps its version.
+      expect(a.packages).toEqual({ leftpad: "1.0.0" });
+      writeFileSync(join(shared, "index.ts"), `/* documented */\n${SHARED_INDEX.replace("// shared helpers", "// shared helpers, with notes")}`);
+      writeFileSync(join(shared, "tag.ts"), `// trims\n${SHARED_TAG}`);
+      expect(await tsFingerprint(entry, { root, timezone: TZ })).toBe(before);
+      // A debugging fixture in a file the package imports (DESIGN §6): the version is still 1.0.0.
+      writeFileSync(join(shared, "tag.ts"), `export const tag = (_s: string) => "test";\n`);
+      const edited = await tsFingerprint(entry, { root, timezone: TZ });
+      expect(edited).not.toBe(before);
+      expect((await load(root, "issues")).codeHash).toBe(edited);
+      writeFileSync(join(shared, "tag.ts"), SHARED_TAG);
+      writeFileSync(join(shared, "index.ts"), SHARED_INDEX.replace("real issue 1", "test"));
+      expect(await tsFingerprint(entry, { root, timezone: TZ })).not.toBe(before);
+    });
+  }
+
+  test("a linked package's files are the asset's local files (root-relative), for what caches its hash", async () => {
+    const { root, shared } = linkedProject("outside");
+    const a = await load(root, "issues");
+    const up = relative(root, shared).split(sep).join("/");
+    expect(a.localFiles).toEqual(["assets/issues.ts", `${up}/index.ts`, `${up}/tag.ts`]);
+    for (const f of a.localFiles) expect(existsSync(join(root, f))).toBe(true);
+  });
+
+  test("a linked package that opens the database is ASSET_OPENS_DATABASE, and never imported", async () => {
+    const { root, shared } = linkedProject("outside");
+    writeFileSync(join(shared, "tag.ts"), `import { DuckDBInstance } from "@duckdb/node-api";\nexport const tag = (s: string) => String(DuckDBInstance) + s;\n`);
+    const a = await load(root, "issues");
+    expect(codes(a.problems)).toEqual(["ASSET_OPENS_DATABASE"]);
+    expect(a.definition).toBeUndefined();
+  });
+
+  test("a registry package installed as a link into node_modules (isolated installs) still counts by its version", async () => {
+    const root = project({
+      "assets/padded.ts": `import { transform } from "@zabaca/croft";\nimport pad from "leftpad";\nexport default transform({ inputs: ["a"], async *rows() { yield { v: pad("x", 3) }; } });\n`,
+      "node_modules/.bun/leftpad@1.0.0/node_modules/leftpad/package.json": JSON.stringify({ name: "leftpad", version: "1.0.0", main: "index.js" }),
+      "node_modules/.bun/leftpad@1.0.0/node_modules/leftpad/index.js": "module.exports = (s, n) => s.padStart(n);\n",
+    });
+    symlinkSync(join(root, "node_modules/.bun/leftpad@1.0.0/node_modules/leftpad"), join(root, "node_modules/leftpad"));
+    const a = await load(root, "padded");
+    expect(a.packages).toEqual({ leftpad: "1.0.0" });
+    write(root, { "node_modules/.bun/leftpad@1.0.0/node_modules/leftpad/index.js": "module.exports = (s, n) => s.padEnd(n);\n" });
+    expect((await load(root, "padded")).codeHash).toBe(a.codeHash!);
   });
 
   test("a file that does not compile throws ASSET_INVALID", async () => {

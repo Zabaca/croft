@@ -90,6 +90,13 @@
           "maximum": 9007199254740991,
           "default": 67108864
         },
+        "maxRows": {
+          "description": "most rows one answer carries, whatever limit asks; more fail with QUERY_TOO_MANY_ROWS",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000000,
+          "default": 100000
+        },
         "allowOrigins": {
           "description": "browser origins allowed to call the read server, e.g. \"http://localhost:3000\"",
           "type": "array",
