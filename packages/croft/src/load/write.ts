@@ -6,6 +6,8 @@
 //   read state   _croft.assets/columns, the real table; OUT_OF_BAND_CHANGE, TABLE_MODIFIED_OUTSIDE_CROFT
 //   KEY_NULL     before anything is written; transforms (sql, ts): a duplicate key is CHECK_FAILED unique(key)
 //   drift        COLUMN_STOPPED_ARRIVING and JSON_KIND_CHANGED need the table as it was (not for sql)
+//   pins         ingests: a pin that differs from its column's stored type retypes the column first, when no stored
+//                value changes (else PIN_CHANGES_DATA; runIngest asks before it fetches: load/config-change.ts)
 //   evolve       all DDL (CREATE / ADD COLUMN / ALTER TYPE) before any DML on the table; a SQL transform's
 //                SELECT defines its table instead (see "SQL transforms" below)
 //   source       the batch aligned to the table's columns, deduplicated by key: highest typed cursor,
@@ -52,6 +54,7 @@ import { type InstantInput, now as clockNow, toEpochMicros } from "../core/time.
 import { ensureState } from "../db/state.ts";
 import { assertNoShrink, detectOutOfBand, type ExtractInfo, isoMicros, readStoredColumns, type StoredColumn, tableStats,
   compareSchema } from "../safety/guards.ts";
+import { type AppliedPins, applyPinChanges } from "./config-change.ts";
 import { RESERVED, type TypedBatch, type WriteTarget } from "./contract.ts";
 import { detectSinceIgnored, nextCursor, resolveCursorType } from "./cursor.ts";
 import { currentDatabase, type EvolveResult, evolveTable, isReservedColumn, normalizeType, quoteIdent, quoteLiteral, type RealColumn,
@@ -233,6 +236,7 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
 
   let evo: EvolveResult;
   let recreated = false;
+  let pinned: AppliedPins | null = null;
   if (kind === "sql") {
     // The SELECT defines the table: create it, keep it, or recreate it with the new shape (DDL, before any DML).
     ({ evo, recreated } = await sqlShape(tx, { ref, db, asset, temp: batch.temp, plans: batch.columns, existed: before.exists }));
@@ -242,8 +246,10 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
       warnings.push(...(await stoppedArriving(tx, ref, asset, before, present, rowsIn, input.readBy ?? {})));
     }
     warnings.push(...jsonKindChanges(asset, batch.columns, stored, before.columns));
+    // The pins in an ingest's code are authoritative: a changed pin retypes its column first (config-change.ts).
+    if (kind === "ingest") pinned = await applyPinChanges(tx, { asset, real: before.exists ? before.columns : null, stored, pins: input.pins, plans: batch.columns });
     // 3g: every ALTER before any DML.
-    evo = await evolveTable(tx, { table: asset, plans: batch.columns, batchColumns: batchCols });
+    evo = await evolveTable(tx, { table: asset, plans: pinned?.plans ?? batch.columns, batchColumns: batchCols });
   }
   for (const c of evo.changes) {
     if (c.kind === "widen" && !warned("TYPE_WIDENED", c.column)) {
@@ -252,6 +258,10 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
         hint: `stored values were kept exactly; SQL that reads ${c.column} now sees ${c.to}`, details: { column: c.column, from: c.from, to: c.to },
       }));
     }
+  }
+  if (pinned) {
+    evo.changes.unshift(...pinned.changes);
+    warnings.push(...pinned.warnings);
   }
   const dataCols = evo.columns.filter((c) => !sameName(c.name, RESERVED.loadedAt));
   const n = ++tempSeq;
@@ -321,7 +331,7 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
      VALUES ($1, $2, $3, CAST($4::JSON AS VARCHAR[]), $5, $6, $7, $8, $9, $10::TIMESTAMPTZ, $11::TIMESTAMPTZ, $12, $13::TIMESTAMPTZ, $14::TIMESTAMPTZ)`,
     [asset, kind, target.write, json(target.key), input.codeHash ?? state?.code_hash ?? null,
       input.behaviorHash ?? state?.behavior_hash ?? null, cursorValue, cursorType, cursorUnit,
-      changed ? stamp : us(state?.last_loaded_us ?? null), oob ? stamp : us(state?.last_replaced_us ?? null),
+      changed ? stamp : us(state?.last_loaded_us ?? null), oob || pinned?.replaced ? stamp : us(state?.last_replaced_us ?? null),
       after.rowCount, us(after.maxLoadedAtUs), stamp],
   );
   await writeColumns(tx, {

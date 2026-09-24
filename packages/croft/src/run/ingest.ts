@@ -13,6 +13,9 @@
 // the runner passes one only with --allow-shrink): granted → the table goes to the trash (its own commit), then the
 // write runs again with the guard off; pending → a confirmation token, nothing written; declined → SHRINK_GUARD. An
 // asset with allowShrink: true skips the question (the user decided in code) but not the trash.
+// A changed key, write mode, incremental field or pin is settled before anything is fetched (load/config-change.ts):
+// INGEST_CONFIG_CHANGED, or a confirmation (IngestInput.confirmChange, actions "convert_key" and "pin_change") that
+// trashes the table first and then converts or retypes it.
 // CROFT_FAULT=after_stage|before_commit|after_commit_before_sqlite|between_trash_and_drop kills the process at
 // that point (crash tests, DESIGN.md §10 "Crash tests").
 import { rmSync } from "node:fs";
@@ -28,6 +31,7 @@ import type { DuckWarehouse } from "../db/warehouse.ts";
 import { type CatalogAsset, type CatalogBase, getCatalog, putCatalog, readCatalogEntry } from "../history/catalog.ts";
 import { createHttp, displayUrl, excerpt, type HttpClient } from "../http/http.ts";
 import { buildTypedBatch } from "../load/cast.ts";
+import { settleConfig } from "../load/config-change.ts";
 import { RESERVED, type TypedBatch } from "../load/contract.ts";
 import { parseFrom, renderSince } from "../load/cursor.ts";
 import { isReservedColumn, quoteIdent, readTableSchema, tempRef } from "../load/evolve.ts";
@@ -38,9 +42,9 @@ import { writeBatch, type WriteResult } from "../load/write.ts";
 import { cursorTypeOfPin, trimStack } from "../project/ts-asset.ts";
 import { type ExtractInfo, isoMicros, readStoredColumns } from "../safety/guards.ts";
 import { plannedTrashPath, trashFailed, trashTable, type TrashEntry } from "../safety/trash.ts";
-import { backfillUnsupported, backfillWouldDuplicate, type PlannedStep } from "./plan.ts";
+import { backfillUnsupported, backfillWouldDuplicate, behaviorHash, type PlannedStep } from "./plan.ts";
 import { OwnTableQuery } from "./snapshot.ts";
-import type { StepInput } from "./step.ts";
+import type { ConfirmDecider, StepInput } from "./step.ts";
 
 export type Phase = "extract" | "write" | "checks";
 
@@ -171,6 +175,12 @@ export function shrinkImpact(stateDir: string, asset: string, rowsBefore: number
 export interface IngestInput extends StepInput {
   /** --from, as typed. */
   from?: string;
+  /** Asks whether a changed key or pin may rewrite stored rows (actions "convert_key", "pin_change";
+   *  load/config-change.ts). The runner passes one when a person started the run; without it such a change fails the
+   *  step (INGEST_CONFIG_CHANGED, PIN_CHANGES_DATA). */
+  confirmChange?: ConfirmDecider;
+  /** --rebuild: the table is rebuilt from scratch, so a changed behavior or pin needs no check of its own. */
+  rebuild?: boolean;
 }
 
 export interface IngestOutcome {
@@ -530,6 +540,9 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
   rmSync(stageDir, { recursive: true, force: true });
   const isFile = step.kind === "file";
 
+  // 0. A changed behavior or pin, before anything is fetched (load/config-change.ts).
+  const settled = await settleConfig(i, { started, hashWith: (w, k) => behaviorHash(w, k, step.incremental) });
+  if ("outcome" in settled) return settled.outcome;
   // 1. State, under a short read lease.
   const state = await readState(warehouse, asset, isFile, signal);
   // 2. since.
@@ -598,11 +611,12 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
   log.write(isFile ? `extracted ${files!.load.length} file(s)` : `extracted ${manifest!.rows} rows in ${manifest!.parts.length} part(s), ${progress.requests} request(s)`);
   fault("after_stage", i.fault);
 
-  const warnings: Problem[] = [...(files?.warnings ?? [])];
+  const warnings: Problem[] = [...settled.warnings, ...(files?.warnings ?? [])];
   const base = {
-    asset, reason: [step.reason, since.echo, held].filter(Boolean).join("; "), behavior: step.behavior,
-    attempt: i.attempt, maxAttempts: i.maxAttempts, schemaChanges: [] as SchemaChange[], checks: [],
+    asset, reason: [step.reason, since.echo, held, settled.note].filter(Boolean).join("; "), behavior: step.behavior,
+    attempt: i.attempt, maxAttempts: i.maxAttempts, schemaChanges: [...settled.schemaChanges] as SchemaChange[], checks: [],
     logsCommand: `croft logs ${asset}`, requests: progress.requests,
+    ...(settled.trashed ? { trashed: { path: settled.trashed.path, rows: settled.trashed.rows } } : {}),
   };
   if (files?.unchanged) {
     rmSync(stageDir, { recursive: true, force: true });
@@ -727,7 +741,7 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
   }));
   log.write(`wrote ${asset}: ${r.rows.added} added, ${r.rows.updated} updated, ${r.rows.unchanged} unchanged, ${r.rows.deleted} deleted; ${r.rows.total} rows`);
   const result: StepResult = {
-    ...base, status: "ok", requests: progress.requests, rows: r.rows, schemaChanges: r.schemaChanges, checks: r.checks,
+    ...base, status: "ok", requests: progress.requests, rows: r.rows, schemaChanges: [...base.schemaChanges, ...r.schemaChanges], checks: r.checks,
     ...(r.cursor ? { cursor: r.cursor } : {}),
     ...(trashed ? { trashed: { path: trashed.path, rows: trashed.rows } } : {}),
     ...(r.created ? { created: createdTable(out.catalog.columns) } : {}),
