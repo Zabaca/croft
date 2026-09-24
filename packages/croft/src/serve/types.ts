@@ -27,18 +27,22 @@ export interface ServeHealth {
 
 /**
  * The query engine behind croft serve (serve/instance.ts + handoff.ts + queue.ts implement it; server.ts only
- * speaks HTTP). It owns the read-only DuckDB instance, admits at most maxConcurrent queries, steps aside for
- * every live write intent (closing every connection before the file is released), and reopens when the
- * intents are gone.
+ * speaks HTTP). It owns the read-only DuckDB instance, held in a query worker process (serve/worker.ts) that it
+ * kills to release the file, admits at most maxConcurrent queries (at most maxQueued wait), steps aside for
+ * every live write intent within graceMs + killAfterMs whatever the queries do, and reopens when the intents
+ * are gone.
  */
 export interface ServeEngine {
   /**
-   * Run one SELECT (the serve gate: user tables, CTEs and a few harmless table functions), fully materialized
-   * and rendered like direct mode (json mode, project offset). Throws CroftError:
-   * - SERVE_UNAVAILABLE with details.retryAfterMs when not admitted within queueMs (a writer holds the file,
-   *   or the queue is full): server.ts answers 503 with Retry-After;
-   * - QUERY_TOO_MANY_ROWS beyond `limit` rows or serve.maxBytes;
-   * - QUERY_TIMEOUT-style interrupts at queryTimeoutMs, gate and SQL errors as `croft query` raises them.
+   * Run one SELECT (the serve gate: user tables, CTEs and a few harmless table functions), streamed within its
+   * limits and rendered like direct mode (json mode, project offset). Throws CroftError:
+   * - SERVE_UNAVAILABLE with details.retryAfterMs and details.reason "write" (a writer holds the file, or the
+   *   query was stopped for one), "busy" (not admitted within queueMs, or maxQueued already wait), "restarted"
+   *   (its worker was killed to end another query, or crashed), "unavailable" or "stopping": server.ts answers
+   *   503 with Retry-After;
+   * - QUERY_TOO_MANY_ROWS beyond `limit` rows (capped at maxRows) or serve.maxBytes;
+   * - TIMEOUT at queryTimeoutMs, INTERRUPTED when the request went away, gate and SQL errors as `croft query`
+   *   raises them.
    */
   query(q: ServeQuery): Promise<ServeQueryData>;
   status(): ServeEngineStatus;
@@ -89,4 +93,10 @@ export interface ServeEngineOptions {
   pollMs?: number;
   /** How long running queries may finish before they are interrupted for a writer. Default 2000. */
   graceMs?: number;
+  /** Queries that may wait for a slot; more are refused at once (503). Default 64. */
+  maxQueued?: number;
+  /** The most rows one answer carries, whatever `limit` asks (serve.maxRows). Default 100_000. */
+  maxRows?: number;
+  /** A stopped query that has not settled this long after its first interrupt is ended by killing its worker. Default 500. */
+  killAfterMs?: number;
 }

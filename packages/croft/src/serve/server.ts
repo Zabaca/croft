@@ -37,8 +37,8 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { CODES, CroftError, problem } from "../core/errors.ts";
 import type { Problem } from "../core/types.ts";
-import { buildEnvelope, redactProblem } from "../cli/render.ts";
-import { collectStatus, type StatusData } from "../cli/commands/status.ts";
+import { buildEnvelope, type Next, redactProblem } from "../cli/render.ts";
+import { collectStatus, type StatusData, statusNext } from "../cli/commands/status.ts";
 import { CROFT_VERSION } from "../cli/version.ts";
 import { now } from "../core/time.ts";
 import { didYouMean } from "../project/suggest.ts";
@@ -391,11 +391,11 @@ class Handler {
     }
     const data: StatusData & { serve: ReturnType<Handler["serveInfo"]> } = { ...state.data, serve: this.serveInfo() };
     const problems = [...state.problems, ...state.edited, ...state.scheduling].map((p) => redactProblem(p, this.o.redact));
-    return json(200, this.envelope("status", data, started, problems), cors);
+    return json(200, this.envelope("status", data, started, problems, statusNext(state.data.assets)), cors);
   }
 
-  private envelope<T>(command: string, data: T, started: number, problems: Problem[] = []) {
-    return buildEnvelope({ command, data, problems, next: [], ...this.o.envelopeMeta(), durationMs: performance.now() - started });
+  private envelope<T>(command: string, data: T, started: number, problems: Problem[] = [], next: Next[] = []) {
+    return buildEnvelope({ command, data, problems, next, ...this.o.envelopeMeta(), durationMs: performance.now() - started });
   }
 
   private refusal(command: string, r: Refusal, started: number, cors: Record<string, string>): Response {

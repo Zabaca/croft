@@ -16,6 +16,7 @@
 // read it, the last heartbeat and whether it is stale (SCHEDULER_STALE, with the diagnosis), holds that need a
 // human (SCHEDULE_HELD), and fire times in words. doctor imports it, so it must never import DuckDB or asset code:
 // the scheduler's view of the assets is imported only when it is asked for.
+import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { userInfo } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
@@ -483,6 +484,22 @@ function jobEnv(env: Env): Env {
 }
 
 /**
+ * The home folder of the user this process runs as, from the password database. Bun's os.userInfo() answers with
+ * $HOME (Node's reads the password database), so under Bun a test that sets HOME to a temp folder would look like
+ * the real user: a Bun child started without HOME is asked instead. userInfo() when that child cannot answer.
+ */
+export function passwdHome(): string {
+  try {
+    const r = spawnSync(process.execPath, ["-e", "process.stdout.write(require('node:os').userInfo().homedir)"], {
+      env: {}, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"],
+    });
+    const home = r.status === 0 ? r.stdout.trim() : "";
+    if (home.startsWith("/")) return home;
+  } catch { /* fall back below */ }
+  return userInfo().homedir;
+}
+
+/**
  * Tests must never touch the real ~/.croft: with CROFT_FORBID_OS_JOBS=1 (tests/preload.ts), a croft folder or home
  * that is the real user's is refused before the registry or the job is written.
  */
@@ -490,7 +507,7 @@ export function guardRealHome(home: CroftHome, env: Env): void {
   if (env.CROFT_FORBID_OS_JOBS !== "1" && process.env.CROFT_FORBID_OS_JOBS !== "1") return;
   let real: string;
   try {
-    real = resolve(userInfo().homedir);
+    real = resolve(passwdHome());
   } catch {
     return;
   }

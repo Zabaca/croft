@@ -71,7 +71,7 @@ describe("loadProject", () => {
     expect(p.config).toEqual({
       database: "warehouse.duckdb", timezone: "Asia/Tokyo", readCopy: false,
       notify: { desktop: true, webhook: null }, concurrency: 4,
-      serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 30000, maxConcurrent: 4, maxBytes: 67108864, allowOrigins: [] },
+      serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 30000, maxConcurrent: 4, maxBytes: 67108864, maxRows: 100000, allowOrigins: [] },
       stateDir: null,
     });
     expect(p.paths).toEqual({

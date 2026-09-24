@@ -4,18 +4,16 @@
 // waiting for each run it starts. Along the way: a new asset is held until it is run by hand, the transform
 // updates in the same scheduled run, an edit holds the ingest again, a pause stops the ticks for two hours, missed
 // hours run once, and status, doctor, context and describe show all of it.
-import { afterAll, beforeAll, describe, expect } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  bugTest, cleanupAll, type Envelope, initProject, json, laTime, type MockApi, mockApi, schedulerEnv, show,
+  cleanupAll, type Envelope, initProject, json, laTime, type MockApi, mockApi, schedulerEnv, show,
 } from "./harness.ts";
 
-// `croft schedule on|off` refuses in every croft process started with a temp HOME while CROFT_FORBID_OS_JOBS=1
-// (INTERNAL_ERROR "refusing to change the scheduler of the real user"): under Bun, os.userInfo().homedir answers
-// $HOME, so guardRealHome (cli/commands/schedule.ts) takes the temp HOME for the real user's. The fix is in T3's
-// needed_shared_changes. Until it lands this journey is a bugTest(); CROFT_E2E_BUGS=1 runs it as a plain test.
-const scheduleTest = bugTest;
+// `croft schedule on|off` once refused in every croft process started with a temp HOME under CROFT_FORBID_OS_JOBS=1
+// (Bun's os.userInfo() answers $HOME); guardRealHome now asks the password database (schedule.ts passwdHome).
+const scheduleTest = test;
 
 let api: MockApi;
 beforeAll(() => {

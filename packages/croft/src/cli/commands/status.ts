@@ -594,11 +594,18 @@ export async function runStatus(ctx: Ctx, deps: StatusDeps = {}): Promise<Comman
   const state = await collectStatus(project, ctx.now(), { home: deps.home ?? croftHome(ctx.processEnv), ...(deps.scheduleView ? { scheduleView: deps.scheduleView } : {}) });
   const check = ctx.values.check === true;
   const unhealthy = !state.data.healthy;
-  const next: Next[] = state.data.assets
+  const next = statusNext(state.data.assets);
+  return { data: state.data, problems: [...state.problems, ...state.edited, ...state.scheduling], next, ok: true, exit: check && unhealthy ? 1 : 0 };
+}
+
+/** next[] of the status envelope: the failed assets' logs, a dry run for the stale ones, a run for the held ones.
+ *  croft serve's GET /status answers with the same. */
+export function statusNext(assets: readonly StatusAsset[]): Next[] {
+  const next: Next[] = assets
     .filter((a) => FAILED.has(a.status))
     .slice(0, 3)
     .map((a) => ({ command: `croft logs ${a.asset} --failed`, reason: `${a.asset} ${a.status}${a.lastRun?.code ? ` (${a.lastRun.code})` : ""}` }));
-  const stale = staleForNext(state.data.assets).map((a) => a.asset);
+  const stale = staleForNext(assets).map((a) => a.asset);
   if (stale.length) {
     const names = stale.length > 5 ? `${stale.slice(0, 5).join(", ")}, …` : stale.join(", ");
     next.push({
@@ -606,10 +613,10 @@ export async function runStatus(ctx: Ctx, deps: StatusDeps = {}): Promise<Comman
       reason: `${stale.length} asset${stale.length === 1 ? " is" : "s are"} stale (${names}): see what a run would update and why`,
     });
   }
-  for (const a of state.data.assets.filter((x) => x.held && x.hold?.code === "SCHEDULE_HELD").slice(0, 3)) {
+  for (const a of assets.filter((x) => x.held && x.hold?.code === "SCHEDULE_HELD").slice(0, 3)) {
     next.push({ command: `croft run ${a.asset}`, reason: `releases it for the scheduler (${a.hold!.reason})` });
   }
-  return { data: state.data, problems: [...state.problems, ...state.edited, ...state.scheduling], next, ok: true, exit: check && unhealthy ? 1 : 0 };
+  return next;
 }
 
 /** The STATUS column: the state plus the notes that matter (§4.2). */

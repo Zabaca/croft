@@ -4,16 +4,16 @@
 // a desktop notification is recorded (CROFT_NOTIFY_DRY: <state>/logs/notifications.ndjson), and the webhook in
 // croft.json receives the failure envelope, with the key redacted. The failure is not retried, not within the run
 // and not by the ticks that follow; a code fix and a run by hand clear it, and the next fire runs the fixed code.
-import { afterAll, beforeAll, describe, expect } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  bugTest, cleanupAll, type Envelope, initProject, json, laTime, type MockApi, mockApi, ndjson, schedulerEnv, show, until,
+  cleanupAll, type Envelope, initProject, json, laTime, type MockApi, mockApi, ndjson, schedulerEnv, show, until,
 } from "./harness.ts";
 
-// `croft schedule on` refuses under CROFT_FORBID_OS_JOBS=1 with a temp HOME (see j20): a bugTest() until the fix
-// in T3's needed_shared_changes lands; CROFT_E2E_BUGS=1 runs it as a plain test.
-const scheduleTest = bugTest;
+// `croft schedule on|off` once refused in every croft process started with a temp HOME under CROFT_FORBID_OS_JOBS=1
+// (Bun's os.userInfo() answers $HOME); guardRealHome now asks the password database (schedule.ts passwdHome).
+const scheduleTest = test;
 
 const KEY = "sk_live_j22SecretKey0123456789abcdef";
 let api: MockApi;

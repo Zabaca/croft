@@ -9,12 +9,12 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
-  bugTest, cleanupAll, type Envelope, initProject, json, laTime, type MockApi, mockApi, PKG, type Project, schedulerEnv, show, until,
+  cleanupAll, type Envelope, initProject, json, laTime, type MockApi, mockApi, PKG, type Project, schedulerEnv, show, until,
 } from "./harness.ts";
 
-// `croft schedule on` refuses under CROFT_FORBID_OS_JOBS=1 with a temp HOME (see j20): the scheduling part is a
-// bugTest() until the fix in T3's needed_shared_changes lands; CROFT_E2E_BUGS=1 runs it as a plain test.
-const scheduleTest = bugTest;
+// `croft schedule on|off` once refused in every croft process started with a temp HOME under CROFT_FORBID_OS_JOBS=1
+// (Bun's os.userInfo() answers $HOME); guardRealHome now asks the password database (schedule.ts passwdHome).
+const scheduleTest = test;
 
 let api: MockApi;
 let built: { code: number | null; out: string };
@@ -112,7 +112,7 @@ describe("journey 21: croft serve", () => {
 
     // A run writes while the server holds the file (its read-only instance is open): the server steps aside, the run
     // succeeds, the app sees the rows, and the server is open again.
-    const engine = async () => ((await (await fetch(`${rec.url}/status`, { headers: { Authorization: `Bearer ${rec.token}` } })).json()) as Envelope).data.engine;
+    const engine = async () => ((await (await fetch(`${rec.url}/status`, { headers: { Authorization: `Bearer ${rec.token}` } })).json()) as Envelope).data.serve.engine;
     expect(await engine()).toMatchObject({ state: "open", writeIntent: null });
     expect((await engine()).openConnections).toBeGreaterThan(0);
     state.orders.push({ id: 3, amount: 30 }, { id: 4, amount: 40 });

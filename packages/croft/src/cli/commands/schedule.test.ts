@@ -3,6 +3,7 @@
 // heartbeat), a fake HOME with CROFT_HOME under it, a unique CROFT_JOB_LABEL, CROFT_NOW, a heartbeat wait of a
 // fraction of a second, and a fake scheduler view (schedule/due.ts is another builder's).
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
@@ -18,7 +19,7 @@ import type { Command } from "../command.ts";
 import { COMMANDS } from "./index.ts";
 import { cleanup, cli, makeProject, type TestProject } from "./inspect-testkit.ts";
 import {
-  agoText, clockText, fireText, guardRealHome, homeShort, parseFor, readScheduling, runSchedule, schedule, type ScheduleDeps,
+  agoText, clockText, fireText, guardRealHome, homeShort, parseFor, passwdHome, readScheduling, runSchedule, schedule, type ScheduleDeps,
   schedulingJson, SINCE_KEY, spanText, staleProblem,
 } from "./schedule.ts";
 
@@ -299,10 +300,21 @@ describe("croft schedule on", () => {
   });
 
   test("under CROFT_FORBID_OS_JOBS, the real user's croft folder is refused before anything is written", () => {
-    const real = userInfo().homedir;
+    const real = passwdHome();
     expect(() => guardRealHome(croftHome({ HOME: real }), {})).toThrow(CroftError);
     expect(() => guardRealHome(croftHome({ HOME: userHome, CROFT_HOME: join(real, ".croft") }), {})).toThrow(/refusing to change the scheduler of the real user/);
     expect(() => guardRealHome(home, {})).not.toThrow();
+  });
+
+  test("a croft process whose HOME is a temp folder is not taken for the real user (Bun's os.userInfo() answers $HOME)", () => {
+    const script = `const { guardRealHome } = await import(${JSON.stringify(new URL("./schedule.ts", import.meta.url).href)});
+const { croftHome } = await import(${JSON.stringify(new URL("../../schedule/home.ts", import.meta.url).href)});
+guardRealHome(croftHome(process.env), process.env);
+process.stdout.write("allowed");`;
+    const r = spawnSync(process.execPath, ["-e", script], {
+      encoding: "utf8", env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: userHome, CROFT_HOME: home.dir, CROFT_FORBID_OS_JOBS: "1" },
+    });
+    expect(`${r.stdout}${r.stderr}`).toBe("allowed");
   });
 });
 
