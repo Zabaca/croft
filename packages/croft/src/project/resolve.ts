@@ -18,6 +18,10 @@
 // graph does not need its code, and `croft run x` never runs the top-level code of unrelated ingests. Every
 // SQL asset and every TS file that may be a transform is always loaded, since the graph needs their inputs.
 //
+// bindProject then binds every SQL asset in run order against empty tables with the columns the catalog mirror
+// has (sql/bind.ts ShadowCatalog): output columns, bind problems, and the unoptimized plan's scans, which it adds
+// to the inputs before building the graph again. The planner and validate use it.
+//
 // Also here, because resolving an asset decides them: selection (selectAssets) and write behavior (resolveWrite,
 // behaviorLabel, behaviorWords, behaviorHash). run/plan.ts re-exports them.
 import { readFileSync } from "node:fs";
@@ -29,6 +33,7 @@ import { captureImport, collectingSink, defaultOutputRedactor } from "../core/ou
 import type { AssetKind, Check, CursorType, Incremental, Problem, WriteMode } from "../core/types.ts";
 import { openMemory } from "../db/connect.ts";
 import type { StepKind } from "../run/plan.ts";
+import { type BindResult, ShadowCatalog } from "../sql/bind.ts";
 import { type DiscoveredAsset, discoverAssets } from "./discover.ts";
 import { ProjectEnv } from "./env.ts";
 import { buildGraph, type Graph } from "./graph.ts";
@@ -171,6 +176,82 @@ export async function resolveProject(i: ResolveInput): Promise<ResolvedProject> 
 
 function nodesOf(assets: readonly ResolvedAsset[]) {
   return assets.map((a) => ({ name: a.name, inputs: a.inputs, orderAfter: a.orderAfter, file: a.file }));
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// The bind check over a whole project (DESIGN.md §6 "Ways to try a change" 1, §3c "Dependencies")
+
+/** A column of an asset's table as the catalog mirror records it (history/catalog.ts CatalogColumn). */
+export interface KnownColumns { name: string; type: string; pending?: boolean }
+
+export interface BindProjectInput {
+  timezone: string;
+  /** Each asset's table as it is now (the catalog mirror's columns, _loaded_at and _file included), or null when
+   *  it was never built. */
+  columns: (asset: string) => readonly KnownColumns[] | null;
+  /** SQL assets rebuilt before the assets that read them, so those bind against the output the new SQL gives
+   *  rather than the table as it is. Default: every SQL asset (validate). A run passes the SQL assets it
+   *  rebuilds: the others keep their table, which is what their readers read. */
+  rebuilt?: (asset: string) => boolean;
+}
+
+export interface ProjectBind {
+  /** Each SQL asset that was bound, by name: loaded, and with no load error but SQL_SYNTAX (quoting a keyword may
+   *  fix it: QUOTE_IDENTIFIER), and not on or after a cycle. */
+  results: Map<string, BindResult>;
+  /** Every asset's inputs with the plan scans of its bind added (sql/deps.ts: table macros, PIVOT). */
+  inputs: Map<string, string[]>;
+  /** The graph again over those inputs, and its CYCLE problems. */
+  graph: Graph;
+  problems: Problem[];
+}
+
+/**
+ * Bind every SQL asset of a resolved project in run order (sql/bind.ts ShadowCatalog): each table read is an
+ * empty table with the columns the catalog mirror has for it (its pending columns passed on, for
+ * NULL_ONLY_COLUMN), or, for an SQL asset that is rebuilt first, the output its own bind gave. An asset whose
+ * bind failed, or whose table is unknown, has no shadow table: its readers get INPUT_NOT_BUILT (info). Never
+ * opens the warehouse.
+ */
+export async function bindProject(p: Pick<ResolvedProject, "assets" | "graph">, o: BindProjectInput): Promise<ProjectBind> {
+  const byName = new Map(p.assets.map((a) => [a.name, a]));
+  const rebuilt = o.rebuilt ?? ((n: string) => byName.get(n)?.kind === "sql");
+  const assetFiles = Object.fromEntries(p.assets.map((a) => [a.name, a.file]));
+  const pending: Record<string, string[]> = {};
+  const results = new Map<string, BindResult>();
+  const shadow = await ShadowCatalog.open(o.timezone);
+  try {
+    for (const name of p.graph.order) {
+      const a = byName.get(name);
+      if (!a) continue;
+      if (a.kind === "sql") {
+        const sql = a.sql;
+        const bindable = a.loaded && sql !== undefined && sql.problems.every((x) => x.severity !== "error" || x.code === "SQL_SYNTAX");
+        const r = bindable ? await shadow.bind(sql, { pending, assetFiles }) : null;
+        if (r) results.set(name, r);
+        if (rebuilt(name)) {
+          if (r?.outputColumns) await shadow.define(name, r.outputColumns);
+          continue;
+        }
+      }
+      const current = o.columns(name);
+      if (!current?.length) continue;
+      await shadow.define(name, current.map((c) => ({ name: c.name, type: c.type })));
+      const nulls = current.filter((c) => c.pending).map((c) => c.name);
+      if (nulls.length) pending[name] = nulls;
+    }
+  } finally {
+    shadow.close();
+  }
+  const inputs = new Map<string, string[]>();
+  const nodes = p.assets.map((a) => {
+    const scans = results.get(a.name)?.planInputs ?? [];
+    const all = [...new Set([...a.inputs, ...scans])];
+    inputs.set(a.name, all);
+    return { name: a.name, inputs: all, orderAfter: [...new Set([...a.orderAfter, ...scans])], file: a.file };
+  });
+  const { graph, problems } = buildGraph(nodes);
+  return { results, inputs, graph, problems };
 }
 
 /** The planner's step kind for an asset: sql, transform (a TS transform), file or rows (an ingest). A TS
@@ -362,7 +443,8 @@ export function behaviorLabel(write: WriteMode, key: readonly string[]): string 
   return key.length ? `replace; key ${key.join(", ")}` : "replace";
 }
 
-function lookbackWords(ms: number): string {
+/** A lookback in words: "30 days", "1 second". */
+export function lookbackWords(ms: number): string {
   const units: [number, string][] = [[86_400_000, "day"], [3_600_000, "hour"], [60_000, "minute"], [1000, "second"]];
   for (const [size, name] of units) {
     if (ms >= size && ms % size === 0) {
@@ -383,6 +465,8 @@ export function behaviorWords(write: WriteMode, key: readonly string[], incremen
     what = `fetches ${incremental.field} newer than the saved position${lb}${unit}`;
   } else if (incremental.kind === "files") {
     what = "loads new and changed files only; rows of deleted files are kept";
+  } else if (incremental.kind === "new-rows") {
+    what = "processes new and changed input rows once";
   } else what = "";
   if (write === "merge") return `updates rows by ${keyText}${what ? `; ${what}` : ""}`;
   if (write === "append") return `adds the new rows${what ? `; ${what}` : ""}`;

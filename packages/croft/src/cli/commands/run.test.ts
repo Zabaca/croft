@@ -7,6 +7,7 @@ import { DuckDBInstance } from "@duckdb/node-api";
 import { closeAllWarehouses } from "../../db/warehouse.ts";
 import { RunsDb } from "../../history/runs-db.ts";
 import { initProject } from "../../project/init.ts";
+import { cleanup as cleanupChildren, spawnHolder } from "../../read/testkit.ts";
 import { eventsPath, runExample } from "../../run/runner.ts";
 import { Confirmations } from "../../safety/confirm.ts";
 import { listTrash } from "../../safety/trash.ts";
@@ -17,6 +18,7 @@ import { formatRun, progressLine, userArgs } from "./run.ts";
 const api = mockApi();
 afterAll(async () => {
   api.stop();
+  cleanupChildren();
   await closeAllWarehouses();
   cleanupProjects();
 });
@@ -313,19 +315,74 @@ describe("--allow-shrink through the CLI", () => {
   }, 30_000);
 });
 
-describe("in-process command", () => {
-  // The phase-2 contract registers these flags with their final specs; builder P replaces the stub (and this test).
-  test("--dry-run, --only and --upstream refuse as PHASE_STUB until built, and nothing runs", async () => {
-    api.state.zones = [{ zone: 1 }];
-    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
-    for (const flag of ["--dry-run", "--only", "--upstream"]) {
-      const r = await inProcess(root, ["run", "zones", flag, "--foreground", "--json"]);
-      expect(r.json.problems[0], flag).toMatchObject({ code: "INTERNAL_ERROR" });
-      expect(r.json.problems[0].message).toStartWith("PHASE_STUB");
-    }
-    expect(withRuns(root, (db) => db.listRuns())).toEqual([]);
-    expect(api.state.log).toEqual([]);
+describe("--dry-run, --only and --upstream", () => {
+  const ZONE_PROJECT = () => ({
+    "assets/zones.ts": simpleGet(api.url, "/zones"),
+    "assets/zone_count.sql": "SELECT count(*) AS n FROM zones\n",
+    "assets/consts.sql": "SELECT 1 AS x\n",
   });
+
+  test("--dry-run plans from runs.sqlite in this process: nothing runs, and it answers while another process holds the warehouse", async () => {
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject(ZONE_PROJECT());
+    expect((await inProcess(root, ["run", "zones", "--only", "--foreground", "--json"])).exit).toBe(0);
+    const runs = withRuns(root, (db) => db.listRuns().length);
+    api.state.log.length = 0;
+    const holder = spawnHolder(join(root, "warehouse.duckdb"), 20_000);
+    await holder.waitFor("held");
+    try {
+      const started = performance.now();
+      const r = await inProcess(root, ["run", "--dry-run", "--json"]);
+      expect(performance.now() - started).toBeLessThan(5_000);
+      expect(r.exit).toBe(0);
+      expect(r.json).toMatchObject({ ok: true, command: "run", problems: [], next: [{ command: "croft run", reason: "run it" }] });
+      expect(r.json.data).toMatchObject({ dryRun: true, order: ["consts", "zones", "zone_count"] });
+      expect(r.json.data.steps.map((s: { asset: string; action: string; reason: string }) => [s.asset, s.action, s.reason])).toEqual([
+        ["consts", "rebuild", "never built"], ["zones", "fetch", "replace"], ["zone_count", "rebuild", "never built"],
+      ]);
+      // --only keeps the plan to the named assets; human output is one line per step (§4.2).
+      const only = await inProcess(root, ["run", "zones", "--dry-run", "--only"]);
+      expect(only.exit).toBe(0);
+      expect(only.stdout).toStartWith("fetch    zones            replace\ndry run: 1 of 1 step would run; nothing ran\n");
+      expect(only.stdout).toContain("croft run zones --only");
+    } finally {
+      holder.proc.kill("SIGKILL");
+    }
+    expect(withRuns(root, (db) => db.listRuns().length)).toBe(runs);
+    expect(api.state.log).toEqual([]);
+  }, 30_000);
+
+  test("a dry run carries no confirmation token; a bad selector is the run's own usage error", async () => {
+    const root = makeProject(ZONE_PROJECT());
+    const bad = await inProcess(root, ["run", "zonez", "--dry-run", "--json"]);
+    expect(bad.exit).toBe(2);
+    expect(bad.json.problems[0]).toMatchObject({ code: "USAGE_ERROR", hint: "did you mean zones?" });
+    const tr = await inProcess(root, ["run", "consts", "--dry-run", "--from", "-7d", "--json"]);
+    expect(tr.exit).toBe(2);
+    expect(tr.json.problems[0]).toMatchObject({ code: "BACKFILL_UNSUPPORTED", asset: "consts" });
+    const token = await main(["run", "zones", "--dry-run"], {
+      cwd: root, env: {}, stdinTTY: false, stdoutTTY: false, stderrTTY: false, stdout: () => {}, stderr: () => {},
+      dispatch: { confirmToken: "c_123456" },
+    });
+    expect(token).toBe(2);
+  });
+
+  test("--upstream fetches what the named asset reads when it was never built, in the detached child too", async () => {
+    api.state.zones = [{ zone: 1 }, { zone: 2 }];
+    const root = makeProject(ZONE_PROJECT());
+    const r = await cli(root, ["run", "zone_count", "--upstream", "--json"]);
+    expect(r.code).toBe(0);
+    expect(r.json!.data.steps.find((s: { asset: string }) => s.asset === "zones")).toMatchObject({ status: "ok", rows: { total: 2 } });
+    expect(await count(root, "zones")).toBe(2);
+    // Without it, zones is not the run's business: nothing is fetched.
+    api.state.log.length = 0;
+    const plain = await inProcess(root, ["run", "consts", "--foreground", "--json"]);
+    expect(plain.json.data.steps.find((s: { asset: string }) => s.asset === "zones")).toBeUndefined();
+    expect(api.state.log).toEqual([]);
+  }, 30_000);
+});
+
+describe("in-process command", () => {
 
   test("human output on a TTY-less foreground run", async () => {
     api.state.zones = [{ zone: 1, name: "a" }, { zone: 2, name: "b" }];
@@ -337,7 +394,9 @@ describe("in-process command", () => {
     // §4.2: the first run says it created the table.
     expect(lines[1]).toMatch(/^ok\s+zones\s+1 request, 2 rows \(\d+ ms\) · new table, 2 columns$/);
     expect(lines[2]).toContain("added 2 · updated 0 · unchanged 0 · 2 rows now");
-    expect(r.stdout).toMatch(/done \d+ ms · 1 updated · 0 failed\nchecks: not enforced until phase 2\n/);
+    // Phase 2 runs checks: the phase-1 "checks: not enforced" line is gone.
+    expect(r.stdout).toMatch(/done \d+ ms · 1 updated · 0 failed\n/);
+    expect(r.stdout).not.toContain("not enforced");
     expect(r.stdout).toContain('next: croft query "from zones limit 5"');
     const again = await inProcess(root, ["run", "zones", "--foreground"]);
     expect(again.stdout.split("\n")[1]).toMatch(/^ok\s+zones\s+1 request, 2 rows \(\d+ ms\)$/);
@@ -362,7 +421,7 @@ describe("in-process command", () => {
       api.state.log.length = 0;
       const r = await inProcess(root, ["run", "issues", ...from, "--foreground", "--json"]);
       expect(r.exit).toBe(0);
-      expect(r.json.data.checksEnforced).toBe(false);
+      expect(r.json.data).not.toHaveProperty("checksEnforced");
       expect(r.json.data.steps[0].reason).toMatch(/^requested; since: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}-0[78]:00\)$/);
       expect(api.state.log[0]!.query.since).toBeDefined();
     }
@@ -373,6 +432,26 @@ describe("in-process command", () => {
     expect(progressLine({ type: "retry", asset: "a", code: "HTTP_ERROR", nextRetryAt: "T" })).toBe("a: HTTP_ERROR; trying again at T");
     expect(progressLine({ type: "waiting", assets: ["a", "b"], heldBy: ["r_1"] })).toBe("waiting for a, b: held by run r_1");
     expect(progressLine({ type: "progress" })).toBeNull();
+    // With the plan's kinds, each step says what it does.
+    const kinds = new Map([["t", "sql"], ["u", "transform"], ["f", "file"]] as const);
+    expect(progressLine({ type: "step", asset: "t", status: "running", attempt: 1 }, kinds)).toBe("t: rebuilding…");
+    expect(progressLine({ type: "step", asset: "u", status: "running", attempt: 1 }, kinds)).toBe("u: running…");
+    expect(progressLine({ type: "step", asset: "f", status: "running", attempt: 1 }, kinds)).toBe("f: loading files…");
+  });
+
+  test("formatRun: the checks that ran (phase 2 evaluates them)", () => {
+    const text = formatRun({
+      runId: "r_0922_1015_k3f9", status: "succeeded",
+      steps: [{ asset: "open_issues", status: "ok", reason: "requested; SQL changed (assets/open_issues.sql)", behavior: "replace; key id", attempt: 1, maxAttempts: 3,
+        rows: { in: 4211, added: 3, updated: 12, unchanged: 4196, deleted: 0, total: 4211 }, schemaChanges: [],
+        checks: [{ check: "unique(id)", ok: true }, { check: "not_null(id)", ok: true }, { check: "id > 0", ok: false, failing: 2 }],
+        logsCommand: "croft logs open_issues", durationMs: 100 }],
+    });
+    expect(text.split("\n").slice(1, 4)).toEqual([
+      "ok       open_issues        4,211 rows (100 ms)",
+      "                            added 3 · updated 12 · unchanged 4,196 · 4,211 rows now · checks 2/3 ok",
+      "                            SQL changed (assets/open_issues.sql)",
+    ]);
   });
 
   test("formatRun: still running, failed and skipped steps", () => {
