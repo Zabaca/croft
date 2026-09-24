@@ -1,6 +1,6 @@
 # croft: design v1
 
-> **Status.** Final design for v1, dated 2026-09-22. It was produced by a design panel: four independent drafts (simplicity, AI operator, correctness and builder lenses), a synthesis, and three adversarial reviews (a non-data-engineer walking real journeys, Claude Code operating the tool, and a technical review backed by spikes). Claims are marked **[V]** when verified by a spike on Bun 1.3.14 with `@duckdb/node-api` 1.5.5-r.5 (DuckDB 1.5.5) on macOS arm64, and **[U]** when relied on but unverified. Appendix B lists the spikes. The working name during design was "tsdb"; the product is named **croft** (D52). **Phases 1 and 2 are complete** (§11) in `packages/croft`, with about 2,230 tests, including an end-to-end suite that drives the real CLI through 20 user journeys (`tests/e2e`). The document was brought in line with that code (`packages/croft/src`), which is the source of truth where the two differ, on 2026-09-23 for phase 1 and on 2026-09-24 for phase 2. Decisions the build refined carry a **Build:** note, and decisions it changed have their own entries from D54 on (§13).
+> **Status.** Final design for v1, dated 2026-09-22. It was produced by a design panel: four independent drafts (simplicity, AI operator, correctness and builder lenses), a synthesis, and three adversarial reviews (a non-data-engineer walking real journeys, Claude Code operating the tool, and a technical review backed by spikes). Claims are marked **[V]** when verified by a spike on Bun 1.3.14 with `@duckdb/node-api` 1.5.5-r.5 (DuckDB 1.5.5) on macOS arm64, and **[U]** when relied on but unverified. Appendix B lists the spikes. The working name during design was "tsdb"; the product is named **croft** (D52). **Phases 1, 2 and 3 are complete** (§11) in `packages/croft`, with about 2,985 tests, including an end-to-end suite that drives the real CLI through 24 user journeys (`tests/e2e`) and a concurrency suite of real processes (`tests/concurrency`). The document was brought in line with that code (`packages/croft/src`), which is the source of truth where the two differ, on 2026-09-23 for phase 1 and on 2026-09-24 for phases 2 and 3. Decisions the build refined carry a **Build:** note, and decisions it changed have their own entries from D54 on (§13).
 
 ## Thesis
 
@@ -118,7 +118,7 @@ The bin is `bin/croft.mjs`, a small plain-JavaScript entry. Its `#!/bin/sh` firs
 
 | File | Contents |
 |---|---|
-| `croft.json` | `{"$schema": "./node_modules/@zabaca/croft/croft.schema.json", "database": "warehouse.duckdb", "timezone": "America/Los_Angeles"}`. The timezone is detected at init, so "daily at 06:00" keeps its meaning on a UTC server. Optional keys: `serve` (`{"port": 7447, "host": "127.0.0.1"}`), `readCopy` (default `false`), `notify` (desktop on by default), `concurrency`. Keys that a later phase's feature reads (`readCopy`, `notify.*` and `serve.*`, all phase 3) are accepted and validated early; `croft docs config` marks them unused until then (`core/phase.ts`). |
+| `croft.json` | `{"$schema": "./node_modules/@zabaca/croft/croft.schema.json", "database": "warehouse.duckdb", "timezone": "America/Los_Angeles"}`. The timezone is detected at init, so "daily at 06:00" keeps its meaning on a UTC server. Optional keys: `serve` (`{"port": 7447, "host": "127.0.0.1"}`, plus `queryTimeoutMs` 30000, `maxConcurrent` 4, `maxBytes` 64 MB, `maxRows` 100,000 and `allowOrigins` `[]`, §5), `readCopy` (default `false`), `notify` (`{"desktop": true, "webhook": null}`, §8), `concurrency`. Keys that a later phase's feature reads are accepted and validated early, and `croft docs config` marks them unused until then (`core/phase.ts`). The phase-3 keys (`readCopy`, `notify.*`, `serve.*`) were such keys in phases 1 and 2, and phase 3 reads them. |
 | `package.json` | `{"private": true, "type": "module", "dependencies": {"@zabaca/croft": "0.1.0"}, "devDependencies": {"@types/bun": "1.3.14", "typescript": "5.9.2"}}`, with exact pins |
 | `tsconfig.json` | strict, `moduleResolution: "bundler"`, `types: ["bun"]`, includes `assets` and `lib`. Editors and Claude get type errors. |
 | `.env` / `.env.example` | `# Secrets for your assets, e.g. GITHUB_TOKEN=...`. `.env` is git-ignored and created with mode 0600; an existing `.env` is never touched. |
@@ -146,6 +146,9 @@ The bin is `bin/croft.mjs`, a small plain-JavaScript entry. Its `#!/bin/sh` firs
 - `.croft/`, the state folder. It holds `runs.sqlite`, `staging/`, `logs/`, `trash/`, `backups/`, `preview.duckdb`, `preview/` and `types/`. It also holds `serve.json` while `croft serve` runs, and `write-intent.d/` while a writer holds or waits for the file.
   - `staging/_chunks/<asset>/` holds an incremental TS transform's chunk while it waits for its commit, so a later attempt can reuse it (§3e).
   - `preview/` holds what the last preview used: the input snapshots, the `_croft` rows of the assets it copied (`preview/_croft/`), its own `runs.sqlite` (catalog source `preview`) and its step logs (`preview/logs/<asset>.log`). `preview.duckdb` also has a `live` schema: `live.<asset>` is the live version of each asset the preview built, and `croft query --preview` can read it (§6).
+  - `runs.sqlite` also keeps the project's settings, such as whether scheduling is on (its `settings` table, added in phase 3 as migration 2, §5).
+  - `logs/tick.log` holds the output of the ticks `croft serve` starts, and `logs/notify.log` the failure notifications that could not go out (§8). A failed refresh of the read copy is logged to `readcopy.log` (§5).
+- `~/.croft/`, the scheduler's per-user folder (`CROFT_HOME` moves it): `projects.json`, the registry of projects with scheduling on, and its lock files; `tick.ts`, the script the per-user OS job runs; and `logs/tick.log`, the job's output (§8).
 
 **Synced and network folders.** On many Macs, `~/Documents` and `~/Desktop` are synced to iCloud by default. File sync can corrupt a DuckDB file mid-write and breaks its locks. The same applies to Dropbox, OneDrive, network filesystems and WSL's `/mnt/<drive>` (drvfs/9p). When `init` detects such a location (by path prefix plus `statfs`), it puts the database and the state folder in `~/.local/share/croft/<project>-<hash>/` instead, as `warehouse.duckdb` and `.croft/` side by side, so the database stays outside the state folder. It records both paths in `croft.json` (as `~/…` when they are under the home folder, so the file still reads right for another user name) and says so in plain words. Asset files stay in the project folder. `init` creates the state folder right away, in the project or relocated.
 
@@ -173,18 +176,19 @@ The bin is `bin/croft.mjs`, a small plain-JavaScript entry. Its `#!/bin/sh` firs
 | Bun newer than the last CI-tested one | `Bun.version` vs `BUN_TESTED` | `BUN_UNTESTED` (a warning in `doctor`) |
 | Started with Node (`npx croft`) | `bin/croft.mjs` checks `typeof Bun`; its `sh` first line falls back to `node`, and prints the problem itself when neither runtime exists | `NEEDS_BUN`: the Bun install one-liner |
 | `bun install` failed, or the pinned copy is missing | `init`'s install result; the launcher finds no pinned copy after its install, or in a `node_modules` without croft | `INSTALL_FAILED`: fix what `bun install` reports, then `bun install` |
+| The scheduler's OS job could not be installed | `croft schedule on`: `launchctl bootstrap` failed, `crontab` is missing or failed, or the platform is neither macOS nor Linux | `INSTALL_FAILED`: log in to the Mac's desktop session (launchd's gui domain needs one), or install and start cron; or `croft schedule on --no-os-job` and keep `croft serve` running (§8) |
 | Native binding missing (optional deps skipped, `node_modules` copied from another OS, x64 Bun under Rosetta) | `import("@duckdb/node-api")` in a subprocess fails, or binding arch ≠ `process.arch`. Commands load lazily (§10), so only the commands that need DuckDB fail | `DUCKDB_BINDING_MISSING`: `rm -rf node_modules && bun install`, or "install the arm64 build of Bun" |
 | Binding fails to load (old glibc) | dlopen error text | `DUCKDB_BINDING_LOAD`: required glibc version |
 | Database written by a newer DuckDB/croft | `_croft.meta.format_version` | `DB_NEWER_FORMAT`: refuses to open rather than risk a downgrade |
 | Database file cannot be opened (damaged, or not a DuckDB file) | DuckDB's open error | `DB_UNREADABLE`: check or restore the file |
 | Database held by another program (DuckDB CLI/UI, DBeaver, the user's app) | parse DuckDB's lock error `…held in <path> (PID n)` [V] | `DB_HELD_BY_OTHER_PROGRAM`: "close /opt/homebrew/bin/duckdb (PID 812); apps should query through `croft serve`; for GUIs, turn on `readCopy` and open warehouse.read.duckdb" |
 | Synced storage (iCloud, Dropbox, OneDrive, Google Drive) | path prefix | `init` relocates automatically (above); `doctor` warns `DB_ON_SYNCED_FOLDER` with the manual move |
-| Network filesystem, or a 9p/WSL drive | `statfs` magic number, `/mnt/<drive>` under WSL | `init` relocates automatically; `doctor` reports `SERVE_UNSAFE_FILESYSTEM` (an error) with the manual move |
+| Network filesystem, or a 9p/WSL drive | `statfs` magic number, `/mnt/<drive>` under WSL; `doctor` also asks `db/fs-kind.ts`, which reads the mount table (§5, "Same kernel only") | `init` relocates automatically; `doctor` reports `SERVE_UNSAFE_FILESYSTEM` (an error) with the manual move |
 | Project not writable | `doctor`: test write to the state folder; `init`: a failed write | `PROJECT_NOT_WRITABLE`: make the folder writable, or create the project elsewhere |
 | Bun's and DuckDB's tzdata disagree for the project zone | compare offsets every 12 h over the next 2 years, and every 15 min across transitions | `TZDATA_MISMATCH` (a warning): the first mismatching instant with both offsets; take days from SQL until Bun and croft are upgraded. Also raised when DuckDB does not know the zone |
 | Referenced secret missing | declared `secrets` vs environment and `.env`; the names come from importing the asset configs, as `croft secrets` does. Finding the assets needs DuckDB, so without a loadable binding the check is skipped with an info line | `SECRET_MISSING`: "add NAME=… to .env (or `croft secrets set NAME`)". A warning in `doctor`; it is an error only when an asset that needs the secret runs |
 | Claude files older than the CLI | version stamp in SKILL.md | `CLAUDE_FILES_OUTDATED`: `croft init --claude` |
-| Scheduler not ticking | heartbeat older than 3 min | `SCHEDULER_STALE`, with the tail of the tick log and a likely cause (§8) |
+| Scheduler not ticking | scheduling on, and no tick for 3 min since the latest of the last heartbeat, turning it on and the end of a pause | `SCHEDULER_STALE` (a warning), with the tail of the tick log and a likely cause (§8) |
 
 ```
 $ croft doctor
@@ -207,7 +211,9 @@ Each problem appears inline under its check, with its code in front and its fix 
 
 The Project section's asset line is its own check (id `assets`). It runs `croft validate`'s checks, which never open the warehouse, and shows only the counts: it is an error when validate finds an error (so `doctor` exits 1), and ok otherwise, warnings included. Before `bun install`, or without a loadable DuckDB binding, it is an info line that only counts the asset files.
 
-Until phase 3 ships `croft serve`, croft's texts name the server "croft's read server", because they may name only commands the build has (§4.1): "held read-only by croft's read server (pid 4121; steps aside for writes)", "read server on 127.0.0.1:7447 (pid 4121)". `LockHolder.program` carries the same name.
+The Scheduling section (id `scheduling`) is an info line while scheduling is off, and ok while it is on ("on · ticks from the per-user OS job | croft serve (pid 4121) · last tick 12 s ago") or paused (with the time it resumes). A scheduler quiet for 3 minutes while on is the warning `SCHEDULER_STALE`, with its likely cause and the tail of the tick log under the line; only then is the OS job inspected (`launchctl print` or `crontab -l`, §8).
+
+Phases 1 and 2 named the server "croft's read server", because their texts could name only commands the build had (§4.1). Phase 3 ships `croft serve`, and `status` names it so ("croft serve http://127.0.0.1:7447 (pid 4121)"), but `doctor` and the lock messages keep the old words: "held read-only by croft's read server (pid 4121; steps aside for writes)", "read server on 127.0.0.1:7447 (pid 4121)". `LockHolder.program` carries the same name. The holder of the lock is the server's query worker, a child process with its own PID (§5), which `db/warehouse.ts` recognizes as croft's.
 
 ---
 
@@ -456,7 +462,7 @@ The grammar as built:
 
 **Other schemas and catalogs** are `CATALOG_PREFIX`: any qualifier other than `main.`, not only three-part names such as `other.main.t`. That includes `warehouse.orders` and `memory.main.orders`, which DuckDB resolves to the table while the AST's dependency list leaves them out, so the dependency would silently go missing; and `_croft.*` and `information_schema.*`. Only an asset name gets the edit fix that drops the prefix.
 
-Tables named in `-- check:`/`-- warn:` subqueries are dependencies too, but they only affect ordering. The run order is deterministic (ties broken by name). A cycle is `CYCLE`, reported once per strongly connected component as the shortest path from its smallest name, with the files. An asset that reads its own table is a cycle; a check whose subquery reads its own asset is not, because checks run after the write. Reading files directly (`FROM 'files/x.csv'`, `read_parquet(…)`) in an asset is `SQL_READS_FILES`, because croft cannot tell when such a file changed. Its fix is "make a file ingest" (`croft new file x`; before phase 5, the templates of `croft docs ingest`), or `FROM <asset>` when the file's base name is an asset. The asset then skips the gate, so the gate's other refusals (`QUERY_PATH_DENIED`) appear once the file read is gone. In `croft query`, reading files is fine.
+Tables named in a blocking `-- check:` subquery are dependencies too, but they only affect ordering. A `-- warn:` subquery's tables order nothing: a warning runs after the commit against the tables as they are, so it may read a table downstream of its own asset (the `open_issues` example). While such a table has not been built, the warning is skipped for the run with an `INPUT_NOT_BUILT` info note. The run order is deterministic (ties broken by name). A cycle is `CYCLE`, reported once per strongly connected component as the shortest path from its smallest name, with the files. An asset that reads its own table is a cycle; a check whose subquery reads its own asset is not, because checks run after the write. Reading files directly (`FROM 'files/x.csv'`, `read_parquet(…)`) in an asset is `SQL_READS_FILES`, because croft cannot tell when such a file changed. Its fix is "make a file ingest" (`croft new file x`; before phase 5, the templates of `croft docs ingest`), or `FROM <asset>` when the file's base name is an asset. The asset then skips the gate, so the gate's other refusals (`QUERY_PATH_DENIED`) appear once the file read is gone. In `croft query`, reading files is fine.
 
 **Volatile SQL.** `now()`, `current_date`, `random()`, `gen_random_uuid()` and similar functions produce values that freeze until the next rebuild. `validate` warns `VOLATILE_SQL` and suggests computing such columns at query time. The list is DuckDB 1.5.5's own VOLATILE and CONSISTENT_WITHIN_QUERY functions, minus those that give an asset the same value on every run (`current_database`, `current_schema`, `error`, …). It adds `current_localtime` and `current_localtimestamp`, which DuckDB marks consistent, and the macros `ago`, `pg_conf_load_time` and `pg_postmaster_start_time`, which expand to `current_timestamp`. A test fails when DuckDB marks a new function. `current_date`, `current_time`, `current_timestamp`, `localtime` and `localtimestamp` appear in the AST as `COLUMN_REF` nodes rather than functions, and the detector handles that [V].
 
@@ -620,7 +626,7 @@ The output goes through the same load pipeline as an ingest.
 - "Rows written by this run" are the table's rows stamped with the write's `_loaded_at`: added and updated rows, as the table holds them after the write. Unchanged rows of a replace diff passed the same check when they were written, so they are not checked again.
 - `unique` leaves out rows with a NULL in its columns, as SQL does.
 - A new or edited check covers the whole table once. croft decides this against the check sources in `StepResult.checks` of the asset's last ok step (`runs.summary`); with no such step, or after a crash that left no summary, every check covers the whole table.
-- Tables named in a check's subquery are ordered before the asset.
+- Tables named in a blocking check's subquery are ordered before the asset. A warning's are not: it runs after the commit, and is skipped with an info note (`INPUT_NOT_BUILT`) while its table has not been built.
 - **Every check is parsed before use.** croft serializes `SELECT (<expr>) FROM <asset>` with `json_serialize_sql` and requires exactly one statement with one select item. Identifiers are quoted with `"` escaping, and every statement croft builds runs through `prepare()`, which accepts a single statement. Concatenating a check into a multi-statement `run()` would execute an embedded `; DROP TABLE …` [V].
 - **A check reads the project's tables only,** by plain name (or `main.x`). These are `CHECK_INVALID`: file paths; `_croft.*`, other schemas and catalog-qualified names ("name the table without a prefix"); a table macro whose table is a path or is computed (it must name its table directly); a path-like string given to a catalog table function; table functions that read files or run SQL given as text; functions with side effects; and parameters. Value functions such as `unnest` and `json_each` take values and never open files, so they stay valid. Every rule is vetted again on the write connection before it runs.
 
@@ -678,7 +684,7 @@ Cross-asset checks that need their own query (for example "every open issue has 
 | | `doctor` | environment plus project summary, under 1 s, no writes |
 | | `new <kind> <name>` / `new --list` | write a commented, working template. Kinds: `api [--pagination keyset\|cursor\|link\|page]`, `file`, `sql`, `transform`. Phase 5; until then the templates are the docs pages `croft docs ingest`, `croft docs sql` and `croft docs transforms` (D60) |
 | | `secrets [set NAME [--stdin]]` | list declared secrets as set or missing; `set` writes `.env` from a hidden prompt or stdin |
-| | `docs [topic\|ERROR_CODE]` / `docs --list` | offline docs for the installed version; the topics include `ingest` (API and file templates), `sql` (the SQL asset header, body and templates), `transforms` (TS transform templates: per-row paid, per-row, whole-table), `checks` (the check language), `internals` and `config` (`croft.json`) |
+| | `docs [topic\|ERROR_CODE]` / `docs --list` | offline docs for the installed version; the topics include `ingest` (API and file templates), `sql` (the SQL asset header, body and templates), `transforms` (TS transform templates: per-row paid, per-row, whole-table), `checks` (the check language), `scheduling`, `serve`, `read-copy`, `internals` and `config` (`croft.json`) |
 | Inspect | `context` | the whole project in one payload, for agents (capped at 20 KB; `--asset` filters) |
 | | `status [--check]` | freshness and health of every asset, and running runs; never waits on the database |
 | | `describe <asset>` | behavior in words, columns, JSON keys, reads/read by, checks, cursor, recent writes, samples |
@@ -692,26 +698,27 @@ Cross-asset checks that need their own query (for example "every open issue has 
 | Maintain | `rename <old> <new>` | rename an asset: file, table and state together; lists references to update |
 | | `delete <asset> [--where "<expr>"]` | move a whole table, or matching rows, to the trash (needs confirmation) |
 | | `restore [asset] [--at <time>]` | list the trash, or bring a version back (needs confirmation) |
-| Schedule | `schedule on\|off\|status\|pause [--for 2h]` | turn scheduled runs on or off; ticks come from the per-user OS job, or from `croft serve` while it runs (`on --no-os-job` for servers) (§8) |
-| Serve | `serve [--host h] [--port 7447]` | optional read server for apps over HTTP, with the scheduler built in; steps aside for every write (§5) |
+| Schedule | `schedule on\|off\|status\|pause [--for 2h]` | turn scheduled runs on or off; ticks come from the per-user OS job, or from `croft serve` while it runs (`on --no-os-job` for servers) (§8); a bare `croft schedule` is `status` |
+| Serve | `serve [--host h] [--port 7447]` | optional read server for apps over HTTP, with the scheduler built in; steps aside for every write; one per project (§5) |
 
-`croft tick` also exists as an internal command, run every minute by the per-user OS job and by `croft serve` (§8). It is not counted above and is not meant to be run by hand.
+`croft tick` also exists as an internal command, run every minute by the per-user OS job and by `croft serve` (§8). It is not counted above and is not meant to be run by hand. It is hidden (`CommandSpec.hidden`): help, did-you-mean and SKILL.md's command list leave it out.
 
 **Which phase ships what** (D59). `core/phase.ts` is the manifest of which command, and which `run`, `query` and `init` flag, ships in which phase (§11). The registry must register exactly the current phase's commands.
 
-- Phase 1 has `init`, `doctor`, `docs`, `help`, `version`, `secrets`, `context`, `status`, `describe`, `query`, `logs`, `run`, `wait` and `confirm`. Phase 2 adds `validate` and `preview`. `schedule`, `serve` and `tick` come in phase 3; `rename`, `delete` and `restore` in phase 4; and `new` in phase 5.
-- Of `run`'s flags, `--dry-run`, `--only` and `--upstream` ship in phase 2, `--due` in phase 3 and `--rebuild` in phase 4. `validate --hook` and `init --with-hook` are phase 5.
+- Phase 1 has `init`, `doctor`, `docs`, `help`, `version`, `secrets`, `context`, `status`, `describe`, `query`, `logs`, `run`, `wait` and `confirm`. Phase 2 adds `validate` and `preview`. Phase 3 adds `schedule`, `serve` and the hidden `tick`. `rename`, `delete` and `restore` come in phase 4, and `new` in phase 5.
+- Of `run`'s flags, `--dry-run`, `--only` and `--upstream` ship in phase 2, `--due` (hidden) in phase 3 and `--rebuild` in phase 4. `validate --hook` and `init --with-hook` are phase 5.
 - `query --preview` works from phase 2 (phase 1 registered it only to refuse with a clear message). No later-phase flag is registered.
 - The manifest also lists the `croft.json` keys a later phase reads (§2).
+- `PHASE_COMPLETE` says whether the current phase is finished (D78). While it is false, `core/codes-raised.test.ts` lets the codes the phase lists stay unraised as its waves are built; a release requires it true.
 - `phaseStub()` in `core/phase.ts` is what a module of the next wave throws (`INTERNAL_ERROR`, a message starting `PHASE_STUB`) until it is built, so builders code against final signatures in parallel.
 
-`agent/contract.test.ts` checks every agent-facing text against the manifest and the registry: CLAUDE.md, SKILL.md, every `croft docs` page, and every string and template literal in the source (`core/phase.ts` aside), read with the TypeScript parser, since any of them can reach an agent as a hint, fix, `next[]` entry or message. A `croft <command>` must exist in this build, and a `--flag` must be an option of that command and not one a later phase adds; only a whole lower-case kebab word counts as a flag, so other programs' flags (`tsc --noEmit`) are not read as croft's. So a build's hints name only its own commands. Where the v1 text of a problem points at `readCopy`, `croft serve`, `croft restore`, `--rebuild` or `croft new` (such as the `--rebuild` fixes in §8's backfill table), the build says what it can do instead, and the test's allowlist of known exceptions is empty.
+`agent/contract.test.ts` checks every agent-facing text against the manifest and the registry: CLAUDE.md, SKILL.md, every `croft docs` page, and every string and template literal in the source (`core/phase.ts` aside), read with the TypeScript parser, since any of them can reach an agent as a hint, fix, `next[]` entry or message. A `croft <command>` must exist in this build, and a `--flag` must be an option of that command and not one a later phase adds; only a whole lower-case kebab word counts as a flag, so other programs' flags (`tsc --noEmit`) are not read as croft's. So a build's hints name only its own commands. Where the v1 text of a problem points at a later phase's command or flag (`croft restore`, `croft rename`, `croft delete`, `--rebuild` or `croft new` in phase 3, such as the `--rebuild` fixes in §8's backfill table), the build says what it can do instead, and the test's allowlist of known exceptions is empty. Since the scan reads every string, another program's long flag that croft passes is built from parts (GNU cp's reflink flag is `"-" + "-reflink=auto"` in `db/readcopy.ts`) or written short (`notify-send -a croft`), so it does not read as a croft option.
 
 **`run` flags:**
 
-- `--dry-run`: what would run and why, with windows and confirmations, without running. It plans exactly as the run does, reads only `runs.sqlite`, never waits and never issues a token. It exits 0 and lists the static errors that would fail steps in `problems[]` ("fails before it runs"); it exits 2 only for a project-level discovery error, as the run would. An asset under another run's live lease shows `hold: "leased"` (the real run would wait for it). The cost guard's row count is an estimate from `runs.sqlite`, over the keyed inputs the code reads with `newRows()`: an input never read counts all its rows; after a read, the rows the input's steps added and updated since the saved position, at least 1 and at most its row count. An input not built yet counts 0.
+- `--dry-run`: what would run and why, with windows and confirmations, without running. It plans exactly as the run does, reads only `runs.sqlite`, never waits and never issues a token. It exits 0 and lists the static errors that would fail steps in `problems[]` ("fails before it runs"); it exits 2 only for a project-level discovery error, as the run would. An asset under another run's live lease shows `hold: "leased"` (the real run would wait for it). The cost guard's row count is an estimate from `runs.sqlite`, over the keyed inputs the code reads with `newRows()`: an input never read counts all its rows; after a read, the rows the input's steps added and updated since the saved position, at least 1 and at most its row count. An input not built yet counts 0. When such an input is built earlier in the same run, the dry run cannot count its rows: the step's reason says it "may need confirmation", unknown until that input is built, and `next` says the run may stop to ask.
 - `--only`: skip downstream. On a bare run it keeps every ingest and every transform that is stale on its own, and leaves out the transforms that would run only because an ingest runs.
-- `--upstream`: also refresh, first, what the named assets need that is stale: what they read and the tables their checks read, directly or not. An ingest counts only when it was never built (before schedules, an ingest is never otherwise stale); a transform counts when it is stale or its own input is refreshed by the run.
+- `--upstream`: also refresh, first, what the named assets need that is stale: what they read and the tables their checks read, directly or not. An ingest counts only when it was never built (a schedule that fired does not make an ingest stale; only the scheduler acts on it); a transform counts when it is stale or its own input is refreshed by the run.
 - `--rebuild`: from scratch; §6 says when it needs confirmation.
 - `--from <date|ISO|-90d>`: backfill a merge ingest (§8).
 - `--allow-shrink`: override `SHRINK_GUARD`, with confirmation.
@@ -719,13 +726,16 @@ Cross-asset checks that need their own query (for example "every open issue has 
 - `--follow <dur>`: how long a non-TTY invocation follows a detached run before returning. The default is 100 s.
 - `--no-wait`: exit 4 at once instead of waiting for a lock.
 - `--events`: NDJSON progress on stderr.
-- `--due`: only scheduled work that is due; used by the scheduler.
+- `--due`: only scheduled work that is due; used by the scheduler (hidden). `croft tick` names the due assets of one group; without names it runs what is due now, and a named asset whose file is gone since the tick is dropped. It goes with no other run flag (`USAGE_ERROR`). Its run has trigger `schedule` and `human: false`, applies the scheduler's holds (§8), and waits up to 30 min for the database lock.
 
 `--run-id` and `--detached` are hidden options (`OptionSpec.hidden`) that the parent passes to its detached child (§5). They are parsed, but never shown in help or suggested by did-you-mean. **No option carries a confirmation token:** a destructive action runs only through `croft confirm <token>` (§6, D56).
 
 **Bare `croft run`** fetches every ingest and updates every transform that is stale. It is the obvious "run my pipeline". Incremental ingests make it cheap. The skill tells agents to name assets when working on one of them. It also takes every asset with a static error, and every asset on a cycle, stale or not, so each fails visibly instead of being silently left out. A static error (a load error, `CHECK_INVALID`, `CYCLE`, a bind error) fails its own step before it runs, never the whole run; `CYCLE` is attached to each step on the cycle.
 
 A named run takes the named assets, stale or not, and then (unless `--only`) every transform downstream of an asset the run takes. `RunPlan.steps` lists only the assets the run takes, in run order. The runner checks staleness again just before each transform, so one whose inputs did not change after all is skipped as `up to date: <inputs> did not change`.
+
+- **Reshaped SQL inputs.** A run that takes an SQL asset also rebuilds first each stale SQL input it reads whose new output columns differ from its table, or that was never built (reason: `<reader> reads its new columns`), so the reader binds and reads what `validate` checked (an edit that adds a column upstream and uses it downstream). Other stale inputs still need `--upstream`.
+- **Inputs never built.** A transform whose input was never built, and is not built by the run, is skipped with `INPUT_NOT_BUILT` (at warning severity here) and the fix `croft run <root input>`, which builds the input and what reads it; it never fails later with `UNKNOWN_TABLE`. The dry run says the same.
 
 ### 4.2 Examples
 
@@ -841,14 +851,16 @@ github_issues    18,556   5 min ago    in 55 min       ok
 stripe_charges   1,130    5 min ago    in 55 min       ok · schema changed today (+ 1 column)
 taxi_zones       265      2 days ago   Oct 1 00:00     ok
 sales            1,904    5 min ago    manual          ok · 1 file gone
-issue_triage     18,556   5 min ago    after inputs    held: code edited 12 min ago, not run by hand yet
+issue_triage     18,556   5 min ago    after inputs    held: code edited 12 min ago, not run by hand yet; croft run issue_triage releases it
 open_issues      4,211    5 min ago    after inputs    failed: CHECK_FAILED (croft logs open_issues --failed)
 daily_revenue    812      5 min ago    after inputs    ok
 old_orders       120      —            —               no asset file (croft delete old_orders)
 Scheduling on · last tick 12 s ago · 0 running
 ```
 
-`status` exits 0 because the command itself worked; `status --check` exits 1 when anything is failed, crashed, held or stale, which makes it a health probe. In JSON, `ok` always means "the command worked", and `data.healthy` carries health.
+`status` exits 0 because the command itself worked; `status --check` exits 1 when anything is failed, crashed, held or stale, or the scheduler is stale, which makes it a health probe. In JSON, `ok` always means "the command worked", and `data.healthy` carries health.
+
+The NEXT column of a scheduled ingest reads `every hour (off)` while scheduling is off and `paused` while it is paused. The last line reads `Scheduling paused until 14:00 · …` during a pause, and `Scheduling on · last tick 14 min ago (stale) · …` when the scheduler has stopped ticking, with the tail of the tick log under it. A running `croft serve` ends the line: `· croft serve http://127.0.0.1:7447 (pid 4121)`.
 
 ```
 $ croft describe stripe_charges
@@ -903,18 +915,34 @@ old_orders   2026-09-20 09:02   120    9 KB    delete
 $ croft serve
 croft serve · http://127.0.0.1:7447 · database warehouse.duckdb (read-only, steps aside for writes)
 token: .croft/serve.json (hosted apps: set CROFT_SERVE_TOKEN)
-scheduler: on, ticking every minute (github_issues next 11:00, stripe_charges next 11:00)
+scheduler: on, ticking every minute
 apps: import from "@zabaca/croft/read" in this project, or set CROFT_URL + CROFT_SERVE_TOKEN
 ^C to stop
 
 $ croft schedule on
 Scheduling is on for ~/my-data (one job per user; checked every minute; survives restarts).
 Waiting for the first tick… ok (after 38 s)
-  github_issues   every hour   next 11:00
-  stripe_charges  every hour   next 11:00
-  taxi_zones      monthly      next Oct 1 00:00
+  github_issues   every hour   0 * * * *   next 11:00
+  stripe_charges  every hour   0 * * * *   next 11:00
+  taxi_zones      monthly      0 0 1 * *   next Oct 1 00:00
 Turn off: croft schedule off
+
+$ croft schedule status
+Scheduling on · ticks from the per-user OS job · last tick 12 s ago
+Job: launchd dev.croft.tick · installed, loaded · bun /Users/ana/.bun/bin/bun
+ASSET           SCHEDULE      CRON        NEXT          LAST FIRE     STATUS
+github_issues   every hour    0 * * * *   in 55 min     10:00         —
+stripe_charges  every hour    0 * * * *   in 55 min     10:00         —
+taxi_zones      monthly       0 0 1 * *   Oct 1 00:00   Sep 1 00:00   —
+sales           manual        —           —             —             —
+issue_triage    after inputs  —           —             —             held: code edited 12 min ago, not run by hand yet; croft run issue_triage releases it
+open_issues     after inputs  —           —             —             —
+daily_revenue   after inputs  —           —             —             —
 ```
+
+`croft serve` stops on SIGINT, SIGTERM or SIGHUP with `croft serve stopped (SIGINT)` and exit 0, the normal way to stop a server (a second signal during the shutdown exits 130). A server not bound to loopback adds a line: `not loopback: put an HTTPS reverse proxy or tunnel in front of <address> (it must send Host: 127.0.0.1:7447)`, and, with a generated token, asks for `CROFT_SERVE_TOKEN` in `.env`, since hosted apps need a token that does not change on every start. With scheduling off, the scheduler line says how to turn it on (`croft schedule on`, or `croft schedule on --no-os-job` on a server).
+
+`croft schedule on` with `--no-os-job` says "ticked by croft serve only (no OS job): nothing runs on a schedule while croft serve is stopped", and whether a `croft serve` is running. The STATUS column of `croft schedule status` shows `due: fired at 11:00` (or `due: fired at 11:00; 3 missed fires run once`), `held: …` for a hold a person must lift (the scheduler only runs code a human has run, §6), or the hold that passes by itself (`leased`, `paused`, `backoff`).
 
 ### 4.3 The JSON contract
 
@@ -927,11 +955,11 @@ Turn off: croft schedule off
   - `{kind: "command", description, command, requiresHuman?}`
   - `{kind: "manual", description, requiresHuman?}`
 - `next` is `[{command, reason}]`. **A destructive command never appears in `next`.** It appears only as `confirmation: {token, expiresAt, command, impact}`.
-- When output redaction (§9.6) changed a value inside `data`, `data` carries `redactedValues: true`, so the reader knows values were altered.
+- When output redaction (§9.6) changed a value inside `data`, `data` carries `redactedValues: true`, so the reader knows values were altered. `run` and `preview` declare every secret the project's assets declare, not only those of the planned assets: the planned assets' loaded specs, plus the literal `secrets: [...]` and `secret("…")` names of every TS asset file, read without importing it.
 
 **Data shapes** are frozen by golden tests and published as JSON Schemas. `croft serve` returns the same envelopes over HTTP (§5).
 
-- **`query`:** `{columns: [{name, type}], rows, rowCount, truncatedRows, truncatedValues}`. HUGEINT, DECIMAL and integers beyond ±2^53 are strings, inside JSON columns too. A number in a JSON column that DOUBLE cannot hold (`1e400`) keeps its source text. `--limit N` and `--full-values` lift the caps.
+- **`query`:** `{columns: [{name, type}], rows, rowCount, truncatedRows, truncatedValues}`. HUGEINT, DECIMAL and integers beyond ±2^53 are strings, inside JSON columns too. A number in a JSON column that DOUBLE cannot hold (`1e400`) keeps its source text. `--limit N` and `--full-values` lift the caps. Over HTTP (`croft serve`), `data` is `{columns, rows, rowCount, tookMs}`, never truncated, with `stale: true` and `asOf` when the answer came from the read copy (§5). `tookMs` counts from the request's arrival, queue wait included.
 - **`run` / `wait`:** `{runId, status: running|succeeded|failed|crashed|interrupted, progress?: {asset, phase: extract|write|checks, rowsFetched, requests, elapsedMs}, steps: StepResult[]}`. A StepResult has:
   - `asset`, `status` (`ok`|`failed`|`skipped`|`unchanged`), `reason`, `skippedBecause?`
   - `behavior`, `attempt`, `maxAttempts`, `nextRetryAt?`
@@ -942,22 +970,33 @@ Turn off: croft schedule off
   - `created?: {columns, jsonColumns}` when the step created the table (the source of "new table, 31 columns (7 JSON)" in §4.2), and `csvHeader?` on a CSV ingest's first load (§3b)
   - `skippedBecause` says why a step did not run: `input X failed (r_…)` or `input X is waiting for confirmation c_…` for a direct input, and `input Y was not built: <why>` for one further up. A transform found fresh on the runner's re-check is skipped with `up to date: <inputs> did not change`. Skips caused by an input are recorded in `runs.sqlite` (attempt 0, status `skipped`), so `status` shows them; the others are not.
 - **`confirm`:** `{token, command, result, outcome: used|not_needed|unused|running, note?}`. `result` is the confirmed command's own `data` (`null` in human mode, where its output passes through as is), and its problems, `next`, confirmation and exit carry over to the envelope. `outcome` says what became of the token (§6).
-- **`status`:** `{healthy, running: [{runId, asset, pid, since, phase, rowsFetched}], assets: [{asset, kind, file, status, rows, lastRun: {runId, at, status, code}, next: {at, reason}, stale, staleReasons[], held, edited, filesGone?, schemaChangedAt?}], scheduling: {state: "on"|"off"|"paused", via: "os-job"|"serve"|null, lastTickAt}, serve?: {url, pid}}`.
+- **`status`:** `{healthy, running: [{runId, asset, pid, since, phase, rowsFetched}], assets: [{asset, kind, file, status, rows, lastRun: {runId, at, status, code}, next: {at, reason, schedule?}, stale, staleReasons[], held, hold?: {code, reason}, edited, filesGone?, schemaChangedAt?}], scheduling: {state: "on"|"off"|"paused", via: "os-job"|"serve"|null, lastTickAt, stale?, pausedUntil?}, serve?: {url, pid}}`.
+  - `scheduling.stale` is present only while scheduling is on, and `pausedUntil` only while it is paused, so the off shape stays `{state: "off", via: null, lastTickAt: null}`.
+  - `next.reason` is `schedule` (at the next fire, while scheduling is on), `scheduling off` or `paused` (a scheduled ingest the scheduler does not run now), `manual` (an ingest without a schedule), `after inputs` (a transform) or `none` (no asset file); `next.schedule` is the ingest's schedule as written.
+  - `hold` says why the scheduler does not run the asset now, while scheduling is on or paused: `SCHEDULE_HELD`, `LARGE_REPROCESS`, `leased`, `paused` or `backoff`. `held` is true only for the holds a human must lift (`SCHEDULE_HELD`, `LARGE_REPROCESS`), and makes `healthy` false.
+  - `problems[]` add one `SCHEDULE_HELD` warning per human-held asset, with the fix `croft run <asset>`, and `SCHEDULER_STALE` (details `{cause, via, lastTickAt, quietForMs, logFile, logTail}`) when the scheduler stopped ticking (§8).
+  - Over HTTP (`GET /status` of `croft serve`), `serve` also carries `{host, port, version, startedAt, engine}`, the server's own state (§5).
   - An asset's `status` is `ok`, `failed`, `crashed`, `interrupted`, `running`, `skipped`, `never_run`, `no_asset_file` or `unknown`. `unknown` means it was built before but the warehouse file is missing; `rows` is then `null`, as it is for an asset never built.
   - When the catalog lists tables but the database file is missing, `status` reports `DB_NOT_FOUND` with `healthy: false`, and `context` carries the same problem and the same `unknown` assets. Both check the file with a `stat`, without opening DuckDB (§3b gives the wording).
-  - `edited` means the code hash now differs from the hash of the code the asset's last run used (the step's, else the catalog's); the file's modification time decides only when a hash is unknown, so touching a file or editing a comment is not an edit. An edited asset whose table older code built also gets `EDITED_SINCE_LAST_RUN` in `problems[]`, worded per kind (§8).
+  - `edited` means the code hash now differs from the hash of the code the asset's last run used (the step's, else the catalog's); the file's modification time decides only when a hash is unknown, so touching a file or editing a comment is not an edit. A skipped step (its input failed, it stopped for a confirmation, it was held) never ran the code, so it does not clear an edit. An edited asset whose table older code built also gets `EDITED_SINCE_LAST_RUN` in `problems[]`, worded per kind (§8).
   - `next[]` suggests `croft run --dry-run` when assets are stale for a reason other than `never_built`.
-- **`describe`:** `{asset, kind, file, behavior: {words, write, key, incremental: {kind, field, cursorValue, cursorType, unit, lookback}}, reads, readBy, columns: [{name, type, pinned, pending, sourceName, format, addedAt, jsonKeys, kinds}], inputsSeen: {input: {seenLoadedAt, inputLastLoadedAt, pendingRows}}, builtWithCodeHash, checks, recentWrites, samples}`. In `inputsSeen`:
+- **`describe`:** `{asset, kind, file, next, schedule, behavior: {words, write, key, incremental: {kind, field, cursorValue, cursorType, unit, lookback}}, reads, readBy, columns: [{name, type, pinned, pending, sourceName, format, addedAt, jsonKeys, kinds}], inputsSeen: {input: {seenLoadedAt, inputLastLoadedAt, pendingRows, readInFull?}}, builtWithCodeHash, checks, recentWrites, samples}`. `next` has `status`'s shape. `schedule` is `{text, cron, nextFires, lastFireAt, lastAttemptAt, scheduling, pausedUntil?}` for an ingest with a schedule, and null otherwise: `nextFires` are the next three fire times in the project zone, which happen only while `scheduling` is on. In `inputsSeen`:
   - `seenLoadedAt` is the stamp of the transform's composite position; declared inputs it has not read yet appear with `seenLoadedAt: null`.
   - `inputLastLoadedAt` is the input's version when the transform last read all of it (null until then): the value staleness compares, the same as `_croft.inputs.input_last_loaded_at` (§5). It is not the input's current version.
   - `pendingRows` counts the input rows after the composite position `(seen_loaded_at, seen_key)`, the count `newRows()` and the cost guard use. It is null when unknown (no table, no `_loaded_at` column) or when `describe` fell back to the catalog mirror.
-- **`validate`:** `{order, assets: [{name, kind, inputs, outputColumns: [{name, type}] | null, behavior, codeChanged}], types?: {status: ok|failed|skipped, errors}}`. `outputColumns` comes from `prepare()`. `inputs` joins the unoptimized plan's scans to each asset's AST inputs, and `order` comes from the graph rebuilt with them. `types` is present with `--types`. `next[]` is `croft validate` after an error or a fixable warning, otherwise `croft preview <assets whose code changed>`, and `croft docs ingest` in a project with no assets.
+  - `readInFull: true` marks a lookup of an incremental TS transform: an input its code reads only with `rows()`, never with `newRows()`. It is read in full each run, so its `pendingRows` is 0, even when the warehouse is busy.
+- **`validate`:** `{order, assets: [{name, kind, inputs, outputColumns: [{name, type}] | null, behavior, codeChanged, schedule?: {text, cron, next}}], types?: {status: ok|failed|skipped, errors}}`. `outputColumns` comes from `prepare()`. `schedule` is a scheduled ingest's, with `next` its next three fire times (ISO with the project offset); the human output adds one line per scheduled ingest: `<asset>: <text> (cron <cron>); next <date time>, <time>, <time>`. `inputs` joins the unoptimized plan's scans to each asset's AST inputs, and `order` comes from the graph rebuilt with them. `types` is present with `--types`. `next[]` is `croft validate` after an error or a fixable warning, otherwise `croft preview <assets whose code changed>`, and `croft docs ingest` in a project with no assets.
 - **`preview`:** `{assets: [{asset, kind, status: ok|failed|skipped, reason, rows, liveRows, partial, capped, requests?, since?, diff: {by, added, removed, changed, unchanged} | null, columns: [{column, change: added|removed|retyped, type, from?, note?}], checks, sample, downstream, durationMs, error?}], partial, inputsSnapshotAt, rebuild, rowCap}` (§6). A CSV ingest's header decision is in its `reason` ("CSV header: first line (detected): …").
 - **`run --dry-run`:** `{dryRun: true, order, steps: [{asset, file, kind, action: fetch|rebuild|update|skip, reasons, reason, behavior, hold?, skippedBecause?, window?: {sinceValue, sinceType, sinceAt?, source: saved|from, saved?, lookback?}, confirmation?: {action: allow_shrink|large_reprocess, command, impact}, problems}]}`. `problems` are the static errors that would fail the step before it runs.
-- **`context`:** `{project, assets: [compact describe], running, held, recentFailures, recentSchemaChanges: [{asset, at, runId, kind, column, from, to, readBy}]}`, capped at 20 KB with `truncated: true`. A compact asset carries `staleReasons`, and `edited: true` when it applies. `recentSchemaChanges[].readBy` lists the assets that read the changed asset (asset level, not column level). `problems[]` hold each asset's load and `CHECK_INVALID` problems and `EDITED_SINCE_LAST_RUN`.
+- **`context`:** `{project, assets: [compact describe], running, held, recentFailures, recentSchemaChanges: [{asset, at, runId, kind, column, from, to, readBy}]}`, capped at 20 KB with `truncated: true`. A compact asset carries `staleReasons`, and `edited: true` when it applies. `recentSchemaChanges[].readBy` lists the assets that read the changed asset (asset level, not column level). `problems[]` hold each asset's load and `CHECK_INVALID` problems and `EDITED_SINCE_LAST_RUN`. `project.scheduling` has `status`'s shape; a compact asset carries `schedule?`, `nextFireAt?` and `hold?`; `held` lists the assets held until a human runs them; and `problems[]` add `SCHEDULER_STALE` and `SCHEDULE_HELD` as in `status`.
+- **`schedule`:** `{action: on|off|pause|status, root, scheduling, job: {kind: launchd|crontab, label, file, installed, loaded, bun, bunExists, bunStable?, changed?, removed?} | null, registry: {file, projects, osJob} | null, serve: {url, pid} | null, firstTick?: {ok, at, waitedMs, alreadyTicking?} | null, assets: [{asset, kind, schedule, cron, nextFireAt, lastFireAt, lastAttemptAt, due, dueReason, held}], assetsUnavailable?}`. `scheduling` has `status`'s shape. `assets` holds the scheduled ingests and the held assets after `on`, every asset for `status`, and none after `off` and `pause`; `held` is `{code, reason}` or null. `firstTick` is null with `--no-os-job`, where nothing is waited for.
+- **`serve`:** one envelope when the server starts, `{url, host, port, pid, loopback, database, startedAt, version, token: {source: CROFT_SERVE_TOKEN|generated, from: .env|env|null, file}, scheduling: {state, via, pausedUntil, tickEveryMs}, stopped: null}`, and nothing more when it stops (exit 0).
+- **`tick`** (internal): `{exited: null|scheduling_off|paused|another_tick, heartbeatAt, spawned: [{runId, assets}], held: [{asset, code, reason}], importedAssetCode, tookMs}`.
 - **Error `details`:**
   - `HTTP_ERROR`: `{method, url (redacted), status, attempts, retryAfterMs, requestIndex, rowsBeforeError}`
-  - `TIMEOUT`: `{phase, rowsSoFar, lastRequest}`
+  - `TIMEOUT`: `{phase, rowsSoFar, lastRequest}`; over HTTP, `{phase: "query", timeoutMs}`
+  - `SERVE_UNAVAILABLE`: `{reason, retryAfterMs, …}`. `reason` is `write` (a writer holds the file, or the query was stopped for one after the grace; with `writeIntent`), `busy` (every slot stayed full, or 64 queries already wait), `restarted` (its query worker was killed to end another query, or crashed), `unavailable` (the file cannot be opened: a GUI holds it; the holder is named) or `stopping` (§5)
+  - `QUERY_TOO_MANY_ROWS` over HTTP: `{limit, maxRows}` when `limit` asked for more than `serve.maxRows` and the result passed `maxRows`; the hint then says to page
   - `TYPE_CONFLICT`: `{column, existingType, incomingKinds, badRows, samples, readBy}`, plus, where they apply, `sourceName`, `storedType` (the same as `existingType`), `incomingType` (the type the incoming values would get in a new column), `incoming` (the same as `incomingKinds`), `conflictKinds` (the kinds that do not fit), `format` (file ingests) and `fixes` (every fix, in order; `fix` is the first). The duplicate names are kept for readers of the earlier ones.
   - `CHECK_FAILED`: `{check, failing, sample, checked, scope}`, and for a blocking failure `results` (the result of every blocking check). `failing` counts, per kind: the rows that fail (`not_null`, rules), the rows that share their values with another row (`unique`), or the rows missing (`min_rows`). `checked` is the rows in scope, and `scope` is `batch` or `table`. `sample` holds up to 20 rows.
   - `QUERY_FAILED`: `{duckdb, duckdbErrorType}`. `QUERY_FAILED` is any error DuckDB raised while binding or running a user query (Binder, Catalog, Conversion, Invalid Input, Out of Range, IO, …), and `duckdbErrorType` names the kind. `SQL_SYNTAX` is only for parser errors, and a missing table or column is still `UNKNOWN_TABLE` or `UNKNOWN_COLUMN`. In an SQL asset, a missing column named through a table (`g.x`: DuckDB's Binder Error "Table "g" does not have a column named "x"", with candidate bindings [V]) is `UNKNOWN_COLUMN` too.
@@ -980,14 +1019,16 @@ Turn off: croft schedule off
 No process ever owns the database for writing, and there is no write daemon. Five kinds of process exist:
 
 1. **Short-lived CLI invocations.**
-2. **Detached runs.** Off a TTY, `croft run` always executes in a detached child process (`detached` + `unref`; a child outlived its parent and was reparented [V]). The invoking process follows the child's events for `--follow` (default 100 s) and prints the result if the run finished. Otherwise it returns exit 6 with the run id.
+2. **Detached runs.** Off a TTY, `croft run` always executes in a detached child process (`detached` + `unref`; a child outlived its parent and was reparented [V]). The invoking process follows the child's events for `--follow` (default 100 s) and prints the result if the run finished. Otherwise it returns exit 6 with the run id. Build: once the child has recorded its finished run, the parent lets it exit (up to 3 s) before returning, because the child closes the warehouse last (a checkpoint), and the next command otherwise saw the file change or waited on its lock.
    - This keeps every run from being killed by Claude Code's shell timeout (120 s by default, 600 s at most). A killed run would lose all extraction work.
    - On a TTY, runs stay in the foreground, and `--foreground` forces that off a TTY too.
    - The run folder `<state>/logs/<run>/` holds, besides the step logs, files whose names start with `_` (which no asset name can): `_process.log` (the child's own stdout and stderr, created with mode 0600; everything in it is redacted, including subprocess output that reaches it through the fd capture below), `_process.json` (the spawn handshake: the child's pid, start time and boot id, written by the parent), and `_not_started.json` (the problem of a child that refused to start, such as a `--from` that cannot apply, §8).
    - `croft wait` for a child that died before it recorded its run (kill -9, OOM, a reboot during a slow import) reports it `crashed` (exit 1, `RUN_CRASHED`) from the handshake, never "still running" forever.
    - A live run writes its progress `{asset, phase, rowsFetched, requests, elapsedMs}` to `runs.summary.progress` at most every 500 ms (and what changed inside a window at its end), which `status` and `context` show as `running[]`; the finished run's result replaces it.
 3. **The per-user scheduler job** (§8). Every minute it starts the project-pinned `croft tick` for each registered project that has scheduling on, and that tick spawns `croft run --due` for due work.
-4. **`croft serve`** (optional), a long-running *read* server with the scheduler built in (§5, "Server mode"). It answers app queries over HTTP and steps aside whenever a run writes. It spawns a fresh `croft tick` subprocess every minute and never ticks in-process. An in-process tick would keep stale `lib/` code, because a cache-busted `import()` does not re-import dependencies [V], and it would risk a second database instance in one process.
+4. **`croft serve`** (optional), a long-running *read* server with the scheduler built in (§5, "Server mode"). It answers app queries over HTTP and steps aside whenever a run writes. It spawns a fresh `croft tick` subprocess once at start and then every minute (skipping a minute while the previous tick still runs), and never ticks in-process. An in-process tick would keep stale `lib/` code, because a cache-busted `import()` does not re-import dependencies [V], and it would risk a second database instance in one process.
+   - **Its query worker.** croft serve itself opens no DuckDB file. It holds the warehouse in a query worker, a child process it spawns and kills (`serve/worker.ts`, spoken to over Bun's IPC channel), and while a writer holds the live file with `readCopy` on, a second worker serves the read copy (D76). A worker exits by itself when croft serve goes away (the IPC channel closes, or it is reparented), and ignores terminal signals.
+   - Each tick runs as `<bun> --no-env-file <croft's bin> tick` in the project folder, detached, with the server's environment minus `CROFT_SERVE_TOKEN` and `CROFT_CONFIRM_GRANT`, its output appended to `<state>/logs/tick.log` (mode 0600, one header line per tick, moved to `tick.log.1` past 5 MB).
 5. **Subprocesses spawned by a tick** (`croft run --due`), which do the scheduled work.
 
 Each command imports asset files fresh, so edits are always picked up. Each TS file is imported in isolation, so one broken file fails only its own asset. With selectors, a TS file whose text calls only `ingest()` is imported only when it is selected or needed before the selection, so `croft run x` never runs the top-level code of unrelated ingests; SQL files and possible transforms are always loaded, since the graph needs their inputs.
@@ -1007,7 +1048,7 @@ So Bun Shell's `$` needs no `.quiet()` inside an asset: its output, and that of 
 
 ### Owning the DuckDB file
 
-**In every process that runs user code, the warehouse file is open only while DuckDB itself is working.** It is never open while user code or the network runs. The one long-lived holder is `croft serve`, which runs no user code, holds the file read-only, and closes it for every write (Server mode, below). The measured facts behind this:
+**In every process that runs user code, the warehouse file is open only while DuckDB itself is working.** It is never open while user code or the network runs. The one long-lived holder is `croft serve`'s query worker, which runs no user code, holds the file read-only, and is killed for every write (Server mode, below). Releasing the file by ending the process (`SIGKILL`) lets the kernel drop its locks however DuckDB's objects stand, so the lock-held-after-close hazards below cannot keep a writer out of serve's file. The measured facts behind this:
 
 - Opening, querying and closing a file with 1–2M rows costs 3–6 ms [V].
 - `closeSync()` releases the OS lock at once, and a waiting process got the file about 57 ms later [V].
@@ -1034,9 +1075,9 @@ The rules that follow from these:
 **Leases.** `warehouse.read(fn)` and `warehouse.write(label, fn)` open the file on demand and close it 100 ms after the last lease ends. Each process picks one access mode for its whole life, because a cached path cannot be reopened with another configuration:
 
 - Processes that write (`run`, `confirm`, `delete`, `restore`, `rename`, and `init` when it runs the example) use read-write, even for their read leases. They always create a write intent first (Server mode, below).
-- `query`, `describe`, `preview`, `doctor`, `tick` and `croft serve` use read-only, and never create an intent. `doctor` does not open the file at all while a live intent exists (§2). `preview` opens its own `.croft/preview.duckdb` read-write, with no write intent, for the whole preview, so two previews, or a preview and `croft query --preview`, take turns.
+- `query`, `describe`, `preview`, `doctor`, `tick` and `croft serve`'s query worker use read-only, and never create an intent. `tick` opens the file only when its `reconcile()` must check a crashed step against it. `doctor` does not open the file at all while a live intent exists (§2). `preview` opens its own `.croft/preview.duckdb` read-write, with no write intent, for the whole preview, so two previews, or a preview and `croft query --preview`, take turns.
 
-- **Lock conflicts** are retried with jittered backoff (25 ms up to 1 s). After 2 s the holder is printed. It is one of: croft's own run, from `runs.sqlite` (for example "croft run r_…, writing daily_revenue, 8 s"); `croft serve`, recognized by the PID in `serve.json` ("croft serve pid 4121 has not stepped aside"; until phase 3 the text says "croft's read server (pid 4121) has not stepped aside", §2); or a foreign program (`DB_HELD_BY_OTHER_PROGRAM`).
+- **Lock conflicts** are retried with jittered backoff (25 ms up to 1 s). After 2 s the holder is printed. It is one of: croft's own run, from `runs.sqlite` (for example "croft run r_…, writing daily_revenue, 8 s"); `croft serve`, recognized by the PID in `serve.json` or as its query worker ("croft's read server (pid 4121) has not stepped aside", with the worker's PID; the build keeps the phase-1 name, §2); or a foreign program (`DB_HELD_BY_OTHER_PROGRAM`).
 - **Default waits.** Off a TTY every wait is capped at 90 s, then exit 4 with the holder, so a wait never outlives the agent's shell. On a TTY: 60 s for `query`/`preview`/`describe` and 10 min for run writes. Scheduled writes wait 30 min. `--no-wait` exits 4 at once. Ctrl-C (the run's `AbortSignal`) ends a lock wait, or a write queued behind this process's own write, at once with `INTERRUPTED` (exit 130). A lease that already holds the file is never cut; the ingest body refuses further statements instead.
 - **Fairness.** A writer that sees registered waiters yields for 200 ms between write steps.
 - **Asset leases** in `runs.sqlite` guarantee that only one run touches an asset at a time. A manual `croft run x` while the scheduler runs `x` waits for the lease, or exits 4 with `ASSET_BUSY` naming the run. A tick skips leased assets, and they stay due. A lease records the PID, the process start time and the boot id (`kern.boottime` or `/proc/sys/kernel/random/boot_id`). It counts as dead when the boot id differs or the start time does not match, because PIDs are reused after a reboot and a PID check alone could leave an asset busy forever.
@@ -1167,7 +1208,8 @@ A **TS transform** step extracts like an ingest, reading its inputs from Parquet
 - The count is the rows after the position of each keyed input the code reads with `newRows()`, found by a lexical scan of the bundle (`newRows("x")`, `ctx.newRows("x")`). A lookup read with `rows()` is not processed row by row, so it does not count. When the scan cannot tell (a computed name), every keyed input counts.
 - An input the scan missed is counted when `newRows()` first reads it, before its first row is handed over. If that goes past `confirmAbove` without an approved count, the step fails with `LARGE_REPROCESS` and an edit fix, rather than ask mid-run.
 - The impact's action is `incremental transform; LARGE_REPROCESS override`, with `estimatedRequests` equal to the pending rows and `downstream` from the step's readers.
-- A scheduled run holds the transform until a human runs it.
+- A scheduled run holds the transform until a human runs it: the step is recorded as skipped, with `LARGE_REPROCESS` as a warning, the run succeeds, and the tick leaves the transform alone until a successful run by hand.
+- A preview cannot ask for a confirmation: it stays within `confirmAbove` (§6).
 - A manual run asks for confirmation, with the row count in the impact. The token is for `croft run <transform>`, the one transform named. A run issues at most one token: a second step that needs one is skipped (`skippedBecause`), with a `next` hint `croft run <transform>`, which only asks again and so is not destructive.
 
 This is how "never spend the user's API money implicitly" is enforced rather than just documented.
@@ -1180,8 +1222,8 @@ This is how "never spend the user's API money implicitly" is enforced rather tha
 | `doctor` | a read-only lease only while no write intent is live | never waits: reports `busy: croft run … is writing` |
 | `query`, `preview`, `describe` samples | a read-only lease | waits only for the current *write step* (usually seconds), printing the holder |
 | `run`, `delete`, `restore`, `confirm`, `rename` | asset leases + write leases per step, each behind a write intent | extraction proceeds in parallel; writes queue behind the current step |
-| scheduler tick | asset leases | skips leased assets; due work stays due |
-| `croft serve` queries | its own read-only instance | closed while `write-intent.d/` holds a live entry; queries wait up to 10 s, then `503` (or read-copy answers marked `stale`) |
+| scheduler tick | `runs.sqlite`; a read-only lease only to reconcile a crashed run | skips leased assets; due work stays due |
+| `croft serve` queries | its query worker's read-only instance | closed while `write-intent.d/` holds a live entry; queries wait up to 10 s, then `503` (or read-copy answers marked `stale`) |
 
 `status`, `context` and `describe` resolve the asset files the way `validate` does (`project/resolve.ts`): TS assets are imported in isolation, with a 5 s import timeout each, and SQL is parsed on a private in-memory DuckDB. So an asset's top-level code runs on `croft status`, which needs it for kinds, code hashes and inputs. `status` still never opens the warehouse.
 
@@ -1237,7 +1279,14 @@ CREATE TABLE confirmations (token TEXT PRIMARY KEY, command TEXT, impact TEXT, i
                             created_at TEXT, expires_at TEXT, used_at TEXT);
 CREATE TABLE catalog  (asset TEXT PRIMARY KEY, json TEXT, source TEXT, refreshed_at TEXT);
                        -- mirror of _croft.* (source: run | preview | pins); DuckDB wins
+CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);            -- migration 2 (phase 3); value is JSON
 ```
+
+`runs.sqlite` versions its schema with `PRAGMA user_version`: each migration is appended and never edited, and a croft that finds a newer schema refuses with `DB_NEWER_FORMAT`. Migration 2 (phase 3) adds `settings`, per-project values as JSON:
+
+- `scheduling`: `{state: on|off|paused, via: os-job|serve|null, pausedUntil?}`, which `croft schedule` writes and every tick reads (§8). A pause whose `pausedUntil` has passed reads as on. `scheduling.since` is when it was last turned on or resumed, from which a scheduler with no tick yet counts as stale.
+- `schedule.facts`: what the scheduler knows of each asset without importing it (kind, schedule, inputs, code hash), keyed by file hash (§8, D79). `schedule.spawned`: the runs ticks started that may not hold their leases yet.
+- `readCopy`: the read copy's coordination and last refresh, `{requested, holder: {pid, procStart, bootId}, refreshedAt, method, heldMs, lastError}` (Server mode, below).
 
 A preview writes its catalog entries, with source `preview`, into its own `.croft/preview/runs.sqlite`, so the live catalog is never overwritten (D66).
 
@@ -1286,7 +1335,7 @@ An app or GUI that keeps the live file open blocks every croft write. Even well-
 
 - **Reads over HTTP.** It answers queries over HTTP (`Bun.serve`) against the live file, so there is no copy, no doubled disk and no stale data.
 - **Runs no user code.** Every write stays in a short-lived `croft run` process with freshly imported code, so D1's reasons still hold: no stale asset code, no crash of user code taking the server down, and no inter-process write protocol.
-- **Runs the scheduler.** While scheduling is on for the project, it spawns a fresh `croft tick` subprocess every minute. That makes it the one command to keep running on a server, in a container or on WSL. There, `croft schedule on --no-os-job` switches scheduling on without installing an OS job. `croft schedule off` and `pause` stop its ticks too, because `croft tick` itself exits at once when scheduling is off or paused (§8). On a laptop, the per-user OS job (§8) still works without it.
+- **Runs the scheduler.** While scheduling is on for the project, it spawns a fresh `croft tick` subprocess at start and then every minute (§5, "Processes"). That makes it the one command to keep running on a server, in a container or on WSL. There, `croft schedule on --no-os-job` switches scheduling on without installing an OS job. `croft schedule off` and `pause` stop its ticks too, because `croft tick` itself exits at once when scheduling is off or paused (§8). On a laptop, the per-user OS job (§8) still works without it.
 
 **Write intents.** Before a process opens the warehouse read-write, `db/warehouse.ts` creates its own intent file: `<state>/write-intent.d/<pid>-<procStart>.json`, holding `{pid, procStart, bootId, runId, since}`. It is written to a temp name with `O_EXCL`, then renamed. The rules:
 
@@ -1294,14 +1343,14 @@ An app or GUI that keeps the live file open blocks every croft write. Even well-
 - The intent is removed only *after* `closeSync()` of that instance returns (after the 100 ms linger). Leases inside that window reuse it, and an in-process reference count covers concurrent leases.
 - The server stays closed while the directory holds any **live** entry. One shared file was wrong: when two writers overlapped, the first to finish deleted it, the server reopened within 14–38 ms, and the second writer gave up after 6 s, in 3 of 3 runs. With one file per writer, the second writer got in after 505–615 ms [V].
 - **Liveness** uses the same check as asset leases: the boot id and the process start time must match, not only the PID, because PIDs are reused after a reboot. One function (`core/proc.ts`, used by `db/intent.ts`) implements it for the server, `doctor` and `@zabaca/croft/read`. The start time is `/proc/<pid>/stat` starttime (clock ticks since boot) on Linux. On macOS it is `ps -o lstart= -p <pid>` run under `LC_ALL=C TZ=UTC` and stored as epoch seconds, so the holder's and the checker's locale and time zone never matter. Records in the older lstart-text format are compared leniently: seconds past the quarter hour, plus the date or year. The server's poll and `reconcile()` delete dead intents.
-- **Foreign holders.** A writer whose lock error names a non-croft holder (the DuckDB UI or DBeaver) withdraws its intent until that holder is gone. The server keeps serving meanwhile.
+- **Foreign holders.** A writer whose lock error names a non-croft holder (the DuckDB UI or DBeaver) withdraws its intent until that holder is gone. The server keeps serving meanwhile. Build: the writer withdraws its intent after 2 s of a foreign holder and announces it again every 5 s, so while a GUI holds the file, croft serve is closed for about 2 s out of every 7.
 
-**Handing the file over.** The server polls the intent directory every 50 ms. `fs.watch` only shortens the delay and is never relied on, because on macOS it merges and drops events [V]. When a live intent appears, the server:
+**Handing the file over.** The server polls the intent directory every 50 ms. `fs.watch` only shortens the delay and is never relied on, because on macOS it merges and drops events [V]; croft serve creates the directory so it can be watched. When a live intent appears, the server:
 
 1. stops admitting new queries into DuckDB (they wait in the HTTP layer);
-2. lets in-flight queries finish, and after 2 s calls `connection.interrupt()` on each query still running, repeating every 20 ms until that query's promise has settled (the client gets `503` with `Retry-After`);
+2. lets in-flight queries finish, and after 2 s (`graceMs`) calls `connection.interrupt()` on each query still running, repeating every 20 ms until that query's promise has settled (the client gets `503` with `Retry-After`). A query that has not settled 500 ms (`killAfterMs`) after its first interrupt is abandoned: its worker is killed, which ends it;
 3. only then destroys prepared statements and result readers and disconnects **every** connection, idle ones included (no connection pool survives a handoff);
-4. calls `closeSync()` on the instance.
+4. kills the query worker (`SIGKILL`) and awaits its exit (D76). The first build called `closeSync()` on the instance in croft serve's own process instead.
 
 The lock is released only when the instance *and all its connections* are closed. In spikes, the lock stayed held in three cases [V]:
 
@@ -1309,35 +1358,56 @@ The lock is released only when the instance *and all its connections* are closed
 - a connection disconnected while its interrupted query had not yet settled; that query's promise never settled;
 - a partly read stream.
 
-In the documented order, the writer got the file about 20 ms after the interrupt. Results are therefore fully materialized, within limits, before a response is written. They are never streamed from DuckDB to a slow HTTP client.
+In the documented order, the writer got the file about 20 ms after the interrupt. But DuckDB checks for interrupts only between tasks, and a SELECT can spend many seconds inside one scalar or list expression, or while planning one [V] (Appendix B), so no interrupt ends it. The kernel drops a process's locks when it exits, whatever DuckDB's objects are doing, so killing the worker bounds the handoff: **a writer gets the file within `graceMs` + `killAfterMs` + the few milliseconds a kill takes**, whatever the queries do (about 2.6 s measured, with a query stuck in `list_sort(range(1.5e8))`) [V].
 
-When the directory is empty again, the server reopens, which takes 3–6 ms. A reopened read-only instance sees every commit made in between, including one that was only in the WAL because its writer was killed after COMMIT [V]. Queries that arrive during a write step wait for it, up to 10 s, and otherwise get `503` with `Retry-After`.
+**Two liveness checks.** Stepping aside uses a quick one: the intent's PID exists in this boot, with no `ps` spawn in the path, so the file is released within milliseconds. Reopening needs the full proof (boot id and start time) and deletes dead intents, so a reused PID costs at most one brief close.
 
-With `readCopy` on, the server instead answers from `warehouse.read.duckdb` while an intent is live, marking the envelope `stale: true, asOf`. In a spike with short queries, one writer and one connection per query, a writer got the file in 10–23 ms across 5 writes while the server answered 2,226 queries in 6 s [V].
+When the directory is empty again, the server reopens. A spare worker is started while the writer works, so reopening takes about 5 ms. A reopened read-only instance sees every commit made in between, including one that was only in the WAL because its writer was killed after COMMIT [V]. Queries that arrive during a write step wait for it, up to 10 s, and otherwise get `503` with `Retry-After`. A worker that dies while serving (killed to end a stuck query, the OOM killer, a crash) is replaced at once; the queries it ran beside the stuck one get a retryable `503` (`reason: "restarted"`), which the read client retries.
+
+With `readCopy` on, the server instead answers from `warehouse.read.duckdb` while an intent is live, marking the query envelope's `data` with `stale: true` and `asOf`, the copy's modification time (its checkpoint) with the project offset. That covers queries that arrive then, queries already waiting when the server steps aside, and queries interrupted for the writer after the grace. The copy has its own worker with the same sandbox, gate and limits and its own admission, started for the queries that need it and killed 100 ms after the last one, so a GUI can open the copy read-write between writes and a refreshed copy is picked up by the next open. A missing or unopenable copy leaves the query waiting as before. In a spike with short queries, one writer and one connection per query, a writer got the file in 10–23 ms across 5 writes while the server answered 2,226 queries in 6 s [V].
+
+**Before the warehouse exists.** `croft serve` may start first: queries get `DB_NOT_FOUND` until a run creates the file, and then the engine opens it. A database from a newer croft (`DB_NEWER_FORMAT`) or an unreadable file (`DB_UNREADABLE`) fails the start; found at a later reopen, each refuses the queries instead.
 
 **Query limits.** Every query passes the same one-SELECT gate as `croft query`, on a sandboxed read-only connection. Then:
 
 - **Tables only.** Serve connections use `allowed_directories = []`, and the gate is an allowlist: user tables in the `main` schema, CTEs (which may not shadow a built-in view), and `range`, `generate_series`, `unnest`, `json_each` and `json_tree`. DuckDB's built-in views need no parentheses (`FROM duckdb_databases`, `pragma_database_list`, `pg_settings`, `duckdb_logs`), so a denylist of function calls is not enough. They are refused, as are every other schema and catalog and the scalars `current_setting`, `getvariable` and `sleep_ms`. HTTP clients can read tables but no files, paths or settings (`QUERY_PATH_DENIED`).
-- **A deadline** (`serve.queryTimeoutMs`, default 30000), enforced with repeated `interrupt()`.
-- **Concurrency:** at most `serve.maxConcurrent` queries (default 4, below the worker-thread count) run in DuckDB at once. The rest queue, and the queue wait counts toward the 10 s wait.
+- **`SHOW TABLES` only.** It lists the `main` schema's names (views included, though querying one is refused). `SHOW ALL TABLES`, a bare `DESCRIBE` or `SHOW` (DuckDB's `__show_tables_expanded`), and `SHOW databases`, `schemas` or `variables` are refused, inside `FROM (…)` and CTEs too, with the hint "SHOW TABLES lists the project's tables, and DESCRIBE <table> the columns of one". Other profiles are unchanged.
+- **Big literal ranges.** `range()` and `generate_series()` used as values (scalars or lists) with literal bounds past 10,000,000 values are refused (`QUERY_PATH_DENIED`, hint: `FROM range(n)`), since DuckDB folds or evaluates such a list in one step that no interrupt reaches; as tables they stream and stay interruptible. Bounds that are not literals pass, and the watchdog ends them.
+- **A deadline** (`serve.queryTimeoutMs`, default 30000), enforced with repeated `interrupt()` and, when those cannot stop the query, by killing its worker `killAfterMs` later (`TIMEOUT`, details `{phase: "query", timeoutMs}`). A request that goes away is `INTERRUPTED` the same way.
+- **Concurrency:** at most `serve.maxConcurrent` queries (default 4, below the worker-thread count) run in DuckDB at once. The rest queue, and the queue wait counts toward the 10 s wait. At most 64 wait; more are refused at once with `503` (`reason: "busy"`), so a burst during a write step cannot pile up.
+- **Request bodies:** at most 8 MB each (`413`), and the `/query` bodies being read or waiting for the engine may add up to 64 MB, measured from `Content-Length`; past that a `/query` gets `503` with `Retry-After` before its body is read.
 - **Memory:** the instance sets `memory_limit` (default 25% of RAM) and `threads`.
-- **No silent truncation.** Values are never truncated over HTTP. A result larger than `limit` (default 10,000 rows) or `serve.maxBytes` fails with `QUERY_TOO_MANY_ROWS`; it is never a partial result.
+- **No silent truncation.** Values are never truncated over HTTP. A result larger than `limit` (default 10,000 rows, capped at `serve.maxRows`, default 100,000) or `serve.maxBytes` (default 64 MB, the rows' JSON as sent) fails with `QUERY_TOO_MANY_ROWS`; it is never a partial result.
+- **Streaming inside the worker.** The worker reads the result from DuckDB chunk by chunk (DuckDB produces only the chunks read), renders and counts each as JSON, and fails as soon as `limit` or `maxBytes` is passed, so memory follows what is answered, not what the query could return: `SELECT *` over 20M rows with `limit` 10 reads one chunk. The answer is still complete before anything is sent to the HTTP client, and rows travel to croft serve as the JSON text the client will parse.
 
 **Security.**
 
-- **A token is always required.** On first start `croft serve` generates a random token into `<state>/serve.json` (mode 0600, git-ignored), along with its URL and PID. `CROFT_SERVE_TOKEN` in `.env` overrides it, and hosted apps use that. Tokens are compared with `crypto.timingSafeEqual`.
-- **Request checks.** The server rejects a request whose `Host` is not the bound address, `localhost` or `127.0.0.1` (DNS rebinding). It rejects one whose `Origin` is not in `serve.allowOrigins` (browser pages), and a `/query` without `Content-Type: application/json`.
-- **Binding.** It listens on `127.0.0.1` by default. `::` and `0.0.0.0` bind every interface. Anything but loopback must sit behind HTTPS (a reverse proxy or tunnel), which the startup banner states. The printed URL uses the address actually bound.
+- **A token is always required**, on `/query`, `/status` and `/health` alike. `croft serve` generates a random token (32 bytes, base64url) into `<state>/serve.json` (mode 0600, git-ignored), along with its URL and PID. `CROFT_SERVE_TOKEN` (the shell, then `.env`) overrides it, and hosted apps use that. Tokens are compared in constant time (`crypto.timingSafeEqual` over equal-length digests). Build: a generated token is new on every start, because `serve.json` is removed when the server stops (D84); local apps read `serve.json` again for each query, and the banner asks for `CROFT_SERVE_TOKEN` when the server is not on loopback. A `CROFT_SERVE_TOKEN` with whitespace, control or non-ASCII characters is `USAGE_ERROR`.
+- **Request checks,** in order: Host, Origin, then the token. The `Host` must name the bound address, or `localhost`, `127.0.0.1` or `[::1]` when the server listens on loopback or on every interface (DNS rebinding). Its port must match when it carries one; a Host without a port is accepted, since the name is what defeats rebinding, and a reverse proxy must send `Host: 127.0.0.1:<port>`, which the refusal's hint and the banner say. The server rejects a request whose `Origin` is not in `serve.allowOrigins` (browser pages), and a `/query` without `Content-Type: application/json`. A CORS preflight is answered after the Host and Origin checks.
+- **Binding.** It listens on `127.0.0.1` by default. `::` and `0.0.0.0` bind every interface. Anything but loopback must sit behind HTTPS (a reverse proxy or tunnel), which the startup banner states. The printed URL uses the address actually bound. Build [V]: `--host localhost` binds `127.0.0.1`, because Bun 1.3.14 binds `localhost` to `::1` only; `reusePort` is off, because with it a second server on the same port took over connections; and since Bun reports a foreign address as `EADDRINUSE` too, croft checks the machine's interfaces to say which it is.
+- **One server per project.** A second `croft serve` for the project is `USAGE_ERROR`, naming the running server's PID and URL. `serve.json` is claimed atomically (a hard link), so two servers starting at once cannot both win, and a dead server's record is replaced.
+- **Stopping.** SIGINT, SIGTERM and SIGHUP stop the ticks, remove `serve.json` (apps fall back to reading the file), stop listening and kill the workers, then exit 0: that is how a server is normally stopped, and service managers treat anything else as failure. A second signal during the shutdown exits 130.
 
-**Same kernel only.** Every croft process that touches a project must run on the same kernel, because DuckDB's lock is a POSIX `fcntl` lock. Inside a container, run `croft run` in the same container (for example `docker exec`). `doctor` and `serve` refuse a database on virtiofs, grpcfuse, fakeowner or 9p mounts with `SERVE_UNSAFE_FILESYSTEM`, as they already do for network filesystems [U].
+**Same kernel only.** Every croft process that touches a project must run on the same kernel, because DuckDB's lock is a POSIX `fcntl` lock. Inside a container, run `croft run` in the same container (for example `docker exec`). `doctor` and `serve` refuse a database, or a state folder (where the write intents live), on a filesystem whose locks cannot be trusted, with `SERVE_UNSAFE_FILESYSTEM` (`db/fs-kind.ts`):
+
+- VM and container shares: virtiofs, grpcfuse, fakeowner and osxfs (Docker Desktop), 9p (also WSL's drives), and VirtualBox, VMware and Parallels shared folders;
+- network filesystems: NFS, SMB/CIFS (SMB2/3 included), AFP, AFS, sshfs, WebDAV (davfs2), curlftpfs and GVfs;
+- cluster filesystems: CephFS, GlusterFS, Lustre, GPFS, BeeGFS, OCFS2, GFS2 and JuiceFS;
+- cloud storage mounted through FUSE (rclone, s3fs, gcsfuse, goofys, mountpoint-s3, blobfuse), and any FUSE mount whose source names another machine (`user@host:`, `host:path`, `remote:`, a URL).
+
+On Linux the type comes from the longest mount point in `/proc/self/mounts` that holds the folder, and without `/proc` from the `statfs` magic number, where every FUSE mount looks alike and is not refused. On macOS it comes from `df -P` and `mount`. Nothing here opens the warehouse. Whether each of these really fails to share the lock is [U].
 
 **The HTTP API** returns the same envelopes as the CLI's `--json`:
 
 | Endpoint | Returns |
 |---|---|
-| `POST /query` with `{sql, params?, limit?}` | the `query` envelope (§4.3), untruncated values, `stale`/`asOf` when served from the read copy |
-| `GET /status` | the `status` envelope |
+| `POST /query` with `{sql, params?, limit?}` | the `query` envelope (§4.3), untruncated values, `stale`/`asOf` in `data` when served from the read copy. Integers beyond ±2^53 in the body are read exactly, so `bigint` params bind as in direct mode; any other key is refused with a did-you-mean |
+| `GET /status` | the `status` envelope, built without importing asset code (croft serve runs none), so staleness only the code can tell (`code_changed`) is left to `croft status`; `data.serve` also carries `{host, port, version, startedAt, engine: {state, writeIntent, inFlight, queued, openConnections, queriesToday}}` |
 | `GET /health` | `{ok, pid, version, database, writeIntent: {pid, runId, since} \| null, queriesToday}` |
+
+`queriesToday` counts the queries admitted since midnight in the project's time zone. Errors are problem envelopes with a status the read client understands: `401` (a missing or wrong token, with `WWW-Authenticate: Bearer`) and `403` (Host, Origin) are `SERVE_UNAUTHORIZED`; `SERVE_UNAVAILABLE`, `DB_BUSY` and `DB_HELD_BY_OTHER_PROGRAM` are `503` with `Retry-After` in whole seconds (at least 1); `QUERY_TOO_MANY_ROWS` is `422`; other exit-2 codes are `400`; an oversized body is `413` and a body that is not JSON `415` (both `USAGE_ERROR`); anything else is `500` `INTERNAL_ERROR`, with no stack. Problem texts are redacted with the project's `.env` values; rows are not, so they equal direct mode's. A client that leaves before its body arrives gets a quiet `499`.
+
+The idle timeout (30 s) applies while a `/query` body is read, so a body that never comes does not hold a socket. While the query queues and runs, the socket's timeout is the query's own budget (queue wait, `serve.queryTimeoutMs`, the kill of a stuck query and a margin), and it is set back to the idle timeout before the answer goes out, so keep-alive sockets are reaped.
 
 **`import { query } from "@zabaca/croft/read"`** is how apps read data. It ships as prebuilt JavaScript and works in Bun and Node [V].
 
@@ -1354,15 +1424,17 @@ With `readCopy` on, the server instead answers from `warehouse.read.duckdb` whil
 - **Same results in both modes.** Both return rows with the §4.3 value rendering: strings for HUGEINT, DECIMAL and integers beyond ±2^53, and ISO strings with the project offset for timestamps. Direct mode also turns `-0` into `0`, so its rows equal their JSON round trip. `query()` throws if an envelope reports any truncation. A golden test runs the same query in both modes.
 - It sets the project time zone on its connection and uses no Bun-only APIs.
 
-**The read copy is opt-in** (`"readCopy": true`), for tools that need a file: the DuckDB UI, DBeaver and notebooks. When it is on, `warehouse.read.duckdb` is refreshed at the end of every run that changed data:
+**The read copy is opt-in** (`"readCopy": true`), for tools that need a file: the DuckDB UI, DBeaver and notebooks. When it is on, `warehouse.read.duckdb` is refreshed at the end of every run that changed data (a run with a step whose status is `ok`), after the warehouse is closed:
 
-1. Under the write lease, run `CHECKPOINT`. A copy taken without it missed committed rows still in the WAL (1,000 of 1,500) [V].
-2. A child process clones the file to a temporary name (`cp -c` on macOS, `cp --reflink=auto` on Linux). A child is used because the owning process must not open the file (above).
-3. Atomically rename it into place.
+1. Under a write lease (the write intent first, then the lock, so croft serve steps aside), run `CHECKPOINT`, in the run's own process. A copy taken without it missed committed rows still in the WAL (1,000 of 1,500) [V]. The WAL is then checked by `stat` to be empty.
+2. Still under the lease, a child process clones the file to a temporary name next to the copy, `.<copy>.<pid>-<random>.tmp`: `cp -c` (clonefile) on macOS, `cp` with reflink=auto on Linux, and a plain `cp` when that fails. A child is used because the owning process must not open the file (above); it is `/bin/cp` by absolute path, with an explicit environment. The lease covers the checkpoint and the whole clone and nothing else: for a plain copy that is the whole copy, since a write during it would tear it. `heldMs` records how long it held. A warehouse the refresh opened itself is closed before the rename.
+3. The temporary file gets the checkpoint's time as its modification time, which becomes croft serve's `asOf`. A `<copy>.wal` a GUI left next to the old copy is removed first, because DuckDB would replay it onto the new one. Then the file is atomically renamed into place: a reader holding the old copy keeps reading it.
 
-On APFS the clone takes 0.1–0.2 ms [V]. Elsewhere it is a full copy, and Linux reflink is [U]. The read copy is POSIX-only in v1.
+On APFS the clone takes 0.1–0.2 ms [V], and a refresh held the write lease 2–3 ms for a 624 MB warehouse [V]. Elsewhere it is a full copy, and Linux reflink is [U]. The read copy is POSIX-only in v1.
 
-The `DB_HELD_BY_OTHER_PROGRAM` fix points apps at `croft serve` and GUIs at the read copy. When the holder is `croft serve` itself (its PID is in `serve.json`), the message says "held by croft serve (pid n); stop it to open the file read-write in another program".
+Refreshes coalesce. Within a process, calls made during a refresh share one follow-up. Across processes, the `readCopy` setting in `runs.sqlite` (§5, "Where state lives") records the refreshing process: a request made while another live process refreshes returns `coalesced`, and that process runs once more (at most 10 rounds); a dead refresher is taken over. A refresh never fails the run: its errors go to `<state>/readcopy.log` and the setting's `lastError`, and a copy that missed a refresh only shows older data, which croft serve marks with `asOf`.
+
+The v1 `DB_HELD_BY_OTHER_PROGRAM` fix points apps at `croft serve` and GUIs at the read copy, and when the holder is `croft serve` itself its message says "held by croft serve (pid n); stop it to open the file read-write in another program". Build: its hint says "close <program>, then retry; apps should open the file only per query (@zabaca/croft/read does)", and a lock held by croft serve's query worker is `DB_BUSY`, "croft's read server (pid n) has not stepped aside" (§2).
 
 ---
 
@@ -1385,7 +1457,7 @@ This is enforced (§5), not only a convention:
 
 **1. `croft validate` touches no data.**
 
-- It parses headers and SQL, finds dependencies and cycles, imports TS assets to check their config shape, and checks schedule phrases, secrets and every check expression. An asset import that does not finish within 30 s is `ASSET_INVALID`, so top-level code that never returns cannot hang `validate`. Until phase 3 brings the phrase parser, only a schedule that is not a string is `SCHEDULE_INVALID`.
+- It parses headers and SQL, finds dependencies and cycles, imports TS assets to check their config shape, and checks schedule phrases, secrets and every check expression. An asset import that does not finish within 30 s is `ASSET_INVALID`, so top-level code that never returns cannot hang `validate`. A schedule that does not parse is `SCHEDULE_INVALID`, an error, so the ingest does not load; its suggestion is a schedule that parses (§8). A schedule that parses is shown with its cron and next three fire times. (Phases 1 and 2, before the phrase parser, refused only a schedule that was not a string.)
 - What only the whole project shows: a TS transform's input that is no asset is `UNKNOWN_TABLE` with an edit fix; an incremental transform's `newRows()` input without a key is `INPUT_NEEDS_KEY`, found from literal `newRows("name")` calls in the asset and the project files it imports (a computed name is left to the run); and a declared secret that is not set is `SECRET_MISSING`, a warning as in `doctor`, because only the user can set it and nothing fails until the asset runs.
 - It runs a **bind check**. An in-memory DuckDB gets empty tables built from the cached column lists, `_loaded_at` and `_file` included. Each SQL asset is `prepare()`d in dependency order, and its output columns become the empty input of the next asset, so each asset binds against its inputs' code as it is now. DuckDB's own messages supply "Candidate bindings" and caret positions, shifted past the header [V]. The unoptimized plan's scans join each asset's inputs, and the graph (`order`, `CYCLE`) is built again with them.
 - **Inputs never built.** The column cache is filled by runs, by previews (the preview's own catalog, for a table never built) and by `columns` pins. An input with no cache yields `INPUT_NOT_BUILT` (info), and only the assets that read it skip the bind, transitively. The message names the root assets to preview ("columns of daily_revenue are unknown until stripe_charges has run or been previewed; bind check skipped"), with the fix `croft preview <roots>`; for an input whose own code has errors it says "until the errors in assets/x.sql are fixed". They are never reported as errors the agent cannot fix. The assets of a cycle skip the bind with no extra problem.
@@ -1399,7 +1471,7 @@ This is enforced (§5), not only a convention:
 - **Planned like a run.** The preview plans as `croft run <assets>` would (§4.1), so each step carries the bind check's problems, and it builds each asset through the step a run uses (§5), against the preview database and the preview's own `runs.sqlite` (`.croft/preview/runs.sqlite`, catalog source `preview`), so the live catalog is never overwritten (D66). The last preview's file and `.croft/preview/` are emptied first.
 - **Inputs are snapshotted.** Under one short read lease, croft copies every live table the preview reads or compares with to `.croft/preview/<name>.parquet`, and the `_croft` rows of those assets to `.croft/preview/_croft/`. The preview database then sees them as views with the live column types: `main.<input>` for an input the preview does not build, and `live.<asset>` for the live version of every asset it builds. So everything in a preview, including later `query --preview` calls, reads one consistent snapshot. The live file is never `ATTACH`ed from a second instance, which would risk releasing its lock (§5).
 - **SQL transforms** are built from those snapshots. SQL downstream of a named asset is built too, but only when every input it reads from the preview is complete, is not an ingest, and passed its checks; otherwise it is listed in that asset's `downstream`. A named asset reads the preview of any input built in the same preview; a listed downstream asset is read from live.
-- **TS transforms** read Parquet snapshots, as in a real run. `--rows` (default 1,000) caps the *input* rows they receive from each input, and `ctx.preview` is true, so a per-row LLM transform costs at most 1,000 calls in a preview.
+- **TS transforms** read Parquet snapshots, as in a real run. `--rows` (default 1,000, at most 100,000; anything else is `USAGE_ERROR`) caps the *input* rows they receive from each input, and `ctx.preview` is true. The cost guard (§5) holds in a preview too: an incremental transform that makes requests is handed at most its `confirmAbove` input rows. Without `--rows` its cap is lowered to fit, and its reason says so; an explicit `--rows` beyond it is `LARGE_REPROCESS`, whose fix is the `--rows` that fits. A preview never asks.
 - **Ingests** fetch from the real saved cursor, with `ctx.preview` true, and stop the generator after `--rows` rows; reaching exactly `--rows` counts as capped, since the generator is stopped without asking for more. The cursor moves only in the preview database. File ingests are not capped: they make no requests, and they read their new and changed files. Downstream assets are listed but not built from a partial sample, because a diff against a partial input would suggest that correct SQL is wrong. A CSV ingest's header decision is in its `reason` and on a `note` line.
 - **Two ways a build starts.** Merge and append ingests and incremental TS transforms start from a copy of the live table and its `_croft` state, so they continue from the saved cursor or positions exactly as a real run would, and the write's own counts are the diff ("212 would update, 788 would add"). Everything else (SQL, full-refresh TS, replace ingests, `--rebuild`, a table never built) is built from scratch in an empty preview table and diffed against `live.<asset>` by key, or by whole rows without one. So `ctx.query` in a replace ingest sees no table of its own during a preview.
 - **The output** diffs against live: row counts, added/removed/changed by key, column changes, check results, samples, and `data.partial` / `data.inputsSnapshotAt` in JSON. When the preview could only build part of the table (capped input rows, or an incremental TS transform), the diff covers only the keys the preview produced ("of 1,000 keys touched, 37 differ"). It never reports every other row as removed. A replace ingest that fetched everything does report removals, and warns `SHRINK_GUARD` when a real run would stop. `croft query --preview` explores the result. The preview file stays until the next preview.
@@ -1421,7 +1493,13 @@ The scheduler reads the working tree, so it could otherwise run an ingest the ag
 
 To prevent this, the tick runs an asset only if its current code hash equals `approved_code_hash`. That hash is set by the last successful **human-initiated** `croft run` or `croft preview` of that asset (a file ingest whose files did not change counts: its code ran). Human-initiated means a command from a terminal or from Claude Code, as opposed to the scheduler.
 
-Otherwise the asset is skipped with `SCHEDULE_HELD`, and `status` shows it plainly: "held: code edited 12 min ago, not run by hand yet; `croft run github_issues` releases it". New assets are held until they have been run by hand once. `croft schedule pause --for 2h` pauses everything during a larger refactor.
+Otherwise the asset is skipped with `SCHEDULE_HELD`, and `status` shows it plainly: "held: code edited 12 min ago, not run by hand yet; `croft run github_issues` releases it". New assets are held until they have been run by hand once ("new: code edited …"). `croft schedule pause --for 2h` pauses everything during a larger refactor.
+
+Build:
+
+- `SCHEDULE_HELD` is a warning (exit 0), never a failure (D77). A scheduled run records the held step as skipped with the warning and succeeds, so a held asset sends no failure notification; `status`, `context` and `schedule` list one warning per held asset, with the fix `croft run <asset>`.
+- A held step is skipped even when its code no longer loads (an edit in progress), rather than failing ("code edited … and it does not load; fix it, then `croft run <asset>` releases it").
+- The code hash covers `lib/` and the project time zone, so an edit in `lib/` holds the TS assets that import it, and a change of `timezone` holds every asset. The scheduler's facts cache sees both in its file hash and reads those assets again once (§8, D79).
 
 ### Nothing implicit destroys ingested data
 
@@ -1667,45 +1745,94 @@ Only ingests have schedules; transforms follow their inputs. An ingest can say `
 - `"monthly"`
 - a 5-field cron expression
 
-`validate` shows the cron form and the next three fire times in the project time zone. Due times come from croft's own time-zone-aware matcher, about 100 lines using `Intl`. Fire times are defined as instants, so DST cannot drop or double them:
+Build: the parser (`schedule/phrase.ts`) takes more, all of it additive:
 
-- A local time that does not exist (02:30 on a spring-forward day) fires at the first valid minute after the gap.
-- A repeated local time (01:30 on a fall-back day) fires once, at its first occurrence.
+- `every N minutes` (N divides 60) and `every minute`; `every hour at :15`; `every N hours` (N divides 24);
+- `daily` / `every day at …`, `weekends at …`, and `every <day> at …` with abbreviated or plural days, lists joined by `,` or `and`, and ranges (`mon-fri`, `monday to friday`, `monday through wednesday`); `monthly at …` (on the 1st);
+- the cron macros `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly` and `@annually`.
+
+A time is `HH:MM`, `9am`, `6:30pm`, `noon` or `midnight`, in any case; a phrase without one fires at 00:00, like `@daily`. Anything else is `SCHEDULE_INVALID`, an error, so the ingest does not load (§6). Its suggestion, when one is close, is always a schedule that parses: a misspelled word (`evry hour`), a missing `at` or `every`, a bare time (`9am` → `daily at 9am`), the nearest N that divides the hour or the day. A 6-field cron's suggestion drops the seconds field, or else a trailing year (AWS style); a 7-field Quartz cron drops both.
+
+**Cron fields** follow Vixie cron: names in any case, 7 is Sunday like 0, `a/n` runs from `a` to the field's end, and `?` in a day field means `*`. When both day fields are restricted, a day matching either fires (`0 0 13 * 5`: the 13th and every Friday); when either starts with `*`, a day must match both. Quartz's `L`, `W` and `#` are refused, and so is a cron that can never fire (`0 0 30 2 *`).
+
+`validate` shows the cron form and the next three fire times in the project time zone. Due times come from croft's own time-zone-aware matcher (`schedule/cron.ts`, local times from `Intl`). Fire times are defined as instants, so DST cannot drop or double them:
+
+- A local time that does not exist (02:30 on a spring-forward day) fires at the first valid minute after the gap, the transition itself. Several times inside the gap fold into that one fire.
+- A repeated local time (01:30 on a fall-back day) fires once, at its first occurrence, when the cron names a fixed time ("daily at 01:30").
+- Build: a cron whose minute or hour field starts with `*` (`every 15 minutes`, `every hour`, `every 2 hours`) is an interval, and fires at both passes of a repeated local time, so its fires stay evenly spaced in real time (D80). That is cron's own rule for its wildcard jobs, and the golden test "every 15 minutes across the overlap: no duplicates, no missing instants" requires it.
 - `last_fire_at` is stored in UTC.
+- The latest fire is looked for at most 400 days back: a schedule whose last fire is older (a Feb 29 cron, say) reads as "no fire" to the tick.
 
-Naive wall-clock matching would never fire "daily at 02:30" on 2026-03-08 in Los Angeles, and would fire "daily at 01:30" twice on 2026-11-01 [V]. Golden tests cover both days. Bun's `Bun.cron.parse` is not used, because its time-zone behavior changed between versions: on 1.3.14 it returned the same UTC result for every zone, and on 1.4.2 it honored the zone [V].
+Naive wall-clock matching would never fire "daily at 02:30" on 2026-03-08 in Los Angeles, and would fire "daily at 01:30" twice on 2026-11-01 [V]. Golden tests cover both days, in Los Angeles and New York, and the transition days of Europe/London, Australia/Sydney, Asia/Kolkata (no DST) and Australia/Lord_Howe (a 30-minute shift). Bun's `Bun.cron.parse` is not used, because its time-zone behavior changed between versions: on 1.3.14 it returned the same UTC result for every zone, and on 1.4.2 it honored the zone [V].
 
 ### Turning it on
 
 `croft schedule on` makes sure **one per-user OS job** exists and adds the project to a registry, `~/.croft/projects.json`. With `--no-os-job` (servers and containers running `croft serve`), it only records scheduling as on.
 
+Build: `on` records the setting first (`runs.sqlite` `settings`, §5), then the registry, then the job, so the job's first run (`RunAtLoad`) already finds the project. If the job cannot be installed, the setting and the registry are put back as they were (`INSTALL_FAILED`, §2). `--no-os-job` also removes the job when no other project uses it. `off` records scheduling off, takes the project out of the registry, and removes the job once no project needs it. `pause [--for 2h]` makes every tick exit at once until the pause ends (`--for` takes a minute to a year: `30m`, `2h`, `1d`, `1h30m`) or until `croft schedule on`; it refuses while scheduling is off. A bare `croft schedule` is `status`.
+
 **The job:**
 
-- **macOS:** a LaunchAgent, `~/Library/LaunchAgents/dev.croft.tick.plist`, with `StartInterval` 60.
-- **Linux:** one crontab line.
-- It runs `~/.croft/tick.ts` with an absolute Bun path, preferring a stable symlink (`~/.bun/bin/bun`, `/opt/homebrew/bin/bun`) over a version-manager path that disappears on upgrade.
-- Its output goes to `~/.croft/logs/tick.log`.
+- **macOS:** a LaunchAgent, `~/Library/LaunchAgents/dev.croft.tick.plist`, with `StartInterval` 60. Build: its keys are `Label`; `ProgramArguments` `[<absolute bun>, "--no-env-file", "~/.croft/tick.ts"]`; `EnvironmentVariables` with `HOME`, and `PATH` set to Bun's folder, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`, `/usr/sbin` and `/sbin`, so scheduled runs find Homebrew tools as manual runs do; `StartInterval` 60; `RunAtLoad`; `AbandonProcessGroup`, so launchd does not kill what the tick started when it exits; and `StandardOutPath` and `StandardErrorPath`, both `~/.croft/logs/tick.log`. The plist is written with mode 0644, since launchd refuses one that is group- or world-writable. It is loaded with `launchctl bootstrap gui/<uid>` (retried while launchd still tears down a job just booted out) and removed with `launchctl bootout gui/<uid>/<label>`, with `launchctl` called by absolute path.
+- **Linux:** one crontab line, between marker lines, read with `crontab -l` and written with `crontab -`; every other line is kept byte for byte:
+
+  ```
+  # croft:dev.croft.tick begin
+  * * * * * /home/ana/.bun/bin/bun --no-env-file /home/ana/.croft/tick.ts >> /home/ana/.croft/logs/tick.log 2>&1
+  # croft:dev.croft.tick end
+  ```
+
+- It runs `~/.croft/tick.ts` with an absolute Bun path, preferring a stable symlink (`~/.bun/bin/bun`, `/opt/homebrew/bin/bun`) over a version-manager path that disappears on upgrade. Build: the stable candidates are `$BUN_INSTALL/bin/bun`, `~/.bun/bin/bun`, `/opt/homebrew/bin/bun` and `/usr/local/bin/bun`, and a stable Bun older than croft needs (a curl install left behind) never wins (D83). Each candidate's `bun --version` is asked once, and the job takes, in order: the first stable candidate at least as new as the running Bun and croft's floor (`engines.bun`); the running Bun, when its own path is stable; the first stable candidate at or above the floor; the running Bun, marked unstable, which `schedule on` points out.
+- Its output goes to `~/.croft/logs/tick.log`, moved to `tick.log.1` once it passes 5 MB.
+- The label is `dev.croft.tick`. `CROFT_JOB_LABEL` (for tests) must be a reverse-DNS name (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`), or it is `USAGE_ERROR` before any path or line is built from it.
+- Installing and removing are idempotent: an unchanged job is not rewritten or reloaded. With `CROFT_FORBID_OS_JOBS=1` (tests) croft refuses to run `launchctl` or `crontab`, and to touch the real user's home, which it takes from the password database rather than `HOME` (§10).
+
+**The per-user tick script,** `~/.croft/tick.ts`, is plain JavaScript generated from a template (version 2), and imports nothing from croft: one script serves every project on the machine, and each project pins its own croft. An older croft never overwrites a script from a newer template. Every minute it:
+
+1. moves `tick.log` to `tick.log.1` once it passes 5 MB;
+2. reads `projects.json` next to itself, tells the projects that are there from those gone or missing (below), and prunes the gone ones;
+3. for each project the OS job ticks whose `runs.sqlite` says scheduling is on (a pause that has ended counts as on; a project whose setting says `via: serve` is skipped even when its registry entry says `os-job`, because `runs.sqlite` is the project's source of truth), starts `<bun> --no-env-file <the pinned croft's bin> tick` in the project folder, detached, with its output in `tick.log`. The child runs on the job's absolute Bun (`process.execPath`), because launchd's `PATH` does not include `~/.bun/bin`, and its `PATH` starts with that Bun's folder. Its environment is explicit: `HOME`, `PATH`, `LANG` and `CROFT_HOME`, plus, when set, `TMPDIR`, `USER`, `LOGNAME`, `TZ` and croft's test variables (`CROFT_JOB_LABEL`, `CROFT_FORBID_OS_JOBS`, `CROFT_NOTIFY_DRY`, `CROFT_NOW`). Nothing else passes, secrets in the job's environment included;
+4. does not start a pinned croft whose `engines.bun` is newer than the job's Bun, or one that is not installed, and logs why, with the fix (`croft schedule on` or `bun install` in that folder).
+
+**Pruning.** The per-user tick and `croft schedule` prune a project only when it is surely gone, so moving or deleting a project cannot leave a job firing forever, and neither an unplugged disk nor a privacy block can unschedule one:
+
+- **gone:** its `croft.json` is missing (`ENOENT` or `ENOTDIR`) while the folder around it is there, on a mounted disk. It is pruned at once.
+- **missing:** its disk is not mounted (`/Volumes/<disk>`, `/media/…`, `/run/media/<user>/<disk>` or `/mnt/<disk>`; a disk counts as mounted when its folder is on another device than the folder above it), or its parent folder is gone too. It stays registered with `missingSince` and is pruned after 30 days missing; seeing it again clears the mark.
+- **unknown:** a permission error (`EPERM` from macOS privacy protection, `EACCES`) says nothing about the project. It is logged, and that line is what the privacy diagnosis reads, but the project is kept.
+
+The registry is rewritten only when something changed, and each change of state is logged once.
+
+**The registry lock.** Its writers are `croft schedule` in any project and the per-user tick, possibly at once. Every change is a read-modify-write under two locks, written to a temp name and renamed into place, so a reader sees the whole old file or the whole new one (D82):
+
+1. the OS lock: an exclusive `bun:sqlite` transaction on `projects.json.lock.db`, an empty file that holds no data. SQLite's lock is a POSIX `fcntl` lock, which the kernel drops when its holder exits or dies, so nobody ever breaks it and two writers never both hold it;
+2. holding it, the pid file older crofts use (`projects.json.lock`, created with `O_EXCL`), broken only when its pid is dead or it is older than 10 s. Only the OS lock's holder can be breaking it.
+
+A writer that cannot get both within 12 s fails with `DB_BUSY` (its hint gives `lsof <lock.db>`, or the pid the lock file holds). The tick script waits at most 2 s and prunes the next minute instead. A lock file that is not a database is `CONFIG_INVALID`, with the fix to delete it.
 
 **Each tick only plans and spawns.** It never does the work itself: launchd runs at most one process per job, so a tick busy with a 40-minute transform would drop every later fire [U]. For every registered project that still exists and has scheduling on, the per-user tick starts the project-pinned `croft tick`, which:
 
-1. exits at once unless scheduling is on and not paused for this project, so ticks from `croft serve` obey `schedule off|pause` too;
+1. exits at once unless scheduling is on for this project (not off, not paused), so ticks from `croft serve` obey `schedule off|pause` too;
 2. exits at once if another tick for the project is alive (a singleton row with PID and process start time), since cron can start overlapping ticks;
-3. records a heartbeat and runs `reconcile()`, opening the warehouse read-only;
-4. computes due work from the `runs.sqlite` mirror;
-5. spawns one detached `croft run --due` per independent group of due assets (the children take the leases);
-6. exits, usually within a second.
+3. records a heartbeat and runs `reconcile()`. Build: the warehouse is opened read-only, and only when a crashed step must be checked against it; with nothing to reconcile (no running run, lease, lock holder, waiter or write intent), reconcile is not even loaded, since it brings the database engine along. A scheduled run found crashed gets its failure notification from this tick, since it never reached its own;
+4. computes due work from `runs.sqlite` and its facts cache (below);
+5. spawns one detached `croft run --due <assets…>` per group of due assets connected through what reads them (the children take the leases), with an explicit environment that never carries a confirmation grant. Build: before each child starts, its ingests get `last_fire_at` (the fire they handle) and `last_attempt_at`, so a child that dies early is not started again every minute, and the run is noted (the setting `schedule.spawned`) until it holds its leases, so a slow child is not started twice;
+6. exits, usually within a second, with one line for `tick.log` (`tick: started r_… (orders)`, or `tick: nothing due`) and one per held asset.
 
-The per-user tick also prunes projects whose folder is gone, so moving or deleting a project cannot leave a job firing forever. It spawns every process with an absolute `process.execPath`, because launchd's `PATH` does not include `~/.bun/bin`.
+**`schedule on` waits for the first heartbeat, up to 70 s.** Build: it does not wait when the unchanged job ticked this project within the last 2 minutes. When no heartbeat comes, it exits 0 with the warning `SCHEDULER_STALE`, and scheduling stays on. The warning carries the tail of `tick.log` and the likely cause:
 
-**`schedule on` waits for the first heartbeat, up to 70 s.** If none arrives, it prints the tail of `tick.log` with the likely cause:
-
-- macOS privacy protection blocking background access to `~/Documents`, `~/Desktop` or `~/Downloads` [U];
+- macOS privacy protection blocking background access to `~/Documents`, `~/Desktop` or `~/Downloads` [U] (on the Mac where the real job was checked, reading `~/Documents` worked with no block [V]);
 - a missing Bun path;
-- on WSL, a VM that sleeps when no terminal is open [U].
+- a job Bun older than the project's croft needs (`bun_too_old`, fixed by `croft schedule on` in that folder);
+- the project's pinned croft not installed (`cd <root> && bun install`);
+- on WSL, a VM that sleeps when no terminal is open, or cron not running [U].
 
-`status` and `doctor` show `SCHEDULER_STALE`, with the same diagnosis, whenever the last heartbeat is older than 3 minutes. On servers, in containers and on WSL, `croft serve` runs the same per-minute loop in the foreground instead, spawning a fresh `croft tick` each minute, and also answers app queries (§5). Native Windows is unsupported in v1 (§2).
+`status` and `doctor` show `SCHEDULER_STALE`, with the same diagnosis, whenever scheduling is on and no tick came for 3 minutes, counted from the latest of the last heartbeat, turning scheduling on (the setting `scheduling.since`) and the end of a pause. For the OS job the diagnosis can also be `not_registered`, `job_missing` or `job_not_loaded`; for scheduling by `croft serve` only, `serve_not_running` or `serve_not_ticking`, from `<state>/logs/tick.log`. On servers, in containers and on WSL, `croft serve` runs the same per-minute loop in the foreground instead, spawning a fresh `croft tick` each minute, and also answers app queries (§5). Native Windows is unsupported in v1 (§2).
 
-**The first task of phase 3 is a spike on launchd and crontab registration,** including test fires, wake behavior and privacy protection, and it gates the rest of the phase. None of this could be verified without modifying the host.
+**The OS job was verified on macOS** [V] (2026-09-24), in the phase-3 spike that gated the rest of the phase and then with croft itself:
+
+- A LaunchAgent with `StartInterval` 60 and `RunAtLoad` ran at load and again 60 s later. `launchctl bootstrap gui/<uid>` loaded it and `launchctl bootout gui/<uid>/<label>` removed it cleanly. The job's `PATH` was `/usr/bin:/bin:/usr/sbin:/sbin` (no `~/.bun/bin`, hence the absolute Bun in `ProgramArguments`), its working folder `/`, `HOME` was set and the uid was the user's. `ProgramArguments` `[<absolute bun>, "--no-env-file", <script>]` worked.
+- `croft schedule on`, with a temporary `CROFT_HOME` and job label, installed and bootstrapped the plist; the first heartbeat came after 1 s; an every-minute ingest ran twice from launchd (trigger `schedule`, ticks of about 13 ms); and `croft schedule off` booted the job out and deleted the plist.
+- Still [U]: crontab registration on a real Linux machine, wake behavior, and privacy protection on other Macs. CI never installs a job.
 
 Why not `Bun.cron`, which registers OS jobs too:
 
@@ -1718,28 +1845,36 @@ Writing a plist or a crontab line directly is about 150 lines, and croft control
 
 ### What counts as due
 
-`croft tick` reads schedules from `schedule_state`, which is cached by file hash, so a tick with nothing due takes about 50 ms and imports no asset code. The due set is:
+`croft tick` reads schedules from `schedule_state`, which is cached by file hash, so a tick with nothing due takes about 50 ms and imports no asset code. Build: what the scheduler knows of an asset without importing it (kind, schedule, inputs, code hash) is cached in `runs.sqlite` by file hash (D79). `schedule_state` keeps phrase, cron and file hash, and the setting `schedule.facts` the rest. The file hash covers the asset file and the project time zone, and for TS assets the size and modification time of everything in `lib/` and of `package.json` and the lockfile, on which the TS code hash depends. Only an asset whose hash changed is imported again, so a tick with nothing changed imports no asset code: about 80 ms from process start to exit, with 20 TS ingests and 20 SQL transforms [V]. The due set is:
 
-- ingests whose schedule fired since `last_fire_at`, plus their stale downstream;
-- **any stale transform**, even when no ingest is due. A transform can be left stale by `run --only`, an edit that has since been run by hand, or an earlier failure. Without this rule it would wait for its input's next scheduled fetch.
+- ingests whose schedule fired since `last_fire_at`, plus their stale downstream. Build: an ingest is due when its latest fire is after both `last_fire_at` and the start of its last successful step, so a run by hand covers the fires before it. The tick names only the ingest; the run takes the stale downstream, as any run does;
+- **any stale transform**, even when no ingest is due. A transform can be left stale by `run --only`, an edit that has since been run by hand, or an earlier failure. Without this rule it would wait for its input's next scheduled fetch. Build: a transform whose input was never built is not due on its own; it follows that input's run.
 
-The tick skips anything **held**:
+The tick skips anything **held**, and a held asset stays due. As built, the holds apply in this order:
 
+- `paused`: scheduling is paused;
 - `SCHEDULE_HELD`: code not yet run by hand (§6);
-- `LARGE_REPROCESS`: the cost guard (§5);
-- `paused`;
-- or leased by another run.
+- `LARGE_REPROCESS`: the cost guard (§5), until a person runs the transform;
+- `leased`: another run holds it, or a run a tick started has not taken its leases yet;
+- `backoff`: a transform whose last attempt failed (below).
 
-`last_attempt_at` is recorded when an attempt starts, and `last_fire_at` when a due fire is handled. After its final retry, a deterministic failure (`TYPE_CONFLICT`, `CHECK_FAILED`, SQL errors) waits for the next fire time, or for a change to its code or inputs. It is never retried every minute.
+`last_attempt_at` is recorded when an attempt starts, and `last_fire_at` when a due fire is handled; `last_fire_at` never moves back. After its final retry, a deterministic failure (`TYPE_CONFLICT`, `CHECK_FAILED`, SQL errors) waits for the next fire time, or for a change to its code or inputs. It is never retried every minute. Build: an ingest waits for its next fire, whatever failed. A transform's deterministic failure (`ASSET_INVALID` too, anything not retryable) waits for a change to its code or inputs, or a run by hand; its retryable failure, crash or interruption waits 15 minutes, or the server's longer `Retry-After`, before the scheduler tries it again.
+
+A `--due` run checks the holds again when it plans, since the world may have changed since the tick: a pause or a lease that appeared meanwhile skips the step, and `schedule off` landing between the tick and its child holds every step (`held: scheduling is off`).
 
 ### What the user experiences
 
 - **Downstream follows automatically.** Transforms have no schedule and update in the same run as their inputs.
-- **Missed times run once.** After a laptop sleeps through 8 hourly fires, the ingest runs once on wake. Its cursor fetches everything since, so no data is skipped.
+- **Missed times run once.** After a laptop sleeps through 8 hourly fires, the ingest runs once on wake. Its cursor fetches everything since, so no data is skipped. Only the latest fire counts, and `croft schedule status` says so: `due: fired at 20:00; 4 missed fires run once`.
 - **Overlaps skip.** An asset still leased by the previous tick is skipped and stays due.
 - **Retries.** TS assets get 2 retries (after 30 s and 2 min) on retryable errors: network errors, 429/5xx after `http`'s own retries, and `DB_BUSY`. SQL and deterministic errors (`TYPE_CONFLICT`, `CHECK_FAILED`, SQL errors) are not retried. A chunked TS transform keeps its committed chunks across retries, but each failed attempt loses, and so can re-bill, the chunk it was filling (§3e). A server's `Retry-After` (`HTTP_ERROR` `details.retryAfterMs`, §3a) is honored: the next attempt waits `max(delay, retryAfterMs)`. A wait longer than a run holds on for (5 minutes, like `maxRetryAfterMs`) ends the step at once, with `nextRetryAt` set to when the server allows the next try, rather than retrying inside the server's backoff window.
 - **Timeout** means "no progress": no row yielded and no request completed for 10 minutes. `timeout: "30m"` changes it. Chunked TS transforms (§3e) can run for hours as long as they progress.
-- **Failures** show in `status`. By default, a failed *scheduled* run also raises a desktop notification (`osascript` on macOS, `notify-send` on Linux). `"notify": {"desktop": false, "webhook": "https://hooks.slack.com/…"}` in `croft.json` changes this. A webhook receives the failure envelope.
+- **Failures** show in `status`. By default, a failed *scheduled* run also raises a desktop notification (`osascript` on macOS, `notify-send` on Linux). `"notify": {"desktop": false, "webhook": "https://hooks.slack.com/…"}` in `croft.json` changes this. A webhook receives the failure envelope. Build (`schedule/notify.ts`):
+  - The desktop notification is in plain words: the project folder, the failed assets, the first error's code and message, and `croft logs <asset> --failed`. Its title is `croft: <project>`. macOS shows it with `osascript` (`display notification`), and Linux with `notify-send -a croft -- <title> <body>` when it is installed.
+  - The webhook receives `{project, text, data: {runId, status, steps}, problems, next, exit, ok}`: the run's summary as `croft run --json` prints it, plus `text`, the notification in one line, because Slack-style incoming webhooks reject a post without it. The run's progress and any confirmation (which holds a token) are left out. Each attempt has 10 s, and there are 3, retrying network errors, timeouts, 429 and 5xx (a `Retry-After` up to 30 s is honored) and never another 4xx. A loopback URL is posted over a plain socket, so `HTTP_PROXY` never sees it; any other host goes through `fetch`.
+  - Everything sent or written is redacted as a run summary is (§9.6), with the run's own declared secrets. A webhook URL counts as secret too (Slack's path is its credential), so logs name only its host.
+  - A notification never fails the run. One that could not go out is a line in `<state>/logs/notify.log`. A held asset is a warning and notifies nothing, and a scheduled run that crashed is notified by the tick that finds it.
+  - With `CROFT_NOTIFY_DRY=1` (tests), each notification is recorded in `<state>/logs/notifications.ndjson` instead of being shown; a loopback webhook is still posted (tests run a mock), and any other is recorded, not sent.
 
 ### Incrementality by asset type
 
@@ -1763,7 +1898,7 @@ The tick skips anything **held**:
   - Identifier minification must stay off: with it on, a comment-only edit changed the hash [V].
 - **Incremental TS transforms** apply new code to new rows only, because they may call paid services. `status` says: "issue_triage edited since last run; 18,556 rows were built by older code; to redo them: `croft run issue_triage --rebuild`" (trash plus confirmation). Until `--rebuild` ships in phase 4, `EDITED_SINCE_LAST_RUN` ends at "… rows were built by older code", and its hint says the rows built earlier keep their values. A time zone change applies to new input rows only, in the same way.
 - **Ingests** never refetch because of a code change.
-- **In every case,** a changed asset is held from the scheduler until it has been run by hand (§6).
+- **In every case,** a changed asset is held from the scheduler until it has been run by hand (§6). Since the time zone is part of every code hash, changing `timezone` in `croft.json` holds every asset.
 
 ### Backfills
 
@@ -1801,7 +1936,16 @@ The agent has never seen this tool. Everything it needs ships inside the install
 
 **Each phase ships these texts cut to its commands** (D59). Items 1 and 2 are the full v1 texts, the target for later phases. A phase ships them cut (`src/agent/claude-md.md` and `skill.md`): lines that send the agent to a command, flag or feature the phase lacks are left out or reworded, and SKILL.md gains a "This version" section rendered from the manifest in `core/phase.ts`, naming the commands the build has, the ones it lacks and what it does not do yet. `agent/templates.test.ts` lists every cut line with its reason, so no rule below disappears unnoticed; it replaced a test that compared the files with this section verbatim. `agent/contract.test.ts` guarantees that every command named in agent-facing text exists in the build (§4.1).
 
-Phase 2 ships the `CLAUDE.md` block below word for word, and its SKILL.md leaves out or rewords only the lines about phase 3–5 commands (`croft new`, `--rebuild`, `rename`, `restore`, `delete`, `schedule`, `serve`, `readCopy`). Its loop step 1 points at the templates in `croft docs ingest`, `croft docs sql` and `croft docs transforms` and at `croft docs checks`, which stand in for phase 5's `croft new` as `croft docs ingest` did in phase 1 (D60).
+Phase 2 shipped the `CLAUDE.md` block below word for word, and its SKILL.md left out or reworded only the lines about phase 3–5 commands (`croft new`, `--rebuild`, `rename`, `restore`, `delete`, `schedule`, `serve`, `readCopy`). Its loop step 1 points at the templates in `croft docs ingest`, `croft docs sql` and `croft docs transforms` and at `croft docs checks`, which stand in for phase 5's `croft new` as `croft docs ingest` did in phase 1 (D60).
+
+Phase 3 ships the `CLAUDE.md` block word for word too, and its SKILL.md restores the phase-3 lines of item 2 word for word: `scheduling` in the description, schedules and holds in the `context` line, "Only ingests have schedules.", the Apps line with `croft serve`, the rule that `croft serve` runs until stopped, the `readCopy` line for GUIs, the ask-first line about `croft serve`, and the Held asset recipe. It leaves out or rewords only the lines about phase 4–5 features (`croft new`, `--rebuild`, `rename`, `restore`, `delete`, pre-upgrade backups): the ask-first line about renaming keeps `croft schedule on|off|pause` and says instead that the table stays under the old name. One more line differs for a reason that is not a phase: the `croft status` line of Orient uses the command's own words ("failed, stale, held, never run, edited since its last run, no asset file"). `templates.test.ts` lists 11 cut lines. The shipped SKILL.md also adds a Schedule recipe, which serves the eval task "schedule hourly":
+
+```
+- Schedule: add `schedule: "every hour"` to the ingest (`croft docs scheduling`); `croft validate` shows the next fires;
+  run it by hand once (new code is held until then), then ask the user before `croft schedule on`.
+```
+
+Phase 3 adds the docs topics `scheduling`, `serve` and `read-copy`, and code pages for `SCHEDULE_INVALID`, `SCHEDULE_HELD`, `SCHEDULER_STALE`, `SERVE_UNAUTHORIZED` and `SERVE_UNAVAILABLE` (28 code pages in all). The ingest templates of `croft docs ingest` carry the `schedule:` lines of §3 again.
 
 **1. The `CLAUDE.md` managed block:**
 
@@ -1917,8 +2061,8 @@ A test fails if any thrown code is unregistered or has no fix template and docs 
 **The codes:**
 
 - **Project:** `DUPLICATE_OUTPUT_COLUMN`, `DECIMAL_PRECISION_UNSUPPORTED`, `QUERY_PATH_DENIED`, `ASSET_INVALID`, `NAME_INVALID`, `NAME_RESERVED`, `NAME_CONFLICT`, `HEADER_UNKNOWN_KEY`, `SQL_SYNTAX`, `SQL_NOT_SELECT`, `SQL_NOT_ONE_STATEMENT`, `PIVOT_NEEDS_VALUES`, `CATALOG_PREFIX`, `SQL_READS_FILES`, `INPUT_NEEDS_KEY`, `UNKNOWN_TABLE`, `UNKNOWN_COLUMN`, `QUOTE_IDENTIFIER`, `UNDECLARED_INPUT`, `CYCLE`, `SCHEDULE_INVALID`, `CHECK_INVALID`, `SECRET_MISSING`, `INCREMENTAL_WITHOUT_KEY`, `CURSOR_TYPE_MISMATCH`, `ASSET_OPENS_DATABASE`, `ASSET_RENAMED`, `QUERY_NOT_SELECT`, `USAGE_ERROR` (bad flags or arguments), `PROJECT_NOT_FOUND`, `QUERY_FAILED` (DuckDB failed while binding or running a user query, §5), `CONFIG_INVALID` (`croft.json`), `DB_NOT_FOUND` (no warehouse file; worded by `runs.sqlite` as built before and now missing, runs that wrote no table yet, or nothing run yet, §3b).
-- **Run:** `HTTP_ERROR`, `ASSET_CODE_ERROR`, `ROW_NOT_OBJECT`, `UNSERIALIZABLE_VALUE`, `CSV_HEADER_AMBIGUOUS`, `PIN_ROUNDED`, `DDL_AFTER_DML` (an internal invariant), `KEYSET_STUCK`, `TIMEOUT`, `INTERRUPTED`, `TYPE_CONFLICT`, `TYPE_PIN_VIOLATION`, `KEY_NULL`, `CHECK_FAILED`, `SHRINK_GUARD`, `INGEST_CONFIG_CHANGED`, `PIN_CHANGES_DATA`, `UNKNOWN_INPUT_COLUMN`, `BACKFILL_UNSUPPORTED`, `BACKFILL_WOULD_DUPLICATE`, `LARGE_REPROCESS`, `INTERNAL_ERROR` (a croft bug), `RUN_CRASHED` (a step whose process died before it committed, found by `reconcile()`).
-- **Coordination:** `DB_BUSY`, `DB_HELD_BY_OTHER_PROGRAM`, `ASSET_BUSY`, `SCHEDULE_HELD`, `SERVE_UNAVAILABLE`, `SERVE_UNAUTHORIZED` (a `401`/`403` from `croft serve`; exit 2, never retried), `SERVE_UNSAFE_FILESYSTEM`, `QUERY_TOO_MANY_ROWS`.
+- **Run:** `HTTP_ERROR`, `ASSET_CODE_ERROR`, `ROW_NOT_OBJECT`, `UNSERIALIZABLE_VALUE`, `CSV_HEADER_AMBIGUOUS`, `PIN_ROUNDED`, `DDL_AFTER_DML` (an internal invariant), `KEYSET_STUCK`, `TIMEOUT`, `INTERRUPTED`, `TYPE_CONFLICT`, `TYPE_PIN_VIOLATION`, `KEY_NULL`, `CHECK_FAILED`, `SHRINK_GUARD`, `INGEST_CONFIG_CHANGED`, `PIN_CHANGES_DATA`, `UNKNOWN_INPUT_COLUMN`, `BACKFILL_UNSUPPORTED`, `BACKFILL_WOULD_DUPLICATE`, `LARGE_REPROCESS`, `INTERNAL_ERROR` (a croft bug), `RUN_CRASHED` (a step whose process died before it committed, found by `reconcile()`), `FILE_NOT_FOUND` and `FILE_UNREADABLE` (a file ingest's file or URL, §3b).
+- **Coordination:** `DB_BUSY`, `DB_HELD_BY_OTHER_PROGRAM`, `ASSET_BUSY`, `SCHEDULE_HELD` (a warning with exit 0: a held asset never fails a run, D77), `SERVE_UNAVAILABLE`, `SERVE_UNAUTHORIZED` (a `401`/`403` from `croft serve`; exit 2, never retried), `SERVE_UNSAFE_FILESYSTEM`, `QUERY_TOO_MANY_ROWS`.
 - **Safety:** `CONFIRMATION_REQUIRED`, `CONFIRMATION_STALE`, `REQUIRES_HUMAN`.
 - **Environment:** `BUN_TOO_OLD`, `NEEDS_BUN`, `DUCKDB_BINDING_MISSING`, `DUCKDB_BINDING_LOAD`, `DB_NEWER_FORMAT`, `CLAUDE_FILES_OUTDATED`, `SCHEDULER_STALE`, `PROJECT_NOT_WRITABLE`, `DB_UNREADABLE`, `INSTALL_FAILED`.
 - **Warnings and info:** `ENV_FILE_IGNORED`, `TABLE_MODIFIED_OUTSIDE_CROFT`, `VOLATILE_SQL`, `MIXED_TYPES`, `NULL_ONLY_COLUMN`, `UNSAFE_INTEGER`, `SINCE_IGNORED`, `EMPTY_EXTRACT`, `TYPE_WIDENED`, `COLUMN_STOPPED_ARRIVING`, `JSON_KIND_CHANGED`, `CSV_ENCODING_GUESSED`, `AMBIGUOUS_DATE_FORMAT`, `MIXED_DATE_FORMATS`, `DUPLICATE_ROWS_ACROSS_FILES`, `TRANSFORM_MAKES_REQUESTS`, `SHRINK_GUARD_DISABLED`, `INPUT_NOT_BUILT`, `EDITED_SINCE_LAST_RUN`, `ORPHAN_TABLE`, `OUT_OF_BAND_CHANGE`, `ENV_FILE_INVALID` (a `.env` line croft cannot parse), `COLUMN_NAME_COLLISION` (§7), `BUN_UNTESTED`, `DB_ON_SYNCED_FOLDER`, `TZDATA_MISMATCH`.
@@ -1930,9 +2074,10 @@ A test fails if any thrown code is unregistered or has no fix template and docs 
 - `context`, `status`, `describe` (columns, JSON keys, behavior in words, cursor, samples);
 - `run --dry-run` (actions, reasons, windows, confirmations);
 - `validate` (with output columns), `preview` (including `--rebuild` for drift);
-- `logs` (`--failed`, `--runs`), `secrets`, `doctor`, `docs internals`.
+- `logs` (`--failed`, `--runs`), `secrets`, `doctor`, `docs internals`;
+- `schedule status` (each asset as the scheduler sees it: schedule, cron, next and last fire, due, held; phase 3).
 
-All of these ship from phase 2. (Phase 1, which had no `run --dry-run`, `validate` or `preview`, backfilled with `croft run <asset> --from <when>`, checking the saved cursor first with `croft describe <asset>`.)
+All of these but `schedule status` ship from phase 2. (Phase 1, which had no `run --dry-run`, `validate` or `preview`, backfilled with `croft run <asset> --from <when>`, checking the saved cursor first with `croft describe <asset>`.)
 
 **6. Protecting the agent's context window:**
 
@@ -1985,7 +2130,7 @@ Declaring `secrets` drives `doctor`, `validate`, error messages and what `ctx.se
 **Dependencies:**
 
 - **Runtime:** only `@duckdb/node-api`, pinned exactly, because both the storage format and the AST shape depend on its version.
-- **Everything else is a Bun built-in:** `bun:sqlite`, `Bun.Glob`, `Bun.file`/`Bun.write`, `Bun.hash`/`Bun.CryptoHasher`, `Bun.build` (fingerprints), `fetch`, `node:util` `parseArgs`, `node:child_process` (detached runs, notifications, `croft tick` spawns, and the `cp -c`/`cp --reflink=auto` clones behind the read copy and backups), `node:fs` (write-intent files; `watch` only as a latency hint), `node:crypto` `timingSafeEqual` (serve tokens), `node:net`/`node:tls` (the read client's proxy-proof loopback HTTP, §5), and `Bun.serve` (`croft serve` and test mocks).
+- **Everything else is a Bun built-in:** `bun:sqlite` (`runs.sqlite`, and the scheduler registry's OS lock), `Bun.Glob`, `Bun.file`/`Bun.write`, `Bun.hash`/`Bun.CryptoHasher`, `Bun.build` (fingerprints), `fetch`, `node:util` `parseArgs`, `node:child_process` (detached runs, notifications, `croft tick` spawns, `launchctl` and `crontab`, and the `cp -c`/`cp --reflink=auto` clones behind the read copy and backups), `Bun.spawn` with its IPC channel (`croft serve`'s query workers), `node:fs` (write-intent files; `watch` only as a latency hint), `node:crypto` `timingSafeEqual` (serve tokens), `node:net`/`node:tls` (the read client's proxy-proof loopback HTTP, §5, also used for loopback webhooks), and `Bun.serve` (`croft serve` and test mocks).
 - **No CLI framework and no schema library.** Validators are hand-written so their errors read well.
 
 ```
@@ -1994,7 +2139,8 @@ src/
   cli/                 main.ts (parseArgs, envelopes, exit codes), launcher.ts (pinned-copy delegation, install,
                        .env cleanup), render.ts (human/JSON, truncation, offsets, redaction), version.ts
                        (BUN_FLOOR, BUN_TESTED), commands/index.ts (registry),
-                       commands/*.ts
+                       commands/*.ts (schedule.ts also holds what status, doctor, context and describe show of
+                       scheduling, and SCHEDULER_STALE; it imports no DuckDB, since doctor imports it)
   core/                errors.ts (CroftError, code registry, fix templates, exit codes), types.ts,
                        time.ts (formatInstant, the one timestamp renderer), proc.ts (pid + start time + boot id),
                        output.ts (asset output, console and fds 1 and 2 → step log or stderr),
@@ -2017,9 +2163,14 @@ src/
                        warehouse.ts (fromCache registry, one mode per process, leases with boot id, lock retry,
                        holder lookup), state.ts (_croft DDL + migrations, format check), values.ts (DuckDB → JS,
                        round-trip safe), tx-guard.ts (DDL_AFTER_DML), readcopy.ts (opt-in: checkpoint +
-                       child-process clone + rename), intent.ts (write-intent file)
-  serve/               server.ts (Bun.serve: /query, /status, /health; token auth), handoff.ts (watch write-intent,
-                       close/reopen the read-only instance), loop.ts (spawn croft tick every minute)
+                       child-process clone + rename; coalesced refreshes), intent.ts (write-intent file),
+                       fs-kind.ts (filesystems whose locks cannot be trusted: SERVE_UNSAFE_FILESYSTEM)
+  serve/               server.ts (Bun.serve: /query, /status, /health; limits, statuses, serve.json), auth.ts
+                       (token, Host, Origin, Content-Type), instance.ts (the engine: workers, admission, handoff,
+                       read-copy answers, watchdog), worker.ts (the query worker process: one read-only instance,
+                       the serve gate, streamed results), query-worker.ts (its handle over IPC; kill to release),
+                       queue.ts (admission, maxQueued, interrupt then kill), handoff.ts (watch write-intent,
+                       quick and full liveness), loop.ts (spawn croft tick at start and every minute), types.ts
   load/                stage.ts (NDJSON parts, canonical + lossless JSON), classify.ts (json_type + regex kinds),
                        types.ts (type rules, name-typed placeholders, CSV money/date formats), cast.ts (whitelist,
                        round-trip loss check), evolve.ts (ALTERs), write.ts (diff-replace, append, merge, dedupe;
@@ -2036,8 +2187,12 @@ src/
                        preview db, partial diffs)
   checks/              parse.ts (check language → validated SQL; vetting), run.ts (checksHook, runWarnings)
   http/                http.ts (retries, Retry-After, Link, lossless JSON, redaction)
-  schedule/            phrase.ts (English → cron), cron.ts (DST-defined matcher), register.ts (launchd, crontab),
-                       tick.ts (per-user registry, per-project plan-and-spawn, singleton, heartbeats), notify.ts
+  schedule/            phrase.ts (English → cron), cron.ts (DST-defined matcher), types.ts (parseSchedule, nextFires,
+                       latestFireAtOrBefore), register.ts (launchd, crontab, pickBun), registry.ts (projects.json,
+                       its locks, pruning), user-tick.ts (the ~/.croft/tick.ts template), heartbeat.ts (heartbeat
+                       wait, diagnosis), home.ts (CROFT_HOME, job label), os.ts (OsRunner, the refusing tripwire),
+                       tick.ts (per-project plan-and-spawn, singleton), due.ts (due set, holds, facts cache,
+                       groups), notify.ts (desktop and webhook)
   history/             runs-db.ts (bun:sqlite), catalog.ts (the catalog mirror), leases.ts, reconcile.ts, logs.ts
   safety/              trash.ts (ATTACH-based trash/restore), confirm.ts (tokens, impact hash, detached-run grants),
                        guards.ts (shrink, config change, pin change, hold), rename.ts, delete.ts, oob.ts (out-of-band
@@ -2224,7 +2379,8 @@ export interface Warehouse {
 }
 // Phase-2 command data (§4.3): validate, preview, run --dry-run
 export interface ValidateAsset { name: string; kind: AssetKind | null; inputs: string[];
-  outputColumns: { name: string; type: string }[] | null; behavior: string; codeChanged: boolean }
+  outputColumns: { name: string; type: string }[] | null; behavior: string; codeChanged: boolean;
+  schedule?: { text: string; cron: string; next: string[] } }      // scheduled ingests (phase 3): next three fires
 export interface ValidateData { order: string[]; assets: ValidateAsset[];
   types?: { status: "ok" | "failed" | "skipped"; errors: number } }            // --types only
 export interface PreviewColumnChange { column: string; change: "added" | "removed" | "retyped"; type: string;
@@ -2301,7 +2457,7 @@ export type ConfirmDecider = (r: ConfirmRequest) => Promise<ConfirmDecision>;
 
 ### Test strategy (`bun test`)
 
-`bunfig.toml` preloads `tests/preload.ts`, which sets two tripwires before any test file loads: `CROFT_FORBID_OS_JOBS=1` (registering the scheduler refuses instead of installing a launchd or crontab job) and `CROFT_NOTIFY_DRY=1` (a failure notification is logged instead of shown). The e2e harness passes both to every croft it spawns. `core/codes-raised.test.ts` is a gate: every registered code is raised somewhere in the source, or listed with the later phase that raises it, and that list only shrinks. It does not count comparisons, `case` labels or `[…].includes()` lists as raising a code.
+`bunfig.toml` preloads `tests/preload.ts`, which sets two tripwires before any test file loads: `CROFT_FORBID_OS_JOBS=1` (registering the scheduler refuses instead of installing a launchd or crontab job) and `CROFT_NOTIFY_DRY=1` (a failure notification is logged instead of shown). The e2e harness passes both to every croft it spawns. Build: under `CROFT_FORBID_OS_JOBS=1` the scheduler's `OsRunner` refuses to run anything (tests inject a fake one), and `croft schedule` refuses a home or croft folder that is the real user's, taken from the password database since Bun's `os.userInfo().homedir` returns `HOME` [V]; tests set `HOME`, `CROFT_HOME` and a unique `CROFT_JOB_LABEL`. `CROFT_NOTIFY_DRY=1` records each notification in `<state>/logs/notifications.ndjson`; a loopback webhook is still posted, so tests use a mock server. `core/codes-raised.test.ts` is a gate: every registered code is raised somewhere in the source, or listed with the later phase that raises it, and that list only shrinks. It does not count comparisons, `case` labels or `[…].includes()` lists as raising a code.
 
 1. **Unit tests, no DuckDB:**
    - Phrase → cron, and the tz-aware matcher across DST in several zones.
@@ -2323,7 +2479,7 @@ export type ConfirmDecider = (r: ConfirmRequest) => Promise<ConfirmDecision>;
    - The sandbox: `COPY TO` the warehouse, `DETACH`/`ATTACH`, reading outside allowed directories, and re-enabling settings, all refused.
    - The single-instance registry.
    - One scenario test per silent-loss hazard: implicit rounding, dropped struct field, MERGE duplicates, sniffer date flip, union-by-name column drop, JSON kind change.
-3. **End-to-end fixture projects** driven by spawning the real CLI (`tests/e2e` holds 20 journey files; phase 2 added `j16`–`j19`, for SQL transforms, TS transforms, preview, and validate with the dry run). A `Bun.serve` mock API covers:
+3. **End-to-end fixture projects** driven by spawning the real CLI (`tests/e2e` holds 24 journey files; phase 2 added `j16`–`j19`, for SQL transforms, TS transforms, preview, and validate with the dry run; phase 3 added `j20` (schedule: holds, a scheduled run with its downstream, pause, missed fires run once, a stale scheduler, off), `j21` (serve: an app reading through it, tokens, a second server refused, the banner, a scheduled run while it serves), `j22` (a scheduled failure: the desktop record and the webhook, redacted, then backoff) and `j23` (the read copy, with a GUI-like process holding it)). A `Bun.serve` mock API covers:
    - ascending keyset, newest-first `starting_after`, and Link pagination;
    - epoch cursors;
    - 429 with `Retry-After`, and flaky 500s;
@@ -2335,15 +2491,19 @@ export type ConfirmDecider = (r: ConfirmRequest) => Promise<ConfirmDecision>;
    - a run plus a query; a foreign read-only holder; two runs on one asset; a tick overlapping a manual run; a detached run followed by `wait`;
    - `croft serve` under steady load while runs write. The writer must get the file within 100 ms with no query in flight, and within 2 s + 100 ms with a 60 s query in flight.
    - two writers, where A removes its intent while B still waits and B must get the file;
-   - 16 concurrent long queries at handoff; an idle connection at handoff (assert zero open connections before `closeSync()`);
+   - 16 concurrent long queries at handoff; an idle connection at handoff (assert zero open connections before the file is released: before `closeSync()` in the first build, before the worker is killed since D76);
    - a stale intent whose PID was reused; a writer blocked by a foreign holder, which withdraws its intent;
    - three direct app readers against one writer.
+
+   Build: the suite lives in `tests/concurrency/` (runs, serve, direct) and uses real processes only: the CLI, `croft serve`, probe writers, foreign DuckDB holders and direct-mode apps. The timing budgets use a probe writer that follows croft's own intent protocol but retries the lock every 5 ms (a real `croft run` backs off up to 1 s, which would hide how fast serve lets go), measured from the writer's own intent `since`; real runs write in the same tests and must succeed. With the query worker (D76), `src/serve/instance.test.ts` adds a stuck query plus a writer (the writer's wait under `graceMs` + 1.5 s), deadlines and aborts of queries no interrupt stops (while executing and while planning), a worker crash, `kill -9` of croft serve leaving no lock, and the worker's peak memory for a 20M-row table read with `limit` 10.
 5. **Crash tests.** `CROFT_FAULT=after_stage|before_commit|after_commit_before_sqlite|between_trash_and_drop|mid_chunk` makes the child `SIGKILL` itself (`mid_chunk`: halfway into filling the chunk after an incremental transform's first commit). The parent then asserts that data and state agree, the cursor is at most the committed maximum, and the next run succeeds.
-6. **Scheduler tests** with a fake clock (`CROFT_NOW`) and a fake `HOME`. They check plist and crontab generation, registry pruning, heartbeat verification, the tick singleton, holds, stale-transform pickup, and DST golden days (2026-03-08 and 2026-11-01 in several zones). Real OS registration is exercised in a phase-3 spike and in manual release checks, because CI cannot install launchd jobs.
+6. **Scheduler tests** with a fake clock (`CROFT_NOW`) and a fake `HOME`. They check plist and crontab generation, registry pruning, heartbeat verification, the tick singleton, holds, stale-transform pickup, and DST golden days (2026-03-08 and 2026-11-01 in several zones). Real OS registration is exercised in a phase-3 spike and in manual release checks, because CI cannot install launchd jobs. Build: the registry lock has race tests (24 writers over a dead holder's lock, a pruning tick racing 12 writers, a holder killed inside the lock), and missing projects use a fake filesystem for mounted and unmounted disks. The e2e journeys turn scheduling on with `croft schedule on --no-os-job` under a temporary `HOME` and `CROFT_HOME`, and play the OS job by running `croft tick` at chosen `CROFT_NOW` times. The real LaunchAgent was checked once by hand [V] (§8).
 7. **`@zabaca/croft/read` under Node** (current LTS) in CI, in both modes:
    - HTTP against `croft serve`: token, a wrong token (`SERVE_UNAUTHORIZED`), `503` with `Retry-After`, `SERVE_UNAVAILABLE`, and loopback with `HTTP_PROXY` set;
    - direct;
    - a golden test that the same query gives identical rows in both modes, and the Next.js `serverExternalPackages` setup.
+
+   Build: `src/read/node-read.test.ts` builds the bundle with `scripts/build-read.ts` into a private folder and runs it under the real Node against a real `croft serve` process: the right and a wrong token, the `serve.json` route, `CROFT_URL` with `CROFT_SERVE_TOKEN`, a `503` retried until the same query succeeds after the write, `SERVE_UNAVAILABLE` once the client's timeout has passed, a recording `HTTP_PROXY` that sees nothing, direct mode, and identical rows from the server, Node direct and Bun direct. The Next.js setup is not covered yet.
 8. **CI matrix.** macOS arm64, Linux x64 glibc and Linux arm64 are tier 1, each on the Bun floor (1.3.14) and `bun@latest`. Alpine and Windows get smoke tests.
 9. **Agent evals** from phase 2 onward. Headless Claude Code sessions run fixture tasks:
    - "add Stripe charges and daily revenue, schedule hourly";
@@ -2399,6 +2559,8 @@ Each phase is usable end to end, and each ships `--json`, error codes, docs page
 
 **Phase 2 is complete** (2026-09-24), with about 2,230 tests. It ships SQL assets (§3c), the dependency graph, staleness and fingerprints, the bind check, TS transforms with snapshots, composite positions, chunked commits and the cost guard (§3e, §5), checks and warnings on every write (§3f), `validate`, `preview` with `query --preview` (§6), and `run --dry-run`, `--only` and `--upstream` (§4.1). The warehouse format is 3 (§5, D69). The build changed some decisions, recorded as D65–D75: a transform's duplicate key fails instead of being deduplicated, the preview keeps its own catalog, chunks are cut at a `newRows()` request, `ResolvedAsset` lives in `project/resolve.ts`, staleness compares a recorded input version (format 3), HUGEINT snapshots are text, SQL steps drop reserved names without regard to case, a position counts yielded outputs, header lines must come first, the SQL fingerprint keeps the case of column names, and `status` resolves the asset code. Phase 2 ships the `CLAUDE.md` block of §9 word for word, and SKILL.md with only phase 3–5 lines left out; its templates are the docs pages `ingest`, `sql` and `transforms`, with `checks` for the check language, ahead of phase 5's `croft new`. It also ships a docs page for each of 23 codes (the 17 codes phase 2 first raises, and six older ones that its SQL assets and bind check raise most), ahead of phase 5's "a docs page per code", and the agent eval harness with its first two tasks (§10). Not yet: schedules, `croft serve` and the read copy (phase 3), and `--rebuild`, `rename`, `delete` and `restore` (phase 4), so hints name what this build can do instead (§4.1).
 
+**Phase 3 is complete** (2026-09-24), with about 2,985 tests. It ships schedules (§8): the phrase parser and the DST-defined matcher, `croft schedule on|off|pause|status`, the per-user OS job (a LaunchAgent on macOS, verified on a real Mac [V], and a crontab block on Linux), the project registry with its OS lock, the per-user tick script and heartbeats, the project tick (`croft tick`, hidden) that plans and spawns `croft run --due`, the due set with its holds, backoff, catch-up once and skip on overlap, and failure notifications on the desktop and to a webhook. It ships `croft serve` (§5): its query worker and watchdog, streamed results within `limit`, `maxRows` and `maxBytes`, a bounded queue, the serve gate's `SHOW` and range limits, the write-intent handoff, `GET /status` as the status envelope, and the scheduler loop; and the opt-in read copy, from which serve answers with `stale` and `asOf`. Scheduling shows in `status`, `doctor`, `context`, `describe` and `validate`. `runs.sqlite` gains its `settings` table (migration 2); the warehouse format stays 3. The build changed some decisions, recorded as D76–D85: croft serve holds the file in a worker process that it kills to release it, holds in a scheduled run are warnings, a phase has a completion flag, the scheduler caches what it knows of each asset by file hash, interval crons fire at both passes of a repeated hour, `GET /status` is the status envelope without asset code, the registry takes an OS lock and keeps missing projects for 30 days, the job's Bun is never older than croft needs, a generated serve token is new on every start, and a scheduled transform's failure backs off. Phase 3 ships the `CLAUDE.md` block of §9 word for word, and SKILL.md with its phase-3 lines restored and only phase 4–5 lines left out, plus a Schedule recipe; the docs topics `scheduling`, `serve` and `read-copy`; and pages for five more codes (§9). The e2e suite gains `j20`–`j23`, and the concurrency suite and the read client under Node now run against real processes (§10). Not yet: `--rebuild`, `rename`, `delete` and `restore` (phase 4), and `croft new` (phase 5).
+
 The total is about 14.5 engineer-weeks and roughly 14–16k lines. The user chose to ship all five phases as v1.
 
 **Post-v1 candidates, in order:**
@@ -2421,9 +2583,9 @@ The total is about 14.5 engineer-weeks and roughly 14–16k lines. The user chos
 | Risk | Mitigation |
 |---|---|
 | The user's app or a SQL GUI holds the live file and blocks writes | apps query through `croft serve`, which steps aside for writes in 10–23 ms [V]; the direct `@zabaca/croft/read` fallback honors the write-intent handshake; GUIs use the opt-in read copy; lock errors name the program and PID; `doctor` shows the holder |
-| `croft serve` exposes data beyond the machine, or to browser pages | token always required (generated into `serve.json`); Host and Origin checks against DNS rebinding and cross-origin requests; loopback by default, HTTPS proxy otherwise; tables only, no file access; query deadline, concurrency and memory limits |
+| `croft serve` exposes data beyond the machine, or to browser pages | token always required (generated into `serve.json`); Host and Origin checks against DNS rebinding and cross-origin requests; loopback by default, HTTPS proxy otherwise; tables only, no file access; query deadline, concurrency, queue, body, row and memory limits, and a query worker that can be killed |
 | Apps get `503` during write steps longer than 10 s | most write steps take seconds; turn on `readCopy` for stale-but-available answers (`stale: true`); writers blocked by a foreign holder withdraw their intent |
-| Server handoff bugs lock writers out | intents are per holder with boot-id liveness; every connection is closed before `closeSync()`; handoff tests cover two writers, long and idle connections, and reused PIDs [V] |
+| Server handoff bugs lock writers out | intents are per holder with boot-id liveness; every connection is closed, then the query worker is killed, so a writer waits at most `graceMs` + `killAfterMs` whatever a query does (D76); handoff tests cover two writers, long, stuck and idle queries, `kill -9` of the server, and reused PIDs [V] |
 | A long write step blocks other commands | the lock is held per write step only; extraction and TS code run lock-free; `status`/`context`/`validate` and `run --dry-run` never open the warehouse; off a TTY, waits cap at 90 s and name the holder |
 | The agent's shell timeout kills long runs | off a TTY, runs always detach and return exit 6 with a run id; `wait`; `status.running[]` |
 | AI-edited code runs unattended on real data | the scheduler hold (only code a human has run); per-file import isolation; checks inside the transaction; trash |
@@ -2432,7 +2594,7 @@ The total is about 14.5 engineer-weeks and roughly 14–16k lines. The user chos
 | Wrong numbers from API semantics (records that change after creation, newest-first paging, epoch cursors) | pagination-specific templates; typed cursors with `unit` and `lookback`; `KEYSET_STUCK`; the skill's API rules; `SINCE_IGNORED`, `EMPTY_EXTRACT` |
 | Silent corruption through DuckDB implicit behavior (rounding casts, dropped offsets, dropped struct fields, MERGE duplicates, sniffer date flips, union-by-name drops) [V] | whitelisted casts plus a round-trip loss check; JSON staging; dedupe before merge; own CSV typing with per-column formats; `union_by_name`; one scenario test per hazard |
 | Strict type conflicts stop a scheduled pipeline | preview shows conflicts before the first real load; name-typed placeholders avoid most wrong first guesses; errors state the effect and give fixes in order; notifications |
-| Scheduler silently not running (privacy protection, WSL idle, moved projects, version managers) | `schedule on` waits for a real heartbeat; `SCHEDULER_STALE` reads the tick log and names a cause; the registry prunes moved projects; stable Bun path |
+| Scheduler silently not running (privacy protection, WSL idle, moved projects, version managers) | `schedule on` waits for a real heartbeat; `SCHEDULER_STALE` reads the tick log and names a cause; the registry prunes moved projects, but keeps a project on an unplugged disk or behind a privacy block; a stable Bun path that is never older than croft needs; the registry's OS lock, which a dead writer cannot leave behind |
 | Bun or DuckDB behavior changes across versions (as `Bun.cron.parse` did) | enforced Bun floor; CI on the floor and on latest; DuckDB pinned exactly; the fingerprint ignores `query_location`; format check; backup before an engine upgrade |
 | Inferred write behavior surprises (forgot `key`) | behavior stated in words everywhere; `INCREMENTAL_WITHOUT_KEY` is an error; a key implies uniqueness checks |
 | Synced folders corrupt the database | automatic relocation to `~/.local/share/croft/…` at `init`; `doctor` flags an existing project on synced (`DB_ON_SYNCED_FOLDER`) or lock-unsafe (`SERVE_UNSAFE_FILESYSTEM`) storage |
@@ -2447,7 +2609,7 @@ The total is about 14.5 engineer-weeks and roughly 14–16k lines. The user chos
 
 ## 13. Decision log
 
-Each entry gives the options, the choice and the reason. **(rev)** marks decisions changed or extended after the adversarial reviews, or by the build. A **Build:** line records how the shipped code (phase 1 on 2026-09-23, phase 2 on 2026-09-24) refined a decision.
+Each entry gives the options, the choice and the reason. **(rev)** marks decisions changed or extended after the adversarial reviews, or by the build. A **Build:** line records how the shipped code (phase 1 on 2026-09-23, phases 2 and 3 on 2026-09-24) refined a decision.
 
 **D1. Daemon or per-step open. (extended by D53)**
 - Options: a `Bun.serve` daemon owning the file; short-lived processes opening the file per step.
@@ -2495,6 +2657,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Options: published snapshots of the last manual run; the working tree; the working tree gated by a human run.
 - Choice: the working tree, but only assets whose current code a human has run successfully (`SCHEDULE_HELD`).
 - Reason: snapshots create a second source of truth. An ungated working tree would let debugging edits (fixtures, temporary filters) merge into real data at the next tick.
+- Build (phase 3): a hold is a warning that skips the step, never a failure, so a held asset neither fails its scheduled run nor notifies (D77). A held step is skipped even when its code no longer loads.
 
 **D10. Guarding destructive operations. (rev)**
 - Options: a trailing `--yes`; a human-only `approve`; `croft confirm <token>`.
@@ -2575,6 +2738,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 **D24. Cron evaluation. (rev)**
 - Choice: croft's own matcher.
 - Reason: `Bun.cron.parse` behaves differently on 1.3.14 and 1.4.2 [V].
+- Build: the matcher reads Vixie cron (names in any case, 7 is Sunday, `a/n` to the field's end, `?` as `*`, either restricted day field matching) and refuses Quartz's `L`, `W` and `#` and crons that never fire. Interval crons fire at both passes of a repeated hour (D80). The phrase parser takes more than §8's list, and its suggestions always parse (§8).
 
 **D25. Run concurrency.**
 - Options: one project lock; per-asset leases.
@@ -2631,11 +2795,13 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 **D36. Standalone check files and notifications. (rev)**
 - Choice: check files are cut (row rules with subqueries instead). Failure notifications are kept: desktop by default for scheduled runs, and an optional webhook.
 - Reason: "something failed overnight" must reach a user who never reads logs.
+- Build (phase 3): the webhook payload adds `text`, the notification in one line, because Slack's incoming webhooks (the §8 example) reject a post without it, and it leaves out any confirmation, which holds a token. Webhook delivery retries network errors, 429 and 5xx, 3 attempts of 10 s. Everything sent is redacted, and a failed notification is a line in `<state>/logs/notify.log`, never a failed run (§8).
 
 **D37. Scheduler registration. (new)**
 - Options: `Bun.cron` per project; one per-user job written by croft.
 - Choice: one per-user job, a project registry and heartbeats.
 - Reason: `Bun.cron` is new and version-dependent, orphans jobs when projects move, and logs where croft never looks. A heartbeat proves the job actually runs.
+- Build (phase 3): a real LaunchAgent installed by `croft schedule on` ran a scheduled ingest from launchd, and `croft schedule off` removed it [V] (§8). The plist adds `AbandonProcessGroup` and a `PATH` with Homebrew's folders; the crontab line sits between marker lines. The per-user tick script is a versioned template that imports nothing from croft. The registry takes an OS lock and keeps a project whose disk is not mounted (D82), and the job's Bun is never older than croft needs (D83).
 
 **D38. Replace semantics. (new, rev)**
 - Options: DELETE + INSERT; a diff (MERGE with `NOT MATCHED BY SOURCE THEN DELETE`).
@@ -2690,6 +2856,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Options: the tick runs the due work; the tick plans and spawns.
 - Choice: plan and spawn, with a singleton row. `croft serve` spawns a fresh tick process each minute.
 - Reason: launchd runs one process per job, so a busy tick drops fires [U]. Cron overlaps ticks. An in-process loop keeps stale `lib/` code [V].
+- Build (phase 3): the tick records `last_fire_at` and `last_attempt_at` before it starts each child, so a child that dies early is not started again every minute, and notes the runs it started until they hold their leases. It imports no asset code unless an asset's file hash changed (D79), loads `reconcile()` only when there is something to reconcile, and notifies a scheduled run it finds crashed. croft serve's loop ticks once at start, then every minute.
 
 **D48. JavaScript value types for TS code. (new)**
 - Options: `Date` for timestamps; ISO strings.
@@ -2701,6 +2868,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Options: schedules on any asset; ingests only.
 - Choice: ingests only. The tick also refreshes any stale transform.
 - Reason: transforms follow their inputs, and this removes the "scheduled transform inside a downstream set" special case.
+- Build (phase 3): a stale transform whose input was never built is not due on its own; it follows that input's run. A transform whose last attempt failed backs off (D85).
 
 **D50. Resumable first loads. (new)**
 - Options: post-v1; monotone partial commits in v1.
@@ -2725,6 +2893,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
   - Writes stay in fresh short-lived processes, so D1's reasons against a daemon still apply.
   - It costs about one more engineer-week, in phase 3.
 - Build: the read client's loopback transport is its own decision (D55). A `401`/`403` is `SERVE_UNAUTHORIZED`, never retried. Direct mode is a lazily loaded chunk, so an app that only talks to a server never loads the native binding, and concurrent direct queries in one process share one reference-counted instance (§5).
+- Build (phase 3): croft serve holds the file in a query worker process, which it kills to release the file (D76), and streams results inside the worker within `limit`, `serve.maxRows` and `serve.maxBytes`. `GET /status` is the status envelope without asset code (D81), and a generated token is new on every start (D84).
 
 **D54. Redaction in command data. (new, 2026-09-23)**
 - Options: redact every `.env` value everywhere (D26 as first written); redact declared secrets only; redact everything in free text, but in command data only declared secrets and values that look like credentials.
@@ -2758,11 +2927,13 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Choice: the second. `core/phase.ts` records which command, `run`/`query`/`init` flag and later-phase `croft.json` key ships in which phase, and the registry must match it. Each phase ships §9 cut to its commands; SKILL.md's "This version" section renders from the manifest, and `agent/templates.test.ts` lists every cut line with its reason. `agent/contract.test.ts` scans CLAUDE.md, SKILL.md, every `croft docs` page and every hint, fix and `next[]` in the source, and fails on a command or flag the build lacks. `query --preview` is registered in phase 1 only so it can refuse. §9 keeps the full v1 texts as the target (§4.1, §9).
 - Reason: the v1 texts told a phase-1 agent to run `croft validate` after every edit, `croft preview` before a run and `croft new` for a new asset, and hints pointed at `croft serve`, `croft restore`, `readCopy` and `--rebuild`. Each was a `USAGE_ERROR` at the step the agent was told to take. A test against the registry keeps later edits honest, and the cut list keeps every §9 rule in view until its phase lands.
 - Build (phase 2): the scan reads every string and template literal in the source, not only hints, fixes, `next[]` entries and option descriptions; `query --preview` works; phase 2 ships the `CLAUDE.md` block whole and cuts from SKILL.md only phase 3–5 lines (§9).
+- Build (phase 3): SKILL.md restores its phase-3 lines word for word and cuts only phase 4–5 lines, with 11 cut entries left; it adds a Schedule recipe. The registry marks `tick` and `run --due` hidden, and `PHASE_COMPLETE` tells the codes-raised gate whether the phase is still being built (D78).
 
 **D60. Ingest templates before `croft new`. (new, 2026-09-23)**
 - Options: build `croft new` in phase 1; ship the templates as a docs page until `croft new` lands with every template in phase 5.
 - Choice: the docs page `croft docs ingest` (`src/agent/docs/ingest.md`), listed by `croft docs --list` as the topic `ingest`. It holds API templates for keyset, cursor and Link-header paging, and file ingests from a folder or a URL. A test type-checks every template against the public API and validates it as an asset.
 - Reason: the skill's rule is "start from a template, don't invent APIs", and phase 1 builds only ingests. A page needs no command, and the test keeps it from drifting from the API.
+- Build (phase 3): the templates carry the `schedule:` lines of §3 again (`every hour`, `monthly`).
 
 **D61. Redacting every rendering of a value. (new, 2026-09-23; extends D54)**
 - Options: match a value's raw text and its `encodeURIComponent` form (the first build); match every common rendering of it.
@@ -2838,6 +3009,56 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Options: only files and `runs.sqlite`, with modification times for edits (phase 1); resolve the asset files as `validate` does.
 - Choice: resolve them: TS assets imported in isolation (5 s each), SQL parsed on a private in-memory DuckDB. `edited` compares code hashes, with the modification time only as a fallback. `status` still never opens the warehouse (§4.3, §5).
 - Reason: kinds, inputs and code hashes need the code, and staleness needs the inputs. A modification time called a touched file or a comment-only edit "edited"; a hash does not. The cost is that an asset's top-level code runs on `croft status`.
+
+**D76. croft serve's query worker. (new, 2026-09-24; refines D53)**
+- Options: the read-only instance in croft serve's own process, closed with `closeSync()` after every query settles (§5 as first written, and the first build); the instance in a child process that croft serve kills to release the file.
+- Choice: the child process (`serve/worker.ts`, spoken to over Bun's IPC channel). croft serve opens no DuckDB file. To give the file up it disconnects every connection, then kills the worker with `SIGKILL` and awaits its exit. A query not settled `killAfterMs` (500 ms) after its first interrupt is ended the same way, whatever stopped it: a writer, its deadline, its client leaving, or the server stopping. A spare worker started during the write keeps reopening at about 5 ms, a worker that dies while serving is replaced at once, and the read copy has a worker of its own. A worker exits by itself when croft serve goes away.
+- Reason: DuckDB checks for interrupts only between tasks, and a SELECT can spend many seconds in one scalar or list expression, or fold a big constant while planning (`list_sort(range(1.5e8))` ran 25 s past every interrupt) [V]; and closing an instance whose query still runs keeps the lock. So D53's promise that a writer gets the file within the grace could not hold. A process's exit is the one release nothing inside DuckDB can delay: the kernel drops its locks. Now a writer waits at most `graceMs` + `killAfterMs` + the kill (about 2.6 s measured) [V], `queryTimeoutMs` always holds, and croft serve's own descriptors can never drop a lock.
+
+**D77. Holds in a scheduled run are warnings. (new, 2026-09-24; refines D9)**
+- Options: `SCHEDULE_HELD` as an error with exit 4, as the registry first had it; a warning that skips the step.
+- Choice: a warning with exit 0. In a scheduled run, a step held by `SCHEDULE_HELD` or by the cost guard (`LARGE_REPROCESS`, whose own code stays an error elsewhere) is recorded as skipped with the hold as a warning, and the run succeeds. `status`, `context`, `schedule` and the tick report the hold as a warning, with the fix `croft run <asset>`.
+- Reason: a hold is the scheduler doing its job, not a failure. As an error it would fail every scheduled run that touched an edited asset, and send a failure notification each hour for an edit the user already knows about. Every surface already reported it as a warning, while the registry and `croft docs SCHEDULE_HELD` said "error".
+
+**D78. A phase's completion flag. (new, 2026-09-24)**
+- Options: raise `PHASE` only when the whole phase is built; raise it at the phase's first contract, with a separate flag for "finished".
+- Choice: `PHASE_COMPLETE` in `core/phase.ts`. While it is false, `core/codes-raised.test.ts` lets the codes listed for the current phase stay unraised; once it is true, every such code must be raised. A release requires it.
+- Reason: a phase is built in parallel waves against the final contract, so its commands must be registered, and its texts name them, before every code they raise exists. The flag keeps the gate strict at the end without blocking the waves.
+
+**D79. The scheduler's facts cache. (new, 2026-09-24)**
+- Options: import every asset on every tick; cache only `schedule_state` (phrase and cron) by file hash, as §8 first had it; cache everything the tick needs, keyed by a hash that covers what the code hash depends on.
+- Choice: the last. `schedule_state` keeps phrase, cron and file hash, and the setting `schedule.facts` each asset's kind, schedule, inputs and code hash. The file hash covers the asset file and the project time zone, and for TS assets the size and modification time of `lib/**`, `package.json` and the lockfile. Only an asset whose hash changed is imported again.
+- Reason: the tick runs every minute for every project; importing asset code each time would run user code unattended every minute and cost seconds. Holds and staleness need the code hash and the inputs, which only an import gives. Covering `lib/` and the time zone makes a `lib/` edit or a zone change hold the asset at the next tick, as the code hash would. Measured: about 80 ms per tick with 40 unchanged assets, and no import [V].
+
+**D80. Interval crons across a repeated hour. (new, 2026-09-24; refines §8's DST rule)**
+- Options: every repeated local time fires once, at its first occurrence (§8 as first written); interval crons fire at both passes.
+- Choice: a cron whose minute or hour field starts with `*` is an interval and fires at both passes of a fall-back hour; a fixed time fires once. A gap time still fires at the first valid minute after the gap.
+- Reason: "every 15 minutes" means every 15 minutes of real time. Firing once in a repeated hour would leave an hour with no fire, which the golden test "no duplicates, no missing instants" catches. It is cron's own rule for its wildcard jobs.
+
+**D81. What `GET /status` returns. (new, 2026-09-24)**
+- Options: the CLI's `status` envelope, as §5 says; the server's own state only (the first build).
+- Choice: the `status` envelope, built from `runs.sqlite`, the catalog mirror and the asset files read as text, without importing asset code, and with `data.serve` carrying the server and its engine state (`{url, pid, host, port, version, startedAt, engine}`).
+- Reason: an app or a monitor asks the server what the CLI would say, and needs no second shape. croft serve runs no user code (D53), so staleness that only the code tells (`code_changed`) is left to `croft status`.
+
+**D82. The registry's lock, and projects that are missing. (new, 2026-09-24)**
+- Options: an `O_EXCL` pid file, broken when its holder looks dead or after 12 s (the first build); an OS lock the kernel releases. For pruning: drop a project whose `croft.json` cannot be found (the first build); tell a project that is gone from one on a disk that is not mounted.
+- Choice: an exclusive `bun:sqlite` transaction on `projects.json.lock.db`, with the old pid file taken inside it for older crofts; a writer that cannot get both in 12 s fails with `DB_BUSY`, and nobody ever breaks the OS lock. A project whose disk is not mounted, or whose parent folder is gone too, is kept as missing and pruned after 30 days; only one whose folder is there without its `croft.json` is pruned at once.
+- Reason: two writers could each judge a pid file abandoned, break it and both go in, so one writer's entry was lost, and the 12 s path broke even a live holder's lock. A `fcntl` lock is released by the kernel when its holder dies, so it needs no breaking; the race tests (24 writers over a dead holder's lock file) lose no entry. An unplugged external disk looked like a deleted project and silently unscheduled it.
+
+**D83. The job's Bun. (new, 2026-09-24; refines D37)**
+- Options: the first stable path that exists (the first build); a stable path whose Bun is new enough.
+- Choice: each candidate's `bun --version` is asked, and the job takes the first stable Bun at least as new as the running one and croft's floor, then the running Bun on a stable path, then a stable Bun at the floor, then the running Bun marked unstable. The per-user tick does not start a pinned croft whose `engines.bun` is newer than the job's Bun, and the diagnosis names it (`bun_too_old`).
+- Reason: a stable path can hold a Bun left behind (an old curl install at `~/.bun/bin/bun` while the user runs Homebrew's). The job then started every project's croft on a Bun older than croft needs, and nothing said why.
+
+**D84. The serve token's life. (new, 2026-09-24)**
+- Options: a token generated on first start and kept (§5 as first written); a token generated on every start.
+- Choice: every start. `serve.json` is removed when the server stops, so apps fall back to reading the file, and a generated token goes with it. Local apps read `serve.json` again for each query; hosted apps use `CROFT_SERVE_TOKEN`, which the banner asks for when the server is not on loopback.
+- Reason: `serve.json` is how apps and croft find a live server, so it must go when the server stops, and a generated token lives only there. A token that must stay the same across restarts, as a hosted app's does, is the user's explicit setting.
+
+**D85. Backoff of scheduled transforms, and when a fire is spent. (new, 2026-09-24)**
+- Options: retry a failed transform at the next tick; wait only for deterministic failures, as §8 first had it; back off every failure.
+- Choice: a transform's deterministic failure waits for a change to its code or inputs (or a run by hand); a retryable failure, a crash or an interruption waits 15 minutes, or the server's longer `Retry-After`. An ingest is due again only at its next fire. The tick records `last_fire_at` and `last_attempt_at` before it starts the child, so a child that dies before its first step does not restart every minute.
+- Reason: a stale transform is due at every tick, so without a backoff a crashing one would start, and notify, every minute. Recording the fire first trades a lost fire for a crash loop; the next fire, or a stale transform's own staleness, brings the asset back.
 
 ---
 
@@ -2983,10 +3204,11 @@ All spikes ran on macOS arm64 with `@duckdb/node-api` 1.5.5-r.5 (DuckDB 1.5.5), 
 | Storage | 30 hourly full rewrites doubled a 9.8 MB file to 19.3 MB; 10% merges stayed at 9.5 MB; the sandbox blocks `read_text('.env')` and https; spilling works under the sandbox; Unicode identifiers work unquoted |
 | Build findings (2026-09-23, recorded in the code's tests) | Bun's `realpathSync` and `realpathSync.native` open the file on macOS, and closing that descriptor released DuckDB's lock, while `lstat`, `readlink` and realpath of a directory did not; the sandbox always lets a connection read its own database file, WAL and `.tmp` folder; `enable_logging` changed a locked READ_ONLY instance; `lock_configuration` refuses a later per-session `SET TimeZone`; a TEMP table shadows `t` and `main.t`; inside a write transaction a TEMP table created by it scanned about 4.5× slower than a view (1,247 vs 417 ms, 1M × 5); the `DECIMAL(38,18)` loss formula gave 11,218 false losses among 40,011 random doubles; DuckDB refuses a zoned time without seconds, and `read_json` rejects unpaired surrogates; 30 of the 35 `type_function` keywords also break `FROM <name>`; under Bun, `node:http` and `fetch` sent `127.0.0.1` requests through `HTTP_PROXY`; Bun spawns children with the environment it started with, `.env` values included, unless given one |
 | Build findings (2026-09-24, phase 2, recorded in the code's tests) | `PRAGMA disable_optimizer` works on a connection whose configuration is locked, while `SET enable_optimizer` is refused; the unoptimized plan's scan nodes carry `extra_info.Table` as `catalog.schema.table` with DuckDB's quoting, and an unused CTE's table is never scanned; a CTE's body sees only earlier CTEs, so a non-recursive `WITH orders AS (SELECT * FROM orders)` reads the table, and a recursive CTE sees itself only in its recursive part; `json_serialize_sql` writes `1e400` as a bare `Infinity`, which is not valid JSON; `PIVOT … IN (SELECT …)` also becomes two statements; `DESCRIBE`, `SUMMARIZE` and `SHOW` prepare with `statementType` SELECT, and `DESCRIBE`'s plan scans nothing; a view renames a repeated `_loaded_at` to `_loaded_at_1`; a prepared statement's column types drop the `JSON` alias inside nested types (`VARCHAR[]` for `JSON[]`), while a view's `duckdb_columns()` keeps it; the parse error of a bare keyword column points past it (`SELECT id, order FROM t` fails at `FROM`, `WHERE order > 1` at `order`); DuckDB's "Did you mean" can name a system view (`pg_constraint`); a missing column is "Referenced column "x" not found in FROM clause!", and `g.x` is "Table "g" does not have a column named "x"", both with candidate bindings; Parquet writes HUGEINT as DOUBLE (rounding 2^127 − 1), and `DECIMAL(38,0)` cannot hold its 39-digit values; DuckDB marks `current_localtime` and `current_localtimestamp` consistent within a query, not volatile |
+| Build findings (2026-09-24, phase 3, recorded in the code's tests and a manual check) | a LaunchAgent with `StartInterval` 60 and `RunAtLoad` ran at load and 60 s later; `launchctl bootstrap gui/<uid>` loads it and `launchctl bootout gui/<uid>/<label>` removes it cleanly; the job's `PATH` is `/usr/bin:/bin:/usr/sbin:/sbin`, its working folder `/`, with `HOME` set and the user's uid; reading `~/Documents` from the job worked on that Mac; `croft schedule on` installed a real LaunchAgent whose first heartbeat came after 1 s, an every-minute ingest ran twice from launchd, and `croft schedule off` removed it; DuckDB checks interrupts only between tasks, so `list_sort(range(150000000))` ran 25 s past every interrupt and `list_reduce(range(10000000), …)` spent about 3.5 s constant-folding in `prepare`, where no interrupt is checked; killing croft serve's query worker let a writer in after 2.5–2.6 s with a 2 s grace; Bun 1.3.14 binds `localhost` to `::1` only; `Bun.serve` with `development: false` binds with `SO_REUSEPORT`, and a second server on the same port took over connections; Bun reports a foreign bind address as `EADDRINUSE`; Bun keeps a request's timeout on its keep-alive socket, and keeps the connection open after a handler has awaited even with `Connection: close`; `Bun.serve`'s idle timeout is capped at 255 s; under Bun, `os.userInfo().homedir` returns `$HOME` (Node returns the password database's); `process.resourceUsage().maxRSS` is bytes on macOS and KiB on Linux; a project tick with nothing changed took about 80 ms from start to exit and imported nothing (40 assets); an APFS clone held the write lease 2–3 ms for a 624 MB warehouse |
 
 **Unverified [U]:**
 
-- OS job registration on each platform (not run, to avoid modifying this machine's launchd) and macOS privacy-protection behavior for background jobs.
+- OS job registration on Linux (crontab), and macOS privacy-protection behavior for background jobs on other Macs. The macOS LaunchAgent itself was verified on 2026-09-24 (§8).
 - WSL idle shutdown.
 - Linux reflink.
 - musl and Windows runtime behavior.

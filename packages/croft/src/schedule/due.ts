@@ -1093,7 +1093,9 @@ interface HoldContext {
 function holdOf(f: AssetFacts, h: History, c: HoldContext): { code: HoldCode; reason: string } | null {
   if (c.scheduling.state === "paused") {
     const until = c.scheduling.pausedUntil ? ` until ${clockWords(new Date(c.scheduling.pausedUntil), c.project.timezone, c.now)}` : "";
-    return { code: "paused", reason: `scheduling is paused${until}; croft schedule on resumes it` };
+    // A project ticked by croft serve only resumes with --no-os-job, so following the hint never installs the OS job (R32-10).
+    const resume = c.scheduling.via === "serve" ? "croft schedule on --no-os-job" : "croft schedule on";
+    return { code: "paused", reason: `scheduling is paused${until}; ${resume} resumes it` };
   }
   if (f.codeHash === null || f.codeHash !== c.approved) {
     return { code: "SCHEDULE_HELD", reason: scheduleHeld({

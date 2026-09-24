@@ -198,8 +198,17 @@ describe("held assets are skipped and stay due", () => {
     const p = await pipeline();
     scheduling(p, "paused", "2026-09-22T13:00:00.000Z");
     const w = await work(p, "2026-09-22T11:00:30Z");
-    expect(view(w, "issues")).toMatchObject({ due: true, held: { code: "paused", reason: "scheduling is paused until 13:00; croft schedule on resumes it" } });
+    // Ticked by croft serve only (the testkit's via): resumed with --no-os-job, which never installs the OS job (R32-10).
+    expect(view(w, "issues")).toMatchObject({ due: true, held: { code: "paused", reason: "scheduling is paused until 13:00; croft schedule on --no-os-job resumes it" } });
     expect(w.groups).toEqual([]);
+    const db = p.db();
+    try {
+      db.setScheduling({ state: "paused", via: "os-job", pausedUntil: "2026-09-22T13:00:00.000Z" });
+    } finally {
+      db.close();
+    }
+    const osJob = await work(p, "2026-09-22T11:00:30Z");
+    expect(view(osJob, "issues").held).toEqual({ code: "paused", reason: "scheduling is paused until 13:00; croft schedule on resumes it" });
   });
 
   test("leased: an asset another run holds is skipped and stays due (overlaps skip)", async () => {
