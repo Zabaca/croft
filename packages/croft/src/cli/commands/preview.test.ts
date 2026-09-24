@@ -34,6 +34,15 @@ describe("croft preview: flags", () => {
     expect(r.json.problems[0]).toMatchObject({ code: "USAGE_ERROR" });
   });
 
+  test("--rows is at most 100,000: a preview is a sample", async () => {
+    expect(parseRows("100000")).toBe(100_000);
+    for (const big of ["100001", "99999999999999999999999"]) expect(() => parseRows(big)).toThrow("--rows is at most 100,000");
+    const p = makeProject({ files: { "assets/github_issues.ts": ISSUES_TS } });
+    const r = await cli(["preview", "github_issues", "--rows", "1000000", "--json"], { cwd: p.root });
+    expect(r.exit).toBe(2);
+    expect(r.json.problems[0]).toMatchObject({ code: "USAGE_ERROR", message: `--rows is at most 100,000; got "1000000"` });
+  });
+
   test("no asset, or a name that is not an asset, is a usage error; the did-you-mean fix previews", async () => {
     const p = makeProject({ files: { "assets/github_issues.ts": ISSUES_TS } });
     const none = await cli(["preview", "--json"], { cwd: p.root });
@@ -101,6 +110,27 @@ SELECT id, title, "user"->>'login' AS author FROM github_issues WHERE state = 'o
     expect(r.stdout).toContain(`Explore: croft query --preview "from open_issues"`);
     expect(r.stdout).not.toContain("Apply:");
     expect(r.stdout).toContain("next: croft preview open_issues");
+  });
+});
+
+describe("croft preview: redaction", () => {
+  test("an asset's error in data is redacted like problems[]: every .env value, declared or not", async () => {
+    const p = makeProject({ files: {
+      ".env": "REGION=Opensesame\n",
+      "assets/broken.ts": `import { ingest } from "@zabaca/croft";
+export default ingest({ key: "id", async *rows() { throw new Error("no route to Opensesame"); } });
+`,
+    } });
+    const r = await cli(["preview", "broken", "--json"], { cwd: p.root });
+    expect(r.exit).toBe(1);
+    const a = (r.json.data as PreviewData).assets[0]!;
+    expect(a).toMatchObject({ asset: "broken", status: "failed", error: { code: "ASSET_CODE_ERROR" } });
+    expect(a.error!.message).toContain("[redacted:REGION]");
+    expect(a.reason).toContain("[redacted:REGION]");
+    expect(r.stdout).not.toContain("Opensesame");
+    const human = await cli(["preview", "broken"], { cwd: p.root });
+    expect(human.stdout).toContain("[redacted:REGION]");
+    expect(human.stdout + human.stderr).not.toContain("Opensesame");
   });
 });
 

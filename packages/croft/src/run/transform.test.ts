@@ -26,7 +26,7 @@ import { behaviorHash, behaviorLabel, behaviorWords, DEFAULT_RETRIES, DEFAULT_TI
 import { staleReasons } from "./staleness.ts";
 import type { ConfirmDecision, ConfirmRequest, StepInput, StepOutcome } from "./step.ts";
 import { cleanupProjects, makeProject, PKG, writeFiles } from "./testkit.ts";
-import { CHUNK, pendingChunkDir, runTransform } from "./transform.ts";
+import { CHUNK, pendingChunkDir, rowsWithin, runTransform } from "./transform.ts";
 
 const g = globalThis as Record<string, unknown>;
 const opened: { runs: RunsDb }[] = [];
@@ -1147,19 +1147,43 @@ export default transform({
     expect(g.__t_seen).toBeUndefined();
   });
 
-  test("no guard for code that makes no requests, for full-refresh transforms, or under preview", async () => {
+  test("no guard for code that makes no requests, or for full-refresh transforms", async () => {
     const h = harness({
       "assets/quiet.ts": guarded().replace(/\s+if \(g.__t_api\) await http.get\(g.__t_api\);/, "").replace("{ newRows, http }", "{ newRows }"),
       "assets/whole.ts": guarded().replace("  incremental: true,\n", ""),
-      "assets/t.ts": guarded(),
     });
     await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2, 3, 4, 5], S1) });
     const quiet = await plan(h, "quiet");
     expect(quiet.usesHttp).toBe(false);
     expect((await step(h, quiet)).result.rows.total).toBe(5);
     expect((await step(h, await plan(h, "whole"))).result.rows.total).toBe(5);
-    const preview = await step(h, await plan(h, "t"), { preview: { rows: 2 } });
-    expect(preview.result.rows.total).toBe(2);
+  });
+
+  test("under preview, --rows bounds the count: within confirmAbove it runs; over it, it is refused before any code runs", async () => {
+    const h = harness({ "assets/t.ts": guarded() });
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2, 3, 4, 5], S1) });
+    const s = await plan(h, "t");
+    // Nobody is asked in a preview, whatever decider it is handed.
+    let asked = 0;
+    const err = await failure(step(h, s, { preview: { rows: 4 }, confirm: async () => (asked++, { kind: "granted" }) }));
+    expect(err.code).toBe("LARGE_REPROCESS");
+    expect(err.problem.message).toBe("a preview of t with up to 4 rows of each input would process 4 input rows (issues 4), more than its confirmAbove of 3, and its code makes requests (an API or an LLM) for them");
+    expect(err.problem.fix).toEqual({ kind: "command", description: "preview at most 3 rows of each input", command: "croft preview t --rows 3" });
+    expect(err.problem.details).toEqual({ pending: 4, confirmAbove: 3, inputs: { issues: 4 }, rows: 4, fits: 3 });
+    expect(asked).toBe(0);
+    expect(g.__t_ran).toBeUndefined();
+    const ok = await step(h, s, { preview: { rows: 3 } });
+    expect(ok.result.rows.total).toBe(3);
+    expect(g.__t_ran).toBe(true);
+  });
+
+  test("rowsWithin: the largest per-input cap whose rows stay within confirmAbove", () => {
+    expect(rowsWithin([5], 2, 1000)).toBe(2);
+    expect(rowsWithin([3], 5, 50)).toBe(50);
+    expect(rowsWithin([3, 3], 4, 1000)).toBe(2);
+    expect(rowsWithin([10, 1], 5, 100)).toBe(4);
+    expect(rowsWithin([4, 4, 4], 2, 10)).toBe(0);
+    expect(rowsWithin([], 0, 10)).toBe(10);
   });
 });
 

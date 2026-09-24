@@ -2,7 +2,9 @@
 // "Retries", "Timeout").
 //
 //   reconcile()     first, like every writing command: dead runs become crashed, their leases go
-//   plan            discover, select, load, what each asset does and why (plan.ts)
+//   plan            discover, select, load, what each asset does and why (plan.ts); then withProjectChecks: every
+//                   declared secret of the project is declared for redaction, and a TS transform input that
+//                   names no asset fails its step (UNKNOWN_TABLE)
 //   createRun       runs.sqlite: the run, argv, and the process that does the work
 //   asset leases    all or nothing, so two runs never touch one asset (history/leases.ts)
 //   steps           in dependency order: a step starts once every planned step in its orderAfter has ended. Up to
@@ -29,7 +31,7 @@
 //
 // Every step writes <state>/logs/<run>/<asset>.log; the run writes <state>/logs/<run>/events.ndjson, which
 // --events copies to stderr and `croft wait` reads for progress.
-import { appendFileSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { checksHook, runWarnings } from "../checks/run.ts";
@@ -44,16 +46,19 @@ import { logDir, logPath, NOT_STARTED_RECORD, openLog, type LogWriter, writeRunR
 import { reconcile } from "../history/reconcile.ts";
 import { RunsDb, type RunStatus, type RunTrigger } from "../history/runs-db.ts";
 import type { HttpOptions } from "../http/http.ts";
+import { staticSecrets } from "../cli/commands/describe.ts";
 import { redactProblem } from "../cli/render.ts";
 import { currentDatabase, isReservedColumn, quoteIdent, tableRef } from "../load/evolve.ts";
 import type { CheckHookResult, WriteBatchInput } from "../load/write.ts";
 import { outsideCapture, setOutputRedactor } from "../core/output.ts";
 import { now as clockNow } from "../core/time.ts";
+import { discoverAssets } from "../project/discover.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { loadProject, type Project } from "../project/root.ts";
 import {
   croftError, fromSince, isRetryable, type ProgressSnapshot, runIngest, savedCursors, SHRINK_ACTION, shrinkCommand, StepProgress,
 } from "./ingest.ts";
+import { unknownInputs } from "./inputs.ts";
 import { backfillUnsupported, isGlob, loadErrors, planRun, type PlannedStep, type RunPlan } from "./plan.ts";
 import { runSqlStep } from "./sql.ts";
 import { staleReasons } from "./staleness.ts";
@@ -447,8 +452,7 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
       const narrowing = { ...(o.only ? { only: true } : {}), ...(o.upstream ? { upstream: true } : {}) };
       plan = o.plan ?? await planRun({ root: project.root, timezone: project.timezone, selectors: o.selectors, cursorTypes: cursorTypes(runs), ...narrowing });
       checkRunFlags(plan, o);
-      // Every declared secret is hidden in data, not only the ones this run reads.
-      for (const s of plan.steps) if (s.spec) env.declare(s.spec.secrets);
+      plan = await withProjectChecks(plan, project, env);
       // No file-ingest directories in the sandbox: extractFiles snapshots every file into the state folder, and
       // the write reads only those snapshots (a `file: "*.csv"` ingest would otherwise open the whole root).
       warehouse = openWarehouse({
@@ -786,6 +790,45 @@ export async function executeRun(o: RunnerOptions): Promise<RunOutcome> {
   } finally {
     runs.close();
     await warehouse?.close();
+  }
+}
+
+/**
+ * The plan checked against every asset of the project, not only the ones it takes. A run and a preview call it
+ * after planning. The asset files are discovered, not imported, so the top-level code of an unrelated ingest
+ * still never runs.
+ * - A TS transform whose declared inputs name no asset (a typo) gets UNKNOWN_TABLE with validate's did-you-mean
+ *   fix (inputs.ts unknownInputs), so its step fails before its code runs, instead of reading a table that can
+ *   never be built and pointing at `croft run <typo>`.
+ * - With `env`: every secret the project's assets declare is declared for data redaction (ProjectEnv.redactData,
+ *   §4.3 redactedValues), as `croft query` declares them. A value declared by an asset outside the plan (an
+ *   upstream ingest that echoes a password) is then hidden from check samples, the stored summary and the events
+ *   like any other. A planned step's loaded spec is exact; every TS file is also read for the names in its
+ *   `secrets: [...]` and `secret("…")` (describe.ts staticSecrets).
+ */
+export async function withProjectChecks(plan: RunPlan, project: Project, env?: ProjectEnv): Promise<RunPlan> {
+  const assets = (await discoverAssets(project.root, { assetsDir: project.paths.assetsDir })).assets;
+  if (env) {
+    for (const s of plan.steps) if (s.spec) env.declare(s.spec.secrets);
+    for (const a of assets) if (a.kind === "ts") env.declare(staticSecrets(readText(a.path)));
+  }
+  const names = assets.map((a) => a.name);
+  const steps = plan.steps.map((s) => {
+    if (s.kind !== "transform" || !s.spec || s.action === "skip") return s;
+    // One the planner already reports (the resolved asset's own problem) is not reported twice.
+    const known = new Set(s.problems.filter((p) => p.code === "UNKNOWN_TABLE").map((p) => p.details?.table));
+    const unknown = unknownInputs({ asset: s.asset, file: s.file, path: s.path, inputs: s.spec.inputs }, names)
+      .filter((p) => !known.has(p.details?.table));
+    return unknown.length ? { ...s, problems: [...s.problems, ...unknown] } : s;
+  });
+  return { ...plan, steps };
+}
+
+function readText(path: string): string {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return "";
   }
 }
 

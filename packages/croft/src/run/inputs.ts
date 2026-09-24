@@ -40,8 +40,8 @@ import { readFileSync, realpathSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { DuckDBConnection } from "@duckdb/node-api";
-import { CroftError, type ProblemInit } from "../core/errors.ts";
-import type { Fix } from "../core/types.ts";
+import { CroftError, problem, type ProblemInit } from "../core/errors.ts";
+import type { Fix, Problem } from "../core/types.ts";
 import type { Row } from "../types.ts";
 import { openMemory } from "../db/connect.ts";
 import { renderValueRows, resultShape } from "../db/values.ts";
@@ -682,6 +682,42 @@ export class TransformInputs {
       details: { ...init.details, sql: sql.slice(0, 500) },
     });
   }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Declared inputs that name no asset
+
+/**
+ * UNKNOWN_TABLE for each declared input of a TS transform that names no asset of the project (a typo such as
+ * "issuez"), with the did-you-mean edit fix validate gives. A run and a preview fail such a step before its code
+ * runs: the input has no table and never will, so "not built yet, croft run issuez" would send the agent to a
+ * command that names nothing. `assets`: every asset name of the project.
+ */
+export function unknownInputs(t: { asset: string; file: string; path: string; inputs: readonly string[] }, assets: readonly string[]): Problem[] {
+  const known = new Set(assets);
+  const others = assets.filter((n) => n !== t.asset);
+  const missing = [...new Set(t.inputs)].filter((x) => !known.has(x));
+  if (missing.length === 0) return [];
+  let text = "";
+  try {
+    text = readFileSync(t.path, "utf8");
+  } catch {}
+  const lines = text.split("\n");
+  return missing.map((x) => {
+    const guess = didYouMean(x, others);
+    const at = lines.findIndex((l) => [`"${x}"`, `'${x}'`, `\`${x}\``].some((q) => l.includes(q)));
+    const line = at < 0 ? undefined : at + 1;
+    return problem("UNKNOWN_TABLE", {
+      asset: t.asset, file: t.file, ...(line ? { line } : {}),
+      message: `${t.asset} declares the input ${x}, but there is no asset named ${x}`,
+      hint: guess
+        ? `did you mean ${guess}? correct the name in inputs (and where the code reads it)`
+        : `inputs name assets (files in assets/): ${others.slice(0, 20).join(", ") || "there are none yet"}`,
+      ...(guess ? { fix: { kind: "edit" as const, description: "fix the input name", file: t.file, ...(line ? { line } : {}), replace: { from: x, to: guess } } } : {}),
+      effect: `${t.asset} did not run; nothing was written`,
+      details: { table: x, ...(guess ? { suggestion: guess } : {}) },
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------------------------------------

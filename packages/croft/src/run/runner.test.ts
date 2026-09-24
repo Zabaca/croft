@@ -10,7 +10,10 @@ import { getCatalog } from "../history/catalog.ts";
 import { acquire } from "../history/leases.ts";
 import { logPath } from "../history/logs.ts";
 import { RunsDb } from "../history/runs-db.ts";
+import { loadProject } from "../project/root.ts";
 import { listTrash } from "../safety/trash.ts";
+import { planRun } from "./plan.ts";
+import { withProjectChecks } from "./runner.ts";
 import { cleanupProjects, cli, keysetIssues, linkItems, makeProject, mockApi, runIn, simpleGet, slowPages } from "./testkit.ts";
 
 const api = mockApi();
@@ -833,6 +836,60 @@ describe("planning", () => {
   });
 });
 
+describe("a TS transform's inputs that name no asset", () => {
+  test("fail its step before the code runs, with UNKNOWN_TABLE and a did-you-mean edit; nothing names croft run of the typo", async () => {
+    const root = makeProject({
+      "assets/issues.sql": "-- key: id\nSELECT i AS id FROM range(1, 4) t(i)\n",
+      "assets/typo.ts": `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["issuez"], key: "id",
+  async *rows({ rows }) {
+    console.log("the code ran");
+    for await (const r of rows<{ id: number }>("issuez")) yield { id: r.id };
+  },
+});
+`,
+    });
+    expect((await runIn(root, ["issues"], { only: true })).exit).toBe(0);
+    const out = await runIn(root, ["typo"]);
+    const step = out.data.steps.find((s) => s.asset === "typo")!;
+    expect(step).toMatchObject({ status: "failed", attempt: 1, maxAttempts: 1 });
+    expect(step.error).toMatchObject({
+      code: "UNKNOWN_TABLE", asset: "typo", file: "assets/typo.ts", line: 3,
+      fix: { kind: "edit", file: "assets/typo.ts", line: 3, replace: { from: "issuez", to: "issues" } },
+      details: { table: "issuez", suggestion: "issues" },
+    });
+    expect(step.error!.message).toContain("issuez");
+    expect(step.error!.hint).toContain("did you mean issues?");
+    expect(out.exit).toBe(2);
+    expect(JSON.stringify(out)).not.toContain("croft run issuez");
+    // The step failed before its code ran: nothing reached its log.
+    const log = logPath(join(root, ".croft"), out.data.runId, "typo");
+    expect(existsSync(log) ? readFileSync(log, "utf8") : "").not.toContain("the code ran");
+    const db = runsDb(root);
+    try {
+      expect(db.stepsFor(out.data.runId).find((s) => s.asset === "typo")).toMatchObject({ status: "failed" });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("withProjectChecks reports each unknown input once, also on a plan that already has it", async () => {
+    const root = makeProject({
+      "assets/issues.sql": "-- key: id\nSELECT 1 AS id\n",
+      "assets/typo.ts": `import { transform } from "@zabaca/croft";\nexport default transform({ inputs: ["issuez", "issues"], key: "id", async *rows() {} });\n`,
+    });
+    const project = loadProject({ root });
+    const plan = await planRun({ root, timezone: project.timezone, selectors: ["typo"] });
+    expect(plan.steps[0]!.problems.map((p) => p.code)).not.toContain("UNKNOWN_TABLE");
+    const once = await withProjectChecks(plan, project);
+    const twice = await withProjectChecks(once, project);
+    for (const p of [once, twice]) {
+      expect(p.steps[0]!.problems.filter((x) => x.code === "UNKNOWN_TABLE").map((x) => x.details?.table)).toEqual(["issuez"]);
+    }
+  });
+});
+
 describe("file ingests through the engine", () => {
   test("files outside files/ load from their snapshots; the warehouse sandbox never opens their folders", async () => {
     const root = makeProject({
@@ -1095,6 +1152,41 @@ export default ingest({
       db.close();
     }
     expect(readFileSync(join(root, ".croft", "logs", out.data.runId, "events.ndjson"), "utf8")).not.toContain("supersecret");
+  });
+
+  test("every asset's declared secrets are hidden in a run's data, not only those of the steps it runs", async () => {
+    const root = makeProject({
+      ".env": "SHOP_PASSWORD=Swordfish\nVAULT_KEY=Opensesame\n",
+      // A config endpoint that echoes the connection settings, the password included.
+      "assets/shop_config.ts": `import { ingest } from "@zabaca/croft";
+export default ingest({
+  secrets: ["SHOP_PASSWORD"], key: "id",
+  async *rows({ secret }) { yield [{ id: 1, host: "db.example.com", password: secret("SHOP_PASSWORD") }]; },
+});
+`,
+      // Unrelated to shop_hosts: a run of shop_hosts does not even import it, and its secret still counts.
+      "assets/vault.ts": `import { ingest } from "@zabaca/croft";
+export default ingest({ secrets: ["VAULT_KEY"], key: "id", async *rows({ secret }) { yield [{ id: 1, ok: secret("VAULT_KEY").length > 0 }]; } });
+`,
+      "assets/shop_hosts.sql": "-- key: id\n-- check: password IS NULL\nSELECT id, host, password, 'Opensesame' AS note FROM shop_config\n",
+    });
+    expect((await runIn(root, ["shop_config"], { only: true })).exit).toBe(0);
+    const out = await runIn(root, ["shop_hosts"]);
+    const step = out.data.steps.find((s) => s.asset === "shop_hosts")!;
+    expect(step.error?.code).toBe("CHECK_FAILED");
+    // Both values are all letters: only a declaration gets them redacted in data.
+    const samples = JSON.stringify(step.checks);
+    expect(samples).toContain("[redacted:SHOP_PASSWORD]");
+    expect(samples).toContain("[redacted:VAULT_KEY]");
+    expect(JSON.stringify(out)).not.toMatch(/Swordfish|Opensesame/);
+    const db = runsDb(root);
+    try {
+      expect(JSON.stringify(db.getRun(out.data.runId)!.summary)).not.toMatch(/Swordfish|Opensesame/);
+      expect(JSON.stringify(db.stepsFor(out.data.runId))).not.toMatch(/Swordfish|Opensesame/);
+    } finally {
+      db.close();
+    }
+    expect(readFileSync(join(root, ".croft", "logs", out.data.runId, "events.ndjson"), "utf8")).not.toMatch(/Swordfish|Opensesame/);
   });
 
   test("an ordinary .env value (MODE=replace) is not redacted out of statuses and behaviors", async () => {
