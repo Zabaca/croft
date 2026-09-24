@@ -29,12 +29,18 @@
 // The catalog mirror says what was built, not that it is still there: status stats the warehouse file (it
 // never opens it), and when the catalog has entries but the file is gone (deleted, or moved away from the
 // "database" path) it reports DB_NOT_FOUND, is not healthy, and shows what was built as unknown.
+//
+// With readCopy on (§5), data.readCopy says where the read copy is and how current (db/readcopy.ts
+// readCopyStatus: a stat and runs.sqlite), and a line under the scheduling line says it in words. A refresh that
+// failed, or a copy older than the last run that wrote data, is a warning there with a hint naming
+// .croft/readcopy.log (R32-11). It is not an asset's health, so `healthy` does not change.
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { CroftError, problem } from "../../core/errors.ts";
 import { formatInstant, parseInstant } from "../../core/time.ts";
 import { recordAlive } from "../../core/proc.ts";
 import type { AssetKind, Problem, Reason } from "../../core/types.ts";
+import { readCopyStatus, readCopyView, type ReadCopyView, readCopyWords } from "../../db/readcopy.ts";
 import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
 import { logDir, tail } from "../../history/logs.ts";
 import { RUNS_DB_FILE, RunsDb, type RunRecord, type StepRecord } from "../../history/runs-db.ts";
@@ -108,6 +114,8 @@ export interface StatusData {
   assets: StatusAsset[];
   scheduling: Scheduling;
   serve?: { url: string; pid: number };
+  /** With readCopy on: the read copy, and how current it is (health). */
+  readCopy?: ReadCopyView;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -544,6 +552,10 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
     };
     const serve = serveOf(project.paths.stateDir);
     if (serve) data.serve = serve;
+    if (project.config.readCopy) {
+      const copy = readCopyView(readCopyStatus(project, db ?? undefined), tz);
+      if (copy) data.readCopy = copy;
+    }
     // resolveProject's problems are discovery's (all of them: no selectors) and CYCLE.
     const problems = [...(missing ? [missing] : []), ...(resolved ? resolved.problems : discovery.problems), ...resolution.problems];
     // The scheduler: stale (the diagnosis reads files only: no launchctl or crontab here), then the held assets.
@@ -585,7 +597,9 @@ export function staleText(reasons: readonly Reason[]): string | null {
 export const status: CommandImpl<StatusData> = {
   run: (ctx) => runStatus(ctx),
   human(result, ctx) {
-    return formatStatus(result.data, ctx.now(), { tz: ctx.project.timezone, problems: result.problems });
+    return formatStatus(result.data, ctx.now(), {
+      tz: ctx.project.timezone, problems: result.problems, root: ctx.project.root, database: ctx.project.paths.database,
+    });
   },
 };
 
@@ -676,12 +690,13 @@ export function nextText(n: AssetNext, tz: string, now: Date): string {
   }
 }
 
-/** The §4.2 table, what is running, and the scheduling line. `problems`: a SCHEDULER_STALE's tick log is printed
- *  under the scheduling line. */
-export function formatStatus(d: StatusData, now: Date, o: { tz?: string; problems?: readonly Problem[] } = {}): string {
+/** The §4.2 table, what is running, the scheduling line, and with readCopy on the read copy's line. `problems`: a
+ *  SCHEDULER_STALE's tick log is printed under the scheduling line. `root` and `database`: the read copy's paths are
+ *  shown relative to the project. */
+export function formatStatus(d: StatusData, now: Date, o: { tz?: string; problems?: readonly Problem[]; root?: string; database?: string } = {}): string {
   const tz = o.tz ?? "UTC";
   const stale = o.problems?.find((p) => p.code === "SCHEDULER_STALE");
-  const tail = stale ? logTailLines(stale) : [];
+  const tail = [...(stale ? logTailLines(stale) : []), ...readCopyLines(d, now, tz, o)];
   if (d.assets.length === 0) {
     return ["No assets yet: add one to assets/ (croft docs ingest has templates), then croft run <asset>.", schedulingLine(d, now, tz), ...tail].join("\n");
   }
@@ -698,6 +713,14 @@ export function formatStatus(d: StatusData, now: Date, o: { tz?: string; problem
   }
   lines.push(schedulingLine(d, now, tz), ...tail);
   return lines.join("\n");
+}
+
+/** "Read copy warehouse.read.duckdb · as of 11:58 (2 min ago)", and for a warning its hint on the next line. */
+function readCopyLines(d: StatusData, now: Date, tz: string, o: { root?: string; database?: string }): string[] {
+  if (!d.readCopy) return [];
+  const root = o.root ?? "";
+  const w = readCopyWords(d.readCopy, { root, database: o.database ?? "", tz, now });
+  return [`Read copy ${w.text}`, ...(w.hint ? [`  hint: ${w.hint}`] : [])];
 }
 
 function schedulingLine(d: StatusData, now: Date, tz: string): string {

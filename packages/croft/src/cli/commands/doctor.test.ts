@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { DuckDBInstance } from "@duckdb/node-api";
 import { type ChildProcess, spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { CODES } from "../../core/errors.ts";
@@ -780,6 +780,124 @@ describe("TZDATA_MISMATCH: Bun's Intl and DuckDB's ICU agree on the project zone
 
 // The Scheduling section (§2 example, §8): who ticks and when it last did; SCHEDULER_STALE with the diagnosis. A fake
 // ~/.croft (CROFT_HOME under a temp HOME) and a fake OsRunner: nothing here reads or runs the real scheduler.
+describe("the read copy (R32-11)", () => {
+  const AT = "2026-09-24T17:05:00.000Z";   // 10:05 in Los Angeles
+
+  async function readCopyProject(on = true): Promise<string> {
+    const root = await project({ timezone: "America/Los_Angeles" });
+    const file = join(root, "croft.json");
+    writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, "utf8")), readCopy: on }));
+    return root;
+  }
+
+  /** The copy, as a refresh leaves it: its mtime is its checkpoint's time. doctor never opens it. */
+  function copyAt(root: string, iso: string): void {
+    const f = join(root, "warehouse.read.duckdb");
+    writeFileSync(f, "a copy");
+    utimesSync(f, new Date(iso), new Date(iso));
+  }
+
+  /** A finished run that wrote data, by a process that is gone. */
+  function wrote(root: string, at: string): string {
+    const db = RunsDb.open(join(root, ".croft"), { now: () => new Date(at) });
+    try {
+      const run = db.createRun({ trigger: "manual", human: true, argv: ["run"], identity: { pid: 2 ** 22 + 9, procStart: "1", bootId: "gone" } });
+      db.startStep({ runId: run.id, asset: "example_sales", attempt: 1, reason: "never_built" });
+      db.finishStep(run.id, "example_sales", 1, { status: "ok" });
+      db.finishRun(run.id, "succeeded");
+      return run.id;
+    } finally {
+      db.close();
+    }
+  }
+
+  function setting(root: string, v: Record<string, unknown>): void {
+    const db = RunsDb.open(join(root, ".croft"));
+    db.setSetting("readCopy", { requested: 1, holder: null, refreshedAt: null, method: "clone", heldMs: 1, covers: null, lastError: null, ...v });
+    db.close();
+  }
+
+  test("off: no read copy line", async () => {
+    const root = await readCopyProject(false);
+    const { data } = await runDoctor(root, deps({ env: { CROFT_NOW: AT } }));
+    expect(data.checks.find((c) => c.id === "readcopy")).toBeUndefined();
+  });
+
+  test("current: its path and how old it is, with the details in JSON", async () => {
+    const root = await readCopyProject();
+    const run = wrote(root, "2026-09-24T16:59:00.000Z");
+    copyAt(root, "2026-09-24T17:00:00.000Z");
+    setting(root, { refreshedAt: "2026-09-24T17:00:00.000Z", covers: { runId: run, at: "2026-09-24T16:59:00.000Z" } });
+    const { data, problems } = await runDoctor(root, deps({ env: { CROFT_NOW: AT } }));
+    expect(check(data.checks, "readcopy")).toEqual({
+      id: "readcopy", section: "environment", status: "ok", text: "read copy warehouse.read.duckdb · as of 10:00 (5 min ago)",
+      details: {
+        path: join(root, "warehouse.read.duckdb"), exists: true, asOf: "2026-09-24T10:00:00-07:00", refreshedAt: "2026-09-24T10:00:00-07:00",
+        method: "clone", lastError: null, lastWrite: { runId: run, at: "2026-09-24T09:59:00-07:00" }, health: "ok", log: join(root, ".croft", "readcopy.log"),
+      },
+    });
+    expect(data.checks.map((c) => c.id).slice(0, 6)).toEqual(["bun", "croft", "duckdb", "warehouse", "serve", "readcopy"]);
+    expect(problems).toEqual([]);
+  });
+
+  test("a refresh that failed: a warning with the reason, and a hint that points at .croft/readcopy.log", async () => {
+    const root = await readCopyProject();
+    copyAt(root, "2026-09-24T15:00:00.000Z");
+    const message = "the read copy was not refreshed: /bin/cp could not copy the warehouse: cp: warehouse.read.duckdb: No space left on device";
+    setting(root, { refreshedAt: "2026-09-24T15:00:00.000Z", lastError: { at: "2026-09-24T17:04:00.000Z", code: null, message } });
+    writeFileSync(join(root, ".croft", "readcopy.log"), `2026-09-24T17:04:00.000Z ${message}\n`);
+    const { data } = await runDoctor(root, deps({ env: { CROFT_NOW: AT } }));
+    const c = check(data.checks, "readcopy");
+    expect(c).toMatchObject({ status: "warn", details: { health: "failed", lastError: { at: "2026-09-24T10:04:00-07:00", code: null, message } } });
+    expect(c.text.split("\n")).toEqual([
+      "read copy warehouse.read.duckdb · as of 08:00 (2 h ago) · the last refresh failed 60 s ago: /bin/cp could not copy the warehouse: cp: warehouse.read.duckdb: No space left on device",
+      "hint: fix what .croft/readcopy.log says (free disk space, for example); the next croft run that writes data refreshes the copy",
+    ]);
+    // Counted with the other warnings (the croft line warns too: this project's packages are not installed).
+    const warned = data.checks.filter((x) => x.status === "warn").map((x) => x.id);
+    expect(warned).toContain("readcopy");
+    expect(data.summary.warnings).toBe(warned.length);
+    const out = formatDoctor(data, []);
+    expect(out).toContain("  warn  read copy warehouse.read.duckdb · as of 08:00 (2 h ago) · the last refresh failed 60 s ago: ");
+    expect(out).toContain("\n        hint: fix what .croft/readcopy.log says (free disk space, for example); the next croft run that writes data refreshes the copy\n");
+    expect(out.trimEnd().split("\n").at(-1)).toBe(`${warned.length} warnings`);
+  });
+
+  test("a program held the warehouse: the hint says to close it", async () => {
+    const root = await readCopyProject();
+    copyAt(root, "2026-09-24T15:00:00.000Z");
+    setting(root, { lastError: { at: "2026-09-24T17:04:00.000Z", code: "DB_HELD_BY_OTHER_PROGRAM", message: "the read copy was not refreshed: warehouse.duckdb is held by DBeaver (PID 812)" } });
+    const { data } = await runDoctor(root, deps({ env: { CROFT_NOW: AT } }));
+    expect(check(data.checks, "readcopy").text.split("\n")).toEqual([
+      "read copy warehouse.read.duckdb · as of 08:00 (2 h ago) · the last refresh failed 60 s ago (DB_HELD_BY_OTHER_PROGRAM): warehouse.duckdb is held by DBeaver (PID 812)",
+      "hint: close the program holding warehouse.duckdb (GUIs open warehouse.read.duckdb instead); the next croft run that writes data refreshes the copy (.croft/readcopy.log has each failure)",
+    ]);
+  });
+
+  test("older than the last run that wrote data: a warning", async () => {
+    const root = await readCopyProject();
+    const first = wrote(root, "2026-09-24T14:59:00.000Z");
+    copyAt(root, "2026-09-24T15:00:00.000Z");
+    setting(root, { refreshedAt: "2026-09-24T15:00:00.000Z", covers: { runId: first, at: "2026-09-24T14:59:00.000Z" } });
+    const run = wrote(root, "2026-09-24T17:00:00.000Z");
+    const { data } = await runDoctor(root, deps({ env: { CROFT_NOW: AT } }));
+    const c = check(data.checks, "readcopy");
+    expect(c).toMatchObject({ status: "warn", details: { health: "behind", lastWrite: { runId: run } } });
+    expect(c.text.split("\n")).toEqual([
+      `read copy warehouse.read.duckdb · as of 08:00 (2 h ago), older than the last run that wrote data (${run}, 10:00)`,
+      "hint: the next croft run that writes data refreshes the copy; no refresh followed that run (readCopy was off then, or the refresh was cut short; .croft/readcopy.log has each failure)",
+    ]);
+  });
+
+  test("not made yet: an info line", async () => {
+    const root = await readCopyProject();
+    const { data } = await runDoctor(root, deps({ env: { CROFT_NOW: AT } }));
+    expect(check(data.checks, "readcopy")).toMatchObject({
+      status: "info", text: "read copy warehouse.read.duckdb · not made yet: the next croft run that writes data makes it", details: { health: "missing", exists: false },
+    });
+  });
+});
+
 describe("the Scheduling section", () => {
   const TICKED = "2026-09-24T17:04:48.000Z";
   const AT = "2026-09-24T17:05:00.000Z";

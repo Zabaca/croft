@@ -12,7 +12,12 @@
 // The Scheduling section (§2, §8) says whether scheduling is on, who ticks (the per-user OS job or croft serve)
 // and when the last tick was, from runs.sqlite without creating it. A scheduler quiet for 3 minutes while on is
 // SCHEDULER_STALE with the likely cause and the end of the tick log; only then is the OS job inspected
-// (launchctl print, crontab -l).
+// (launchctl print, crontab -l). A paused project is told the command that resumes it as it was: `croft schedule
+// on --no-os-job` for one ticked by croft serve only.
+//
+// With readCopy on, the Environment section has the read copy's line (db/readcopy.ts, which imports DuckDB only to
+// refresh): a refresh that failed, or a copy older than the last run that wrote data, is a warning whose hint
+// names .croft/readcopy.log.
 import { accessSync, constants as fsConstants, existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
@@ -21,6 +26,7 @@ import { now, offsetSeconds } from "../../core/time.ts";
 import type { LockHolder, Problem } from "../../core/types.ts";
 import { filesystemKind, folderKind, type FsKind } from "../../db/fs-kind.ts";
 import { isHolderAlive, liveIntents } from "../../db/intent.ts";
+import { readCopyStatus, readCopySummary } from "../../db/readcopy.ts";
 import { CLAUDE_MD, claudeBlock, findBlock, SKILL_PATH, skillStamp } from "../../agent/templates.ts";
 import { ProjectEnv } from "../../project/env.ts";
 import { appRootOf, relocationPlan } from "../../project/init.ts";
@@ -153,6 +159,7 @@ export async function runDoctor(cwd: string, d: DoctorDeps): Promise<{ data: Doc
   if (project) {
     await checkWarehouse(r, d, project, probe.ok);
     await checkServe(r, d, project);
+    checkReadCopy(r, d, project);
     if (probe.ok) await checkTzdata(r, d, project.timezone);
   }
 
@@ -511,6 +518,22 @@ async function checkServe(r: Report, d: DoctorDeps, project: Project): Promise<v
   const queries = typeof health.queriesToday === "number" ? ` · ${formatCount(health.queriesToday)} queries today` : "";
   r.add("environment", "serve", "ok", `read server on ${where} (pid ${s.pid}) · token in ${shownFile}${queries}`, undefined,
     { running: true, pid: s.pid, url: s.url, queriesToday: health.queriesToday ?? null });
+}
+
+/**
+ * The read copy (readCopy on, §5; R32-11): its path and how old it is. A refresh that failed (with its error), or a
+ * copy older than the last run that wrote data, is a warning with a hint that names .croft/readcopy.log; "not made
+ * yet" is an info line. A stat and runs.sqlite only (db/readcopy.ts readCopyStatus): the copy is never opened.
+ */
+function checkReadCopy(r: Report, d: DoctorDeps, project: Project): void {
+  if (!project.config.readCopy) return;
+  let at: Date;
+  try { at = now(d.env); } catch { at = new Date(); }
+  const s = readCopySummary(readCopyStatus(project), project, at);
+  if (!s) return;
+  const lines = [`read copy ${s.text}`, ...(s.hint ? [`hint: ${s.hint}`] : [])];
+  const status = s.warning ? "warn" : s.view.health === "missing" ? "info" : "ok";
+  r.add("environment", "readcopy", status, lines.join("\n"), undefined, { ...s.view });
 }
 
 // JSON timestamps take their offsets from Bun's Intl (core/time.ts); `::DATE` and every SQL time function use
