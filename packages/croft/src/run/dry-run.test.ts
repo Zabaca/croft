@@ -112,6 +112,35 @@ describe("croft run --dry-run", () => {
     expect(bare.events.skippedBecause).toContain("before its saved position 5");
   });
 
+  test("--from: what reads a backfilled ingest is skipped, as the run skips it; a broken transform too", async () => {
+    const { run } = setup({
+      ...FILES,
+      "assets/issue_count.sql": "SELECT count(*) AS n FROM issues\n",
+      "assets/typo.sql": "-- check: id >\nSELECT id FROM issues\n",
+    });
+    expect(stepsOf((await run({ selectors: ["issues"] })).data).typo.problems.map((p: { code: string }) => p.code)).toEqual(["CHECK_INVALID"]);
+    const out = await run({ selectors: ["issues"], from: "-7d" });
+    const s = stepsOf(out.data);
+    expect(s.issues).toMatchObject({ action: "fetch", window: { source: "from" } });
+    expect(s.issue_count).toMatchObject({ action: "skip", skippedBecause: "--from applies to merge ingests", problems: [] });
+    expect(s.typo).toMatchObject({ action: "skip", skippedBecause: "--from applies to merge ingests", problems: [] });
+    expect(out.problems).toEqual([]);
+    expect(formatDryRun(out.data)).toContain("1 of 3 steps would run");
+  });
+
+  test("a mistyped asset's did-you-mean fix repeats the dry run as typed, never a real run", async () => {
+    const { run } = setup(FILES);
+    await expect(run({ selectors: ["isues"] })).rejects.toMatchObject({
+      code: "USAGE_ERROR", problem: { hint: "did you mean issues?", fix: { kind: "command", command: "croft run issues --dry-run" } },
+    });
+    await expect(run({ selectors: ["zones", "isues"], only: true, from: "-7d" })).rejects.toMatchObject({
+      problem: { fix: { command: "croft run zones issues --only --from -7d --dry-run" } },
+    });
+    await expect(run({ selectors: ["issue*", "chargse"], upstream: true })).rejects.toMatchObject({
+      problem: { fix: { command: "croft run 'issue*' charges --upstream --dry-run" } },
+    });
+  });
+
   test("--allow-shrink: the rows that would go to the trash, and no token; allowShrink in code needs none", async () => {
     const { run, project } = setup({ ...FILES, "assets/lax.ts": ingest("allowShrink: true,") }, [...CATALOG, entry("lax", { rows: 40 })]);
     const out = await run({ selectors: ["zones"], allowShrink: true });
@@ -163,6 +192,27 @@ export default transform({
     const later = stepsOf((await since.run({ selectors: ["triage"] })).data).triage;
     expect(later.reason).toBe("input issues has new rows");
     expect(later.confirmation.impact).toMatchObject({ rows: 1510, estimatedRequests: 1510 });
+  });
+
+  test("the cost guard counts only the inputs the code reads with newRows(), as the run does: a lookup read with rows() is not", async () => {
+    const triage = `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["issues", "labels"], key: "id", incremental: true,
+  async *rows({ newRows, rows, http }) {
+    const labels = await rows("labels");
+    for await (const r of newRows("issues")) { await http.get("https://example.test/" + r.id + labels.length); yield r; }
+  },
+});
+`;
+    const files = { ...FILES, "assets/labels.ts": ingest(`key: "name",`), "assets/triage.ts": triage };
+    const labels = entry("labels", { key: ["name"], rows: 1200 });
+    // Built, and no issue is new since: nothing to process, whatever the size of the lookup.
+    const built = [...CATALOG, labels,
+      entry("triage", { kind: "ts", write: "merge", key: ["id"], inputsSeen: { issues: { seenLoadedAt: T1, seenKey: [7], inputLastLoadedAt: T1 } } })];
+    expect(stepsOf((await setup(files, built).run({ selectors: ["triage"], only: true })).data).triage.confirmation).toBeUndefined();
+    // Never built: every issue is pending (5,000), and the 1,200 labels are not counted.
+    const first = stepsOf((await setup(files, [...CATALOG, labels]).run({ selectors: ["triage"], only: true })).data).triage;
+    expect(first.confirmation.impact).toMatchObject({ rows: 5000, estimatedRequests: 5000 });
   });
 
   test("a step that would fail before it runs is shown with its problem; what reads it is skipped, as the runner skips it", async () => {

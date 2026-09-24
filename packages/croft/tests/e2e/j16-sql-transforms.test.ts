@@ -420,11 +420,11 @@ test("journey 16c: a transform left stale by `--only` upstream of it is updated 
 // ---------------------------------------------------------------------------------------------------------
 // Product bugs (reported). Each keeps its assertions in bugTest(): flip to test() once fixed.
 
-// BUG (reported): a table read only in a check's subquery is ordered first (§3f), but `croft run <asset>
-// --upstream` does not build it when it was never built, so the asset fails with CHECK_INVALID and the hint
-// "correct the check in assets/daily_revenue.sql". The check is correct: its table is just not built yet. Either
-// --upstream builds it (it runs first anyway), or the problem says to build the table (croft run regions).
-bugTest("journey 16d: `run <asset> --upstream` builds, or at least names, the never-built table a check reads", async () => {
+// FIXED (reported): a table read only in a check's subquery is ordered first (§3f), but `croft run <asset>
+// --upstream` did not build it when it was never built, so the asset failed with CHECK_INVALID and the hint
+// "correct the check in assets/daily_revenue.sql". The check is correct: its table is just not built yet. Now
+// --upstream builds it, and without --upstream the problem names the table (croft run regions).
+test("journey 16d: `run <asset> --upstream` builds, or at least names, the never-built table a check reads", async () => {
   const p = await shopProject();
   const r = await p.json(["run", "daily_revenue", "--upstream"]);
   const daily = stepOf(r.json, "daily_revenue");
@@ -458,12 +458,12 @@ test("journey 16f: a transform step's inputs[].seenBefore/seenAfter carry the pr
   expect(inputs[0]!.seenAfter, JSON.stringify(inputs)).toMatch(ISO_WITH_OFFSET);
 });
 
-// BUG (reported): after only croft.json's timezone changed, the run reason (dry run, run output) says
-// "SQL changed (assets/clean_orders.sql)" for every SQL transform, and status reports EDITED_SINCE_LAST_RUN
+// FIXED (reported): after only croft.json's timezone changed, the run reason (dry run, run output) said
+// "SQL changed (assets/clean_orders.sql)" for every SQL transform, and status reported EDITED_SINCE_LAST_RUN
 // ("edited since its last run") for every asset, though no asset file was edited. An agent reading it looks for
-// an edit that does not exist; the reason should name the time zone (§8: "Changing timezone in croft.json
+// an edit that does not exist; the reason names the time zone now (§8: "Changing timezone in croft.json
 // rebuilds every transform").
-bugTest("journey 16g: a time zone change is the reason given, not an SQL change", () => {
+test("journey 16g: a time zone change is the reason given, not an SQL change", () => {
   expect(tzDryRun).toBeDefined();
   const clean = stepOf(tzDryRun!, "clean_orders");
   expect(clean.reason, JSON.stringify(clean)).toMatch(/time ?zone/i);

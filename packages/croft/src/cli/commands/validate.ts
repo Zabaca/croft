@@ -8,7 +8,9 @@
 //    (SECRET_MISSING, a warning: nothing fails until the asset runs, as in doctor).
 // 2. The bind check (sql/bind.ts ShadowCatalog), over empty tables in an in-memory DuckDB:
 //    - every table the catalog mirror (runs.sqlite) knows is defined from its cached columns, _loaded_at and
-//      _file included, and its pending columns (all NULL so far) are passed for NULL_ONLY_COLUMN;
+//      _file included, and its pending columns (all NULL so far) are passed for NULL_ONLY_COLUMN; a table never
+//      built but previewed, from the columns the preview gave it (.croft/preview/runs.sqlite: §6 "the column
+//      cache is filled by runs, by previews and by `columns` pins");
 //    - SQL assets are bound in graph order, and each one's output columns replace its table, so the next asset
 //      binds against the code as it is now;
 //    - an asset whose input has no columns yet (never built, or an SQL input whose columns are unknown in turn)
@@ -33,10 +35,11 @@ import { RUNS_DB_FILE, RunsDb } from "../../history/runs-db.ts";
 import { quoteIdent } from "../../load/evolve.ts";
 import { missingSecret, type ProjectEnv } from "../../project/env.ts";
 import { buildGraph, type Graph } from "../../project/graph.ts";
-import { type ResolvedAsset, resolveProject } from "../../project/resolve.ts";
+import { type ResolvedAsset, resolveProject, selectorWords } from "../../project/resolve.ts";
 import type { Project } from "../../project/root.ts";
 import type { LoadedSqlAsset } from "../../project/sql-asset.ts";
 import { didYouMean } from "../../project/suggest.ts";
+import { previewDirectory } from "../../run/preview.ts";
 import { ShadowCatalog, type ShadowColumn } from "../../sql/bind.ts";
 import type { CommandImpl, Next } from "../command.ts";
 import { formatDuration, formatProblems, problemSummary } from "../render.ts";
@@ -112,9 +115,16 @@ export function nextSteps(r: ValidateReport): Next[] {
 export async function validateProject(i: ValidateInput): Promise<ValidateReport> {
   const { root, timezone } = i.project;
   const catalog = readCatalog(i.project.paths.stateDir);
+  const live = new Map(catalog.map((c) => [c.asset, c]));
+  // The column cache holds previews too (§6): an input never built but previewed binds against the columns the
+  // preview gave it (.croft/preview/runs.sqlite, source "preview"). A live entry always wins, and only the bind
+  // reads previews: a preview is no build (codeChanged, cursor types).
+  const columns = [...catalog, ...readCatalog(previewDirectory(i.project.paths.stateDir)).filter((c) => !live.has(c.asset))];
   const cursorTypes = Object.fromEntries(catalog.flatMap((c) => (c.cursor?.type ? [[c.asset, c.cursor.type]] : [])));
   const resolved = await resolveProject({
-    root, timezone, cursorTypes,
+    root, timezone, cursorTypes, builtHashes: (name) => live.get(name)?.codeHash ?? null,
+    // A mistyped name's fix is validate again: it touches no data, and neither does its fix.
+    retry: (selectors) => ["croft validate", ...selectorWords(selectors), ...(i.types ? ["--types"] : [])].join(" "),
     ...(i.selectors?.length ? { selectors: i.selectors } : {}),
     ...(i.importTimeoutMs !== undefined ? { importTimeoutMs: i.importTimeoutMs } : {}),
   });
@@ -125,7 +135,7 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
   // Declared secrets set in the shell are redacted from the output like .env values.
   i.env.declare(resolved.assets.flatMap((a) => a.ts?.spec?.secrets ?? []));
 
-  const bound = await bindProject(resolved.assets, runOrder(resolved.graph, resolved.assets), scope, catalog, timezone);
+  const bound = await bindProject(resolved.assets, runOrder(resolved.graph, resolved.assets), scope, columns, timezone);
 
   // The graph again, with the plan's scans: they can add inputs (and so edges and cycles) the AST did not show.
   const inputsOf = (a: ResolvedAsset): string[] => {
@@ -141,7 +151,6 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
     ...resolved.problems.filter((p) => p.code !== "CYCLE"),
     ...cycles.filter((p) => selected.size === byName.size || cycleNames(p).some((n) => selected.has(n))),
   ];
-  const catalogOf = new Map(catalog.map((c) => [c.asset, c]));
   const assets: ValidateAsset[] = [];
   for (const name of order) {
     const a = byName.get(name);
@@ -149,12 +158,13 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
     const own = a.problems.filter((p) => !(bound.quoted.has(name) && p.code === "SQL_SYNTAX"));
     problems.push(...[...own, ...staticProblems(a, byName, root, i.env), ...(bound.problems.get(name) ?? [])]
       .map((p) => (p.asset ? p : { ...p, asset: name })));
-    const built = catalogOf.get(name);
+    const built = live.get(name);
     assets.push({
       name, kind: a.kind, inputs: inputsOf(a),
       outputColumns: a.kind === "sql" ? bound.outputs.get(name)?.map((c) => ({ name: c.name, type: c.type })) ?? null : null,
       behavior: a.behavior,
-      codeChanged: !!(a.codeHash && built?.codeHash && a.codeHash !== built.codeHash),
+      // A time zone change alone is no code change (project/resolve.ts timeZoneChanged).
+      codeChanged: !!(a.codeHash && built?.codeHash && a.codeHash !== built.codeHash && !a.timeZoneChanged),
     });
   }
 

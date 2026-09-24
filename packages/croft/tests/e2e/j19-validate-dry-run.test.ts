@@ -16,7 +16,7 @@
 // - validate, status and the dry run never wait while another program holds the warehouse.
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { githubAsset, githubRoute, type Issue, issue, stripeAsset, TOKEN } from "./fixtures.ts";
-import { bugTest, cleanupAll, type Envelope, initProject, json, type MockApi, mockApi, type Project, show } from "./harness.ts";
+import { cleanupAll, type Envelope, initProject, json, type MockApi, mockApi, type Project, show } from "./harness.ts";
 
 const KEY = "sk_test_e2eStripeKey987654";
 let api: MockApi;
@@ -527,14 +527,15 @@ test("journey 19e: validate, status and the dry run never wait while another pro
 }, 120_000);
 
 // ---------------------------------------------------------------------------------------------------------
-// Product bugs (reported). Each keeps its assertions in bugTest(): flip to test() once fixed.
+// Product bugs reported in W2.3, fixed since (they were bugTest()s). A new product bug goes here as a bugTest()
+// (tests/e2e/harness.ts) until it is fixed.
 
-// BUG (reported): under --from the dry run and the run disagree. `croft run stripe_charges --from 2026-06-24
+// FIXED (reported): under --from the dry run and the run disagreed. `croft run stripe_charges --from 2026-06-24
 // --dry-run` plans daily_revenue as "rebuild … input stripe_charges may have new rows" ("2 of 2 steps would
 // run"), but the run skips it with "--from applies to merge ingests". A bare `--from -30d` dry run likewise lists
 // every transform (and a LARGE_REPROCESS confirmation) that the run then skips. DESIGN §8: "run --dry-run --from
 // -90d shows the same without fetching"; run/dry-run.ts: "It plans exactly as the run does".
-bugTest("journey 19f: under --from, the dry run's actions match what the run does", async () => {
+test("journey 19f: under --from, the dry run's actions match what the run does", async () => {
   const p = await trackerProject();
   const first = await p.json(["run", "stripe_charges"]);
   expect(first.code, show(first)).toBe(0);
@@ -547,11 +548,11 @@ bugTest("journey 19f: under --from, the dry run's actions match what the run doe
   expect(planned, `${show(dry)}\n${show(run)}`).toEqual(happened);
 }, 120_000);
 
-// BUG (reported): a mistyped asset name gets USAGE_ERROR with a did-you-mean fix that always says
+// FIXED (reported): a mistyped asset name got USAGE_ERROR with a did-you-mean fix that always said
 // `croft run <guess>`, whichever command was typed. After `croft validate open_issue` (which never touches data)
 // or `croft run open_issue --dry-run`, the fix an agent follows really runs the asset: fetching, writing, and
 // for a paid transform spending money. The fix should repeat the command that was typed.
-bugTest("journey 19g: a mistyped asset's did-you-mean fix repeats the command typed (validate, run --dry-run)", async () => {
+test("journey 19g: a mistyped asset's did-you-mean fix repeats the command typed (validate, run --dry-run)", async () => {
   expect(shared).toBeDefined();
   const p = shared!;
   const v = await p.json(["validate", "open_issue"]);
