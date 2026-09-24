@@ -34,7 +34,7 @@ export async function runQuery(sql: unknown, params: unknown, options: unknown, 
     onRoute?.("url");
     const token = tokenFor(explicit.url, o, ctx.env, () => localRecord(o, ctx));
     const rows = await serverQuery({ url: explicit.url, token: token?.token ?? null, tokenSource: token?.source ?? null, local: false }, req, timings);
-    if (rows === ABSENT) throw new CroftError("INTERNAL_ERROR", { message: "an explicit croft serve URL was treated as absent", hint: "report this croft bug" });
+    if (rows === ABSENT) throw new CroftError("INTERNAL_ERROR", { message: "an explicit read server URL was treated as absent", hint: "report this croft bug" });
     return rows;
   }
 

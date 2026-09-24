@@ -5,7 +5,7 @@
 //   that ships it. The registry (cli/commands/index.ts) must register exactly the commands of this phase and
 //   no flag of a later one except `query --preview`, which is registered to refuse clearly (a test checks both).
 // - SKILL.md renders its "This version" section from the manifest (agent/templates.ts), and a test scans
-//   CLAUDE.md, SKILL.md, every `croft docs` page, and every hint, fix and next[] in the source for a
+//   CLAUDE.md, SKILL.md, every `croft docs` page, and every string in the source (this file aside) for a
 //   `croft <command>` or `--flag` this build does not have (agent/contract.test.ts).
 // - When a phase lands: raise PHASE, register its commands, and add the skill text for them.
 //
@@ -14,6 +14,17 @@
 // "Checks unique(id) · not_null(id)" read as a promise. To remove when phase 2 runs checks: delete
 // CHECKS_ENFORCED and every use of it (grep CHECKS_ENFORCED): the `checksEnforced` field of run, wait,
 // describe and context data, and the human lines in run.ts, describe.ts and context.ts.
+//
+// phaseStub() is what a module of the next wave throws until it is built: the contract commit gives each one
+// its final signature, so builders code against it in parallel (the phase-2 execution spec). grep PHASE_STUB
+// finds what is left.
+import { CroftError } from "./errors.ts";
+
+/** What an unbuilt stub throws: INTERNAL_ERROR with a message starting "PHASE_STUB". Its builder replaces the
+ *  call with the real code. */
+export function phaseStub(what: string): never {
+  throw new CroftError("INTERNAL_ERROR", { message: `PHASE_STUB: ${what} is not built yet`, hint: "report this croft bug" });
+}
 
 /** The phase of DESIGN.md §11 this build implements. */
 export const PHASE: number = 1;

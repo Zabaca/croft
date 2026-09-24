@@ -5,8 +5,10 @@ import { CroftError } from "../core/errors.ts";
 import type { Sql } from "../core/types.ts";
 
 /** Version of the _croft schema. A database with a larger number was written by a newer croft.
- *  2: _croft.writes.attempt (the step attempt that committed, so reconcile() can tell retries apart). */
-export const FORMAT_VERSION = 2;
+ *  2: _croft.writes.attempt (the step attempt that committed, so reconcile() can tell retries apart).
+ *  3: _croft.inputs.input_last_loaded_at (the input's last_loaded_at when a transform last read all of it,
+ *     which staleness compares with; seen_loaded_at and seen_key stay newRows()'s composite position). */
+export const FORMAT_VERSION = 3;
 export const CROFT_VERSION: string = pkg.version;
 
 // Exactly the DDL of DESIGN.md §5, made idempotent. Each entry is one statement (the Sql wrapper
@@ -23,7 +25,7 @@ export const STATE_DDL: readonly string[] = [
     pinned BOOLEAN, pending BOOLEAN, kinds VARCHAR[], present_last_batch BOOLEAN, added_at TIMESTAMPTZ,
     PRIMARY KEY (asset, name))`,
   `CREATE TABLE IF NOT EXISTS _croft.inputs (asset VARCHAR, input VARCHAR, seen_loaded_at TIMESTAMPTZ, seen_key JSON,
-    PRIMARY KEY (asset, input))`,
+    input_last_loaded_at TIMESTAMPTZ, PRIMARY KEY (asset, input))`,
   `CREATE TABLE IF NOT EXISTS _croft.files (asset VARCHAR, path VARCHAR, size BIGINT, mtime TIMESTAMPTZ, etag VARCHAR,
     sha256 VARCHAR, loaded_at TIMESTAMPTZ, PRIMARY KEY (asset, path))`,
   `CREATE TABLE IF NOT EXISTS _croft.writes (asset VARCHAR, loaded_at TIMESTAMPTZ, run_id VARCHAR, mode VARCHAR,
@@ -36,6 +38,7 @@ export const STATE_DDL: readonly string[] = [
  *  migrated table has the same column order as a new one. */
 export const STATE_COLUMNS_ADDED: readonly { table: string; column: string; ddl: string }[] = [
   { table: "writes", column: "attempt", ddl: `ALTER TABLE _croft.writes ADD COLUMN attempt INTEGER` },
+  { table: "inputs", column: "input_last_loaded_at", ddl: `ALTER TABLE _croft.inputs ADD COLUMN input_last_loaded_at TIMESTAMPTZ` },
 ];
 
 export const STATE_TABLES = ["meta", "assets", "columns", "inputs", "files", "writes"] as const;
@@ -77,7 +80,7 @@ export async function checkFormat(db: Sql): Promise<Meta> {
 }
 
 /**
- * Create the _croft schema and tables when missing, add the columns a format-1 database lacks, and record
+ * Create the _croft schema and tables when missing, add the columns an older database lacks, and record
  * format_version, duckdb_version and croft_version. Idempotent; run it inside a write lease. DDL runs before
  * the meta upsert (DML), and an ALTER runs only while its column is missing, so it respects the DDL-before-DML
  * rule even when called twice in one transaction around writes to _croft.

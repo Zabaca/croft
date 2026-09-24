@@ -560,6 +560,68 @@ describe("atomicity", () => {
   });
 });
 
+describe("transform bookkeeping", () => {
+  const seen = (w: DuckWarehouse, asset: string) => read(w,
+    `SELECT input, strftime(seen_loaded_at AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%S.%fZ') AS seen, seen_key AS k,
+       strftime(input_last_loaded_at AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%S.%fZ') AS last
+     FROM _croft.inputs WHERE asset = $1 ORDER BY input`, [asset]);
+
+  test("positions upsert _croft.inputs with the write, per input, keys exactly", async () => {
+    const w = warehouse();
+    const big = 2n ** 63n + 5n;
+    await load(w, "triage", { ...zones, rows: zoneRows(2) }, {
+      key: ["id"], write: "merge", kind: "ts", now: T0,
+      positions: [
+        { input: "issues", seenLoadedAt: "2026-09-22T09:00:00.000001Z", seenKey: [big, "b"] },
+        { input: "labels", seenLoadedAt: "2026-09-22T08:00:00Z", inputLastLoadedAt: "2026-09-22T08:00:00Z" },
+      ],
+    });
+    expect(await seen(w, "triage")).toEqual([
+      { input: "issues", seen: "2026-09-22T09:00:00.000001Z", k: [big, "b"], last: null },
+      { input: "labels", seen: "2026-09-22T08:00:00.000000Z", k: null, last: "2026-09-22T08:00:00.000000Z" },
+    ]);
+    // The next chunk moves one input on; an unchanged write still records its position.
+    const r = await load(w, "triage", { ...zones, rows: zoneRows(2) }, {
+      key: ["id"], write: "merge", kind: "ts", now: T1,
+      positions: [{ input: "issues", seenLoadedAt: "2026-09-22T10:30:00Z", seenKey: null, inputLastLoadedAt: "2026-09-22T10:30:00Z" }],
+    });
+    expect(r.changed).toBe(false);
+    expect(await seen(w, "triage")).toEqual([
+      { input: "issues", seen: "2026-09-22T10:30:00.000000Z", k: null, last: "2026-09-22T10:30:00.000000Z" },
+      { input: "labels", seen: "2026-09-22T08:00:00.000000Z", k: null, last: "2026-09-22T08:00:00.000000Z" },
+    ]);
+  });
+
+  test("a failing check rolls the positions back with the rows", async () => {
+    const w = warehouse();
+    await load(w, "triage", { ...zones, rows: zoneRows(1) }, {
+      key: ["id"], write: "merge", kind: "ts", now: T0, positions: [{ input: "issues", seenLoadedAt: T0, seenKey: [1] }],
+    });
+    const before = await seen(w, "triage");
+    const e = await rejection(load(w, "triage", { ...zones, rows: zoneRows(3) }, {
+      key: ["id"], write: "merge", kind: "ts", now: T1, positions: [{ input: "issues", seenLoadedAt: T1, seenKey: [3] }],
+      checks: async () => {
+        throw new CroftError("CHECK_FAILED", { message: "zone is not null failed for 1 row", hint: "fix the rows" });
+      },
+    }));
+    expect(e.code).toBe("CHECK_FAILED");
+    expect(await seen(w, "triage")).toEqual(before);
+    expect((await table(w, "triage")).length).toBe(1);
+  });
+
+  test("a checks hook's results become WriteResult.checks, its problems warnings", async () => {
+    const w = warehouse();
+    const results = [{ check: "not_null(zone)", ok: true }, { check: "zone <> 'x'", ok: true }];
+    const r = await load(w, "zones", { ...zones, rows: zoneRows(2) }, {
+      key: ["id"], now: T0,
+      checks: async () => ({ problems: [{ severity: "warning", code: "CHECK_FAILED", message: "warn: 1 row", hint: "", docs: "" }], results }),
+    });
+    expect(r.checks).toEqual(results);
+    expect(r.warnings.map((p) => p.message)).toContain("warn: 1 row");
+    expect((await load(w, "plain", { ...zones, rows: zoneRows(1) }, { key: ["id"], now: T0 })).checks).toEqual([]);
+  });
+});
+
 describe("_loaded_at stamps", () => {
   test("strictly increase per table even when the clock steps back or stands still", async () => {
     const w = warehouse();

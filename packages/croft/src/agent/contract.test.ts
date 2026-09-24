@@ -12,9 +12,10 @@
 //   global one), and not one a later phase adds;
 // - a `--flag` on its own must be an option of some command of this build.
 //
-// The source scan (agent/contract-testkit.ts) reads the string literals of every hint, command, reason and
-// todo property, every description inside a fix, and every command option's description, in src/**/*.ts
-// (tests and test kits aside), with the TypeScript parser.
+// The source scan (agent/contract-testkit.ts) reads every string and template literal in src/**/*.ts (tests
+// and test kits aside) with the TypeScript parser, not only hints, fixes and next[] entries: a message, a
+// docs line or a log line reaches the agent just the same. core/phase.ts is exempt: it names every phase's
+// commands on purpose (the SKILL.md notes it renders are checked below).
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -26,7 +27,7 @@ import { LATER_COMMANDS, laterFlags, SHIPPED_COMMANDS, versionNotes } from "../c
 import type { Ctx } from "../cli/command.ts";
 import { docs } from "../cli/commands/docs.ts";
 import { COMMANDS } from "../cli/commands/index.ts";
-import { agentStrings, type Finding, registered, scan, sourceFiles, SRC } from "./contract-testkit.ts";
+import { EXEMPT, type Finding, registered, scan, sourceFiles, sourceStrings, SRC } from "./contract-testkit.ts";
 import { claudeBlock, CROFT_VERSION, scaffold, skillMd, tsconfigJson } from "./templates.ts";
 
 // ---------------------------------------------------------------------------------------------------------
@@ -122,11 +123,12 @@ describe("croft tells the agent to use only what this build has", () => {
     expect(pages.flatMap((p) => scan(`croft docs ${p.name}`, p.page))).toEqual([]);
   });
 
-  test("every hint, fix and next[] in the source", () => {
+  test("every string in the source: hints, fixes, next[] entries, messages, docs", () => {
     const findings: Finding[] = [];
     for (const file of sourceFiles()) {
-      const rel = relative(SRC, file);
-      for (const s of agentStrings(file, readFileSync(file, "utf8"))) findings.push(...scan(`src/${rel}:${s.line}`, s.text));
+      const rel = relative(SRC, file).split("\\").join("/");
+      if (EXEMPT.has(rel)) continue;
+      for (const s of sourceStrings(file, readFileSync(file, "utf8"))) findings.push(...scan(`src/${rel}:${s.line}`, s.text));
     }
     const known = (f: Finding) => ELSEWHERE.some((e) => f.where.startsWith(`src/${e.file}:`) && f.text.includes(e.text));
     expect(findings.filter((f) => !known(f))).toEqual([]);
@@ -170,11 +172,15 @@ describe("croft tells the agent to use only what this build has", () => {
     }
   });
 
-  test("the source scan reads hints, fixes and next[] entries", () => {
-    const text = `const a = { hint: \`run croft x \${y} --z\`, fix: { kind: "command", description: "d1", command: "c1" }, message: "m" };
-next.push({ command: "c2", reason: cond ? "r1" : "r2" });`;
-    expect(agentStrings("x.ts", text).map((s) => s.text)).toEqual(["run croft x X --z", "d1", "c1", "c2", "r1", "r2"]);
+  test("the source scan reads every string and template literal, but not names, types or module paths", () => {
+    const text = `import { a } from "./a.ts";
+type Mode = "--not-text";
+const a = { hint: \`run croft x \${y ? "in" : "out"} --z\`, fix: { kind: "command", description: "d1", command: "c1" }, message: "m", "quoted-name": 1 };
+next.push({ command: "c2", reason: cond ? "r1" : "r2" });
+log(\`plain\`);`;
+    expect(sourceStrings("x.ts", text).map((s) => s.text)).toEqual(["run croft x X --z", "in", "out", "command", "d1", "c1", "m", "c2", "r1", "r2", "plain"]);
+    expect(sourceStrings("x.ts", text).map((s) => s.line)).toEqual([3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 5]);
     const spec = `lazyCommand({ name: "q", description: "not an option", options: { preview: { type: "boolean", description: "o1" } } });`;
-    expect(agentStrings("y.ts", spec).map((s) => s.text)).toEqual(["o1"]);
+    expect(sourceStrings("y.ts", spec).map((s) => s.text)).toEqual(["q", "not an option", "boolean", "o1"]);
   });
 });

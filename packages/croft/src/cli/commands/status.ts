@@ -466,6 +466,6 @@ function schedulingLine(d: StatusData, now: Date): string {
   const parts = [`Scheduling ${d.scheduling.state}`];
   if (d.scheduling.lastTickAt) parts.push(`last tick ${ago(d.scheduling.lastTickAt, now)}`);
   parts.push(`${d.running.length} running`);
-  if (d.serve) parts.push(`croft serve ${d.serve.url} (pid ${d.serve.pid})`);
+  if (d.serve) parts.push(`read server ${d.serve.url} (pid ${d.serve.pid})`);
   return parts.join(" · ");
 }

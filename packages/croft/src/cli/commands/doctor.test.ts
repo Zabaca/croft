@@ -364,10 +364,10 @@ describe("croft serve detection", () => {
       writeFileSync(join(root, ".croft", "serve.json"), JSON.stringify({ pid: process.pid, url: `http://127.0.0.1:${server.port}`, token: "t0k3n" }));
       const { data, problems } = await runDoctor(root, deps());
       expect(check(data.checks, "serve")).toMatchObject({
-        status: "ok", text: `croft serve on 127.0.0.1:${server.port} (pid ${process.pid}) · token in .croft/serve.json · 1,204 queries today`,
+        status: "ok", text: `read server on 127.0.0.1:${server.port} (pid ${process.pid}) · token in .croft/serve.json · 1,204 queries today`,
       });
       expect(seen).toEqual(["/health Bearer t0k3n"]);
-      expect(check(data.checks, "warehouse").text).toContain(`held read-only by croft serve (pid ${process.pid}; steps aside for writes)`);
+      expect(check(data.checks, "warehouse").text).toContain(`held read-only by croft's read server (pid ${process.pid}; steps aside for writes)`);
       expect(problems).toEqual([]);
     } finally {
       server.stop(true);

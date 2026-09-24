@@ -52,19 +52,19 @@
       "default": 4
     },
     "serve": {
-      "description": "croft serve, the local HTTP server apps query through",
+      "description": "the read server, the local HTTP server apps query through",
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "port": {
-          "description": "croft serve port",
+          "description": "read server port",
           "type": "integer",
           "minimum": 1,
           "maximum": 65535,
           "default": 7447
         },
         "host": {
-          "description": "croft serve address; anything but loopback must sit behind HTTPS",
+          "description": "read server address; anything but loopback must sit behind HTTPS",
           "type": "string",
           "pattern": "\\S",
           "default": "127.0.0.1"
@@ -91,7 +91,7 @@
           "default": 67108864
         },
         "allowOrigins": {
-          "description": "browser origins allowed to call croft serve, e.g. \"http://localhost:3000\"",
+          "description": "browser origins allowed to call the read server, e.g. \"http://localhost:3000\"",
           "type": "array",
           "items": {
             "type": "string",

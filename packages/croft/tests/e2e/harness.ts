@@ -58,6 +58,9 @@ export function baseEnv(extra: Record<string, string> = {}): Record<string, stri
     // init detects the project time zone from the machine; journeys assume Los Angeles (CI runners are UTC).
     TZ: "America/Los_Angeles",
     CROFT_RETRY_DELAYS: "50,100",
+    // The tripwires of tests/preload.ts: no journey installs OS jobs or shows notifications.
+    CROFT_FORBID_OS_JOBS: "1",
+    CROFT_NOTIFY_DRY: "1",
     ...extra,
   };
 }

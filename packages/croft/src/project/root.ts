@@ -43,12 +43,12 @@ export const CONFIG_KEYS: { key: string; type: string; default: string; descript
   { key: "notify.desktop", type: "boolean", default: "true", description: "desktop notification when a scheduled run fails" },
   { key: "notify.webhook", type: "string | null", default: "null", description: "http(s) URL that receives the failure envelope of a scheduled run" },
   { key: "concurrency", type: "integer", default: String(DEFAULTS.concurrency), description: "extractions that run at the same time in one run (1-64)" },
-  { key: "serve.port", type: "integer", default: String(DEFAULTS.serve.port), description: "croft serve port" },
-  { key: "serve.host", type: "string", default: `"${DEFAULTS.serve.host}"`, description: "croft serve address; anything but loopback must sit behind HTTPS" },
+  { key: "serve.port", type: "integer", default: String(DEFAULTS.serve.port), description: "read server port" },
+  { key: "serve.host", type: "string", default: `"${DEFAULTS.serve.host}"`, description: "read server address; anything but loopback must sit behind HTTPS" },
   { key: "serve.queryTimeoutMs", type: "integer", default: String(DEFAULTS.serve.queryTimeoutMs), description: "deadline for one query over HTTP" },
   { key: "serve.maxConcurrent", type: "integer", default: String(DEFAULTS.serve.maxConcurrent), description: "queries running in DuckDB at once; the rest queue" },
   { key: "serve.maxBytes", type: "integer", default: String(DEFAULTS.serve.maxBytes), description: "largest result in bytes; bigger results fail with QUERY_TOO_MANY_ROWS" },
-  { key: "serve.allowOrigins", type: "string[]", default: "[]", description: "browser origins allowed to call croft serve, e.g. \"http://localhost:3000\"" },
+  { key: "serve.allowOrigins", type: "string[]", default: "[]", description: "browser origins allowed to call the read server, e.g. \"http://localhost:3000\"" },
   { key: "stateDir", type: "string", default: "\".croft\"", description: "state folder; croft sets it when it moves state off a synced folder" },
 ];
 
@@ -210,7 +210,7 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined, p
         if (origin && origin === o) serve.allowOrigins.push(origin);
         else if (origin) add(path, `"${path}" must be an origin without a path; found ${show(o)}`, `use "${origin}"`, editFix(path, `use "${origin}"`, `"${o as string}"`, `"${origin}"`));
         else add(path, `"${path}" must be an origin like "http://localhost:3000"; found ${show(o)}`,
-          o === "*" ? "list each origin that may call croft serve; \"*\" is not allowed" : "use scheme://host[:port]");
+          o === "*" ? "list each origin that may call the read server; \"*\" is not allowed" : "use scheme://host[:port]");
       });
     }
   }

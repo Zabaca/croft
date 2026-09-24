@@ -40,7 +40,7 @@ test("journey 12: doctor --json on a fresh project, after a run, and outside any
   const wh = after.json.data.checks.find((c: { id: string }) => c.id === "warehouse");
   expect(wh.status, JSON.stringify(wh)).toBe("ok");
   expect(wh.details).toMatchObject({ exists: true, writable: true, heldBy: null });
-  expect(wh.details.meta.format_version).toBe("2");
+  expect(wh.details.meta.format_version).toBe("3");
   expect(after.json.data.summary).toMatchObject({ errors: 0, warnings: 0 });
   expect(after.json.durationMs).toBeLessThan(3000); // §4.1: "under 1 s" (loose bound for loaded CI machines)
   // Human output: sections, one line per check.

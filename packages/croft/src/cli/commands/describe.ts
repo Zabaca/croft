@@ -232,7 +232,7 @@ export function checksOf(c: AssetConfig | null, key: string[]): { check: string;
 /** "croft run r_…, writing x", "croft serve pid 4121", "DuckDB UI (PID 812)". */
 export function holderText(h: LockHolder): string {
   if (h.runId) return `croft run ${h.runId}${h.asset ? `, writing ${h.asset}` : ""}`;
-  if (h.program === "croft serve") return `croft serve pid ${h.pid}`;
+  if (h.program === "croft's read server") return `croft's read server (pid ${h.pid})`;
   return `${h.program ?? "another program"}${h.pid !== null ? ` (PID ${h.pid})` : ""}`;
 }
 

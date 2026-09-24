@@ -1,0 +1,4 @@
+# `bun test` in packages/croft (DESIGN.md §10 "Test strategy").
+[test]
+# Tripwires set before any test file loads: no test installs OS jobs or shows desktop notifications.
+preload = ["./tests/preload.ts"]

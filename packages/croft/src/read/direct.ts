@@ -230,10 +230,10 @@ function busy(project: Project, c: LockConflict, waitedMs: number): CroftError {
   }
   if (c.pid !== null && servePid(project.paths.stateDir) === c.pid) {
     return new CroftError("DB_BUSY", {
-      message: `the warehouse is held by croft serve (pid ${c.pid}); waited ${secs} s`,
+      message: `the warehouse is held by croft's read server (pid ${c.pid}); waited ${secs} s`,
       hint: "query through that server (set CROFT_URL), or stop it and retry",
       retryable: true,
-      details: { ...details, holder: { ...holder, program: "croft serve" } },
+      details: { ...details, holder: { ...holder, program: "croft's read server" } },
     });
   }
   const who = `${c.program ?? "another program"}${c.pid !== null ? ` (PID ${c.pid})` : ""}`;

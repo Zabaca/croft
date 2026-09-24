@@ -124,7 +124,7 @@ export function explicitUrl(o: { url?: string }, env: Env): { url: URL; source: 
   const url = httpUrl(text);
   if (!url) {
     throw new CroftError("USAGE_ERROR", {
-      message: `${source === "option" ? "{ url }" : "CROFT_URL"} must be the http(s) address of croft serve, like http://127.0.0.1:7447; found ${JSON.stringify(text)}`,
+      message: `${source === "option" ? "{ url }" : "CROFT_URL"} must be the http(s) address of croft's read server, like http://127.0.0.1:7447; found ${JSON.stringify(text)}`,
       hint: "use the server's http(s) address, like http://127.0.0.1:7447",
     });
   }

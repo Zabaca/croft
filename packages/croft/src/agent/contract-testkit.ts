@@ -1,6 +1,7 @@
 // The agent-contract scanner (agent/contract.test.ts): finds every `croft <command>` and `--flag` in a text
-// that this build does not have, and reads the agent-facing strings (hints, fixes, next[] entries, docs todos
-// and option descriptions) out of croft's source with the TypeScript parser. For tests only.
+// that this build does not have, and reads every string and template literal out of croft's source with the
+// TypeScript parser (any of them can reach an agent: a hint, a fix, a next[] entry, a message, a docs page).
+// For tests only.
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -75,44 +76,37 @@ export function sourceFiles(dir = SRC): string[] {
   return out.sort();
 }
 
-const AGENT_KEYS = new Set(["hint", "command", "reason", "todo"]);
+/** Files whose strings name later-phase commands on purpose: the phase manifest lists every command of every
+ *  phase, and renders the "not in this version" notes (whose own text a test checks). Root-relative to src/. */
+export const EXEMPT = new Set(["core/phase.ts"]);
 
-/** The text of every string in the hints, fixes, next[] entries, docs todos and command option descriptions
- *  (`options: { flag: { description } }`, shown by croft help) of one source file. A template literal's
- *  substitutions read as X ("croft run X --from"). */
-export function agentStrings(file: string, text: string): { line: number; text: string }[] {
+/**
+ * The text of every string literal and template literal in one source file: hints, fixes, next[] entries,
+ * docs, option descriptions, messages, and anything else that can end up in front of an agent. A template
+ * literal's substitutions read as X ("croft run X --from"); strings inside a substitution are read on their
+ * own. Property names and literal types are not text anyone reads, so they are left out.
+ */
+export function sourceStrings(file: string, text: string): { line: number; text: string }[] {
   const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const out: { line: number; text: string }[] = [];
-  const nameOf = (n: ts.PropertyAssignment) => (ts.isIdentifier(n.name) || ts.isStringLiteral(n.name) ? n.name.text : "");
-  const strings = (node: ts.Node) => {
-    const visit = (n: ts.Node) => {
-      let s: string | null = null;
-      if (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) s = n.text;
-      else if (ts.isTemplateExpression(n)) s = n.head.text + n.templateSpans.map((sp) => `X${sp.literal.text}`).join("");
-      if (s !== null) out.push({ line: sf.getLineAndCharacterOfPosition(n.getStart()).line + 1, text: s });
-      if (!ts.isTemplateExpression(n)) ts.forEachChild(n, visit);
-      else n.templateSpans.forEach((sp) => visit(sp.expression));
-    };
-    visit(node);
-  };
-  const walk = (n: ts.Node) => {
-    if (ts.isPropertyAssignment(n)) {
-      const name = nameOf(n);
-      // The property that holds the object this one is in, and the one above that.
-      const holder = (node: ts.Node): ts.PropertyAssignment | null =>
-        ts.isObjectLiteralExpression(node.parent) && ts.isPropertyAssignment(node.parent.parent) ? node.parent.parent : null;
-      const up = holder(n);
-      const inFix = up !== null && nameOf(up) === "fix";
-      const up2 = up && holder(up);
-      const inOption = up2 !== null && nameOf(up2) === "options";
-      if (AGENT_KEYS.has(name) || (name === "description" && (inFix || inOption))) {
-        strings(n.initializer);
-        return;
-      }
+  const at = (n: ts.Node) => sf.getLineAndCharacterOfPosition(n.getStart()).line + 1;
+  const visit = (n: ts.Node): void => {
+    if (ts.isLiteralTypeNode(n)) return;
+    if (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) {
+      const p = n.parent;
+      const isName = (ts.isPropertyAssignment(p) || ts.isPropertySignature(p) || ts.isPropertyDeclaration(p)
+        || ts.isMethodDeclaration(p) || ts.isEnumMember(p)) && p.name === n;
+      const isModule = ts.isImportDeclaration(p) || ts.isExportDeclaration(p) || ts.isExternalModuleReference(p);
+      if (!isName && !isModule) out.push({ line: at(n), text: n.text });
+      return;
     }
-    ts.forEachChild(n, walk);
+    if (ts.isTemplateExpression(n)) {
+      out.push({ line: at(n), text: n.head.text + n.templateSpans.map((sp) => `X${sp.literal.text}`).join("") });
+      for (const sp of n.templateSpans) visit(sp.expression);
+      return;
+    }
+    ts.forEachChild(n, visit);
   };
-  walk(sf);
+  visit(sf);
   return out;
 }
-

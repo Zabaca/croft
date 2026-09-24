@@ -508,7 +508,7 @@ export class DuckWarehouse implements Warehouse {
       : { pid, program: c.program };
     let croft = Boolean(intent);
     if (!croft && servePid(this.stateDir) === pid) {
-      base.program = "croft serve";
+      base.program = "croft's read server";
       croft = true;
     }
     const extra = this.o.lookupHolder ? await this.o.lookupHolder(pid) : null;
@@ -536,7 +536,7 @@ export class DuckWarehouse implements Warehouse {
       });
     }
     let who: string;
-    if (holder.program === "croft serve") who = `croft serve pid ${holder.pid} has not stepped aside`;
+    if (holder.program === "croft's read server") who = `croft's read server (pid ${holder.pid}) has not stepped aside`;
     else if (holder.runId) {
       const since = holder.since ? `, ${Math.max(0, Math.round((Date.now() - Date.parse(holder.since)) / 1000))} s` : "";
       who = `croft run ${holder.runId}${holder.asset ? `, writing ${holder.asset}` : ""}${since}`;

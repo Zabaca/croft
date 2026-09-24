@@ -35,7 +35,7 @@ export interface ServerTimings {
 export const DEFAULT_SERVER_TIMINGS: Omit<ServerTimings, "timeoutMs"> = { responseGraceMs: 60_000, localConnectMs: 1000 };
 
 /** Returned instead of rows when a serve.json server does not answer. */
-export const ABSENT: unique symbol = Symbol("croft serve absent");
+export const ABSENT: unique symbol = Symbol("read server absent");
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -75,7 +75,7 @@ export async function serverQuery(target: ServerTarget, req: SelectRequest, t: S
     // The token travels in a header line; a control character there could inject headers.
     if (/[\x00-\x1f\x7f]/.test(target.token)) {
       throw new CroftError("USAGE_ERROR", {
-        message: `the croft serve token from ${target.tokenSource} contains a control character`,
+        message: `the read server token from ${target.tokenSource} contains a control character`,
         hint: "use the token exactly as written in .croft/serve.json",
       });
     }
@@ -94,7 +94,7 @@ export async function serverQuery(target: ServerTarget, req: SelectRequest, t: S
     } catch (e) {
       if (!(e instanceof TransportError)) throw e;
       if (target.local) return ABSENT;
-      if (Date.now() >= deadline) throw unavailable(target, `cannot reach croft serve at ${target.url.origin}: ${e.message}`, start, { reason: "unreachable", phase: e.phase });
+      if (Date.now() >= deadline) throw unavailable(target, `cannot reach croft's read server at ${target.url.origin}: ${e.message}`, start, { reason: "unreachable", phase: e.phase });
       await sleep(Math.min(backoffMs(attempt), Math.max(1, deadline - Date.now())));
       continue;
     }
@@ -104,7 +104,7 @@ export async function serverQuery(target: ServerTarget, req: SelectRequest, t: S
       const now = Date.now();
       if (now >= deadline) {
         const problem = errorProblem(envelope);
-        throw unavailable(target, `croft serve at ${target.url.origin} still answered ${reply.status} after ${secs(now - start)} s${problem?.message ? ` (${String(problem.message)})` : ""}`, start,
+        throw unavailable(target, `croft's read server at ${target.url.origin} still answered ${reply.status} after ${secs(now - start)} s${problem?.message ? ` (${String(problem.message)})` : ""}`, start,
           { reason: "busy", status: reply.status, retryAfter: reply.headers["retry-after"] ?? null });
       }
       const wait = retryAfterMs(reply.headers["retry-after"], now) ?? backoffMs(attempt);
@@ -142,7 +142,7 @@ function rowsFrom(target: ServerTarget, reply: HttpReply, envelope: Record<strin
   if (problem) throw fromProblem(problem, reply.status);
   if (reply.status < 200 || reply.status >= 300 || !envelope) {
     throw new CroftError("SERVE_UNAVAILABLE", {
-      message: `croft serve at ${target.url.origin} answered ${reply.status} without a query envelope`,
+      message: `croft's read server at ${target.url.origin} answered ${reply.status} without a query envelope`,
       hint: "check that { url } / CROFT_URL points at a croft read server",
       retryable: reply.status >= 500,
       details: { url: target.url.origin, status: reply.status, body: reply.body.slice(0, 200) },
@@ -151,7 +151,7 @@ function rowsFrom(target: ServerTarget, reply: HttpReply, envelope: Record<strin
   const data = envelope.data as Record<string, unknown> | undefined;
   if (envelope.ok === false || !data || !Array.isArray(data.rows)) {
     throw new CroftError("INTERNAL_ERROR", {
-      message: `croft serve at ${target.url.origin} sent a query envelope without rows`,
+      message: `croft's read server at ${target.url.origin} sent a query envelope without rows`,
       hint: "use the same croft version for the app and the server",
       details: { url: target.url.origin, status: reply.status, ok: envelope.ok ?? null, croftVersion: envelope.croftVersion ?? null },
     });
@@ -160,14 +160,14 @@ function rowsFrom(target: ServerTarget, reply: HttpReply, envelope: Record<strin
   const truncatedRows = data.truncatedRows;
   const truncatedValues = data.truncatedValues;
   if (reported(truncatedRows) || data.rows.length > limit) {
-    throw tooManyRows(limit, { truncatedRows: truncatedRows ?? null, rowsReturned: data.rows.length, via: "croft serve" });
+    throw tooManyRows(limit, { truncatedRows: truncatedRows ?? null, rowsReturned: data.rows.length, via: "read server" });
   }
   if (reported(truncatedValues)) {
     throw new CroftError("QUERY_TOO_MANY_ROWS", {
-      message: "croft serve shortened some values in this result; croft never returns a partial result",
+      message: "croft's read server shortened some values in this result; croft never returns a partial result",
       hint: "select fewer or smaller columns, or raise serve.maxBytes in croft.json",
       retryable: false,
-      details: { truncatedValues, via: "croft serve" },
+      details: { truncatedValues, via: "read server" },
     });
   }
   return data.rows as Row[];
@@ -183,7 +183,7 @@ export function fromProblem(p: Record<string, unknown>, status: number): CroftEr
   const str = (v: unknown) => (typeof v === "string" ? v : undefined);
   const num = (v: unknown) => (typeof v === "number" ? v : undefined);
   const init: ProblemInit = {
-    message: str(p.message) ?? `croft serve answered ${status}`,
+    message: str(p.message) ?? `croft's read server answered ${status}`,
     hint: str(p.hint) ?? "",
   };
   if (str(p.asset)) init.asset = str(p.asset);
@@ -200,7 +200,7 @@ export function fromProblem(p: Record<string, unknown>, status: number): CroftEr
   // A code this croft does not know means the app and the server run different croft versions.
   return new CroftError("INTERNAL_ERROR", {
     ...init,
-    message: `${code || "error"} from croft serve: ${init.message}`,
+    message: `${code || "error"} from croft's read server: ${init.message}`,
     hint: init.hint || "use the same croft version for the app and the server",
     details: { ...init.details, remoteCode: code || null, status },
   });
@@ -220,8 +220,8 @@ function unavailable(target: ServerTarget, message: string, start: number, detai
 
 function unauthorized(target: ServerTarget, status: number): CroftError {
   const message = target.token
-    ? `croft serve at ${target.url.origin} rejected the token from ${target.tokenSource} (${status})`
-    : `croft serve at ${target.url.origin} requires a token (${status}), and none was found`;
+    ? `croft's read server at ${target.url.origin} rejected the token from ${target.tokenSource} (${status})`
+    : `croft's read server at ${target.url.origin} requires a token (${status}), and none was found`;
   return new CroftError("SERVE_UNAUTHORIZED", {
     message,
     hint: "pass { token }, or set CROFT_SERVE_TOKEN to the token in the project's .croft/serve.json (or the server's CROFT_SERVE_TOKEN)",

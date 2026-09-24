@@ -17,7 +17,8 @@
 //                replaceFiles: the same diff, restricted to the rows of the reloaded files; with a key, see
 //                "Overlapping files" below
 //   checks       caller's blocking checks; a throw rolls the whole transaction back
-//   state        cursor, _croft.assets, _croft.columns, _croft.writes (with the step attempt) in the same transaction
+//   state        cursor, _croft.assets, _croft.columns, _croft.writes (with the step attempt) and, for
+//                transforms, _croft.inputs (positions) in the same transaction
 //
 // Changed rows get one stamp, greatest(now, last stamp + 1 µs), so _loaded_at is strictly increasing per
 // table even when the clock steps back; unchanged rows keep theirs, so downstream work wakes only for real
@@ -61,6 +62,30 @@ export interface CheckContext {
   rows: StepResult["rows"];
 }
 
+/** What a checks hook may return besides nothing: non-blocking findings, and one result per check it ran
+ *  (StepResult.checks). A bare Problem[] is the findings alone. */
+export interface CheckHookResult {
+  problems: Problem[];
+  results: StepResult["checks"];
+}
+
+/**
+ * One transform input's position, upserted into _croft.inputs with the write (catalog.ts InputSeen has the
+ * semantics). Instants are ISO-8601 (UTC, microseconds, as catalog entries carry them).
+ */
+export interface InputPosition {
+  input: string;
+  /** newRows()'s position: the stamp of the last input row processed (SQL and full-refresh steps: the input's
+   *  last_loaded_at they read); null when nothing was read. */
+  seenLoadedAt: string | null;
+  /** The key of the last input row processed at seenLoadedAt, stored as JSON (bigints exactly); null or
+   *  undefined when every row at seenLoadedAt was processed. */
+  seenKey?: unknown;
+  /** The input's last_loaded_at when the step last read all of it; null or undefined while the snapshot this
+   *  position is in is not finished. Staleness compares with it. */
+  inputLastLoadedAt?: string | null;
+}
+
 export interface WriteBatchInput {
   batch: TypedBatch;
   target: WriteTarget;
@@ -78,6 +103,9 @@ export interface WriteBatchInput {
   sinceUsed?: string | number;
   /** _croft.writes.inputs (TS transforms). */
   inputs?: unknown;
+  /** Transforms: each input's position, upserted into _croft.inputs in this transaction, so a position commits
+   *  with the rows it produced and never without them. */
+  positions?: InputPosition[];
   /** The step attempt this write belongs to (runs.sqlite steps.attempt), for _croft.writes.attempt. reconcile()
    *  counts a crashed step's commits by it, so chunks an earlier failed attempt committed are not its own. */
   attempt?: number;
@@ -86,8 +114,8 @@ export interface WriteBatchInput {
   /** What extraction saw, for SHRINK_GUARD details. */
   extract?: ExtractInfo;
   /** Blocking checks, run after the write and before the bookkeeping. Throw to roll everything back; returned
-   *  problems (non-blocking warnings) are passed through. */
-  checks?: (tx: Sql, ctx: CheckContext) => Promise<Problem[] | void>;
+   *  problems (non-blocking warnings) are passed through, and results become WriteResult.checks. */
+  checks?: (tx: Sql, ctx: CheckContext) => Promise<Problem[] | CheckHookResult | void>;
 }
 
 export interface WriteResult {
@@ -102,6 +130,8 @@ export interface WriteResult {
   created: boolean;
   /** batch.warnings plus what this write found. */
   warnings: Problem[];
+  /** What the checks hook reported for each check it ran (empty without one, or when it returned none). */
+  checks: StepResult["checks"];
 }
 
 interface AssetState {
@@ -114,6 +144,9 @@ const big = (v: unknown): bigint | null => (v === null || v === undefined ? null
 const lower = (s: string) => s.toLowerCase();
 const sameName = (a: string, b: string) => lower(a) === lower(b);
 const json = (v: unknown) => JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? x.toString() : x));
+// JSON.rawJSON (Bun, Node 21+) writes a bigint as its exact digits; TypeScript's lib does not declare it yet.
+const rawJSON = (JSON as unknown as { rawJSON(text: string): unknown }).rawJSON;
+const exactJson = (v: unknown) => JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? rawJSON(x.toString()) : x));
 
 async function readAssetState(tx: Sql, asset: string): Promise<AssetState | null> {
   const [row] = await tx.all<Record<string, unknown>>(
@@ -211,9 +244,14 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
 
   const after = await tableStats(tx, asset, db);
   const rows = { in: rowsIn, ...counts, total: after.rowCount };
+  const checks: StepResult["checks"] = [];
   if (input.checks) {
     const extra = await input.checks(tx, { asset, table: ref, batch: src, loadedAt: stamp, rows });
-    if (extra) warnings.push(...extra);
+    if (Array.isArray(extra)) warnings.push(...extra);
+    else if (extra) {
+      warnings.push(...extra.problems);
+      checks.push(...extra.results);
+    }
   }
 
   // 3k: the cursor moves only with the rows, in the same transaction, and never backwards.
@@ -263,9 +301,16 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
       state?.cursor_value ?? null, cursorValue, input.sinceUsed === undefined ? null : String(input.sinceUsed),
       input.inputs === undefined ? null : json(input.inputs), json(evo.changes), input.codeHash ?? null, input.attempt ?? null],
   );
+  for (const p of input.positions ?? []) {
+    await tx.exec(
+      `INSERT OR REPLACE INTO _croft.inputs (asset, input, seen_loaded_at, seen_key, input_last_loaded_at)
+       VALUES ($1, $2, $3::TIMESTAMPTZ, $4::JSON, $5::TIMESTAMPTZ)`,
+      [asset, p.input, p.seenLoadedAt, p.seenKey === null || p.seenKey === undefined ? null : exactJson(p.seenKey), p.inputLastLoadedAt ?? null],
+    );
+  }
   for (const t of [src, `__croft_w${n}_old`, `__croft_w${n}_new`, `__croft_w${n}_pair`]) await tx.exec(`DROP TABLE IF EXISTS ${tempRef(t)}`);
 
-  return { rows, schemaChanges: evo.changes, cursor, loadedAt: stamp, changed, created: evo.created, warnings };
+  return { rows, schemaChanges: evo.changes, cursor, loadedAt: stamp, changed, created: evo.created, warnings, checks };
 }
 
 // ---------------------------------------------------------------------------------------------------------

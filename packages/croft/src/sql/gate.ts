@@ -28,6 +28,7 @@ import { isAbsolute, sep } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { mapSandboxError, type Profile } from "../db/connect.ts";
 import { physicalPath } from "../project/root.ts";
+import { asciiLower, type AstNode, collect, location, looksLikePath, stringOf, type Use } from "./ast.ts";
 
 export interface GateOptions {
   profile?: Profile;                                  // "serve" allows tables only
@@ -176,55 +177,11 @@ export async function assertOneSelect(conn: DuckDBConnection, sql: string, o: Ga
   return stmt;
 }
 
-// ---- The AST walk -----------------------------------------------------------------------------------------
+// ---- AST helpers (the walk is sql/ast.ts) -----------------------------------------------------------------
 
-type Node = Record<string, unknown>;
-type Use =
-  | { kind: "table_function"; name: string; fn: Node; at?: number }
-  | { kind: "scalar"; name: string; at?: number }
-  | { kind: "relation"; catalog: string; schema: string; name: string; at?: number }
-  | { kind: "show"; name: string };
-
-/** DuckDB matches built-in names ASCII case-insensitively; anything non-ASCII can only match a user object. */
-const lower = (s: string) => s.replace(/[A-Z]/g, (c) => c.toLowerCase());
-const str = (v: unknown) => (typeof v === "string" ? v : "");
-
-function location(node: Node): number | undefined {
-  const loc = node.query_location;
-  // json_serialize_sql uses 2^64-1 for "no location"; JSON.parse rounds it to ~1.8e19.
-  return typeof loc === "number" && loc < 2 ** 53 ? loc : undefined;
-}
-
-/** Every function call, table reference and CTE name in the statement, in source order. */
-function collect(ast: unknown): { uses: Use[]; ctes: Set<string> } {
-  const uses: Use[] = [];
-  const ctes = new Set<string>();
-  const stack: { node: unknown; head: boolean }[] = [{ node: ast, head: false }];
-  while (stack.length) {
-    const { node, head } = stack.pop()!;
-    if (Array.isArray(node)) {
-      for (let i = node.length - 1; i >= 0; i--) stack.push({ node: node[i], head: false });
-      continue;
-    }
-    if (!node || typeof node !== "object") continue;
-    const rec = node as Node;
-    if (typeof rec.function_name === "string") {
-      uses.push(head ? { kind: "table_function", name: rec.function_name, fn: rec, at: location(rec) } : { kind: "scalar", name: rec.function_name, at: location(rec) });
-    }
-    if (rec.type === "BASE_TABLE" && typeof rec.table_name === "string") {
-      uses.push({ kind: "relation", catalog: str(rec.catalog_name), schema: str(rec.schema_name), name: rec.table_name, at: location(rec) });
-    }
-    if (rec.type === "SHOW_REF" && rec.query == null && typeof rec.table_name === "string" && rec.table_name !== "") {
-      uses.push({ kind: "show", name: rec.table_name.replace(/^"(.*)"$/, "$1") });
-    }
-    const map = (rec.cte_map as { map?: unknown } | undefined)?.map;
-    if (Array.isArray(map)) for (const e of map) if (typeof e?.key === "string") ctes.add(lower(e.key));
-    const next: { node: unknown; head: boolean }[] = [];
-    for (const [k, v] of Object.entries(rec)) if (v && typeof v === "object") next.push({ node: v, head: rec.type === "TABLE_FUNCTION" && k === "function" });
-    for (let i = next.length - 1; i >= 0; i--) stack.push(next[i]!);
-  }
-  return { uses, ctes };
-}
+type Node = AstNode;
+const lower = asciiLower;
+const str = stringOf;
 
 /** A table function's positional arguments: named ones come as `name := v` (an alias) or `name = v`. */
 function positional(fn: Node): Node[] {
@@ -249,10 +206,6 @@ function literalPaths(n: Node | undefined): string[] | null {
   }
   return null;
 }
-
-// A table name DuckDB would hand to a replacement scan (read_csv, read_parquet, read_json, a DuckDB file):
-// those need a file extension, and names croft creates never contain a dot or a slash.
-const looksLikePath = (name: string) => /[./\\]/.test(name);
 
 // ---- The checks -------------------------------------------------------------------------------------------
 
@@ -328,7 +281,7 @@ class Checker {
     const shown = [u.catalog, u.schema, u.name].filter(Boolean).join(".");
     if (looksLikePath(u.name)) {
       // `FROM 'files/x.csv'`: DuckDB reads the file through a replacement scan (or attaches a .duckdb file).
-      if (this.serve) throw this.serveDenied(shown, u.at, "is a file; croft serve reads the project's tables only");
+      if (this.serve) throw this.serveDenied(shown, u.at, "is a file; the read server reads the project's tables only");
       const guard = await this.pathGuard();
       await guard.check(u.name, (why, hint) => this.pathDenied(why, hint, u.at));
       return;
@@ -342,7 +295,7 @@ class Checker {
     // A CTE reference; a CTE may not share a name with a built-in view, or a reference outside the CTE's
     // scope would reach the view.
     if (plain && ctes.has(name) && !cat.others.has(name)) return;
-    throw this.serveDenied(shown, u.at, "is not one of the project's tables; croft serve reads those only");
+    throw this.serveDenied(shown, u.at, "is not one of the project's tables; the read server reads those only");
   }
 
   private pathGuard(): Promise<PathGuard> {
@@ -375,7 +328,7 @@ class Checker {
     return { file: this.o.file, line: pos ? pos.line + (this.o.lineOffset ?? 0) : undefined, column: pos?.column };
   }
 
-  private serveDenied(what: string, at?: number, why = "is not available over HTTP; croft serve reads the project's tables only"): CroftError {
+  private serveDenied(what: string, at?: number, why = "is not available over HTTP; the read server reads the project's tables only"): CroftError {
     return new CroftError("QUERY_PATH_DENIED", {
       message: `${what} ${why}`,
       hint: "query the project's tables by name; files come in through file ingests",

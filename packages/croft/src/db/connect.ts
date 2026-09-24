@@ -234,7 +234,7 @@ export function mapSandboxError(err: unknown, profile: Profile): unknown {
   if (!isSandboxDenial(err)) return err;
   const msg = (err as Error).message;
   const path = msg.match(/Cannot access (?:file|directory) "([^"]+)"/)?.[1];
-  const where = profile === "serve" ? "croft serve reads tables only" : profile === "query" ? "croft query reads files only under files/" : "croft can only reach the project's files/ and state folders";
+  const where = profile === "serve" ? "croft's read server reads tables only" : profile === "query" ? "croft query reads files only under files/" : "croft can only reach the project's files/ and state folders";
   return new CroftError("QUERY_PATH_DENIED", {
     message: path ? `cannot read ${path}: ${where}` : where,
     hint: profile === "serve" ? "query tables, not files" : "move the file under files/, or load it with a file ingest",

@@ -24,7 +24,8 @@ const EXPECTED: Record<string, [string, string][]> = {
   columns: [["asset", "VARCHAR"], ["name", "VARCHAR"], ["type", "VARCHAR"], ["source_name", "VARCHAR"], ["format", "VARCHAR"],
     ["pinned", "BOOLEAN"], ["pending", "BOOLEAN"], ["kinds", "VARCHAR[]"], ["present_last_batch", "BOOLEAN"],
     ["added_at", "TIMESTAMP WITH TIME ZONE"]],
-  inputs: [["asset", "VARCHAR"], ["input", "VARCHAR"], ["seen_loaded_at", "TIMESTAMP WITH TIME ZONE"], ["seen_key", "JSON"]],
+  inputs: [["asset", "VARCHAR"], ["input", "VARCHAR"], ["seen_loaded_at", "TIMESTAMP WITH TIME ZONE"], ["seen_key", "JSON"],
+    ["input_last_loaded_at", "TIMESTAMP WITH TIME ZONE"]],
   files: [["asset", "VARCHAR"], ["path", "VARCHAR"], ["size", "BIGINT"], ["mtime", "TIMESTAMP WITH TIME ZONE"], ["etag", "VARCHAR"],
     ["sha256", "VARCHAR"], ["loaded_at", "TIMESTAMP WITH TIME ZONE"]],
   writes: [["asset", "VARCHAR"], ["loaded_at", "TIMESTAMP WITH TIME ZONE"], ["run_id", "VARCHAR"], ["mode", "VARCHAR"],
@@ -102,11 +103,11 @@ describe("ensureState", () => {
     }
   });
 
-  test("format 2: _croft.writes records the step attempt", () => {
-    expect(FORMAT_VERSION).toBe(2);
+  test("format 3: _croft.writes records the step attempt (2), _croft.inputs what a transform last read in full (3)", () => {
+    expect(FORMAT_VERSION).toBe(3);
   });
 
-  test("migrates a format-1 database: adds _croft.writes.attempt, keeps its rows, records format 2", async () => {
+  test("migrates a format-1 database: adds _croft.writes.attempt, keeps its rows, records the current format", async () => {
     const w = warehouse();
     await w.write("v1", async (tx) => {
       for (const ddl of FORMAT_1_DDL) await tx.exec(ddl);
@@ -119,13 +120,32 @@ describe("ensureState", () => {
       await tx.exec(`INSERT INTO _croft.writes (asset, loaded_at, run_id, rows_in, attempt) VALUES ('orders', '2026-09-22T11:00:00Z', 'r_new', 7, 2)`);
       return ensureState(tx);
     }, { runId: "r" });
-    expect(meta.format_version).toBe("2");
-    expect(await w.read((db) => readMeta(db), { purpose: "t" })).toMatchObject({ format_version: "2" });
+    expect(meta.format_version).toBe("3");
+    expect(await w.read((db) => readMeta(db), { purpose: "t" })).toMatchObject({ format_version: "3" });
     const cols = await w.read((db) => db.all<{ c: string; ty: string }>(
       `SELECT column_name c, data_type ty FROM duckdb_columns() WHERE schema_name = '_croft' AND table_name = 'writes' ORDER BY column_index`), { purpose: "t" });
     expect(cols.map((r) => [r.c, r.ty])).toEqual(EXPECTED.writes!);
     expect(await w.read((db) => db.all(`SELECT run_id, rows_in, attempt FROM _croft.writes ORDER BY loaded_at`), { purpose: "t" })).toEqual([
       { run_id: "r_old", rows_in: 5, attempt: null }, { run_id: "r_new", rows_in: 7, attempt: 2 },
+    ]);
+  });
+
+  test("migrates a format-2 database: adds _croft.inputs.input_last_loaded_at, keeps its rows, records format 3", async () => {
+    const w = warehouse();
+    await w.write("v2", async (tx) => {
+      await tx.exec(`CREATE SCHEMA _croft`);
+      await tx.exec(`CREATE TABLE _croft.meta (key VARCHAR PRIMARY KEY, value VARCHAR)`);
+      await tx.exec(`CREATE TABLE _croft.inputs (asset VARCHAR, input VARCHAR, seen_loaded_at TIMESTAMPTZ, seen_key JSON, PRIMARY KEY (asset, input))`);
+      await tx.exec(`INSERT INTO _croft.meta VALUES ('format_version', '2')`);
+      await tx.exec(`INSERT INTO _croft.inputs VALUES ('triage', 'issues', '2026-09-22T10:00:00Z', '[7]')`);
+    }, { runId: "r" });
+    const meta = await w.write("state", (tx) => ensureState(tx), { runId: "r" });
+    expect(meta.format_version).toBe("3");
+    const cols = await w.read((db) => db.all<{ c: string; ty: string }>(
+      `SELECT column_name c, data_type ty FROM duckdb_columns() WHERE schema_name = '_croft' AND table_name = 'inputs' ORDER BY column_index`), { purpose: "t" });
+    expect(cols.map((r) => [r.c, r.ty])).toEqual(EXPECTED.inputs!);
+    expect(await w.read((db) => db.all(`SELECT asset, input, seen_key, input_last_loaded_at FROM _croft.inputs`), { purpose: "t" })).toEqual([
+      { asset: "triage", input: "issues", seen_key: [7], input_last_loaded_at: null },
     ]);
   });
 

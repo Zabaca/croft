@@ -81,7 +81,7 @@ export const query: CommandImpl<QueryData> = {
   async run(ctx) {
     if (ctx.values.preview === true) {
       throw new CroftError("USAGE_ERROR", {
-        message: "croft query --preview reads the preview database, which a later version of croft adds",
+        message: "query --preview reads the preview database, which a later version of croft adds",
         hint: "query the live tables without --preview; this version has no preview database",
         fix: { kind: "manual", description: "drop --preview and query the live warehouse" },
       });

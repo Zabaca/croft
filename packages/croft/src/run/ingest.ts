@@ -25,9 +25,7 @@ import { canonicalPath } from "../db/connect.ts";
 import { hasState } from "../db/state.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
 import { type CatalogAsset, type CatalogBase, getCatalog, putCatalog, readCatalogEntry } from "../history/catalog.ts";
-import type { LogWriter } from "../history/logs.ts";
-import type { RunsDb } from "../history/runs-db.ts";
-import { createHttp, displayUrl, excerpt, type HttpClient, type HttpOptions } from "../http/http.ts";
+import { createHttp, displayUrl, excerpt, type HttpClient } from "../http/http.ts";
 import { buildTypedBatch } from "../load/cast.ts";
 import { RESERVED, type TypedBatch } from "../load/contract.ts";
 import { parseFrom, renderSince } from "../load/cursor.ts";
@@ -35,14 +33,13 @@ import { isReservedColumn, quoteIdent, readTableSchema, tempRef } from "../load/
 import { buildFileBatch, extractFiles, type FileExtract, type KnownFile, recordFiles } from "../load/files.ts";
 import { writeStage } from "../load/stage.ts";
 import type { KnownColumn } from "../load/types.ts";
-import { writeBatch, type WriteBatchInput, type WriteResult } from "../load/write.ts";
-import type { Project } from "../project/root.ts";
-import type { ProjectEnv } from "../project/env.ts";
+import { writeBatch, type WriteResult } from "../load/write.ts";
 import { cursorTypeOfPin, trimStack } from "../project/ts-asset.ts";
 import { type ExtractInfo, isoMicros, readStoredColumns } from "../safety/guards.ts";
 import { plannedTrashPath, trashFailed, trashTable, type TrashEntry } from "../safety/trash.ts";
 import { backfillUnsupported, backfillWouldDuplicate, type PlannedStep } from "./plan.ts";
 import { OwnTableQuery } from "./snapshot.ts";
+import type { ConfirmDecision, StepInput } from "./step.ts";
 
 export type Phase = "extract" | "write" | "checks";
 
@@ -159,7 +156,7 @@ export interface ShrinkRequest {
   impact: Impact;
   error: CroftError;
 }
-export type ShrinkDecision = { kind: "granted" } | { kind: "pending"; confirmation: Confirmation } | { kind: "declined" };
+export type ShrinkDecision = ConfirmDecision;
 export type ShrinkDecider = (r: ShrinkRequest) => Promise<ShrinkDecision>;
 
 export const SHRINK_ACTION = "replace ingest; SHRINK_GUARD override";
@@ -172,28 +169,13 @@ export function shrinkImpact(stateDir: string, asset: string, rowsBefore: number
 
 // ---------------------------------------------------------------------------------------------------------
 
-export interface IngestInput {
-  step: PlannedStep;
-  project: Project;
-  env: ProjectEnv;
-  warehouse: DuckWarehouse;
-  runs: RunsDb;
-  runId: string;
-  attempt: number;
-  maxAttempts: number;
-  /** The run's signal combined with the step's no-progress timeout. */
-  signal: AbortSignal;
-  progress: StepProgress;
-  log: LogWriter;
+/** An ingest step's input: the step contract (step.ts) plus the flags only ingests take. Ingests do not use
+ *  `confirm` (a SHRINK_GUARD override asks `shrink`) or, until `croft preview` lands, `preview`. */
+export interface IngestInput extends StepInput {
   /** --from, as typed. */
   from?: string;
   /** Present with --allow-shrink: decides whether a SHRINK_GUARD may be overridden. */
   shrink?: ShrinkDecider;
-  http?: Partial<Omit<HttpOptions, "signal" | "redact" | "log">>;
-  /** Blocking checks inside the write transaction (phase 2 fills this in). */
-  checks?: WriteBatchInput["checks"];
-  fault?: string;
-  now?: () => Date;
 }
 
 export interface IngestOutcome {
@@ -664,6 +646,7 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
         kind: "ingest", ...(step.codeHash ? { codeHash: step.codeHash } : {}), behaviorHash: step.behaviorHash, pins: spec.pins,
         ...(formats ? { formats } : {}), ...(since.value !== undefined ? { sinceUsed: since.value } : {}),
         attempt: i.attempt, extract: progress.extractInfo(), ...(i.checks ? { checks: i.checks } : {}),
+        ...(i.readBy ? { readBy: i.readBy } : {}),
         ...(i.now ? { now: i.now() } : {}),
       });
       // writeBatch saved greatest(saved, loaded). After a --from beyond the saved cursor that would jump over the
@@ -744,7 +727,7 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
   }));
   log.write(`wrote ${asset}: ${r.rows.added} added, ${r.rows.updated} updated, ${r.rows.unchanged} unchanged, ${r.rows.deleted} deleted; ${r.rows.total} rows`);
   const result: StepResult = {
-    ...base, status: "ok", requests: progress.requests, rows: r.rows, schemaChanges: r.schemaChanges,
+    ...base, status: "ok", requests: progress.requests, rows: r.rows, schemaChanges: r.schemaChanges, checks: r.checks,
     ...(r.cursor ? { cursor: r.cursor } : {}),
     ...(trashed ? { trashed: { path: trashed.path, rows: trashed.rows } } : {}),
     ...(r.created ? { created: createdTable(out.catalog.columns) } : {}),

@@ -9,11 +9,12 @@ import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { CroftError, isCode } from "../core/errors.ts";
 import { captureImport, collectingSink, defaultOutputRedactor } from "../core/output.ts";
-import type { CursorType, Incremental, Problem, Reason, WriteMode } from "../core/types.ts";
+import type { Check, CursorType, Hold, Incremental, Problem, Reason, WriteMode } from "../core/types.ts";
 import type { FileIngest } from "../types.ts";
 import { type DiscoveredAsset, discoverAssets } from "../project/discover.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { didYouMean } from "../project/suggest.ts";
+import type { LoadedSqlAsset } from "../project/sql-asset.ts";
 import { type LoadedTsAsset, loadTsAsset, type TsAssetSpec } from "../project/ts-asset.ts";
 
 export type StepKind = "rows" | "file" | "transform" | "sql";
@@ -23,14 +24,33 @@ export interface PlannedStep {
   file: string;                 // root-relative, "assets/github_issues.ts"
   path: string;                 // absolute
   kind: StepKind;
-  action: "fetch" | "skip";
+  /** fetch: an ingest runs. rebuild: an SQL or full-refresh TS transform is recomputed in full. update: an
+   *  incremental TS transform processes its new input rows. skip: nothing runs (the reason says why). */
+  action: "fetch" | "rebuild" | "update" | "skip";
   reasons: Reason[];
+  /** Why the scheduler (or the cost guard) holds the step back; a held step does not run. */
+  hold?: Hold;
   /** Why the step runs, or why it is skipped, in words. */
   reason: string;
   /** Load problems. Any error makes the step fail without running (the other steps still run). */
   problems: Problem[];
   loaded?: LoadedTsAsset;
   spec?: TsAssetSpec;
+  /** SQL assets: the loaded file (header, body, AST inputs, fingerprint). */
+  sql?: LoadedSqlAsset;
+  /** The assets it reads: an SQL asset's AST and plan dependencies, a TS transform's `inputs`. [] for ingests. */
+  inputs: string[];
+  /** What runs before it: its inputs plus the tables its checks read in subqueries (they only order). */
+  orderAfter: string[];
+  /** The assets that read it (project/graph.ts readBy). */
+  readBy: string[];
+  /** Its checks and warnings, parsed (checks/parse.ts), a key's implied unique and not_null first. */
+  checks: Check[];
+  /** TS transforms: the code makes requests (ctx.http, fetch, an HTTP or LLM package): the cost guard applies
+   *  to incremental ones, TRANSFORM_MAKES_REQUESTS to full-refresh ones. */
+  usesHttp?: boolean;
+  /** Incremental TS transforms: LARGE_REPROCESS above this many pending input rows (default 1000, §5). */
+  confirmAbove?: number;
   write: WriteMode;
   key: string[];
   incremental: Incremental;
@@ -48,7 +68,11 @@ export interface PlannedStep {
 }
 
 export interface RunPlan {
+  /** One step per selected asset, in name order. */
   steps: PlannedStep[];
+  /** The selected assets in the order they run: every asset after its orderAfter, ties broken by name
+   *  (project/graph.ts order). Phase 1 plans ingests only, so this is name order. */
+  order: string[];
   /** Discovery problems (bad or clashing file names): all of them for a bare run, else those a glob matched. */
   problems: Problem[];
   /** Directories of declared file ingests. The run's warehouse sandbox no longer needs them (files are read from
@@ -208,7 +232,7 @@ function baseStep(a: DiscoveredAsset): Omit<PlannedStep, "kind" | "action" | "re
   return {
     asset: a.name, file: a.file, path: a.path, problems: [], write: "replace", key: [], incremental: { kind: "none" },
     behavior: "replace", words: "", behaviorHash: behaviorHash("replace", [], { kind: "none" }), retries: DEFAULT_RETRIES,
-    timeoutMs: DEFAULT_TIMEOUT_MS,
+    timeoutMs: DEFAULT_TIMEOUT_MS, inputs: [], orderAfter: [], readBy: [], checks: [],
   };
 }
 
@@ -263,6 +287,7 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
   }
   return {
     steps,
+    order: steps.map((s) => s.asset),
     // Every discovery problem for a bare run; for selectors, those about files a glob also matched.
     problems: i.selectors.length === 0
       ? discovery.problems

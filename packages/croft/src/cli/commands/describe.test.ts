@@ -105,7 +105,7 @@ describe("croft describe --json", () => {
 export default transform({ inputs: ["github_issues"], key: "issue_id", incremental: true, async *rows() {} });
 `;
     const p = await issues({ "assets/issue_triage.ts": triage }, [
-      `INSERT INTO _croft.inputs VALUES ('issue_triage', 'github_issues', '2026-09-22 17:30:00+00', NULL)`,
+      `INSERT INTO _croft.inputs (asset, input, seen_loaded_at, seen_key) VALUES ('issue_triage', 'github_issues', '2026-09-22 17:30:00+00', NULL)`,
     ]);
     const d = (await cli(["describe", "issue_triage", "--json"], { cwd: p.root, env: ENV })).json.data;
     expect(d).toMatchObject({ kind: "ts", reads: ["github_issues"], next: { reason: "after inputs" } });

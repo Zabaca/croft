@@ -383,13 +383,13 @@ async function checkWarehouse(r: Report, d: DoctorDeps, project: Project, bindin
   try {
     const meta = await w.read(async (db) => readMeta(db), { waitMs: d.lockWaitMs, purpose: "doctor" });
     const serveHolds = serve !== null && serve.alive;
-    parts.push(serveHolds ? `held read-only by croft serve (pid ${serve.pid}; steps aside for writes)` : "not held");
+    parts.push(serveHolds ? `held read-only by croft's read server (pid ${serve.pid}; steps aside for writes)` : "not held");
     if (meta.format_version) {
       parts.push(`duckdb ${String(meta.duckdb_version ?? "?").replace(/^v/, "")} · croft format ${meta.format_version}`);
     } else {
       parts.push("no croft state yet");
     }
-    Object.assign(details, { meta, heldBy: serveHolds ? { pid: serve.pid, program: "croft serve" } : null });
+    Object.assign(details, { meta, heldBy: serveHolds ? { pid: serve.pid, program: "croft's read server" } : null });
     r.add("environment", "warehouse", writable ? "ok" : "warn", parts.join(" · "), undefined, details);
   } catch (e) {
     if (!(e instanceof CroftError)) {
@@ -477,17 +477,17 @@ async function checkServe(r: Report, d: DoctorDeps, project: Project): Promise<v
   }
   if (!health) {
     const p = problem("SERVE_UNAVAILABLE", {
-      message: `croft serve (pid ${s.pid}) is running but does not answer on ${s.url ?? "its recorded address"}`,
+      message: `croft's read server (pid ${s.pid}) is running but does not answer on ${s.url ?? "its recorded address"}`,
       hint: `ask the user to stop process ${s.pid}: it recorded serve.json but does not answer, and apps read the warehouse file directly once it is gone`,
       fix: { kind: "manual", description: `stop the server process that does not answer (pid ${s.pid})`, requiresHuman: true },
       retryable: true,
       details: { pid: s.pid, url: s.url },
     });
-    r.add("environment", "serve", "error", `croft serve pid ${s.pid} does not answer on ${where}`, p, { running: true, pid: s.pid, url: s.url });
+    r.add("environment", "serve", "error", `read server (pid ${s.pid}) does not answer on ${where}`, p, { running: true, pid: s.pid, url: s.url });
     return;
   }
   const queries = typeof health.queriesToday === "number" ? ` · ${formatCount(health.queriesToday)} queries today` : "";
-  r.add("environment", "serve", "ok", `croft serve on ${where} (pid ${s.pid}) · token in ${shownFile}${queries}`, undefined,
+  r.add("environment", "serve", "ok", `read server on ${where} (pid ${s.pid}) · token in ${shownFile}${queries}`, undefined,
     { running: true, pid: s.pid, url: s.url, queriesToday: health.queriesToday ?? null });
 }
 
