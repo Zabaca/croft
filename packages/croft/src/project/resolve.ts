@@ -43,6 +43,7 @@ import { RUNS_DB_FILE, RunsDb } from "../history/runs-db.ts";
 import { losslessReviver } from "../load/stage.ts";
 import type { StepKind } from "../run/plan.ts";
 import { noteTimeZoneChange } from "../run/staleness.ts";
+import { parseSchedule, type Schedule } from "../schedule/types.ts";
 import { finiteJson } from "../sql/ast.ts";
 import { type BindResult, ShadowCatalog } from "../sql/bind.ts";
 import type { SelectAst } from "../sql/gate.ts";
@@ -120,7 +121,9 @@ export interface ResolvedAsset {
   words: string;
   /** Hash of write mode, key and cursor field: INGEST_CONFIG_CHANGED. */
   behaviorHash: string;
-  schedule?: { text: string; cron: string };                 // ingests only; set from phase 3 (the phrase parser)
+  /** Ingests only: the schedule as written and its 5-field cron (schedule/phrase.ts, §8). ts-asset.ts refused a
+   *  schedule that does not parse (SCHEDULE_INVALID), so a loaded ingest with one always has both. */
+  schedule?: Schedule;
   /** Its checks and warnings, parsed and vetted (checks/parse.ts), a key's implied unique and not_null first.
    *  An invalid one is left out and reported as CHECK_INVALID. */
   checks: Check[];
@@ -464,8 +467,15 @@ async function resolveAsset(a: DiscoveredAsset, i: ResolveInput, names: readonly
     behaviorHash: behaviorHash(write, spec.key, spec.incremental), pins: spec.pins,
     ...(typeof description === "string" && description ? { description } : {}),
     ...(spec.confirmAbove !== undefined ? { confirmAbove: spec.confirmAbove } : {}),
+    ...(spec.schedule !== undefined ? scheduleOf(spec.schedule) : {}),
   };
   return withChecks(out, { key: spec.key, checks: spec.checks, warnings: spec.warnings }, connection);
+}
+
+/** The parsed schedule of an ingest whose spec has one (it parsed when ts-asset.ts validated it). */
+function scheduleOf(text: string): { schedule?: Schedule } {
+  const parsed = parseSchedule(text);
+  return parsed.ok ? { schedule: parsed.schedule } : {};
 }
 
 /** Parse and vet the asset's checks and warnings; orderAfter becomes its inputs plus the tables its blocking checks

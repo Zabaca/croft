@@ -20,6 +20,7 @@ import { pathToFileURL } from "node:url";
 import { CroftError, problem, type Code, type ProblemInit } from "../core/errors.ts";
 import { guardImport } from "../core/output.ts";
 import type { CursorType, Incremental, Problem, WriteMode } from "../core/types.ts";
+import { parseSchedule } from "../schedule/types.ts";
 import type { AssetDefinition } from "../types.ts";
 import { NAME_PATTERN, type DiscoveredAsset } from "./discover.ts";
 import { ProjectEnv } from "./env.ts";
@@ -811,7 +812,22 @@ export function validateDefinition(value: unknown, o: ValidateOptions): Validati
       if (typeof cfg.schedule !== "string" || cfg.schedule.trim() === "") {
         c.add("SCHEDULE_INVALID", "schedule", `schedule must be a non-empty string, got ${describe(cfg.schedule)}`,
           'write it in words or as cron: schedule: "every hour", "daily at 06:00", "0 6 * * 1-5"');
-      } else schedule = cfg.schedule.trim();
+      } else {
+        // A phrase or a cron (schedule/phrase.ts); the spec keeps the text, and resolve.ts gives its cron.
+        const parsed = parseSchedule(cfg.schedule);
+        if (parsed.ok) schedule = parsed.schedule.text;
+        else if (parsed.suggestion === undefined) c.add("SCHEDULE_INVALID", "schedule", parsed.problem, parsed.hint);
+        else {
+          const line = locateKey(o.source, "schedule");
+          c.add("SCHEDULE_INVALID", "schedule", parsed.problem, parsed.hint, {
+            fix: {
+              kind: "edit", description: `schedule: "${parsed.suggestion}"`, file: o.file, ...(line !== undefined ? { line } : {}),
+              replace: { from: cfg.schedule, to: parsed.suggestion },
+            },
+            details: { suggestion: parsed.suggestion },
+          });
+        }
+      }
     }
     if (cfg.allowShrink !== undefined) {
       if (typeof cfg.allowShrink !== "boolean") c.invalid("allowShrink", `allowShrink must be true or false, got ${describe(cfg.allowShrink)}`, "remove allowShrink, or set it to true");
