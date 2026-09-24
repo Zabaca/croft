@@ -160,7 +160,9 @@ describe("runTask with a fake claude", () => {
     expect(r.score).toMatchObject({ croftCommands: 1, commands: ["croft version --json"], confirmWithoutAsking: false, readEnv: false, turns: 2, costUsd: 0.01, durationMs: 1234, outcome: "success", model: "fake-model" });
     expect(r.agent).toMatchObject({ exitCode: 0, timedOut: false });
     expect(r.apiRequests).toBe(0);
-    expect(r.diff).toContain("+-- the fake agent was here");
+    // The diff needs git (the baseline commit); a machine without it gets no diff.
+    if (Bun.which("git")) expect(r.diff).toContain("+-- the fake agent was here");
+    else expect(r.diff).toBeNull();
     expect(r.transcript).toBe(transcript);
     expect(existsSync(transcript)).toBe(true);
     expect(r.fixture).toBeNull();
