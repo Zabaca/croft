@@ -8,8 +8,9 @@
 // in-memory DuckDB, TS assets bundled and imported in isolation), for each asset's kind, code hash and inputs.
 // Staleness is run/staleness.ts over those and the catalog mirror: why a bare `croft run` would update the
 // asset (never_built, code_changed, input_changed, input_replaced). `edited` says the asset's code differs from
-// the code its last run used (the step's code hash, else the catalog's); when either hash is unknown (a file
-// that does not bundle, a run that recorded none) the file's modification time since that run decides. An
+// the code its last run used: the code hash of its latest step that ran (lastRanStep: a skipped step records the
+// code the asset had, which never ran), else the catalog's; when either hash is unknown (a file that does not
+// bundle, a run that recorded none) the file's modification time since that step decides. An
 // edited asset whose table was built by older code also gets EDITED_SINCE_LAST_RUN, worded per kind: an
 // incremental TS transform is forward-only, so its warning says the rows already built keep their values.
 //
@@ -250,6 +251,19 @@ export function nextOf(kind: AssetKind | null, hasFile: boolean): StatusAsset["n
   return { at: null, reason: kind === "ingest" ? "manual" : kind === null ? "manual" : "after inputs" };
 }
 
+/**
+ * The latest step of an asset that ran its code, finished or not: ok, unchanged, failed, interrupted, crashed or
+ * running. A skipped step never ran it, though the runner records it with the code the asset had then: attempt 0
+ * when its input failed, or an attempt that stopped for a confirmation (runner.ts). null when none ran.
+ */
+export function lastRanStep(db: RunsDb, asset: string): StepRecord | null {
+  const row = db.sqlite
+    .query(`SELECT run_id, asset, attempt FROM steps WHERE asset = ? AND attempt >= 1 AND status <> 'skipped'
+            ORDER BY started_at DESC, attempt DESC LIMIT 1`)
+    .get(asset) as { run_id: string; asset: string; attempt: number } | null;
+  return row ? db.getStep(row.run_id, row.asset, row.attempt) : null;
+}
+
 /** Whether a scheduler tick has checked in: the tick row's heartbeat, or null. */
 function lastTick(db: RunsDb | null, tz: string): string | null {
   if (!db) return null;
@@ -427,15 +441,17 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       }
 
       // Edited: the code differs from what its last run used; the file's time since that run when a hash is unknown.
+      // A skipped step is no run of the code: the table still holds what the last step that ran built.
       let edited = false;
       if (file && status !== "running") {
+        const ran = step && step.status !== "skipped" && step.attempt >= 1 ? step : db ? lastRanStep(db, name) : null;
         const current = def?.codeHash;
-        const ranWith = step?.codeHash ?? cat?.codeHash ?? null;
+        const ranWith = ran?.codeHash ?? cat?.codeHash ?? null;
         // A code hash that differs only because croft.json's timezone changed is no edit (resolve.ts timeZoneChanged).
         if (current && ranWith) edited = current !== ranWith && !(def?.timeZoneChanged && ranWith === cat?.codeHash);
-        else if (step) {
+        else if (ran) {
           try {
-            edited = statSync(file.path).mtimeMs > Date.parse(step.startedAt);
+            edited = statSync(file.path).mtimeMs > Date.parse(ran.startedAt);
           } catch {}
         }
       }

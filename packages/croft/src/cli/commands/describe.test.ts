@@ -19,6 +19,24 @@ async function issues(files: Record<string, string> = {}, extra: string[] = []) 
   return p;
 }
 
+/** An incremental transform with a lookup: teams is read in full with rows() on every run, never with newRows(). */
+const LOOKUP_TS = `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["github_issues", "teams"], key: "issue_id", incremental: true,
+  async *rows({ newRows, rows }) {
+    const teams: string[] = [];
+    for await (const t of rows<{ team: string }>("teams")) teams.push(t.team);
+    for await (const i of newRows("github_issues")) yield { issue_id: i.id, team: teams[i.id % teams.length] };
+  },
+});
+`;
+const TEAMS_SEED = [
+  `CREATE TABLE teams (team VARCHAR, team_name VARCHAR, _loaded_at TIMESTAMPTZ)`,
+  `INSERT INTO teams VALUES ('a', 'Alpha', '2026-09-22 18:30:00+00'), ('b', 'Beta', '2026-09-22 18:30:00+00')`,
+  `INSERT INTO _croft.assets VALUES ('teams', 'sql', 'replace', ['team'], 'hash-t', 'behavior-t', NULL, NULL, NULL,
+     '2026-09-22 18:30:00+00', NULL, 2, '2026-09-22 18:30:00+00', '2026-09-22 18:30:00+00')`,
+];
+
 describe("croft describe --json", () => {
   test("golden: config, state, columns with JSON keys, checks, recent writes and 3 samples", async () => {
     const p = await issues();
@@ -103,7 +121,8 @@ describe("croft describe --json", () => {
   });
 
   const TRIAGE_TS = `import { transform } from "@zabaca/croft";
-export default transform({ inputs: ["github_issues"], key: "issue_id", incremental: true, async *rows() {} });
+export default transform({ inputs: ["github_issues"], key: "issue_id", incremental: true,
+  async *rows({ newRows }) { for await (const i of newRows<{ id: number }>("github_issues")) yield { issue_id: i.id }; } });
 `;
 
   test("inputs seen: the input rows after the transform's position, and the input's version it last read in full", async () => {
@@ -139,6 +158,58 @@ export default transform({ inputs: ["github_issues"], key: "issue_id", increment
          VALUES ('issue_triage', 'github_issues', '2026-09-22 17:00:00+00', '["2"]', NULL)`,
     ]);
     expect((await cli(["describe", "issue_triage", "--json"], { cwd: later.root, env: ENV })).json.data.inputsSeen.github_issues.pendingRows).toBe(1);
+  });
+
+  test("inputs seen: a lookup an incremental transform reads in full with rows() is read in full each run, with nothing pending", async () => {
+    const p = await issues({ "assets/issue_triage.ts": LOOKUP_TS }, [
+      ...TEAMS_SEED,
+      `INSERT INTO _croft.inputs (asset, input, seen_loaded_at, seen_key, input_last_loaded_at) VALUES
+         ('issue_triage', 'github_issues', '2026-09-22 17:00:00+00', '["2"]', '2026-09-22 18:00:00+00'),
+         ('issue_triage', 'teams', NULL, NULL, '2026-09-22 18:30:00+00')`,
+    ]);
+    const d = (await cli(["describe", "issue_triage", "--json"], { cwd: p.root, env: ENV })).json.data;
+    expect(d.reads).toEqual(["github_issues", "teams"]);
+    expect(d.inputsSeen).toEqual({
+      github_issues: { seenLoadedAt: "2026-09-22T10:00:00-07:00", inputLastLoadedAt: "2026-09-22T11:00:00-07:00", pendingRows: 1 },
+      teams: { seenLoadedAt: null, inputLastLoadedAt: "2026-09-22T11:30:00-07:00", pendingRows: 0, readInFull: true },
+    });
+    const human = (await cli(["describe", "issue_triage"], { cwd: p.root, env: ENV })).stdout;
+    expect(human).toContain("Input      github_issues: 1 new row since 2026-09-22T10:00:00-07:00");
+    expect(human).toContain("Input      teams: read in full each run, last at 2026-09-22T11:30:00-07:00");
+    expect(human).not.toContain("none read yet");
+  });
+
+  test("inputs seen: a lookup of an incremental transform never built is read in full each run; its newRows() input is all pending", async () => {
+    const p = await issues({ "assets/issue_triage.ts": LOOKUP_TS }, TEAMS_SEED);
+    const d = (await cli(["describe", "issue_triage", "--json"], { cwd: p.root, env: ENV })).json.data;
+    expect(d.inputsSeen).toEqual({
+      github_issues: { seenLoadedAt: null, inputLastLoadedAt: null, pendingRows: 3 },
+      teams: { seenLoadedAt: null, inputLastLoadedAt: null, pendingRows: 0, readInFull: true },
+    });
+    const human = (await cli(["describe", "issue_triage"], { cwd: p.root, env: ENV })).stdout;
+    expect(human).toContain("Input      github_issues: 3 rows, none read yet");
+    expect(human).toContain("Input      teams: read in full each run, not read yet");
+  });
+
+  test("inputs seen: a lookup keeps nothing pending even with a position its older code saved with newRows()", async () => {
+    const p = await issues({ "assets/issue_triage.ts": LOOKUP_TS }, [
+      ...TEAMS_SEED,
+      `INSERT INTO _croft.inputs (asset, input, seen_loaded_at, seen_key, input_last_loaded_at) VALUES
+         ('issue_triage', 'teams', '2026-09-22 17:00:00+00', NULL, '2026-09-22 18:30:00+00')`,
+    ]);
+    const d = (await cli(["describe", "issue_triage", "--json"], { cwd: p.root, env: ENV })).json.data;
+    expect(d.inputsSeen.teams).toEqual({ seenLoadedAt: "2026-09-22T10:00:00-07:00", inputLastLoadedAt: "2026-09-22T11:30:00-07:00", pendingRows: 0, readInFull: true });
+  });
+
+  test("inputs seen: when the code's newRows() reads cannot be told, every input counts (as the cost guard counts them)", async () => {
+    // newRows handed to other code: the scan cannot tell which inputs it reads (project/ts-asset.ts detectNewRows).
+    const p = await issues({ "assets/issue_triage.ts": LOOKUP_TS.replace('for await (const i of newRows("github_issues"))', "for await (const i of each(newRows))")
+      .replace("export default", 'const each = (f: (n: string) => AsyncIterable<{ id: number }>) => f("github_issues");\nexport default') }, TEAMS_SEED);
+    const d = (await cli(["describe", "issue_triage", "--json"], { cwd: p.root, env: ENV })).json.data;
+    expect(d.inputsSeen).toEqual({
+      github_issues: { seenLoadedAt: null, inputLastLoadedAt: null, pendingRows: 3 },
+      teams: { seenLoadedAt: null, inputLastLoadedAt: null, pendingRows: 2 },
+    });
   });
 
   test("a header key croft does not know is reported (project/sql-asset.ts parseSqlHeader)", async () => {
@@ -284,6 +355,36 @@ describe("croft describe while a run holds the warehouse", () => {
       });
       expect((await cli(["describe", "open_issues"], { cwd: p.root, env: ENV })).stdout)
         .toContain("Input      github_issues: ? new rows since 2026-09-22T10:30:00-07:00");
+    } finally {
+      DESCRIBE_TIMING.busyWaitMs = saved;
+      holder.proc.kill("SIGKILL");
+    }
+  });
+
+  test("a lookup read in full each run has nothing pending, even from the catalog", async () => {
+    const p = await issues({ "assets/issue_triage.ts": LOOKUP_TS }, TEAMS_SEED);
+    const db = runsDb(p.stateDir);
+    putCatalog(db, {
+      ...ISSUES_CATALOG, asset: "issue_triage", kind: "ts", cursor: null, reads: ["github_issues", "teams"],
+      inputsSeen: {
+        github_issues: { seenLoadedAt: "2026-09-22T17:00:00.000000Z", seenKey: ["2"], inputLastLoadedAt: "2026-09-22T18:00:00.000000Z" },
+        teams: { seenLoadedAt: null, seenKey: null, inputLastLoadedAt: "2026-09-22T18:30:00.000000Z" },
+      },
+    });
+    db.close();
+    const holder = spawnHolder(p.database, 20_000);
+    await holder.waitFor("held");
+    const saved = DESCRIBE_TIMING.busyWaitMs;
+    DESCRIBE_TIMING.busyWaitMs = 300;
+    try {
+      const r = await cli(["describe", "issue_triage", "--json"], { cwd: p.root, env: ENV });
+      expect(r.json.data.source).toBe("catalog");
+      expect(r.json.data.inputsSeen).toEqual({
+        github_issues: { seenLoadedAt: "2026-09-22T10:00:00-07:00", inputLastLoadedAt: "2026-09-22T11:00:00-07:00", pendingRows: null },
+        teams: { seenLoadedAt: null, inputLastLoadedAt: "2026-09-22T11:30:00-07:00", pendingRows: 0, readInFull: true },
+      });
+      expect((await cli(["describe", "issue_triage"], { cwd: p.root, env: ENV })).stdout)
+        .toContain("Input      teams: read in full each run, last at 2026-09-22T11:30:00-07:00");
     } finally {
       DESCRIBE_TIMING.busyWaitMs = saved;
       holder.proc.kill("SIGKILL");

@@ -15,7 +15,8 @@
 // processed at that stamp), the input's version it last read in full (inputLastLoadedAt, what staleness compares:
 // history/catalog.ts InputSeen) and pendingRows, the input rows after that position (newRows()'s count, the
 // rows of the position's own stamp whose key comes after it included). Declared inputs it has not read yet are
-// listed with every row pending.
+// listed with every row pending. A lookup of an incremental TS transform, an input its code reads only in full
+// with rows() and never with newRows() (lookupsOf), is read in full each run: readInFull, and nothing pending.
 //
 // This file also holds what the other read-only commands (context, query, secrets) share: loading asset
 // configs without failing on one broken file, the read-only warehouse, and value capping with redaction.
@@ -387,23 +388,51 @@ export interface SeenInput {
   /** The input's last_loaded_at when the transform last read all of it (history/catalog.ts InputSeen). */
   inputLastLoadedAt: string | null;
   /** Input rows after the position (all of them when there is none); null when unknown (no table, no
-   *  _loaded_at column, or the warehouse was busy). */
+   *  _loaded_at column, or the warehouse was busy). 0 for a lookup read in full each run (readInFull). */
   pendingRows: number | null;
+  /** A lookup (lookupsOf): the code reads it in full with rows() on every run, never with newRows(), so none of
+   *  its rows wait to be processed. Absent for any other input. */
+  readInFull?: true;
+}
+
+/**
+ * The lookups of an incremental TS transform: the inputs its code reads only in full (rows()), never with
+ * newRows() (LoadedTsAsset.readsNewRows), as the run's cost guard and the dry run tell them apart. None for any
+ * other asset, or when the scan cannot tell which inputs newRows() reads (every input then counts).
+ */
+export function lookupsOf(r: ResolvedAsset | null | undefined): string[] {
+  const spec = r?.ts?.spec;
+  const reads = r?.ts?.readsNewRows;
+  if (!spec || spec.role !== "transform" || spec.incremental.kind !== "new-rows" || !reads) return [];
+  return spec.inputs.filter((i) => !reads.includes(i));
+}
+
+/** A lookup as inputsSeen shows it: read in full each run, nothing pending (its position, if older code saved
+ *  one with newRows(), is kept as the state has it). */
+function lookupSeen(s: Pick<SeenInput, "seenLoadedAt" | "inputLastLoadedAt"> | null): SeenInput {
+  return { seenLoadedAt: s?.seenLoadedAt ?? null, inputLastLoadedAt: s?.inputLastLoadedAt ?? null, pendingRows: 0, readInFull: true };
 }
 
 /**
  * What `asset` has seen of each input (its _croft.inputs rows, and each of `declared` it has no row for yet):
  * the position, the version it last read in full, and how many input rows come after the position. The count
  * is newRows()'s (run/snapshot.ts countAfter): later stamps, and at the position's own stamp the rows whose key
- * comes after the position's key. Call inside a read lease.
+ * comes after the position's key. `lookups` (lookupsOf) are read in full each run and count nothing. Call inside
+ * a read lease.
  */
-export async function inputsSeenOf(db: LeaseSql, asset: string, declared: readonly string[]): Promise<Record<string, SeenInput>> {
+export async function inputsSeenOf(db: LeaseSql, asset: string, declared: readonly string[],
+  o: { lookups?: readonly string[] } = {}): Promise<Record<string, SeenInput>> {
   const seen = await readInputsSeen(db, asset);
+  const lookups = new Set(o.lookups ?? []);
   const out: Record<string, SeenInput> = {};
   for (const input of [...new Set([...Object.keys(seen), ...declared])].sort()) {
     const s = Object.hasOwn(seen, input) ? seen[input]! : null;
     const facts = await readInputFacts(db, input);
     if (!s && !facts) continue;                      // declared, but no such table: nothing to say yet
+    if (lookups.has(input)) {
+      out[input] = lookupSeen(s);
+      continue;
+    }
     let pendingRows: number | null = null;
     if (facts?.columns.some((c) => c.name === RESERVED.loadedAt)) {
       const position = s?.seenLoadedAt ? { stamp: s.seenLoadedAt, key: Array.isArray(s.seenKey) ? s.seenKey.map(String) : null } : null;
@@ -415,9 +444,9 @@ export async function inputsSeenOf(db: LeaseSql, asset: string, declared: readon
 }
 
 /** What the warehouse knows about one asset. Call inside a read lease. `inputs`: the inputs its definition
- *  declares, listed in inputsSeen even before it has read them. */
+ *  declares, listed in inputsSeen even before it has read them; `lookups`: those read in full each run (lookupsOf). */
 export async function readWarehouseAsset(db: LeaseSql, asset: string,
-  o: { samples: number; keys?: boolean; inputs?: readonly string[] } = { samples: 3 }): Promise<WarehouseAsset> {
+  o: { samples: number; keys?: boolean; inputs?: readonly string[]; lookups?: readonly string[] } = { samples: 3 }): Promise<WarehouseAsset> {
   const out: WarehouseAsset = { state: null, tableExists: false, rows: null, columns: [], inputsSeen: {}, recentWrites: [], samples: [] };
   const withState = await hasState(db);
   if (withState) {
@@ -465,7 +494,7 @@ export async function readWarehouseAsset(db: LeaseSql, asset: string,
     }
   }
   if (withState) {
-    out.inputsSeen = await inputsSeenOf(db, asset, o.inputs ?? []);
+    out.inputsSeen = await inputsSeenOf(db, asset, o.inputs ?? [], o.lookups ? { lookups: o.lookups } : {});
     out.recentWrites = (await rowsOf(db,
       `SELECT run_id, loaded_at, mode, rows_in, added, updated, unchanged, deleted, cursor_before, cursor_after, schema_changes
        FROM _croft.writes WHERE asset = $1 ORDER BY loaded_at DESC LIMIT 5`, [asset])).map((w) => ({
@@ -555,7 +584,8 @@ export interface DescribeData {
   readBy: string[];
   rows: number | null;
   columns: DescribeColumn[];
-  /** Per input, instants in the project zone; pendingRows null when the warehouse was busy (source "catalog"). */
+  /** Per input, instants in the project zone; pendingRows null when the warehouse was busy (source "catalog"),
+   *  except for a lookup read in full each run (readInFull), which has none pending. */
   inputsSeen: Record<string, SeenInput>;
   builtWithCodeHash: string | null;
   checks: { check: string; blocking: boolean; implied: boolean }[];
@@ -627,12 +657,13 @@ export const describe: CommandImpl<DescribeData> = {
     const problems = [...(config ? config.problems : []), ...resolution.problems];
     const reads = readsOf(resolved, catalogAll);
     const inputs = config?.loaded ? config.inputs : catalog?.reads ?? [];
+    const lookups = new Set(lookupsOf(resolved?.assets.find((a) => a.name === name)));
 
     let wh: WarehouseAsset | null = null;
     let source: DescribeData["source"] = "none";
     const next: { command: string; reason: string }[] = [];
     try {
-      wh = await readOnlyWarehouse(ctx, project).read((db) => readWarehouseAsset(db, name, { samples: 3, inputs }),
+      wh = await readOnlyWarehouse(ctx, project).read((db) => readWarehouseAsset(db, name, { samples: 3, inputs, lookups: [...lookups] }),
         { purpose: `describe ${name}`, waitMs: DESCRIBE_TIMING.busyWaitMs });
       source = "warehouse";
     } catch (e) {
@@ -661,11 +692,14 @@ export const describe: CommandImpl<DescribeData> = {
       name: c.name, type: c.type, pinned: c.pinned, pending: c.pending, sourceName: c.sourceName, format: c.format, addedAt: null,
       jsonKeys: c.jsonKeys ?? null, kinds: null,
     }));
-    // The warehouse's own record when it could be read; the catalog's copy of it (nothing counted) otherwise.
+    // The warehouse's own record when it could be read; the catalog's copy of it (nothing counted, except that a
+    // lookup never has anything pending) otherwise.
     const seen: Record<string, SeenInput> = source === "warehouse" ? wh!.inputsSeen
-      : Object.fromEntries(Object.entries(cat?.inputsSeen ?? {}).map(([input, s]) => [input, { seenLoadedAt: s.seenLoadedAt, inputLastLoadedAt: s.inputLastLoadedAt, pendingRows: null }]));
-    const inputsSeen = Object.fromEntries(Object.entries(seen).map(([input, s]) => [input, {
+      : Object.fromEntries(Object.entries(cat?.inputsSeen ?? {}).map(([input, s]) => [input, lookups.has(input) ? lookupSeen(s)
+        : { seenLoadedAt: s.seenLoadedAt, inputLastLoadedAt: s.inputLastLoadedAt, pendingRows: null }]));
+    const inputsSeen = Object.fromEntries(Object.entries(seen).map(([input, s]): [string, SeenInput] => [input, {
       seenLoadedAt: zoned(s.seenLoadedAt, tz), inputLastLoadedAt: zoned(s.inputLastLoadedAt, tz), pendingRows: s.pendingRows,
+      ...(s.readInFull ? { readInFull: true as const } : {}),
     }]));
     const data: DescribeData = {
       asset: name,
@@ -741,8 +775,10 @@ function cursorText(b: Behavior, tz: string): string | null {
   return `${inc.field} = ${value}${extra}`;
 }
 
-/** "2 new rows since 2026-09-22T10:00:00-07:00", "3 rows, none read yet", "? new rows since …" (catalog). */
+/** "2 new rows since 2026-09-22T10:00:00-07:00", "3 rows, none read yet", "? new rows since …" (catalog),
+ *  "read in full each run, last at 2026-09-22T10:00:00-07:00" (a lookup). */
 function inputText(s: SeenInput): string {
+  if (s.readInFull) return `read in full each run, ${s.inputLastLoadedAt ? `last at ${s.inputLastLoadedAt}` : "not read yet"}`;
   const n = s.pendingRows;
   const count = n === null ? "?" : formatCount(n);
   if (s.seenLoadedAt === null) return n === null ? "not read yet" : `${count} row${n === 1 ? "" : "s"}, none read yet`;

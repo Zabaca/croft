@@ -474,6 +474,51 @@ describe("croft status: staleness", () => {
     expect(r.json.problems.map((x: { code: string }) => x.code)).not.toContain("EDITED_SINCE_LAST_RUN");
   });
 
+  /** A later run that skipped `asset` without running its code, recorded as the runner records it: with the code
+   *  hash the asset has now (runner.ts startStep), at `attempt` 0 (its input failed) or 1 (it stopped to ask). */
+  function skippedRun(p: TestProject, asset: string, o: { attempt: number; codeHash?: string; at?: string }) {
+    const db = runsDb(p.stateDir, () => new Date(o.at ?? "2026-09-22T18:59:00.000Z"));
+    try {
+      const run = db.createRun({ id: `r_0922_1159_skp${o.attempt}`, trigger: "manual", human: true, argv: ["run"], identity: DEAD });
+      db.startStep({ runId: run.id, asset, attempt: o.attempt, reason: "requested", ...(o.codeHash ? { codeHash: o.codeHash } : {}) });
+      db.finishStep(run.id, asset, o.attempt, { status: "skipped", reason: "requested" });
+      db.finishRun(run.id, "failed");
+    } finally {
+      db.close();
+    }
+  }
+
+  for (const [why, attempt] of [["its input failed", 0], ["it stopped for a confirmation", 1]] as const) {
+    test(`a skipped step never ran the code (${why}): the edit is still since the last run that did`, async () => {
+      const p = await pipeline({ hashes: { issue_triage: "older-code" }, entries: { issue_triage: { rows: 18_556 } } });
+      skippedRun(p, "issue_triage", { attempt, codeHash: (await codeHashes(p.root)).issue_triage! });
+      const { r, a } = await status(p);
+      expect(a.issue_triage).toMatchObject({ status: "skipped", stale: false, edited: true });
+      const edited = r.json.problems.find((x: { code: string }) => x.code === "EDITED_SINCE_LAST_RUN");
+      expect(edited).toMatchObject({ severity: "warning", asset: "issue_triage" });
+      expect(edited.message).toBe("issue_triage edited since its last run; 18,556 rows were built by older code");
+      expect((await cli(["status"], { cwd: p.root, env: ENV })).stdout).toMatch(/^issue_triage .* skipped · edited since its last run$/m);
+    });
+  }
+
+  test("a skipped step never ran the code: without a code hash, the file's time is compared with the last run that did", async () => {
+    // A file that does not bundle has no code hash.
+    const p = await pipeline({ files: { "assets/issue_triage.ts": "export default transform({ inputs: [\n" } });
+    const edit = new Date("2026-09-22T18:57:00Z");
+    utimesSync(join(p.root, "assets/issue_triage.ts"), edit, edit);
+    skippedRun(p, "issue_triage", { attempt: 0 });
+    const { a } = await status(p);
+    expect(a.issue_triage).toMatchObject({ status: "skipped", edited: true });
+  });
+
+  test("a skipped step after a run of the current code: not edited", async () => {
+    const p = await pipeline();
+    skippedRun(p, "issue_triage", { attempt: 0, codeHash: (await codeHashes(p.root)).issue_triage! });
+    const { r, a } = await status(p);
+    expect(a.issue_triage).toMatchObject({ status: "skipped", edited: false });
+    expect(r.json.problems.map((x: { code: string }) => x.code)).not.toContain("EDITED_SINCE_LAST_RUN");
+  });
+
   test("a transform whose definition no longer loads: edited, but its code is no reason to run (whether it is incremental is unknown)", async () => {
     // Written before anything imports it: this process caches a module it has imported once.
     const p = await pipeline({ files: { "assets/issue_triage.ts": `${TRIAGE_TS}throw new Error("top-level boom");\n` }, hashes: { issue_triage: "older-code" } });
