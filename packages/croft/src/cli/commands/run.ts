@@ -33,7 +33,7 @@ import { DEFAULT_FOLLOW_MS, followRun, parseWait, pickRunId, spawnDetachedRun, w
 import { dryRun, formatDryRun, refuseToken } from "../../run/dry-run.ts";
 import { croftError } from "../../run/ingest.ts";
 import { cursorTypesOf, loadErrors, type PlannedStep, planRun, readMirror, type RunPlan } from "../../run/plan.ts";
-import { checkRunFlags, executeRun, jsonSafe, redactValue, type RunData, type RunEvent, type RunSummary } from "../../run/runner.ts";
+import { checkRunFlags, executeRun, jsonSafe, lockWaitText, redactValue, type RunData, type RunEvent, type RunSummary } from "../../run/runner.ts";
 import { duePlanning, dueWork } from "../../schedule/due.ts";
 import type { CommandImpl, CommandResult, Ctx } from "../command.ts";
 import { dispatchOf } from "../main.ts";
@@ -255,7 +255,11 @@ export const run: CommandImpl<RunData | DryRunData> = {
         const spawned = spawnDetachedRun({ root: project.root, stateDir: project.paths.stateDir, args: childArgs, runId, env });
         const res = await followRun({
           stateDir: project.paths.stateDir, runId, timeoutMs: followMs, spawned,
-          ...(events ? { onEvent: (line: string) => ctx.render.progress(line) } : {}),
+          // --events: every line. Otherwise only who holds the file the run waits for (§5 "Lock conflicts").
+          onEvent: events ? (line: string) => ctx.render.progress(line) : (line: string) => {
+            const text = lockWaitLine(line);
+            if (text) ctx.render.progress(text);
+          },
         });
         if (res.kind === "not_started") throw croftFrom(res.problem);
         if (confirmToken !== undefined) settleConfirmation(ctx, confirmToken, res.summary);
@@ -297,10 +301,12 @@ export const run: CommandImpl<RunData | DryRunData> = {
         ...(confirmToken !== undefined ? { confirmToken } : {}),
         ...(interactive && !ctx.json ? { prompt: askYesNo } : {}),
         noWait: v["no-wait"] === true, signal: ac.signal,
-        ...(events ? { onEvent: (line: string) => ctx.render.progress(line) } : interactive && !ctx.json ? { onEvent: (_line: string, e: RunEvent) => {
-          const text = progressLine(e, kinds);
+        // --events: every event as its line; on a terminal, progress in words; otherwise only who holds the file the
+        // run waits for (§5 "Lock conflicts").
+        onEvent: events ? (line: string) => ctx.render.progress(line) : (_line: string, e: RunEvent) => {
+          const text = interactive && !ctx.json ? progressLine(e, kinds) : lockWaitText(e);
           if (text) ctx.render.progress(text);
-        } } : {}),
+        },
         ...(delays ? { retryDelaysMs: delays } : {}),
         ...(ctx.processEnv.CROFT_FAULT ? { fault: ctx.processEnv.CROFT_FAULT } : {}),
       });
@@ -330,8 +336,19 @@ export function progressLine(e: RunEvent, kinds?: ReadonlyMap<string, PlannedSte
     return `${String(e.asset)}: ${doing}${Number(e.attempt) > 1 ? ` (attempt ${String(e.attempt)})` : ""}…`;
   }
   if (e.type === "retry") return `${String(e.asset)}: ${String(e.code)}; trying again at ${String(e.nextRetryAt)}`;
+  const lockWait = lockWaitText(e);
+  if (lockWait) return lockWait;
   if (e.type === "waiting") return `waiting for ${assets(e.assets)}: held by run ${assets(e.heldBy)}`;
   return null;
+}
+
+/** The words of a lock-wait event line from events.ndjson (runner.ts lockWaitEvent), or null. */
+function lockWaitLine(line: string): string | null {
+  try {
+    return lockWaitText(JSON.parse(line) as RunEvent);
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------------------------------------

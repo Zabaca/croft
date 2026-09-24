@@ -301,7 +301,11 @@ export async function followRun(i: FollowInput): Promise<FollowResult> {
     // (a checkpoint writes the file). Let it exit, briefly, so the next command neither waits on the lock nor sees
     // the file change after this one returned.
     if (final && final.status !== "running" && i.spawned && !child.exit) {
-      await Promise.race([i.spawned.exited, Bun.sleep(i.exitGraceMs ?? 3000)]);
+      // The grace's timer is cleared once the child exits: a pending timer would hold this process (and `croft run`)
+      // for the rest of the grace after returning.
+      let grace: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([i.spawned.exited, new Promise<void>((r) => (grace = setTimeout(r, i.exitGraceMs ?? 3000)))]);
+      clearTimeout(grace);
     }
     // The child exited while its run still says running: it died (a finished run is recorded before exit).
     if (final && final.status === "running" && (child.exit || gone.rec)) {
@@ -357,5 +361,13 @@ if (import.meta.main) {
     return (text) => env.redact(text);
   });
   const { main } = await import("../cli/main.ts");
-  process.exitCode = await main(process.argv.slice(2));
+  const code = await main(process.argv.slice(2));
+  // The run is recorded and its after-run work done: exit now, with every warehouse closed first. Asset code may leave
+  // a timer or a socket open (a client's keep-alive pool), which would keep this process alive with nothing to do and
+  // its parent waiting out the grace for its exit. Nothing is cut off: stdout and stderr are _process.log, a file,
+  // written synchronously, and the fd capture's last pump runs on exit. A lease asset code left open cannot hold the
+  // close for long: the exit hook closes what is left synchronously (db/warehouse.ts).
+  const { closeAllWarehouses } = await import("../db/warehouse.ts");
+  await Promise.race([closeAllWarehouses().catch(() => {}), new Promise((r) => setTimeout(r, 1000))]);
+  process.exit(code);
 }

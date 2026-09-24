@@ -91,10 +91,10 @@ describe("journey 20: croft schedule", () => {
     const byHand = await ok(["run", "items"], 10, 5);
     expect(byHand.data.steps.map((s: Envelope) => [s.asset, s.status])).toEqual([["items", "ok"], ["item_count", "ok"]]);
     expect(fetches()).toBe(1);
-    // (Not due: false. The run by hand is stamped in runs.sqlite with the real clock, years before CROFT_NOW, so the
-    // scheduler still counts the 10:00 fire as unhandled; see laTime. No tick comes before 11:00.)
+    // The run by hand at 10:05 (runs.sqlite follows CROFT_NOW) handled the 10:00 fire: nothing is due.
     const released = await ok(["schedule", "status"], 10, 6);
     for (const a of released.data.assets) expect(a, a.asset).toMatchObject({ held: null });
+    expect(released.data.assets.find((a: Envelope) => a.asset === "items")).toMatchObject({ due: false });
     expect(released.problems.filter((x: Envelope) => x.code === "SCHEDULE_HELD")).toEqual([]);
 
     // 11:00: the tick starts the ingest's run; the transform that reads it updates in the same run.
@@ -131,7 +131,6 @@ describe("journey 20: croft schedule", () => {
     expect(fetches()).toBe(2);
     await ok(["run", "items"], 12, 10);
     expect(fetches()).toBe(3);
-    // (No tick between that run and the next fire: runs.sqlite stamps runs with the real clock, see laTime.)
 
     // 13:00: scheduled again.
     state.items.push({ id: 4, name: "d" });

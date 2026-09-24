@@ -13,8 +13,8 @@ import { RunsDb } from "../history/runs-db.ts";
 import { loadProject } from "../project/root.ts";
 import { listTrash } from "../safety/trash.ts";
 import { planRun } from "./plan.ts";
-import { withProjectChecks } from "./runner.ts";
-import { cleanupProjects, cli, keysetIssues, linkItems, makeProject, mockApi, runIn, simpleGet, slowPages } from "./testkit.ts";
+import { type RunEvent, withProjectChecks } from "./runner.ts";
+import { cleanupProjects, cli, cliEnv, keysetIssues, linkItems, makeProject, mockApi, runIn, simpleGet, slowPages } from "./testkit.ts";
 
 const api = mockApi();
 afterAll(async () => {
@@ -813,6 +813,58 @@ describe("a lock wait and Ctrl-C", () => {
       holder.kill("SIGKILL");
     }
   });
+
+  // DESIGN §5 "Lock conflicts": after 2 s the holder is printed.
+  test("a run waiting for the file names its holder after 2 s: a waiting event, in events.ndjson for a detached run's id", async () => {
+    const { spawnHolder, cleanup } = await import("../read/testkit.ts");
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    expect((await runIn(root, ["zones"])).exit).toBe(0);
+    await closeAllWarehouses();
+    const holder = spawnHolder(join(root, "warehouse.duckdb"), 3000);
+    try {
+      await holder.waitFor("held");
+      const events: RunEvent[] = [];
+      // The id a detached run's parent picks: the wait comes before the run exists (reconcile opens the file).
+      const runId = "r_0101_0000_wait";
+      const out = await runIn(root, ["zones"], { runId, onEvent: (_l, e) => events.push(e) });
+      expect(out.exit).toBe(0);
+      const waiting = events.filter((e) => e.type === "waiting");
+      expect(waiting).toHaveLength(1);
+      expect(waiting[0]).toMatchObject({ runId, holder: { pid: holder.pid } });
+      expect(String(waiting[0]!.message)).toMatch(new RegExp(`^waiting for the warehouse: .* \\(PID ${holder.pid}\\) holds it \\(\\d+ s so far\\)$`));
+      expect(Number(waiting[0]!.waitedMs)).toBeGreaterThanOrEqual(2000);
+      const lines = readFileSync(join(root, ".croft", "logs", runId, "events.ndjson"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as RunEvent);
+      expect(lines.filter((e) => e.type === "waiting")).toEqual([expect.objectContaining({ runId, holder: expect.objectContaining({ pid: holder.pid }) })]);
+    } finally {
+      cleanup();
+    }
+  }, 20_000);
+
+  test("croft run prints the holder on stderr while it waits, detached or not; with --events as the waiting event", async () => {
+    const { spawnHolder, cleanup } = await import("../read/testkit.ts");
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    expect((await runIn(root, ["zones"])).exit).toBe(0);
+    await closeAllWarehouses();
+    try {
+      for (const args of [["--json"], ["--foreground"], ["--json", "--events"]]) {
+        // Long enough that the run, once started, still waits over 2 s.
+        const holder = spawnHolder(join(root, "warehouse.duckdb"), 4500);
+        await holder.waitFor("held");
+        const r = await cli(root, ["run", "zones", ...args]);
+        expect(r.code, `${args.join(" ")}\n${r.stderr}`).toBe(0);
+        if (args.includes("--events")) {
+          const waiting = r.stderr.split("\n").filter((l) => l.startsWith("{")).map((l) => JSON.parse(l) as RunEvent).filter((e) => e.type === "waiting");
+          expect(waiting, r.stderr).toEqual([expect.objectContaining({ holder: expect.objectContaining({ pid: holder.pid }) })]);
+        } else {
+          expect(r.stderr, args.join(" ")).toMatch(new RegExp(`^waiting for the warehouse: .* \\(PID ${holder.pid}\\) holds it \\(\\d+ s so far\\)$`, "m"));
+        }
+      }
+    } finally {
+      cleanup();
+    }
+  }, 60_000);
 });
 
 describe("planning", () => {
@@ -1211,6 +1263,103 @@ export default ingest({ secrets: ["VAULT_KEY"], key: "id", async *rows({ secret 
       expect((db.getRun(out.data.runId)!.summary as { data: { steps: { behavior: string }[] } }).data.steps[0]!.behavior).toBe("replace");
     } finally {
       db.close();
+    }
+  });
+});
+
+describe("a detached run's process", () => {
+  test("exits once its run is recorded, even when asset code left a timer running; its parent returns at once", async () => {
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({
+      "assets/leaky.ts": `import { ingest } from "@zabaca/croft";
+export default ingest({
+  async *rows({ http }) {
+    // A client's keep-alive timer, never cleared.
+    setInterval(() => {}, 1000);
+    yield (await http.get("${api.url}/zones")).json<Record<string, unknown>[]>();
+  },
+});
+`,
+    });
+    const started = Date.now();
+    const r = await cli(root, ["run", "leaky", "--json"]);
+    const returned = Date.now();
+    expect(r.code, r.stderr).toBe(0);
+    const runId = r.json!.data.runId as string;
+    const db = runsDb(root);
+    const finishedAt = Date.parse(db.getRun(runId)!.finishedAt!);
+    db.close();
+    expect(finishedAt).toBeGreaterThanOrEqual(started - 1000);
+    expect(returned - finishedAt).toBeLessThan(1000);
+    const pid = (JSON.parse(readFileSync(join(root, ".croft", "logs", runId, "_process.json"), "utf8")) as { pid: number }).pid;
+    const gone = () => {
+      try {
+        process.kill(pid, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    };
+    try {
+      const deadline = Date.now() + 2000;
+      while (!gone() && Date.now() < deadline) await new Promise((res) => setTimeout(res, 20));
+      expect(gone()).toBe(true);
+    } finally {
+      if (!gone()) process.kill(pid, "SIGKILL");
+    }
+  });
+});
+
+describe("the project clock", () => {
+  // runs.sqlite follows the project clock (CROFT_NOW in tests), like run ids, _loaded_at and the scheduler's fires, so
+  // a run by hand at 11:05 counts as having handled the 11:00 fire.
+  test("a run and its steps are stamped with the runner's clock", async () => {
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    const at = new Date("2031-05-06T07:08:09.000Z");
+    const out = await runIn(root, ["zones"], { now: () => at });
+    expect(out.exit).toBe(0);
+    const db = runsDb(root);
+    try {
+      expect(db.getRun(out.data.runId)).toMatchObject({ startedAt: at.toISOString(), finishedAt: at.toISOString() });
+      expect(db.stepsFor(out.data.runId)).toMatchObject([{ asset: "zones", startedAt: at.toISOString(), finishedAt: at.toISOString() }]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("a failed run's staging is kept 3 days on the clock that stamped it", async () => {
+    const { mkdirSync } = await import("node:fs");
+    const { pruneStaging } = await import("./runner.ts");
+    const root = makeProject({});
+    const state = join(root, ".croft");
+    // CROFT_NOW ten days back: the run ended just now on its own clock.
+    const db = RunsDb.open(state, { now: () => new Date(Date.now() - 10 * 86_400_000) });
+    try {
+      const run = db.createRun({ trigger: "manual", human: true, argv: ["run"] });
+      db.finishRun(run.id, "failed");
+      mkdirSync(join(state, "staging", run.id, "a"), { recursive: true });
+      expect(pruneStaging(state, db)).toEqual([]);
+      expect(pruneStaging(state, db, Date.now() + 4 * 86_400_000).map((d) => d.split("/").at(-1))).toEqual([run.id]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("croft run under CROFT_NOW stamps runs.sqlite with it, detached or not", async () => {
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    const at = "2031-05-06T07:08:09.000Z";
+    for (const mode of [["--foreground"], []]) {
+      const r = await cli(root, ["run", "zones", ...mode, "--json"], cliEnv({ CROFT_NOW: at }));
+      expect(r.code, r.stderr).toBe(0);
+      const db = runsDb(root);
+      try {
+        expect(db.getRun(r.json!.data.runId)).toMatchObject({ startedAt: at, finishedAt: at });
+        expect(db.stepsFor(r.json!.data.runId)).toMatchObject([{ startedAt: at }]);
+      } finally {
+        db.close();
+      }
     }
   });
 });

@@ -144,12 +144,9 @@ describe("runs and readers (slow: real processes)", () => {
     expect(r.json!.data.steps[0]).toMatchObject({ asset: "example_sales", status: "ok", rows: { added: 1, total: 121 } });
   }, 60_000);
 
-  // Bug: DESIGN §5 "Lock conflicts ... After 2 s the holder is printed." `croft run` waits silently: its warehouse
-  // onWait (run/runner.ts) only registers a lock waiter, so a run blocked by a foreign program (or by another run's
-  // write step) says nothing until its 90 s wait ends with DB_HELD_BY_OTHER_PROGRAM; --events shows only the
-  // step's "write" phase. Repro: hold warehouse.duckdb read-only in another process, then
-  // `croft run example_sales --foreground` in the project: stderr stays empty for the whole wait.
-  bugTest("a run blocked by a foreign holder prints the holder after 2 s (DESIGN §5)", async () => {
+  // DESIGN §5 "Lock conflicts ... After 2 s the holder is printed.": a run blocked by a foreign program names it on
+  // stderr while it waits, before its 90 s wait could end in DB_HELD_BY_OTHER_PROGRAM.
+  test("a run blocked by a foreign holder prints the holder after 2 s (DESIGN §5)", async () => {
     const p = await built();
     addSale(p, 2002);
     const holder = foreignHolder(placeOf(p).database, "READ_ONLY");

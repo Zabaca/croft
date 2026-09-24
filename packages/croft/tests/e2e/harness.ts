@@ -311,9 +311,8 @@ export function schedulerEnv(): { HOME: string; CROFT_HOME: string; CROFT_JOB_LA
 /**
  * CROFT_NOW for a wall-clock time on one day in the project zone (America/Los_Angeles, -07:00 in June).
  *
- * The day is years ahead on purpose. A run records its runs and steps in runs.sqlite with the real clock, while
- * fire times, heartbeats and last_fire_at follow CROFT_NOW; a CROFT_NOW later than every real stamp keeps the
- * scheduler's own last_fire_at the thing that decides what is due, as it is without CROFT_NOW.
+ * The day is years away from the real clock on purpose: runs.sqlite (runs, steps), fire times, heartbeats and
+ * last_fire_at all follow CROFT_NOW, so a stamp taken from the real clock by mistake stands out.
  */
 export function laTime(hour: number, minute = 0): string {
   return `2036-06-10T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00-07:00`;

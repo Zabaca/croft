@@ -113,13 +113,18 @@ describe("croft run --due: the scheduler's run", () => {
     expect(out.exit).toBe(0);
   });
 
-  test("a scheduled run never approves code", async () => {
+  test("a scheduled run never approves code, and never runs code nobody approved, even from a plan without holds", async () => {
     const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones", HOURLY) }, { timezone: "UTC" });
     api.state.zones = [{ id: 1 }];
-    // A plan without the scheduler's holds (the plan's own tests cover those): only the runner's human:false.
+    on(root);
+    // A plan without the scheduler's holds (the plan's own tests cover those): the step's start still checks them.
     const plan = await planRun({ root, timezone: "UTC", selectors: ["zones"] });
     const out = await runIn(root, ["zones"], { plan, trigger: "schedule", human: false, argv: ["run", "--due", "zones"] });
-    expect(out.data.steps[0]!.status).toBe("ok");
+    expect(out.data.steps[0]).toMatchObject({ status: "skipped" });
+    expect(out.data.steps[0]!.skippedBecause).toStartWith("held (SCHEDULE_HELD): new: code edited");
+    expect(api.state.log).toEqual([]);
+    // A run that is not a person's (human false) runs, and its success approves nothing.
+    expect((await runIn(root, ["zones"], { plan, human: false })).data.steps[0]!.status).toBe("ok");
     const db = runsDb(root);
     expect(db.approvedCode("zones")).toBeNull();
     db.close();
@@ -236,6 +241,131 @@ export default transform({
     expect(planned.steps.find((s) => s.asset === "issues")).toMatchObject({ hold: "leased", reason: "held: run r_0924_0900_hold holds it; it stays due" });
     db2.sqlite.query("DELETE FROM leases").run();
     db2.close();
+  });
+});
+
+// R32-07: a scheduled run plans, then waits for the file (up to 30 min), and runs earlier steps and retries first. Its
+// holds are checked again as each step starts, against the code the step loads then.
+describe("croft run --due: holds when a step starts", () => {
+  const due = (root: string, assets: string[], plan: Awaited<ReturnType<typeof duePlan>>, now: Date, o: Partial<RunnerOptions> = {}) =>
+    runIn(root, assets, { plan, trigger: "schedule", human: false, argv: ["run", "--due", ...assets], now: () => now, ...o });
+
+  test("code edited after the plan (a file rows() imports when it runs) holds the step; nothing runs or is recorded as handled", async () => {
+    const root = makeProject({
+      "assets/items.ts": `import { ingest } from "@zabaca/croft";
+export default ingest({
+  key: "id",${HOURLY}
+  async *rows() { const { rows } = await import("../lib/rows.ts"); yield rows; },
+});
+`,
+      "lib/rows.ts": `export const rows = [{ id: 1, title: "real issue 1" }];\n`,
+      "assets/titles.sql": "select id, title from items\n",
+    }, { timezone: "UTC" });
+    expect((await runIn(root, ["items", "titles"])).data.status).toBe("succeeded");
+    on(root);
+    const { now } = nextFire();
+    const plan = await duePlan(loadProject({ root }), ["items"], now);
+    expect(plan.steps.map((s) => [s.asset, s.hold ?? null])).toEqual([["items", null], ["titles", null]]);
+    // While the run waits for the file: a debugging fixture nobody has run by hand (DESIGN §6).
+    writeFileSync(join(root, "lib/rows.ts"), `export const rows = [{ id: 1, title: "test" }];\n`);
+    const h = hooks();
+    const out = await due(root, ["items"], plan, now, { hooks: h.hooks });
+    expect(out.exit).toBe(0);
+    const [items, titles] = out.data.steps;
+    expect(items).toMatchObject({ asset: "items", status: "skipped" });
+    expect(items!.skippedBecause).toMatch(/^held \(SCHEDULE_HELD\): code edited .*, not run by hand yet; croft run items releases it$/);
+    expect(titles).toMatchObject({ asset: "titles", status: "skipped" });
+    expect(titles!.skippedBecause).toStartWith("input items is held (SCHEDULE_HELD)");
+    expect(out.problems.find((p) => p.code === "SCHEDULE_HELD")).toMatchObject({ severity: "warning", asset: "items", fix: { command: "croft run items" } });
+    const db = runsDb(root);
+    try {
+      // No attempt of items (a reader skipped for its input is recorded, as when the plan holds the input).
+      expect(db.stepsFor(out.data.runId).map((s) => s.asset)).toEqual(["titles"]);
+      expect(db.scheduleState("items")).toMatchObject({ lastFireAt: null, lastAttemptAt: null });
+    } finally {
+      db.close();
+    }
+    expect(h.calls).toEqual({ readCopy: [], notify: [] });
+  });
+
+  test("an edit while the step waits for the file (a GUI holds it) holds the step once it has the file", async () => {
+    const { spawnHolder, cleanup } = await import("../read/testkit.ts");
+    const root = makeProject({
+      "assets/items.ts": `import { ingest } from "@zabaca/croft";
+export default ingest({
+  key: "id",${HOURLY}
+  async *rows() { const { rows } = await import("../lib/rows.ts"); yield rows; },
+});
+`,
+      "lib/rows.ts": `export const rows = [{ id: 1, title: "real issue 1" }];\n`,
+    }, { timezone: "UTC" });
+    expect((await runIn(root, ["items"])).data.status).toBe("succeeded");
+    on(root);
+    await closeAllWarehouses();
+    const { now } = nextFire();
+    const plan = await duePlan(loadProject({ root }), ["items"], now);
+    expect(plan.steps.map((s) => [s.asset, s.hold ?? null])).toEqual([["items", null]]);
+    const holder = spawnHolder(join(root, "warehouse.duckdb"), 2500);
+    try {
+      await holder.waitFor("held");
+      const running = due(root, ["items"], plan, now);
+      await Bun.sleep(700);
+      writeFileSync(join(root, "lib/rows.ts"), `export const rows = [{ id: 1, title: "test" }];\n`);
+      const out = await running;
+      expect(out.data.steps[0]).toMatchObject({ asset: "items", status: "skipped" });
+      expect(out.data.steps[0]!.skippedBecause).toStartWith("held (SCHEDULE_HELD): ");
+      const db = runsDb(root);
+      expect(db.stepsFor(out.data.runId)).toEqual([]);
+      db.close();
+    } finally {
+      cleanup();
+    }
+  }, 20_000);
+
+  test("scheduling paused after the plan holds the run's steps as they start", async () => {
+    const root = await pipeline();
+    const { now } = nextFire();
+    const plan = await duePlan(loadProject({ root }), ["issues"], now);
+    const db = runsDb(root);
+    db.setScheduling({ state: "paused", via: "serve" });
+    db.close();
+    api.state.log.length = 0;
+    const out = await due(root, ["issues"], plan, now);
+    expect(out.data.steps.map((s) => [s.asset, s.status, s.skippedBecause])).toEqual([
+      ["issues", "skipped", "held: scheduling is paused"],
+      ["open_issues", "skipped", "input issues is held: scheduling is paused"],
+    ]);
+    expect(out.exit).toBe(0);
+    expect(api.state.log).toEqual([]);
+  });
+
+  test("a pause while an earlier step runs holds the later ones", async () => {
+    const root = await pipeline();
+    api.state.issues.push({ id: 3, title: "c", updated_at: "2026-09-03T10:00:00Z" });
+    const { now } = nextFire();
+    const plan = await duePlan(loadProject({ root }), ["issues"], now);
+    const pause = (_line: string, e: { type: string; asset?: unknown; status?: unknown }) => {
+      if (e.type !== "step" || e.asset !== "issues" || e.status !== "running") return;
+      const db = runsDb(root);
+      db.setScheduling({ state: "off", via: null });
+      db.close();
+    };
+    const out = await due(root, ["issues"], plan, now, { onEvent: pause });
+    expect(out.data.steps.map((s) => [s.asset, s.status, s.skippedBecause ?? null])).toEqual([
+      ["issues", "ok", null],
+      ["open_issues", "skipped", "held: scheduling is off"],
+    ]);
+  });
+
+  test("a run by hand checks nothing of the sort", async () => {
+    const root = await pipeline();
+    const db = runsDb(root);
+    db.setScheduling({ state: "paused", via: "serve" });
+    db.close();
+    writeFileSync(join(root, "assets/issues.ts"), keysetIssues(api.url, `${HOURLY}\n  description: "edited",`));
+    const out = await runIn(root, ["issues"]);
+    expect(out.data.steps[0]).toMatchObject({ asset: "issues", status: "ok" });
+    expect(out.data.steps.filter((s) => s.skippedBecause?.includes("held"))).toEqual([]);
   });
 });
 
