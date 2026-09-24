@@ -88,5 +88,17 @@ export default ingest({
     expect(existsSync(join(p.stateDir, "readcopy.log"))).toBe(false);
     // The warehouse itself was never touched by the GUI.
     expect((await p.rows("select count(*) AS n from orders"))[0]!.n).toBe(3);
+
+    // status and doctor show the copy, current after the last run that wrote data (R32-11). A run's process may
+    // still be finishing its refresh when its result is out: that reads as refreshing, never as a warning.
+    let st = await p.json(["status"], home);
+    for (let i = 0; i < 50 && st.json.data.readCopy?.health === "refreshing"; i++) {
+      await Bun.sleep(100);
+      st = await p.json(["status"], home);
+    }
+    expect(st.json.data.readCopy, show(st)).toMatchObject({ path: copy, exists: true, health: "ok", lastError: null, lastWrite: { runId: third.json.data.runId } });
+    const doctor = await p.json(["doctor"], home);
+    expect(doctor.json.data.checks.find((c: Envelope) => c.id === "readcopy"), show(doctor)).toMatchObject({ section: "environment", status: "ok", details: { health: "ok" } });
+    expect(doctor.json.data.checks.find((c: Envelope) => c.id === "readcopy").text).toMatch(/^read copy warehouse\.read\.duckdb · as of \d\d:\d\d \(/);
   }, 120_000);
 });

@@ -726,6 +726,16 @@ describe("croft status: scheduling", () => {
     expect(human.trimEnd().split("\n").at(-1)).toBe("Scheduling paused until 14:00 · last tick 2 h ago · 0 running");
   });
 
+  test("paused with no end: the line names the command that resumes it, --no-os-job for croft serve only (R32-10)", async () => {
+    const p = await pipeline({ files: { "assets/github_issues.ts": SCHEDULED_TS } });
+    const d: StatusDeps = { scheduleView: async () => view() };
+    turnOn(p, { paused: null, heartbeat: "2026-09-22T17:00:00.000Z" });
+    expect((await run(p, [], d)).stdout.trimEnd().split("\n").at(-1)).toBe("Scheduling paused until croft schedule on · last tick 2 h ago · 0 running");
+    turnOn(p, { via: "serve", paused: null });
+    expect((await run(p, [], d)).stdout.trimEnd().split("\n").at(-1))
+      .toBe("Scheduling paused until croft schedule on --no-os-job · last tick 2 h ago · 0 running");
+  });
+
   test("the scheduler's view failing: NEXT comes from the schedule itself, with a warning", async () => {
     const p = await pipeline({ files: { "assets/github_issues.ts": SCHEDULED_TS } });
     turnOn(p, { heartbeat: "2026-09-22T18:59:48.000Z" });
@@ -734,5 +744,88 @@ describe("croft status: scheduling", () => {
     expect(byAsset(r.json.data).github_issues.next).toEqual({ at: "2026-09-22T13:00:00-07:00", reason: "schedule", schedule: "every hour" });
     expect(r.json.problems).toEqual([expect.objectContaining({ code: "INTERNAL_ERROR", severity: "warning" })]);
     expect(r.json.problems[0].message).toContain("no such table: schedule_state");
+  });
+});
+
+// The read copy (readCopy on, §5; R32-11): where it is and how current, in data.readCopy and a line under the
+// scheduling line. A refresh that failed, or a copy older than the last run that wrote data, is a warning whose
+// hint names .croft/readcopy.log. It is not an asset's health: `healthy` does not change.
+describe("croft status: the read copy (R32-11)", () => {
+  async function readCopyProject(): Promise<TestProject> {
+    const p = await scenario();
+    writeFileSync(join(p.root, "croft.json"), JSON.stringify({ database: "warehouse.duckdb", timezone: "America/Los_Angeles", readCopy: true }));
+    return p;
+  }
+
+  /** The read copy's lines: the one under the scheduling line, and a warning's hint (next[] follows them). */
+  async function copyLines(p: TestProject): Promise<string[]> {
+    const lines = (await cli(["status"], { cwd: p.root, env: ENV })).stdout.split("\n");
+    const i = lines.findIndex((l) => l.startsWith("Read copy "));
+    expect(lines[i - 1]).toStartWith("Scheduling off");
+    return lines.slice(i, lines[i + 1]?.startsWith("  hint: ") ? i + 2 : i + 1);
+  }
+
+  function copyAt(p: TestProject, iso: string): void {
+    const f = join(p.root, "warehouse.read.duckdb");
+    writeFileSync(f, "a copy");
+    utimesSync(f, new Date(iso), new Date(iso));
+  }
+
+  /** The readCopy setting a refresh leaves, covering the last run that wrote data unless `extra` says otherwise. */
+  function refreshedAt(p: TestProject, iso: string, extra: Record<string, unknown> = {}): void {
+    const db = runsDb(p.stateDir);
+    try {
+      const last = db.sqlite.query(`SELECT id AS runId, finished_at AS at FROM runs WHERE status <> 'running' AND finished_at IS NOT NULL
+        AND EXISTS (SELECT 1 FROM steps s WHERE s.run_id = runs.id AND s.status = 'ok') ORDER BY finished_at DESC, id DESC LIMIT 1`).get();
+      db.setSetting("readCopy", { requested: 1, holder: null, refreshedAt: iso, method: "clone", heldMs: 1, covers: last, lastError: null, ...extra });
+    } finally {
+      db.close();
+    }
+  }
+
+  test("off: no readCopy in data, no line (the golden shape has none)", async () => {
+    const p = await scenario();
+    const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+    expect(r.json.data).not.toHaveProperty("readCopy");
+    expect((await cli(["status"], { cwd: p.root, env: ENV })).stdout).not.toContain("Read copy");
+  });
+
+  test("current: its path and time in data.readCopy and on the last line", async () => {
+    const p = await readCopyProject();
+    copyAt(p, "2026-09-22T18:58:00.000Z");
+    refreshedAt(p, "2026-09-22T18:58:00.000Z");
+    const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+    expect(Object.keys(r.json.data)).toEqual(["healthy", "running", "assets", "scheduling", "readCopy"]);
+    expect(r.json.data.readCopy).toMatchObject({
+      path: join(p.root, "warehouse.read.duckdb"), exists: true, asOf: "2026-09-22T11:58:00-07:00", refreshedAt: "2026-09-22T11:58:00-07:00",
+      method: "clone", lastError: null, health: "ok", log: join(p.stateDir, "readcopy.log"),
+    });
+    expect(await copyLines(p)).toEqual(["Read copy warehouse.read.duckdb · as of 11:58 (2 min ago)"]);
+  });
+
+  test("a refresh that failed: a warning line and a hint naming .croft/readcopy.log; healthy is unchanged", async () => {
+    const p = await readCopyProject();
+    const before = (await cli(["status", "--json"], { cwd: p.root, env: ENV })).json.data.healthy;
+    copyAt(p, "2026-09-22T17:00:00.000Z");
+    const message = "the read copy was not refreshed: /bin/cp could not copy the warehouse: cp: warehouse.read.duckdb: No space left on device";
+    refreshedAt(p, "2026-09-22T17:00:00.000Z", { lastError: { at: "2026-09-22T18:55:00.000Z", code: null, message } });
+    const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+    expect(r.json.data.readCopy).toMatchObject({ health: "failed", lastError: { at: "2026-09-22T11:55:00-07:00", code: null, message } });
+    expect(r.json.data.healthy).toBe(before);
+    expect(await copyLines(p)).toEqual([
+      "Read copy warehouse.read.duckdb · as of 10:00 (2 h ago) · the last refresh failed 5 min ago: /bin/cp could not copy the warehouse: cp: warehouse.read.duckdb: No space left on device",
+      "  hint: fix what .croft/readcopy.log says (free disk space, for example); the next croft run that writes data refreshes the copy",
+    ]);
+  });
+
+  test("older than the last run that wrote data: a warning", async () => {
+    const p = await readCopyProject();
+    copyAt(p, "2026-09-22T17:00:00.000Z");
+    refreshedAt(p, "2026-09-22T17:00:00.000Z", { covers: { runId: "r_0922_0959_old1", at: "2026-09-22T16:59:00.000Z" } });
+    const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+    expect(r.json.data.readCopy).toMatchObject({ health: "behind", lastWrite: { runId: expect.stringMatching(/^r_/) } });
+    const [line, hint] = await copyLines(p);
+    expect(line).toStartWith("Read copy warehouse.read.duckdb · as of 10:00 (2 h ago), older than the last run that wrote data (r_");
+    expect(hint).toBe("  hint: the next croft run that writes data refreshes the copy; no refresh followed that run (readCopy was off then, or the refresh was cut short; .croft/readcopy.log has each failure)");
   });
 });
