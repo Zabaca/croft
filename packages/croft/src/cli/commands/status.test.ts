@@ -4,11 +4,15 @@ import { join } from "node:path";
 import { allCatalog, type CatalogAsset, putCatalog } from "../../history/catalog.ts";
 import { resolveProject } from "../../project/resolve.ts";
 import { cleanup as cleanupChildren, spawnHolder, writeServeJson } from "../../read/testkit.ts";
+import type { AssetScheduleView, HoldCode } from "../../schedule/due.ts";
+import type { Command } from "../command.ts";
+import { COMMANDS } from "./index.ts";
 import {
   busyScenario, cleanup, cli, DEAD, ISSUES_CATALOG, ISSUES_SEED, ISSUES_TS, makeProject, NOW, OPEN_SQL, runsDb, SCENARIO_FILES, seed, shape,
   type TestProject,
 } from "./inspect-testkit.ts";
-import { ago, schemaChangesFromRuns, staleText } from "./status.ts";
+import { type ScheduleViewFn, SINCE_KEY } from "./schedule.ts";
+import { ago, runStatus, schemaChangesFromRuns, status as statusImpl, type StatusDeps, staleText } from "./status.ts";
 
 afterAll(async () => {
   cleanupChildren();
@@ -586,5 +590,149 @@ describe("helpers", () => {
     expect(staleText(["input_replaced"])).toBe("stale: an input was replaced");
     expect(staleText(["never_built"])).toBeNull();
     expect(staleText([])).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// Scheduling (phase 3, §8): NEXT, held, the scheduling line and SCHEDULER_STALE. The scheduler's view
+// (schedule/due.ts, another builder's) is a fake: `croft status` runs through runStatus with it.
+
+describe("croft status: scheduling", () => {
+  const SCHEDULED_TS = ISSUES_TS.replace('key: "id",', 'key: "id",\n  schedule: "every hour",');
+  // NOW is 12:00 in Los Angeles: the hourly ingest fires next at 13:00.
+  const NEXT_FIRE = "2026-09-22T20:00:00.000Z";
+
+  function view(o: { held?: Record<string, { code: HoldCode; reason: string }>; next?: string | null } = {}): AssetScheduleView[] {
+    const base = { lastFireAt: null, lastAttemptAt: null, due: false, dueReason: null };
+    return [
+      { ...base, asset: "github_issues", kind: "ingest", schedule: { text: "every hour", cron: "0 * * * *" }, nextFireAt: o.next === undefined ? NEXT_FIRE : o.next,
+        lastFireAt: "2026-09-22T19:00:00.000Z", held: o.held?.github_issues ?? null },
+      ...(["open_issues", "issue_triage", "issue_report"] as const).map((asset) => ({
+        ...base, asset, kind: asset === "open_issues" ? "sql" as const : "ts" as const, schedule: null, nextFireAt: null, held: o.held?.[asset] ?? null,
+      })),
+    ];
+  }
+
+  function statusCommand(d: StatusDeps): Command {
+    const spec = COMMANDS.find((c) => c.name === "status")!;
+    const { load: _load, ...rest } = spec;
+    return { ...rest, run: (ctx) => runStatus(ctx, d), human: statusImpl.human!.bind(statusImpl) };
+  }
+
+  const never: ScheduleViewFn = async () => {
+    throw new Error("the scheduler's view must not be read while scheduling is off");
+  };
+
+  function run(p: TestProject, argv: string[], d: StatusDeps, env: Record<string, string> = ENV) {
+    return cli(["status", ...argv], { cwd: p.root, env, commands: [statusCommand(d)] });
+  }
+
+  function turnOn(p: TestProject, o: { via?: "os-job" | "serve"; since?: string; heartbeat?: string; paused?: string | null } = {}) {
+    const db = runsDb(p.stateDir);
+    try {
+      db.setScheduling(o.paused !== undefined ? { state: "paused", via: o.via ?? "os-job", pausedUntil: o.paused } : { state: "on", via: o.via ?? "os-job" });
+      db.setSetting(SINCE_KEY, o.since ?? "2026-09-22T18:00:00.000Z");
+      if (o.heartbeat) db.heartbeat(o.heartbeat);
+    } finally {
+      db.close();
+    }
+  }
+
+  test("off: a scheduled ingest's NEXT says its schedule is off, and the scheduler's view is not read", async () => {
+    const p = await pipeline({ files: { "assets/github_issues.ts": SCHEDULED_TS } });
+    const r = await run(p, ["--json"], { scheduleView: never });
+    expect(r.exit).toBe(0);
+    const a = byAsset(r.json.data);
+    expect(a.github_issues.next).toEqual({ at: null, reason: "scheduling off", schedule: "every hour" });
+    expect(a.open_issues.next).toEqual({ at: null, reason: "after inputs" });
+    expect(r.json.data.scheduling).toEqual({ state: "off", via: null, lastTickAt: null });
+    expect(r.json.data.healthy).toBe(true);
+    expect(r.json.problems).toEqual([]);
+    const human = await run(p, [], { scheduleView: never });
+    expect(human.stdout).toMatch(/^github_issues +18,556 +5 min ago +every hour \(off\) +ok$/m);
+  });
+
+  test("on and ticking: NEXT is the next fire; the scheduling line has the last tick", async () => {
+    const p = await pipeline({ files: { "assets/github_issues.ts": SCHEDULED_TS } });
+    turnOn(p, { heartbeat: "2026-09-22T18:59:48.000Z" });
+    const r = await run(p, ["--json"], { scheduleView: async () => view() });
+    expect(r.exit).toBe(0);
+    const d = r.json.data;
+    expect(d.scheduling).toEqual({ state: "on", via: "os-job", lastTickAt: "2026-09-22T11:59:48-07:00", stale: false });
+    const a = byAsset(d);
+    expect(a.github_issues).toMatchObject({ next: { at: "2026-09-22T13:00:00-07:00", reason: "schedule", schedule: "every hour" }, held: false });
+    expect(a.github_issues).not.toHaveProperty("hold");
+    expect(a.issue_report.next).toEqual({ at: null, reason: "after inputs" });
+    expect(d.healthy).toBe(true);
+    expect(r.json.problems).toEqual([]);
+    const human = (await run(p, [], { scheduleView: async () => view() })).stdout;
+    expect(human).toMatch(/^github_issues +18,556 +5 min ago +in 60 min +ok$/m);
+    expect(human.trimEnd().split("\n").at(-1)).toBe("Scheduling on · last tick 12 s ago · 0 running");
+  });
+
+  test("held: SCHEDULE_HELD with its reason; --check counts it; next says the run that releases it", async () => {
+    const p = await pipeline({ files: { "assets/github_issues.ts": SCHEDULED_TS } });
+    turnOn(p, { heartbeat: "2026-09-22T18:59:48.000Z" });
+    const held = { issue_triage: { code: "SCHEDULE_HELD" as const, reason: "code edited 12 min ago, not run by hand yet" },
+      open_issues: { code: "leased" as const, reason: "running in r_0922_1159_abcd" } };
+    const d: StatusDeps = { scheduleView: async () => view({ held }) };
+    const r = await run(p, ["--json"], d);
+    const a = byAsset(r.json.data);
+    expect(a.issue_triage).toMatchObject({ held: true, hold: held.issue_triage, status: "ok" });
+    // Holds that pass by themselves (a lease, a pause, a backoff) are shown but are not "held".
+    expect(a.open_issues).toMatchObject({ held: false, hold: held.open_issues });
+    expect(r.json.data.healthy).toBe(false);
+    expect(r.json.problems).toEqual([expect.objectContaining({
+      severity: "warning", code: "SCHEDULE_HELD", asset: "issue_triage",
+      message: "issue_triage is held from the scheduler: code edited 12 min ago, not run by hand yet",
+      fix: expect.objectContaining({ kind: "command", command: "croft run issue_triage" }),
+    })]);
+    expect(r.json.next).toEqual([{ command: "croft run issue_triage", reason: "releases it for the scheduler (code edited 12 min ago, not run by hand yet)" }]);
+    expect((await run(p, ["--check", "--json"], d)).exit).toBe(1);
+    const human = (await run(p, [], d)).stdout;
+    expect(human).toMatch(/^issue_triage +18,556 +5 min ago +after inputs +held: code edited 12 min ago, not run by hand yet \(croft run issue_triage\)$/m);
+  });
+
+  test("stale: SCHEDULER_STALE (a warning) with the diagnosis and the tick log; not healthy", async () => {
+    const p = await pipeline({ files: { "assets/github_issues.ts": SCHEDULED_TS } });
+    turnOn(p, { via: "serve", heartbeat: "2026-09-22T18:50:00.000Z" });
+    mkdirSync(join(p.stateDir, "logs"), { recursive: true });
+    writeFileSync(join(p.stateDir, "logs", "tick.log"), "── 2026-09-22T18:50:00.000Z croft serve (pid 99) starts croft tick\n");
+    const d: StatusDeps = { scheduleView: async () => view() };
+    const r = await run(p, ["--json"], d);
+    expect(r.exit).toBe(0);
+    expect(r.json.data.scheduling).toEqual({ state: "on", via: "serve", lastTickAt: "2026-09-22T11:50:00-07:00", stale: true });
+    expect(r.json.data.healthy).toBe(false);
+    const stale = r.json.problems.find((x: { code: string }) => x.code === "SCHEDULER_STALE");
+    expect(stale).toMatchObject({ severity: "warning", details: { cause: "serve_not_running", via: "serve", quietForMs: 600_000 } });
+    expect(stale.message).toBe("the scheduler has not ticked for 10 min (last tick 2026-09-22T11:50:00-07:00): scheduling is on for croft serve only (croft schedule on --no-os-job), and croft serve is not running");
+    expect((await run(p, ["--check", "--json"], d)).exit).toBe(1);
+    const human = (await run(p, [], d)).stdout;
+    expect(human).toContain("Scheduling on · last tick 10 min ago (stale) · 0 running\n");
+    expect(human).toContain(`  ${join(p.stateDir, "logs", "tick.log")}, last lines:\n    ── 2026-09-22T18:50:00.000Z croft serve (pid 99) starts croft tick\n`);
+    expect(human).toContain("warn  SCHEDULER_STALE  the scheduler has not ticked for 10 min");
+  });
+
+  test("paused: NEXT says paused; the scheduling line says until when", async () => {
+    const p = await pipeline({ files: { "assets/github_issues.ts": SCHEDULED_TS } });
+    turnOn(p, { paused: "2026-09-22T21:00:00.000Z", heartbeat: "2026-09-22T17:00:00.000Z" });
+    const d: StatusDeps = { scheduleView: async () => view() };
+    const r = await run(p, ["--json"], d);
+    expect(r.json.data.scheduling).toEqual({ state: "paused", via: "os-job", lastTickAt: "2026-09-22T10:00:00-07:00", pausedUntil: "2026-09-22T14:00:00-07:00" });
+    expect(byAsset(r.json.data).github_issues.next).toEqual({ at: null, reason: "paused", schedule: "every hour" });
+    expect(r.json.data.healthy).toBe(true);
+    const human = (await run(p, [], d)).stdout;
+    expect(human).toMatch(/^github_issues +18,556 +5 min ago +paused +ok$/m);
+    expect(human.trimEnd().split("\n").at(-1)).toBe("Scheduling paused until 14:00 · last tick 2 h ago · 0 running");
+  });
+
+  test("the scheduler's view failing: NEXT comes from the schedule itself, with a warning", async () => {
+    const p = await pipeline({ files: { "assets/github_issues.ts": SCHEDULED_TS } });
+    turnOn(p, { heartbeat: "2026-09-22T18:59:48.000Z" });
+    const r = await run(p, ["--json"], { scheduleView: async () => { throw new Error("no such table: schedule_state"); } });
+    expect(r.exit).toBe(0);
+    expect(byAsset(r.json.data).github_issues.next).toEqual({ at: "2026-09-22T13:00:00-07:00", reason: "schedule", schedule: "every hour" });
+    expect(r.json.problems).toEqual([expect.objectContaining({ code: "INTERNAL_ERROR", severity: "warning" })]);
+    expect(r.json.problems[0].message).toContain("no such table: schedule_state");
   });
 });

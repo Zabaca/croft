@@ -8,21 +8,30 @@
 //
 // Human output shows each problem under its check, with its fix, as in the §2 example
 // (humanShowsProblems in the registry), rather than main.ts appending the standard blocks.
+//
+// The Scheduling section (§2, §8) says whether scheduling is on, who ticks (the per-user OS job or croft serve)
+// and when the last tick was, from runs.sqlite without creating it. A scheduler quiet for 3 minutes while on is
+// SCHEDULER_STALE with the likely cause and the end of the tick log; only then is the OS job inspected
+// (launchctl print, crontab -l).
 import { accessSync, constants as fsConstants, existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { CroftError, problem } from "../../core/errors.ts";
 import { now, offsetSeconds } from "../../core/time.ts";
 import type { LockHolder, Problem } from "../../core/types.ts";
+import { filesystemKind, folderKind, type FsKind } from "../../db/fs-kind.ts";
 import { isHolderAlive, liveIntents } from "../../db/intent.ts";
 import { CLAUDE_MD, claudeBlock, findBlock, SKILL_PATH, skillStamp } from "../../agent/templates.ts";
 import { ProjectEnv } from "../../project/env.ts";
 import { appRootOf, relocationPlan } from "../../project/init.ts";
 import { configProblems, findRoot, loadProject, syncedLocation, type ConfigIssue, type Project } from "../../project/root.ts";
+import { croftHome, type CroftHome } from "../../schedule/home.ts";
+import { type OsRunner, realRunner } from "../../schedule/os.ts";
 import type { CommandImpl } from "../command.ts";
 import { LAUNCH_ENV, SELF_ROOT } from "../launcher.ts";
 import { formatCount, formatProblem } from "../render.ts";
 import { BUN_FLOOR, BUN_TESTED, CROFT_VERSION, versionAtLeast } from "../version.ts";
+import { agoText, clockText, logTailLines, readScheduling, schedulingJson, type SchedulingRecord, staleProblem, tickerText } from "./schedule.ts";
 
 export type Section = "environment" | "project" | "scheduling";
 export type CheckStatus = "ok" | "warn" | "error" | "info";
@@ -58,6 +67,13 @@ export interface DoctorDeps {
   duckdbOffsets?(tz: string, instants: readonly number[]): Promise<number[] | null>;
   rosetta(): boolean;
   synced(path: string): string | null;
+  /** The filesystem of the database ("file") or of .croft/ ("folder"), db/fs-kind.ts: a VM or container share or a
+   *  network mount is SERVE_UNSAFE_FILESYSTEM. Default: the real probe (df and mount on macOS, /proc/mounts on Linux). */
+  filesystem?(path: string, kind: "file" | "folder"): FsKind;
+  /** ~/.croft, for the Scheduling section's diagnosis (the registry, the job's plist, tick.log). Default croftHome(env). */
+  croftHome?: CroftHome;
+  /** Inspects the scheduler job when the scheduler is stale. Default: realRunner. */
+  osRunner?: OsRunner;
   /** How long the warehouse probe waits on a lock before naming the holder. */
   lockWaitMs: number;
   healthTimeoutMs: number;
@@ -76,6 +92,9 @@ export function defaultDeps(env: Record<string, string | undefined>): DoctorDeps
     duckdbOffsets,
     rosetta: () => rosetta(env),
     synced: (p) => syncedLocation(p),
+    croftHome: croftHome(env),
+    // The test tripwire of this process holds whatever environment doctor was given.
+    osRunner: realRunner(process.env.CROFT_FORBID_OS_JOBS === "1" ? { ...env, CROFT_FORBID_OS_JOBS: "1" } : env),
     lockWaitMs: 150,
     healthTimeoutMs: 300,
   };
@@ -155,7 +174,7 @@ export async function runDoctor(cwd: string, d: DoctorDeps): Promise<{ data: Doc
   if (d.wsl) {
     r.add("environment", "wsl", "info", "WSL stops its VM when no terminal is open, so scheduled runs pause until one is");
   }
-  // HOOK(schedule): the Scheduling section (on/off, who ticks, SCHEDULER_STALE) belongs to the schedule slice.
+  if (project) checkScheduling(r, d, project);
 
   const count = (s: CheckStatus) => r.checks.filter((c) => c.status === s).length;
   // Stable section order for output: environment, project, scheduling.
@@ -665,6 +684,29 @@ function checkStorage(r: Report, d: DoctorDeps, project: Project): void {
     r.add("project", "storage", unsafe ? "error" : "warn", `storage: ${p.message}`, p);
     return;
   }
+  // The mount itself (db/fs-kind.ts): a VM or container share (virtiofs, Docker Desktop's grpcfuse and fakeowner,
+  // 9p) or a network filesystem, where a process on the other side neither sees nor honors DuckDB's lock.
+  const fsOf = d.filesystem ?? ((p: string, kind: "file" | "folder") => (kind === "file" ? filesystemKind(p) : folderKind(p)));
+  const mounts = [
+    { what: "the database", path: database, kind: fsOf(database, "file") },
+    { what: ".croft/", path: stateDir, kind: fsOf(stateDir, "folder") },
+  ];
+  const bad = mounts.find((m) => m.kind.unsafe !== null);
+  if (bad) {
+    const why = bad.kind.unsafe!;
+    const plan = relocationPlan(project.root, why, d.home);
+    const p = problem("SERVE_UNSAFE_FILESYSTEM", {
+      message: `${bad.what} is on ${why}, where DuckDB's file lock does not hold across machines and writes can be lost`,
+      hint: `move ${bad.path} to ${plan.dir} (a disk of the machine that runs croft) and set "database": "${plan.database}" and "stateDir": "${plan.stateDir}" in croft.json`,
+      fix: {
+        kind: "manual", requiresHuman: true,
+        description: `with no croft command running, move the database and .croft/ to ${plan.dir}, then set "database": "${plan.database}" and "stateDir": "${plan.stateDir}" in croft.json`,
+      },
+      details: { reason: why, relocateTo: plan.dir, path: bad.path, filesystem: bad.kind.type, mountPoint: bad.kind.mountPoint },
+    });
+    r.add("project", "storage", "error", `storage: ${p.message}`, p);
+    return;
+  }
   const rootWhy = d.synced(project.root);
   if (rootWhy) {
     r.add("project", "storage", "ok", `storage: the project folder is in ${rootWhy}; the database and .croft/ live in ${dirname(database)} (safe)`,
@@ -804,6 +846,50 @@ function checkClaudeFiles(r: Report, root: string): void {
     details: { reasons: s.reasons },
   });
   r.add("project", "claude", "warn", `CLAUDE_FILES_OUTDATED ${s.reasons[0]}${s.reasons.length > 1 ? ` (+${s.reasons.length - 1} more)` : ""}`, p);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scheduling
+
+/**
+ * "on · ticks from croft serve (pid 4121) · last tick 12 s ago" (§2). A scheduler quiet for 3 minutes while on is
+ * SCHEDULER_STALE, with the likely cause and the end of the tick log under the line.
+ */
+function checkScheduling(r: Report, d: DoctorDeps, project: Project): void {
+  let at: Date;
+  try { at = now(d.env); } catch { at = new Date(); }
+  const tz = project.timezone;
+  let rec: SchedulingRecord;
+  try {
+    rec = readScheduling(project.paths.stateDir, at);
+  } catch (e) {
+    r.add("scheduling", "scheduling", "info", `not read: ${String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 200)}`);
+    return;
+  }
+  const details = { ...schedulingJson(rec, tz) } as Record<string, unknown>;
+  if (rec.state === "off") {
+    r.add("scheduling", "scheduling", "info", "off (croft schedule on runs the scheduled ingests on their schedules)", undefined, details);
+    return;
+  }
+  const last = rec.heartbeatAt ? `last tick ${agoText(rec.heartbeatAt, at)}`
+    : rec.since ? `no tick since it was turned on ${agoText(rec.since, at)}` : "no tick yet";
+  if (rec.state === "paused") {
+    const until = rec.pausedUntil ? `until ${clockText(rec.pausedUntil, tz, at)} (croft schedule on resumes it now)` : "until croft schedule on";
+    r.add("scheduling", "scheduling", "ok", `paused ${until}${rec.heartbeatAt ? ` · ${last}` : ""}`, undefined, details);
+    return;
+  }
+  const s = servePid(project.paths.stateDir);
+  const serve = s?.alive ? { pid: s.pid } : null;
+  const head = `on · ticks from ${tickerText(rec, serve)} · ${last}`;
+  if (!rec.stale) {
+    r.add("scheduling", "scheduling", "ok", head, undefined, details);
+    return;
+  }
+  const p = staleProblem(rec, {
+    root: project.root, stateDir: project.paths.stateDir, tz, now: at, home: d.croftHome ?? croftHome(d.env), serve, platform: d.platform,
+    ...(rec.via === "os-job" && d.osRunner ? { runner: d.osRunner } : {}),
+  });
+  r.add("scheduling", "scheduling", "warn", [`${head} (stale)`, ...logTailLines(p, "")].join("\n"), p, details);
 }
 
 // ---------------------------------------------------------------------------------------------

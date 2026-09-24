@@ -18,6 +18,10 @@
 // listed with every row pending. A lookup of an incremental TS transform, an input its code reads only in full
 // with rows() and never with newRows() (lookupsOf), is read in full each run: readInFull, and nothing pending.
 //
+// An ingest's schedule (§8): as written, its cron, its next three fire times in the project zone and its last fire
+// and attempt (runs.sqlite schedule_state), with the project's scheduling setting, since nothing fires while it
+// is off or paused.
+//
 // This file also holds what the other read-only commands (context, query, secrets) share: loading asset
 // configs without failing on one broken file, the read-only warehouse, and value capping with redaction.
 import { readFileSync } from "node:fs";
@@ -36,10 +40,12 @@ import { parseSqlHeader } from "../../project/sql-asset.ts";
 import { didYouMean } from "../../project/suggest.ts";
 import { loadTsAsset } from "../../project/ts-asset.ts";
 import { countAfter, readInputFacts } from "../../run/snapshot.ts";
+import { parseSchedule, type Schedule } from "../../schedule/types.ts";
 import type { Row } from "../../types.ts";
 import type { CommandImpl, Ctx } from "../command.ts";
 import { formatCount, formatDuration, table, toJsonLine, truncate, VALUE_WIDTH } from "../render.ts";
-import { effectiveStatus, nextOf, openRunsDb, resolveAssets, runningEntries, zoned } from "./status.ts";
+import { clockText, nextFireOf, SCHEDULING_OFF, schedulingOf, type SchedulingRecord } from "./schedule.ts";
+import { type AssetNext, effectiveStatus, nextOf, openRunsDb, resolveAssets, runningEntries, zoned } from "./status.ts";
 
 // ---------------------------------------------------------------------------------------------------------
 // Asset configs, read from the files
@@ -571,12 +577,29 @@ export function capRows(rows: readonly Row[], o: { full: boolean; redact: (s: st
 // ---------------------------------------------------------------------------------------------------------
 // The command
 
+/** An ingest's schedule (§8). Instants are in the project zone. */
+export interface DescribeSchedule {
+  /** As written ("every hour"). */
+  text: string;
+  cron: string;
+  /** The next three fire times; they happen only while scheduling is on. */
+  nextFires: string[];
+  lastFireAt: string | null;
+  lastAttemptAt: string | null;
+  /** The project's scheduling setting. */
+  scheduling: SchedulingRecord["state"];
+  /** While paused: when it resumes on its own, or null (until `croft schedule on`). */
+  pausedUntil?: string | null;
+}
+
 export interface DescribeData {
   asset: string;
   kind: AssetKind | null;
   file: string | null;
   description: string | null;
-  next: { at: string | null; reason: string };
+  next: AssetNext;
+  /** Ingests with a schedule; null otherwise. */
+  schedule: DescribeSchedule | null;
   behavior: Behavior;
   /** The assets it reads (its definition's inputs; for a table without an asset file, what it last read). */
   reads: string[];
@@ -622,8 +645,14 @@ export const describe: CommandImpl<DescribeData> = {
     let catalogRefreshedAt: string | null = null;
     let steps: StepRecord[] = [];
     let dead = new Set<string>();
+    const now = ctx.now();
+    let scheduling: SchedulingRecord = SCHEDULING_OFF;
+    let fired: { lastFireAt: string | null; lastAttemptAt: string | null } = { lastFireAt: null, lastAttemptAt: null };
     try {
       if (runs) {
+        scheduling = schedulingOf(runs, now);
+        const s = runs.scheduleState(name);
+        if (s) fired = { lastFireAt: s.lastFireAt, lastAttemptAt: s.lastAttemptAt };
         const entry = runs.catalogGet<CatalogAsset>(name);
         catalog = entry?.value ?? null;
         catalogRefreshedAt = entry?.refreshedAt ?? null;
@@ -701,12 +730,19 @@ export const describe: CommandImpl<DescribeData> = {
       seenLoadedAt: zoned(s.seenLoadedAt, tz), inputLastLoadedAt: zoned(s.inputLastLoadedAt, tz), pendingRows: s.pendingRows,
       ...(s.readInFull ? { readInFull: true as const } : {}),
     }]));
+    const parsed = kind === "ingest" ? scheduleOf(resolved?.assets.find((a) => a.name === name)?.schedule, config?.schedule ?? null) : null;
+    const schedule: DescribeSchedule | null = parsed && found ? {
+      text: parsed.text, cron: parsed.cron, nextFires: nextFireOf(parsed.cron, tz, now, 3).map((t) => zoned(t.toISOString(), tz)!),
+      lastFireAt: zoned(fired.lastFireAt, tz), lastAttemptAt: zoned(fired.lastAttemptAt, tz), scheduling: scheduling.state,
+      ...(scheduling.state === "paused" ? { pausedUntil: zoned(scheduling.pausedUntil, tz) } : {}),
+    } : null;
     const data: DescribeData = {
       asset: name,
       kind,
       file: found?.file ?? null,
       description: config?.description ?? null,
-      next: nextOf(kind, !!found),
+      next: nextOf(kind, !!found, { state: scheduling.state, schedule: schedule?.text ?? null, at: schedule?.nextFires[0] ?? null }),
+      schedule,
       behavior,
       reads: [...inputs],
       readBy: readersOf(name, reads),
@@ -734,7 +770,7 @@ export const describe: CommandImpl<DescribeData> = {
     return { data, problems, next };
   },
   human(result, ctx) {
-    return formatDescribe(result.data, ctx.project.timezone, ctx.render.style.bold);
+    return formatDescribe(result.data, ctx.project.timezone, ctx.render.style.bold, ctx.now());
   },
 };
 
@@ -748,6 +784,15 @@ function orphanTable(name: string, kind: AssetKind | null, rows: number | null):
     hint: `put ${file} back to keep updating it; if the table should go instead, ask the user first: deleting it is destructive`,
     fix: { kind: "manual", requiresHuman: true, description: `restore ${file}, or ask the user whether ${name} should be deleted` },
   });
+}
+
+/** An ingest's schedule: the resolved one, else its config's text parsed (null when it does not parse: validate
+ *  reports SCHEDULE_INVALID). */
+function scheduleOf(resolved: Schedule | undefined, text: string | null): Schedule | null {
+  if (resolved) return resolved;
+  if (!text) return null;
+  const p = parseSchedule(text);
+  return p.ok ? p.schedule : null;
 }
 
 /** _croft.assets facts in the catalog's shape, so behaviorOf reads either. */
@@ -799,11 +844,36 @@ export function columnsText(columns: readonly { name: string; type: string; pend
   return parts.length > max ? `${shown} · … ${parts.length - max} more` : shown;
 }
 
-export function formatDescribe(d: DescribeData, tz: string, bold: (s: string) => string = (s) => s): string {
+/** The head line's last part (§4.2): "every hour (next 11:00 America/Los_Angeles)", "manual", "after inputs". */
+function nextWords(n: AssetNext, tz: string, now: Date): string {
+  switch (n.reason) {
+    case "none":
+      return "no asset file";
+    case "schedule":
+      return `${n.schedule} (next ${n.at ? `${clockText(n.at, tz, now)} ${tz}` : "unknown"})`;
+    case "scheduling off":
+    case "paused":
+      return `${n.schedule} (${n.reason})`;
+    default:
+      return n.reason;
+  }
+}
+
+/** "every hour (cron 0 * * * *) · next 13:00, 14:00, 15:00 · last fire 12:00", and why nothing fires when off or paused. */
+function scheduleText(s: DescribeSchedule, tz: string, now: Date): string {
+  const parts = [`${s.text} (cron ${s.cron})`];
+  if (s.nextFires.length) parts.push(`next ${s.nextFires.map((t) => clockText(t, tz, now)).join(", ")}`);
+  if (s.lastFireAt) parts.push(`last fire ${clockText(s.lastFireAt, tz, now)}`);
+  if (s.scheduling === "off") parts.push("scheduling is off (croft schedule on)");
+  if (s.scheduling === "paused") parts.push(`paused${s.pausedUntil ? ` until ${clockText(s.pausedUntil, tz, now)}` : ""} (croft schedule on resumes it)`);
+  return parts.join(" · ");
+}
+
+export function formatDescribe(d: DescribeData, tz: string, bold: (s: string) => string = (s) => s, now: Date = new Date()): string {
   const label = (s: string) => bold(s.padEnd(10));
-  const next = d.next.reason === "none" ? "no asset file" : d.next.reason;
-  const lines = [[d.asset, d.kind ?? "unknown kind", d.file ?? "(no asset file)", next].join(" · ")];
+  const lines = [[d.asset, d.kind ?? "unknown kind", d.file ?? "(no asset file)", nextWords(d.next, tz, now)].join(" · ")];
   if (d.description) lines.push(`${label("About")} ${d.description}`);
+  if (d.schedule) lines.push(`${label("Schedule")} ${scheduleText(d.schedule, tz, now)}`);
   lines.push(`${label("Behavior")} ${d.behavior.words}`);
   const cursor = cursorText(d.behavior, tz);
   if (cursor) lines.push(`${label("Cursor")} ${cursor}`);

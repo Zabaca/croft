@@ -14,11 +14,16 @@
 // edited asset whose table was built by older code also gets EDITED_SINCE_LAST_RUN, worded per kind: an
 // incremental TS transform is forward-only, so its warning says the rows already built keep their values.
 //
-// No scheduler yet (phase 3): `next` is "manual" for ingests and "after inputs" for transforms, nothing is
-// held, and scheduling is {state: "off", via: null}.
+// Scheduling (§8, schedule.ts): `next` is the next fire time for a scheduled ingest while scheduling is on
+// ("scheduling off" or "paused" otherwise), "manual" for an ingest without a schedule and "after inputs" for a
+// transform. While scheduling is on or paused, the scheduler's view (schedule/due.ts scheduleView, which imports
+// no asset code) gives the fire times and the holds: an asset a human must run first is `held` and reported as
+// SCHEDULE_HELD (a warning), with `croft run <asset>` as the fix. With scheduling off the view is never read.
+// SCHEDULER_STALE (a warning, with the likely cause and the tick log) says the scheduler has not ticked for 3
+// minutes while on.
 //
 // `status` exits 0 because the command worked; `--check` exits 1 when anything is failed, crashed, held or
-// stale, which makes it a health probe. In JSON, ok always means "the command worked" and data.healthy
+// stale (the scheduler included), which makes it a health probe. In JSON, ok always means "the command worked" and data.healthy
 // carries health.
 //
 // The catalog mirror says what was built, not that it is still there: status stats the warehouse file (it
@@ -38,8 +43,16 @@ import type { ResolvedAsset, ResolvedProject } from "../../project/resolve.ts";
 import type { Project } from "../../project/root.ts";
 import { readServeRecord } from "../../read/locate.ts";
 import { editedProblem, staleReasons, type StaleView } from "../../run/staleness.ts";
-import type { CommandImpl } from "../command.ts";
+import type { AssetScheduleView, HoldCode } from "../../schedule/due.ts";
+import { croftHome, type CroftHome } from "../../schedule/home.ts";
+import type { CommandImpl, CommandResult, Ctx, Next } from "../command.ts";
 import { formatCount, table } from "../render.ts";
+import {
+  clockText, defaultScheduleView, fireText, heldProblem, HUMAN_HOLDS, logTailLines, nextFireOf, type Scheduling, SCHEDULING_OFF,
+  schedulingJson, schedulingOf, type SchedulingRecord, type ScheduleViewFn, staleProblem,
+} from "./schedule.ts";
+
+export type { Scheduling } from "./schedule.ts";
 
 export interface RunningEntry {
   runId: string;
@@ -62,19 +75,32 @@ export interface StatusAsset {
   /** null when never built, or when the warehouse file is missing. */
   rows: number | null;
   lastRun: LastRun | null;
-  next: { at: string | null; reason: "manual" | "after inputs" | "none" };
+  next: AssetNext;
   /** A bare `croft run` would update it: staleReasons is not empty. */
   stale: boolean;
   /** run/staleness.ts: never_built, code_changed, input_changed, input_replaced. Empty while it runs. */
   staleReasons: Reason[];
+  /** The scheduler holds it until a human acts (SCHEDULE_HELD, LARGE_REPROCESS). */
   held: boolean;
+  /** Why the scheduler does not run it now, while scheduling is on or paused: a hold that needs a human (held), or
+   *  one that passes by itself (leased, paused, backoff). */
+  hold?: { code: HoldCode; reason: string };
   /** Its code differs from the code its last run used. */
   edited: boolean;
   filesGone?: string[];
   schemaChangedAt?: string;
 }
 
-export interface Scheduling { state: "on" | "off" | "paused"; via: "os-job" | "serve" | null; lastTickAt: string | null }
+/**
+ * When an asset runs next. "schedule": at the next fire time (scheduling on); "scheduling off" and "paused": a
+ * scheduled ingest that the scheduler does not run now; "manual": an ingest without a schedule; "after inputs": a
+ * transform; "none": no asset file. `schedule` is the ingest's schedule as written.
+ */
+export interface AssetNext {
+  at: string | null;
+  reason: "schedule" | "scheduling off" | "paused" | "manual" | "after inputs" | "none";
+  schedule?: string;
+}
 
 export interface StatusData {
   healthy: boolean;
@@ -246,9 +272,16 @@ export function schemaChangesFromRuns(db: RunsDb | null, since: Date): SummaryCh
   return out;
 }
 
-export function nextOf(kind: AssetKind | null, hasFile: boolean): StatusAsset["next"] {
+/**
+ * When an asset runs next, without the scheduler's view: an ingest's `schedule` (its text) makes it "scheduling
+ * off" or "paused" by the setting; while on, `at` is the next fire (the view's, else the schedule's own).
+ */
+export function nextOf(kind: AssetKind | null, hasFile: boolean, s?: { state: SchedulingRecord["state"]; schedule?: string | null; at?: string | null }): AssetNext {
   if (!hasFile) return { at: null, reason: "none" };
-  return { at: null, reason: kind === "ingest" ? "manual" : kind === null ? "manual" : "after inputs" };
+  if (kind !== null && kind !== "ingest") return { at: null, reason: "after inputs" };
+  if (!s?.schedule) return { at: null, reason: "manual" };
+  const reason = s.state === "on" ? "schedule" : s.state === "paused" ? "paused" : "scheduling off";
+  return { at: reason === "schedule" ? s.at ?? null : null, reason, schedule: s.schedule };
 }
 
 /**
@@ -262,13 +295,6 @@ export function lastRanStep(db: RunsDb, asset: string): StepRecord | null {
             ORDER BY started_at DESC, attempt DESC LIMIT 1`)
     .get(asset) as { run_id: string; asset: string; attempt: number } | null;
   return row ? db.getStep(row.run_id, row.asset, row.attempt) : null;
-}
-
-/** Whether a scheduler tick has checked in: the tick row's heartbeat, or null. */
-function lastTick(db: RunsDb | null, tz: string): string | null {
-  if (!db) return null;
-  const row = db.sqlite.query("SELECT heartbeat_at FROM tick WHERE id = 1").get() as { heartbeat_at: string | null } | null;
-  return zoned(row?.heartbeat_at ?? null, tz);
 }
 
 function serveOf(stateDir: string): { url: string; pid: number } | undefined {
@@ -321,6 +347,8 @@ export interface ProjectState {
   problems: Problem[];
   /** EDITED_SINCE_LAST_RUN, one per edited asset whose table older code built, in name order. */
   edited: Problem[];
+  /** SCHEDULER_STALE, then SCHEDULE_HELD per held asset; a warning when the scheduler's view could not be read. */
+  scheduling: Problem[];
   discovered: DiscoveredAsset[];
   /** The asset files resolved (kinds, code hashes, inputs, the graph); null when that failed (see problems). */
   resolved: ResolvedProject | null;
@@ -388,11 +416,36 @@ export function staleView(o: { name: string; file: string; kind: AssetKind; def:
   };
 }
 
+/** What status, context and their tests replace. */
+export interface StatusDeps {
+  /** The scheduler's view of the assets (schedule/due.ts scheduleView), read only while scheduling is not off. */
+  scheduleView?: ScheduleViewFn;
+  /** ~/.croft, for SCHEDULER_STALE's diagnosis (the registry, the job, tick.log); croftHome() by default. */
+  home?: CroftHome;
+}
+
+/** The scheduler's view by asset while scheduling is on or paused; a warning instead when it cannot be read. */
+async function schedulerView(root: string, now: Date, rec: SchedulingRecord, view: ScheduleViewFn):
+  Promise<{ byAsset: Map<string, AssetScheduleView>; problems: Problem[] }> {
+  if (rec.state === "off") return { byAsset: new Map(), problems: [] };
+  try {
+    return { byAsset: new Map((await view({ root, now })).map((v) => [v.asset, v])), problems: [] };
+  } catch (e) {
+    const p = e instanceof CroftError ? { ...e.problem } : problem("INTERNAL_ERROR", {
+      message: `the scheduler's view of the assets could not be read (${String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 300)}), so holds are not shown`,
+      hint: "croft schedule status reads the same view and shows the whole error; if it fails too, report this croft bug",
+      fix: { kind: "command", description: "show what the scheduler sees", command: "croft schedule status" },
+    });
+    p.severity = "warning";
+    return { byAsset: new Map(), problems: [p] };
+  }
+}
+
 /**
  * Everything `status` shows, from files, the catalog mirror and runs.sqlite only. `resolved` passes asset files
  * already resolved (resolveAssets); otherwise they are resolved here.
  */
-export async function collectStatus(project: Project, now: Date, o: { resolved?: ResolvedProject | null } = {}): Promise<ProjectState> {
+export async function collectStatus(project: Project, now: Date, o: { resolved?: ResolvedProject | null } & StatusDeps = {}): Promise<ProjectState> {
   const tz = project.timezone;
   const discovery = await discoverAssets(project.root, { assetsDir: project.paths.assetsDir });
   const resolution = o.resolved !== undefined ? { resolved: o.resolved, problems: [] } : await resolveAssets(project);
@@ -401,6 +454,8 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
   const definitions = new Map((resolved?.assets ?? []).map((a) => [a.name, a]));
   const db = openRunsDb(project.paths.stateDir);
   try {
+    const rec = db ? schedulingOf(db, now) : SCHEDULING_OFF;
+    const scheduler = await schedulerView(project.root, now, rec, o.scheduleView ?? defaultScheduleView);
     const catalog = db ? allCatalog(db) : [];
     const byName = new Map(catalog.map((c) => [c.asset, c]));
     const catalogByName = Object.fromEntries(byName);
@@ -460,16 +515,24 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
         if (warning) edits.push(warning);
       }
 
+      // When it runs next: the scheduler's view while scheduling is on, else the schedule's own next fire.
+      const sv = scheduler.byAsset.get(name) ?? null;
+      const schedule = sv?.schedule ?? def?.schedule ?? null;
+      const at = !schedule || rec.state !== "on" ? null
+        : sv ? sv.nextFireAt : nextFireOf(schedule.cron, tz, now)[0]?.toISOString() ?? null;
+      const hold = sv?.held ?? null;
       const out: StatusAsset = {
         asset: name, kind, file: file?.file ?? null, status, rows: cat && !missing ? cat.rows : null, lastRun,
-        next: nextOf(kind, !!file), stale: reasons.length > 0, staleReasons: reasons, held: false, edited,
+        next: nextOf(kind, !!file, { state: rec.state, schedule: schedule?.text ?? null, at: zoned(at, tz) }),
+        stale: reasons.length > 0, staleReasons: reasons, held: !!file && hold !== null && HUMAN_HOLDS.has(hold.code), edited,
       };
+      if (file && hold) out.hold = { code: hold.code, reason: hold.reason };
       if (cat?.filesGone?.length) out.filesGone = [...cat.filesGone];
       const changed = summaryChanges.filter((c) => c.asset === name).map((c) => c.at).sort().pop();
       if (changed) out.schemaChangedAt = zoned(changed, tz)!;
       return out;
     });
-    const healthy = !missing && !assets.some((a) => FAILED.has(a.status) || a.held || a.stale);
+    const healthy = !missing && !rec.stale && !assets.some((a) => FAILED.has(a.status) || a.held || a.stale);
     const recentSteps = db
       ? db.listRuns({ since: new Date(now.getTime() - 7 * DAY_MS), limit: 200 }).flatMap((r) => db.stepsFor(r.id))
       : [];
@@ -477,13 +540,22 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       healthy,
       running,
       assets,
-      scheduling: { state: "off", via: null, lastTickAt: lastTick(db, tz) },
+      scheduling: schedulingJson(rec, tz),
     };
     const serve = serveOf(project.paths.stateDir);
     if (serve) data.serve = serve;
     // resolveProject's problems are discovery's (all of them: no selectors) and CYCLE.
     const problems = [...(missing ? [missing] : []), ...(resolved ? resolved.problems : discovery.problems), ...resolution.problems];
-    return { data, problems, edited: edits, discovered: discovery.assets, resolved, catalog, recentSteps, dead, summaryChanges };
+    // The scheduler: stale (the diagnosis reads files only: no launchctl or crontab here), then the held assets.
+    const schedulingProblems: Problem[] = [];
+    if (rec.stale) {
+      schedulingProblems.push(staleProblem(rec, {
+        root: project.root, stateDir: project.paths.stateDir, tz, now, home: o.home ?? croftHome(), serve: serve ? { pid: serve.pid } : null,
+      }));
+    }
+    schedulingProblems.push(...scheduler.problems);
+    for (const a of assets) if (a.held && a.hold?.code === "SCHEDULE_HELD") schedulingProblems.push(heldProblem(a.asset, a.hold.reason));
+    return { data, problems, edited: edits, scheduling: schedulingProblems, discovered: discovery.assets, resolved, catalog, recentSteps, dead, summaryChanges };
   } finally {
     db?.close();
   }
@@ -511,29 +583,34 @@ export function staleText(reasons: readonly Reason[]): string | null {
 // The command
 
 export const status: CommandImpl<StatusData> = {
-  async run(ctx) {
-    const project = ctx.project;
-    const state = await collectStatus(project, ctx.now());
-    const check = ctx.values.check === true;
-    const unhealthy = !state.data.healthy;
-    const next = state.data.assets
-      .filter((a) => FAILED.has(a.status))
-      .slice(0, 3)
-      .map((a) => ({ command: `croft logs ${a.asset} --failed`, reason: `${a.asset} ${a.status}${a.lastRun?.code ? ` (${a.lastRun.code})` : ""}` }));
-    const stale = staleForNext(state.data.assets).map((a) => a.asset);
-    if (stale.length) {
-      const names = stale.length > 5 ? `${stale.slice(0, 5).join(", ")}, …` : stale.join(", ");
-      next.push({
-        command: "croft run --dry-run",
-        reason: `${stale.length} asset${stale.length === 1 ? " is" : "s are"} stale (${names}): see what a run would update and why`,
-      });
-    }
-    return { data: state.data, problems: [...state.problems, ...state.edited], next, ok: true, exit: check && unhealthy ? 1 : 0 };
-  },
+  run: (ctx) => runStatus(ctx),
   human(result, ctx) {
-    return formatStatus(result.data, ctx.now());
+    return formatStatus(result.data, ctx.now(), { tz: ctx.project.timezone, problems: result.problems });
   },
 };
+
+export async function runStatus(ctx: Ctx, deps: StatusDeps = {}): Promise<CommandResult<StatusData>> {
+  const project = ctx.project;
+  const state = await collectStatus(project, ctx.now(), { home: deps.home ?? croftHome(ctx.processEnv), ...(deps.scheduleView ? { scheduleView: deps.scheduleView } : {}) });
+  const check = ctx.values.check === true;
+  const unhealthy = !state.data.healthy;
+  const next: Next[] = state.data.assets
+    .filter((a) => FAILED.has(a.status))
+    .slice(0, 3)
+    .map((a) => ({ command: `croft logs ${a.asset} --failed`, reason: `${a.asset} ${a.status}${a.lastRun?.code ? ` (${a.lastRun.code})` : ""}` }));
+  const stale = staleForNext(state.data.assets).map((a) => a.asset);
+  if (stale.length) {
+    const names = stale.length > 5 ? `${stale.slice(0, 5).join(", ")}, …` : stale.join(", ");
+    next.push({
+      command: "croft run --dry-run",
+      reason: `${stale.length} asset${stale.length === 1 ? " is" : "s are"} stale (${names}): see what a run would update and why`,
+    });
+  }
+  for (const a of state.data.assets.filter((x) => x.held && x.hold?.code === "SCHEDULE_HELD").slice(0, 3)) {
+    next.push({ command: `croft run ${a.asset}`, reason: `releases it for the scheduler (${a.hold!.reason})` });
+  }
+  return { data: state.data, problems: [...state.problems, ...state.edited, ...state.scheduling], next, ok: true, exit: check && unhealthy ? 1 : 0 };
+}
 
 /** The STATUS column: the state plus the notes that matter (§4.2). */
 export function statusText(a: StatusAsset, now: Date): string {
@@ -563,8 +640,14 @@ export function statusText(a: StatusAsset, now: Date): string {
     default:
       head = "ok";
   }
+  // Held from the scheduler (§6): on a healthy row it is the state, with the run that releases it.
+  if (a.held && a.hold) {
+    const held = `held: ${a.hold.code === "LARGE_REPROCESS" ? "LARGE_REPROCESS, " : ""}${a.hold.reason}`;
+    if (head === "ok") head = a.hold.reason.includes("croft run") ? held : `${held} (croft run ${a.asset})`;
+    else notes.push(held);
+  }
   const stale = staleText(a.staleReasons);
-  // The command goes on a healthy row only: a failed one already names what to look at first.
+  // The command goes on a healthy row only: a failed or held one already names what to do first.
   if (stale) notes.push(head === "ok" ? `${stale} (croft run ${a.asset})` : stale);
   if (a.filesGone?.length) notes.push(`${a.filesGone.length} file${a.filesGone.length === 1 ? "" : "s"} gone`);
   if (a.schemaChangedAt) notes.push(`schema changed ${ago(a.schemaChangedAt, now)}`);
@@ -572,29 +655,50 @@ export function statusText(a: StatusAsset, now: Date): string {
   return [head, ...notes].join(" · ");
 }
 
-export function formatStatus(d: StatusData, now: Date): string {
+/** The NEXT column: "in 55 min", "Oct 1 00:00", "every hour (off)", "paused", "manual", "after inputs", "—". */
+export function nextText(n: AssetNext, tz: string, now: Date): string {
+  switch (n.reason) {
+    case "none":
+      return "—";
+    case "schedule":
+      return n.at ? fireText(n.at, tz, now) : n.schedule ?? "—";
+    case "scheduling off":
+      return `${n.schedule} (off)`;
+    default:
+      return n.reason;
+  }
+}
+
+/** The §4.2 table, what is running, and the scheduling line. `problems`: a SCHEDULER_STALE's tick log is printed
+ *  under the scheduling line. */
+export function formatStatus(d: StatusData, now: Date, o: { tz?: string; problems?: readonly Problem[] } = {}): string {
+  const tz = o.tz ?? "UTC";
+  const stale = o.problems?.find((p) => p.code === "SCHEDULER_STALE");
+  const tail = stale ? logTailLines(stale) : [];
   if (d.assets.length === 0) {
-    return ["No assets yet: add one to assets/ (croft docs ingest has templates), then croft run <asset>.", schedulingLine(d, now)].join("\n");
+    return ["No assets yet: add one to assets/ (croft docs ingest has templates), then croft run <asset>.", schedulingLine(d, now, tz), ...tail].join("\n");
   }
   const rows = d.assets.map((a) => [
     a.asset,
     a.rows === null ? "—" : formatCount(a.rows),
     a.lastRun ? ago(a.lastRun.at, now) : "—",
-    a.next.reason === "none" ? "—" : a.next.reason,
+    nextText(a.next, tz, now),
     statusText(a, now),
   ]);
   const lines = [table(["ASSET", "ROWS", "LAST RUN", "NEXT", "STATUS"], rows, { limit: Infinity, maxWidth: 200 }).text];
   for (const r of d.running) {
     lines.push(`running  ${r.runId}${r.asset ? `  ${r.asset}` : ""}${r.pid !== null ? `  pid ${r.pid}` : ""}  since ${ago(r.since, now).replace(/ ago$/, "")}${r.phase ? `  ${r.phase}` : ""}${r.rowsFetched !== null ? `  ${formatCount(r.rowsFetched)} rows fetched` : ""}`);
   }
-  lines.push(schedulingLine(d, now));
+  lines.push(schedulingLine(d, now, tz), ...tail);
   return lines.join("\n");
 }
 
-function schedulingLine(d: StatusData, now: Date): string {
-  const parts = [`Scheduling ${d.scheduling.state}`];
-  if (d.scheduling.lastTickAt) parts.push(`last tick ${ago(d.scheduling.lastTickAt, now)}`);
+function schedulingLine(d: StatusData, now: Date, tz: string): string {
+  const s = d.scheduling;
+  const parts = [`Scheduling ${s.state}${s.state === "paused" ? ` ${s.pausedUntil ? `until ${clockText(s.pausedUntil, tz, now)}` : "until croft schedule on"}` : ""}`];
+  if (s.lastTickAt) parts.push(`last tick ${ago(s.lastTickAt, now)}${s.stale ? " (stale)" : ""}`);
+  else if (s.state === "on") parts.push(s.stale ? "no tick yet (stale)" : "no tick yet");
   parts.push(`${d.running.length} running`);
-  if (d.serve) parts.push(`read server ${d.serve.url} (pid ${d.serve.pid})`);
+  if (d.serve) parts.push(`croft serve ${d.serve.url} (pid ${d.serve.pid})`);
   return parts.join(" · ");
 }

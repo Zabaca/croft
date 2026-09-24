@@ -12,6 +12,10 @@
 // declared secrets; their problems (a file that does not load, CHECK_INVALID) and EDITED_SINCE_LAST_RUN are
 // the payload's problems.
 //
+// Scheduling (§8): the project's setting as status shows it, each ingest's schedule and next run, and the assets
+// held from the scheduler (held[], with SCHEDULE_HELD in problems), from the scheduler's view while scheduling is
+// on or paused (status.ts collectStatus; never read while it is off).
+//
 // The payload is capped at 20 KB (§9.6). Past that it sheds detail in order: JSON keys, then column lists,
 // then whole assets from the end (listed in data.omitted), and says truncated: true. --asset narrows it.
 import { existsSync } from "node:fs";
@@ -22,14 +26,17 @@ import { hasState } from "../../db/state.ts";
 import type { CatalogAsset } from "../../history/catalog.ts";
 import { FAILED_STATUSES } from "../../history/runs-db.ts";
 import { didYouMean } from "../../project/suggest.ts";
+import { croftHome } from "../../schedule/home.ts";
 import type { Row } from "../../types.ts";
-import type { CommandImpl } from "../command.ts";
+import type { CommandImpl, CommandResult, Ctx } from "../command.ts";
 import { formatCount, toJsonLine } from "../render.ts";
 import {
   type AssetConfig, behaviorOf, checksOf, columnsText, configOf, declareProjectSecrets, isBusy, loadConfigs, readersOf, readOnlyWarehouse, readsOf,
 } from "./describe.ts";
+import { agoText, clockText, fireText } from "./schedule.ts";
 import {
-  ago, collectStatus, effectiveStatus, INSPECT_IMPORT_TIMEOUT_MS, type LastRun, type RunningEntry, type StatusAsset, statusText, zoned,
+  ago, collectStatus, effectiveStatus, INSPECT_IMPORT_TIMEOUT_MS, type LastRun, type RunningEntry, type Scheduling, type StatusAsset,
+  type StatusDeps, statusText, zoned,
 } from "./status.ts";
 
 export const CONTEXT_CAP_BYTES = 20 * 1024;
@@ -47,7 +54,13 @@ export interface CompactAsset {
   lastLoadedAt: string | null;
   status: StatusAsset["status"];
   lastRun: LastRun | null;
+  /** status's next.reason: "schedule", "scheduling off", "paused", "manual", "after inputs", "none". */
   next: string;
+  /** An ingest's schedule as written, and its next fire while scheduling is on (null otherwise). */
+  schedule?: string;
+  nextFireAt?: string | null;
+  /** Why the scheduler does not run it now (status's hold). */
+  hold?: StatusAsset["hold"];
   /** Why a bare `croft run` would update it (status's staleReasons); empty when fresh. */
   staleReasons: Reason[];
   /** Present when its code differs from the code its last run used. */
@@ -78,10 +91,11 @@ export interface ContextData {
     database: string;
     timezone: string;
     assets: number;
-    scheduling: { state: "on" | "off" | "paused"; via: "os-job" | "serve" | null };
+    scheduling: Scheduling;
   };
   assets: CompactAsset[];
   running: RunningEntry[];
+  /** The assets held from the scheduler until a human runs them (status's held). */
   held: string[];
   recentFailures: FailureEntry[];
   recentSchemaChanges: SchemaChangeEntry[];
@@ -133,7 +147,8 @@ function compact(s: StatusAsset, config: AssetConfig | null, cat: CatalogAsset |
     asset: s.asset, kind: s.kind, file: s.file, description: config?.description ?? null, behavior: b.words, key: b.key,
     cursor: b.incremental?.kind === "cursor" ? { field: b.incremental.field, value: b.incremental.cursorValue } : null,
     rows: s.rows, lastLoadedAt: zoned(cat?.lastLoadedAt ?? null, tz), status: s.status, lastRun: s.lastRun,
-    next: s.next.reason, staleReasons: [...s.staleReasons], ...(s.edited ? { edited: true as const } : {}), reads: [...reads],
+    next: s.next.reason, ...(s.next.schedule ? { schedule: s.next.schedule, nextFireAt: s.next.at } : {}), ...(s.hold ? { hold: s.hold } : {}),
+    staleReasons: [...s.staleReasons], ...(s.edited ? { edited: true as const } : {}), reads: [...reads],
     checks: checksOf(config, b.key).map((c) => (c.blocking ? c.check : `warn ${c.check}`)),
   };
   if (s.filesGone) out.filesGone = s.filesGone;
@@ -170,104 +185,121 @@ export function capContext(d: ContextData, cap = CONTEXT_CAP_BYTES): ContextData
 }
 
 export const context: CommandImpl<ContextData> = {
-  async run(ctx) {
-    const project = ctx.project;
-    const tz = project.timezone;
-    const now = ctx.now();
-    const since = new Date(now.getTime() - 7 * DAY_MS);
-    const state = await collectStatus(project, now);
-    const configs = await declareProjectSecrets(ctx, project, state.resolved
-      ? state.resolved.assets.map(configOf)
-      : await loadConfigs(project, state.discovered, { importTimeoutMs: INSPECT_IMPORT_TIMEOUT_MS }));
-    const byConfig = new Map(configs.map((c) => [c.name, c]));
-    const byCatalog = new Map(state.catalog.map((c) => [c.asset, c]));
-    const reads = readsOf(state.resolved, state.catalog);
-
-    let filter: Set<string> | null = null;
-    const wanted = ctx.values.asset;
-    if (wanted !== undefined) {
-      const names = (Array.isArray(wanted) ? wanted : [wanted]).map(String);
-      const known = state.data.assets.map((a) => a.asset);
-      for (const n of names) {
-        if (!known.includes(n)) {
-          const guess = didYouMean(n, known);
-          throw new CroftError("UNKNOWN_TABLE", {
-            message: `there is no asset named ${n}`,
-            hint: guess ? `did you mean ${guess}?` : "croft status lists the assets",
-            fix: guess ? { kind: "command", description: `use ${guess}`, command: `croft context --asset ${guess}` }
-              : { kind: "command", description: "list the assets", command: "croft status" },
-            details: { asset: n, ...(guess ? { suggestion: guess } : {}) },
-          });
-        }
-      }
-      filter = new Set(names);
-    }
-    const keep = (asset: string) => !filter || filter.has(asset);
-
-    const recentFailures: FailureEntry[] = state.recentSteps
-      .filter((s) => keep(s.asset))
-      .map((s) => ({ s, status: effectiveStatus(s, state.dead) }))
-      .filter(({ status }) => (FAILED_STATUSES as readonly string[]).includes(status))
-      .slice(0, 20)
-      .map(({ s, status }) => ({
-        asset: s.asset, runId: s.runId, at: zoned(s.finishedAt ?? s.startedAt, tz)!, status, code: s.error?.code ?? null,
-        message: s.error?.message ?? null,
-      }));
-
-    const warehouseProblems: Problem[] = [];
-    let recentSchemaChanges = await warehouseChanges(ctx, since, (p) => warehouseProblems.push(p));
-    let schemaChangesFrom: ContextData["schemaChangesFrom"] = "warehouse";
-    if (recentSchemaChanges === null) {
-      schemaChangesFrom = "runs";
-      recentSchemaChanges = state.summaryChanges.map((c) => changeEntry(c.asset, zoned(c.at, tz)!, c.runId, c.change));
-    }
-    recentSchemaChanges = recentSchemaChanges.filter((c) => keep(c.asset)).slice(0, 50)
-      .map((c) => ({ ...c, readBy: readersOf(c.asset, reads) }));
-
-    let data: ContextData = {
-      project: {
-        root: project.root, database: project.databaseLabel, timezone: tz, assets: state.data.assets.length,
-        scheduling: { state: state.data.scheduling.state, via: state.data.scheduling.via },
-      },
-      assets: state.data.assets.filter((a) => keep(a.asset))
-        .map((a) => compact(a, byConfig.get(a.asset) ?? null, byCatalog.get(a.asset) ?? null, reads.get(a.asset) ?? [], tz)),
-      running: state.data.running.filter((r) => r.asset === null || keep(r.asset)),
-      held: [],
-      recentFailures,
-      recentSchemaChanges,
-      schemaChangesFrom,
-      truncated: false,
-    };
-    data = capContext(data);
-
-    const problems: Problem[] = [
-      ...state.problems, ...configs.filter((c) => keep(c.name)).flatMap((c) => c.problems),
-      ...state.edited.filter((p) => p.asset === undefined || keep(p.asset)), ...warehouseProblems,
-    ];
-    const next = data.truncated
-      ? [{ command: "croft context --asset <name>", reason: "the payload was capped at 20 KB; narrow it to the assets you work on" }]
-      : [];
-    // context reports what it found; broken asset files are problems to fix, not a failure of the command.
-    return { data, problems, next, ok: true, exit: 0 };
-  },
+  run: (ctx) => runContext(ctx),
   human(result, ctx) {
-    return formatContext(result.data, ctx.now());
+    return formatContext(result.data, ctx.now(), ctx.project.timezone);
   },
 };
 
-export function formatContext(d: ContextData, now: Date): string {
-  const lines = [`${d.project.root} · ${d.project.database} · ${d.project.timezone} · ${d.project.assets} asset${d.project.assets === 1 ? "" : "s"} · scheduling ${d.project.scheduling.state}`];
+export async function runContext(ctx: Ctx, deps: StatusDeps = {}): Promise<CommandResult<ContextData>> {
+  const project = ctx.project;
+  const tz = project.timezone;
+  const now = ctx.now();
+  const since = new Date(now.getTime() - 7 * DAY_MS);
+  const state = await collectStatus(project, now, {
+    home: deps.home ?? croftHome(ctx.processEnv), ...(deps.scheduleView ? { scheduleView: deps.scheduleView } : {}),
+  });
+  const configs = await declareProjectSecrets(ctx, project, state.resolved
+    ? state.resolved.assets.map(configOf)
+    : await loadConfigs(project, state.discovered, { importTimeoutMs: INSPECT_IMPORT_TIMEOUT_MS }));
+  const byConfig = new Map(configs.map((c) => [c.name, c]));
+  const byCatalog = new Map(state.catalog.map((c) => [c.asset, c]));
+  const reads = readsOf(state.resolved, state.catalog);
+
+  let filter: Set<string> | null = null;
+  const wanted = ctx.values.asset;
+  if (wanted !== undefined) {
+    const names = (Array.isArray(wanted) ? wanted : [wanted]).map(String);
+    const known = state.data.assets.map((a) => a.asset);
+    for (const n of names) {
+      if (!known.includes(n)) {
+        const guess = didYouMean(n, known);
+        throw new CroftError("UNKNOWN_TABLE", {
+          message: `there is no asset named ${n}`,
+          hint: guess ? `did you mean ${guess}?` : "croft status lists the assets",
+          fix: guess ? { kind: "command", description: `use ${guess}`, command: `croft context --asset ${guess}` }
+            : { kind: "command", description: "list the assets", command: "croft status" },
+          details: { asset: n, ...(guess ? { suggestion: guess } : {}) },
+        });
+      }
+    }
+    filter = new Set(names);
+  }
+  const keep = (asset: string) => !filter || filter.has(asset);
+
+  const recentFailures: FailureEntry[] = state.recentSteps
+    .filter((s) => keep(s.asset))
+    .map((s) => ({ s, status: effectiveStatus(s, state.dead) }))
+    .filter(({ status }) => (FAILED_STATUSES as readonly string[]).includes(status))
+    .slice(0, 20)
+    .map(({ s, status }) => ({
+      asset: s.asset, runId: s.runId, at: zoned(s.finishedAt ?? s.startedAt, tz)!, status, code: s.error?.code ?? null,
+      message: s.error?.message ?? null,
+    }));
+
+  const warehouseProblems: Problem[] = [];
+  let recentSchemaChanges = await warehouseChanges(ctx, since, (p) => warehouseProblems.push(p));
+  let schemaChangesFrom: ContextData["schemaChangesFrom"] = "warehouse";
+  if (recentSchemaChanges === null) {
+    schemaChangesFrom = "runs";
+    recentSchemaChanges = state.summaryChanges.map((c) => changeEntry(c.asset, zoned(c.at, tz)!, c.runId, c.change));
+  }
+  recentSchemaChanges = recentSchemaChanges.filter((c) => keep(c.asset)).slice(0, 50)
+    .map((c) => ({ ...c, readBy: readersOf(c.asset, reads) }));
+
+  let data: ContextData = {
+    project: {
+      root: project.root, database: project.databaseLabel, timezone: tz, assets: state.data.assets.length,
+      scheduling: state.data.scheduling,
+    },
+    assets: state.data.assets.filter((a) => keep(a.asset))
+      .map((a) => compact(a, byConfig.get(a.asset) ?? null, byCatalog.get(a.asset) ?? null, reads.get(a.asset) ?? [], tz)),
+    running: state.data.running.filter((r) => r.asset === null || keep(r.asset)),
+    held: state.data.assets.filter((a) => a.held && keep(a.asset)).map((a) => a.asset),
+    recentFailures,
+    recentSchemaChanges,
+    schemaChangesFrom,
+    truncated: false,
+  };
+  data = capContext(data);
+
+  const problems: Problem[] = [
+    ...state.problems, ...configs.filter((c) => keep(c.name)).flatMap((c) => c.problems),
+    ...state.edited.filter((p) => p.asset === undefined || keep(p.asset)), ...warehouseProblems,
+    ...state.scheduling.filter((p) => p.asset === undefined || keep(p.asset)),
+  ];
+  const next = data.truncated
+    ? [{ command: "croft context --asset <name>", reason: "the payload was capped at 20 KB; narrow it to the assets you work on" }]
+    : [];
+  // context reports what it found; broken asset files are problems to fix, not a failure of the command.
+  return { data, problems, next, ok: true, exit: 0 };
+}
+
+/** "scheduling on (last tick 12 s ago)", "scheduling paused until 14:00", "scheduling off". */
+function schedulingWords(s: Scheduling, now: Date, tz: string): string {
+  if (s.state === "paused") return `scheduling paused ${s.pausedUntil ? `until ${clockText(s.pausedUntil, tz, now)}` : "until croft schedule on"}`;
+  if (s.state === "off") return "scheduling off";
+  return `scheduling on (${s.lastTickAt ? `last tick ${agoText(s.lastTickAt, now)}` : "no tick yet"}${s.stale ? ", stale" : ""})`;
+}
+
+export function formatContext(d: ContextData, now: Date, tz = d.project.timezone): string {
+  const lines = [`${d.project.root} · ${d.project.database} · ${d.project.timezone} · ${d.project.assets} asset${d.project.assets === 1 ? "" : "s"} · ${schedulingWords(d.project.scheduling, now, tz)}`];
   for (const a of d.assets) {
     const status: StatusAsset = {
       asset: a.asset, kind: a.kind, file: a.file, status: a.status, rows: a.rows, lastRun: a.lastRun,
       next: { at: null, reason: a.next as StatusAsset["next"]["reason"] }, stale: a.staleReasons.length > 0, staleReasons: a.staleReasons,
-      held: false, edited: a.edited === true,
+      held: a.hold !== undefined && d.held.includes(a.asset), ...(a.hold ? { hold: a.hold } : {}), edited: a.edited === true,
       ...(a.filesGone ? { filesGone: a.filesGone } : {}), ...(a.schemaChangedAt ? { schemaChangedAt: a.schemaChangedAt } : {}),
     };
     lines.push("");
     const rows = a.rows !== null ? `${formatCount(a.rows)} rows` : a.status === "unknown" || a.lastLoadedAt ? "rows unknown" : "not built";
     lines.push(`${a.asset} · ${a.kind ?? "unknown kind"} · ${a.file ?? "(no asset file)"} · ${rows} · ${statusText(status, now)}`);
     if (a.description) lines.push(`  ${a.description}`);
+    if (a.schedule) {
+      const when = a.next === "schedule" ? (a.nextFireAt ? `next ${fireText(a.nextFireAt, tz, now)}` : "next fire unknown")
+        : a.next === "paused" ? "paused" : "scheduling is off (croft schedule on)";
+      lines.push(`  schedule  ${a.schedule} · ${when}`);
+    }
     lines.push(`  behavior  ${a.behavior}`);
     if (a.cursor) lines.push(`  cursor    ${a.cursor.field} = ${a.cursor.value ?? "(nothing saved yet)"}`);
     if (a.reads.length) lines.push(`  reads     ${a.reads.join(", ")}`);

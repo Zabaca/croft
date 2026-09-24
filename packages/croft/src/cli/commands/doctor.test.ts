@@ -1,13 +1,18 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { DuckDBInstance } from "@duckdb/node-api";
 import { type ChildProcess, spawn } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { CODES } from "../../core/errors.ts";
 import { offsetSeconds } from "../../core/time.ts";
 import { CROFT_VERSION, SKILL_PATH, skillMd } from "../../agent/templates.ts";
+import type { FsKind } from "../../db/fs-kind.ts";
+import { RunsDb } from "../../history/runs-db.ts";
 import { initProject } from "../../project/init.ts";
+import { croftHome } from "../../schedule/home.ts";
+import type { OsRunner } from "../../schedule/os.ts";
+import { addProject } from "../../schedule/registry.ts";
 import { scan } from "../../agent/contract-testkit.ts";
 import { SELF_ROOT } from "../launcher.ts";
 import { main } from "../main.ts";
@@ -15,6 +20,7 @@ import { BUN_TESTED } from "../version.ts";
 import {
   type DoctorCheck, type DoctorDeps, type DuckdbProbe, duckdbOffsets, formatBytes, formatDoctor, probeDuckdb, runDoctor,
 } from "./doctor.ts";
+import { SINCE_KEY } from "./schedule.ts";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "doctor-")));
 const children: ChildProcess[] = [];
@@ -34,11 +40,12 @@ async function project(o: { app?: boolean; timezone?: string } = {}): Promise<st
 }
 
 const OK_PROBE: DuckdbProbe = { ok: true, version: "v1.5.5", extensions: ["autocomplete", "core_functions", "icu", "json", "parquet"], platformArch: `${process.platform}-${process.arch}` };
+const LOCAL: FsKind = { type: "apfs", mountPoint: "/", source: "mounts", unsafe: null };
 
 function deps(o: Partial<DoctorDeps> = {}): DoctorDeps {
   return {
     bunVersion: "1.3.14", platform: process.platform, arch: process.arch, croftRoot: SELF_ROOT, env: {}, home: join(base, "home"),
-    wsl: false, probeDuckdb: () => OK_PROBE, rosetta: () => false, synced: () => null, lockWaitMs: 150, healthTimeoutMs: 300, ...o,
+    wsl: false, probeDuckdb: () => OK_PROBE, rosetta: () => false, synced: () => null, filesystem: () => LOCAL, lockWaitMs: 150, healthTimeoutMs: 300, ...o,
   };
 }
 
@@ -100,7 +107,7 @@ describe("croft doctor --json", () => {
     expect(env).toMatchObject({ schemaVersion: 1, ok: true, command: "doctor", database: "warehouse.duckdb", timezone: "Asia/Tokyo", problems: [], next: [] });
     expect(env.durationMs).toBeLessThan(1000);
     const checks: DoctorCheck[] = env.data.checks;
-    expect(checks.map((c) => c.id)).toEqual(["bun", "croft", "duckdb", "warehouse", "serve", "config", "assets", "storage", "writable", "env", "claude"]);
+    expect(checks.map((c) => c.id)).toEqual(["bun", "croft", "duckdb", "warehouse", "serve", "config", "assets", "storage", "writable", "env", "claude", "scheduling"]);
     // The example asset, validated as croft validate does (and within the second).
     expect(check(checks, "assets")).toMatchObject({
       status: "ok", text: "1 asset · 0 errors, 0 warnings (details: croft validate)", details: { assets: 1, errors: 0, warnings: 0, info: 0 },
@@ -768,5 +775,121 @@ describe("TZDATA_MISMATCH: Bun's Intl and DuckDB's ICU agree on the project zone
     const differs = monthly.some((t, i) => duck[i] !== offsetSeconds(t, tz));
     const { problems } = await runDoctor(root, deps({ env: { CROFT_NOW: NOW } }));
     if (differs) expect(problems.map((p) => p.code)).toContain("TZDATA_MISMATCH");
+  });
+});
+
+// The Scheduling section (§2 example, §8): who ticks and when it last did; SCHEDULER_STALE with the diagnosis. A fake
+// ~/.croft (CROFT_HOME under a temp HOME) and a fake OsRunner: nothing here reads or runs the real scheduler.
+describe("the Scheduling section", () => {
+  const TICKED = "2026-09-24T17:04:48.000Z";
+  const AT = "2026-09-24T17:05:00.000Z";
+
+  function fakeHome() {
+    const userHome = join(base, `home${n++}`);
+    mkdirSync(userHome, { recursive: true });
+    return croftHome({ HOME: userHome, CROFT_HOME: join(userHome, ".croft"), CROFT_JOB_LABEL: `dev.croft.test-${process.pid}-${n}` });
+  }
+
+  function recorder(respond: (argv: readonly string[]) => { status: number; stderr?: string } = () => ({ status: 0 })) {
+    const calls: string[][] = [];
+    const runner: OsRunner = { exec: (argv) => (calls.push([...argv]), { stdout: "", stderr: "", ...respond(argv) }) };
+    return { runner, calls };
+  }
+
+  function turnOn(root: string, s: { state: "on" | "paused"; via: "os-job" | "serve"; pausedUntil?: string | null }, o: { since?: string; heartbeat?: string } = {}) {
+    const db = RunsDb.open(join(root, ".croft"));
+    db.setScheduling(s);
+    db.setSetting(SINCE_KEY, o.since ?? "2026-09-24T16:00:00.000Z");
+    if (o.heartbeat) db.heartbeat(o.heartbeat);
+    db.close();
+  }
+
+  test("off: an info line, and runs.sqlite is not created", async () => {
+    const root = await project();
+    const { data, problems } = await runDoctor(root, deps({ env: { CROFT_NOW: AT } }));
+    expect(check(data.checks, "scheduling")).toEqual({
+      id: "scheduling", section: "scheduling", status: "info", text: "off (croft schedule on runs the scheduled ingests on their schedules)",
+      details: { state: "off", via: null, lastTickAt: null },
+    });
+    expect(problems).toEqual([]);
+    expect(existsSync(join(root, ".croft", "runs.sqlite"))).toBe(false);
+  });
+
+  test("on, ticked by croft serve: the §2 line", async () => {
+    const root = await project({ timezone: "America/Los_Angeles" });
+    turnOn(root, { state: "on", via: "serve" }, { heartbeat: TICKED });
+    writeFileSync(join(root, ".croft", "serve.json"), JSON.stringify({ pid: process.pid, url: "http://127.0.0.1:1" }));
+    const { data } = await runDoctor(root, deps({ env: { CROFT_NOW: AT }, croftHome: fakeHome() }));
+    expect(check(data.checks, "scheduling")).toMatchObject({
+      status: "ok", text: `on · ticks from croft serve (pid ${process.pid}) · last tick 12 s ago`,
+      details: { state: "on", via: "serve", lastTickAt: "2026-09-24T10:04:48-07:00", stale: false },
+    });
+  });
+
+  test("on, ticked by the OS job, and paused", async () => {
+    const root = await project();
+    turnOn(root, { state: "on", via: "os-job" }, { heartbeat: TICKED });
+    const { runner, calls } = recorder();
+    const on = await runDoctor(root, deps({ env: { CROFT_NOW: AT }, croftHome: fakeHome(), osRunner: runner }));
+    expect(check(on.data.checks, "scheduling")).toMatchObject({ status: "ok", text: "on · ticks from the per-user OS job · last tick 12 s ago" });
+    expect(calls).toEqual([]);   // a healthy scheduler is not inspected
+    turnOn(root, { state: "paused", via: "os-job", pausedUntil: "2026-09-24T19:00:00.000Z" });
+    const paused = await runDoctor(root, deps({ env: { CROFT_NOW: AT }, croftHome: fakeHome() }));
+    expect(check(paused.data.checks, "scheduling")).toMatchObject({ status: "ok", text: "paused until 04:00 (croft schedule on resumes it now) · last tick 12 s ago" });
+  });
+
+  test("stale: SCHEDULER_STALE with the cause, the tick log under it, and the fix", async () => {
+    const root = await project();
+    const home = fakeHome();
+    addProject(home, { root, via: "os-job" });
+    mkdirSync(home.logDir, { recursive: true });
+    writeFileSync(home.tickLog, "2026-09-24T16:55:00.000Z tick: 1 project\n");
+    turnOn(root, { state: "on", via: "os-job" }, { heartbeat: "2026-09-24T16:55:00.000Z" });
+    // launchd does not know the job, and its plist is gone.
+    const { runner, calls } = recorder((argv) => (argv[1] === "print" ? { status: 113, stderr: "Could not find service" } : { status: 0 }));
+    const { data, problems } = await runDoctor(root, deps({ env: { CROFT_NOW: AT }, croftHome: home, osRunner: runner, platform: "darwin" }));
+    const c = check(data.checks, "scheduling");
+    expect(c).toMatchObject({ status: "warn", code: "SCHEDULER_STALE", details: { state: "on", stale: true } });
+    expect(c.text.split("\n")).toEqual([
+      "on · ticks from the per-user OS job · last tick 10 min ago (stale)",
+      `${home.tickLog}, last lines:`,
+      "  2026-09-24T16:55:00.000Z tick: 1 project",
+    ]);
+    expect(calls.map((x) => x[1])).toContain("print");
+    expect(problems).toEqual([expect.objectContaining({
+      code: "SCHEDULER_STALE", severity: "warning", fix: expect.objectContaining({ kind: "command", command: "croft schedule on" }),
+      details: expect.objectContaining({ cause: "job_missing" }),
+    })]);
+    const out = formatDoctor(data, problems);
+    expect(out).toContain([
+      "Scheduling",
+      "  warn  SCHEDULER_STALE on · ticks from the per-user OS job · last tick 10 min ago (stale)",
+      `        ${home.tickLog}, last lines:`,
+      "          2026-09-24T16:55:00.000Z tick: 1 project",
+      "        fix: croft schedule on",
+    ].join("\n"));
+  });
+});
+
+describe("storage: filesystems whose locks do not hold across machines (db/fs-kind.ts)", () => {
+  test("the database or .croft/ on a VM or container share, or a network mount: SERVE_UNSAFE_FILESYSTEM", async () => {
+    const root = await project();
+    const share: FsKind = { type: "virtiofs", mountPoint: "/mnt/share", source: "mounts", unsafe: "virtiofs, a VM or container file share" };
+    const seen: string[] = [];
+    const { data, problems } = await runDoctor(root, deps({ filesystem: (p) => (seen.push(p), p.endsWith("warehouse.duckdb") ? share : LOCAL) }));
+    expect(seen).toEqual([join(root, "warehouse.duckdb"), join(root, ".croft")]);
+    expect(check(data.checks, "storage")).toMatchObject({ status: "error", code: "SERVE_UNSAFE_FILESYSTEM" });
+    expect(problems.map((x) => x.code)).toEqual(["SERVE_UNSAFE_FILESYSTEM"]);
+    expect(problems[0]!.message).toBe("the database is on virtiofs, a VM or container file share, where DuckDB's file lock does not hold across machines and writes can be lost");
+    expect(problems[0]!.fix).toMatchObject({ kind: "manual", requiresHuman: true });
+    expect(problems[0]!.hint).toContain(`"database": "~/.local/share/croft/`);
+    expect(problems[0]!.details).toMatchObject({ reason: "virtiofs, a VM or container file share", filesystem: "virtiofs", mountPoint: "/mnt/share" });
+  });
+
+  test("a local disk is ok, and a probe that cannot tell says nothing", async () => {
+    const root = await project();
+    expect(check((await runDoctor(root, deps())).data.checks, "storage").status).toBe("ok");
+    const unknown: FsKind = { type: null, mountPoint: null, source: "none", unsafe: null };
+    expect(check((await runDoctor(root, deps({ filesystem: () => unknown }))).data.checks, "storage").status).toBe("ok");
   });
 });

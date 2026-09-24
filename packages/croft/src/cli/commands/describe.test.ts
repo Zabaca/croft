@@ -45,13 +45,13 @@ describe("croft describe --json", () => {
     expect(r.json).toMatchObject({ ok: true, command: "describe", problems: [] });
     const d = r.json.data;
     expect(Object.keys(d)).toEqual([
-      "asset", "kind", "file", "description", "next", "behavior", "reads", "readBy", "rows", "columns", "inputsSeen",
+      "asset", "kind", "file", "description", "next", "schedule", "behavior", "reads", "readBy", "rows", "columns", "inputsSeen",
       "builtWithCodeHash", "checks", "recentWrites", "recentRuns", "samples", "truncatedValues", "source",
     ]);
     // open_issues.sql selects from it.
     expect(d).toMatchObject({
       asset: "github_issues", kind: "ingest", file: "assets/github_issues.ts", description: "Issues of oven-sh/bun",
-      next: { at: null, reason: "manual" }, reads: [], readBy: ["open_issues"], rows: 3, inputsSeen: {}, builtWithCodeHash: "hash-1",
+      next: { at: null, reason: "manual" }, schedule: null, reads: [], readBy: ["open_issues"], rows: 3, inputsSeen: {}, builtWithCodeHash: "hash-1",
       source: "warehouse", truncatedValues: 0, recentRuns: [],
     });
     expect(d.behavior).toEqual({
@@ -315,6 +315,68 @@ describe("croft describe: human output", () => {
     expect(lines).toContain("Checks     unique(id) · not_null(id) · not_null(title) · state IN ('open', 'closed')");
     expect(r.stdout).not.toContain("not enforced");
     expect(r.stdout).toMatch(/Sample {5}id +title +state/);
+  });
+});
+
+// Scheduling (phase 3, §8): an ingest's schedule, its cron, the next three fires and the last fire. NOW is 12:00 in
+// Los Angeles, so "every hour" fires next at 13:00, 14:00 and 15:00.
+describe("croft describe: schedule", () => {
+  const SCHEDULED_TS = ISSUES_TS.replace('key: "id",', 'key: "id",\n  schedule: "every hour",');
+
+  function scheduling(p: { stateDir: string }, s: { state: "on" | "off" | "paused"; via: "os-job" | "serve" | null; pausedUntil?: string | null }) {
+    const db = runsDb(p.stateDir);
+    try {
+      db.setScheduling(s);
+      db.putScheduleState("github_issues", { lastFireAt: "2026-09-22T19:00:00.000Z", lastAttemptAt: "2026-09-22T19:00:02.000Z" });
+    } finally {
+      db.close();
+    }
+  }
+
+  test("on: the schedule, its cron, the next three fires and the last fire; next is the first of them", async () => {
+    const p = await issues({ "assets/github_issues.ts": SCHEDULED_TS });
+    scheduling(p, { state: "on", via: "os-job" });
+    const r = await cli(["describe", "github_issues", "--json"], { cwd: p.root, env: ENV });
+    expect(r.exit).toBe(0);
+    expect(r.json.data.schedule).toEqual({
+      text: "every hour", cron: "0 * * * *",
+      nextFires: ["2026-09-22T13:00:00-07:00", "2026-09-22T14:00:00-07:00", "2026-09-22T15:00:00-07:00"],
+      lastFireAt: "2026-09-22T12:00:00-07:00", lastAttemptAt: "2026-09-22T12:00:02-07:00", scheduling: "on",
+    });
+    expect(r.json.data.next).toEqual({ at: "2026-09-22T13:00:00-07:00", reason: "schedule", schedule: "every hour" });
+    const human = (await cli(["describe", "github_issues"], { cwd: p.root, env: ENV })).stdout.split("\n");
+    expect(human[0]).toBe("github_issues · ingest · assets/github_issues.ts · every hour (next 13:00 America/Los_Angeles)");
+    expect(human).toContain("Schedule   every hour (cron 0 * * * *) · next 13:00, 14:00, 15:00 · last fire 12:00");
+  });
+
+  test("off: the fires it would have, and that scheduling is off", async () => {
+    const p = await issues({ "assets/github_issues.ts": SCHEDULED_TS });
+    const r = await cli(["describe", "github_issues", "--json"], { cwd: p.root, env: ENV });
+    expect(r.json.data.schedule).toMatchObject({ text: "every hour", cron: "0 * * * *", lastFireAt: null, lastAttemptAt: null, scheduling: "off" });
+    expect(r.json.data.schedule.nextFires).toHaveLength(3);
+    expect(r.json.data.next).toEqual({ at: null, reason: "scheduling off", schedule: "every hour" });
+    const human = (await cli(["describe", "github_issues"], { cwd: p.root, env: ENV })).stdout.split("\n");
+    expect(human[0]).toBe("github_issues · ingest · assets/github_issues.ts · every hour (scheduling off)");
+    expect(human).toContain("Schedule   every hour (cron 0 * * * *) · next 13:00, 14:00, 15:00 · scheduling is off (croft schedule on)");
+  });
+
+  test("paused: said so, with when it resumes", async () => {
+    const p = await issues({ "assets/github_issues.ts": SCHEDULED_TS });
+    scheduling(p, { state: "paused", via: "os-job", pausedUntil: "2026-09-22T21:30:00.000Z" });
+    const r = await cli(["describe", "github_issues", "--json"], { cwd: p.root, env: ENV });
+    expect(r.json.data.next).toEqual({ at: null, reason: "paused", schedule: "every hour" });
+    const human = (await cli(["describe", "github_issues"], { cwd: p.root, env: ENV })).stdout.split("\n");
+    expect(human[0]).toBe("github_issues · ingest · assets/github_issues.ts · every hour (paused)");
+    expect(human).toContain("Schedule   every hour (cron 0 * * * *) · next 13:00, 14:00, 15:00 · last fire 12:00 · paused until 14:30 (croft schedule on resumes it)");
+  });
+
+  test("transforms and unscheduled ingests have none", async () => {
+    const p = await issues();
+    const r = await cli(["describe", "open_issues", "--json"], { cwd: p.root, env: ENV });
+    expect(r.json.data.schedule).toBeNull();
+    const human = await cli(["describe", "github_issues"], { cwd: p.root, env: ENV });
+    expect(human.stdout.split("\n")[0]).toBe("github_issues · ingest · assets/github_issues.ts · manual");
+    expect(human.stdout).not.toMatch(/^Schedule/m);
   });
 });
 
