@@ -196,9 +196,23 @@ export function resultColumns(reader: DuckDBResultReader): ColumnInfo[] {
 /** All rows of a fully read result as objects. Duplicate column names get DuckDB's `:1` suffixes; a column
  *  named "__proto__" is an ordinary key. */
 export function renderRows(reader: DuckDBResultReader, ctx: RenderContext): Row[] {
-  const names = reader.deduplicatedColumnNames();
-  const types = reader.columnTypes();
-  const rows = reader.getRows();
+  return renderValueRows(reader.getRows(), { names: reader.deduplicatedColumnNames(), types: reader.columnTypes() }, ctx);
+}
+
+/** The column names (deduplicated, as renderRows keys them) and types of a result, fully read or streaming. */
+export interface ResultShape { names: readonly string[]; types: readonly DuckDBType[] }
+
+/** The shape of a streaming result (`connection.stream()`), whose rows arrive one chunk at a time. */
+export function resultShape(result: { deduplicatedColumnNames(): string[]; columnTypes(): DuckDBType[] }): ResultShape {
+  return { names: result.deduplicatedColumnNames(), types: result.columnTypes() };
+}
+
+/**
+ * Row-major DuckDB values as objects, keyed by `shape.names`: the rows of one chunk of a streaming result (a TS
+ * transform streams its input snapshots chunk by chunk, run/inputs.ts), or of a fully read one (renderRows).
+ */
+export function renderValueRows(rows: readonly (readonly DuckDBValue[])[], shape: ResultShape, ctx: RenderContext): Row[] {
+  const { names, types } = shape;
   const proto = names.includes("__proto__");
   const out: Row[] = new Array(rows.length);
   for (let r = 0; r < rows.length; r++) {
