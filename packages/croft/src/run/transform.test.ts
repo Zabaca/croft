@@ -150,6 +150,10 @@ const tx = (h: H, fn: (db: Sql) => Promise<void>) => h.w.write("test", fn, { run
 const S1 = "2026-03-01T10:00:00.000001Z";
 const S2 = "2026-03-01T10:00:00.000002Z";
 const S3 = "2026-03-01T10:00:00.000003Z";
+/** S1 and S2 as StepResult.inputs shows them (§4 Conventions): in the project zone (Los Angeles) with its offset.
+ *  The state (_croft.inputs, _croft.writes) keeps UTC. */
+const L1 = "2026-03-01T02:00:00.000001-08:00";
+const L2 = "2026-03-01T02:00:00.000002-08:00";
 
 const ISSUES = { id: "BIGINT", title: "VARCHAR" };
 const issues = (ids: number[], stamp: string, title = (id: number) => `issue ${id}`) =>
@@ -195,7 +199,7 @@ describe("full-refresh transforms", () => {
     expect(out.result.status).toBe("ok");
     expect(out.result.rows).toEqual({ in: 3, added: 3, updated: 0, unchanged: 0, deleted: 0, total: 3 });
     expect(out.result.created?.columns).toBe(2);
-    expect(out.result.inputs).toEqual([{ input: "issues", seenBefore: null, seenAfter: S1, rows: 3 }]);
+    expect(out.result.inputs).toEqual([{ input: "issues", seenBefore: null, seenAfter: L1, rows: 3 }]);
     expect(await all(h, `SELECT issue_id, loud FROM loud ORDER BY issue_id`)).toEqual([
       { issue_id: 1, loud: "ISSUE 1" }, { issue_id: 2, loud: "ISSUE 2" }, { issue_id: 3, loud: "ISSUE 3" },
     ]);
@@ -519,7 +523,7 @@ describe("newRows() positions never skip rows (§3e)", () => {
     const next = await step(h, s);
     expect(g.__t_seen).toEqual(["2", "6"]);
     expect(next.result.rows).toMatchObject({ in: 2, added: 1, updated: 1, total: 6 });
-    expect(next.result.inputs).toEqual([{ input: "issues", seenBefore: S1, seenAfter: S2, rows: 2 }]);
+    expect(next.result.inputs).toEqual([{ input: "issues", seenBefore: L1, seenAfter: L2, rows: 2 }]);
   });
 
   test("keys compare by their type (9 < 10 as BIGINT), and composite keys column by column", async () => {
@@ -790,7 +794,7 @@ describe("chunked commits (§3e)", () => {
       [{ input: "issues", seenBefore: S1, seenAfter: S1, rows: 3 }],
       [{ input: "issues", seenBefore: S1, seenAfter: S1, rows: 1 }],
     ]);
-    expect(out.result.inputs).toEqual([{ input: "issues", seenBefore: null, seenAfter: S1, rows: 7 }]);
+    expect(out.result.inputs).toEqual([{ input: "issues", seenBefore: null, seenAfter: L1, rows: 7 }]);
     expect(existsSync(pendingChunkDir(h.stateDir, "t"))).toBe(false);
   });
 

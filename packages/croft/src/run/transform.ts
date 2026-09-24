@@ -53,6 +53,7 @@ import { codeError, createdTable, croftError, FAIRNESS_YIELD_MS, fault, jsonKeys
 import { stepAborted, TransformInputs } from "./inputs.ts";
 import type { PlannedStep } from "./plan.ts";
 import { countAfter, type InputFacts, type InputSnapshot, readInputFacts, type SeenPosition } from "./snapshot.ts";
+import { inputsInZone } from "./sql.ts";
 import type { StepInput, StepOutcome } from "./step.ts";
 
 /** When an incremental transform commits a chunk (§3e): at the first newRows() request after the chunk holds
@@ -327,7 +328,7 @@ export async function runTransform(i: StepInput): Promise<StepOutcome> {
   ];
   const result: StepResult = {
     asset, status: "ok", reason: notes.filter(Boolean).join("; "), behavior: step.behavior, attempt: i.attempt, maxAttempts: i.maxAttempts,
-    rows: r, schemaChanges: totals.schemaChanges, checks: totals.checks, requests: progress.requests, inputs: finalInputs,
+    rows: r, schemaChanges: totals.schemaChanges, checks: totals.checks, requests: progress.requests, inputs: inputsInZone(finalInputs, project.timezone),
     ...(totals.created ? { created: createdTable(catalog.columns) } : {}),
     logsCommand: `croft logs ${asset}`, durationMs: Date.now() - started,
   };

@@ -22,6 +22,7 @@
 // CROFT_FAULT=before_commit|after_commit_before_sqlite kills the process at that point (crash tests).
 import { runWarnings } from "../checks/run.ts";
 import { CroftError, isCode } from "../core/errors.ts";
+import { formatInstant } from "../core/time.ts";
 import type { Problem, Sql, StepResult } from "../core/types.ts";
 import { hasState } from "../db/state.ts";
 import { putCatalog, readCatalogEntry } from "../history/catalog.ts";
@@ -134,7 +135,7 @@ export async function runSqlStep(i: StepInput): Promise<StepOutcome> {
   const result: StepResult = {
     asset, status: "ok", reason: step.reason, behavior: step.behavior, attempt: i.attempt, maxAttempts: i.maxAttempts,
     rows: r.rows, schemaChanges: r.schemaChanges, checks: [...r.checks, ...late.results],
-    ...(read.length ? { inputs: read } : {}),
+    ...(read.length ? { inputs: inputsInZone(read, i.project.timezone) } : {}),
     ...(r.created ? { created: createdTable(out.catalog.columns) } : {}),
     logsCommand: `croft logs ${asset}`, durationMs: Date.now() - started,
   };
@@ -156,6 +157,22 @@ function loadError(step: PlannedStep, p: Problem | undefined): CroftError {
 }
 
 const us = (v: number | bigint | null | undefined) => (v === null || v === undefined ? null : isoMicros(BigInt(v)));
+
+/**
+ * StepResult.inputs as JSON shows instants (§4 Conventions): seenBefore and seenAfter in the project zone with its
+ * offset, as describe's inputsSeen shows the same positions. The state (_croft.inputs, _croft.writes.inputs) keeps
+ * them in UTC; this is only how a step's result shows them. SQL and TS transform steps both use it.
+ */
+export function inputsInZone(inputs: NonNullable<StepResult["inputs"]>, timezone: string): NonNullable<StepResult["inputs"]> {
+  const at = (iso: string): string => {
+    try {
+      return formatInstant(iso, timezone);
+    } catch {
+      return iso; // "" (nothing read yet) or anything else that is not an instant
+    }
+  };
+  return inputs.map((x) => ({ ...x, seenBefore: x.seenBefore === null ? null : at(x.seenBefore), seenAfter: at(x.seenAfter) }));
+}
 
 /** Each input's last_loaded_at, version and rows as this transaction sees them, and the position recorded
  *  before. */

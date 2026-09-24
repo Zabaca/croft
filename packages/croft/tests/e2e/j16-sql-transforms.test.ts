@@ -434,11 +434,11 @@ bugTest("journey 16d: `run <asset> --upstream` builds, or at least names, the ne
   expect(daily.error?.hint ?? "", show(r)).not.toContain("correct the check");
 }, 60_000);
 
-// BUG (reported): DESIGN §4 Conventions: "Timestamps in JSON are ISO-8601 with the project offset", so they agree
+// Fixed (was a reported bug): DESIGN §4 Conventions: "Timestamps in JSON are ISO-8601 with the project offset", so they agree
 // with ::DATE and with `croft query`. CHECK_FAILED's details.sample (and StepResult.checks[].sample, and the
 // rendered sample line) show a TIMESTAMPTZ as UTC with microseconds ("2026-03-01T18:00:00.000000Z"), while
 // `croft query` shows the same value as "2026-03-01T10:00:00-08:00".
-bugTest("journey 16e: CHECK_FAILED samples render timestamps with the project offset, as croft query does", () => {
+test("journey 16e: CHECK_FAILED samples render timestamps with the project offset, as croft query does", () => {
   expect(checkFailedRun).toBeDefined();
   const bad = stepOf(checkFailedRun!, "clean_orders");
   const sample = bad.error.details.sample[0];
@@ -447,10 +447,10 @@ bugTest("journey 16e: CHECK_FAILED samples render timestamps with the project of
   expect(bad.error.message).toContain('ordered_at="2026-03-01T10:00:00-08:00"');
 });
 
-// BUG (reported): the same convention for StepResult.inputs (§4.3 `inputs?: [{input, seenBefore, seenAfter,
+// Fixed (was a reported bug): the same convention for StepResult.inputs (§4.3 `inputs?: [{input, seenBefore, seenAfter,
 // rows}]`): seenBefore/seenAfter are UTC ("2026-09-24T15:28:38.925000Z"), while describe's inputsSeen shows
 // the same positions with the project offset.
-bugTest("journey 16f: a transform step's inputs[].seenBefore/seenAfter carry the project offset", () => {
+test("journey 16f: a transform step's inputs[].seenBefore/seenAfter carry the project offset", () => {
   expect(rebuildRun).toBeDefined();
   const inputs = stepOf(rebuildRun!, "clean_orders").inputs as Step[];
   expect(inputs.length).toBe(1);
@@ -470,9 +470,9 @@ bugTest("journey 16g: a time zone change is the reason given, not an SQL change"
   expect(clean.reason).not.toContain("SQL changed");
 });
 
-// BUG (reported): the run output counts a failing *warning* as a failed check: "checks 2/3 ok" on an ok step,
+// Fixed (was a reported bug): the run output counts a failing *warning* as a failed check: "checks 2/3 ok" on an ok step,
 // where §4.2 shows blocking checks and warnings apart ("checks 3/3 ok · 1 warning").
-bugTest("journey 16h: human run output counts warnings apart from checks (checks 2/2 ok · 1 warning)", async () => {
+test("journey 16h: human run output counts warnings apart from checks (checks 2/2 ok · 1 warning)", async () => {
   const { project: p } = await initProject();
   p.write("assets/numbers.sql", "-- key: n\n-- warn: n < 2\nSELECT * FROM (VALUES (1), (2), (3)) AS t(n)\n");
   const r = await p.croft(["run", "numbers"]);
@@ -481,9 +481,9 @@ bugTest("journey 16h: human run output counts warnings apart from checks (checks
   expect(r.stdout).not.toContain("checks 2/3 ok");
 }, 60_000);
 
-// BUG (reported): a failed step's multi-line error (CHECK_FAILED with its sample rows) is printed as is under the
+// Fixed (was a reported bug): a failed step's multi-line error (CHECK_FAILED with its sample rows) is printed as is under the
 // step, so its sample rows start at column 3 and break the run table; §3f shows them indented under the step.
-bugTest("journey 16i: a failed step's sample rows are indented under the step in human run output", async () => {
+test("journey 16i: a failed step's sample rows are indented under the step in human run output", async () => {
   const { project: p } = await initProject();
   p.write("assets/numbers.sql", "-- key: n\n-- check: n < 3\nSELECT * FROM (VALUES (1), (2), (3)) AS t(n)\n");
   const r = await p.croft(["run", "numbers"]);

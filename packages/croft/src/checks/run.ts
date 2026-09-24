@@ -4,7 +4,8 @@
 // `min_rows` the whole table; a check whose text changed since the last run covers the whole table once. An
 // incremental TS transform commits in chunks: min_rows applies once its run has finished, at the last chunk
 // (ChunkCheckContext).
-// CHECK_FAILED details are {check, failing, sample}: 20 sample rows collected, 3 rendered.
+// CHECK_FAILED details are {check, failing, sample}: 20 sample rows collected, 3 rendered. A sample shows a
+// TIMESTAMPTZ with the project offset, as `croft query` does (instantsInZone).
 //
 // Also in the details: `checked` (the rows in scope) and `scope` ("batch" or "table"); a blocking failure adds
 // `results`, every blocking check's result, since the hook throws instead of returning them. Every blocking
@@ -28,6 +29,7 @@
 // write back like a failure: data a check cannot vouch for is not committed. A warning that cannot run is a
 // warning-severity CHECK_INVALID; a failing warning a warning-severity CHECK_FAILED. Neither is ever an error.
 import { CroftError, problem } from "../core/errors.ts";
+import { formatInstant } from "../core/time.ts";
 import type { Check, Problem, Sql } from "../core/types.ts";
 import type { CheckContext, CheckHookResult, WriteBatchInput } from "../load/write.ts";
 import { quoteIdent, quoteLiteral } from "../load/evolve.ts";
@@ -189,9 +191,9 @@ async function evaluate(sql: Sql, t: Target, c: Check, whole: boolean, counts: C
         `SELECT count(*) AS groups, coalesce(sum(n), 0) AS n FROM (SELECT count(*) AS n FROM ${t.table} WHERE ${set} GROUP BY ${list} HAVING count(*) > 1)`);
       const failing = num(r?.n);
       if (failing === 0) return ok();
-      const sample = await sql.all<Row>(
+      const sample = await sampleRows(sql,
         `SELECT * EXCLUDE (${STAMP}) FROM ${t.table} WHERE ${set} QUALIFY count(*) OVER (PARTITION BY ${list}) > 1 ORDER BY ${list} LIMIT ${SAMPLE_ROWS}`);
-      return { check: c, result: { check: c.source, ok: false, failing, sample: sample.map(plainRow) }, checked: counts.total, whole: true, groups: num(r?.groups) };
+      return { check: c, result: { check: c.source, ok: false, failing, sample }, checked: counts.total, whole: true, groups: num(r?.groups) };
     }
     let fails: string;
     if (c.kind === "not_null") {
@@ -209,8 +211,8 @@ async function evaluate(sql: Sql, t: Target, c: Check, whole: boolean, counts: C
     const [r] = await sql.all<{ n: unknown }>(`SELECT count(*) AS n FROM ${t.table} WHERE ${scope}${fails}`);
     const failing = num(r?.n);
     if (failing === 0) return ok();
-    const sample = await sql.all<Row>(`SELECT * EXCLUDE (${STAMP}) FROM ${t.table} WHERE ${scope}${fails} LIMIT ${SAMPLE_ROWS}`);
-    return { check: c, result: { check: c.source, ok: false, failing, sample: sample.map(plainRow) }, checked, whole, widened };
+    const sample = await sampleRows(sql, `SELECT * EXCLUDE (${STAMP}) FROM ${t.table} WHERE ${scope}${fails} LIMIT ${SAMPLE_ROWS}`);
+    return { check: c, result: { check: c.source, ok: false, failing, sample }, checked, whole, widened };
   } catch (e) {
     throw asCheckError(e, t, c);
   }
@@ -315,6 +317,48 @@ function summary(x: Outcome): string {
 const MAX_TEXT = 200;
 const SHOWN_TEXT = 24;
 const LINE_WIDTH = 96;
+
+/** The rows of `select`, a sample query, as a sample shows them: safe for JSON (plainRow), instants in the project
+ *  zone (instantsInZone). */
+async function sampleRows(sql: Sql, select: string): Promise<Row[]> {
+  const rows = await sql.all<Row>(select);
+  return (await instantsInZone(sql, select, rows)).map(plainRow);
+}
+
+/**
+ * `rows`, read by `select` on `sql`, with each TIMESTAMPTZ as JSON shows it: in the project zone with its offset,
+ * as `croft query` does, so it agrees with ::DATE (§4 Conventions). A lease reads a TIMESTAMPTZ as UTC with Z
+ * (its "ts" mode). The columns are the ones `select` returns as TIMESTAMPTZ (DESCRIBE, which only binds it), so text
+ * that looks like an instant is never touched; the zone is DuckDB's session TimeZone, the project's
+ * (db/connect.ts). Top-level columns only. For any sample of rows a problem carries (load/write.ts has one too).
+ */
+export async function instantsInZone(sql: Sql, select: string, rows: Row[]): Promise<Row[]> {
+  if (!rows.length) return rows;
+  let z: { tz: unknown; cols: unknown } | undefined;
+  try {
+    [z] = await sql.all<{ tz: unknown; cols: unknown }>(
+      `SELECT current_setting('TimeZone') AS tz, list(column_name) FILTER (WHERE column_type = 'TIMESTAMP WITH TIME ZONE') AS cols
+       FROM (DESCRIBE ${select})`);
+  } catch {
+    return rows;   // `select` just ran, so its DESCRIBE binds; should it not, the sample keeps UTC rather than fail
+  }
+  const zoned = Array.isArray(z?.cols) ? z.cols.map(String) : [];
+  if (!zoned.length) return rows;
+  const tz = typeof z?.tz === "string" && z.tz ? z.tz : "UTC";
+  const inZone = (v: unknown): unknown => {
+    if (typeof v !== "string") return v;
+    try {
+      return formatInstant(v, tz);
+    } catch {
+      return v;   // "infinity", "-infinity"
+    }
+  };
+  return rows.map((r) => {
+    const out: Row = { ...r };
+    for (const k of zoned) if (Object.hasOwn(out, k)) out[k] = inZone(out[k]);
+    return out;
+  });
+}
 
 /** A sample row safe for JSON: bigints as numbers when exact (else their digits), long strings cut. */
 function plainRow(r: Row): Row {

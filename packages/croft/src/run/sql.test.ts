@@ -27,8 +27,8 @@ afterAll(async () => {
 
 interface Env { project: Project; env: ProjectEnv; warehouse: DuckWarehouse; runs: RunsDb }
 
-function setup(): Env {
-  const root = makeProject({}, { timezone: "UTC" });
+function setup(timezone = "UTC"): Env {
+  const root = makeProject({}, { timezone });
   const project = loadProject({ root });
   const warehouse = openWarehouse({
     path: project.paths.database, mode: "read_write", timezone: project.timezone, root, stateDir: project.paths.stateDir, register: false, isTTY: false,
@@ -42,6 +42,8 @@ const T0 = "2026-09-22T10:00:00.000000Z";
 const T1 = "2026-09-22T11:00:00.000000Z";
 const T2 = "2026-09-22T12:00:00.000000Z";
 const T3 = "2026-09-22T13:00:00.000000Z";
+/** T0 as StepResult.inputs shows it (§4 Conventions): with the project offset (UTC here). The state keeps T0. */
+const Z0 = "2026-09-22T10:00:00+00:00";
 
 /** Write an upstream asset the way its own step would: rows from a SELECT, through writeBatch. */
 async function seed(e: Env, asset: string, select: string, o: { now: string; kind?: AssetKind; key?: string[]; write?: "replace" | "merge" }): Promise<void> {
@@ -126,7 +128,7 @@ describe("runSqlStep", () => {
     expect(out.result).toMatchObject({
       asset: "open_issues", status: "ok", reason: "requested", behavior: "replace; key id", attempt: 1, maxAttempts: 1,
       rows: { in: 2, added: 2, updated: 0, unchanged: 0, deleted: 0, total: 2 }, schemaChanges: [], checks: [],
-      inputs: [{ input: "issues", seenBefore: null, seenAfter: T0, rows: 3 }],
+      inputs: [{ input: "issues", seenBefore: null, seenAfter: Z0, rows: 3 }],
       created: { columns: 2, jsonColumns: 0 }, logsCommand: "croft logs open_issues",
     });
     expect(out.warnings).toEqual([]);
@@ -144,6 +146,18 @@ describe("runSqlStep", () => {
     expect(out.catalog!.columns.map((c) => [c.name, c.type])).toEqual([["id", "INTEGER"], ["title", "VARCHAR"], ["_loaded_at", "TIMESTAMPTZ"]]);
     expect(getCatalog(e.runs, "open_issues")).toEqual(out.catalog!);
     expect(await temps(e)).toEqual([]);
+  });
+
+  test("StepResult.inputs shows positions with the project offset (§4 Conventions); the state keeps UTC", async () => {
+    const e = setup("America/Los_Angeles");
+    await seed(e, "issues", ISSUES, { now: T0, key: ["id"] });
+    const step = sqlStep("open_issues", "SELECT id, title FROM issues WHERE state = 'open'", { key: ["id"], inputs: ["issues"] });
+    await run(e, step, { at: T1 });
+    const again = await run(e, step, { at: T2 });
+    expect(again.result.inputs).toEqual([{ input: "issues", seenBefore: "2026-09-22T03:00:00-07:00", seenAfter: "2026-09-22T03:00:00-07:00", rows: 3 }]);
+    expect(await inputsOf(e, "open_issues")).toEqual([{ input: "issues", seen: T0, k: null, last: T0 }]);
+    const writes = await read<{ inputs: unknown }>(e, `SELECT inputs FROM _croft.writes WHERE asset = 'open_issues' ORDER BY loaded_at`);
+    expect(writes[0]!.inputs).toEqual([{ input: "issues", seenBefore: null, seenAfter: T0, rows: 3 }]);
   });
 
   test("SELECT * over every asset kind leaves croft's reserved columns out, joins included", async () => {
@@ -188,7 +202,7 @@ describe("runSqlStep", () => {
     await run(e, step, { at: T1 });
     const same = await run(e, step, { at: T2 });
     expect(same.result.rows).toEqual({ in: 2, added: 0, updated: 0, unchanged: 2, deleted: 0, total: 2 });
-    expect(same.result.inputs).toEqual([{ input: "issues", seenBefore: T0, seenAfter: T0, rows: 3 }]);
+    expect(same.result.inputs).toEqual([{ input: "issues", seenBefore: Z0, seenAfter: Z0, rows: 3 }]);
     expect(same.catalog!.lastLoadedAt).toBe(T1);
     await seed(e, "issues", `SELECT * FROM (VALUES (1, 'crash!', 'open'), (2, 'docs', 'open'), (3, 'hang', 'closed')) AS v(id, title, state)`, { now: T2, key: ["id"] });
     const changed = await run(e, step, { at: T3 });
@@ -356,7 +370,7 @@ describe("runSqlStep failures", () => {
     expect(staleReasons(await view())).toEqual([]);
     // The position stays at the input's last_loaded_at; the version seen is the later of it and last_replaced_at.
     expect(await inputsOf(e, "issue_count")).toEqual([{ input: "issues", seen: T0, k: null, last: T2 }]);
-    expect(out.result.inputs).toEqual([{ input: "issues", seenBefore: T0, seenAfter: T0, rows: 2 }]);
+    expect(out.result.inputs).toEqual([{ input: "issues", seenBefore: Z0, seenAfter: Z0, rows: 2 }]);
     await run(e, step, { at: T3 });
     expect(staleReasons(await view())).toEqual([]);
   });

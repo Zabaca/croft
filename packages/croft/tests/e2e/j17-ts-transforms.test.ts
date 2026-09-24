@@ -432,10 +432,10 @@ export default transform({
     expect(await p.rows("select label from issue_labels where issue_id = 4")).toEqual([{ label: "question" }]);
   }, 120_000);
 
-  // BUG (cosmetic, cli/commands/run.ts stepLines): a failed step prints `${code}: ${message}` as is, so the sample
+  // Fixed (was a cosmetic bug, cli/commands/run.ts stepLines): a failed step prints `${code}: ${message}` as is, so the sample
   // rows of a CHECK_FAILED message (lines of their own) start at column 2 instead of under the step, unlike
   // DESIGN §3f's rendering, and they break the column layout of the run's lines.
-  bugTest("c2. the human run output keeps CHECK_FAILED's sample rows under the failed step", () => {
+  test("c2. the human run output keeps CHECK_FAILED's sample rows under the failed step", () => {
     expect(checkFailedText).toBeDefined();
     const lines = checkFailedText!.split("\n");
     const head = lines.findIndex((l) => /^failed\s+issue_labels\s+CHECK_FAILED/.test(l));
@@ -515,11 +515,11 @@ export default transform({
     expect(llm.total()).toBe(9);
   }, 120_000);
 
-  // BUG (cli/commands/run.ts settleConfirmation; R flagged it in p2w2-elsewhere.md): a confirmed LARGE_REPROCESS
+  // Fixed (was a bug in cli/commands/run.ts settleConfirmation; R flagged it in p2w2-elsewhere.md): a confirmed LARGE_REPROCESS
   // run spends its token in the runner but trashes nothing, so settleConfirmation takes it for a run that did not
   // need the confirmation. croft confirm then reports outcome "not_needed" with the note "nothing destructive was
   // left to do, so it ran as a plain command", for a token that was needed and used (§6: outcome "used").
-  bugTest("d2. croft confirm of a cost-guard token reports outcome used, not not_needed", () => {
+  test("d2. croft confirm of a cost-guard token reports outcome used, not not_needed", () => {
     expect(reprocessConfirmed).toBeDefined();
     expect(reprocessConfirmed!.data.outcome).toBe("used");
     expect(reprocessConfirmed!.data.note).toBeUndefined();

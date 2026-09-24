@@ -13,6 +13,7 @@ import { Confirmations } from "../../safety/confirm.ts";
 import { listTrash } from "../../safety/trash.ts";
 import { cleanupProjects, cli, cliEnv, keysetIssues, makeProject, mockApi, PKG, simpleGet, slowPages, startCli, until } from "../../run/testkit.ts";
 import { main } from "../main.ts";
+import type { StepResult } from "../../core/types.ts";
 import { formatRun, progressLine, userArgs } from "./run.ts";
 
 const api = mockApi();
@@ -305,6 +306,64 @@ describe("--allow-shrink through the CLI", () => {
     expect(await count(root, "zones")).toBe(3);
   }, 60_000);
 
+  test("off a TTY, a confirmed run that no longer needs its token says not_needed, whichever of parent and child settles it", async () => {
+    api.state.zones = [1, 2, 3].map((zone) => ({ zone, v: 1 }));
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    expect((await cli(root, ["run", "zones", "--json"])).code).toBe(0);
+    api.state.zones = [];
+    const asked = await cli(root, ["run", "zones", "--allow-shrink", "--json"]);
+    expect(asked.code).toBe(5);
+    const token = asked.json!.confirmation.token as string;
+    api.state.zones = [1, 2, 3].map((zone) => ({ zone, v: 2 }));   // the source recovered
+    const plain = await cli(root, ["confirm", token, "--json"]);
+    expect(plain.code).toBe(0);
+    expect(plain.json!.data).toMatchObject({ outcome: "not_needed", result: { steps: [{ status: "ok" }] } });
+    expect(plain.json!.data.note).toContain(`did not need confirmation ${token}`);
+    withRuns(root, (db) => expect(new Confirmations(db).get(token)!.usedAt).not.toBeNull());
+  }, 60_000);
+
+  test("croft confirm of a cost-guard token (LARGE_REPROCESS) reports outcome used, detached and in-process (§6)", async () => {
+    api.state.zones = [1, 2, 3].map((zone) => ({ zone }));
+    const triage = `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["zones"],
+  key: "zone",
+  incremental: true,
+  confirmAbove: 2,
+  async *rows({ newRows, http }) {
+    for await (const r of newRows<{ zone: number }>("zones")) {
+      await http.get("${api.url}/zones");
+      yield { zone: r.zone, seen: true };
+    }
+  },
+});
+`;
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones", '\n  key: "zone",'), "assets/triage.ts": triage });
+    expect((await cli(root, ["run", "zones", "--only", "--json"])).code).toBe(0);
+    const ask = async () => {
+      const r = await cli(root, ["run", "triage", "--json"]);
+      expect(r.code).toBe(5);
+      expect(r.json!.confirmation).toMatchObject({ command: "croft run triage", impact: { action: "incremental transform; LARGE_REPROCESS override" } });
+      return r.json!.confirmation.token as string;
+    };
+
+    // Off a TTY: the run detaches; its child spends the token where the guard asks.
+    const t1 = await ask();
+    const done = await cli(root, ["confirm", t1, "--json"]);
+    expect(done.code).toBe(0);
+    expect(done.json!.data).toMatchObject({ token: t1, outcome: "used", result: { steps: [{ asset: "triage", status: "ok", rows: { added: 3 } }] } });
+    expect(done.json!.data.note).toBeUndefined();
+
+    // On a TTY: the run is this process.
+    api.state.zones = [4, 5, 6].map((zone) => ({ zone }));
+    expect((await cli(root, ["run", "zones", "--only", "--json"])).code).toBe(0);
+    const t2 = await ask();
+    const here = await inProcess(root, ["confirm", t2, "--json"], { stdinTTY: true, stdoutTTY: true });
+    expect(here.exit).toBe(0);
+    expect(here.json.data).toMatchObject({ token: t2, outcome: "used", result: { steps: [{ asset: "triage", status: "ok", rows: { added: 3 } }] } });
+    expect(here.json.data.note).toBeUndefined();
+  }, 60_000);
+
   test("the grant variable means nothing to a plain run, and is never passed on to its detached child", async () => {
     api.state.zones = [{ zone: 1 }];
     const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
@@ -439,19 +498,44 @@ describe("in-process command", () => {
     expect(progressLine({ type: "step", asset: "f", status: "running", attempt: 1 }, kinds)).toBe("f: loading files…");
   });
 
-  test("formatRun: the checks that ran (phase 2 evaluates them)", () => {
-    const text = formatRun({
-      runId: "r_0922_1015_k3f9", status: "succeeded",
-      steps: [{ asset: "open_issues", status: "ok", reason: "requested; SQL changed (assets/open_issues.sql)", behavior: "replace; key id", attempt: 1, maxAttempts: 3,
-        rows: { in: 4211, added: 3, updated: 12, unchanged: 4196, deleted: 0, total: 4211 }, schemaChanges: [],
-        checks: [{ check: "unique(id)", ok: true }, { check: "not_null(id)", ok: true }, { check: "id > 0", ok: false, failing: 2 }],
-        logsCommand: "croft logs open_issues", durationMs: 100 }],
+  test("formatRun: the checks that ran (phase 2 evaluates them); a failing warning is counted apart (§4.2)", () => {
+    const step = (checks: StepResult["checks"]): StepResult => ({
+      asset: "open_issues", status: "ok", reason: "requested; SQL changed (assets/open_issues.sql)", behavior: "replace; key id", attempt: 1, maxAttempts: 3,
+      rows: { in: 4211, added: 3, updated: 12, unchanged: 4196, deleted: 0, total: 4211 }, schemaChanges: [], checks,
+      logsCommand: "croft logs open_issues", durationMs: 100,
     });
+    const text = formatRun({ runId: "r_0922_1015_k3f9", status: "succeeded", steps: [step([{ check: "unique(id)", ok: true }, { check: "not_null(id)", ok: true }, { check: "id > 0", ok: false, failing: 2 }])] });
+    // On an ok step every blocking check passed, so a failing entry is a warning.
     expect(text.split("\n").slice(1, 4)).toEqual([
       "ok       open_issues        4,211 rows (100 ms)",
-      "                            added 3 · updated 12 · unchanged 4,196 · 4,211 rows now · checks 2/3 ok",
+      "                            added 3 · updated 12 · unchanged 4,196 · 4,211 rows now · checks 2/2 ok · 1 warning",
       "                            SQL changed (assets/open_issues.sql)",
     ]);
+    const second = (checks: StepResult["checks"]) => formatRun({ runId: "r_0922_1015_k3f9", status: "succeeded", steps: [step(checks)] }).split("\n")[2];
+    expect(second([{ check: "unique(id)", ok: true }, { check: "not_null(id)", ok: true }])).toEndWith("4,211 rows now · checks 2/2 ok");
+    expect(second([{ check: "a > 0", ok: false, failing: 1 }, { check: "b > 0", ok: false }])).toEndWith("4,211 rows now · 2 warnings");
+  });
+
+  test("formatRun: a failed step's multi-line error stays under the step's text column (§3f)", () => {
+    const failed = (asset: string): StepResult => ({
+      asset, status: "failed", reason: "requested", behavior: "replace; key id", attempt: 2, maxAttempts: 3,
+      rows: { in: 0, added: 0, updated: 0, unchanged: 0, deleted: 0, total: 0 }, schemaChanges: [], checks: [],
+      logsCommand: `croft logs ${asset} --failed`, durationMs: 5,
+      error: { severity: "error", code: "CHECK_FAILED", message: "not_null(author): 3 of 4,211 rows\n  id=2291  author=NULL\nalso failing: id > 0: 1 of 4,211 rows", hint: "", docs: "" },
+    });
+    const text = formatRun({ runId: "r_0922_1015_k3f9", status: "failed", steps: [failed("open_issues")] });
+    expect(text.split("\n").slice(1, 5)).toEqual([
+      "failed   open_issues        CHECK_FAILED: not_null(author): 3 of 4,211 rows (attempt 2 of 3)",
+      "                              id=2291  author=NULL",
+      "                            also failing: id > 0: 1 of 4,211 rows",
+      "                            croft logs open_issues --failed",
+    ]);
+    // A name longer than its column moves the text column; the block follows it.
+    const long = "a_rather_long_asset_name";
+    const lines = formatRun({ runId: "r_0922_1015_k3f9", status: "failed", steps: [failed(long)] }).split("\n").slice(1, 5);
+    const column = lines[0]!.indexOf("CHECK_FAILED");
+    expect(column).toBe(10 + long.length);
+    for (const l of lines.slice(1)) expect(l.length - l.trimStart().length).toBeGreaterThanOrEqual(column);
   });
 
   test("formatRun: still running, failed and skipped steps", () => {
