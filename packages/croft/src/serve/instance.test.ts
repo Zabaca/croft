@@ -26,6 +26,8 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // A query that runs for hours unless interrupted, and passes the serve gate (range() is allowed).
 const SLOW = "SELECT sum(a.range * b.range) AS s FROM range(10000000) a, range(1000000) b";
+// A query that interrupts cannot stop for seconds (one list_reduce call over 20M values; p.n = 20000000).
+const STUCK = "SELECT list_reduce(range(n), (a, b) -> a + b) AS x FROM p";
 
 // ---- engines ------------------------------------------------------------------------------------------
 
@@ -250,6 +252,73 @@ describe("queries", () => {
     expect(err.problem.hint).toBeString();
     expect((await e.query(q("SELECT range FROM range(20)", { limit: 20 }))).rowCount).toBe(20);
     expect((await e.query(q("SELECT range FROM range(0)", { limit: 0 }))).rows).toEqual([]);
+  });
+
+  test("DuckDB stops at limit + 1: a 20M-row table with limit 10 fails at once, and the worker's memory stays flat", async () => {
+    const p = await makeProject({ seed: ["CREATE TABLE big AS SELECT range AS id, repeat('x', 40) || range::VARCHAR AS s FROM range(20000000)"] });
+    const peaks: number[] = [];
+    const { e } = await engine(p, { hooks: { queryEnded: (x) => peaks.push(x.workerPeakRss) } });
+    await e.query(q("SELECT count(*) AS c FROM big"));
+    const before = peaks.at(-1)!;
+    const start = Date.now();
+    const err = await rejection(e.query(q("SELECT * FROM big", { limit: 10 })));
+    expect(err.code).toBe("QUERY_TOO_MANY_ROWS");
+    expect(err.problem.details).toMatchObject({ limit: 10 });
+    expect(Date.now() - start).toBeLessThan(2000 + SLACK);
+    // Materialized, the result took about 1.4 GB; streamed, a few chunks.
+    expect(peaks.at(-1)! - before).toBeLessThan(200 * 1024 * 1024);
+    // The same with a 1 MB cap and a limit that allows everything: it fails as the bytes pass the cap.
+    const capped = await engine(p, { maxBytes: 1024 * 1024, hooks: { queryEnded: (x) => peaks.push(x.workerPeakRss) } });
+    await capped.e.query(q("SELECT 1 AS x"));
+    const before2 = peaks.at(-1)!;
+    const big = await rejection(capped.e.query(q("SELECT * FROM big", { limit: 50_000_000 })));
+    expect(big.code).toBe("QUERY_TOO_MANY_ROWS");
+    expect(big.problem.details).toMatchObject({ maxBytes: 1024 * 1024 });
+    expect(peaks.at(-1)! - before2).toBeLessThan(200 * 1024 * 1024);
+  }, 60_000);
+
+  test("DESCRIBE, SUMMARIZE, SHOW TABLES and PIVOT stream like any SELECT; SHOW ALL TABLES is refused", async () => {
+    const p = await seeded({ seed: ["CREATE TABLE t AS SELECT range AS n, 'x' || range AS s FROM range(5)", "CREATE SCHEMA _croft", "CREATE TABLE _croft.meta (key VARCHAR, value VARCHAR)"] });
+    const { e } = await engine(p);
+    expect((await e.query(q("DESCRIBE t"))).rows.map((r) => r.column_name)).toEqual(["n", "s"]);
+    expect((await e.query(q("SUMMARIZE t"))).rowCount).toBe(2);
+    expect((await e.query(q("SHOW TABLES"))).rows).toEqual([{ name: "t" }]);
+    expect((await e.query(q("PIVOT t ON s IN ('x1', 'x2') USING count(*)"))).columns.map((c) => c.name)).toEqual(["n", "x1", "x2"]);
+    const err = await rejection(e.query(q("SHOW ALL TABLES")));
+    expect(err.code).toBe("QUERY_PATH_DENIED");
+    expect(err.problem.hint).toContain("SHOW TABLES");
+  });
+
+  test("the server caps limit at maxRows: a bigger limit still fails past the cap, with a hint to page", async () => {
+    const p = await seeded();
+    const { e } = await engine(p, { maxRows: 50 });
+    const err = await rejection(e.query(q("SELECT range FROM range(100)", { limit: 1_000_000 })));
+    expect(err.code).toBe("QUERY_TOO_MANY_ROWS");
+    expect(err.problem.details).toMatchObject({ limit: 1_000_000, maxRows: 50 });
+    expect(err.message).toContain("50 rows");
+    expect(err.problem.hint).toContain("LIMIT");
+    expect((await e.query(q("SELECT range FROM range(50)", { limit: 1_000_000 }))).rowCount).toBe(50);
+    // Within the cap, the client's own limit is what the message names.
+    expect((await rejection(e.query(q("SELECT range FROM range(30)", { limit: 20 })))).problem.details).toMatchObject({ limit: 20 });
+  });
+
+  test("the wait queue is bounded: past maxQueued a query is refused at once with SERVE_UNAVAILABLE", async () => {
+    const p = await seeded();
+    const { e } = await engine(p, { maxConcurrent: 1, maxQueued: 2 });
+    const stop = new AbortController();
+    const slow = rejection(e.query(q(SLOW, { signal: stop.signal })));
+    await until("the slow query to run", () => e.status().inFlight === 1);
+    const waiting = [rejection(e.query(q("SELECT 1 AS x", { signal: stop.signal }))), rejection(e.query(q("SELECT 1 AS x", { signal: stop.signal })))];
+    await until("two queued", () => e.status().queued === 2);
+    const start = Date.now();
+    const err = await rejection(e.query(q("SELECT 1 AS x")));
+    expect(Date.now() - start).toBeLessThan(100 + SLACK);
+    expect(err.code).toBe("SERVE_UNAVAILABLE");
+    expect(err.problem.details).toMatchObject({ reason: "busy", maxQueued: 2 });
+    expect(err.problem.details?.retryAfterMs).toBeGreaterThan(0);
+    expect(err.message).toContain("waiting");
+    stop.abort();
+    for (const x of [await slow, ...(await Promise.all(waiting))]) expect(x.code).toBe("INTERRUPTED");
   });
 
   test("a result larger than serve.maxBytes is QUERY_TOO_MANY_ROWS", async () => {
@@ -533,6 +602,123 @@ describe("handing the file to a writer", () => {
     await until("reopen", () => e.status().state === "open");
     expect((await e.query(q("SELECT who FROM log"))).rows).toEqual([{ who: "r_hooks" }]);
   });
+
+  test("a query stuck inside one expression, which interrupts cannot stop, never holds the file: the writer gets it within graceMs + 1.5 s", async () => {
+    // list_reduce over a range is one scalar call on one chunk: DuckDB checks for interrupts only once it returns,
+    // seconds later (list_sort(range(n)) and constant-folded lists behave the same). n comes from a table, so the
+    // serve gate's cap on literal range() bounds does not refuse it: the watchdog is what is tested.
+    const p = await seeded({ seed: ["CREATE TABLE t AS SELECT range AS n FROM range(5)", "CREATE TABLE p AS SELECT 20000000::BIGINT AS n"] });
+    const graceMs = 500;
+    const { e, events } = await engine(p, { graceMs });
+    const stuck = rejection(e.query(q(STUCK)));
+    await until("the stuck query to run", () => e.status().inFlight === 1);
+    await sleep(100);
+    const w = probeWriter(p, "r_stuck", 50);
+    const appeared = Date.parse((await w.waitFor("intent")).since!);
+    const acquired = (await w.waitFor("acquired")).t;
+    expect(acquired - appeared).toBeLessThan(graceMs + 1500 + WRITER_SHARE + SLACK);
+    const released = events.find((x) => x.kind === "released" && x.pid === w.pid)!;
+    expect(released.at - appeared).toBeLessThan(graceMs + 1500 + SLACK);
+    // The client learns why, and that it may retry.
+    const err = await stuck;
+    expect(err.code).toBe("SERVE_UNAVAILABLE");
+    expect(err.message).toContain("r_stuck");
+    expect(err.problem.details).toMatchObject({ reason: "write" });
+    expect(err.problem.retryable).toBe(true);
+    expect(err.problem.hint).toBeString();
+    await w.waitFor("released");
+    await until("reopen", () => e.status().state === "open");
+    expect((await e.query(q("SELECT who FROM log"))).rows).toEqual([{ who: "r_stuck" }]);
+  }, 60_000);
+
+  test("the query deadline holds even when interrupts cannot stop the query; the engine serves on", async () => {
+    const p = await seeded({ seed: ["CREATE TABLE t AS SELECT range AS n FROM range(5)", "CREATE TABLE p AS SELECT 20000000::BIGINT AS n"] });
+    const { e } = await engine(p, { queryTimeoutMs: 300 });
+    const start = Date.now();
+    const err = await rejection(e.query(q(STUCK)));
+    expect(err.code).toBe("TIMEOUT");
+    expect(err.problem.details).toMatchObject({ phase: "query", timeoutMs: 300 });
+    expect(Date.now() - start).toBeLessThan(300 + 1500 + SLACK);
+    expect((await e.query(q("SELECT count(*) AS c FROM t"))).rows).toEqual([{ c: 5 }]);
+    // A constant list DuckDB folds while planning (the gate's literal cap allows 10,000,000 values): stuck in prepare.
+    const planned = Date.now();
+    const folded = await rejection(e.query(q("SELECT list_reduce(range(10000000), (a, b) -> a + b) AS x")));
+    expect(folded.code).toBe("TIMEOUT");
+    expect(Date.now() - planned).toBeLessThan(300 + 1500 + SLACK);
+    expect((await e.query(q("SELECT count(*) AS c FROM t"))).rows).toEqual([{ c: 5 }]);
+  }, 60_000);
+
+  test("a stuck query whose client went away is ended too; a query beside it is told to retry (503), and the next ones run", async () => {
+    const p = await seeded({ seed: ["CREATE TABLE t AS SELECT range AS n FROM range(5)", "CREATE TABLE p AS SELECT 20000000::BIGINT AS n"] });
+    const { e } = await engine(p);
+    const gone = new AbortController();
+    const stuck = rejection(e.query(q(STUCK, { signal: gone.signal })));
+    const beside = rejection(e.query(q(SLOW)));
+    await until("both to run", () => e.status().inFlight === 2);
+    await sleep(100);
+    const start = Date.now();
+    gone.abort();
+    expect((await stuck).code).toBe("INTERRUPTED");
+    expect(Date.now() - start).toBeLessThan(1500 + SLACK);
+    const err = await beside;
+    expect(err.code).toBe("SERVE_UNAVAILABLE");
+    expect(err.problem.retryable).toBe(true);
+    expect(err.problem.details?.retryAfterMs).toBeGreaterThan(0);
+    expect(err.problem.hint).toBeString();
+    expect((await e.query(q("SELECT count(*) AS c FROM t"))).rows).toEqual([{ c: 5 }]);
+    expect(e.status()).toMatchObject({ state: "open", inFlight: 0 });
+  }, 60_000);
+
+  test("a query worker that dies (the OOM killer, a crash) is replaced; queries keep being answered", async () => {
+    const p = await seeded();
+    const pids: number[] = [];
+    const { e } = await engine(p, { hooks: { queryEnded: (x) => pids.push(x.workerPid) } });
+    await e.query(q("SELECT 1 AS x"));
+    const first = pids[0]!;
+    process.kill(first, "SIGKILL");
+    // Until the engine has noticed, a query can still reach the dead worker: it is told to retry, as the read client
+    // does on a 503.
+    const end = Date.now() + 10_000;
+    for (;;) {
+      try {
+        expect((await e.query(q("SELECT count(*) AS c FROM t"))).rows).toEqual([{ c: 5 }]);
+        break;
+      } catch (err) {
+        if (!(err instanceof CroftError) || Date.now() > end) throw err;
+        expect(err.code).toBe("SERVE_UNAVAILABLE");
+        expect(err.problem.retryable).toBe(true);
+        await sleep(20);
+      }
+    }
+    expect(pids.at(-1)).not.toBe(first);
+    expect(e.status().state).toBe("open");
+  }, 60_000);
+
+  test("croft serve killed with -9 takes its query worker along: a writer gets the file", async () => {
+    const p = await seeded();
+    const file = script("serve-engine.mjs", `
+      const { openServeEngine } = await import(process.env.CROFT_INSTANCE_TS);
+      const e = await openServeEngine({ root: process.argv[2], resources: { threads: 2 }, hooks: { queryEnded: (x) => console.log(JSON.stringify({ event: "worker", t: Date.now(), pid: x.workerPid })) } });
+      await e.query({ sql: "SELECT 1 AS x", params: [], limit: 10 });
+      setInterval(() => {}, 1000);
+    `);
+    const server = track(spawn(process.execPath, [file, p.root], { env: { ...childEnv(), CROFT_INSTANCE_TS: join(import.meta.dir, "instance.ts") }, stdio: ["ignore", "pipe", "pipe"] }));
+    const worker = (await server.waitFor("worker")) as { pid?: number };
+    server.proc.kill("SIGKILL");
+    await server.exited;
+    const w = probeWriter(p, "r_after_kill", 0);
+    const { since } = await w.waitFor("intent");
+    expect((await w.waitFor("acquired")).t - Date.parse(since!)).toBeLessThan(1500 + SLACK);
+    const gone = () => {
+      try {
+        process.kill(worker.pid!, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    };
+    await until("the orphaned worker to be reaped", gone, 5000);
+  }, 60_000);
 
   test("an unsafe filesystem refuses to start: SERVE_UNSAFE_FILESYSTEM", async () => {
     const p = await seeded();

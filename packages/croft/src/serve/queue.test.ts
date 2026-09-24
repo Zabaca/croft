@@ -190,3 +190,56 @@ describe("Flight.stop", () => {
     expect(c.at).toEqual([]);
   });
 });
+
+describe("bounds", () => {
+  test("past maxQueued waiting, enter() refuses at once with the engine's error; a free slot still admits", async () => {
+    const a = new Admission({
+      maxConcurrent: 1, maxQueued: 2,
+      unavailable: (waitedMs) => new CroftError("SERVE_UNAVAILABLE", { message: `waited ${waitedMs}`, hint: "retry" }),
+      aborted: () => new CroftError("INTERRUPTED", { message: "request went away", hint: "nothing to do" }),
+      full: () => new CroftError("SERVE_UNAVAILABLE", { message: "queue full", hint: "retry", details: { reason: "busy" } }),
+    });
+    a.resume();
+    const first = await a.enter({ deadline: soon() });
+    const waiting = [a.enter({ deadline: soon() }), a.enter({ deadline: soon() })];
+    expect(a.queued).toBe(2);
+    const start = Date.now();
+    const err = await rejection(a.enter({ deadline: soon() }));
+    expect(Date.now() - start).toBeLessThan(50);
+    expect(err.message).toBe("queue full");
+    expect(a.queued).toBe(2);
+    first.release();
+    const second = await waiting[0]!;
+    second.release();
+    (await waiting[1]!).release();
+    // With room again, it queues and is admitted as before.
+    (await a.enter({ deadline: soon() })).release();
+  });
+
+  test("a stopped flight that does not settle within stuckAfterMs is abandoned: its connection's abandon() runs once", async () => {
+    const a = new Admission({
+      maxConcurrent: 2, interruptEveryMs: 20, stuckAfterMs: 80,
+      unavailable: () => new CroftError("SERVE_UNAVAILABLE", { message: "busy", hint: "retry" }),
+      aborted: () => new CroftError("INTERRUPTED", { message: "gone", hint: "nothing to do" }),
+    });
+    a.resume();
+    const stuck = await a.enter({ deadline: soon() });
+    const abandoned: number[] = [];
+    stuck.attach({ interrupt: () => {}, abandon: () => abandoned.push(Date.now()) });
+    const start = Date.now();
+    stuck.stop("timeout");
+    await sleep(200);
+    expect(abandoned.length).toBe(1);
+    expect(abandoned[0]! - start).toBeGreaterThanOrEqual(75);
+    stuck.release();
+    // One that settles in time is never abandoned.
+    const fine = await a.enter({ deadline: soon() });
+    const never: number[] = [];
+    fine.attach({ interrupt: () => {}, abandon: () => never.push(1) });
+    fine.stop("write");
+    await sleep(20);
+    fine.release();
+    await sleep(120);
+    expect(never).toEqual([]);
+  });
+});
