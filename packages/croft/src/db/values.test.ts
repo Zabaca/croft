@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { DuckDBConnection } from "@duckdb/node-api";
 import { formatInstant as formatZoned, offsetSeconds, parseInstant } from "../core/time.ts";
 import { openMemory } from "./connect.ts";
-import { formatDate, formatInstant, renderRows, resultColumns, type RenderContext } from "./values.ts";
+import { formatDate, formatInstant, renderRows, renderValueRows, resultColumns, resultShape, type RenderContext } from "./values.ts";
 
 const LA = "America/Los_Angeles";
 const dbs: { close(): void }[] = [];
@@ -226,4 +226,25 @@ test("a column or struct field named __proto__ is an ordinary key", async () => 
     expect(Object.keys(r!.s as object)).toEqual(["__proto__", "x"]);
     expect(JSON.stringify(r)).toBe('{"__proto__":1,"b":2,"s":{"__proto__":{"a":5},"x":6}}');
   }
+});
+
+test("a streaming result renders chunk by chunk exactly as a fully read one (TS transform inputs)", async () => {
+  const c = await conn();
+  const sql = `SELECT i AS id, i::HUGEINT * 170141183460469231731687303715 AS h, TIMESTAMPTZ '2026-03-01T07:30:00.123456Z' + to_microseconds(i) AS at,
+    {'k': i} AS s, i AS dup, i + 1 AS dup FROM range(5000) r(i)`;
+  const whole = await rows(sql, ts, c);
+  const result = await c.stream(sql);
+  const shape = resultShape(result);
+  expect(shape.names).toEqual(["id", "h", "at", "s", "dup", "dup:1"]);
+  const streamed: Record<string, unknown>[] = [];
+  let chunks = 0;
+  for (;;) {
+    const chunk = await result.fetchChunk();
+    if (!chunk || chunk.rowCount === 0) break;
+    chunks++;
+    streamed.push(...renderValueRows(chunk.getRows(), shape, ts));
+  }
+  expect(chunks).toBeGreaterThan(1);
+  expect(streamed).toEqual(whole);
+  expect(streamed[4999]).toMatchObject({ id: 4999, h: 4999n * 170141183460469231731687303715n, at: "2026-03-01T07:30:00.128455Z" });
 });
