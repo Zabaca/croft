@@ -1,5 +1,5 @@
 // What this build ships (DESIGN.md §11 "Phases"), so the text croft gives an agent only names commands and
-// flags that exist. DESIGN.md §4.1 describes all of v1; this build is phase 3 ("Keep it fresh").
+// flags that exist. DESIGN.md §4.1 describes all of v1; this build is phase 4 ("Grow safely").
 //
 // - The command manifest below lists every command, and each run, validate and init flag DESIGN.md §4.1 gives a
 //   phase after 1, with the phase that ships it. The registry (cli/commands/index.ts) must register exactly the
@@ -21,7 +21,7 @@ export function phaseStub(what: string): never {
 }
 
 /** The phase of DESIGN.md §11 this build implements. */
-export const PHASE: number = 3;
+export const PHASE: number = 4;
 
 /** Whether PHASE is finished. False while its waves are being built: its error codes may still be unraised
  *  (core/codes-raised.test.ts). Set to true when the phase ends; a release requires it. */
@@ -83,10 +83,8 @@ export function laterConfigKey(key: string): { phase: number; feature: string } 
   return hit && hit.phase > PHASE ? { phase: hit.phase, feature: hit.feature } : null;
 }
 
-/** What phase 3 does not do yet, in words, for SKILL.md. */
-export const PHASE_LIMITS = [
-  "There is no rebuild from scratch: an incremental TS transform applies new code to new input rows only.",
-];
+/** What phase 4 does not do yet, in words, for SKILL.md. */
+export const PHASE_LIMITS: string[] = [];
 
 /** SKILL.md's "This version" section: the commands that exist, the ones that do not, and what is not built.
  *  Rendered from the manifest, so it never names a command as available that the registry lacks. */

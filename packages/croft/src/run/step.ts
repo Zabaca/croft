@@ -9,7 +9,7 @@
 // A step throws its failure as a CroftError; the runner records it and decides about retries (§8). It returns
 // a StepOutcome otherwise, including when it skipped itself for a confirmation (result.status "skipped",
 // `confirmation` set). Only the orchestrator edits this file (the phase-2 execution spec).
-import type { Confirmation, Impact, Problem } from "../core/types.ts";
+import type { ConfirmAction, Confirmation, Impact, Problem } from "../core/types.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
 import type { LogWriter } from "../history/logs.ts";
 import type { RunsDb } from "../history/runs-db.ts";
@@ -60,8 +60,9 @@ export type StepOutcome = IngestOutcome;
 /** A guarded action that needs a human's yes, as a step asks its ConfirmDecider. */
 export interface ConfirmRequest {
   asset: string;
-  /** allow_shrink: a replace ingest's --allow-shrink (SHRINK_GUARD); large_reprocess: the cost guard (§5). */
-  action: "allow_shrink" | "large_reprocess";
+  /** core/types.ts ConfirmAction: allow_shrink (SHRINK_GUARD), large_reprocess (the cost guard, §5), and the
+   *  phase-4 actions (rebuild, delete, restore, convert_key, pin_change). */
+  action: ConfirmAction;
   /** The command `croft confirm <token>` runs, e.g. "croft run issue_triage". */
   command: string;
   /** What the action does, as shown to the human and hashed into the token (safety/confirm.ts). */

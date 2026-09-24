@@ -28,8 +28,8 @@ import { type Dispatch, main, scanArgv } from "../main.ts";
 import { openRunsDb } from "./status.ts";
 
 /** The commands that carry out a confirmation: they read the token from dispatchOf(ctx) and spend it where
- *  they act. delete, restore and rename join when they exist. */
-export const CONFIRMABLE = new Set<string>(["run"]);
+ *  they act. rename needs no confirmation (§6). */
+export const CONFIRMABLE = new Set<string>(["run", "delete", "restore"]);
 
 export type ConfirmOutcome = "used" | "not_needed" | "unused" | "running";
 
