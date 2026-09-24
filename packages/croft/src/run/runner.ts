@@ -46,7 +46,7 @@ import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { checksHook, runWarnings } from "../checks/run.ts";
 import { CroftError, exitCodeFor } from "../core/errors.ts";
-import type { Confirmation, CursorType, Hold, Problem, Reason, StepResult } from "../core/types.ts";
+import type { Confirmation, CursorType, Hold, LockHolder, Problem, Reason, StepResult } from "../core/types.ts";
 import type { ExampleResult } from "../project/init.ts";
 import { Confirmations } from "../safety/confirm.ts";
 import { openWarehouse, type DuckWarehouse } from "../db/warehouse.ts";
@@ -56,7 +56,7 @@ import { logDir, logPath, NOT_STARTED_RECORD, openLog, type LogWriter, writeRunR
 import { reconcile } from "../history/reconcile.ts";
 import { RunsDb, type RunStatus, type RunTrigger } from "../history/runs-db.ts";
 import type { HttpOptions } from "../http/http.ts";
-import { staticSecrets } from "../cli/commands/describe.ts";
+import { holderText, staticSecrets } from "../cli/commands/describe.ts";
 import { redactProblem } from "../cli/render.ts";
 import { currentDatabase, isReservedColumn, quoteIdent, tableRef } from "../load/evolve.ts";
 import type { CheckHookResult, WriteBatchInput } from "../load/write.ts";
@@ -236,7 +236,7 @@ export function redactValue<T>(value: T, env: ProjectEnv): T {
 /** Events for one run: appended to events.ndjson and handed to the caller. */
 export class EventLog {
   readonly path: string;
-  constructor(stateDir: string, runId: string, private readonly onEvent?: (line: string, event: RunEvent) => void,
+  constructor(stateDir: string, readonly runId: string, private readonly onEvent?: (line: string, event: RunEvent) => void,
     private readonly redact: <T>(v: T) => T = (v) => v) {
     const dir = logDir(stateDir, runId);
     mkdirSync(dir, { recursive: true });
@@ -260,6 +260,19 @@ export class EventLog {
 
 export function eventsPath(stateDir: string, runId: string): string {
   return join(logDir(stateDir, runId), "events.ndjson");
+}
+
+/** A wait for the database file that has gone on for 2 s (§5 "Lock conflicts"): who holds it, in words too. */
+export function lockWaitEvent(holder: LockHolder, waitedMs: number, runId?: string): RunEvent {
+  return {
+    type: "waiting", ...(runId ? { runId } : {}), holder, waitedMs,
+    message: `waiting for the warehouse: ${holderText(holder)} holds it (${Math.round(waitedMs / 1000)} s so far)`,
+  };
+}
+
+/** The words of a lock-wait event (lockWaitEvent), or null for any other event. */
+export function lockWaitText(e: RunEvent): string | null {
+  return e.type === "waiting" && e.holder && typeof e.message === "string" ? e.message : null;
 }
 
 function jsonLine(v: unknown): string {
@@ -506,6 +519,21 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
   const clock = o.now ?? (() => clockNow());
   const runs = RunsDb.open(paths.stateDir, { now: clock });
   let warehouse: DuckWarehouse | undefined;
+  const redact = <T>(v: T): T => redactValue(v, env);
+  // Where the run's events go. A detached run's id is known before the run exists, so its first lock wait (reconcile
+  // opens the file) already reaches its events.ndjson, which its parent follows; a run in this process without an
+  // id hands such an early event to the caller only.
+  let eventLog: EventLog | undefined = o.runId ? new EventLog(paths.stateDir, o.runId, o.onEvent, redact) : undefined;
+  const onLockWait = (holder: LockHolder, waitedMs: number): void => {
+    // Fairness (§5 "Leases"): a writer that sees waiters yields between its write steps (ingest.ts).
+    runs.registerWaiter(`croft run${o.runId ? ` ${o.runId}` : ""}`);
+    // After 2 s the holder is printed (§5 "Lock conflicts"): the command prints the event's words.
+    const e = lockWaitEvent(holder, waitedMs, eventLog?.runId);
+    if (eventLog) return eventLog.emit(e);
+    const full = redact({ ...e, at: new Date().toISOString() });
+    const onEvent = o.onEvent;
+    if (onEvent) outsideCapture(() => onEvent(jsonLine(full), full));
+  };
   try {
     const interactive = o.interactive === true;
     const scheduled = o.trigger === "schedule";
@@ -532,8 +560,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
           const h = runs.getLockHolder();
           return h && h.pid === pid ? h : null;
         },
-        // Fairness (§5 "Leases"): a writer that sees waiters yields between its write steps (ingest.ts).
-        onWait: () => runs.registerWaiter(`croft run${o.runId ? ` ${o.runId}` : ""}`),
+        onWait: onLockWait,
       });
       rec = await reconcile({ db: runs, warehouse });
       for (const dir of rec.stagingDirs) rmSync(dir, { recursive: true, force: true });
@@ -548,7 +575,8 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
       ...(o.runId ? { id: o.runId } : {}), trigger: o.trigger ?? "manual", human: o.human ?? true, argv: [...o.argv], timeZone: project.timezone,
     });
     const runId = run.id;
-    const events = new EventLog(paths.stateDir, runId, o.onEvent, (v) => redactValue(v, env));
+    const events = eventLog ?? new EventLog(paths.stateDir, runId, o.onEvent, redact);
+    eventLog = events;
     const runAc = new AbortController();
     const onOuterAbort = () => runAc.abort(croftError(o.signal?.reason) ?? interruptedError());
     if (o.signal?.aborted) onOuterAbort();
@@ -897,6 +925,12 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
       runs.unregisterWaiter();
     }
   } finally {
+    // A run refused before it existed may have waited for the file too.
+    try {
+      runs.unregisterWaiter();
+    } catch {
+      // runs.sqlite trouble: the next reconcile has the same table.
+    }
     runs.close();
     await warehouse?.close();
   }

@@ -13,7 +13,7 @@ import { RunsDb } from "../history/runs-db.ts";
 import { loadProject } from "../project/root.ts";
 import { listTrash } from "../safety/trash.ts";
 import { planRun } from "./plan.ts";
-import { withProjectChecks } from "./runner.ts";
+import { type RunEvent, withProjectChecks } from "./runner.ts";
 import { cleanupProjects, cli, cliEnv, keysetIssues, linkItems, makeProject, mockApi, runIn, simpleGet, slowPages } from "./testkit.ts";
 
 const api = mockApi();
@@ -813,6 +813,58 @@ describe("a lock wait and Ctrl-C", () => {
       holder.kill("SIGKILL");
     }
   });
+
+  // DESIGN §5 "Lock conflicts": after 2 s the holder is printed.
+  test("a run waiting for the file names its holder after 2 s: a waiting event, in events.ndjson for a detached run's id", async () => {
+    const { spawnHolder, cleanup } = await import("../read/testkit.ts");
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    expect((await runIn(root, ["zones"])).exit).toBe(0);
+    await closeAllWarehouses();
+    const holder = spawnHolder(join(root, "warehouse.duckdb"), 3000);
+    try {
+      await holder.waitFor("held");
+      const events: RunEvent[] = [];
+      // The id a detached run's parent picks: the wait comes before the run exists (reconcile opens the file).
+      const runId = "r_0101_0000_wait";
+      const out = await runIn(root, ["zones"], { runId, onEvent: (_l, e) => events.push(e) });
+      expect(out.exit).toBe(0);
+      const waiting = events.filter((e) => e.type === "waiting");
+      expect(waiting).toHaveLength(1);
+      expect(waiting[0]).toMatchObject({ runId, holder: { pid: holder.pid } });
+      expect(String(waiting[0]!.message)).toMatch(new RegExp(`^waiting for the warehouse: .* \\(PID ${holder.pid}\\) holds it \\(\\d+ s so far\\)$`));
+      expect(Number(waiting[0]!.waitedMs)).toBeGreaterThanOrEqual(2000);
+      const lines = readFileSync(join(root, ".croft", "logs", runId, "events.ndjson"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as RunEvent);
+      expect(lines.filter((e) => e.type === "waiting")).toEqual([expect.objectContaining({ runId, holder: expect.objectContaining({ pid: holder.pid }) })]);
+    } finally {
+      cleanup();
+    }
+  }, 20_000);
+
+  test("croft run prints the holder on stderr while it waits, detached or not; with --events as the waiting event", async () => {
+    const { spawnHolder, cleanup } = await import("../read/testkit.ts");
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
+    expect((await runIn(root, ["zones"])).exit).toBe(0);
+    await closeAllWarehouses();
+    try {
+      for (const args of [["--json"], ["--foreground"], ["--json", "--events"]]) {
+        // Long enough that the run, once started, still waits over 2 s.
+        const holder = spawnHolder(join(root, "warehouse.duckdb"), 4500);
+        await holder.waitFor("held");
+        const r = await cli(root, ["run", "zones", ...args]);
+        expect(r.code, `${args.join(" ")}\n${r.stderr}`).toBe(0);
+        if (args.includes("--events")) {
+          const waiting = r.stderr.split("\n").filter((l) => l.startsWith("{")).map((l) => JSON.parse(l) as RunEvent).filter((e) => e.type === "waiting");
+          expect(waiting, r.stderr).toEqual([expect.objectContaining({ holder: expect.objectContaining({ pid: holder.pid }) })]);
+        } else {
+          expect(r.stderr, args.join(" ")).toMatch(new RegExp(`^waiting for the warehouse: .* \\(PID ${holder.pid}\\) holds it \\(\\d+ s so far\\)$`, "m"));
+        }
+      }
+    } finally {
+      cleanup();
+    }
+  }, 60_000);
 });
 
 describe("planning", () => {
