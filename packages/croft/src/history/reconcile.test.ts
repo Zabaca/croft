@@ -199,6 +199,38 @@ describe("reconcile", () => {
     expect(db.getStep(run.id, "orders", 1)?.status).toBe("crashed");
   });
 
+  // croft run's detached parent, and croft wait, mark a run crashed (steps included) the moment they see its
+  // process die. DuckDB still decides: the next reconcile checks those steps like any other.
+  test("a run already marked crashed by croft run's parent or croft wait still has its steps checked", async () => {
+    const run = await crashedRun();
+    expect(db.markCrashed(run.id)).toBe(true);
+    expect(db.getStep(run.id, "orders", 1)?.status).toBe("crashed");
+    const r = await reconcile({ db, warehouse: fakeWarehouse({ writes: [
+      { run_id: run.id, asset: "orders", rows_in: 120, added: 100, updated: 20 },
+    ] }) });
+    expect(r.crashed).toEqual([]);
+    expect(r.recovered).toEqual([{ runId: run.id, asset: "orders", attempt: 1, commits: 1 }]);
+    expect(r.lost).toEqual([{ runId: run.id, asset: "customers", attempt: 2 }]);
+    expect(r.releasedLeases).toEqual(["customers", "orders", "refs"]);
+    expect(db.getStep(run.id, "orders", 1)).toMatchObject({ status: "ok", reason: "schedule_due (recovered)", added: 100, error: null });
+    const lost = db.getStep(run.id, "customers", 2)!;
+    expect(lost).toMatchObject({ status: "crashed", error: { code: "RUN_CRASHED" } });
+    expect(lost.finishedAt).not.toBeNull();
+    expect(lost.error?.message).toContain("nothing from this step was saved");
+    expect(db.danglingSteps()).toEqual([]);
+  });
+
+  test("a step an older croft left running in a crashed run is crashed and checked too", async () => {
+    const run = await crashedRun();
+    db.sqlite.query("UPDATE runs SET status = 'crashed' WHERE id = ?").run(run.id);
+    const busy = fakeWarehouse({ writes: null, fail: () => new CroftError("DB_BUSY", { message: "locked", hint: "wait" }) });
+    const r1 = await reconcile({ db, warehouse: busy, waitMs: 10 });
+    expect(r1.unresolved.map((s) => s.asset).sort()).toEqual(["customers", "orders"]);
+    expect(db.getStep(run.id, "orders", 1)).toMatchObject({ status: "crashed", finishedAt: null });
+    const r2 = await reconcile({ db, warehouse: fakeWarehouse({ writes: [] }) });
+    expect(r2.lost.map((s) => s.asset).sort()).toEqual(["customers", "orders"]);
+  });
+
   test("chunked commits of one step are summed", async () => {
     const run = await crashedRun();
     const r = await reconcile({ db, warehouse: fakeWarehouse({ writes: [
@@ -222,7 +254,9 @@ describe("reconcile", () => {
     expect(r1.problems).toHaveLength(1);
     expect(r1.problems[0]).toMatchObject({ code: "DB_BUSY", severity: "warning" });
     expect(r1.problems[0]?.message).toContain("could not check which steps of crashed runs committed");
-    expect(db.getStep(run.id, "orders", 1)?.status).toBe("running");
+    // The run is crashed, and so are its steps (status must not show them running), unchecked until r2.
+    expect(db.getStep(run.id, "orders", 1)).toMatchObject({ status: "crashed", finishedAt: null, error: { code: "RUN_CRASHED" } });
+    expect(db.getStep(run.id, "customers", 2)).toMatchObject({ status: "crashed", finishedAt: null });
 
     const r2 = await reconcile({ db, warehouse: fakeWarehouse({ writes: [
       { run_id: run.id, asset: "orders", rows_in: 1, added: 1, updated: 0 },

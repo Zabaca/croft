@@ -165,10 +165,12 @@ export function finishedSteps(stateDir: string, runId: string): StepResult[] {
   return [...out.values()];
 }
 
-function stepFromRecord(s: StepRecord, attempts: number): StepResult {
+function stepFromRecord(s: StepRecord, attempts: number, runEnd: string | null): StepResult {
   const status: StepResult["status"] = s.status === "ok" || s.status === "skipped" || s.status === "unchanged" ? s.status : "failed";
   const started = Date.parse(s.startedAt);
-  const finished = s.finishedAt ? Date.parse(s.finishedAt) : Date.now();
+  // A step crashed before reconcile checked it has no finish time yet: it ended when its run did.
+  const end = s.finishedAt ?? runEnd;
+  const finished = end ? Date.parse(end) : Date.now();
   return {
     asset: s.asset, status, reason: s.reason ?? "", behavior: "", attempt: s.attempt, maxAttempts: attempts,
     rows: { in: s.rowsIn ?? 0, added: s.added ?? 0, updated: s.updated ?? 0, unchanged: 0, deleted: 0, total: 0 },
@@ -184,12 +186,13 @@ export function summaryFromRecords(run: RunRecord, steps: StepRecord[]): RunSumm
     const had = last.get(s.asset);
     if (!had || s.attempt > had.attempt) last.set(s.asset, s);
   }
-  const results = [...last.values()].map((s) => stepFromRecord(s, s.attempt));
+  const results = [...last.values()].map((s) => stepFromRecord(s, s.attempt, run.finishedAt));
   const problems: Problem[] = results.flatMap((r) => (r.error ? [{ ...r.error, runId: run.id }] : []));
   if (run.status === "crashed" && !problems.some((p) => p.code === "RUN_CRASHED")) {
     problems.push(problem("RUN_CRASHED", {
       runId: run.id, message: `run ${run.id} (pid ${run.pid ?? "?"}) stopped before it finished`,
-      hint: "steps that had not committed saved nothing; run the assets again", retryable: true,
+      hint: "what a step committed before the crash stays; steps that had not committed saved nothing; run the assets again",
+      retryable: true,
     }));
   }
   const exit = run.status === "succeeded" ? 0 : run.status === "interrupted" ? 130 : 1;
@@ -250,7 +253,9 @@ export function crashedBeforeStart(stateDir: string, runId: string, child: Child
 }
 
 /**
- * Follow a run until it ends or `timeoutMs` passes. A run whose process died is marked crashed. A child that
+ * Follow a run until it ends or `timeoutMs` passes. A run whose process died is marked crashed, with its running
+ * steps (RunsDb.markCrashed), so status shows the crash at once; the next reconcile() still checks those steps
+ * against the warehouse, which may turn one into `ok (recovered)`. A child that
  * exits before it created the run record is reported with the problem it recorded, or the tail of its output;
  * without `spawned` (croft wait), a child whose recorded process is gone before it created the run record is
  * crashed, never "running" forever.
