@@ -88,6 +88,9 @@ describe("the Claude files are DESIGN.md §9, cut to what this build ships", () 
     expect(lines).toContain("croft status                # failed, stale, held, never run, edited since its last run, no asset file");
     expect(lines).toContain("- Renaming or deleting files in assets/ (the table stays under the old name; this version cannot rename or drop it); `croft schedule on|off|pause`.");
     expect(lines.find((l) => l.startsWith("  or answering"))).toBe("  or answering a question from project data.");
+    // Added to §9: how an ingest gets on a schedule, which the eval task "schedule hourly" needs in one place.
+    expect(lines).toContain("- Schedule: add `schedule: \"every hour\"` to the ingest (`croft docs scheduling`); `croft validate` shows the next fires;");
+    expect(lines).toContain("  run it by hand once (new code is held until then), then ask the user before `croft schedule on`.");
   });
 
   test("the app block differs from the project block only where the project lives in data/", () => {

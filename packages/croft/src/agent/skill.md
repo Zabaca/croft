@@ -62,6 +62,8 @@ croft status                # failed, stale, held, never run, edited since its l
 - Failed run: croft status --json → croft logs <asset> --failed → fix → croft validate --json → croft preview <asset>
   → croft run <asset> → croft status.
 - Held asset: it was edited and not run by hand; run it by hand once (croft run <asset>) after checking the preview.
+- Schedule: add `schedule: "every hour"` to the ingest (`croft docs scheduling`); `croft validate` shows the next fires;
+  run it by hand once (new code is held until then), then ask the user before `croft schedule on`.
 - Backfill: croft run <asset> --dry-run --from -90d, then the same without --dry-run. Merge ingests only.
   A date works too (--from 2026-06-24); a text cursor takes a value in its own format. The saved cursor never moves back.
 - Wrong number: croft describe <asset> --json → croft preview <asset> --rebuild (drift) → query the upstream
