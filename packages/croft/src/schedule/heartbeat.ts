@@ -8,6 +8,8 @@
 //   ~/Downloads, which a background job may not read without Full Disk Access [U];
 // - Bun missing: the job's absolute Bun path is gone (a version manager's, removed on upgrade), or the shell
 //   could not find it;
+// - Bun too old: the job's Bun is older than a project's pinned croft needs (the per-user tick logs it and does
+//   not start that croft; a croft that started anyway said BUN_TOO_OLD);
 // - the project's own croft not installed (the per-user tick logs it);
 // - WSL, from /proc/version: the VM sleeps when no terminal is open, and cron often is not running [U];
 // - otherwise a generic cause, pointing at the log.
@@ -92,7 +94,7 @@ export async function waitForHeartbeat(root: string, o: WaitOptions = {}): Promi
 
 // ---- diagnosis ----
 
-export type DiagnosisCause = "privacy" | "bun_missing" | "croft_missing" | "wsl" | "unknown";
+export type DiagnosisCause = "privacy" | "bun_missing" | "bun_too_old" | "croft_missing" | "wsl" | "unknown";
 
 export interface Diagnosis {
   cause: DiagnosisCause;
@@ -147,6 +149,23 @@ export function diagnose(home: CroftHome, o: DiagnoseOptions = {}): Diagnosis {
         : "the scheduler job cannot start Bun: its path no longer exists (tick.log: not found)",
       hint: "run croft schedule on again: it points the job at the Bun installed now, preferring a path that survives upgrades (~/.bun/bin/bun from curl -fsSL https://bun.sh/install | bash)",
       fix: { kind: "command", description: "point the scheduler job at the Bun installed now", command: "croft schedule on" },
+    };
+  }
+
+  // The per-user tick does not start a pinned croft whose engines.bun is newer than the job's Bun, and says so;
+  // a croft that started anyway refuses with BUN_TOO_OLD's message.
+  const tooOld = /^(?:\S+ )?(\/.*): its croft needs Bun (\S+) or newer, and the scheduler job runs Bun (\S+) \((.*)\);/m.exec(lastLines(logTail));
+  const refused = tooOld ? null : /croft needs Bun (\S+) or newer; this is Bun (\S+)/.exec(lastLines(logTail));
+  if (tooOld || refused) {
+    const [need, have] = tooOld ? [tooOld[2]!, tooOld[3]!] : [refused![1]!, refused![2]!];
+    const jobBun = tooOld ? tooOld[4]! : bun;
+    const root = tooOld ? tooOld[1]! : null;
+    const command = root ? `cd ${shellQuote(root)} && croft schedule on` : "croft schedule on";
+    return {
+      ...base, cause: "bun_too_old",
+      message: `the scheduler job runs Bun ${have}${jobBun ? ` (${jobBun})` : ""}, older than the Bun ${need} ${root ? `${root}'s` : "the project's"} croft needs, so its ticks do not run`,
+      hint: `run ${command}: it points the job at a Bun at least as new as the one running croft; or upgrade that Bun (bun upgrade, or brew upgrade bun for Homebrew's)`,
+      fix: { kind: "command", description: "point the scheduler job at a newer Bun", command },
     };
   }
 

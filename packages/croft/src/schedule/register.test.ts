@@ -246,6 +246,15 @@ describe("the LaunchAgent (macOS)", () => {
     expect(r.tickScriptChanged).toBe(false);
   });
 
+  test("a tick script installed from an older template (1: the lock file alone) is rewritten, the job left as it is", () => {
+    ensureJob(fakeRunner().runner, home, mac());
+    writeFileSync(home.tickScript, "// croft-tick-template: 1\n");
+    const r = ensureJob(fakeRunner().runner, home, mac());
+    expect(r.tickScriptChanged).toBe(true);
+    expect(r.changed).toBe(false);
+    expect(readFileSync(home.tickScript, "utf8")).toBe(tickScriptSource());
+  });
+
   test("unchanged but not loaded (booted out, a failed bootstrap): bootstrapped without rewriting", () => {
     ensureJob(fakeRunner().runner, home, mac());
     utimesSync(plistPath(home), new Date(0), new Date(0));

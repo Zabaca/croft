@@ -10,21 +10,27 @@
 // Every minute it:
 // - rotates logs/tick.log past MAX_TICK_LOG_BYTES;
 // - reads projects.json next to itself (import.meta.dir, so CROFT_HOME needs no baking in);
-// - prunes projects whose croft.json is definitely gone (ENOENT/ENOTDIR). A permission error (EPERM from
-//   macOS privacy protection) is logged, never pruned: that line in tick.log is what heartbeat.ts diagnoses;
+// - sorts the projects as registry.ts's projectPresence does: present; gone (croft.json definitely gone, with the
+//   folder around it there on a mounted disk), which it prunes; missing (its disk not mounted, or its parent
+//   folder gone too), which it marks with missingSince and prunes only after MISSING_PRUNE_DAYS days missing; or
+//   unknown (a permission error, EPERM from macOS privacy protection), which is logged, never pruned: that line in
+//   tick.log is what heartbeat.ts diagnoses. A marked project that is back is unmarked. The registry is changed
+//   under registry.ts's lock protocol (the OS lock, then the lock file), and only when something changed;
 // - for each os-job project whose runs.sqlite scheduling is on (a pause that has ended counts as on, like
 //   RunsDb.getScheduling), starts `<bun> --no-env-file <pinned bin> tick` with cwd = the project, detached,
 //   stdio to tick.log, and an explicit environment. launchd's PATH lacks ~/.bun/bin, so the child runs on
-//   process.execPath (the job's absolute Bun) and its PATH starts with that Bun's folder.
+//   process.execPath (the job's absolute Bun) and its PATH starts with that Bun's folder. A pinned croft whose
+//   engines.bun is newer than the job's Bun is not started: the log line says so, and heartbeat.ts diagnoses it.
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { CONFIG_FILE } from "../project/root.ts";
 import { RUNS_DB_FILE } from "../history/runs-db.ts";
 import type { CroftHome } from "./home.ts";
-import { LOCK_STALE_MS, LOCK_SUFFIX } from "./registry.ts";
+import { LOCK_DB_SUFFIX, LOCK_STALE_MS, LOCK_SUFFIX, MISSING_PRUNE_DAYS, MISSING_PRUNE_MS } from "./registry.ts";
 
 /** Bumped whenever the template changes. writeTickScript never replaces a script from a later template, so
- *  projects pinned to different croft versions do not rewrite it back and forth. */
-export const TICK_TEMPLATE_VERSION = 1;
+ *  projects pinned to different croft versions do not rewrite it back and forth. 2: the OS lock (review R31-03),
+ *  missing projects (R31-10), and the pinned croft's engines.bun. */
+export const TICK_TEMPLATE_VERSION = 2;
 
 /** tick.log is renamed to tick.log.1 once it is larger than this. */
 export const MAX_TICK_LOG_BYTES = 5 * 1024 * 1024;
@@ -46,7 +52,8 @@ const TEMPLATE = String.raw`// croft's per-user scheduler tick (DESIGN.md sectio
 // croft-tick-template: __TEMPLATE_VERSION__
 //
 // The OS job (a LaunchAgent on macOS, a crontab line on Linux) runs this every minute with an absolute Bun.
-// It reads projects.json next to it, removes projects whose folder or __CONFIG__ is gone, and starts the
+// It reads projects.json next to it, removes projects whose folder or __CONFIG__ is gone (and ones missing for
+// __MISSING_DAYS__ days: on a disk that is not mounted, or whose parent folder is gone too), and starts the
 // project-pinned "croft tick" of every project whose scheduling is on. It imports nothing from croft.
 import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
@@ -57,9 +64,12 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 const DIR = import.meta.dir;
 const REGISTRY = join(DIR, "projects.json");
 const LOCK = REGISTRY + "__LOCK_SUFFIX__";
+const LOCK_DB = REGISTRY + "__LOCK_DB_SUFFIX__";
 const LOG = join(DIR, "logs", "tick.log");
 const LOCK_STALE_MS = __LOCK_STALE_MS__;
 const LOCK_WAIT_MS = 2000;
+const MISSING_PRUNE_MS = __MISSING_PRUNE_MS__;
+const MISSING_DAYS = __MISSING_DAYS__;
 const MAX_LOG_BYTES = __MAX_LOG_BYTES__;
 const CONFIG = "__CONFIG__";
 const RUNS_DB = "__RUNS_DB__";
@@ -83,7 +93,7 @@ function rotateLog() {
   } catch {}
 }
 
-// The registry: an array of {root, addedAt, via}. null when it cannot be used this minute.
+// The registry: an array of {root, addedAt, via, missingSince?}. null when it cannot be used this minute.
 function readRegistry() {
   let text;
   try {
@@ -103,21 +113,133 @@ function readRegistry() {
   }
 }
 
-// "gone" only when the file system says so; a permission error (EPERM from macOS privacy protection) is
-// logged, and the project kept.
-function presence(root, quiet) {
+// Where removable and network disks are mounted, the candidates for the disk a path is on: /Volumes/<disk>
+// (macOS), /media/<disk> and /media/<user>/<disk>, /run/media/<user>/<disk>, /mnt/<disk> (Linux).
+function volumeRoots(root) {
+  const s = root.split("/").filter((x) => x !== "");
+  const at = (n) => "/" + s.slice(0, n).join("/");
+  if ((s[0] === "Volumes" || s[0] === "mnt") && s.length >= 2) return [at(2)];
+  if (s[0] === "media" && s.length >= 2) return s.length >= 3 ? [at(2), at(3)] : [at(2)];
+  if (s[0] === "run" && s[1] === "media" && s.length >= 4) return [at(4)];
+  return [];
+}
+
+// A mount point: a folder on another device than the folder it is in. A folder that is not there is none.
+function mounted(dir) {
   try {
-    statSync(join(root, CONFIG));
-    return "present";
-  } catch (e) {
-    if (e.code === "ENOENT" || e.code === "ENOTDIR") return "gone";
-    if (!quiet) log(root + ": cannot check the project: " + e.message);
-    return "unknown";
+    return statSync(dir).dev !== statSync(dirname(dir)).dev;
+  } catch {
+    return false;
   }
 }
 
-// The lock protocol of croft's registry.ts: an O_EXCL lock file holding the pid, broken when its holder is
-// dead or it is older than LOCK_STALE_MS. A tick waits at most LOCK_WAIT_MS, then leaves pruning for later.
+const notFound = (e) => e.code === "ENOENT" || e.code === "ENOTDIR";
+
+// registry.ts's projectPresence: {state, why}. "gone" only when the file system says croft.json is not there
+// and the folder around the project is, on a mounted disk. "missing" when the disk is not mounted or that folder
+// is gone too: it may come back. A permission error (EPERM from macOS privacy protection) is "unknown", logged
+// unless quiet, and the project kept.
+function presence(root, quiet) {
+  try {
+    statSync(join(root, CONFIG));
+    return { state: "present" };
+  } catch (e) {
+    if (!notFound(e)) {
+      if (!quiet) log(root + ": cannot check the project: " + e.message);
+      return { state: "unknown" };
+    }
+  }
+  const volumes = volumeRoots(root);
+  if (volumes.length > 0 && !volumes.some(mounted)) {
+    return { state: "missing", why: "its disk " + volumes[volumes.length - 1] + " is not mounted" };
+  }
+  const parent = dirname(root);
+  try {
+    if (statSync(parent).isDirectory()) return { state: "gone" };
+  } catch (e) {
+    if (!notFound(e)) {
+      if (!quiet) log(root + ": cannot check the project: " + e.message);
+      return { state: "unknown" };
+    }
+  }
+  return { state: "missing", why: "neither it nor " + parent + " exists" };
+}
+
+// Whether a missing project has been missing for MISSING_PRUNE_MS: missingSince is when it was first found so.
+function missingTooLong(e, now) {
+  const since = typeof e.missingSince === "string" ? Date.parse(e.missingSince) : NaN;
+  return Number.isFinite(since) && now - since >= MISSING_PRUNE_MS;
+}
+
+// The lock protocol of croft's registry.ts. First the OS lock: an exclusive transaction on the lock database,
+// which the kernel drops when its holder exits or dies, so nobody ever breaks it. Holding it, the lock file
+// older crofts use (O_EXCL, the pid inside), broken only when its holder is dead or it is older than
+// LOCK_STALE_MS: with the OS lock held, no other writer of this protocol can be breaking it too. A tick waits
+// at most LOCK_WAIT_MS in all, then leaves the change for the next minute. "done", "busy" or "failed" (logged).
+function withLock(fn) {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let db;
+  try {
+    db = new Database(LOCK_DB, { create: true });
+  } catch (e) {
+    log("cannot open " + LOCK_DB + ": " + e.message);
+    return "failed";
+  }
+  try {
+    for (;;) {
+      try {
+        db.exec("PRAGMA busy_timeout = 0");
+        db.exec("BEGIN EXCLUSIVE");
+        break;
+      } catch (e) {
+        if (e.code !== "SQLITE_BUSY") {
+          log("cannot lock " + LOCK_DB + " (" + e.message + "); with no croft schedule command running, delete it (it holds no data)");
+          return "failed";
+        }
+        if (Date.now() > deadline) return "busy";
+        Bun.sleepSync(5 + Math.random() * 20);
+      }
+    }
+    try {
+      if (!takeLockFile(deadline)) return "busy";
+      try {
+        fn();
+      } finally {
+        try {
+          if (readFileSync(LOCK, "utf8").trim() === String(process.pid)) unlinkSync(LOCK);
+        } catch {}
+      }
+      return "done";
+    } finally {
+      try { db.exec("ROLLBACK"); } catch {}
+    }
+  } finally {
+    db.close();
+  }
+}
+
+function takeLockFile(deadline) {
+  for (;;) {
+    try {
+      const fd = openSync(LOCK, "wx", 0o600);
+      try {
+        writeSync(fd, process.pid + "\n");
+      } finally {
+        closeSync(fd);
+      }
+      return true;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      if (abandoned()) {
+        try { unlinkSync(LOCK); } catch {}
+        continue;
+      }
+      if (Date.now() > deadline) return false;
+      Bun.sleepSync(5 + Math.random() * 20);
+    }
+  }
+}
+
 function abandoned() {
   try {
     if (Date.now() - statSync(LOCK).mtimeMs > LOCK_STALE_MS) return true;
@@ -134,37 +256,11 @@ function abandoned() {
   }
 }
 
-function withLock(fn) {
-  const deadline = Date.now() + LOCK_WAIT_MS;
-  for (;;) {
-    try {
-      const fd = openSync(LOCK, "wx", 0o600);
-      try {
-        writeSync(fd, process.pid + "\n");
-      } finally {
-        closeSync(fd);
-      }
-      break;
-    } catch (e) {
-      if (e.code !== "EEXIST") throw e;
-      if (abandoned()) {
-        try { unlinkSync(LOCK); } catch {}
-        continue;
-      }
-      if (Date.now() > deadline) return false;
-      Bun.sleepSync(5 + Math.random() * 20);
-    }
-  }
-  try {
-    fn();
-  } finally {
-    try { unlinkSync(LOCK); } catch {}
-  }
-  return true;
-}
-
-function prune(gone) {
-  const done = withLock(() => {
+// Apply what this minute found, under the lock, checking each project again: drop the gone and the ones missing
+// too long, mark the newly missing, unmark the ones that are back. Written only when something changed.
+function update(now) {
+  const notes = [];
+  const outcome = withLock(() => {
     let list;
     try {
       list = JSON.parse(readFileSync(REGISTRY, "utf8"));
@@ -172,13 +268,35 @@ function prune(gone) {
       return;
     }
     if (!Array.isArray(list)) return;
-    const removed = new Set();
-    const keep = list.filter((e) => {
-      const drop = e && gone.has(e.root) && presence(e.root, true) === "gone";
-      if (drop) removed.add(e.root);
-      return !drop;
-    });
-    if (removed.size === 0) return;
+    let changed = false;
+    const keep = [];
+    for (const e of list) {
+      if (!e || typeof e.root !== "string" || !isAbsolute(e.root)) {
+        keep.push(e);
+        continue;
+      }
+      const p = presence(e.root, true);
+      if (p.state === "gone") {
+        changed = true;
+        notes.push("removed " + e.root + " from the schedule: its folder or " + CONFIG + " is gone");
+      } else if (p.state === "missing" && missingTooLong(e, now)) {
+        changed = true;
+        notes.push("removed " + e.root + " from the schedule: missing since " + e.missingSince + " (" + MISSING_DAYS + " days or more)");
+      } else if (p.state === "missing" && typeof e.missingSince !== "string") {
+        changed = true;
+        notes.push(e.root + " is missing: " + p.why + "; it stays on the schedule, and is removed after " + MISSING_DAYS + " days missing");
+        keep.push(Object.assign({}, e, { missingSince: new Date(now).toISOString() }));
+      } else if (p.state === "present" && e.missingSince !== undefined) {
+        changed = true;
+        notes.push(e.root + " is back; it stays on the schedule");
+        const back = Object.assign({}, e);
+        delete back.missingSince;
+        keep.push(back);
+      } else {
+        keep.push(e);
+      }
+    }
+    if (!changed) return;
     const tmp = REGISTRY + "." + process.pid + "." + Math.random().toString(16).slice(2, 10) + ".tmp";
     const fd = openSync(tmp, "wx", 0o600);
     try {
@@ -188,9 +306,9 @@ function prune(gone) {
       closeSync(fd);
     }
     renameSync(tmp, REGISTRY);
-    for (const root of removed) log("removed " + root + " from the schedule: its folder or " + CONFIG + " is gone");
   });
-  if (!done) log(REGISTRY + " is locked by another croft; pruning next minute");
+  if (outcome === "done") for (const n of notes) log(n);
+  else if (outcome === "busy") log(REGISTRY + " is locked by another croft; pruning next minute");
 }
 
 // croft.json "stateDir" (relative to the project, ~ for the home folder), else <project>/.croft.
@@ -236,7 +354,8 @@ function schedulingOn(root) {
   }
 }
 
-// The pinned copy's bin (its package.json "bin"), else node_modules/.bin/croft; null when not installed.
+// The pinned copy: its bin (package.json "bin", else node_modules/.bin/croft) and the oldest Bun it runs on (its
+// engines.bun, ">=x.y.z", or null); null when it is not installed.
 function pinnedCroft(root) {
   try {
     const copy = realpathSync(join(root, "node_modules", ...PACKAGE.split("/")));
@@ -244,13 +363,26 @@ function pinnedCroft(root) {
     const bin = typeof pkg.bin === "string" ? pkg.bin : pkg.bin && typeof pkg.bin.croft === "string" ? pkg.bin.croft : "bin/croft.mjs";
     const file = join(copy, bin);
     statSync(file);
-    return file;
+    const floor = pkg.engines && typeof pkg.engines.bun === "string" ? /^\s*>=\s*v?(\d+(?:\.\d+)*)\s*$/.exec(pkg.engines.bun) : null;
+    return { bin: file, bun: floor ? floor[1] : null };
   } catch {}
   try {
-    return realpathSync(join(root, "node_modules", ".bin", "croft"));
+    return { bin: realpathSync(join(root, "node_modules", ".bin", "croft")), bun: null };
   } catch {
     return null;
   }
+}
+
+// croft's versionAtLeast: "1.3.14" or "1.4.0-canary.2" against a floor.
+function versionAtLeast(have, floor) {
+  const parse = (v) => String(v).split(/[-+]/)[0].split(".").map((n) => parseInt(n, 10) || 0);
+  const a = parse(have);
+  const b = parse(floor);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const d = (a[i] || 0) - (b[i] || 0);
+    if (d !== 0) return d > 0;
+  }
+  return true;
 }
 
 // PATH: the job's Bun folder first, then the job's PATH (launchd's comes from the plist, cron's is bare), then
@@ -270,9 +402,14 @@ function childEnv() {
 }
 
 function startTick(root) {
-  const bin = pinnedCroft(root);
-  if (bin === null) {
+  const pinned = pinnedCroft(root);
+  if (pinned === null) {
     log(root + ": its croft is not installed (no node_modules/" + PACKAGE + "); run bun install in that folder");
+    return;
+  }
+  if (pinned.bun !== null && !versionAtLeast(Bun.version, pinned.bun)) {
+    log(root + ": its croft needs Bun " + pinned.bun + " or newer, and the scheduler job runs Bun " + Bun.version + " ("
+      + process.execPath + "); run croft schedule on in that folder to point the job at a newer Bun");
     return;
   }
   let out = "ignore";
@@ -281,7 +418,7 @@ function startTick(root) {
     out = openSync(LOG, "a", 0o600);
   } catch {}
   try {
-    const child = spawn(process.execPath, ["--no-env-file", bin, "tick"], {
+    const child = spawn(process.execPath, ["--no-env-file", pinned.bin, "tick"], {
       cwd: root, env: childEnv(), detached: true, stdio: ["ignore", out, out],
     });
     child.on("error", (e) => log(root + ": could not start croft tick: " + e.message));
@@ -297,17 +434,22 @@ function main() {
   rotateLog();
   const entries = readRegistry();
   if (entries === null) return;
+  const now = nowMs();
   const seen = new Set();
-  const gone = new Set();
   const tick = [];
+  let stale = false;
   for (const e of entries) {
     if (seen.has(e.root)) continue;
     seen.add(e.root);
     const p = presence(e.root, false);
-    if (p === "gone") gone.add(e.root);
-    else if (p === "present" && e.via === "os-job") tick.push(e.root);
+    if (p.state === "gone") stale = true;
+    else if (p.state === "missing" && (typeof e.missingSince !== "string" || missingTooLong(e, now))) stale = true;
+    else if (p.state === "present") {
+      if (e.missingSince !== undefined) stale = true;
+      if (e.via === "os-job") tick.push(e.root);
+    }
   }
-  if (gone.size > 0) prune(gone);
+  if (stale) update(now);
   for (const root of tick) {
     try {
       if (schedulingOn(root)) startTick(root);
@@ -330,7 +472,10 @@ export function tickScriptSource(): string {
   const values: Record<string, string> = {
     __TEMPLATE_VERSION__: String(TICK_TEMPLATE_VERSION),
     __LOCK_SUFFIX__: LOCK_SUFFIX,
+    __LOCK_DB_SUFFIX__: LOCK_DB_SUFFIX,
     __LOCK_STALE_MS__: String(LOCK_STALE_MS),
+    __MISSING_PRUNE_MS__: String(MISSING_PRUNE_MS),
+    __MISSING_DAYS__: String(MISSING_PRUNE_DAYS),
     __MAX_LOG_BYTES__: String(MAX_TICK_LOG_BYTES),
     __CONFIG__: CONFIG_FILE,
     __RUNS_DB__: RUNS_DB_FILE,

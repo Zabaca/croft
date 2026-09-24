@@ -150,6 +150,26 @@ describe("diagnose", () => {
     expect(diagnose(home, { ...base, platform: "linux", bunPath: null }).cause).toBe("bun_missing");
   });
 
+  test("Bun too old: the tick says the job's Bun is older than the project's croft needs (review R31-09)", () => {
+    const bun = join(userHome, ".bun/bin/bun");
+    log(`2026-09-24T10:00:00.000Z ${root}: its croft needs Bun 1.3.14 or newer, and the scheduler job runs Bun 1.0.0 (${bun}); run croft schedule on in that folder to point the job at a newer Bun\n`);
+    const d = diagnose(home, { ...base, bunPath: bun, exists: () => true });
+    expect(d.cause).toBe("bun_too_old");
+    expect(d.message).toContain(`Bun 1.0.0 (${bun})`);
+    expect(d.message).toContain("1.3.14");
+    expect(d.message).toContain(root);
+    expect(d.hint).toContain("croft schedule on");
+    expect(d.fix).toMatchObject({ kind: "command", command: `cd ${root} && croft schedule on` });
+  });
+
+  test("Bun too old: a pinned croft that started anyway said BUN_TOO_OLD", () => {
+    log("croft needs Bun 1.3.14 or newer; this is Bun 1.1.0\n");
+    const d = diagnose(home, base);
+    expect(d.cause).toBe("bun_too_old");
+    expect(d.message).toContain("Bun 1.1.0");
+    expect(d.fix).toMatchObject({ kind: "command", command: "croft schedule on" });
+  });
+
   test("a project whose croft is not installed", () => {
     log(`2026-09-24T10:00:00.000Z ${root}: its croft is not installed (no node_modules/@zabaca/croft); run bun install in that folder\n`);
     const d = diagnose(home, base);
