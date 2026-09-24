@@ -80,6 +80,18 @@ export interface RunFilter {
   limit?: number;                    // default 50
 }
 export interface Waiter { pid: number; purpose: string; since: string }
+/** schedule_state (§8): instants are ISO-8601 UTC. */
+export interface ScheduleStateRow {
+  asset: string; phrase: string | null; cron: string | null; fileHash: string | null;
+  lastFireAt: string | null; lastAttemptAt: string | null; approvedCodeHash: string | null;
+}
+export interface TickRow { pid: number | null; procStart: string | null; heartbeatAt: string | null }
+interface ScheduleStateDbRow { asset: string; phrase: string | null; cron: string | null; file_hash: string | null;
+  last_fire_at: string | null; last_attempt_at: string | null; approved_code_hash: string | null }
+function toScheduleState(r: ScheduleStateDbRow): ScheduleStateRow {
+  return { asset: r.asset, phrase: r.phrase, cron: r.cron, fileHash: r.file_hash, lastFireAt: r.last_fire_at,
+    lastAttemptAt: r.last_attempt_at, approvedCodeHash: r.approved_code_hash };
+}
 export interface CatalogEntry<T = unknown> { asset: string; value: T; source: CatalogSource; refreshedAt: string }
 export interface RunsDbOptions { now?: () => Date }
 
@@ -521,6 +533,70 @@ export class RunsDb {
     const row = this.sqlite.query("SELECT approved_code_hash FROM schedule_state WHERE asset = ?").get(asset) as
       { approved_code_hash: string | null } | null;
     return row?.approved_code_hash ?? null;
+  }
+
+  // ---- schedule_state and the tick row (§8) ----
+
+  /** An asset's schedule_state row, or null. */
+  scheduleState(asset: string): ScheduleStateRow | null {
+    const r = this.sqlite.query(`SELECT asset, phrase, cron, file_hash, last_fire_at, last_attempt_at, approved_code_hash
+      FROM schedule_state WHERE asset = ?`).get(asset) as ScheduleStateDbRow | null;
+    return r ? toScheduleState(r) : null;
+  }
+
+  allScheduleState(): ScheduleStateRow[] {
+    const rows = this.sqlite.query(`SELECT asset, phrase, cron, file_hash, last_fire_at, last_attempt_at, approved_code_hash
+      FROM schedule_state ORDER BY asset`).all() as ScheduleStateDbRow[];
+    return rows.map(toScheduleState);
+  }
+
+  /** Update the given columns of an asset's schedule_state row (creating it); others are kept. */
+  putScheduleState(asset: string, v: Partial<Omit<ScheduleStateRow, "asset">>): void {
+    const cols: [keyof Omit<ScheduleStateRow, "asset">, string][] = [
+      ["phrase", "phrase"], ["cron", "cron"], ["fileHash", "file_hash"], ["lastFireAt", "last_fire_at"],
+      ["lastAttemptAt", "last_attempt_at"], ["approvedCodeHash", "approved_code_hash"],
+    ];
+    const set = cols.filter(([k]) => v[k] !== undefined);
+    this.sqlite.query("INSERT INTO schedule_state (asset) VALUES (?) ON CONFLICT (asset) DO NOTHING").run(asset);
+    if (!set.length) return;
+    this.sqlite.query(`UPDATE schedule_state SET ${set.map(([, c]) => `${c} = ?`).join(", ")} WHERE asset = ?`)
+      .run(...set.map(([k]) => v[k] ?? null), asset);
+  }
+
+  deleteScheduleState(asset: string): boolean {
+    return this.sqlite.query("DELETE FROM schedule_state WHERE asset = ?").run(asset).changes === 1;
+  }
+
+  /** The tick row: the project tick that holds the singleton, and the last heartbeat. */
+  getTick(): TickRow | null {
+    const r = this.sqlite.query("SELECT pid, proc_start, heartbeat_at FROM tick WHERE id = 1").get() as
+      { pid: number | null; proc_start: string | null; heartbeat_at: string | null } | null;
+    return r ? { pid: r.pid, procStart: r.proc_start, heartbeatAt: r.heartbeat_at } : null;
+  }
+
+  /**
+   * Take the tick singleton for `id` (default: this process): true when no other live tick holds it. `alive`
+   * decides whether a recorded holder still runs (core/proc.ts recordAlive by default; tests inject one).
+   */
+  claimTick(alive: (h: { pid: number; procStart: string | null }) => boolean, id: ProcessIdentity = currentIdentity()): boolean {
+    return this.transaction(() => {
+      const cur = this.getTick();
+      if (cur?.pid && cur.pid !== id.pid && alive({ pid: cur.pid, procStart: cur.procStart })) return false;
+      this.sqlite.query(`INSERT INTO tick (id, pid, proc_start, heartbeat_at) VALUES (1, ?, ?, ?)
+        ON CONFLICT (id) DO UPDATE SET pid = excluded.pid, proc_start = excluded.proc_start`)
+        .run(id.pid, id.procStart, cur?.heartbeatAt ?? null);
+      return true;
+    });
+  }
+
+  /** Release the singleton if `pid` holds it; the heartbeat stays. */
+  releaseTick(pid: number = process.pid): void {
+    this.sqlite.query("UPDATE tick SET pid = NULL, proc_start = NULL WHERE id = 1 AND pid = ?").run(pid);
+  }
+
+  /** Record a heartbeat (ISO-8601 UTC; default now). */
+  heartbeat(at: string = this.nowIso()): void {
+    this.sqlite.query(`INSERT INTO tick (id, heartbeat_at) VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET heartbeat_at = excluded.heartbeat_at`).run(at);
   }
 
   // ---- settings (per project) ----

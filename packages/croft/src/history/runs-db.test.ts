@@ -412,3 +412,32 @@ describe("settings and scheduling (§8)", () => {
     expect(db.getScheduling()).toEqual({ state: "off", via: null });
   });
 });
+
+describe("schedule_state and the tick row (§8)", () => {
+  test("putScheduleState updates only the given columns; approveCode keeps them", () => {
+    expect(db.scheduleState("zones")).toBeNull();
+    db.putScheduleState("zones", { phrase: "every hour", cron: "0 * * * *", lastFireAt: "2026-09-22T16:00:00.000Z" });
+    db.approveCode("zones", "h1");
+    db.putScheduleState("zones", { lastAttemptAt: "2026-09-22T17:00:00.000Z" });
+    expect(db.scheduleState("zones")).toEqual({
+      asset: "zones", phrase: "every hour", cron: "0 * * * *", fileHash: null, lastFireAt: "2026-09-22T16:00:00.000Z",
+      lastAttemptAt: "2026-09-22T17:00:00.000Z", approvedCodeHash: "h1",
+    });
+    db.putScheduleState("other", {});
+    expect(db.allScheduleState().map((r) => r.asset)).toEqual(["other", "zones"]);
+    expect(db.deleteScheduleState("other")).toBe(true);
+  });
+
+  test("the tick singleton: a live holder keeps it, a dead one loses it; the heartbeat survives release", () => {
+    const me = { pid: 100, procStart: "a", bootId: "b" };
+    const other = { pid: 200, procStart: "c", bootId: "b" };
+    expect(db.claimTick(() => true, me)).toBe(true);
+    db.heartbeat("2026-09-22T17:00:00.000Z");
+    expect(db.claimTick(() => true, other)).toBe(false);
+    expect(db.claimTick(() => false, other)).toBe(true);
+    expect(db.getTick()).toEqual({ pid: 200, procStart: "c", heartbeatAt: "2026-09-22T17:00:00.000Z" });
+    db.releaseTick(200);
+    expect(db.getTick()).toEqual({ pid: null, procStart: null, heartbeatAt: "2026-09-22T17:00:00.000Z" });
+    expect(db.claimTick(() => true, me)).toBe(true);
+  });
+});
