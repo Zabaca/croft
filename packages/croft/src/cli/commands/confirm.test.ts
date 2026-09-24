@@ -10,10 +10,10 @@ import { cleanup, cli, makeProject, runsDb } from "./inspect-testkit.ts";
 // Test commands, registered only here, that carry out a confirmation like run does: croft confirm hands them
 // the token through the Dispatch (never argv).
 beforeAll(() => {
-  for (const n of ["zap", "lax", "sloppy", "flaky"]) CONFIRMABLE.add(n);
+  for (const n of ["zap", "lax", "sloppy", "sloppier", "flaky"]) CONFIRMABLE.add(n);
 });
 afterAll(() => {
-  for (const n of ["zap", "lax", "sloppy", "flaky"]) CONFIRMABLE.delete(n);
+  for (const n of ["zap", "lax", "sloppy", "sloppier", "flaky"]) CONFIRMABLE.delete(n);
   cleanup();
 });
 
@@ -76,6 +76,15 @@ const SLOPPY: Command = {
   },
 };
 
+// The same bug in the shape of croft delete and croft restore: their data says what they did.
+const SLOPPIER: Command = {
+  name: "sloppier", summary: "test", usage: "croft sloppier <what>", options: {}, maxPositionals: 1,
+  async run(ctx) {
+    const what = ctx.positionals[0];
+    return { data: what === "restored" ? { asset: "x", status: "restored", trashed: null } : { asset: "x", status: "deleted", trashed: { path: "t", rows: 1 } }, problems: [], next: [] };
+  },
+};
+
 // A command that fails before it reaches its confirmation.
 let flakyCalls = 0;
 const FLAKY: Command = {
@@ -86,7 +95,7 @@ const FLAKY: Command = {
   },
 };
 
-const COMMANDS_PLUS = [...COMMANDS, ZAP, LAX, SLOPPY, FLAKY];
+const COMMANDS_PLUS = [...COMMANDS, ZAP, LAX, SLOPPY, SLOPPIER, FLAKY];
 
 async function tokenFor(root: string, asset = "taxi_zones"): Promise<string> {
   const r = await cli(["zap", asset, "--json"], { cwd: root, commands: COMMANDS_PLUS });
@@ -246,6 +255,12 @@ describe("croft confirm", () => {
     const b = await cli(["confirm", sloppy, "--json"], { cwd: p.root, commands: COMMANDS_PLUS });
     expect(b.exit).toBe(1);
     expect(b.json.problems[0].message).toBe(`croft sloppy acted without spending confirmation ${sloppy}`);
+    for (const what of ["deleted", "restored"]) {
+      const token = stored(p.root, `croft sloppier ${what}`);
+      const c = await cli(["confirm", token, "--json"], { cwd: p.root, commands: COMMANDS_PLUS });
+      expect(c.exit, what).toBe(1);
+      expect(c.json.problems[0].message, what).toBe(`croft sloppier acted without spending confirmation ${token}`);
+    }
   });
 });
 

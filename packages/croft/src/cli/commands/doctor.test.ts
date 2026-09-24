@@ -483,6 +483,43 @@ describe("project checks", () => {
     }
   });
 
+  describe("the trash (§6: 30 days, and the 5 newest of each table)", () => {
+    /** A trashed version on disk: its file and sidecar, as trash.ts writes them. */
+    function version(root: string, asset: string, at: string, bytes = 1000): string {
+      const dir = join(root, ".croft", "trash", asset);
+      mkdirSync(dir, { recursive: true });
+      const stamp = new Date(at).toISOString().replace(/[-:]/g, "");
+      const path = join(dir, `${stamp}.duckdb`);
+      writeFileSync(path, "x".repeat(bytes));
+      writeFileSync(join(dir, `${stamp}.json`), JSON.stringify({ asset, path, trashedAt: new Date(at).toISOString(), reason: "delete", runId: null, rows: 3, bytes }));
+      return path;
+    }
+    const NOW = "2026-09-22T12:00:00.000Z";
+    const ago = (days: number) => new Date(Date.parse(NOW) - days * 86_400_000).toISOString();
+
+    test("an empty trash has no line", async () => {
+      const root = await project();
+      const { data } = await runDoctor(root, deps({ env: { CROFT_NOW: NOW } }));
+      expect(data.checks.find((c) => c.id === "trash")).toBeUndefined();
+    });
+
+    test("what it holds, after doctor prunes the expired versions (never a table's 5 newest)", async () => {
+      const root = await project();
+      const orders = [1, 40, 50, 60, 70, 80, 90].map((d) => version(root, "orders", ago(d)));
+      const zones = [100, 200].map((d) => version(root, "zones", ago(d)));
+      const { data, problems } = await runDoctor(root, deps({ env: { CROFT_NOW: NOW } }));
+      expect(problems).toEqual([]);
+      const line = check(data.checks, "trash");
+      expect(line).toMatchObject({ section: "project", status: "ok", details: { versions: 7, tables: 2, bytes: 7000, pruned: 2 } });
+      expect(line.text).toBe("trash: 7 versions of 2 tables, 6.8 KB; removed 2 older than 30 days (kept: 30 days, and the 5 newest of each table; croft restore lists them)");
+      expect(orders.map(existsSync)).toEqual([true, true, true, true, true, false, false]);
+      expect(zones.map(existsSync)).toEqual([true, true]);
+      // Nothing left to prune the next time.
+      const again = await runDoctor(root, deps({ env: { CROFT_NOW: NOW } }));
+      expect(check(again.data.checks, "trash").text).toBe("trash: 7 versions of 2 tables, 6.8 KB (kept: 30 days, and the 5 newest of each table; croft restore lists them)");
+    });
+  });
+
   test("before the first run the write test uses the project folder", async () => {
     const root = await project();
     rmSync(join(root, ".croft"), { recursive: true });
