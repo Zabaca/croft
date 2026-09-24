@@ -142,9 +142,10 @@ export async function runDoctor(cwd: string, d: DoctorDeps): Promise<{ data: Doc
     const problems = configProblems(configIssues);
     problems.forEach((p, i) => r.add("project", i === 0 ? "config" : `config.${i}`, "error", `croft.json: ${p.message}`, p));
   } else if (project) {
-    r.add("project", "config", "ok", `croft.json · timezone ${project.timezone} · ${assetSummary(project.paths.assetsDir)}`);
+    r.add("project", "config", "ok", `croft.json · timezone ${project.timezone}`);
   }
   if (project) {
+    await checkAssets(r, d, project, probe.ok);
     checkStorage(r, d, project);
     checkWritable(r, project);
   }
@@ -593,14 +594,51 @@ function offsetText(seconds: number): string {
 // ---------------------------------------------------------------------------------------------
 // Project
 
-function assetSummary(assetsDir: string): string {
+function assetFileCount(assetsDir: string): number {
   let n = 0;
   try {
     for (const f of new Bun.Glob("**/*.{ts,sql}").scanSync({ cwd: assetsDir, onlyFiles: true })) if (!f.split("/").some((s) => s.startsWith("."))) n++;
   } catch { /* no assets/ yet */ }
-  // HOOK(validate): once discovery and validation exist, report "N assets · E errors, W warnings" here.
-  // Until then croft context lists each asset file's problems without running anything.
-  return `${n} asset file${n === 1 ? "" : "s"} (details: croft context)`;
+  return n;
+}
+
+/**
+ * The assets, validated as `croft validate` validates them (static checks and the bind check, on an in-memory
+ * DuckDB; never the warehouse): "6 assets · 0 errors, 1 warning (details: croft validate)" (§2). The problems
+ * stay validate's and doctor shows the counts: the line is an error when an asset has one, ok otherwise.
+ * validate.ts imports DuckDB, so it is loaded only after the binding check passed; without a binding the files
+ * are only counted.
+ */
+async function checkAssets(r: Report, d: DoctorDeps, project: Project, bindingOk: boolean): Promise<void> {
+  const files = assetFileCount(project.paths.assetsDir);
+  const filesText = `${files} asset file${files === 1 ? "" : "s"}`;
+  if (!bindingOk) {
+    r.add("project", "assets", "info", `${filesText}, not validated (validating needs the DuckDB binding)`);
+    return;
+  }
+  // Before bun install, every TS asset fails to import @zabaca/croft; the croft line already says to install.
+  if (declaresCroft(project.root) && !existsSync(join(project.root, "node_modules", "@zabaca", "croft", "package.json"))) {
+    r.add("project", "assets", "info", `${filesText}, not validated until the project's packages are installed (bun install)`);
+    return;
+  }
+  let problems: Problem[];
+  let assets: number;
+  try {
+    const { validateProject } = await import("./validate.ts");
+    const report = await validateProject({ project, env: ProjectEnv.load(project.root, d.env), importTimeoutMs: 5000 });
+    problems = report.problems;
+    assets = report.data.assets.length;
+  } catch (e) {
+    r.add("project", "assets", "info", `${filesText}, not validated: ${String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 200)}`);
+    return;
+  }
+  const count = (s: Problem["severity"]) => problems.filter((p) => p.severity === s).length;
+  const errors = count("error");
+  const warnings = count("warning");
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  r.add("project", "assets", errors > 0 ? "error" : "ok",
+    `${plural(assets, "asset")} · ${plural(errors, "error")}, ${plural(warnings, "warning")} (details: croft validate)`,
+    undefined, { assets, errors, warnings, info: count("info") });
 }
 
 function checkStorage(r: Report, d: DoctorDeps, project: Project): void {
