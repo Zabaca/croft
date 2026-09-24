@@ -417,6 +417,173 @@ describe("planRun: static errors fail their own step", () => {
   });
 });
 
+// R2.2: validate binds every SQL asset against the NEW output of the SQL it reads; a named run bound against the
+// input's BUILT columns, so after an edit to two chained SQL assets validate passed and `croft run daily` (its dry
+// run, `croft preview daily`) failed with UNKNOWN_COLUMN, pointing at the correct file.
+describe("planRun: SQL binds against the new output of the SQL it reads, as validate does", () => {
+  const ORDERS_COLUMNS = [col("id", "BIGINT"), col("amount", "BIGINT"), col("status", "VARCHAR"), col("updated_at", "TIMESTAMPTZ"), col("_loaded_at", "TIMESTAMPTZ")];
+  const SHOP = {
+    "assets/orders.ts": INGEST,
+    "assets/clean_orders.sql": "-- key: id\nSELECT id, amount, status FROM orders\n",
+    "assets/daily.sql": "-- key: status\nSELECT status, sum(amount) AS total FROM clean_orders GROUP BY ALL\n",
+    "assets/weekly.sql": "SELECT count(*) AS n FROM clean_orders\n",
+  };
+  const seen = (input: string) => ({ [input]: { seenLoadedAt: T1, seenKey: null, inputLastLoadedAt: T1 } });
+
+  /** SHOP built once, as its files are now: nothing is stale. */
+  async function shop() {
+    const root = makeProject(SHOP);
+    const s = by(await planRun({ root, timezone: "UTC", selectors: [], catalog: [] }));
+    const catalog = [
+      entry("orders", { write: "merge", key: ["id"], columns: ORDERS_COLUMNS, codeHash: s.orders!.codeHash ?? null }),
+      entry("clean_orders", {
+        kind: "sql", key: ["id"], codeHash: s.clean_orders!.codeHash!, inputsSeen: seen("orders"),
+        columns: [col("id", "BIGINT"), col("amount", "BIGINT"), col("status", "VARCHAR"), col("_loaded_at", "TIMESTAMPTZ")],
+      }),
+      entry("daily", { kind: "sql", key: ["status"], codeHash: s.daily!.codeHash!, inputsSeen: seen("clean_orders"), columns: [col("status", "VARCHAR"), col("total", "HUGEINT")] }),
+      entry("weekly", { kind: "sql", codeHash: s.weekly!.codeHash!, inputsSeen: seen("clean_orders"), columns: [col("n", "BIGINT")] }),
+    ];
+    return { root, catalog };
+  }
+
+  test("a new column upstream, used downstream: the run rebuilds the input first and binds against its new columns", async () => {
+    const { root, catalog } = await shop();
+    expect((await planRun({ root, timezone: "UTC", selectors: ["daily"], catalog })).order).toEqual(["daily"]);
+    writeFiles(root, {
+      "assets/clean_orders.sql": "-- key: id\nSELECT id, amount, status, round(amount * 1.2, 2) AS amount_vat FROM orders\n",
+      "assets/daily.sql": "-- key: status\nSELECT status, sum(amount_vat) AS total_vat FROM clean_orders GROUP BY ALL\n",
+    });
+    const only = await planRun({ root, timezone: "UTC", selectors: ["daily"], catalog, only: true });
+    expect(only.order).toEqual(["clean_orders", "daily"]);
+    const s = by(only);
+    expect(codes(s.daily)).toEqual([]);
+    expect(s.clean_orders).toMatchObject({
+      action: "rebuild", reasons: ["code_changed"], reason: "SQL changed (assets/clean_orders.sql); daily reads its new columns", problems: [],
+      neededBy: ["daily"],
+    });
+    expect(s.daily).toMatchObject({ action: "rebuild", reasons: ["requested", "code_changed", "input_changed"] });
+    expect(s.daily!.neededBy).toBeUndefined();
+    // Without --only, what else reads the rebuilt input follows it, as for any asset a run takes.
+    const all = await planRun({ root, timezone: "UTC", selectors: ["daily"], catalog });
+    expect(all.order).toEqual(["clean_orders", "daily", "weekly"]);
+    expect(codes(by(all).daily)).toEqual([]);
+    // A preview plans the same way (it names the same assets): no UNKNOWN_COLUMN for amount_vat.
+    expect(by(await planRun({ root, timezone: "UTC", selectors: ["daily"], catalog })).daily!.problems).toEqual([]);
+  });
+
+  test("an input whose SQL changed but whose columns did not is left alone; a never-built SQL input is built first", async () => {
+    const { root, catalog } = await shop();
+    writeFiles(root, { "assets/clean_orders.sql": "-- key: id\nSELECT id, amount, status FROM orders WHERE status <> 'void'\n" });
+    expect((await planRun({ root, timezone: "UTC", selectors: ["daily"], catalog, only: true })).order).toEqual(["daily"]);
+    // Never built: nothing to read yet, so it runs first (its own input, orders, is built).
+    const unbuilt = catalog.filter((c) => c.asset !== "clean_orders");
+    const first = by(await planRun({ root, timezone: "UTC", selectors: ["daily"], catalog: unbuilt, only: true }));
+    expect(Object.keys(first)).toEqual(["clean_orders", "daily"]);
+    expect(first.clean_orders).toMatchObject({ action: "rebuild", reasons: ["never_built"], reason: "never built; daily reads it" });
+    expect(codes(first.daily)).toEqual([]);
+  });
+
+  test("a broken SQL input is not taken: the reader reads its table as it is", async () => {
+    const { root, catalog } = await shop();
+    writeFiles(root, { "assets/clean_orders.sql": "-- key: id\nSELECT id, amount, status, nope FROM orders\n" });
+    const s = by(await planRun({ root, timezone: "UTC", selectors: ["daily"], catalog, only: true }));
+    expect(Object.keys(s)).toEqual(["daily"]);
+    expect(codes(s.daily)).toEqual([]);
+  });
+});
+
+// R2.2: a named run of an asset whose input was never built, and is not in the run, dropped the bind's
+// INPUT_NOT_BUILT: the dry run said it would run, and the run failed with UNKNOWN_TABLE "no table named orders".
+describe("planRun: an input never built that the run does not build", () => {
+  test("the step is skipped with INPUT_NOT_BUILT naming the run that builds the input; what reads it too", async () => {
+    const root = makeProject(PROJECT);
+    const plan = await planRun({ root, timezone: "UTC", selectors: ["open_issues"], catalog: [] });
+    expect(plan.order).toEqual(["open_issues", "triage"]);
+    const s = by(plan);
+    expect(s.open_issues).toMatchObject({ action: "skip", reason: "input api has never been built, and this run does not build it (croft run api does)" });
+    expect(s.open_issues!.problems).toMatchObject([{
+      code: "INPUT_NOT_BUILT", severity: "warning", asset: "open_issues", file: "assets/open_issues.sql",
+      message: "open_issues reads api, which has never been built, and this run does not build it",
+      hint: "build api first (croft run api), or both in one run: croft run open_issues --upstream",
+      fix: { kind: "command", command: "croft run api" },
+      details: { input: "api", inputs: ["api"] },
+    }]);
+    expect(loadErrors(s.open_issues!)).toEqual([]);
+    // triage reads open_issues, which this run no longer builds; building api builds both after it.
+    expect(s.triage).toMatchObject({ action: "skip", reason: "input open_issues has never been built, and this run does not build it (croft run api does)" });
+    expect(s.triage!.problems[0]).toMatchObject({
+      code: "INPUT_NOT_BUILT", message: "triage reads open_issues, which has never been built, and this run does not build it",
+      hint: "build api first (croft run api), or both in one run: croft run triage --upstream",
+      fix: { command: "croft run api" }, details: { input: "open_issues", notBuilt: ["api"] },
+    });
+
+    // A TS transform too, whose input is built: only what is missing counts.
+    const withApi = [entry("api", { write: "merge", key: ["id"], columns: API_COLUMNS })];
+    const t = by(await planRun({ root, timezone: "UTC", selectors: ["triage"], catalog: withApi }));
+    expect(t.triage).toMatchObject({ action: "skip", problems: [{ code: "INPUT_NOT_BUILT", fix: { command: "croft run open_issues" } }] });
+    // --upstream builds it first; so does naming it, or a bare run.
+    expect(by(await planRun({ root, timezone: "UTC", selectors: ["open_issues"], catalog: [], upstream: true })).open_issues!.action).toBe("rebuild");
+    expect(by(await planRun({ root, timezone: "UTC", selectors: ["api", "open_issues"], catalog: [] })).open_issues!.problems).toEqual([]);
+    expect(by(await planRun({ root, timezone: "UTC", selectors: [], catalog: [] })).triage!.action).toBe("update");
+    // An input never built that reads another never built: the fix builds the root, and so everything after it.
+    const deep = by(await planRun({ root, timezone: "UTC", selectors: ["triage"], catalog: [], only: true }));
+    expect(deep.triage).toMatchObject({
+      action: "skip", reason: "input open_issues has never been built, and this run does not build it (croft run api does)",
+      problems: [{ code: "INPUT_NOT_BUILT", fix: { command: "croft run api" }, details: { inputs: ["open_issues"], notBuilt: ["api"] } }],
+    });
+    // An input that fails to load is the run's own news: its reader is planned, and skipped when it fails.
+    writeFiles(root, { "assets/open_issues.sql": "-- key: id\nSELECT id, title FROM api WHERE\n" });
+    const broken = by(await planRun({ root, timezone: "UTC", selectors: ["open_issues"], catalog: withApi }));
+    expect(broken.triage).toMatchObject({ action: "update", problems: [] });
+  });
+});
+
+// R2.2: DESIGN §3c's warn example `-- warn: id IN (SELECT issue_id FROM issue_triage)`, with issue_triage reading
+// open_issues, made an ordering edge that closed a cycle: both assets failed with CYCLE on every run, though a
+// warning never blocks anything.
+describe("planRun: a warning's subquery does not order the steps", () => {
+  const TRIAGE_OPEN = `import { transform } from "@zabaca/croft";
+export default transform({ inputs: ["open_issues"], key: "issue_id", incremental: true, async *rows() {} });
+`;
+  const FILES = {
+    "assets/github_issues.sql": "-- key: id\nSELECT i AS id, 'Issue ' || i AS title FROM range(1, 4) t(i)\n",
+    "assets/open_issues.sql": "-- key: id\n-- warn: id IN (SELECT issue_id FROM issue_triage)\nSELECT id, title FROM github_issues\n",
+    "assets/issue_triage.ts": TRIAGE_OPEN,
+  };
+  const WARNING = "id IN (SELECT issue_id FROM issue_triage)";
+
+  test("no cycle; a warning whose table is not built when it would run is skipped with an info note", async () => {
+    const root = makeProject(FILES);
+    const plan = await planRun({ root, timezone: "UTC", selectors: [], catalog: [] });
+    expect(plan.problems).toEqual([]);
+    expect(plan.order).toEqual(["github_issues", "open_issues", "issue_triage"]);
+    const s = by(plan);
+    expect(s.open_issues!.orderAfter).toEqual(["github_issues"]);
+    expect(s.issue_triage).toMatchObject({ action: "update", problems: [] });
+    // issue_triage is built after open_issues (a warning does not wait for it): the warning is left out this run.
+    expect(s.open_issues!.checks.map((c) => c.source)).toEqual(["unique(id)", "not_null(id)"]);
+    expect(s.open_issues!.problems).toMatchObject([{
+      code: "INPUT_NOT_BUILT", severity: "info", asset: "open_issues", file: "assets/open_issues.sql", line: 2,
+      message: `open_issues: the warning "${WARNING}" reads issue_triage, which has not been built yet, so it is skipped in this run`,
+      details: { check: WARNING, table: "issue_triage" },
+    }]);
+    expect(loadErrors(s.open_issues!)).toEqual([]);
+
+    // Once issue_triage is built, the warning reads it as it is, whatever runs after.
+    const built = [entry("issue_triage", { kind: "ts", write: "merge", key: ["issue_id"] })];
+    const later = by(await planRun({ root, timezone: "UTC", selectors: ["open_issues"], catalog: [...built, entry("github_issues", { kind: "sql" })] }));
+    expect(later.open_issues!.checks.map((c) => c.source)).toContain(WARNING);
+    expect(later.open_issues!.problems).toEqual([]);
+  });
+
+  test("a blocking check that reads a downstream table is still a cycle: it runs before the write commits", async () => {
+    const root = makeProject({ ...FILES, "assets/open_issues.sql": `-- key: id\n-- check: ${WARNING}\nSELECT id, title FROM github_issues\n` });
+    const s = by(await planRun({ root, timezone: "UTC", selectors: [], catalog: [] }));
+    expect(codes(s.open_issues)).toEqual(["CYCLE"]);
+    expect(codes(s.issue_triage)).toEqual(["CYCLE"]);
+  });
+});
+
 describe("the --from matrix (§8)", () => {
   const step = (o: Partial<Parameters<typeof backfillUnsupported>[0]>) =>
     ({ asset: "x", file: "assets/x.ts", kind: "rows", write: "merge", incremental: cursor, ...o }) as Parameters<typeof backfillUnsupported>[0];

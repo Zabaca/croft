@@ -215,6 +215,48 @@ export default transform({
     expect(first.confirmation.impact).toMatchObject({ rows: 5000, estimatedRequests: 5000 });
   });
 
+  // R2.2: the dry run's estimate skipped inputs not built yet, so the first build of a paid transform (its input
+  // built by the same run) showed no confirmation, and the run then stopped to ask (exit 5).
+  test("the cost guard on a first build whose input the run builds first: the rows are unknown until then, and the run may ask", async () => {
+    const triage = `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["fresh"], key: "id", incremental: true,
+  async *rows({ newRows, http }) { for await (const r of newRows("fresh")) { await http.get("https://example.test/" + r.id); yield r; } },
+});
+`;
+    const { run } = setup({ ...FILES, "assets/triage.ts": triage });
+    const out = await run({ selectors: ["fresh"] });
+    expect(out.data.order).toEqual(["fresh", "triage"]);
+    const s = stepsOf(out.data).triage;
+    expect(s.action).toBe("update");
+    expect(s.confirmation).toBeUndefined();
+    expect(s.reason).toBe("never built; may need confirmation: the rows it would process are unknown until fresh is built, first in this run (LARGE_REPROCESS above 1,000)");
+    expect(out.next).toEqual([{ command: "croft run fresh", reason: "run it; it may stop to ask before triage, whose input rows are unknown until fresh is built" }]);
+    expect(formatDryRun(out.data)).toContain("update   triage           never built; may need confirmation: the rows it would process are unknown until fresh is built");
+    // An input already built gives its rows, as before: a confirmation, not a maybe.
+    const built = stepsOf((await setup({ ...FILES, "assets/triage.ts": triage.replaceAll("fresh", "issues") }).run({ selectors: ["issues"] })).data).triage;
+    expect(built.confirmation.impact).toMatchObject({ rows: 5000 });
+    expect(built.reason).toBe("never built");
+  });
+
+  // R2.2: `croft run clean` when its input was never built and the run does not build it: the dry run said it would
+  // run, and the run failed with UNKNOWN_TABLE "no table named fresh".
+  test("an input never built that the run does not build: the step is skipped with INPUT_NOT_BUILT, and next builds the input", async () => {
+    const { run } = setup({ ...FILES, "assets/clean.sql": "-- key: id\nSELECT id FROM fresh\n" });
+    const out = await run({ selectors: ["clean"] });
+    const s = stepsOf(out.data).clean;
+    expect(s).toMatchObject({ action: "skip", skippedBecause: "input fresh has never been built, and this run does not build it (croft run fresh does)", problems: [] });
+    expect(out.problems).toMatchObject([{ code: "INPUT_NOT_BUILT", severity: "warning", asset: "clean", fix: { kind: "command", command: "croft run fresh" } }]);
+    expect(out.next).toEqual([{ command: "croft run fresh", reason: "build fresh first: clean reads it, and it has never been built" }]);
+    expect(out.exit).toBe(0);
+    expect(formatDryRun(out.data).split("\n")).toEqual([
+      "skip     clean            input fresh has never been built, and this run does not build it (croft run fresh does)",
+      "dry run: 0 of 1 step would run; nothing ran",
+    ]);
+    // Built first in the same run: it would run.
+    expect(stepsOf((await run({ selectors: ["clean"], upstream: true })).data).clean).toMatchObject({ action: "rebuild", problems: [] });
+  });
+
   test("a step that would fail before it runs is shown with its problem; what reads it is skipped, as the runner skips it", async () => {
     const { run } = setup({
       ...FILES,

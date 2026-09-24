@@ -10,15 +10,17 @@
 //    file through loadTsAsset (import scan, bundle, isolated import, config validation);
 // 3. parse its checks and warnings (checks/parse.ts parseChecks) and vet them with DuckDB's parser
 //    (analyzeChecks), which also gives the tables a check reads;
-// 4. orderAfter = inputs ∪ the tables its checks read, and buildGraph (project/graph.ts): the run order, reads,
-//    readBy, downstream, upstream and CYCLE;
+// 4. orderAfter = inputs ∪ the tables its blocking checks read, and buildGraph (project/graph.ts): the run order,
+//    reads, readBy, downstream, upstream and CYCLE. A warning's tables do not order anything: it runs after the
+//    commit and never blocks (§3f), so it reads them as they are (run/plan.ts skips one whose table is not built);
+//    as an ordering edge it closed a cycle whenever it read a table downstream of its asset (§3c's own example);
 // 5. an asset whose code hash differs from the one it was built with only because croft.json's timezone changed
 //    gets timeZoneChanged (see "Time zone changes" below).
 //
 // With selectors, a TS file whose text calls ingest() only (sniffKind) is imported when it is selected or
-// needed before the selection (upstream of it, or read by its checks: neededBy), and left unimported otherwise
-// (`loaded: false`): an ingest reads no asset, so the graph does not need its code, and `croft run x` never runs
-// the top-level code of unrelated ingests. Every SQL asset and every TS file that may be a transform is always
+// needed before the selection (upstream of it, or read by its blocking checks: neededBy), and left unimported
+// otherwise (`loaded: false`): an ingest reads no asset, so the graph does not need its code, and `croft run x`
+// never runs the top-level code of unrelated ingests. Every SQL asset and every TS file that may be a transform is always
 // loaded, since the graph needs their inputs.
 //
 // bindProject then binds every SQL asset in run order against empty tables with the columns the catalog mirror
@@ -108,7 +110,8 @@ export interface ResolvedAsset {
    *  unoptimized plan's scans), a TS transform's declared `inputs`, [] for an ingest. Names that are not assets
    *  stay (the bind check reports UNKNOWN_TABLE); the graph ignores them. */
   inputs: string[];
-  /** inputs + the tables its checks read in subqueries (they only order the steps, §3f). */
+  /** inputs + the tables its blocking checks read in subqueries (they only order the steps, §3f). A warning's
+   *  tables are not here: it runs after the commit, against the tables as they are. */
   orderAfter: string[];
   write: WriteMode; key: string[]; incremental: Incremental;
   /** Short label: "merge by id", "replace; key id", "append". */
@@ -172,8 +175,8 @@ export async function resolveProject(i: ResolveInput): Promise<ResolvedProject> 
       else byName.set(a.name, notLoaded(a));
     }
     // What the selection needs first, through other assets, is loaded too (--upstream runs it): what it reads,
-    // and the tables its checks read. A file sniffed as an ingest that turns out to read assets (or to have
-    // checks that do) brings them in on the next round.
+    // and the tables its blocking checks read. A file sniffed as an ingest that turns out to read assets (or to
+    // have checks that do) brings them in on the next round.
     while (!everything) {
       const missing = neededBy(selected, (n) => byName.get(n)?.orderAfter ?? []).filter((n) => byName.get(n)?.loaded === false);
       if (missing.length === 0) break;
@@ -202,7 +205,7 @@ function nodesOf(assets: readonly ResolvedAsset[]) {
 
 /**
  * Every name that must run before any of `names`, directly or through others, by `after` (an asset's
- * orderAfter: its inputs and the tables its checks read, §3f; Graph.upstream follows inputs only). `names`
+ * orderAfter: its inputs and the tables its blocking checks read, §3f; Graph.upstream follows inputs only). `names`
  * excluded, in no particular order. Names `after` gives that are not assets come along; callers look them up.
  */
 export function neededBy(names: readonly string[], after: (name: string) => readonly string[]): string[] {
@@ -465,7 +468,8 @@ async function resolveAsset(a: DiscoveredAsset, i: ResolveInput, names: readonly
   return withChecks(out, { key: spec.key, checks: spec.checks, warnings: spec.warnings }, connection);
 }
 
-/** Parse and vet the asset's checks and warnings; orderAfter becomes its inputs plus the tables they read. */
+/** Parse and vet the asset's checks and warnings; orderAfter becomes its inputs plus the tables its blocking checks
+ *  read (a warning never blocks, so what it reads does not order the steps). */
 async function withChecks(out: ResolvedAsset, c: { key: readonly string[]; checks: readonly string[]; warnings: readonly string[] },
   connection: () => Promise<DuckDBConnection>): Promise<ResolvedAsset> {
   const parsed = parseChecks({ asset: out.name, file: out.file, key: c.key, checks: c.checks, warnings: c.warnings });
@@ -474,7 +478,7 @@ async function withChecks(out: ResolvedAsset, c: { key: readonly string[]; check
     : { checks: [] as Check[], problems: [] as Problem[] };
   out.checks = vetted.checks;
   out.problems.push(...parsed.problems, ...vetted.problems);
-  out.orderAfter = [...new Set([...out.inputs, ...vetted.checks.flatMap((x) => x.reads)])];
+  out.orderAfter = [...new Set([...out.inputs, ...vetted.checks.filter((x) => x.blocking).flatMap((x) => x.reads)])];
   out.ok = !out.problems.some((p) => p.severity === "error");
   return out;
 }

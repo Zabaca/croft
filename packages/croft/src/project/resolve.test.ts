@@ -108,6 +108,29 @@ export default ingest({ async *rows() {} });
     expect(a.other!.loaded).toBe(false);
   });
 
+  // §3f: warnings run after the commit and never block, so the tables their subqueries read do not order the
+  // steps (R2.2: DESIGN §3c's warn example closed a cycle with the transform that reads open_issues).
+  test("only a blocking check's tables order the asset; a warning's do not, and --upstream does not load them", async () => {
+    const root = makeProject({
+      "assets/regions.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ key: "region", async *rows() {} });\n`,
+      "assets/triage.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ key: "issue_id", async *rows() {} });\n`,
+      "assets/report.sql": "-- check: region IN (SELECT region FROM regions)\n-- warn: id IN (SELECT issue_id FROM triage)\nSELECT 'East' AS region, 1 AS id\n",
+    });
+    const r = await resolveProject({ root, timezone: "UTC", selectors: ["report"] });
+    const a = byName(r.assets);
+    expect(a.report!.checks.find((c) => !c.blocking)).toMatchObject({ reads: ["triage"] });
+    expect(a.report!.orderAfter).toEqual(["regions"]);
+    expect(a.triage!.loaded).toBe(false);
+    // A warning reading a table that reads the asset is no cycle.
+    const loop = makeProject({
+      "assets/open_issues.sql": "-- key: id\n-- warn: id IN (SELECT issue_id FROM issue_triage)\nSELECT 1 AS id\n",
+      "assets/issue_triage.sql": "SELECT id AS issue_id FROM open_issues\n",
+    });
+    const l = await resolveProject({ root: loop, timezone: "UTC" });
+    expect(l.problems).toEqual([]);
+    expect(l.graph.order).toEqual(["open_issues", "issue_triage"]);
+  });
+
   test("unknown selectors are usage errors, as for croft run", async () => {
     const root = makeProject(PROJECT);
     await expect(resolveProject({ root, timezone: "UTC", selectors: ["open_issuse"] })).rejects.toMatchObject({ code: "USAGE_ERROR" });

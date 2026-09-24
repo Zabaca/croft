@@ -9,10 +9,13 @@
 //   confirmations   --allow-shrink on a replace ingest (its current rows would go to the trash), and the cost
 //                   guard of an incremental TS transform that makes requests (LARGE_REPROCESS), with the pending
 //                   rows of the inputs it reads with newRows() estimated from the mirror and the steps
-//                   runs.sqlite recorded for each input
+//                   runs.sqlite recorded for each input. An input never built that the run builds first has no
+//                   rows to count yet: the step's reason says the run may ask, since they are unknown until then
 //   skips           an asset downstream of one that would fail before it runs (a static error) is skipped, as
 //                   the runner skips it; --from skips every transform, and in a bare run or a glob the ingests
-//                   it does not apply to (run/plan.ts)
+//                   it does not apply to; and a transform whose input was never built and is not built by the
+//                   run either is skipped with INPUT_NOT_BUILT, whose fix (the run that builds the input) leads
+//                   next (run/plan.ts)
 //   holds           an asset another run holds the lease of: the run would wait for it
 //
 // Nothing is created: without runs.sqlite the project has never run, and everything is "never built". A dry
@@ -30,7 +33,7 @@ import { lookbackWords, selectorWords } from "../project/resolve.ts";
 import type { Project } from "../project/root.ts";
 import { cursorTypeOfPin } from "../project/ts-asset.ts";
 import { croftError, fromSince, shrinkImpact } from "./ingest.ts";
-import { cursorTypesOf, FROM_ONLY_MERGE, loadErrors, type PlannedStep, planRun, type RunPlan } from "./plan.ts";
+import { cursorTypesOf, FROM_ONLY_MERGE, inputNotBuilt, loadErrors, type PlannedStep, planRun, type RunPlan } from "./plan.ts";
 import { checkRunFlags, shrinkCommand } from "./runner.ts";
 import { DEFAULT_CONFIRM_ABOVE, REPROCESS_ACTION } from "./transform.ts";
 
@@ -112,6 +115,11 @@ export async function dryRun(i: DryRunInput): Promise<DryRunOutcome> {
   /** Steps that would fail before they run, or are skipped because an input would: the runner skips what reads
    *  them. (A step skipped for --from does not block its readers: they read its table as it is.) */
   const blocked = new Map<string, string>();
+  /** Steps that would run, so far: their tables exist for the steps after them. */
+  const running = new Set<string>();
+  /** The runs that build a never-built input first (INPUT_NOT_BUILT fixes), and the steps that may stop to ask. */
+  const builds: Next[] = [];
+  const mayAsk: { asset: string; until: string[] }[] = [];
 
   for (const step of plan.steps) {
     const entry = entries.get(step.asset) ?? null;
@@ -123,6 +131,13 @@ export async function dryRun(i: DryRunInput): Promise<DryRunOutcome> {
       reason: step.reason.replace(/^requested; /, ""), behavior: step.behavior, problems: errors,
     };
     if (step.action !== "skip") problems.push(...step.problems.map((p) => ({ ...p, asset: p.asset ?? step.asset })));
+    // Skipped for an input that will not exist: that is the news, with the run that builds the input.
+    const unbuilt = inputNotBuilt(step);
+    if (unbuilt) {
+      problems.push({ ...unbuilt, asset: unbuilt.asset ?? step.asset });
+      const build = buildFirst(unbuilt);
+      if (build && !builds.some((b) => b.command === build.command)) builds.push(build);
+    }
     const ingest = step.kind === "rows" || step.kind === "file";
 
     // An input that would fail or be skipped: the runner skips this step too.
@@ -156,8 +171,14 @@ export async function dryRun(i: DryRunInput): Promise<DryRunOutcome> {
     }
 
     if (out.action !== "skip" && out.problems.length === 0) {
-      const confirmation = confirmationOf(step, entry, { plan, entries, history, project, allowShrink: i.allowShrink === true, selectors: i.selectors });
-      if (confirmation) out.confirmation = confirmation;
+      const ask = confirmationOf(step, entry, {
+        plan, entries, history, project, allowShrink: i.allowShrink === true, selectors: i.selectors, builtFirst: (x) => running.has(x),
+      });
+      if (ask?.confirmation) out.confirmation = ask.confirmation;
+      else if (ask?.until) {
+        out.reason = `${out.reason}; ${mayAskWords(ask.until, ask.rows, ask.limit)}`;
+        mayAsk.push({ asset: step.asset, until: ask.until });
+      }
       const holder = history.leased.get(step.asset);
       if (holder) {
         out.hold = "leased";
@@ -166,13 +187,14 @@ export async function dryRun(i: DryRunInput): Promise<DryRunOutcome> {
     }
     if (out.problems.length > 0) blocked.set(step.asset, `would fail (${out.problems[0]!.code})`);
     else if (out.action === "skip" && stopped !== undefined) blocked.set(step.asset, `is skipped (${out.skippedBecause})`);
+    else if (out.action !== "skip") running.add(step.asset);
     steps.push(out);
   }
 
   return {
     data: { dryRun: true, order: [...plan.order], steps },
     problems: dedupe(problems),
-    next: nextOf(steps, i),
+    next: nextOf(steps, i, { builds, mayAsk }),
     exit: plan.problems.some((p) => p.severity === "error") ? 2 : 0,
   };
 }
@@ -248,21 +270,28 @@ interface ConfirmContext {
   project: Project;
   allowShrink: boolean;
   selectors: readonly string[];
+  /** The run builds this asset before the step (an earlier step that would run). */
+  builtFirst: (asset: string) => boolean;
 }
 
-function confirmationOf(step: PlannedStep, entry: CatalogAsset | null, c: ConfirmContext): DryRunConfirmation | null {
+/** What a step would stop for: a confirmation; or, for the cost guard, the inputs whose rows are unknown until
+ *  the run has built them (it may stop then), with the rows known so far and the limit. */
+interface Ask { confirmation?: DryRunConfirmation; until?: string[]; rows?: number; limit?: number }
+
+function confirmationOf(step: PlannedStep, entry: CatalogAsset | null, c: ConfirmContext): Ask | null {
   // --allow-shrink names exactly one replace ingest (checkRunFlags); allowShrink: true in its code needs no token.
   if (c.allowShrink && c.selectors[0] === step.asset && (step.kind === "rows" || step.kind === "file") && step.write === "replace"
     && step.spec?.allowShrink !== true && entry && entry.rows > 0) {
-    return { action: "allow_shrink", command: shrinkCommand(step.asset), impact: shrinkImpact(c.project.paths.stateDir, step.asset, entry.rows) };
+    return { confirmation: { action: "allow_shrink", command: shrinkCommand(step.asset), impact: shrinkImpact(c.project.paths.stateDir, step.asset, entry.rows) } };
   }
   if (step.kind === "transform" && step.action === "update" && step.usesHttp === true) {
     const pending = pendingEstimate(step, entry, c);
     const limit = step.confirmAbove ?? DEFAULT_CONFIRM_ABOVE;
-    if (pending > limit) {
-      const impact: Impact = { asset: step.asset, action: REPROCESS_ACTION, rows: pending, downstream: [...step.readBy], estimatedRequests: pending };
-      return { action: "large_reprocess", command: `croft run ${step.asset}`, impact };
+    if (pending.rows > limit) {
+      const impact: Impact = { asset: step.asset, action: REPROCESS_ACTION, rows: pending.rows, downstream: [...step.readBy], estimatedRequests: pending.rows };
+      return { confirmation: { action: "large_reprocess", command: `croft run ${step.asset}`, impact } };
     }
+    if (pending.unknown.length) return { until: pending.unknown, rows: pending.rows, limit };
   }
   return null;
 }
@@ -273,15 +302,23 @@ function confirmationOf(step: PlannedStep, entry: CatalogAsset | null, c: Confir
  * at most the input's rows. As the run's cost guard (run/transform.ts), only the inputs the code reads with
  * newRows() count (LoadedTsAsset.readsNewRows; every input when the scan cannot tell): a lookup read with rows()
  * never gets a position, and is no work to process. Inputs without a key are not counted (the transform's own
- * count skips them too), and neither is an input never built (it has no rows yet; the run builds it first).
+ * count skips them too). An input never built has no rows to count: when the run builds it first (`builtFirst`),
+ * all its rows will be pending, and how many is unknown until then (`unknown`, for the dry run to say so).
  */
-export function pendingEstimate(step: PlannedStep, entry: CatalogAsset | null, c: Pick<ConfirmContext, "entries" | "history">): number {
+export function pendingEstimate(step: PlannedStep, entry: CatalogAsset | null,
+  c: Pick<ConfirmContext, "entries" | "history" | "plan"> & { builtFirst?: (asset: string) => boolean }): { rows: number; unknown: string[] } {
   const reads = step.loaded?.readsNewRows;
   let total = 0;
+  const unknown: string[] = [];
   for (const input of step.inputs) {
     if (reads && !reads.includes(input)) continue;
     const e = c.entries.get(input);
-    if (!e || e.key.length === 0 || e.rows === 0) continue;
+    if (!e) {
+      const keyed = (c.plan.steps.find((s) => s.asset === input)?.key.length ?? 0) > 0;
+      if (keyed && c.builtFirst?.(input)) unknown.push(input);
+      continue;
+    }
+    if (e.key.length === 0 || e.rows === 0) continue;
     const seen = entry?.inputsSeen?.[input];
     if (!seen?.seenLoadedAt) {
       total += e.rows;
@@ -291,7 +328,16 @@ export function pendingEstimate(step: PlannedStep, entry: CatalogAsset | null, c
     const written = (c.history.writes.get(input) ?? []).filter((w) => later(w.finishedAt, seen.seenLoadedAt!)).reduce((n, w) => n + w.rows, 0);
     total += Math.min(e.rows, Math.max(1, written));
   }
-  return total;
+  return { rows: total, unknown };
+}
+
+/** The reason's note for a transform the cost guard may stop: the inputs built first in this run, whose rows are
+ *  unknown until then. */
+function mayAskWords(until: readonly string[], rows = 0, limit = DEFAULT_CONFIRM_ABOVE): string {
+  const inputs = listed(until);
+  const known = rows > 0 ? `about ${rows.toLocaleString("en-US")} input rows, and the rows of ${inputs} are` : "the rows it would process are";
+  return `may need confirmation: ${known} unknown until ${inputs} ${until.length === 1 ? "is" : "are"} built, first in this run `
+    + `(LARGE_REPROCESS above ${limit.toLocaleString("en-US")})`;
 }
 
 function later(a: string, b: string): boolean {
@@ -315,16 +361,38 @@ function dedupe(problems: Problem[]): Problem[] {
   });
 }
 
-function nextOf(steps: readonly DryRunStep[], i: DryRunInput): Next[] {
+function nextOf(steps: readonly DryRunStep[], i: DryRunInput, o: { builds: readonly Next[]; mayAsk: readonly { asset: string; until: string[] }[] }): Next[] {
   const next: Next[] = [];
   if (steps.some((s) => s.problems.length > 0)) next.push({ command: "croft validate", reason: "see every problem of the project with its fix" });
+  // A step skipped for an input never built: the run that builds that input (and then what reads it).
+  next.push(...o.builds);
   // --allow-shrink is destructive: it never appears in next (§4.3); the user runs it themselves.
   const runnable = steps.some((s) => s.action !== "skip" && s.problems.length === 0);
   if (runnable && !i.allowShrink) {
     const waits = steps.some((s) => s.confirmation);
-    next.push({ command: runWords(i).join(" "), reason: waits ? "run it; it stops to ask before the steps that need confirmation" : "run it" });
+    const until = [...new Set(o.mayAsk.flatMap((m) => m.until))];
+    const reason = waits ? "run it; it stops to ask before the steps that need confirmation"
+      : until.length ? `run it; it may stop to ask before ${listed(o.mayAsk.map((m) => m.asset))}, whose input rows are unknown until ${listed(until)} ${until.length === 1 ? "is" : "are"} built`
+        : "run it";
+    next.push({ command: runWords(i).join(" "), reason });
   }
   return next;
+}
+
+/** The next step for a step skipped with INPUT_NOT_BUILT: its fix, the run that builds the never-built input. */
+function buildFirst(p: Problem): Next | null {
+  if (p.fix?.kind !== "command") return null;
+  const inputs = Array.isArray(p.details?.inputs) ? p.details.inputs.map(String) : [];
+  const roots = Array.isArray(p.details?.notBuilt) ? p.details.notBuilt.map(String) : inputs;
+  const one = roots.length === 1;
+  const direct = roots.length === inputs.length && roots.every((r) => inputs.includes(r));
+  const what = direct ? (one ? "it" : "them") : `${listed(inputs)}, which ${inputs.length === 1 ? "needs" : "need"} ${one ? "it" : "them"}`;
+  return { command: p.fix.command, reason: `build ${listed(roots)} first: ${p.asset ?? "a step"} reads ${what}, and ${one ? "it has" : "they have"} never been built` };
+}
+
+/** "a", "a and b", "a, b and c". */
+function listed(list: readonly string[]): string {
+  return list.length <= 1 ? list.join("") : `${list.slice(0, -1).join(", ")} and ${list.at(-1)}`;
 }
 
 /** `croft run` with the dry run's selectors and flags, less --dry-run (and --allow-shrink, which is destructive:

@@ -285,8 +285,14 @@ test("journey 19a: before the first run, validate reports INPUT_NOT_BUILT and th
   expect(up.code, show(up)).toBe(0);
   expect(actions(up.json)).toEqual([["github_issues", "fetch"], ["issue_triage", "update"], ["open_issues", "rebuild"], ["issue_stats", "rebuild"]]);
   expect(up.json.next).toEqual([{ command: "croft run open_issues --upstream", reason: "run it" }]);
+  // --only: github_issues was never built and this run does not build it, so open_issues cannot run. It is
+  // skipped with INPUT_NOT_BUILT and the run that builds its input, not planned to fail with "no table named".
   const only = await p.json(["run", "open_issues", "--only", "--dry-run"]);
-  expect(actions(only.json)).toEqual([["open_issues", "rebuild"]]);
+  expect(actions(only.json)).toEqual([["open_issues", "skip"]]);
+  expect(stepOf(only.json, "open_issues").skippedBecause).toBe("input github_issues has never been built, and this run does not build it (croft run github_issues does)");
+  expect((only.json.problems as Obj[]).find((x) => x.code === "INPUT_NOT_BUILT" && x.asset === "open_issues")?.fix)
+    .toMatchObject({ command: "croft run github_issues" });
+  expect(only.json.next[0]).toMatchObject({ command: "croft run github_issues" });
 
   // Neither touched the API or made the warehouse.
   expect(api.log).toHaveLength(0);

@@ -2,7 +2,9 @@
 // who reads whom, the order steps run in, and cycles.
 //
 // Two kinds of edge: `inputs` (the asset reads that table; staleness and downstream follow them) and
-// `orderAfter` (inputs plus tables its checks read in subqueries, §3f: they only order the steps).
+// `orderAfter` (inputs plus tables its blocking checks read in subqueries, §3f: they only order the steps). A
+// warning's tables are no edge at all: it runs after the commit against the tables as they are, so it can read a
+// table downstream of its own asset (§3c's `-- warn: id IN (SELECT issue_id FROM issue_triage)`) without a cycle.
 //
 // - The order is Kahn's algorithm over both kinds, always taking the smallest ready name, so it never depends
 //   on the order the nodes came in.
@@ -16,7 +18,7 @@ export interface GraphNode {
   name: string;
   /** The assets it reads (PlannedStep.inputs). */
   inputs: readonly string[];
-  /** Everything that must run before it: its inputs and the tables its checks read. */
+  /** Everything that must run before it: its inputs and the tables its blocking checks read. */
   orderAfter: readonly string[];
   /** Root-relative, for CYCLE's problem ("assets/a.sql → assets/b.sql → assets/a.sql"). */
   file?: string;
@@ -224,23 +226,30 @@ function cycleProblem(cycle: readonly string[], nodes: Map<string, GraphNode>, r
   const fileOf = (n: string) => nodes.get(n)?.file ?? n;
   const first = cycle[0]!;
   const steps: string[] = [];
+  let check = false;
   for (let i = 0; i + 1 < cycle.length; i++) {
     const a = cycle[i]!;
     const b = cycle[i + 1]!;
-    steps.push(reads.get(a)!.includes(b) ? `${fileOf(a)} reads ${b}` : `a check in ${fileOf(a)} reads ${b}`);
+    const input = reads.get(a)!.includes(b);
+    check ||= !input;
+    steps.push(input ? `${fileOf(a)} reads ${b}` : `a check in ${fileOf(a)} reads ${b}`);
   }
   const self = cycle.length === 2;
   const file = nodes.get(first)?.file;
+  // Why a check's read counts (only a blocking check's does), so the agent does not look for a read in the SQL.
+  const why = check ? " (a blocking check runs before its write commits, so the table it reads is built first; a warning's is not)" : "";
   return problem("CYCLE", {
     message: self
       ? `${first} reads its own table (${fileOf(first)})`
       : `assets read each other in a cycle: ${cycle.join(" → ")} (${cycle.map(fileOf).join(" → ")})`,
     hint: self
       ? `an asset cannot read the table it builds; remove the read of ${first} from ${fileOf(first)}`
-      : `remove one of these reads: ${steps.join("; ")}`,
+      : `remove one of these reads: ${steps.join("; ")}${why}`,
     asset: first,
     ...(file ? { file } : {}),
-    effect: "these assets, and every asset after them, are left out of the run order",
+    // What a run does (run/plan.ts: CYCLE is a static error of each asset on the cycle); validate and the plan
+    // put them last in the order.
+    effect: "the assets on the cycle fail before they run, and the assets that read them are skipped; the others still run",
     details: { cycle: [...cycle], files: cycle.map(fileOf) },
   });
 }
