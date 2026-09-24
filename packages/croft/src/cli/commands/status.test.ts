@@ -1,12 +1,14 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { putCatalog } from "../../history/catalog.ts";
+import { allCatalog, type CatalogAsset, putCatalog } from "../../history/catalog.ts";
+import { resolveProject } from "../../project/resolve.ts";
 import { cleanup as cleanupChildren, spawnHolder, writeServeJson } from "../../read/testkit.ts";
 import {
-  busyScenario, cleanup, cli, ISSUES_CATALOG, ISSUES_SEED, makeProject, NOW, runsDb, SCENARIO_FILES, seed, shape,
+  busyScenario, cleanup, cli, DEAD, ISSUES_CATALOG, ISSUES_SEED, ISSUES_TS, makeProject, NOW, OPEN_SQL, runsDb, SCENARIO_FILES, seed, shape,
+  type TestProject,
 } from "./inspect-testkit.ts";
-import { ago, schemaChangesFromRuns, sniffKind } from "./status.ts";
+import { ago, schemaChangesFromRuns, staleText } from "./status.ts";
 
 afterAll(async () => {
   cleanupChildren();
@@ -16,12 +18,31 @@ afterAll(async () => {
 const ENV = { CROFT_NOW: NOW };
 const BEFORE_RUNS = new Date("2026-09-22T18:00:00Z");
 
-/** The busy scenario, with asset files last edited before every run, and a warehouse file: status never opens
- *  it, only checks that it is there (without it the catalog's tables are gone, DB_NOT_FOUND). */
-function scenario(o: { warehouse?: boolean } = {}) {
+/** The code hashes croft computes for the project's asset files now: what a run of them records. */
+async function codeHashes(root: string): Promise<Record<string, string>> {
+  const r = await resolveProject({ root, timezone: "America/Los_Angeles" });
+  return Object.fromEntries(r.assets.flatMap((a) => (a.codeHash ? [[a.name, a.codeHash]] : [])));
+}
+
+/** Give each catalog entry whose asset file exists the hash of that file's code, as a run of it would have. */
+async function builtWithTheirCode(p: TestProject): Promise<void> {
+  const hashes = await codeHashes(p.root);
+  const db = runsDb(p.stateDir);
+  try {
+    for (const c of allCatalog(db)) if (hashes[c.asset]) putCatalog(db, { ...c, codeHash: hashes[c.asset]! });
+  } finally {
+    db.close();
+  }
+}
+
+/** The busy scenario, with asset files last edited before every run, each built with the code it has now,
+ *  and a warehouse file: status never opens it, only checks that it is there (without it the catalog's
+ *  tables are gone, DB_NOT_FOUND). */
+async function scenario(o: { warehouse?: boolean } = {}) {
   const p = makeProject({ files: SCENARIO_FILES });
   for (const f of Object.keys(SCENARIO_FILES)) utimesSync(join(p.root, f), BEFORE_RUNS, BEFORE_RUNS);
   busyScenario(p.stateDir);
+  await builtWithTheirCode(p);
   if (o.warehouse !== false) writeFileSync(p.database, "");
   return p;
 }
@@ -29,8 +50,8 @@ function scenario(o: { warehouse?: boolean } = {}) {
 const byAsset = (data: { assets: { asset: string }[] }) => Object.fromEntries(data.assets.map((a) => [a.asset, a])) as Record<string, any>;
 
 describe("croft status --json", () => {
-  test("golden shape (§4.3), with scheduling off in phase 1", async () => {
-    const p = scenario();
+  test("golden shape (§4.3), with scheduling off (no scheduler before phase 3)", async () => {
+    const p = await scenario();
     const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
     expect(r.exit).toBe(0);
     expect(r.json).toMatchObject({ ok: true, command: "status", problems: [] });
@@ -47,7 +68,7 @@ describe("croft status --json", () => {
   });
 
   test("every asset's state: ok, failed with its code, running, crashed, never run, no asset file", async () => {
-    const p = scenario();
+    const p = await scenario();
     const d = (await cli(["status", "--json"], { cwd: p.root, env: ENV })).json.data;
     expect(d.assets.map((a: { asset: string }) => a.asset)).toEqual(["github_issues", "old_orders", "open_issues", "sales", "stripe_charges", "taxi_zones"]);
     const a = byAsset(d);
@@ -67,7 +88,7 @@ describe("croft status --json", () => {
   });
 
   test("running[] comes from runs.sqlite: live runs only, with the progress they report", async () => {
-    const p = scenario();
+    const p = await scenario();
     const d = (await cli(["status", "--json"], { cwd: p.root, env: ENV })).json.data;
     expect(d.running).toEqual([{ runId: "r_0922_1157_live", asset: "sales", pid: process.pid, since: "2026-09-22T11:56:00-07:00", phase: "extract", rowsFetched: 61200 }]);
   });
@@ -134,7 +155,7 @@ describe("croft status --json", () => {
   });
 
   test("--check exits 1 when unhealthy and 0 when healthy; ok stays true", async () => {
-    const p = scenario();
+    const p = await scenario();
     const bad = await cli(["status", "--check", "--json"], { cwd: p.root, env: ENV });
     expect(bad.exit).toBe(1);
     expect(bad.json.ok).toBe(true);
@@ -146,23 +167,49 @@ describe("croft status --json", () => {
     const db = runsDb(good.stateDir);
     putCatalog(db, ISSUES_CATALOG);
     db.close();
+    await builtWithTheirCode(good);
     writeFileSync(good.database, "");
     const r = await cli(["status", "--check", "--json"], { cwd: good.root, env: ENV });
     expect(r.exit).toBe(0);
     expect(r.json.data.healthy).toBe(true);
+    expect(r.json.problems).toEqual([]);
   });
 
-  test("an asset file edited after its last run says so", async () => {
-    const p = scenario();
+  test("an asset whose code changed since its last run is edited; a touched file whose code is the same is not", async () => {
+    const p = await scenario();
+    const later = new Date("2026-09-22T18:58:00Z");
+    // Formatting and comments are not code (the fingerprint of DESIGN §8).
+    writeFileSync(join(p.root, "assets/stripe_charges.ts"), `// Stripe charges\n${SCENARIO_FILES["assets/stripe_charges.ts"]}`);
+    utimesSync(join(p.root, "assets/stripe_charges.ts"), later, later);
+    writeFileSync(join(p.root, "assets/github_issues.ts"), ISSUES_TS.replace('key: "id"', 'key: "number"'));
+    const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+    const a = byAsset(r.json.data);
+    expect(a.github_issues).toMatchObject({ edited: true, stale: false, staleReasons: [] });
+    expect(a.stripe_charges.edited).toBe(false);
+    // An ingest's edit changes what the next run fetches, never what it has loaded.
+    expect(r.json.problems).toEqual([expect.objectContaining({
+      severity: "warning", code: "EDITED_SINCE_LAST_RUN", asset: "github_issues", file: "assets/github_issues.ts",
+      fix: expect.objectContaining({ kind: "command", command: "croft run github_issues" }),
+    })]);
+    expect(r.stdout).not.toContain("--rebuild");
+    const human = await cli(["status"], { cwd: p.root, env: ENV });
+    expect(human.stdout).toMatch(/^github_issues .* ok · schema changed 5 min ago · edited since its last run$/m);
+  });
+
+  test("a file whose code does not load falls back to its modification time", async () => {
+    const p = await scenario();
+    writeFileSync(join(p.root, "assets/github_issues.ts"), "export default ingest({ key: \n");
+    utimesSync(join(p.root, "assets/github_issues.ts"), BEFORE_RUNS, BEFORE_RUNS);
+    expect(byAsset((await cli(["status", "--json"], { cwd: p.root, env: ENV })).json.data).github_issues.edited).toBe(false);
     const later = new Date("2026-09-22T18:58:00Z");
     utimesSync(join(p.root, "assets/github_issues.ts"), later, later);
-    const a = byAsset((await cli(["status", "--json"], { cwd: p.root, env: ENV })).json.data);
-    expect(a.github_issues.edited).toBe(true);
-    expect(a.stripe_charges.edited).toBe(false);
+    const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+    expect(r.exit).toBe(0);
+    expect(byAsset(r.json.data).github_issues).toMatchObject({ kind: "ingest", status: "ok", edited: true });
   });
 
   test("a live croft serve is listed", async () => {
-    const p = scenario();
+    const p = await scenario();
     writeServeJson(p.stateDir, { url: "http://127.0.0.1:7447", pid: process.pid });
     const d = (await cli(["status", "--json"], { cwd: p.root, env: ENV })).json.data;
     expect(d.serve).toEqual({ url: "http://127.0.0.1:7447", pid: process.pid });
@@ -171,7 +218,7 @@ describe("croft status --json", () => {
 
 describe("croft status: human output", () => {
   test("the §4.2 table: rows, last run, next, status with its notes and fixes", async () => {
-    const p = scenario();
+    const p = await scenario();
     const r = await cli(["status"], { cwd: p.root, env: ENV });
     expect(r.exit).toBe(0);
     const lines = r.stdout.trimEnd().split("\n");
@@ -200,7 +247,7 @@ describe("croft status when the warehouse file is missing", () => {
   // The catalog mirror in runs.sqlite says what was built; the warehouse file says whether it is still there.
   // status stats the file (it never opens it), so a deleted or moved warehouse is not reported as healthy.
   test("a catalog without its warehouse file: DB_NOT_FOUND, not healthy, the rows unknown", async () => {
-    const p = scenario({ warehouse: false });
+    const p = await scenario({ warehouse: false });
     const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
     expect(r.exit).toBe(0);
     expect(r.json.ok).toBe(true);
@@ -223,7 +270,7 @@ describe("croft status when the warehouse file is missing", () => {
   });
 
   test("human output says the rows are unknown and why", async () => {
-    const p = scenario({ warehouse: false });
+    const p = await scenario({ warehouse: false });
     const r = await cli(["status"], { cwd: p.root, env: ENV });
     const lines = r.stdout.trimEnd().split("\n");
     const row = (name: string) => lines.find((l) => l.startsWith(`${name} `))!.replace(/ {2,}/g, " | ");
@@ -242,7 +289,7 @@ describe("croft status when the warehouse file is missing", () => {
 
 describe("croft status never waits on DuckDB", () => {
   test("it answers while another process holds the warehouse write lock", async () => {
-    const p = scenario({ warehouse: false });
+    const p = await scenario({ warehouse: false });
     await seed(p.database, ISSUES_SEED);
     const holder = spawnHolder(p.database, 20_000);
     await holder.waitFor("held");
@@ -256,7 +303,7 @@ describe("croft status never waits on DuckDB", () => {
   });
 
   test("it never opens the warehouse: a file that is not a database changes nothing", async () => {
-    const p = scenario();
+    const p = await scenario();
     writeFileSync(p.database, "not a duckdb file");
     const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
     expect(r.exit).toBe(0);
@@ -277,6 +324,184 @@ describe("croft status never waits on DuckDB", () => {
     expect(r.exit).toBe(0);
     expect(r.json.ok).toBe(true);
     expect(r.json.problems[0].code).toBe("NAME_INVALID");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// Staleness (DESIGN.md §5 "Versions, staleness and atomicity", §8 "What a code change does"), from the catalog
+// mirror and the asset files alone.
+
+const TRIAGE_TS = `import { transform } from "@zabaca/croft";
+export default transform({ inputs: ["github_issues"], key: "issue_id", incremental: true, async *rows() {} });
+`;
+const REPORT_TS = `import { transform } from "@zabaca/croft";
+export default transform({ inputs: ["open_issues"], async *rows() {} });
+`;
+/** github_issues loaded at 18:55 (UTC); what the transforms saw of it. */
+const LOADED = "2026-09-22T18:55:00.000000Z";
+const EARLIER = "2026-09-22T18:00:00.000000Z";
+
+/**
+ * github_issues (ingest) → open_issues (SQL) → issue_report (full-refresh TS), and issue_triage (incremental TS)
+ * reading github_issues. Every asset built by a run of its current code at 11:55 America/Los_Angeles, each
+ * transform having read its inputs at their current version, unless `o` says otherwise.
+ */
+async function pipeline(o: { seen?: Record<string, string>; hashes?: Record<string, string>; entries?: Record<string, Partial<CatalogAsset>>;
+  running?: string; files?: Record<string, string> } = {}) {
+  const files = {
+    "assets/github_issues.ts": ISSUES_TS, "assets/open_issues.sql": OPEN_SQL, "assets/issue_triage.ts": TRIAGE_TS, "assets/issue_report.ts": REPORT_TS,
+    ...o.files,
+  };
+  const p = makeProject({ files });
+  for (const f of Object.keys(files)) utimesSync(join(p.root, f), BEFORE_RUNS, BEFORE_RUNS);
+  const hashes = { ...(await codeHashes(p.root)), ...o.hashes };
+  let clock = Date.parse("2026-09-22T18:55:00.000Z");
+  const db = runsDb(p.stateDir, () => new Date(clock));
+  try {
+    const run = db.createRun({ id: "r_0922_1155_all1", trigger: "manual", human: true, argv: ["run"], identity: DEAD });
+    const reads: Record<string, string[]> = { github_issues: [], open_issues: ["github_issues"], issue_triage: ["github_issues"], issue_report: ["open_issues"] };
+    for (const [asset, inputs] of Object.entries(reads)) {
+      db.startStep({ runId: run.id, asset, attempt: 1, reason: "requested", codeHash: hashes[asset]! });
+      db.finishStep(run.id, asset, 1, { status: "ok" });
+      const seen = Object.fromEntries(inputs.map((i) => [i, { seenLoadedAt: LOADED, seenKey: null, inputLastLoadedAt: o.seen?.[`${asset}.${i}`] ?? LOADED }]));
+      putCatalog(db, {
+        ...ISSUES_CATALOG, asset, kind: asset === "github_issues" ? "ingest" : asset === "open_issues" ? "sql" : "ts", lastRunId: run.id,
+        codeHash: hashes[asset]!, lastLoadedAt: LOADED, ...(inputs.length ? { inputsSeen: seen, reads: inputs, cursor: null } : {}),
+        ...o.entries?.[asset],
+      });
+    }
+    db.finishRun(run.id, "succeeded");
+    if (o.running) {
+      const live = db.createRun({ id: "r_0922_1158_live", trigger: "manual", human: true, argv: ["run", o.running] });
+      db.startStep({ runId: live.id, asset: o.running, attempt: 1, reason: "requested" });
+    }
+  } finally {
+    db.close();
+  }
+  writeFileSync(p.database, "");
+  return p;
+}
+
+const status = async (p: TestProject) => {
+  const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+  expect(r.exit).toBe(0);
+  return { r, a: byAsset(r.json.data) };
+};
+
+describe("croft status: staleness", () => {
+  test("fresh: every transform built with its code from its inputs' current version; NEXT is after inputs", async () => {
+    const { r, a } = await status(await pipeline());
+    for (const name of ["github_issues", "open_issues", "issue_triage", "issue_report"]) {
+      expect(a[name]).toMatchObject({ status: "ok", stale: false, staleReasons: [], edited: false });
+    }
+    expect(a.github_issues.next).toEqual({ at: null, reason: "manual" });
+    for (const name of ["open_issues", "issue_triage", "issue_report"]) expect(a[name].next).toEqual({ at: null, reason: "after inputs" });
+    expect(a.issue_triage.kind).toBe("ts");
+    expect(r.json.data.healthy).toBe(true);
+    expect(r.json.problems).toEqual([]);
+    expect(r.json.next).toEqual([]);
+  });
+
+  test("input_changed: an input loaded rows after the transform last read it", async () => {
+    const p = await pipeline({ seen: { "open_issues.github_issues": EARLIER, "issue_triage.github_issues": EARLIER } });
+    const { r, a } = await status(p);
+    expect(a.open_issues).toMatchObject({ status: "ok", stale: true, staleReasons: ["input_changed"], edited: false });
+    expect(a.issue_triage).toMatchObject({ stale: true, staleReasons: ["input_changed"] });
+    // What a transform reads is known from the definition: issue_report reads open_issues, which did not change.
+    expect(a.issue_report).toMatchObject({ stale: false, staleReasons: [] });
+    expect(a.github_issues.staleReasons).toEqual([]);
+    expect(r.json.data.healthy).toBe(false);
+    expect((await cli(["status", "--check", "--json"], { cwd: p.root, env: ENV })).exit).toBe(1);
+    expect(r.json.next).toEqual([{ command: "croft run --dry-run", reason: "2 assets are stale (issue_triage, open_issues): see what a run would update and why" }]);
+    const human = (await cli(["status"], { cwd: p.root, env: ENV })).stdout;
+    expect(human).toMatch(/^open_issues +18,556 +5 min ago +after inputs +ok · stale: inputs changed \(croft run open_issues\)$/m);
+  });
+
+  test("input_replaced: an input changed out of band after the transform last read it", async () => {
+    const { a } = await status(await pipeline({ entries: { github_issues: { lastReplacedAt: "2026-09-22T18:56:00.000000Z" } } }));
+    expect(a.open_issues).toMatchObject({ stale: true, staleReasons: ["input_replaced"] });
+    expect(a.issue_triage).toMatchObject({ stale: true, staleReasons: ["input_replaced"] });
+  });
+
+  test("code_changed: an SQL transform edited since it was built is stale and edited; EDITED_SINCE_LAST_RUN says the run rebuilds it", async () => {
+    const p = await pipeline();
+    writeFileSync(join(p.root, "assets/open_issues.sql"), OPEN_SQL.replace("WHERE state = 'open'", "WHERE state <> 'closed'"));
+    const { r, a } = await status(p);
+    expect(a.open_issues).toMatchObject({ stale: true, staleReasons: ["code_changed"], edited: true });
+    // Its readers are not stale until it is rebuilt: their input has not changed yet.
+    expect(a.issue_report).toMatchObject({ stale: false });
+    expect(r.json.problems).toEqual([expect.objectContaining({
+      code: "EDITED_SINCE_LAST_RUN", severity: "warning", asset: "open_issues", file: "assets/open_issues.sql",
+      fix: { kind: "command", description: "rebuild open_issues with the new code", command: "croft run open_issues" },
+    })]);
+    const human = (await cli(["status"], { cwd: p.root, env: ENV })).stdout;
+    expect(human).toContain("ok · stale: code changed (croft run open_issues) · edited since its last run");
+    expect(human).toContain("EDITED_SINCE_LAST_RUN");
+  });
+
+  test("an incremental TS transform edited is forward-only: not stale, and the warning never offers a rebuild", async () => {
+    const p = await pipeline({ hashes: { issue_triage: "older-code" }, entries: { issue_triage: { rows: 18_556 } } });
+    const { r, a } = await status(p);
+    expect(a.issue_triage).toMatchObject({ status: "ok", stale: false, staleReasons: [], edited: true });
+    expect(r.json.data.healthy).toBe(true);
+    const edited = r.json.problems.find((x: { code: string }) => x.code === "EDITED_SINCE_LAST_RUN");
+    expect(edited).toMatchObject({ severity: "warning", asset: "issue_triage", file: "assets/issue_triage.ts" });
+    expect(edited.message).toBe("issue_triage edited since its last run; 18,556 rows were built by older code");
+    expect(edited.effect).toBe("the next run processes new input rows with the new code");
+    expect(JSON.stringify(r.json)).not.toContain("--rebuild");
+    expect((await cli(["status"], { cwd: p.root, env: ENV })).stdout).not.toContain("--rebuild");
+  });
+
+  test("a full-refresh TS transform edited is stale (code_changed)", async () => {
+    const { a } = await status(await pipeline({ hashes: { issue_report: "older-code" } }));
+    expect(a.issue_report).toMatchObject({ stale: true, staleReasons: ["code_changed"], edited: true });
+  });
+
+  test("a run that already tried the new code: edited is about the last run, the table still needs the rebuild", async () => {
+    const p = await pipeline({ hashes: { open_issues: "older-code" } });
+    const now = (await codeHashes(p.root)).open_issues!;
+    const db = runsDb(p.stateDir, () => new Date("2026-09-22T18:59:00.000Z"));
+    try {
+      const run = db.createRun({ id: "r_0922_1159_bad2", trigger: "manual", human: true, argv: ["run", "open_issues"], identity: DEAD });
+      db.startStep({ runId: run.id, asset: "open_issues", attempt: 1, reason: "code_changed", codeHash: now });
+      db.finishStep(run.id, "open_issues", 1, { status: "failed" });
+      db.finishRun(run.id, "failed");
+    } finally {
+      db.close();
+    }
+    const { r, a } = await status(p);
+    expect(a.open_issues).toMatchObject({ status: "failed", stale: true, staleReasons: ["code_changed"], edited: false });
+    expect(r.json.problems.map((x: { code: string }) => x.code)).not.toContain("EDITED_SINCE_LAST_RUN");
+  });
+
+  test("a transform whose definition no longer loads: edited, but its code is no reason to run (whether it is incremental is unknown)", async () => {
+    // Written before anything imports it: this process caches a module it has imported once.
+    const p = await pipeline({ files: { "assets/issue_triage.ts": `${TRIAGE_TS}throw new Error("top-level boom");\n` }, hashes: { issue_triage: "older-code" } });
+    const { r, a } = await status(p);
+    expect(a.issue_triage).toMatchObject({ kind: "ts", status: "ok", stale: false, staleReasons: [], edited: true });
+    expect(r.json.problems.map((x: { code: string }) => x.code)).not.toContain("EDITED_SINCE_LAST_RUN");
+  });
+
+  test("an asset being run right now is not stale", async () => {
+    const { a } = await status(await pipeline({ seen: { "open_issues.github_issues": EARLIER }, running: "open_issues" }));
+    expect(a.open_issues).toMatchObject({ status: "running", stale: false, staleReasons: [], edited: false });
+  });
+
+  test("a TS transform never run: its kind comes from its definition, and NEXT is after inputs", async () => {
+    const p = makeProject({ files: { "assets/github_issues.ts": ISSUES_TS, "assets/issue_triage.ts": TRIAGE_TS } });
+    const { a } = await status(p);
+    expect(a.issue_triage).toMatchObject({ kind: "ts", status: "never_run", stale: true, staleReasons: ["never_built"], next: { reason: "after inputs" } });
+  });
+
+  test("a project whose files cannot all be resolved still gets its status", async () => {
+    const p = await pipeline();
+    // At the time of writing resolveProject throws a raw SyntaxError on this SQL (sql/gate.ts reads DuckDB's
+    // `Infinity` as JSON); whatever resolving does with it, status answers from the catalog and the files.
+    writeFileSync(join(p.root, "assets/open_issues.sql"), "-- key: id\nSELECT 1e400 AS id FROM github_issues\n");
+    const { r, a } = await status(p);
+    expect(a.github_issues).toMatchObject({ status: "ok" });
+    expect(a.open_issues).toMatchObject({ status: "ok", kind: "sql" });
+    expect(r.json.ok).toBe(true);
   });
 });
 
@@ -311,12 +536,10 @@ describe("helpers", () => {
     expect(ago(null, now)).toBe("—");
   });
 
-  test("sniffKind reads the kind from the text without importing", () => {
-    const p = makeProject({ files: { "assets/a.ts": "export default transform({ inputs: [] })", "assets/b.ts": "export default ingest({})", "assets/c.ts": "" } });
-    const at = (f: string) => ({ kind: "ts" as const, path: join(p.root, "assets", f) });
-    expect(sniffKind(at("a.ts"))).toBe("ts");
-    expect(sniffKind(at("b.ts"))).toBe("ingest");
-    expect(sniffKind(at("c.ts"))).toBeNull();
-    expect(sniffKind({ kind: "sql", path: "x" })).toBe("sql");
+  test("staleText: the reasons a run would update an asset, in words; never built is the head's to say", () => {
+    expect(staleText(["code_changed", "input_changed"])).toBe("stale: code changed, inputs changed");
+    expect(staleText(["input_replaced"])).toBe("stale: an input was replaced");
+    expect(staleText(["never_built"])).toBeNull();
+    expect(staleText([])).toBeNull();
   });
 });

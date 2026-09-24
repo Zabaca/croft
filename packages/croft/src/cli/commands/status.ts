@@ -1,13 +1,20 @@
 // croft status [--check] (DESIGN.md §4.1, §4.2, §4.3 "status"; §5 "How commands behave while a run is
-// writing"): the freshness and health of every asset, and what is running. It never opens the warehouse,
-// so it never waits on DuckDB: it reads the catalog mirror and runs.sqlite (bun:sqlite, WAL, readable
-// while DuckDB is locked), the asset files on disk, and for a live run's per-step progress the end of its
-// logs/<run>/events.ndjson. Asset code is not imported either: a TS file's
-// kind comes from the catalog, or from a look at its text when it has never run.
+// writing", "Versions, staleness and atomicity"; §8 "What a code change does"): the freshness and health of
+// every asset, and what is running. It never opens the warehouse, so it never waits on DuckDB: it reads the
+// catalog mirror and runs.sqlite (bun:sqlite, WAL, readable while DuckDB is locked), the asset files on disk,
+// and for a live run's per-step progress the end of its logs/<run>/events.ndjson.
 //
-// Phase 1 has no scheduler: `next` is "manual" for ingests and "after inputs" for transforms, nothing is
-// held, and scheduling is {state: "off", via: null}. Staleness is "never built" only; the planner (run
-// --dry-run) is what compares code and input versions.
+// The asset files are resolved as the planner resolves them (project/resolve.ts: SQL parsed on a private
+// in-memory DuckDB, TS assets bundled and imported in isolation), for each asset's kind, code hash and inputs.
+// Staleness is run/staleness.ts over those and the catalog mirror: why a bare `croft run` would update the
+// asset (never_built, code_changed, input_changed, input_replaced). `edited` says the asset's code differs from
+// the code its last run used (the step's code hash, else the catalog's); when either hash is unknown (a file
+// that does not bundle, a run that recorded none) the file's modification time since that run decides. An
+// edited asset whose table was built by older code also gets EDITED_SINCE_LAST_RUN, worded per kind: an
+// incremental TS transform is forward-only, so its warning says the rows already built keep their values.
+//
+// No scheduler yet (phase 3): `next` is "manual" for ingests and "after inputs" for transforms, nothing is
+// held, and scheduling is {state: "off", via: null}.
 //
 // `status` exits 0 because the command worked; `--check` exits 1 when anything is failed, crashed, held or
 // stale, which makes it a health probe. In JSON, ok always means "the command worked" and data.healthy
@@ -16,18 +23,20 @@
 // The catalog mirror says what was built, not that it is still there: status stats the warehouse file (it
 // never opens it), and when the catalog has entries but the file is gone (deleted, or moved away from the
 // "database" path) it reports DB_NOT_FOUND, is not healthy, and shows what was built as unknown.
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { problem } from "../../core/errors.ts";
+import { CroftError, problem } from "../../core/errors.ts";
 import { formatInstant, parseInstant } from "../../core/time.ts";
 import { recordAlive } from "../../core/proc.ts";
-import type { AssetKind, Problem } from "../../core/types.ts";
+import type { AssetKind, Problem, Reason } from "../../core/types.ts";
 import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
 import { logDir, tail } from "../../history/logs.ts";
 import { RUNS_DB_FILE, RunsDb, type RunRecord, type StepRecord } from "../../history/runs-db.ts";
 import { discoverAssets, type DiscoveredAsset } from "../../project/discover.ts";
+import type { ResolvedAsset, ResolvedProject } from "../../project/resolve.ts";
 import type { Project } from "../../project/root.ts";
 import { readServeRecord } from "../../read/locate.ts";
+import { editedProblem, staleReasons, type StaleView } from "../../run/staleness.ts";
 import type { CommandImpl } from "../command.ts";
 import { formatCount, table } from "../render.ts";
 
@@ -53,9 +62,12 @@ export interface StatusAsset {
   rows: number | null;
   lastRun: LastRun | null;
   next: { at: string | null; reason: "manual" | "after inputs" | "none" };
+  /** A bare `croft run` would update it: staleReasons is not empty. */
   stale: boolean;
-  staleReasons: string[];
+  /** run/staleness.ts: never_built, code_changed, input_changed, input_replaced. Empty while it runs. */
+  staleReasons: Reason[];
   held: boolean;
+  /** Its code differs from the code its last run used. */
   edited: boolean;
   filesGone?: string[];
   schemaChangedAt?: string;
@@ -233,23 +245,6 @@ export function schemaChangesFromRuns(db: RunsDb | null, since: Date): SummaryCh
   return out;
 }
 
-/** An asset's kind without importing its code: .sql files are SQL transforms; a .ts file that calls
- *  transform( is a TS transform, one that calls ingest( an ingest. null when the text says neither. */
-export function sniffKind(a: Pick<DiscoveredAsset, "kind" | "path">): AssetKind | null {
-  if (a.kind === "sql") return "sql";
-  let text: string;
-  try {
-    text = readFileSync(a.path, "utf8");
-  } catch {
-    return null;
-  }
-  const t = /\btransform\s*\(/.test(text);
-  const i = /\bingest\s*\(/.test(text);
-  if (t && !i) return "ts";
-  if (i && !t) return "ingest";
-  return null;
-}
-
 export function nextOf(kind: AssetKind | null, hasFile: boolean): StatusAsset["next"] {
   if (!hasFile) return { at: null, reason: "none" };
   return { at: null, reason: kind === "ingest" ? "manual" : kind === null ? "manual" : "after inputs" };
@@ -308,8 +303,13 @@ export function missingWarehouse(project: Project, history: WarehouseHistory, tz
 
 export interface ProjectState {
   data: StatusData;
+  /** About the project: DB_NOT_FOUND, discovery's problems, CYCLE, a project that could not be resolved. */
   problems: Problem[];
+  /** EDITED_SINCE_LAST_RUN, one per edited asset whose table older code built, in name order. */
+  edited: Problem[];
   discovered: DiscoveredAsset[];
+  /** The asset files resolved (kinds, code hashes, inputs, the graph); null when that failed (see problems). */
+  resolved: ResolvedProject | null;
   catalog: CatalogAsset[];
   /** Steps and runs, for context (recent failures). Empty without runs.sqlite. */
   recentSteps: StepRecord[];
@@ -317,27 +317,90 @@ export interface ProjectState {
   summaryChanges: SummaryChange[];
 }
 
+/** How long an asset's top-level code may take to load before status, context and describe give up on it. */
+export const INSPECT_IMPORT_TIMEOUT_MS = 5000;
+
 /**
- * Everything `status` shows, from files, the catalog mirror and runs.sqlite only. `kinds` may supply asset
- * kinds known from their configs (context imports the asset files); otherwise the catalog or a look at the
- * file decides.
+ * The project's asset files resolved (project/resolve.ts), or null with the reason as a problem when they cannot
+ * be: an inspecting command still reports what the catalog and the files say. Loaded on demand, so the commands
+ * that share this module's helpers (logs, confirm) do not load DuckDB.
  */
-export async function collectStatus(project: Project, now: Date, o: { kinds?: Record<string, AssetKind | null> } = {}): Promise<ProjectState> {
+export async function resolveAssets(project: Project): Promise<{ resolved: ResolvedProject | null; problems: Problem[] }> {
+  const { resolveProject } = await import("../../project/resolve.ts");
+  try {
+    return { resolved: await resolveProject({ root: project.root, timezone: project.timezone, importTimeoutMs: INSPECT_IMPORT_TIMEOUT_MS }), problems: [] };
+  } catch (e) {
+    if (e instanceof CroftError) return { resolved: null, problems: [e.problem] };
+    const why = String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 300);
+    return {
+      resolved: null,
+      problems: [problem("INTERNAL_ERROR", {
+        message: `the asset files could not be resolved (${why}), so staleness and edits are not shown`,
+        hint: "croft validate checks each asset file and names the one at fault; if it names none, report this croft bug",
+        fix: { kind: "command", description: "check the asset files", command: "croft validate" },
+      })],
+    };
+  }
+}
+
+/** Whether an asset's definition loaded: an SQL file (its header and SELECT were read), or a TS file whose
+ *  config validated. */
+function defined(def: ResolvedAsset | null): def is ResolvedAsset {
+  return !!def && (def.kind === "sql" || !!def.ts?.spec);
+}
+
+/** An asset's kind: its definition's when it loaded, else the catalog's, else a look at its text. */
+function kindOf(def: ResolvedAsset | null, cat: CatalogAsset | null, file: DiscoveredAsset | null, sniff: (a: DiscoveredAsset) => AssetKind | null): AssetKind | null {
+  return (defined(def) ? def.kind : null) ?? cat?.kind ?? def?.kind ?? (file ? sniff(file) : null);
+}
+
+/**
+ * The staleness view of an asset (run/staleness.ts): its definition now and the catalog mirror. What it reads is
+ * its definition's inputs, plus what its last build recorded reading (CatalogAsset.reads: an SQL asset's
+ * dependencies from the query plan, which only the bind check finds). An incremental TS transform keeps to its
+ * definition: its code change is no reason to run, so an input it no longer reads must not make it stale. A
+ * definition that does not load gives no code hash: whether it is incremental is unknown, and an unknown is
+ * never a reason to run.
+ */
+export function staleView(o: { name: string; file: string; kind: AssetKind; def: ResolvedAsset | null; entry: CatalogAsset | null;
+  catalog: Readonly<Record<string, CatalogAsset>> }): StaleView {
+  const def = defined(o.def) ? o.def : null;
+  const incremental = def?.incremental.kind === "new-rows";
+  const declared = def?.inputs ?? [];
+  const inputs = incremental ? declared : [...new Set([...declared, ...(o.entry?.reads ?? [])])];
+  return {
+    asset: o.name, file: o.file, kind: o.kind, incremental, inputs, entry: o.entry, inputEntries: o.catalog,
+    ...(def?.codeHash ? { codeHash: def.codeHash } : {}),
+  };
+}
+
+/**
+ * Everything `status` shows, from files, the catalog mirror and runs.sqlite only. `resolved` passes asset files
+ * already resolved (resolveAssets); otherwise they are resolved here.
+ */
+export async function collectStatus(project: Project, now: Date, o: { resolved?: ResolvedProject | null } = {}): Promise<ProjectState> {
   const tz = project.timezone;
   const discovery = await discoverAssets(project.root, { assetsDir: project.paths.assetsDir });
+  const resolution = o.resolved !== undefined ? { resolved: o.resolved, problems: [] } : await resolveAssets(project);
+  const resolved = resolution.resolved;
+  const { sniffKind } = await import("../../project/resolve.ts");
+  const definitions = new Map((resolved?.assets ?? []).map((a) => [a.name, a]));
   const db = openRunsDb(project.paths.stateDir);
   try {
     const catalog = db ? allCatalog(db) : [];
     const byName = new Map(catalog.map((c) => [c.asset, c]));
+    const catalogByName = Object.fromEntries(byName);
     const missing = missingWarehouse(project, warehouseHistory(db, catalog), tz);
     const { running, dead } = runningEntries(db, tz, project.paths.stateDir);
     const summaryChanges = schemaChangesFromRuns(db, new Date(now.getTime() - 7 * DAY_MS));
     const names = [...new Set([...discovery.assets.map((a) => a.name), ...catalog.map((c) => c.asset)])].sort();
     const files = new Map(discovery.assets.map((a) => [a.name, a]));
+    const edits: Problem[] = [];
     const assets: StatusAsset[] = names.map((name) => {
       const file = files.get(name) ?? null;
       const cat = byName.get(name) ?? null;
-      const kind = cat?.kind ?? (o.kinds && name in o.kinds ? o.kinds[name]! : file ? sniffKind(file) : null);
+      const def = definitions.get(name) ?? null;
+      const kind = kindOf(def, cat, file, sniffKind);
       const step = db?.latestStep(name) ?? null;
       const stepStatus = step ? effectiveStatus(step, dead) : null;
       let lastRun: LastRun | null = null;
@@ -353,17 +416,36 @@ export async function collectStatus(project: Project, now: Date, o: { kinds?: Re
       else if (stepStatus === "skipped") status = "skipped";
       else if (cat || stepStatus === "ok" || stepStatus === "unchanged") status = missing ? "unknown" : "ok";
       else status = "never_run";
-      const staleReasons = file && !cat && status !== "running" && !(stepStatus === "ok" || stepStatus === "unchanged") ? ["never_built"] : [];
-      // Edited: the file changed after the step that last read it started (only once it has run).
-      let edited = false;
-      if (file && step && status !== "running") {
-        try {
-          edited = statSync(file.path).mtimeMs > Date.parse(step.startedAt);
-        } catch {}
+
+      // Staleness: nothing for a table without an asset file (no run updates it) or one being updated now.
+      const view = file && kind ? staleView({ name, file: file.file, kind, def, entry: cat, catalog: catalogByName }) : null;
+      let reasons: Reason[] = [];
+      if (file && status !== "running") {
+        reasons = view ? staleReasons(view) : cat ? [] : ["never_built"];
+        // A step that committed while its mirror entry was not written yet (reconcile rewrites it) built the table.
+        if (!cat && (stepStatus === "ok" || stepStatus === "unchanged")) reasons = reasons.filter((r) => r !== "never_built");
       }
+
+      // Edited: the code differs from what its last run used; the file's time since that run when a hash is unknown.
+      let edited = false;
+      if (file && status !== "running") {
+        const current = def?.codeHash;
+        const ranWith = step?.codeHash ?? cat?.codeHash ?? null;
+        if (current && ranWith) edited = current !== ranWith;
+        else if (step) {
+          try {
+            edited = statSync(file.path).mtimeMs > Date.parse(step.startedAt);
+          } catch {}
+        }
+      }
+      if (edited && view) {
+        const warning = editedProblem(view);
+        if (warning) edits.push(warning);
+      }
+
       const out: StatusAsset = {
         asset: name, kind, file: file?.file ?? null, status, rows: cat && !missing ? cat.rows : null, lastRun,
-        next: nextOf(kind, !!file), stale: staleReasons.length > 0, staleReasons, held: false, edited,
+        next: nextOf(kind, !!file), stale: reasons.length > 0, staleReasons: reasons, held: false, edited,
       };
       if (cat?.filesGone?.length) out.filesGone = [...cat.filesGone];
       const changed = summaryChanges.filter((c) => c.asset === name).map((c) => c.at).sort().pop();
@@ -382,11 +464,30 @@ export async function collectStatus(project: Project, now: Date, o: { kinds?: Re
     };
     const serve = serveOf(project.paths.stateDir);
     if (serve) data.serve = serve;
-    const problems = missing ? [missing, ...discovery.problems] : discovery.problems;
-    return { data, problems, discovered: discovery.assets, catalog, recentSteps, dead, summaryChanges };
+    // resolveProject's problems are discovery's (all of them: no selectors) and CYCLE.
+    const problems = [...(missing ? [missing] : []), ...(resolved ? resolved.problems : discovery.problems), ...resolution.problems];
+    return { data, problems, edited: edits, discovered: discovery.assets, resolved, catalog, recentSteps, dead, summaryChanges };
   } finally {
     db?.close();
   }
+}
+
+/** The stale assets a run would update for a reason other than never having been built (a never-run asset
+ *  says `croft run <asset>` in its own row). */
+function staleForNext(assets: readonly StatusAsset[]): StatusAsset[] {
+  return assets.filter((a) => !FAILED.has(a.status) && a.staleReasons.some((r) => r !== "never_built"));
+}
+
+const REASON_WORDS: Partial<Record<Reason, string>> = {
+  code_changed: "code changed",
+  input_changed: "inputs changed",
+  input_replaced: "an input was replaced",
+};
+
+/** "stale: code changed, inputs changed", or null when nothing but never_built (the row's head says that). */
+export function staleText(reasons: readonly Reason[]): string | null {
+  const words = reasons.filter((r) => r !== "never_built").map((r) => REASON_WORDS[r] ?? r.replaceAll("_", " "));
+  return words.length ? `stale: ${words.join(", ")}` : null;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -402,7 +503,15 @@ export const status: CommandImpl<StatusData> = {
       .filter((a) => FAILED.has(a.status))
       .slice(0, 3)
       .map((a) => ({ command: `croft logs ${a.asset} --failed`, reason: `${a.asset} ${a.status}${a.lastRun?.code ? ` (${a.lastRun.code})` : ""}` }));
-    return { data: state.data, problems: state.problems, next, ok: true, exit: check && unhealthy ? 1 : 0 };
+    const stale = staleForNext(state.data.assets).map((a) => a.asset);
+    if (stale.length) {
+      const names = stale.length > 5 ? `${stale.slice(0, 5).join(", ")}, …` : stale.join(", ");
+      next.push({
+        command: "croft run --dry-run",
+        reason: `${stale.length} asset${stale.length === 1 ? " is" : "s are"} stale (${names}): see what a run would update and why`,
+      });
+    }
+    return { data: state.data, problems: [...state.problems, ...state.edited], next, ok: true, exit: check && unhealthy ? 1 : 0 };
   },
   human(result, ctx) {
     return formatStatus(result.data, ctx.now());
@@ -437,6 +546,9 @@ export function statusText(a: StatusAsset, now: Date): string {
     default:
       head = "ok";
   }
+  const stale = staleText(a.staleReasons);
+  // The command goes on a healthy row only: a failed one already names what to look at first.
+  if (stale) notes.push(head === "ok" ? `${stale} (croft run ${a.asset})` : stale);
   if (a.filesGone?.length) notes.push(`${a.filesGone.length} file${a.filesGone.length === 1 ? "" : "s"} gone`);
   if (a.schemaChangedAt) notes.push(`schema changed ${ago(a.schemaChangedAt, now)}`);
   if (a.edited) notes.push("edited since its last run");

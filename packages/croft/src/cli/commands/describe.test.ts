@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { putCatalog } from "../../history/catalog.ts";
 import { cleanup as cleanupChildren, spawnHolder } from "../../read/testkit.ts";
-import { behaviorOf, capValue, checksOf, DESCRIBE_TIMING, durationWords, sqlHeader, staticSecrets, type AssetConfig } from "./describe.ts";
+import { behaviorOf, capValue, checksOf, DESCRIBE_TIMING, durationWords, loadConfigs, staticSecrets, type AssetConfig } from "./describe.ts";
 import {
   busyScenario, CHARGES_TS, cleanup, cli, ISSUES_CATALOG, ISSUES_SEED, ISSUES_TS, makeProject, NOW, OPEN_SQL, runsDb, seed, shape, STATE,
 } from "./inspect-testkit.ts";
@@ -28,13 +28,12 @@ describe("croft describe --json", () => {
     const d = r.json.data;
     expect(Object.keys(d)).toEqual([
       "asset", "kind", "file", "description", "next", "behavior", "reads", "readBy", "rows", "columns", "inputsSeen",
-      "builtWithCodeHash", "checks", "checksEnforced", "recentWrites", "recentRuns", "samples", "truncatedValues", "source",
+      "builtWithCodeHash", "checks", "recentWrites", "recentRuns", "samples", "truncatedValues", "source",
     ]);
-    // Phase 1 lists checks but does not run them, and says so (core/phase.ts).
-    expect(d.checksEnforced).toBe(false);
+    // open_issues.sql selects from it.
     expect(d).toMatchObject({
       asset: "github_issues", kind: "ingest", file: "assets/github_issues.ts", description: "Issues of oven-sh/bun",
-      next: { at: null, reason: "manual" }, reads: [], readBy: [], rows: 3, inputsSeen: {}, builtWithCodeHash: "hash-1",
+      next: { at: null, reason: "manual" }, reads: [], readBy: ["open_issues"], rows: 3, inputsSeen: {}, builtWithCodeHash: "hash-1",
       source: "warehouse", truncatedValues: 0, recentRuns: [],
     });
     expect(d.behavior).toEqual({
@@ -91,6 +90,9 @@ describe("croft describe --json", () => {
     expect(r.json.data).toMatchObject({
       asset: "open_issues", kind: "sql", file: "assets/open_issues.sql", description: "Open issues with their author",
       next: { reason: "after inputs" }, rows: null, columns: [], samples: [], recentWrites: [], source: "warehouse",
+      reads: ["github_issues"], readBy: [],
+      // Never built: every row of its input is new to it.
+      inputsSeen: { github_issues: { seenLoadedAt: null, inputLastLoadedAt: null, pendingRows: 3 } },
       behavior: { words: "rebuilt in full when an input or its SQL changes; rows matched by id", write: "replace", key: ["id"], incremental: null },
       checks: [
         { check: "unique(id)", blocking: true, implied: true }, { check: "not_null(id)", blocking: true, implied: true },
@@ -100,19 +102,50 @@ describe("croft describe --json", () => {
     expect(r.json.next).toEqual([{ command: "croft run open_issues", reason: "build the table" }]);
   });
 
-  test("inputs seen: how many input rows are newer than what the transform last saw", async () => {
-    const triage = `import { transform } from "@zabaca/croft";
+  const TRIAGE_TS = `import { transform } from "@zabaca/croft";
 export default transform({ inputs: ["github_issues"], key: "issue_id", incremental: true, async *rows() {} });
 `;
-    const p = await issues({ "assets/issue_triage.ts": triage }, [
-      `INSERT INTO _croft.inputs (asset, input, seen_loaded_at, seen_key) VALUES ('issue_triage', 'github_issues', '2026-09-22 17:30:00+00', NULL)`,
+
+  test("inputs seen: the input rows after the transform's position, and the input's version it last read in full", async () => {
+    const p = await issues({ "assets/issue_triage.ts": TRIAGE_TS }, [
+      `INSERT INTO _croft.inputs (asset, input, seen_loaded_at, seen_key, input_last_loaded_at)
+         VALUES ('open_issues', 'github_issues', '2026-09-22 17:30:00+00', NULL, '2026-09-22 17:30:00+00')`,
+    ]);
+    const d = (await cli(["describe", "open_issues", "--json"], { cwd: p.root, env: ENV })).json.data;
+    expect(d).toMatchObject({ kind: "sql", reads: ["github_issues"], next: { reason: "after inputs" } });
+    // inputLastLoadedAt is what staleness compares with (history/catalog.ts InputSeen), not the input's version now.
+    expect(d.inputsSeen).toEqual({
+      github_issues: { seenLoadedAt: "2026-09-22T10:30:00-07:00", inputLastLoadedAt: "2026-09-22T10:30:00-07:00", pendingRows: 1 },
+    });
+    const human = await cli(["describe", "open_issues"], { cwd: p.root, env: ENV });
+    expect(human.stdout).toContain("Input      github_issues: 1 new row since 2026-09-22T10:30:00-07:00");
+  });
+
+  test("inputs seen: a composite position counts the rows of its own stamp that come after its key (§3e)", async () => {
+    // Rows 1 and 2 share the stamp 17:00; the position is (17:00, id 1): row 2 and row 3 (18:00) are pending.
+    const p = await issues({ "assets/issue_triage.ts": TRIAGE_TS }, [
+      `INSERT INTO _croft.inputs (asset, input, seen_loaded_at, seen_key, input_last_loaded_at)
+         VALUES ('issue_triage', 'github_issues', '2026-09-22 17:00:00+00', '["1"]', NULL)`,
     ]);
     const d = (await cli(["describe", "issue_triage", "--json"], { cwd: p.root, env: ENV })).json.data;
     expect(d).toMatchObject({ kind: "ts", reads: ["github_issues"], next: { reason: "after inputs" } });
     expect(d.inputsSeen).toEqual({
-      github_issues: { seenLoadedAt: "2026-09-22T10:30:00-07:00", inputLastLoadedAt: "2026-09-22T11:00:00-07:00", pendingRows: 1 },
+      github_issues: { seenLoadedAt: "2026-09-22T10:00:00-07:00", inputLastLoadedAt: null, pendingRows: 2 },
     });
     expect(d.behavior.words).toBe("processes only new input rows; updates rows by issue_id");
+    // The position's own row is done: at (17:00, id 2) only row 3 is left.
+    const later = await issues({ "assets/issue_triage.ts": TRIAGE_TS }, [
+      `INSERT INTO _croft.inputs (asset, input, seen_loaded_at, seen_key, input_last_loaded_at)
+         VALUES ('issue_triage', 'github_issues', '2026-09-22 17:00:00+00', '["2"]', NULL)`,
+    ]);
+    expect((await cli(["describe", "issue_triage", "--json"], { cwd: later.root, env: ENV })).json.data.inputsSeen.github_issues.pendingRows).toBe(1);
+  });
+
+  test("a header key croft does not know is reported (project/sql-asset.ts parseSqlHeader)", async () => {
+    const p = await issues({ "assets/open_issues.sql": OPEN_SQL.replace("-- check: not_null(author)", "-- chek: not_null(author)") });
+    const r = await cli(["describe", "open_issues", "--json"], { cwd: p.root, env: ENV });
+    expect(r.json.problems.map((x: { code: string }) => x.code)).toContain("HEADER_UNKNOWN_KEY");
+    expect(r.json.data.checks.map((c: { check: string }) => c.check)).toEqual(["unique(id)", "not_null(id)", "id > 0"]);
   });
 
   test("an epoch cursor is shown with its instant; a lookback in words", async () => {
@@ -141,7 +174,8 @@ export default transform({ inputs: ["github_issues"], key: "issue_id", increment
     const { unlinkSync } = await import("node:fs");
     unlinkSync(`${p.root}/assets/github_issues.ts`);
     const r = await cli(["describe", "github_issues", "--json"], { cwd: p.root, env: ENV });
-    expect(r.json.data).toMatchObject({ file: null, kind: "ingest", rows: 3, next: { reason: "none" } });
+    // open_issues.sql still reads it.
+    expect(r.json.data).toMatchObject({ file: null, kind: "ingest", rows: 3, next: { reason: "none" }, readBy: ["open_issues"] });
     // A destructive command never appears in next (§4.3); the orphan is a warning with a manual, human fix.
     expect(r.json.next.map((n: { command: string }) => n.command).join("\n")).not.toMatch(/\bdelete\b/);
     expect(r.exit).toBe(0);
@@ -206,9 +240,9 @@ describe("croft describe: human output", () => {
     expect(lines).toContain("Cursor     updated_at = 2026-09-22T10:00:00Z");
     expect(lines).toContain("Table      3 rows · 6 columns · last write 2026-09-22T11:00:00-07:00 (+1 added, 0 updated)");
     expect(r.stdout).toContain("Columns    id BIGINT · title VARCHAR · state VARCHAR · labels JSON {color, name} · user JSON {id, login, site_admin} · updated_at TIMESTAMPTZ");
-    const checks = lines.indexOf("Checks     unique(id) · not_null(id) · not_null(title) · state IN ('open', 'closed')");
-    expect(checks).toBeGreaterThan(0);
-    expect(lines[checks + 1]).toBe("           checks: not enforced until phase 2");
+    expect(lines).toContain("Read by    open_issues");
+    expect(lines).toContain("Checks     unique(id) · not_null(id) · not_null(title) · state IN ('open', 'closed')");
+    expect(r.stdout).not.toContain("not enforced");
     expect(r.stdout).toMatch(/Sample {5}id +title +state/);
   });
 });
@@ -218,6 +252,10 @@ describe("croft describe while a run holds the warehouse", () => {
     const p = await issues();
     const db = runsDb(p.stateDir);
     putCatalog(db, ISSUES_CATALOG);
+    putCatalog(db, {
+      ...ISSUES_CATALOG, asset: "open_issues", kind: "sql", cursor: null, reads: ["github_issues"],
+      inputsSeen: { github_issues: { seenLoadedAt: "2026-09-22T17:30:00.000000Z", seenKey: null, inputLastLoadedAt: "2026-09-22T17:30:00.000000Z" } },
+    });
     db.close();
     const holder = spawnHolder(p.database, 20_000);
     await holder.waitFor("held");
@@ -238,6 +276,14 @@ describe("croft describe while a run holds the warehouse", () => {
       expect(r.stderr).toContain("the warehouse is busy");
       const human = await cli(["describe", "github_issues"], { cwd: p.root, env: ENV });
       expect(human.stdout).toContain("from the catalog");
+      // What a transform has seen comes from the catalog too; counting what is new needs the warehouse.
+      const sql = await cli(["describe", "open_issues", "--json"], { cwd: p.root, env: ENV });
+      expect(sql.json.data).toMatchObject({ source: "catalog", reads: ["github_issues"] });
+      expect(sql.json.data.inputsSeen).toEqual({
+        github_issues: { seenLoadedAt: "2026-09-22T10:30:00-07:00", inputLastLoadedAt: "2026-09-22T10:30:00-07:00", pendingRows: null },
+      });
+      expect((await cli(["describe", "open_issues"], { cwd: p.root, env: ENV })).stdout)
+        .toContain("Input      github_issues: ? new rows since 2026-09-22T10:30:00-07:00");
     } finally {
       DESCRIBE_TIMING.busyWaitMs = saved;
       holder.proc.kill("SIGKILL");
@@ -246,11 +292,16 @@ describe("croft describe while a run holds the warehouse", () => {
 });
 
 describe("helpers", () => {
-  test("sqlHeader reads description, key, check and warn; plain comments may sit between", () => {
-    expect(sqlHeader(OPEN_SQL)).toEqual({ description: "Open issues with their author", key: ["id"], checks: ["not_null(author)"], warnings: ["id > 0"] });
-    expect(sqlHeader("-- key: day, currency\n\n-- check: net <= gross\nSELECT 1\n-- check: ignored")).toEqual({
-      description: null, key: ["day", "currency"], checks: ["net <= gross"], warnings: [],
+  test("loadConfigs reads an SQL asset's header with project/sql-asset.ts parseSqlHeader", async () => {
+    const p = makeProject({
+      files: { "assets/open_issues.sql": OPEN_SQL, "assets/daily.sql": "-- key: day, currency\n\n-- check: net <= gross\nSELECT 1\n-- check: ignored" },
     });
+    const sql = (name: string) => ({ name, file: `assets/${name}.sql`, path: `${p.root}/assets/${name}.sql`, kind: "sql" as const });
+    const configs = await loadConfigs(p.project, [sql("open_issues"), sql("daily")]);
+    expect(configs.map(({ name, description, key, checks, warnings, write, loaded }) => ({ name, description, key, checks, warnings, write, loaded }))).toEqual([
+      { name: "open_issues", description: "Open issues with their author", key: ["id"], checks: ["not_null(author)"], warnings: ["id > 0"], write: "replace", loaded: true },
+      { name: "daily", description: null, key: ["day", "currency"], checks: ["net <= gross"], warnings: [], write: "replace", loaded: true },
+    ]);
   });
 
   test("staticSecrets finds secrets lists and secret() calls", () => {
