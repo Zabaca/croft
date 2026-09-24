@@ -399,6 +399,100 @@ describe("croft preview: TS transforms", () => {
   }, 60_000);
 });
 
+describe("croft preview: the cost guard", () => {
+  const PAID = (confirmAbove: number) => TRIAGE().replace("incremental: true,", `incremental: true,\n  confirmAbove: ${confirmAbove},`);
+
+  test("without --rows, a transform that makes requests gets at most its confirmAbove input rows, and says so", async () => {
+    api.issues = [1, 2, 3, 4, 5].map((n) => issue(n, n));
+    const root = makeProject({ "assets/issues.ts": ISSUES(), "assets/triage.ts": PAID(2) });
+    await run(root, "issues", "--only");
+    const calls = api.calls;
+    const out = await preview(root, ["triage"]);
+    expect(api.calls - calls).toBe(2);
+    const a = byName(out.data.assets, "triage");
+    expect(a).toMatchObject({ status: "ok", capped: true, partial: true, rows: 2, liveRows: null });
+    expect(a.reason).toContain("inputs capped at 2 rows");
+    expect(a.reason).toContain("confirmAbove");
+    expect(out.problems.filter((p) => p.severity === "error")).toEqual([]);
+    expect(out.data.rowCap).toBe(1000);
+  }, 60_000);
+
+  test("an explicit --rows over confirmAbove is LARGE_REPROCESS before any call, with the --rows that fits", async () => {
+    api.issues = [1, 2, 3, 4, 5].map((n) => issue(n, n));
+    const root = makeProject({ "assets/issues.ts": ISSUES(), "assets/triage.ts": PAID(2) });
+    await run(root, "issues", "--only");
+    const calls = api.calls;
+    const out = await preview(root, ["triage"], { rows: 5 });
+    expect(api.calls - calls).toBe(0);
+    const a = byName(out.data.assets, "triage");
+    expect(a).toMatchObject({ status: "failed", error: { code: "LARGE_REPROCESS", asset: "triage" } });
+    expect(a.error!.message).toContain("5 input rows");
+    expect(a.error!.fix).toMatchObject({ kind: "command", command: "croft preview triage --rows 2" });
+    expect(a.error!.details).toMatchObject({ pending: 5, confirmAbove: 2, rows: 5 });
+    expect(exitCodeFor(out.problems)).toBe(1);
+    expect(out.apply).toEqual([]);
+    // --rows within confirmAbove previews as asked.
+    const ok = await preview(root, ["triage"], { rows: 2 });
+    expect(api.calls - calls).toBe(2);
+    expect(byName(ok.data.assets, "triage")).toMatchObject({ status: "ok", capped: true, rows: 2 });
+  }, 60_000);
+
+  test("fewer pending rows than confirmAbove preview in full; --rows is capped at 100,000", async () => {
+    api.issues = [1, 2, 3].map((n) => issue(n, n));
+    const root = makeProject({ "assets/issues.ts": ISSUES(), "assets/triage.ts": PAID(5) });
+    await run(root, "issues", "--only");
+    const calls = api.calls;
+    const out = await preview(root, ["triage"], { rows: 50 });
+    expect(api.calls - calls).toBe(3);
+    expect(byName(out.data.assets, "triage")).toMatchObject({ status: "ok", capped: false, rows: 3 });
+    const tooMany = await preview(root, ["triage"], { rows: 100_001 }).catch((e: unknown) => e);
+    expect((tooMany as { code?: string }).code).toBe("USAGE_ERROR");
+  }, 60_000);
+});
+
+describe("croft preview: secrets and inputs", () => {
+  test("every asset's declared secrets are hidden in samples, in JSON and on screen", async () => {
+    const root = makeProject({
+      ".env": "SHOP_PASSWORD=Swordfish\n",
+      "assets/shop_config.ts": `import { ingest } from "@zabaca/croft";
+export default ingest({
+  secrets: ["SHOP_PASSWORD"], key: "id",
+  async *rows({ secret }) { yield [{ id: 1, host: "db.example.com", password: secret("SHOP_PASSWORD") }]; },
+});
+`,
+      "assets/shop_hosts.sql": "-- key: id\n-- check: password IS NULL\nSELECT id, host, password FROM shop_config\n",
+    });
+    await run(root, "shop_config", "--only");
+    const json = await croft(root, ["preview", "shop_hosts"]);
+    expect(json.code).toBe(3);
+    expect(json.stdout).toContain("[redacted:SHOP_PASSWORD]");
+    expect(json.stdout).not.toContain("Swordfish");
+    const p = Bun.spawn([process.execPath, MAIN, "preview", "shop_hosts"], { cwd: root, env: ENV, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
+    await p.exited;
+    expect(stdout).toContain("[redacted:SHOP_PASSWORD]");
+    expect(stdout + stderr).not.toContain("Swordfish");
+  }, 60_000);
+
+  test("a TS transform whose inputs name no asset fails with UNKNOWN_TABLE and a did-you-mean, before its code runs", async () => {
+    const root = makeProject({
+      "assets/issues.sql": "-- key: id\nSELECT i AS id FROM range(1, 4) t(i)\n",
+      "assets/typo.ts": `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["issuez"], key: "id",
+  async *rows({ rows }) { for await (const r of rows<{ id: number }>("issuez")) yield { id: r.id }; },
+});
+`,
+    });
+    await run(root, "issues", "--only");
+    const out = await preview(root, ["typo"]);
+    const a = byName(out.data.assets, "typo");
+    expect(a).toMatchObject({ status: "failed", error: { code: "UNKNOWN_TABLE", fix: { kind: "edit", replace: { from: "issuez", to: "issues" } } } });
+    expect(out.problems.map((x) => x.code)).not.toContain("INPUT_NOT_BUILT");
+    expect(JSON.stringify(out)).not.toContain("croft run issuez");
+  }, 60_000);
+});
+
 describe("croft preview: partial previews and what is downstream", () => {
   const THINGS = `import { ingest } from "@zabaca/croft";
 export default ingest({ key: "id", rows() { return [1, 2, 3, 4, 5].map((i) => ({ id: i, v: i })); } });

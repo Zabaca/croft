@@ -20,7 +20,10 @@
 //                            input of it is partial or an ingest (a diff against a partial input would suggest that
 //                            correct SQL is wrong); it is then listed as downstream, not built
 //                transform   runTransform with StepInput.preview: ctx.preview is true, and each input gives the code
-//                            at most --rows rows (a per-row LLM transform costs at most that many calls)
+//                            at most --rows rows (a per-row LLM transform costs at most that many calls). The cost
+//                            guard (§5) holds too: an incremental transform that makes requests gets at most its
+//                            confirmAbove input rows. Without --rows its cap is lowered to fit, and its reason says
+//                            so; an explicit --rows over it is LARGE_REPROCESS, with the --rows that fits
 //                ingest      runIngest from the saved position, with ctx.preview true and the generator stopped after
 //                            --rows rows; the position moves only in the preview database. File ingests read their
 //                            new and changed files (no requests are made, so no cap applies). Downstream assets are
@@ -63,13 +66,16 @@ import { isoMicros, wouldShrink } from "../safety/guards.ts";
 import { windowOf } from "./dry-run.ts";
 import { croftError, runIngest, StepProgress } from "./ingest.ts";
 import { cursorTypesOf, loadErrors, type PlannedStep, planRun, readMirror, type RunPlan } from "./plan.ts";
+import { withProjectChecks } from "./runner.ts";
 import { snapshotTable } from "./snapshot.ts";
 import { runSqlStep } from "./sql.ts";
 import type { StepInput, StepOutcome } from "./step.ts";
-import { runTransform } from "./transform.ts";
+import { previewGuard, previewReprocess, runTransform } from "./transform.ts";
 
 /** --rows when it is not given: the input rows a TS transform receives, the rows an ingest fetches (§6). */
 export const DEFAULT_PREVIEW_ROWS = 1000;
+/** The most --rows may be: a preview is a sample; a real run processes everything. */
+export const MAX_PREVIEW_ROWS = 100_000;
 /** The preview database, in the state folder. */
 export const PREVIEW_DATABASE = "preview.duckdb";
 /** The preview's snapshots, logs and runs.sqlite, in the state folder. */
@@ -92,7 +98,8 @@ export interface PreviewInput {
   env: ProjectEnv;
   /** The assets named (names or globs); at least one. */
   selectors: readonly string[];
-  /** --rows (default 1,000). */
+  /** --rows (default 1,000; at most 100,000). Left out, a TS transform that makes requests gets at most its
+   *  confirmAbove input rows (the cost guard, §5); given, a preview over confirmAbove is LARGE_REPROCESS. */
   rows?: number;
   /** --rebuild: every named asset is built from scratch and compared with its live table. */
   rebuild?: boolean;
@@ -159,7 +166,7 @@ interface Entry {
 /** Build the named assets (and SQL downstream of them) in the preview database and diff them against live. */
 export async function runPreview(i: PreviewInput): Promise<PreviewOutcome> {
   const { project, env } = i;
-  const cap = i.rows ?? DEFAULT_PREVIEW_ROWS;
+  const cap = previewRows(i.rows);
   const clock = i.now ?? (() => clockNow());
   const tz = project.timezone;
   if (i.selectors.length === 0) {
@@ -173,8 +180,9 @@ export async function runPreview(i: PreviewInput): Promise<PreviewOutcome> {
   setOutputRedactor((t) => env.redact(t));
   const stateDir = project.paths.stateDir;
   const mirror = readMirror(stateDir);
-  const plan = await planFor(i, mirror);
-  for (const s of plan.steps) if (s.spec) env.declare(s.spec.secrets);
+  // Every asset's secrets are hidden in samples, and a transform input that names no asset fails its step, as in
+  // a run (runner.ts withProjectChecks).
+  const plan = await withProjectChecks(await planFor(i, mirror), project, env);
   const byName = new Map(plan.steps.map((s) => [s.asset, s]));
   const named = new Set(plan.steps.filter((s) => s.reasons.includes("requested")).map((s) => s.asset));
   // What the preview may build: the named assets, and the SQL downstream of them.
@@ -222,6 +230,27 @@ export async function runPreview(i: PreviewInput): Promise<PreviewOutcome> {
     await pdb.close();
     await live?.close();
   }
+}
+
+/** --rows as a preview takes it: a whole number from 1 to MAX_PREVIEW_ROWS; DEFAULT_PREVIEW_ROWS when not
+ *  given. `typed`: the flag's text, for the message. */
+export function previewRows(rows: number | undefined, typed = String(rows)): number {
+  if (rows === undefined) return DEFAULT_PREVIEW_ROWS;
+  if (!Number.isInteger(rows) || rows < 1) {
+    throw new CroftError("USAGE_ERROR", {
+      message: `--rows needs a whole number of rows, 1 or more; got ${JSON.stringify(typed)}`,
+      hint: "for example --rows 200",
+      fix: { kind: "manual", description: "pass --rows with a whole number, such as --rows 200" },
+    });
+  }
+  if (rows > MAX_PREVIEW_ROWS) {
+    throw new CroftError("USAGE_ERROR", {
+      message: `--rows is at most ${MAX_PREVIEW_ROWS.toLocaleString("en-US")}; got ${JSON.stringify(typed)}`,
+      hint: `a preview is a sample: pass --rows ${DEFAULT_PREVIEW_ROWS} or leave it out; a real run (croft run) processes everything`,
+      fix: { kind: "manual", description: `pass --rows ${MAX_PREVIEW_ROWS} or fewer` },
+    });
+  }
+  return rows;
 }
 
 /** The plan `croft run <assets>` would make, from the catalog mirror. A name that is not an asset gets its
@@ -495,10 +524,22 @@ class Engine {
     }, Math.max(10, Math.min(1000, Math.floor(timeoutMs / 4))));
     const fetch = { capped: false };
     let out: StepOutcome;
+    // The rows of each input a transform gets, and the confirmAbove that lowered them below --rows.
+    let rows = cap;
+    let fitted: number | undefined;
     try {
+      // The cost guard (§5): a transform that makes requests is handed at most its confirmAbove input rows. Without
+      // --rows the cap is lowered to fit; an explicit --rows over it is refused before any of its code runs.
+      const g = step.kind === "transform" ? await previewGuard(step, pdb, cap, stepSignal) : null;
+      if (g && g.pending > g.limit) {
+        if (this.i.rows !== undefined || g.fits < 1) throw previewReprocess(step, g, cap, { rebuild: this.i.rebuild === true });
+        rows = g.fits;
+        fitted = g.limit;
+        log.write(`at most ${rows} rows of each input: ${asset} makes requests, and ${cap} rows of each would be ${g.pending} input rows, more than its confirmAbove of ${g.limit}`);
+      }
       const input: StepInput = {
-        step: previewStep(step, cap, fetch), project: this.project, env: this.i.env, warehouse: pdb, runs, runId, attempt: 1, maxAttempts: 1,
-        signal: stepSignal, progress, log, preview: { rows: cap },
+        step: previewStep(step, rows, fetch), project: this.project, env: this.i.env, warehouse: pdb, runs, runId, attempt: 1, maxAttempts: 1,
+        signal: stepSignal, progress, log, preview: { rows },
         ...readByOf(step, this.c.mirror.find((m) => m.asset === asset) ?? null),
         ...(this.i.http ? { http: this.i.http } : {}), ...(this.i.now ? { now: this.i.now } : {}),
       };
@@ -542,7 +583,7 @@ class Engine {
     const since = ingest && entry.mode === "copy" ? sinceOf(step, r, this.c.mirror, this.project.timezone, (this.i.now ?? clockNow)()) : undefined;
     const requests = r.requests !== undefined && (ingest || r.requests > 0) ? r.requests : undefined;
     entry.asset = {
-      ...entry.asset, status: d.failed ? "failed" : "ok", reason: reasonOf(entry, { capped, cap, builtInputs, rebuild: this.i.rebuild === true, result: r, since }),
+      ...entry.asset, status: d.failed ? "failed" : "ok", reason: reasonOf(entry, { capped, cap: rows, ...(fitted !== undefined ? { fitted } : {}), builtInputs, rebuild: this.i.rebuild === true, result: r, since }),
       rows: d.rows, liveRows: d.liveRows, partial: entry.partial, capped, ...(requests !== undefined ? { requests } : {}),
       ...(since !== undefined ? { since } : {}), diff: d.diff, columns: d.columns, checks: d.checks, sample: d.sample,
       durationMs: Date.now() - started,
@@ -821,8 +862,9 @@ function sinceOf(step: PlannedStep, r: StepResult, mirror: readonly CatalogAsset
   }
 }
 
-/** How the asset was built, in words. */
-function reasonOf(e: Entry, o: { capped: boolean; cap: number; builtInputs: readonly string[]; rebuild: boolean; result: StepResult; since?: string }): string {
+/** How the asset was built, in words. `cap`: the rows of each input it got; `fitted`: the confirmAbove that
+ *  lowered them below the default --rows. */
+function reasonOf(e: Entry, o: { capped: boolean; cap: number; fitted?: number; builtInputs: readonly string[]; rebuild: boolean; result: StepResult; since?: string }): string {
   const { step } = e;
   const parts: string[] = [];
   if (step.kind === "rows" || step.kind === "file") {
@@ -845,7 +887,11 @@ function reasonOf(e: Entry, o: { capped: boolean; cap: number; builtInputs: read
   const live = readsOf(step).filter((x) => !o.builtInputs.includes(x));
   const from = [...o.builtInputs.map((x) => `the preview of ${x}`), ...(live.length ? [`live ${live.join(", ")}`] : [])];
   if (from.length) parts.push(`from ${from.join(" and ")}`);
-  if (o.capped) parts.push(`inputs capped at ${o.cap} rows`);
+  if (o.capped) {
+    parts.push(o.fitted !== undefined
+      ? `inputs capped at ${o.cap} rows to stay within its confirmAbove of ${o.fitted} (its code makes requests for each row)`
+      : `inputs capped at ${o.cap} rows`);
+  }
   if (!e.named) parts.push("downstream of the named assets");
   return parts.join("; ");
 }

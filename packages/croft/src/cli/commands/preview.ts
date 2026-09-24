@@ -20,24 +20,17 @@
 import { relative } from "node:path";
 import { CroftError } from "../../core/errors.ts";
 import type { PreviewAsset, PreviewData, Problem, StepResult } from "../../core/types.ts";
-import { DEFAULT_PREVIEW_ROWS, previewDirectory, runPreview } from "../../run/preview.ts";
+import { DEFAULT_PREVIEW_ROWS, previewDirectory, previewRows, runPreview } from "../../run/preview.ts";
 import type { Row } from "../../types.ts";
 import type { CommandImpl, CommandResult, Next } from "../command.ts";
-import { formatCount, formatDuration, table } from "../render.ts";
+import { formatCount, formatDuration, redactProblem, table } from "../render.ts";
 import { capValue, holderFromRuns, holderText } from "./describe.ts";
 
-/** --rows N: a whole number of rows, 1 or more. */
+/** --rows N: a whole number of rows, from 1 to 100,000 (run/preview.ts previewRows). */
 export function parseRows(v: unknown): number {
   if (v === undefined) return DEFAULT_PREVIEW_ROWS;
   const text = String(v).trim();
-  if (!/^\d+$/.test(text) || !Number.isSafeInteger(Number(text)) || Number(text) < 1) {
-    throw new CroftError("USAGE_ERROR", {
-      message: `--rows needs a whole number of rows, 1 or more; got ${JSON.stringify(String(v))}`,
-      hint: "for example --rows 200",
-      fix: { kind: "manual", description: "pass --rows with a whole number, such as --rows 200" },
-    });
-  }
-  return Number(text);
+  return previewRows(/^\d+$/.test(text) ? Number(text) : Number.NaN, String(v));
 }
 
 /** Sample values in a table cell are cut shorter than query's 80 characters: a sample is a glance. */
@@ -49,7 +42,8 @@ type PreviewResult = CommandResult<PreviewData> & { shown: PreviewShown };
 
 export const preview: CommandImpl<PreviewData> = {
   async run(ctx) {
-    const rows = parseRows(ctx.values.rows);
+    // Left out, --rows stays unset: a transform that makes requests then gets at most its confirmAbove rows.
+    const rows = ctx.values.rows === undefined ? undefined : parseRows(ctx.values.rows);
     const rebuild = ctx.values.rebuild === true;
     const project = ctx.project;
     const interactive = ctx.isTTY.stdin && ctx.isTTY.stdout;
@@ -67,7 +61,7 @@ export const preview: CommandImpl<PreviewData> = {
     let out;
     try {
       out = await runPreview({
-        project, env: ctx.env, selectors: [...ctx.positionals], rows, rebuild, interactive, signal: ac.signal, now: () => ctx.now(),
+        project, env: ctx.env, selectors: [...ctx.positionals], ...(rows !== undefined ? { rows } : {}), rebuild, interactive, signal: ac.signal, now: () => ctx.now(),
         onWait: (h, ms, what) => ctx.render.progress(`waiting for ${what}: ${holderText(h)} holds it (${Math.round(ms / 1000)} s so far)`),
         lookupHolder: (pid) => holderFromRuns(project.paths.stateDir, pid),
         ...(interactive && !ctx.json ? { onProgress: (line: string) => ctx.render.progress(line) } : {}),
@@ -76,9 +70,16 @@ export const preview: CommandImpl<PreviewData> = {
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
     }
-    // Samples are redacted and cut like query output (--json keeps 80 characters, as query does).
+    // Samples are redacted and cut like query output (--json keeps 80 characters, as query does). An asset's error
+    // is a problem, redacted as free text like problems[] (every .env value), and so is a reason that quotes it.
     const redact = (s: string) => ctx.env.redactData(s);
-    for (const a of out.data.assets) a.sample = a.sample.map((r) => capRow(r, redact));
+    const text = (s: string) => ctx.env.redact(s);
+    for (const a of out.data.assets) {
+      a.sample = a.sample.map((r) => capRow(r, redact));
+      if (!a.error) continue;
+      if (a.reason.startsWith(`${a.error.code}: `)) a.reason = text(a.reason);
+      a.error = redactProblem(a.error, text);
+    }
     const first = out.built[0];
     const explore = first !== undefined ? `croft query --preview "from ${first}"` : undefined;
     const apply = out.apply.length ? `croft run ${out.apply.join(" ")}` : undefined;

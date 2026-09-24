@@ -12,7 +12,9 @@
 //               counts the rows after the position of each keyed input the code reads with newRows() (the scan
 //               of ts-asset.ts detectNewRows; every keyed input when the scan cannot tell); a lookup read with
 //               rows() is not processed row by row. An input the scan missed is counted when newRows() first
-//               reads it, before its first row is handed over
+//               reads it, before its first row is handed over. A preview (StepInput.preview) counts at most its
+//               --rows of each input and, with nobody to ask, refuses a count over confirmAbove; croft preview
+//               without --rows first lowers its cap to one that fits (previewGuard)
 //   extract     NO database lock: rows(ctx) → NDJSON parts (load/stage.ts); ctx.rows/newRows/query read Parquet
 //               snapshots of the inputs through a private DuckDB (run/inputs.ts); ctx.http, ctx.secret, ctx.log;
 //               console output and fds 1 and 2 go to the step log (core/output.ts)
@@ -150,17 +152,14 @@ export async function runTransform(i: StepInput): Promise<StepOutcome> {
   const afterReuse = new Map(committed);
   if (reusable) for (const p of reusable.meta.positions) afterReuse.set(p.input, positionOf(p));
 
-  // 3. The cost guard, before any code runs.
-  const usesHttp = step.usesHttp ?? step.loaded?.usesHttp ?? false;
+  // 3. The cost guard, before any code runs. A preview hands the code at most --rows rows of each input, so the
+  //    cap bounds its count; a preview has nobody to ask, so a count over confirmAbove refuses it.
   let guard: Guard | null = null;
-  if (incremental && usesHttp && !i.preview) {
-    const limit = step.confirmAbove ?? spec.confirmAbove ?? DEFAULT_CONFIRM_ABOVE;
-    // The inputs the code reads with newRows(), when the scan could tell; otherwise every input counts.
-    const reads = step.loaded?.readsNewRows;
-    const counted = reads ? inputNames.filter((n) => reads.includes(n)) : [...inputNames];
-    const counts = counted.length ? await pendingCounts(warehouse, counted, afterReuse, signal) : {};
-    const pending = Object.values(counts).reduce((a, b) => a + b, 0);
-    guard = { limit, counts, pending, counted: new Set(counted), confirmed: false };
+  if (costGuarded(step)) {
+    const g = await guardCount(step, warehouse, afterReuse, signal, i.preview?.rows);
+    guard = { ...g, counted: new Set(g.counted), confirmed: false };
+    const { limit, counts, pending } = g;
+    if (pending > limit && i.preview) throw previewReprocess(step, g, i.preview.rows);
     if (pending > limit) {
       const err = largeReprocess(step, pending, limit, counts, !i.confirm);
       if (!i.confirm) throw err;
@@ -359,6 +358,71 @@ async function readState(warehouse: DuckWarehouse, asset: string, inputs: readon
 function positionOf(p: { seenLoadedAt: string | null; seenKey?: unknown }): SeenPosition | null {
   if (!p.seenLoadedAt) return null;
   return { stamp: p.seenLoadedAt, key: Array.isArray(p.seenKey) ? p.seenKey.map(String) : null };
+}
+
+/** The cost guard applies (§5): an incremental transform whose code makes requests (an API, an LLM). */
+function costGuarded(step: PlannedStep): boolean {
+  return step.incremental.kind === "new-rows" && (step.usesHttp ?? step.loaded?.usesHttp ?? false);
+}
+
+/** The declared inputs of a transform step. */
+function inputsOf(step: PlannedStep): readonly string[] {
+  return step.inputs.length ? step.inputs : step.spec?.inputs ?? [];
+}
+
+/** The cost guard's count of a step before its code runs. */
+export interface GuardCount {
+  /** confirmAbove. */
+  limit: number;
+  /** Input rows the code would be handed, per counted keyed input. */
+  counts: Record<string, number>;
+  pending: number;
+  /** The inputs counted: those the code reads with newRows() when the scan of its code could tell, otherwise
+   *  every input. */
+  counted: string[];
+}
+
+/**
+ * The rows after the position of each keyed input the code reads with newRows() (a lookup read with rows() is not
+ * processed row by row). `cap`: croft preview's --rows, the most newRows() hands over of each input.
+ */
+async function guardCount(step: PlannedStep, warehouse: DuckWarehouse, positions: ReadonlyMap<string, SeenPosition | null>,
+  signal: AbortSignal, cap?: number): Promise<GuardCount> {
+  const inputs = inputsOf(step);
+  const limit = step.confirmAbove ?? step.spec?.confirmAbove ?? DEFAULT_CONFIRM_ABOVE;
+  const reads = step.loaded?.readsNewRows;
+  const counted = reads ? inputs.filter((n) => reads.includes(n)) : [...inputs];
+  const all = counted.length ? await pendingCounts(warehouse, counted, positions, signal) : {};
+  const counts = Object.fromEntries(Object.entries(all).map(([k, n]) => [k, cap === undefined ? n : Math.min(n, cap)]));
+  return { limit, counts, pending: Object.values(counts).reduce((a, b) => a + b, 0), counted };
+}
+
+/** The largest per-input row cap, at most `cap`, whose rows (each input's count, capped) stay within `limit`;
+ *  0 when not even one row of each counted input does. */
+export function rowsWithin(counts: readonly number[], limit: number, cap: number): number {
+  const total = (c: number) => counts.reduce((a, n) => a + Math.min(n, c), 0);
+  if (total(cap) <= limit) return cap;
+  let lo = 0;
+  let hi = cap;                                            // total(lo) <= limit < total(hi)
+  while (hi - lo > 1) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (total(mid) <= limit) lo = mid;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/**
+ * croft preview's cost guard, before the step runs: what a preview of `step` with at most `cap` rows of each
+ * input would hand its code, and the largest cap that stays within confirmAbove (`fits`: 0 when none does). null
+ * when the guard does not apply (a full-refresh transform, or code that makes no requests). Reads the positions
+ * the step's table has in `warehouse` (the preview database).
+ */
+export async function previewGuard(step: PlannedStep, warehouse: DuckWarehouse, cap: number, signal: AbortSignal): Promise<(GuardCount & { fits: number }) | null> {
+  if (!costGuarded(step)) return null;
+  const state = await readState(warehouse, step.asset, inputsOf(step), signal);
+  const g = await guardCount(step, warehouse, state.saved, signal, cap);
+  return { ...g, fits: rowsWithin(Object.values(g.counts), g.limit, cap) };
 }
 
 /** Input rows after the positions, per keyed input (the rows newRows() can hand over). */
@@ -837,6 +901,29 @@ function largeReprocess(step: PlannedStep, pending: number, limit: number, count
       description: `show the user that ${asset} would process ${pending} input rows and make requests for each; only after an explicit yes: croft run ${asset}`,
     },
     details,
+  });
+}
+
+/**
+ * LARGE_REPROCESS in croft preview: with --rows `rows`, the preview would hand the code more input rows than its
+ * confirmAbove, and a preview cannot ask. The fix previews at most as many rows as confirmAbove allows.
+ */
+export function previewReprocess(step: PlannedStep, g: Pick<GuardCount, "limit" | "counts" | "pending">, rows: number, o: { rebuild?: boolean } = {}): CroftError {
+  const asset = step.asset;
+  const per = Object.entries(g.counts).filter(([, n]) => n > 0).map(([k, n]) => `${k} ${n}`).join(", ");
+  const fits = rowsWithin(Object.values(g.counts), g.limit, rows);
+  const command = `croft preview ${asset}${o.rebuild ? " --rebuild" : ""} --rows ${fits}`;
+  return new CroftError("LARGE_REPROCESS", {
+    asset, file: step.file,
+    message: `a preview of ${asset} with up to ${rows} rows of each input would process ${g.pending} input rows (${per}), more than its confirmAbove of ${g.limit}, and its code makes requests (an API or an LLM) for them`,
+    hint: fits >= 1
+      ? `preview fewer rows, within confirmAbove: ${command}; to allow more without asking, raise confirmAbove in ${step.file}`
+      : `not even one row of each input fits within its confirmAbove of ${g.limit}; raise confirmAbove in ${step.file}`,
+    effect: "nothing was processed; nothing real changed",
+    fix: fits >= 1
+      ? { kind: "command", description: `preview at most ${fits} row${fits === 1 ? "" : "s"} of each input`, command }
+      : { kind: "manual", requiresHuman: true, description: `ask the user whether ${asset} may make ${g.pending} paid requests without asking; only after a yes, raise confirmAbove in ${step.file}` },
+    details: { pending: g.pending, confirmAbove: g.limit, inputs: g.counts, rows, ...(fits >= 1 ? { fits } : {}) },
   });
 }
 
