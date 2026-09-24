@@ -19,11 +19,15 @@
 // - Values are redacted before they are cut (so a cut never leaves half a secret behind), after the
 //   project's declared secrets are declared (ProjectEnv.redactData hides those whatever they look like).
 //
-// --preview (the preview database) arrives with croft preview in phase 2.
+// --preview reads .croft/preview.duckdb, what the last `croft preview` built, instead of the warehouse. It is opened
+// read-only (it waits while a preview is building it), with the same one-SELECT gate and the state folder protected:
+// the preview's views read the Parquet snapshots in .croft/preview/, which a query can reach only through them.
+// Without a preview it is DB_NOT_FOUND; a table the preview does not hold is UNKNOWN_TABLE, listing what it holds.
 import { type DuckDBConnection, DuckDBInstance, DuckDBResultReader } from "@duckdb/node-api";
 import { existsSync } from "node:fs";
 import { CroftError } from "../../core/errors.ts";
 import { connect, instanceConfig } from "../../db/connect.ts";
+import { openWarehouse } from "../../db/warehouse.ts";
 import type { ColumnInfo } from "../../db/values.ts";
 import { renderValue, resultColumns } from "../../db/values.ts";
 import type { Project } from "../../project/root.ts";
@@ -31,9 +35,9 @@ import { didYouMean } from "../../project/suggest.ts";
 import { mapQueryError } from "../../read/select.ts";
 import { assertOneSelect } from "../../sql/gate.ts";
 import type { Row } from "../../types.ts";
-import type { CommandImpl } from "../command.ts";
+import type { CommandImpl, Ctx } from "../command.ts";
 import { formatCount, formatDuration, table } from "../render.ts";
-import { type AssetConfig, capValue, declareProjectSecrets, readOnlyWarehouse } from "./describe.ts";
+import { type AssetConfig, capValue, declareProjectSecrets, holderText, readOnlyWarehouse } from "./describe.ts";
 import { missingWarehouse, openRunsDb, type WarehouseHistory, warehouseHistory } from "./status.ts";
 
 export interface QueryData {
@@ -79,13 +83,6 @@ interface Raw { columns: ColumnInfo[]; rows: Row[]; rowCount: number }
 
 export const query: CommandImpl<QueryData> = {
   async run(ctx) {
-    if (ctx.values.preview === true) {
-      throw new CroftError("USAGE_ERROR", {
-        message: "query --preview reads the preview database, which a later version of croft adds",
-        hint: "query the live tables without --preview; this version has no preview database",
-        fix: { kind: "manual", description: "drop --preview and query the live warehouse" },
-      });
-    }
     const sql = ctx.positionals[0];
     if (sql === undefined || sql.trim() === "") {
       throw new CroftError("USAGE_ERROR", {
@@ -102,9 +99,11 @@ export const query: CommandImpl<QueryData> = {
 
     const run = (conn: DuckDBConnection) => inDirectory(project.root, () => selectRows(conn, sql, limit, project.timezone, project.paths.stateDir));
     // No warehouse yet (nothing has run): an in-memory DuckDB, never a new warehouse file.
-    const raw = existsSync(project.paths.database)
-      ? await readOnlyWarehouse(ctx, project).read((db) => run(db.connection), { purpose: "croft query" })
-      : await withoutWarehouse(project, configs, run);
+    const raw = ctx.values.preview === true
+      ? await fromPreview(ctx, project, run)
+      : existsSync(project.paths.database)
+        ? await readOnlyWarehouse(ctx, project).read((db) => run(db.connection), { purpose: "croft query" })
+        : await withoutWarehouse(project, configs, run);
 
     const redact = (s: string) => ctx.env.redactData(s);
     let truncatedValues = 0;
@@ -175,6 +174,47 @@ async function selectRows(conn: DuckDBConnection, sql: string, limit: number, tz
     throw mapQueryError(e, "query");
   } finally {
     stmt.destroySync();
+  }
+}
+
+/**
+ * `croft query --preview`: the SELECT against .croft/preview.duckdb, read-only. Its views read the preview's
+ * Parquet snapshots in the state folder, so the connection has the warehouse sandbox (files/ and the state folder);
+ * the gate still protects the state folder from the SQL itself, so only those views reach it.
+ */
+async function fromPreview(ctx: Ctx, project: Project, run: (conn: DuckDBConnection) => Promise<Raw>): Promise<Raw> {
+  // Imported here: the preview engine is not needed by a plain query.
+  const { LIVE_SCHEMA, previewDatabasePath } = await import("../../run/preview.ts");
+  const path = previewDatabasePath(project.paths.stateDir);
+  if (!existsSync(path)) {
+    throw new CroftError("DB_NOT_FOUND", {
+      message: "there is no preview to query: croft preview has not built one in this project",
+      hint: "build one first: croft preview <asset>, then croft query --preview \"from <asset>\"",
+      fix: { kind: "manual", description: "run croft preview <asset> first, then query it with --preview" },
+      details: { database: path },
+    });
+  }
+  const db = openWarehouse({
+    path, mode: "read_only", label: "the preview database", register: false, timezone: project.timezone, root: project.root,
+    stateDir: project.paths.stateDir, isTTY: ctx.isTTY.stdin && ctx.isTTY.stdout,
+    onWait: (h, ms) => ctx.render.progress(`waiting for the preview database: ${holderText(h)} holds it (${Math.round(ms / 1000)} s so far)`),
+  });
+  try {
+    return await db.read((lease) => run(lease.connection), { purpose: "croft query --preview" });
+  } catch (e) {
+    if (!(e instanceof CroftError) || e.code !== "UNKNOWN_TABLE") throw e;
+    const held = await db.read((lease) => lease.all<{ name: string }>(
+      `SELECT table_name AS name FROM duckdb_tables() WHERE database_name = current_database() AND schema_name = 'main' AND NOT internal
+       UNION SELECT view_name FROM duckdb_views() WHERE database_name = current_database() AND schema_name = 'main' AND NOT internal
+       ORDER BY 1`), { purpose: "croft query --preview" }).catch(() => [] as { name: string }[]);
+    const names = held.map((h) => h.name);
+    e.problem.hint = names.length
+      ? `the preview holds ${names.join(", ")} (and ${LIVE_SCHEMA}.<asset>, the live version of each asset it built); croft preview <asset> builds another`
+      : "the preview is empty; croft preview <asset> builds one";
+    e.problem.details = { ...e.problem.details, preview: names };
+    throw e;
+  } finally {
+    await db.close();
   }
 }
 
