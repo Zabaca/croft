@@ -10,7 +10,7 @@ import type { Incremental, Sql, WriteMode } from "../core/types.ts";
 import { ensureState } from "../db/state.ts";
 import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/warehouse.ts";
 import { behaviorHash } from "../project/resolve.ts";
-import { behaviorChange, planPinChanges, type StoredBehavior } from "./config-change.ts";
+import { applyConfigChange, behaviorChange, planPinChanges, readConfigState, type StoredBehavior } from "./config-change.ts";
 import { readTableSchema } from "./evolve.ts";
 import { tableBatch } from "./table-batch.ts";
 import { writeBatch } from "./write.ts";
@@ -168,5 +168,52 @@ describe("planPinChanges", () => {
     const out = await plan(w, { amount: { type: "DECIMAL(18,2)" } });
     expect(out).toMatchObject([{ column: "amount", from: "DOUBLE", to: "DECIMAL(18,2)", changed: 1 }]);
     expect(await plan(w, { amount: { type: "VARCHAR" } })).toMatchObject([{ changed: 0 }]);
+  });
+});
+
+// R41-03: the conversion's count is of the key as its pins retype it, and the conversion never removes more (or other)
+// rows than the count the person confirmed.
+describe("readConfigState and applyConfigChange: a key conversion with a pin on the key", () => {
+  /** A table of `zip` texts, as a keyless append ingest wrote it. */
+  async function appendZips(w: DuckWarehouse, zips: (string | null)[]): Promise<void> {
+    await seed(w, zips);
+    await w.write("append", (tx) => tx.exec(`UPDATE _croft.assets SET write_mode = 'append', key_columns = [], behavior_hash = $1 WHERE name = 'people'`,
+      [behaviorHash("append", [], { kind: "none" })]), { runId: "r_append" });
+  }
+  const gains = {
+    write: "merge" as const, key: ["zip"], behaviorHash: behaviorHash("merge", ["zip"], { kind: "none" }),
+    hashWith: (wm: WriteMode, k: readonly string[]) => behaviorHash(wm, k, { kind: "none" }),
+  };
+  const state = (w: DuckWarehouse, pins: Record<string, { type: string }>) =>
+    w.read((db) => readConfigState(db, { asset: "people", pins, now: gains }), { purpose: "test" });
+  const zipPin = (w: DuckWarehouse) => w.read(async (db) => {
+    const real = (await readTableSchema(db, "people"))!;
+    return (await planPinChanges(db, { asset: "people", real, stored: [], pins: { zip: { type: "BIGINT" } } }))[0]!;
+  }, { purpose: "test" });
+
+  test("texts that cast to one value are duplicates, and values the cast turns into NULL have no key", async () => {
+    const w = warehouse();
+    await appendZips(w, ["1", "01", "2", "abc"]);
+    expect((await state(w, {})).conversion).toMatchObject({ removed: 0, nullKeys: 0, retyped: [] });
+    const pinned = await state(w, { zip: { type: "BIGINT" } });
+    expect(pinned.conversion).toMatchObject({ removed: 1, nullKeys: 1, retyped: [{ column: "zip", to: "BIGINT" }], sample: [{ key: { zip: 1 }, rows: 2 }] });
+    expect(pinned.pins).toMatchObject([{ column: "zip", changed: 2 }]);
+  });
+
+  test("the conversion removes exactly the rows confirmed, or nothing: CONFIRMATION_STALE rolls the whole change back", async () => {
+    const w = warehouse();
+    await appendZips(w, ["1", "01", "2"]);
+    const c = await zipPin(w);
+    const convert = { key: ["zip"], write: "merge" as const, behaviorHash: gains.behaviorHash };
+    // Confirmed as removing nothing (a pin change alone): the retype makes a duplicate, so nothing happens.
+    const e = await rejection(w.write("change", (tx) => applyConfigChange(tx, { asset: "people", pins: [c], convert: { ...convert, removed: 0 } }), { runId: "r_c" }));
+    expect(e.code).toBe("CONFIRMATION_STALE");
+    expect(e.problem.details).toEqual({ removed: 1, confirmed: 0 });
+    expect(await zipType(w)).toBe("VARCHAR");
+    expect(await read(w, `SELECT count(*)::INT AS n FROM people`)).toEqual([{ n: 3 }]);
+    // As confirmed: one row goes.
+    const out = await w.write("change", (tx) => applyConfigChange(tx, { asset: "people", pins: [c], convert: { ...convert, removed: 1 } }), { runId: "r_d" });
+    expect(out.removed).toBe(1);
+    expect(await read(w, `SELECT zip::INT AS zip FROM people ORDER BY zip`)).toEqual([{ zip: 1 }, { zip: 2 }]);
   });
 });

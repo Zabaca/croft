@@ -8,6 +8,7 @@ import { CroftError } from "../core/errors.ts";
 import type { Incremental, Problem, Reason, WriteMode } from "../core/types.ts";
 import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/warehouse.ts";
 import { openLog } from "../history/logs.ts";
+import { getCatalog } from "../history/catalog.ts";
 import { RunsDb } from "../history/runs-db.ts";
 import { discoverAssets } from "../project/discover.ts";
 import { ProjectEnv } from "../project/env.ts";
@@ -533,6 +534,91 @@ describe("pin changes: the pins in the code are authoritative", () => {
     expect(out.result.status).toBe("ok");
     expect(listTrash(h.stateDir, "events")).toHaveLength(1);
     expect(await all(h, `SELECT id::INT AS id, zip FROM events ORDER BY id`)).toEqual([{ id: 1, zip: 1 }, { id: 2, zip: null }]);
+  });
+});
+
+// R41-03: the key a conversion deduplicates by is the key as its pin retypes it. Texts that differ but cast to the same
+// value collide, and every value the cast turns into NULL has no key: both are counted before anything is asked, so
+// the confirmed impact covers every row the conversion deletes, and nothing is deleted beyond it.
+describe("a key conversion together with a pin on the key", () => {
+  test("values the pin turns into NULL rule the conversion out: INGEST_CONFIG_CHANGED, nothing asked, nothing changed", async () => {
+    const h = harness({ "assets/items.ts": source(`  write: "append",`) });
+    g.__cfg_rows = ["1", "01", "abc", "xyz", "2"].map((id, n) => ({ id, v: `v${n}` }));
+    await ingestStep(h, await plan(h, "items"));
+    const { fn, asked } = decider("granted");
+    const e = await failure(ingestStep(h, await plan(h, "items", { key: ["id"], write: "merge", pins: { id: { type: "BIGINT" } } }), { confirmChange: fn }));
+    expect(e.code).toBe("INGEST_CONFIG_CHANGED");
+    expect(asked).toEqual([]);
+    expect(e.problem.details).toMatchObject({ convertible: false, nullKeys: 2 });
+    expect(e.problem.message).toContain("2 stored rows would have no id once it is retyped to BIGINT, its pin");
+    expect(await all(h, `SELECT count(*)::INT AS n FROM items`)).toEqual([{ n: 5 }]);
+    expect(listTrash(h.stateDir)).toEqual([]);
+  });
+
+  test("texts that cast to the same key are duplicates: one convert_key question covers the rows removed and the values changed", async () => {
+    const h = harness({ "assets/items.ts": source(`  write: "append",`) });
+    g.__cfg_rows = [{ id: "1", v: "first" }, { id: "2", v: "two" }];
+    await ingestStep(h, await plan(h, "items"));
+    g.__cfg_rows = [{ id: "01", v: "second" }];
+    await ingestStep(h, await plan(h, "items"));
+    g.__cfg_rows = [];
+    const step = await plan(h, "items", { key: ["id"], write: "merge", pins: { id: { type: "BIGINT" } } });
+    const pending = decider("pending");
+    await ingestStep(h, step, { confirmChange: pending.fn });
+    expect(pending.asked).toHaveLength(1);
+    const req = pending.asked[0]!;
+    // "01" and "1" are both 1 once retyped: 1 row goes, and 1 value ("01" → 1) changes.
+    expect(req).toMatchObject({ action: "convert_key", impact: { rows: 2 }, problem: { code: "INGEST_CONFIG_CHANGED" } });
+    expect(req.impact.action).toBe("append ingest gains key id; duplicates removed in place; pin change: id VARCHAR → BIGINT");
+    expect(req.problem.message).toContain("retypes id to BIGINT, its pin, then keeps the latest row of each id and removes 1 duplicate row (e.g. id=1 ×2)");
+    expect(req.problem.message).toContain(`its pin BIGINT would change 1 of 3 stored values (e.g. "01" → 1)`);
+    expect(await all(h, `SELECT count(*)::INT AS n FROM items`)).toEqual([{ n: 3 }]);
+
+    const { fn } = decider("granted");
+    const out = await ingestStep(h, step, { confirmChange: fn });
+    expect(out.result.status).toBe("ok");
+    expect(await all(h, `SELECT id::INT AS id, v FROM items ORDER BY id`)).toEqual([{ id: 1, v: "second" }, { id: 2, v: "two" }]);
+    expect(listTrash(h.stateDir, "items")).toHaveLength(1);
+    // The catalog mirror follows the table.
+    expect(getCatalog(h.runs, "items")).toMatchObject({ rows: 2, write: "merge", key: ["id"] });
+  });
+
+  test("with no collision and no NULL, a lossy key pin asks pin_change and removes nothing", async () => {
+    const h = harness({ "assets/items.ts": source(`  write: "append",`) });
+    g.__cfg_rows = [{ id: "01", v: "a" }, { id: "2", v: "b" }];
+    await ingestStep(h, await plan(h, "items"));
+    g.__cfg_rows = [];
+    const { fn, asked } = decider("granted");
+    const out = await ingestStep(h, await plan(h, "items", { key: ["id"], write: "merge", pins: { id: { type: "BIGINT" } } }), { confirmChange: fn });
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toMatchObject({ action: "pin_change", impact: { rows: 1 } });
+    expect(out.result.status).toBe("ok");
+    expect(await all(h, `SELECT id::INT AS id FROM items ORDER BY id`)).toEqual([{ id: 1 }, { id: 2 }]);
+    expect(await assetRow(h, "items")).toMatchObject({ write_mode: "merge", key_columns: ["id"] });
+  });
+
+  test("a change that committed before the fetch failed is in the catalog mirror", async () => {
+    const h = harness({ "assets/items.ts": `import { ingest } from "@zabaca/croft";
+const g = globalThis as any;
+export default ingest({
+  write: "append",
+  rows() {
+    if (g.__cfg_fail) throw new Error("token expired");
+    return g.__cfg_rows ?? [];
+  },
+});
+` });
+    g.__cfg_rows = [{ id: 1, v: "a" }, { id: 1, v: "b" }, { id: 2, v: "c" }];
+    await ingestStep(h, await plan(h, "items"));
+    expect(getCatalog(h.runs, "items")).toMatchObject({ rows: 3 });
+    g.__cfg_fail = true;
+    try {
+      await failure(ingestStep(h, await plan(h, "items", { key: ["id"], write: "merge" }), { confirmChange: decider("granted").fn }));
+    } finally {
+      delete g.__cfg_fail;
+    }
+    expect(await all(h, `SELECT count(*)::INT AS n FROM items`)).toEqual([{ n: 2 }]);
+    expect(getCatalog(h.runs, "items")).toMatchObject({ rows: 2, write: "merge", key: ["id"] });
   });
 });
 

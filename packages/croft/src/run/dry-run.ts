@@ -12,8 +12,10 @@
 //                   runs.sqlite recorded for each input. An input never built that the run builds first has no
 //                   rows to count yet: the step's reason says the run may ask, since they are unknown until then.
 //                   --rebuild of an ingest or an incremental TS transform (run/rebuild.ts): the rows that would go to
-//                   the trash, and for a paid transform every input row it would process again. A rebuild that
-//                   trashes is destructive, so the run it describes is never in next.
+//                   the trash, and for a paid transform every input row it would process again; for an ingest, the
+//                   paid incremental transforms that have read it and would process every row again, and a file
+//                   ingest's files the mirror knows are gone (named, their rows unknown here). A rebuild that trashes
+//                   is destructive, so the run it describes is never in next.
 //                   An ingest whose code changed how its rows are written or typed (§6 "Behavior changes", "Pin
 //                   changes"; run/plan.ts pendingBehavior, pendingPins, from the mirror): a changed key, write mode
 //                   or cursor field fails the step before it runs (INGEST_CONFIG_CHANGED, as the run's settleConfig);
@@ -50,7 +52,7 @@ import {
   type BehaviorSide, buildFirst, cursorTypesOf, FROM_ONLY_MERGE, loadErrors, pendingBehavior, pendingPins, type PlannedStep, planRun, rebuildCommand,
   type RunPlan, skipProblem,
 } from "./plan.ts";
-import { rebuildImpact, rebuildKindOf, rebuildTrashes, rebuildWords } from "./rebuild.ts";
+import { rebuildImpact, rebuildKindOf, rebuildNotes, rebuildTrashes, rebuildWords } from "./rebuild.ts";
 import { checkRunFlags, shrinkCommand, withProjectChecks } from "./runner.ts";
 import { DEFAULT_CONFIRM_ABOVE, REPROCESS_ACTION } from "./transform.ts";
 
@@ -329,8 +331,14 @@ function confirmationOf(step: PlannedStep, entry: CatalogAsset | null, c: Confir
     // From scratch every input row is pending: the estimate with no saved position.
     const paid = step.kind === "transform" && step.usesHttp === true ? pendingEstimate(step, null, c) : null;
     if (rows > 0 || (paid !== null && paid.rows > limit)) {
-      const impact = rebuildImpact(c.project.paths.stateDir, step, rows, paid?.rows);
-      return { confirmation: { action: "rebuild", command: rebuildCommand(step.asset), impact } };
+      // An ingest's rebuild gives every row a new _loaded_at: each paid reader that has read it processes every row again.
+      const readers = rows > 0 ? (step.paidReaders ?? []).filter((r) => c.entries.get(r)?.inputsSeen?.[step.asset]?.seenLoadedAt).map((r) => ({ asset: r, rows })) : [];
+      const gone = step.kind === "file" ? (entry?.filesGone ?? []).map((path) => ({ path, rows: null })) : [];
+      const allowShrink = c.allowShrink && step.kind !== "transform";
+      const impact = rebuildImpact(c.project.paths.stateDir, step, rows, {
+        ...(paid ? { estimatedRequests: paid.rows } : {}), paid: readers, gone, ...(allowShrink ? { allowShrink: true } : {}),
+      });
+      return { confirmation: { action: "rebuild", command: rebuildCommand(step.asset, { allowShrink }), impact } };
     }
     if (paid?.unknown.length) return { until: paid.unknown, rows: paid.rows, limit };
     return null;
@@ -487,8 +495,10 @@ export function confirmationWords(c: DryRunConfirmation): string {
     return `needs confirmation if the source returns less than half: the current ${n} rows go to the trash first`;
   }
   if (c.action === "rebuild") {
-    const then = rebuildWords(rebuildKindOf(c.impact), c.impact.estimatedRequests !== undefined ? { estimatedRequests: c.impact.estimatedRequests } : {});
-    return `needs confirmation: ${c.impact.rows > 0 ? `its ${n} rows go to the trash first, then ${then}` : then}`;
+    const kind = rebuildKindOf(c.impact);
+    const then = rebuildWords(kind, kind === "transform" && c.impact.estimatedRequests !== undefined ? { estimatedRequests: c.impact.estimatedRequests } : {});
+    const notes = rebuildNotes(c.impact).map((x) => `; ${x}`).join("");
+    return `needs confirmation: ${c.impact.rows > 0 ? `its ${n} rows go to the trash first, then ${then}` : then}${notes}`;
   }
   if (c.action === "convert_key") return `needs confirmation if stored rows repeat a key: its ${n} rows go to the trash first (${c.impact.action})`;
   if (c.action === "pin_change") return `needs confirmation if the pin would change stored values: its ${n} rows go to the trash first (${c.impact.action})`;

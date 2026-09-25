@@ -16,6 +16,11 @@
 // the latest _loaded_at, then the highest cursor, then the last written. Stored rows without the key, or a key
 // column the table lacks, rule it out (a merge never matches a NULL key). When no stored row would go (every key
 // is already unique), nothing is destroyed and the new behavior applies with the write, without asking.
+// A key column whose pin changes is counted as the pin will retype it, since the conversion retypes first: texts that
+// differ but cast to the same value ('1' and '01') are duplicates, and a value the cast turns into NULL is a row
+// without the key, which rules the conversion out. So the one question covers every row the conversion removes and
+// every value it changes; the conversion then refuses (CONFIRMATION_STALE, nothing changed) to remove any other number
+// of rows than the one confirmed.
 //
 // Pins. The pins in the code are authoritative: a pin removed from the code unpins its column (write.ts records
 // it, the column keeps its type and values), and a pin that differs from the stored type retypes the column. A
@@ -48,7 +53,7 @@ import type { ColumnPlan, Confirmation, Fix, Impact, Problem, SchemaChange, Sql,
 import { now as clockNow, toEpochMicros } from "../core/time.ts";
 import { canonicalPath } from "../db/connect.ts";
 import { hasState } from "../db/state.ts";
-import { getCatalog } from "../history/catalog.ts";
+import { baseFrom, type CatalogBase, getCatalog, putCatalog, readCatalogEntry } from "../history/catalog.ts";
 import type { IngestInput, IngestOutcome } from "../run/ingest.ts";
 import type { ConfirmRequest } from "../run/step.ts";
 import { isoMicros, readStoredColumns, type StoredColumn, tableStats } from "../safety/guards.ts";
@@ -122,10 +127,12 @@ export function behaviorChange(stored: StoredBehavior, now: BehaviorNow): Behavi
 export interface KeyConversion {
   /** The key, spelled as the table's columns are. */
   key: string[];
-  /** Stored rows the conversion removes (all but one per key). */
+  /** Stored rows the conversion removes (all but one per key, the key as its pins retype it). */
   removed: number;
-  /** Stored rows with a NULL in the key: the conversion is not possible. */
+  /** Stored rows with a NULL in the key, as its pins retype it: the conversion is not possible. */
   nullKeys: number;
+  /** Key columns counted as their pin retypes them, with the pin's type. */
+  retyped: { column: string; to: string }[];
   /** Key columns the table does not have: the conversion is not possible. */
   missing: string[];
   /** Up to 3 keys stored more than once, with how often. */
@@ -140,22 +147,32 @@ function keepOrder(columns: RealColumn[], cursor?: string): string {
     .filter(Boolean).join(", ");
 }
 
-async function countConversion(sql: Sql, o: { ref: string; key: readonly string[]; columns: RealColumn[]; cursor?: string }): Promise<KeyConversion> {
+/** Count the conversion to `key`, each key column as its pin change (`pins`) would retype it. Read-only. */
+async function countConversion(sql: Sql, o: { ref: string; key: readonly string[]; columns: RealColumn[]; cursor?: string; pins: readonly PinChange[] }): Promise<KeyConversion> {
   const key = o.key.map((k) => o.columns.find((c) => sameName(c.name, k))?.name ?? k);
   const missing = o.key.filter((k) => !o.columns.some((c) => sameName(c.name, k)));
-  if (missing.length) return { key, removed: 0, nullKeys: 0, missing, sample: [] };
-  const part = key.map(quoteIdent).join(", ");
+  if (missing.length) return { key, removed: 0, nullKeys: 0, retyped: [], missing, sample: [] };
+  const retyped: KeyConversion["retyped"] = [];
+  const exprs = key.map((k) => {
+    const c = o.pins.find((x) => sameName(x.column, k));
+    if (!c) return quoteIdent(k);
+    retyped.push({ column: k, to: c.to });
+    return `(${retypeExprs(c.column, c.from, c.to, c.format).cast})`;
+  });
+  const part = exprs.join(", ");
   const [row] = await sql.all<{ n: number | bigint; nulls: number | bigint }>(
     `SELECT (SELECT count(*) FROM (SELECT 1 FROM ${o.ref} QUALIFY row_number() OVER (PARTITION BY ${part} ORDER BY ${keepOrder(o.columns, o.cursor)}) > 1)) AS n,
-       (SELECT count(*) FROM ${o.ref} WHERE ${key.map((k) => `${quoteIdent(k)} IS NULL`).join(" OR ")}) AS nulls`);
+       (SELECT count(*) FROM ${o.ref} WHERE ${exprs.map((e) => `${e} IS NULL`).join(" OR ")}) AS nulls`);
   const removed = Number(row!.n);
+  const shown = exprs.map((e, n) => `${e} AS ${quoteIdent(key[n]!)}`).join(", ");
+  const groups = exprs.map((_e, n) => String(n + 1)).join(", ");
   const sample = removed === 0 ? [] : (await sql.all<Record<string, unknown>>(
-    `SELECT ${part}, count(*) AS __rows FROM ${o.ref} GROUP BY ALL HAVING count(*) > 1 ORDER BY count(*) DESC, ${part} LIMIT 3`))
+    `SELECT ${shown}, count(*) AS __rows FROM ${o.ref} GROUP BY ${groups} HAVING count(*) > 1 ORDER BY count(*) DESC, ${groups} LIMIT 3`))
     .map((r) => {
       const { __rows, ...k } = JSON.parse(json(r)) as Record<string, unknown>;
       return { key: k, rows: Number(__rows) };
     });
-  return { key, removed, nullKeys: Number(row!.nulls), missing: [], sample };
+  return { key, removed, nullKeys: Number(row!.nulls), retyped, missing: [], sample };
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -408,10 +425,11 @@ export async function readConfigState(sql: Sql, o: ReadConfigInput): Promise<Con
   const change = a && rows > 0
     ? behaviorChange({ kind: a.kind, write: a.write_mode as WriteMode | null, key: a.key_columns ?? [], behaviorHash: a.behavior_hash }, o.now)
     : null;
-  const conversion = change?.appendGainsKey
-    ? await countConversion(sql, { ref, key: change.to.key, columns, ...(o.cursor ? { cursor: o.cursor } : {}) })
-    : undefined;
   const pins = await planPinChanges(sql, { asset: o.asset, real: columns, stored: await readStoredColumns(sql, o.asset), pins: o.pins, resolved });
+  // The conversion retypes first: the key is counted as its pins make it.
+  const conversion = change?.appendGainsKey
+    ? await countConversion(sql, { ref, key: change.to.key, columns, pins, ...(o.cursor ? { cursor: o.cursor } : {}) })
+    : undefined;
   return { rows, change, ...(conversion ? { conversion } : {}), pins };
 }
 
@@ -422,8 +440,9 @@ export interface ConfigChangeInput {
   asset: string;
   /** Lossy pins the user confirmed: retyped with the conversion that was shown. */
   pins: PinChange[];
-  /** An append ingest gaining a key: keep one stored row per key, and record the new behavior. */
-  convert?: { key: string[]; write: WriteMode; behaviorHash: string; cursor?: string };
+  /** An append ingest gaining a key: keep one stored row per key, and record the new behavior. `removed`: the rows
+   *  the confirmed impact counted; any other number is CONFIRMATION_STALE, and nothing changes. */
+  convert?: { key: string[]; write: WriteMode; behaviorHash: string; cursor?: string; removed: number };
   now?: Date;
 }
 
@@ -448,6 +467,17 @@ export async function applyConfigChange(tx: Sql, o: ConfigChangeInput): Promise<
     const [row] = await tx.all<{ Count: number | bigint }>(
       `DELETE FROM ${ref} WHERE rowid IN (SELECT rowid FROM ${ref} QUALIFY row_number() OVER (PARTITION BY ${part} ORDER BY ${keepOrder(columns, o.convert.cursor)}) > 1)`);
     removed = Number(row?.Count ?? 0);
+    // Never more (or other) than the person confirmed: the whole change rolls back.
+    if (removed !== o.convert.removed) {
+      throw new CroftError("CONFIRMATION_STALE", {
+        asset: o.asset,
+        message: `converting ${o.asset} to the key ${o.convert.key.join(", ")} would remove ${plural(removed, "row")}, not the ${o.convert.removed} counted when it was confirmed; nothing was changed`,
+        hint: `the table changed since it was counted; croft run ${o.asset} counts again and asks again`,
+        effect: "nothing was changed (the table is in the trash too)",
+        fix: { kind: "command", description: "count the conversion again and ask again", command: `croft run ${o.asset}` },
+        details: { removed, confirmed: o.convert.removed },
+      });
+    }
   }
   const stats = await tableStats(tx, o.asset, db);
   const [s] = await tx.all<{ ll: number | bigint | null; lr: number | bigint | null }>(
@@ -515,7 +545,11 @@ function configChanged(o: Owner & { change: BehaviorChange; rows: number; increm
   const what = change.changed.map((p) => (p === "write" ? "write mode" : p === "key" ? "key" : "incremental field")).join(" and ");
   const conv = o.conversion;
   const blocked = conv && conv.missing.length ? `the stored rows have no column ${conv.missing.join(", ")}`
-    : conv && conv.nullKeys > 0 ? `${plural(conv.nullKeys, "stored row")} ${conv.nullKeys === 1 ? "has" : "have"} no ${conv.key.join(", ")}` : null;
+    : conv && conv.nullKeys > 0
+      ? conv.retyped.length
+        ? `${plural(conv.nullKeys, "stored row")} would have no ${conv.key.join(", ")} once ${conv.retyped.length === 1 ? "it is" : "they are"} retyped to ${conv.retyped.map((r) => r.to).join(", ")}, ${conv.retyped.length === 1 ? "its pin" : "their pins"}`
+        : `${plural(conv.nullKeys, "stored row")} ${conv.nullKeys === 1 ? "has" : "have"} no ${conv.key.join(", ")}`
+      : null;
   const convertible = Boolean(conv) && !blocked;
   const rebuild = `croft run ${asset} --rebuild refetches everything under the new rules (its table goes to the trash first, and it asks for confirmation)`;
   const fixes: Fix[] = [
@@ -526,7 +560,8 @@ function configChanged(o: Owner & { change: BehaviorChange; rows: number; increm
   let hint: string;
   if (convertible) {
     const k = conv!.key.join(", ");
-    message = `${asset} now has the key ${k}, but its ${plural(rows, "stored row")} ${were(rows)} appended without one: converting it in place keeps the latest row of each ${k} and removes ${plural(conv!.removed, "duplicate row")}${keySample(conv!)}; its table goes to the trash first`;
+    const retype = conv!.retyped.length ? `retypes ${conv!.retyped.map((r) => `${r.column} to ${r.to}`).join(" and ")}, ${conv!.retyped.length === 1 ? "its pin" : "their pins"}, then ` : "";
+    message = `${asset} now has the key ${k}, but its ${plural(rows, "stored row")} ${were(rows)} appended without one: converting it in place ${retype}keeps the latest row of each ${k} and removes ${plural(conv!.removed, "duplicate row")}${keySample(conv!)}; its table goes to the trash first`;
     if (o.pins?.length) message += `; and ${o.pins.map((c) => pinWords(c, asset)).join("; ")}`;
     hint = `ask the user; if they agree, run croft run ${asset} again and confirm the conversion. Otherwise remove the key again, or ${rebuild}`;
     fixes.push({ kind: "manual", requiresHuman: true, description: `ask the user whether to convert in place: croft run ${asset} asks for confirmation, moves the table to the trash first, then keeps the latest row of each ${k}` });
@@ -538,7 +573,7 @@ function configChanged(o: Owner & { change: BehaviorChange; rows: number; increm
     asset, file, message, hint, effect: "nothing was fetched or written", fix: fixes[0],
     details: {
       changed: change.changed, from: change.from, to: change.to, rows, convertible,
-      ...(conv ? { removed: conv.removed, nullKeys: conv.nullKeys, missing: conv.missing, sample: conv.sample } : {}),
+      ...(conv ? { removed: conv.removed, nullKeys: conv.nullKeys, missing: conv.missing, sample: conv.sample, ...(conv.retyped.length ? { retyped: conv.retyped } : {}) } : {}),
       ...(o.pins?.length ? { pins: pinDetails(o.pins) } : {}),
       fixes,
     },
@@ -622,7 +657,7 @@ export async function settleConfig(i: IngestInput, o: { started: number; hashWit
     : pinChangesData(owner, lossy, "nothing was fetched or written");
   const code = converting ? "INGEST_CONFIG_CHANGED" : "PIN_CHANGES_DATA";
   const what = converting
-    ? `${asset} would keep one row per ${k}, removing ${plural(convert!.removed, "duplicate row")}${lossy.length ? `, and ${lossy.map((c) => `${c.column} would become ${c.to} (${plural(c.changed, "value")} change)`).join(", ")}` : ""}`
+    ? `${asset} would keep one row per ${k}${convert!.retyped.length ? ` as ${convert!.retyped.length === 1 ? "its pin retypes it" : "their pins retype them"}` : ""}, removing ${plural(convert!.removed, "duplicate row")}${lossy.length ? `, and ${lossy.map((c) => `${c.column} would become ${c.to} (${plural(c.changed, "value")} change)`).join(", ")}` : ""}`
     : lossy.map((c) => `${c.column} of ${asset} would become ${c.to}: ${plural(c.changed, "stored value")} change`).join("; ");
 
   let trashed: TrashEntry | null = null;
@@ -651,11 +686,26 @@ export async function settleConfig(i: IngestInput, o: { started: number; hashWit
     log.write(`preview: ${what}; applied to the preview's copy (a real run asks for confirmation first)`);
   }
 
-  const applied = await warehouse.write(`change ${asset}`, (tx) => applyConfigChange(tx, {
-    asset, pins: lossy,
-    ...(convert ? { convert: { key: convert.key, write: step.write, behaviorHash: step.behaviorHash, ...(cursor ? { cursor } : {}) } } : {}),
-    ...(i.now ? { now: i.now() } : {}),
-  }), { runId, asset, signal });
+  // The key's own pin changes are retyped before the deduplication, lossless ones too: the count was of the key as
+  // they make it. The conversion goes along only as counted (what the confirmed impact holds: removing nothing, or
+  // the duplicates it named).
+  const keyPins = convert ? state.pins.filter((c) => c.changed === 0 && convert.key.some((k) => sameName(k, c.column))) : [];
+  const prev = getCatalog(i.runs, asset);
+  const base: CatalogBase = {
+    ...baseFrom(prev, asset, prev?.lastRunId ?? null), kind: "ingest",
+    ...(convert ? { write: step.write, key: convert.key, behavior: step.words } : {}),
+    ...(prev ? {} : { cursorField: cursor ?? null }),
+  };
+  const applied = await warehouse.write(`change ${asset}`, async (tx) => {
+    const out = await applyConfigChange(tx, {
+      asset, pins: [...lossy, ...keyPins],
+      ...(convert ? { convert: { key: convert.key, write: step.write, behaviorHash: step.behaviorHash, removed: convert.removed, ...(cursor ? { cursor } : {}) } } : {}),
+      ...(i.now ? { now: i.now() } : {}),
+    });
+    return { ...out, entry: await readCatalogEntry(tx, base) };
+  }, { runId, asset, signal });
+  // The mirror follows the table at once: a fetch or write that fails after this still leaves status right.
+  if (applied.entry) putCatalog(i.runs, applied.entry, "run");
 
   const where = trashed ? `; the previous table is in the trash: ${trashed.path}` : preview ? "; a real run asks for confirmation first" : "";
   const extra = { ...(trashed ? { trashPath: trashed.path, trashedRows: trashed.rows } : {}), ...(preview ? { preview: true } : {}) };

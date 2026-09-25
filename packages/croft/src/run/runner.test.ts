@@ -5,15 +5,16 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DuckDBInstance } from "@duckdb/node-api";
-import { closeAllWarehouses } from "../db/warehouse.ts";
+import { closeAllWarehouses, openWarehouse } from "../db/warehouse.ts";
 import { getCatalog } from "../history/catalog.ts";
 import { acquire } from "../history/leases.ts";
-import { logPath } from "../history/logs.ts";
+import { logPath, openLog } from "../history/logs.ts";
 import { RunsDb } from "../history/runs-db.ts";
 import { PARTIAL_COMMIT, PARTIAL_COMMIT_ROWS } from "../load/partial.ts";
 import { loadProject } from "../project/root.ts";
 import { listTrash } from "../safety/trash.ts";
 import { planRun } from "./plan.ts";
+import { Rebuilds } from "./rebuild.ts";
 import { type RunEvent, withProjectChecks } from "./runner.ts";
 import { cleanupProjects, cli, cliEnv, keysetIssues, linkItems, makeProject, mockApi, runIn, simpleGet, slowPages } from "./testkit.ts";
 
@@ -626,9 +627,9 @@ const g = globalThis as { __int_fail?: boolean };
 export default ingest({
   key: "id", incremental: "ts", retries: 0,
   async *rows() {
-    yield [{ id: 1, ts: "2026-09-01T00:00:01Z" }, { id: 2, ts: "2026-09-01T00:00:02Z" }];
+    yield [{ id: 1, ts: "2026-09-01T00:00:01Z" }, { id: 2, ts: "2026-09-01T00:00:02Z" }, { id: 3, ts: "2026-09-01T00:00:03Z" }];
     if (g.__int_fail) throw new Error("token expired");
-    yield [{ id: 3, ts: "2026-09-01T00:00:03Z" }];
+    yield [{ id: 4, ts: "2026-09-01T00:00:04Z" }];
   },
 });
 ` });
@@ -639,12 +640,14 @@ export default ingest({
       const out = await runIn(root, ["events"], { rebuild: true, interactive: true, prompt: async () => true });
       expect(out.exit).toBe(1);
       const step = out.data.steps[0]!;
-      expect(step).toMatchObject({ status: "failed", trashed: { rows: 3 }, error: { code: "ASSET_CODE_ERROR" } });
-      expect(step.error!.effect).toStartWith(`events was reset for --rebuild before this failure: its previous 3 rows are in the trash (${step.trashed!.path})`);
+      expect(step).toMatchObject({ status: "failed", trashed: { rows: 4 }, error: { code: "ASSET_CODE_ERROR" } });
+      expect(step.error!.effect).toStartWith(`events was reset for --rebuild before this failure: its previous 4 rows are in the trash (${step.trashed!.path})`);
       // The way back is croft restore, which asks first: in the hint, never in next (§4.3).
       expect(step.error!.hint).toEndWith("; events holds the 2 rows its rebuild saved so far: croft run events continues it, or croft restore events brings the previous table back (it asks first)");
-      expect(step.error!.details).toMatchObject({ rebuild: { reset: true, trashPath: step.trashed!.path, trashedRows: 3 } });
+      expect(step.error!.details).toMatchObject({ rebuild: { reset: true, trashPath: step.trashed!.path, trashedRows: 4 } });
       expect(JSON.stringify(out.next)).not.toContain("restore");
+      // The part that replaced the old table held half of its rows (FreshStart.holdRows): 1 and 2; the 3 was waiting
+      // for the next page to show it had no ties left.
       expect(await rows(root, "select id::INT id from events order by id")).toEqual([{ id: 1 }, { id: 2 }]);
     } finally {
       PARTIAL_COMMIT.rows = PARTIAL_COMMIT_ROWS;
@@ -653,7 +656,203 @@ export default ingest({
     // A plain run continues from the part's cursor.
     const next = await runIn(root, ["events"]);
     expect(next.exit).toBe(0);
-    expect(await rows(root, "select count(*)::INT n from events")).toEqual([{ n: 3 }]);
+    expect(await rows(root, "select count(*)::INT n from events")).toEqual([{ n: 4 }]);
+  });
+
+  test("a monotone part never replaces the old table with fewer than half of its rows: it waits until the refetch holds them (R41-08)", async () => {
+    const g = globalThis as { __hold_fail?: boolean };
+    const root = makeProject({ "assets/events.ts": `import { ingest } from "@zabaca/croft";
+const g = globalThis as { __hold_fail?: boolean };
+export default ingest({
+  key: "id", incremental: "ts", retries: 0,
+  async *rows() {
+    for (let i = 1; i <= 6; i++) {
+      if (g.__hold_fail && i === 4) throw new Error("token expired");
+      yield [{ id: i, ts: "2026-09-01T00:00:0" + i + "Z" }];
+    }
+  },
+});
+` });
+    expect((await runIn(root, ["events"])).exit).toBe(0);
+    PARTIAL_COMMIT.rows = 1;
+    g.__hold_fail = true;
+    try {
+      // Parts of one row would commit at once; the first may not until the refetch holds 3 of the 6 rows, and the
+      // source fails at the fourth: nothing replaced the old table.
+      const out = await runIn(root, ["events"], { rebuild: true, interactive: true, prompt: async () => true });
+      expect(out.exit).toBe(1);
+      expect(out.data.steps[0]!.error!.effect ?? "").not.toContain("was reset");
+      expect(await rows(root, "select count(*)::INT n from events")).toEqual([{ n: 6 }]);
+    } finally {
+      PARTIAL_COMMIT.rows = PARTIAL_COMMIT_ROWS;
+      delete g.__hold_fail;
+    }
+  });
+
+  // §6 shrink guard: "an expired token that returns [] must not wipe the table". A rebuild's swap has it too.
+  test("a refetch that returns nothing fails with SHRINK_GUARD: the old table stays, and so does what reads it (R41-08)", async () => {
+    api.state.issues = issues([1, 2, 3]);
+    const root = makeProject({ "assets/issues.ts": keysetIssues(api.url), "assets/open.sql": "select count(*) as n from issues\n" });
+    expect((await runIn(root, ["issues", "open"])).exit).toBe(0);
+    // An expired token that still answers 200 with [].
+    api.state.issues = [];
+    const out = await runIn(root, ["issues"], { rebuild: true, interactive: true, prompt: async () => true });
+    expect(out.exit).not.toBe(0);
+    const step = out.data.steps.find((s) => s.asset === "issues")!;
+    expect(step).toMatchObject({ status: "failed", trashed: { rows: 3 }, error: { code: "SHRINK_GUARD", retryable: false } });
+    expect(step.error!.message).toBe("the refetch of issues for --rebuild holds 0 rows, and its table has 3: croft does not replace a table with a refetch that has fewer than half of its rows");
+    expect(step.error!.effect).toBe(`nothing was written; issues keeps its 3 rows (a copy is in the trash too: ${step.trashed!.path})`);
+    expect(step.error!.fix).toMatchObject({ kind: "manual", requiresHuman: true });
+    expect(step.error!.fix!.description).toContain("croft run issues --rebuild --allow-shrink");
+    expect(step.error!.details).toMatchObject({ rowsBefore: 3, rowsAfter: 0, rebuild: true, trashPath: step.trashed!.path });
+    expect(await rows(root, "select count(*)::INT n from issues")).toEqual([{ n: 3 }]);
+    expect(await rows(root, "select n::INT n from open")).toEqual([{ n: 3 }]);
+    const db = runsDb(root);
+    try {
+      expect(getCatalog(db, "issues")).toMatchObject({ rows: 3 });
+    } finally {
+      db.close();
+    }
+    // Not half either: 1 of 3.
+    api.state.issues = issues([1]);
+    const one = await runIn(root, ["issues"], { rebuild: true, interactive: true, prompt: async () => true });
+    expect(one.data.steps.find((s) => s.asset === "issues")!.error).toMatchObject({ code: "SHRINK_GUARD", details: { rowsBefore: 3, rowsAfter: 1 } });
+    // Half is allowed.
+    api.state.issues = issues([1, 2]);
+    const half = await runIn(root, ["issues"], { rebuild: true, interactive: true, prompt: async () => true });
+    expect(half.data.steps.find((s) => s.asset === "issues")).toMatchObject({ status: "ok", rows: { total: 2 } });
+  });
+
+  test("allowShrink: true lets a rebuild shrink; the swap marks the table replaced, so what read it is stale even when nothing was written (R41-08)", async () => {
+    api.state.zones = [{ zone: 1 }, { zone: 2 }, { zone: 3 }, { zone: 4 }];
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones", "\n  allowShrink: true,"), "assets/zone_count.sql": "select count(*) as n from zones\n" });
+    expect((await runIn(root, ["zones", "zone_count"])).exit).toBe(0);
+    api.state.zones = [];
+    const out = await runIn(root, ["zones"], { rebuild: true, only: true, interactive: true, prompt: async () => true });
+    expect(out.exit).toBe(0);
+    const step = out.data.steps.find((s) => s.asset === "zones")!;
+    expect(step).toMatchObject({ status: "ok", rows: { total: 0 }, trashed: { rows: 4 } });
+    const w = out.problems.find((p) => p.code === "SHRINK_GUARD_DISABLED" && p.details?.rebuild === true)!;
+    expect(w).toMatchObject({ severity: "warning", details: { rowsBefore: 4, rowsAfter: 0, trashPath: step.trashed!.path, trashedRows: 4 } });
+    // A plain run rebuilds what read the old table: it was replaced.
+    const next = await runIn(root, []);
+    expect(next.data.steps.find((s) => s.asset === "zone_count")).toMatchObject({ status: "ok" });
+    expect(await rows(root, "select n::INT n from zone_count")).toEqual([{ n: 0 }]);
+  });
+
+  // §6: a rebuild gives every refetched row a new _loaded_at, so an incremental transform that pays per row would pay
+  // for every row again: the rebuild's one confirmation says so, with the requests, before anything is paid for.
+  test("an ingest read by a paid incremental transform: its confirmation counts the rows the transform pays for again (R41-07)", async () => {
+    api.state.issues = issues([1, 2, 3]);
+    api.state.zones = [{ zone: 1 }];
+    const labeller = `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["issues"], key: "id", incremental: true,
+  async *rows({ newRows, http }) {
+    for await (const r of newRows("issues")) {
+      await http.get("${api.url}/zones");
+      yield { id: r.id, label: "x:" + r.title };
+    }
+  },
+});
+`;
+    const root = makeProject({ "assets/issues.ts": keysetIssues(api.url), "assets/labels.ts": labeller });
+    expect((await runIn(root, ["issues", "labels"])).exit).toBe(0);
+    // A second paid reader that has not read issues yet: its first build processes every row anyway.
+    writeFileSync(join(root, "assets/tags.ts"), labeller);
+    const paidCalls = () => api.state.log.filter((l) => l.path === "/zones").length;
+    api.state.log.length = 0;
+    const asked = await runIn(root, ["issues"], { rebuild: true, only: true });
+    expect(asked.exit).toBe(5);
+    expect(asked.confirmation!.impact).toEqual({
+      asset: "issues", rows: 3, trashPath: asked.confirmation!.impact.trashPath, downstream: ["labels", "tags"], estimatedRequests: 3,
+      action: "ingest; --rebuild refetches from scratch; then labels processes all 3 rows of issues again, and its code makes requests for them (about 3)",
+    });
+    expect(asked.problems.find((x) => x.code === "CONFIRMATION_REQUIRED")!.message).toBe("needs confirmation (--rebuild): the 3 rows of issues go to the trash, then it is fetched "
+      + "from scratch; then labels processes all 3 rows of issues again, and its code makes requests for them (about 3)");
+    expect(paidCalls()).toBe(0);
+    // On a TTY the question says it too.
+    const questions: string[] = [];
+    await runIn(root, ["issues"], { rebuild: true, only: true, interactive: true, prompt: async (q) => (questions.push(q), false) });
+    expect(questions[0]).toBe(["issues: its 3 rows go to the trash (.croft/trash/issues/), then it is fetched from scratch",
+      "  then labels processes all 3 rows of issues again, and its code makes requests for them (about 3)", "  then: labels, tags update", "Proceed? [y/N] "].join("\n"));
+    expect(paidCalls()).toBe(0);
+    // Confirmed: the refetch, then labels pays for the 3 rows the person said yes to.
+    const done = await runIn(root, ["issues"], { rebuild: true, confirmToken: asked.confirmation!.token });
+    expect(done.data.steps.find((s) => s.asset === "issues")).toMatchObject({ status: "ok", trashed: { rows: 3 } });
+    expect(done.data.steps.find((s) => s.asset === "labels")).toMatchObject({ status: "ok", requests: 3 });
+  });
+
+  test("a paid reader over its confirmAbove after the rebuild never pays without a yes (R41-07)", async () => {
+    api.state.issues = issues([1, 2, 3]);
+    api.state.zones = [{ zone: 1 }];
+    const root = makeProject({ "assets/issues.ts": keysetIssues(api.url), "assets/labels.ts": `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["issues"], key: "id", incremental: true, confirmAbove: 2,
+  async *rows({ newRows, http }) {
+    for await (const r of newRows("issues")) {
+      await http.get("${api.url}/zones");
+      yield { id: r.id };
+    }
+  },
+});
+` });
+    expect((await runIn(root, ["issues", "labels"], { interactive: true, prompt: async () => true })).exit).toBe(0);
+    // The rebuild's preparation counts what labels would pay for again, for the runner to grant its cost guard.
+    const project = loadProject({ root });
+    const plan = await planRun({ root, timezone: project.timezone, selectors: ["issues"], rebuild: true });
+    const step = plan.steps.find((s) => s.asset === "issues")!;
+    expect(step.paidReaders).toEqual(["labels"]);
+    const w = openWarehouse({ path: project.paths.database, mode: "read_write", timezone: project.timezone, root, stateDir: project.paths.stateDir, isTTY: false, register: false });
+    const db = runsDb(root);
+    const log = openLog(project.paths.stateDir, "r_prep", "issues", { redact: (t) => t });
+    try {
+      const prep = await new Rebuilds().prepare({
+        step, warehouse: w, runs: db, runId: "r_prep", stateDir: project.paths.stateDir, attempt: 1, maxAttempts: 1, signal: new AbortController().signal, log,
+        confirm: async () => ({ kind: "granted" }),
+      });
+      expect(prep).toMatchObject({ kind: "ready", paid: [{ asset: "labels", rows: 3 }] });
+    } finally {
+      log.close();
+      db.close();
+      await closeAllWarehouses();
+    }
+
+    api.state.log.length = 0;
+    const asked = await runIn(root, ["issues"], { rebuild: true });
+    expect(asked.confirmation!.impact).toMatchObject({ downstream: ["labels"], estimatedRequests: 3 });
+    const done = await runIn(root, ["issues"], { rebuild: true, confirmToken: asked.confirmation!.token });
+    const labels = done.data.steps.find((s) => s.asset === "labels")!;
+    const paidCalls = api.state.log.filter((l) => l.path === "/zones").length;
+    if (labels.status === "ok") {
+      // The runner granted labels' cost guard for the 3 rows the rebuild's confirmation named.
+      expect(labels.requests).toBe(3);
+    } else {
+      // Or labels asks for itself: skipped, nothing paid.
+      expect(labels).toMatchObject({ status: "skipped", reason: "needs confirmation" });
+      expect(paidCalls).toBe(0);
+    }
+  });
+
+  test("a file ingest: the confirmation names the files gone from disk, whose rows do not come back (R41-12)", async () => {
+    const root = makeProject({
+      "assets/sales.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ file: "files/sales/*.csv", incremental: true, key: "order_id" });\n`,
+      "files/sales/jan.csv": "order_id,amount\n1,10\n2,20\n",
+      "files/sales/feb.csv": "order_id,amount\n3,30\n",
+    });
+    expect((await runIn(root, ["sales"])).exit).toBe(0);
+    rmSync(join(root, "files/sales/jan.csv"));
+    const asked = await runIn(root, ["sales"], { rebuild: true });
+    expect(asked.exit).toBe(5);
+    expect(asked.confirmation!.impact.action)
+      .toBe("file ingest; --rebuild loads every file again; the 2 rows of 1 file no longer on disk (files/sales/jan.csv) do not come back, and stay only in the trash");
+    expect(asked.problems.find((x) => x.code === "CONFIRMATION_REQUIRED")!.message).toBe("needs confirmation (--rebuild): the 3 rows of sales go to the trash, then every file "
+      + "is loaded again; the 2 rows of 1 file no longer on disk (files/sales/jan.csv) do not come back, and stay only in the trash");
+    const done = await runIn(root, ["sales"], { rebuild: true, confirmToken: asked.confirmation!.token });
+    expect(done.data.steps[0]).toMatchObject({ status: "ok", rows: { total: 1 }, trashed: { rows: 3 } });
+    // Nothing gone: nothing to name.
+    const again = await runIn(root, ["sales"], { rebuild: true });
+    expect(again.confirmation!.impact.action).toBe("file ingest; --rebuild loads every file again");
   });
 
   test("two rebuilds that each need a yes: one token per run; the other is skipped naming its command, never in next", async () => {
