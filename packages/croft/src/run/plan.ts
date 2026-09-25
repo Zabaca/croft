@@ -237,6 +237,7 @@ export function rebuildSelectors(selectors: readonly string[]): void {
   throw new CroftError("USAGE_ERROR", {
     message: glob === undefined ? "--rebuild takes the names of the assets to build from scratch" : `--rebuild takes exact asset names, not a glob (${glob})`,
     hint: "name each asset: croft run <asset> --rebuild (an ingest or an incremental transform goes to the trash first, after confirmation)",
+    fix: { kind: "command", description: "list the assets, to name each one to build from scratch", command: "croft status" },
     details: { selectors: [...selectors] },
   });
 }

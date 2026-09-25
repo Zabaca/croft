@@ -635,7 +635,7 @@ export async function settleConfig(i: IngestInput, o: { started: number; hashWit
     if (decision.kind === "pending") {
       const c = decision.confirmation;
       log.write(`needs confirmation ${c.token}: ${what}`);
-      return { outcome: pendingOutcome(i, c, what, state.rows, o.started) };
+      return { outcome: pendingOutcome(i, c, what, state.rows, o.started, req.problem) };
     }
     log.write(`confirmed: moving ${asset} to the trash first, then ${converting ? "converting it in place" : "retyping its pinned columns"}`);
     const why = `${converting ? `key ${k} added` : `pin ${lossy.map((c) => `${c.column} ${c.from} → ${c.to}`).join(", ")}`} (${runId})`;
@@ -687,8 +687,9 @@ export async function settleConfig(i: IngestInput, o: { started: number; hashWit
   return { schemaChanges: applied.changes, warnings, ...(trashed ? { trashed } : {}), note };
 }
 
-/** The step's outcome while its confirmation waits: skipped, nothing fetched or written. */
-function pendingOutcome(i: IngestInput, c: Confirmation, what: string, rows: number, started: number): IngestOutcome {
+/** The step's outcome while its confirmation waits: skipped, nothing fetched or written. `cause` (INGEST_CONFIG_CHANGED or
+ *  PIN_CHANGES_DATA, with its samples) goes with it as a warning, so the person asked sees what would change (§6). */
+function pendingOutcome(i: IngestInput, c: Confirmation, what: string, rows: number, started: number, cause: Problem): IngestOutcome {
   const { step } = i;
   const result: StepResult = {
     asset: step.asset, status: "skipped", reason: "needs confirmation", behavior: step.behavior, attempt: i.attempt, maxAttempts: i.maxAttempts,
@@ -696,5 +697,6 @@ function pendingOutcome(i: IngestInput, c: Confirmation, what: string, rows: num
     rows: { in: 0, added: 0, updated: 0, unchanged: 0, deleted: 0, total: rows }, schemaChanges: [], checks: [], requests: 0,
     logsCommand: `croft logs ${step.asset}`, durationMs: Date.now() - started,
   };
-  return { result, warnings: [], problems: [changeConfirmation(c, what)], confirmation: c };
+  const shown: Problem = { ...cause, severity: "warning", hint: `show the user these values with the confirmation's impact; only after an explicit yes: croft confirm ${c.token}` };
+  return { result, warnings: [shown], problems: [changeConfirmation(c, what)], confirmation: c };
 }

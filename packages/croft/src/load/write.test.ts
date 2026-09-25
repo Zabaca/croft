@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CroftError } from "../core/errors.ts";
+import { CroftError, problem } from "../core/errors.ts";
 import type { ColumnPlan, Problem, Sql, ValueKind } from "../core/types.ts";
 import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/warehouse.ts";
 import type { BatchCursor, TypedBatch, WriteTarget } from "./contract.ts";
@@ -753,6 +753,22 @@ describe("drift warnings", () => {
     const r = await load(w, "gh", { columns: { id: "BIGINT", user: "JSON" }, rows: [{ id: 3, user: "ghost" }, { id: 4, user: null }] }, { write: "merge", key: ["id"], now: T2 });
     expect(r.warnings.find((x) => x.code === "JSON_KIND_CHANGED")?.details).toEqual({ column: "user", before: ["object"], added: ["string"] });
     expect(await read(w, `SELECT kinds FROM _croft.columns WHERE asset = 'gh' AND name = 'user'`)).toEqual([{ kinds: ["object", "string"] }]);
+  });
+
+  test("JSON_KIND_CHANGED once per column: the typing plan's version (raw kinds) gives way to the write's", async () => {
+    const w = warehouse();
+    const plan = (column: string, before: string[], added: string[]) =>
+      problem("JSON_KIND_CHANGED", { message: `JSON column ${column} now also holds ... values`, hint: "h", details: { column, before, added } });
+    await load(w, "gh", { columns: { id: "BIGINT", user: "JSON", at: "JSON" }, rows: [{ id: 1, user: { login: "a" }, at: "2026-09-22T10:00:00Z" }] },
+      { write: "merge", key: ["id"], now: T0 });
+    // user: object → string, which cast.ts's plan reports too; at: an ISO instant → a plain string, the same for `->>`.
+    const r = await load(w, "gh", {
+      columns: { id: "BIGINT", user: "JSON", at: "JSON" }, rows: [{ id: 2, user: "ghost", at: "soon" }],
+      warnings: [plan("user", ["object"], ["string"]), plan("at", ["iso_instant"], ["string"])],
+    }, { write: "merge", key: ["id"], now: T1 });
+    expect(r.warnings.filter((x) => x.code === "JSON_KIND_CHANGED").map((x) => [x.details?.column, x.message])).toEqual([
+      ["user", "JSON column user now also holds string values (before: object)"],
+    ]);
   });
 });
 

@@ -12,7 +12,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import {
-  bugTest, cleanupAll, codes, destructiveNext, type Envelope, findProblem, initProject, json, type MockApi, mockApi, type Project, show, stepOf,
+  cleanupAll, codes, destructiveNext, type Envelope, findProblem, initProject, json, type MockApi, mockApi, type Project, show, stepOf,
   trashVersions,
 } from "./harness.ts";
 
@@ -233,8 +233,8 @@ describe("journey 25: --rebuild", () => {
     expect(runs.json.data.runs).toHaveLength(1);
   }, 120_000);
 
-  // Every problem carries a fix (§9 "Error design"); these three refusals have a hint only.
-  bugTest("d2. every --rebuild refusal carries a fix, and none is a destructive command", async () => {
+  // Every problem carries a fix (§9 "Error design").
+  test("d2. every --rebuild refusal carries a fix, and none is a destructive command", async () => {
     const { p } = await tracker("/d2", [issue(1)]);
     for (const [args] of REFUSED) {
       const r = await p.json(args);

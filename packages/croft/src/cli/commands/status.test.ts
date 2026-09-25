@@ -218,6 +218,37 @@ describe("croft status --json", () => {
     const d = (await cli(["status", "--json"], { cwd: p.root, env: ENV })).json.data;
     expect(d.serve).toEqual({ url: "http://127.0.0.1:7447", pid: process.pid });
   });
+
+  test("drift (§7) runs reported in the last 7 days: per asset, newest first, one per column; a note on its row; not a health matter", async () => {
+    const p = await scenario();
+    let clock = Date.parse("2026-09-22T18:57:00.000Z");
+    const db = runsDb(p.stateDir, () => new Date(clock));
+    try {
+      const warn = (code: string, details: Record<string, unknown>) =>
+        ({ severity: "warning", code, message: code, hint: "", docs: "", asset: "github_issues", details });
+      for (const [id, problems] of [
+        ["r_0922_1157_drf1", [warn("COLUMN_STOPPED_ARRIVING", { column: "milestone", readBy: [] })]],
+        ["r_0922_1158_drf2", [warn("COLUMN_STOPPED_ARRIVING", { column: "milestone", readBy: [] }), warn("JSON_KIND_CHANGED", { column: "user", before: ["object"], added: ["string"] })]],
+      ] as const) {
+        clock += 60_000;
+        const run = db.createRun({ id, trigger: "schedule", human: false, argv: ["run", "--due"], identity: DEAD });
+        db.finishRun(run.id, "succeeded", { data: { runId: id, status: "succeeded", steps: [] }, problems, next: [], exit: 0, ok: true });
+      }
+    } finally {
+      db.close();
+    }
+    const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+    expect(byAsset(r.json.data).github_issues.drift).toEqual([
+      { code: "COLUMN_STOPPED_ARRIVING", column: "milestone", text: "milestone stopped arriving", at: "2026-09-22T11:59:00-07:00", runId: "r_0922_1158_drf2" },
+      { code: "JSON_KIND_CHANGED", column: "user", text: "user now also string", at: "2026-09-22T11:59:00-07:00", runId: "r_0922_1158_drf2" },
+    ]);
+    expect(byAsset(r.json.data).stripe_charges.drift).toBeUndefined();
+    const human = await cli(["status"], { cwd: p.root, env: ENV });
+    expect(human.stdout).toMatch(/^github_issues .* ok · schema changed 5 min ago · drift: milestone stopped arriving, user now also string \(1 min ago\)$/m);
+    // Older than 7 days: gone.
+    const later = await cli(["status", "--json"], { cwd: p.root, env: { CROFT_NOW: "2026-10-05T00:00:00Z" } });
+    expect(byAsset(later.json.data).github_issues.drift).toBeUndefined();
+  });
 });
 
 describe("croft status: human output", () => {

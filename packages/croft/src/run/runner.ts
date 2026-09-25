@@ -57,7 +57,7 @@ import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { checksHook, runWarnings } from "../checks/run.ts";
 import { CroftError, exitCodeFor } from "../core/errors.ts";
-import type { Confirmation, CursorType, Hold, LockHolder, Problem, Reason, StepResult } from "../core/types.ts";
+import type { Confirmation, CursorType, Fix, Hold, LockHolder, Problem, Reason, StepResult } from "../core/types.ts";
 import type { ExampleResult } from "../project/init.ts";
 import { Confirmations } from "../safety/confirm.ts";
 import { canonicalPath } from "../db/connect.ts";
@@ -197,15 +197,17 @@ export interface RunnerOptions {
  * run or a failed step.
  */
 export function checkRunFlags(plan: RunPlan, o: Pick<RunnerOptions, "selectors" | "from" | "allowShrink" | "rebuild" | "confirmToken">): void {
-  const usage = (message: string, hint: string) => new CroftError("USAGE_ERROR", { message, hint });
+  const usage = (message: string, hint: string, fix?: Fix) => new CroftError("USAGE_ERROR", { message, hint, ...(fix ? { fix } : {}) });
   const named = o.selectors.length === 1 && !isGlob(o.selectors[0]!) ? plan.steps.find((s) => s.asset === o.selectors[0]) : undefined;
   if (o.rebuild) {
     rebuildSelectors(o.selectors);
     if (o.from !== undefined) {
-      throw usage("--rebuild and --from do not go together", "--rebuild builds an asset from scratch; --from backfills a merge ingest from a point: croft run <asset> --rebuild, or croft run <asset> --from <when>");
+      throw usage("--rebuild and --from do not go together", "--rebuild builds an asset from scratch; --from backfills a merge ingest from a point: croft run <asset> --rebuild, or croft run <asset> --from <when>",
+        { kind: "manual", description: "use one of the two: --rebuild to build the asset from scratch, or --from to backfill a merge ingest" });
     }
     if (o.allowShrink) {
-      throw usage("--rebuild and --allow-shrink do not go together", "a rebuild moves the table to the trash first, so no shrink guard applies: croft run <asset> --rebuild");
+      throw usage("--rebuild and --allow-shrink do not go together", "a rebuild moves the table to the trash first, so no shrink guard applies: croft run <asset> --rebuild",
+        { kind: "manual", description: "drop --allow-shrink: a rebuild moves the table to the trash first" });
     }
   }
   if (o.confirmToken !== undefined && !o.allowShrink && !o.rebuild && (!named || named.kind === "sql")) {

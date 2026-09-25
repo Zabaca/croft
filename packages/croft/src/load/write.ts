@@ -246,6 +246,9 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
     if (before.exists && before.rowCount > 0 && rowsIn >= 100) {
       warnings.push(...(await stoppedArriving(tx, ref, asset, before, present, rowsIn, input.readBy ?? {})));
     }
+    // JSON_KIND_CHANGED once per column, by the kinds `->>` tells apart: it replaces the typing plan's (load/types.ts),
+    // which compares raw kinds, so it repeated this warning in other words and also fired for a date after a timestamp.
+    for (let i = warnings.length - 1; i >= 0; i--) if (warnings[i]!.code === "JSON_KIND_CHANGED") warnings.splice(i, 1);
     warnings.push(...jsonKindChanges(asset, batch.columns, stored, before.columns));
     // The pins in an ingest's code are authoritative: a changed pin retypes its column first (config-change.ts).
     if (kind === "ingest") pinned = await applyPinChanges(tx, { asset, real: before.exists ? before.columns : null, stored, pins: input.pins, plans: batch.columns });

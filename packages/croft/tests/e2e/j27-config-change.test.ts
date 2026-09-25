@@ -13,7 +13,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import {
-  bugTest, cleanupAll, codes, destructiveNext, type Envelope, findProblem, initProject, json, type MockApi, mockApi, type Project, show, stepOf,
+  cleanupAll, codes, destructiveNext, type Envelope, findProblem, initProject, json, type MockApi, mockApi, type Project, show, stepOf,
   trashVersions,
 } from "./harness.ts";
 
@@ -195,7 +195,7 @@ describe("journey 27: behavior and pin changes, partial commits, EMPTY_EXTRACT",
   // §6: a lossy pin "raises PIN_CHANGES_DATA, with samples, and needs confirmation". The run's envelope carries only
   // CONFIRMATION_REQUIRED ("2 stored values change"): the samples the user should see before saying yes are not in it
   // (load/config-change.ts pendingOutcome drops the PIN_CHANGES_DATA problem the confirmation was asked with).
-  bugTest("c2. the run that asks for a pin change shows PIN_CHANGES_DATA with its samples", async () => {
+  test("c2. the run that asks for a pin change shows PIN_CHANGES_DATA with its samples", async () => {
     const { p } = await pinned("/c2");
     const asked = await p.json(["run", "people"]);
     expect(asked.code, show(asked)).toBe(5);

@@ -46,6 +46,10 @@
 // readCopyStatus: a stat and runs.sqlite), and a line under the scheduling line says it in words. A refresh that
 // failed, or a copy older than the last run that wrote data, is a warning there with a hint naming
 // .croft/readcopy.log (R32-11). It is not an asset's health, so `healthy` does not change.
+//
+// Drift (§7, history/drift.ts): the COLUMN_STOPPED_ARRIVING, JSON_KIND_CHANGED and TYPE_WIDENED warnings runs of the
+// last 7 days recorded in their summaries are each asset's `drift`, and a short note on its row ("drift: login stopped
+// arriving (2 h ago)"). They were warnings of those runs; they do not change `healthy`.
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { CroftError, problem } from "../../core/errors.ts";
@@ -54,6 +58,7 @@ import { recordAlive } from "../../core/proc.ts";
 import type { AssetKind, Problem, Reason } from "../../core/types.ts";
 import { readCopyStatus, readCopyView, type ReadCopyView, readCopyWords } from "../../db/readcopy.ts";
 import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
+import { type DriftEntry, driftNote, recentDrift } from "../../history/drift.ts";
 import { logDir, tail } from "../../history/logs.ts";
 import { RUNS_DB_FILE, RunsDb, type RunRecord, type StepRecord } from "../../history/runs-db.ts";
 import { discoverAssets, type DiscoveredAsset } from "../../project/discover.ts";
@@ -110,6 +115,8 @@ export interface StatusAsset {
   /** An incremental TS transform whose input was replaced since it read it (input_replaced): each such input, and
    *  whether `croft restore` replaced it. A plain run processes new input rows only; `--rebuild` redoes every row. */
   replaced?: { input: string; restored: boolean }[];
+  /** Drift its runs of the last 7 days reported (§7), newest first, one per code and column; `at` in the project zone. */
+  drift?: { code: DriftEntry["code"]; column: string | null; text: string; at: string; runId: string }[];
 }
 
 /**
@@ -380,6 +387,8 @@ export interface ProjectState {
   recentSteps: StepRecord[];
   dead: Set<string>;
   summaryChanges: SummaryChange[];
+  /** The drift runs of the last 7 days reported (history/drift.ts), newest first. */
+  drift: DriftEntry[];
 }
 
 /** How long an asset's top-level code may take to load before status, context and describe give up on it. */
@@ -487,6 +496,7 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
     const missing = missingWarehouse(project, warehouseHistory(db, catalog), tz);
     const { running, dead } = runningEntries(db, tz, project.paths.stateDir);
     const summaryChanges = schemaChangesFromRuns(db, new Date(now.getTime() - 7 * DAY_MS));
+    const drift = recentDrift(db, new Date(now.getTime() - 7 * DAY_MS));
     const names = [...new Set([...discovery.assets.map((a) => a.name), ...catalog.map((c) => c.asset)])].sort();
     const files = new Map(discovery.assets.map((a) => [a.name, a]));
     const edits: Problem[] = [];
@@ -570,6 +580,8 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       if (cat?.filesGone?.length) out.filesGone = [...cat.filesGone];
       const changed = summaryChanges.filter((c) => c.asset === name).map((c) => c.at).sort().pop();
       if (changed) out.schemaChangedAt = zoned(changed, tz)!;
+      const drifted = drift.filter((e) => e.asset === name);
+      if (drifted.length) out.drift = drifted.map((e) => ({ code: e.code, column: e.column, text: e.text, at: zoned(e.at, tz)!, runId: e.runId }));
       return out;
     });
     const renamed = await renamedProblems(project, discovery.assets, catalog, resolved ? definitions : null);
@@ -600,7 +612,7 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
     }
     schedulingProblems.push(...scheduler.problems);
     for (const a of assets) if (a.held && a.hold?.code === "SCHEDULE_HELD") schedulingProblems.push(heldProblem(a.asset, a.hold.reason));
-    return { data, problems, edited: edits, scheduling: schedulingProblems, discovered: discovery.assets, resolved, catalog, recentSteps, dead, summaryChanges };
+    return { data, problems, edited: edits, scheduling: schedulingProblems, discovered: discovery.assets, resolved, catalog, recentSteps, dead, summaryChanges, drift };
   } finally {
     db?.close();
   }
@@ -811,6 +823,7 @@ export function statusText(a: StatusAsset, now: Date, renamed?: RenamedRow, conf
   if (replaced) notes.push(stale ? replaced : `stale: ${replaced}`);
   if (a.filesGone?.length) notes.push(`${a.filesGone.length} file${a.filesGone.length === 1 ? "" : "s"} gone`);
   if (a.schemaChangedAt) notes.push(`schema changed ${ago(a.schemaChangedAt, now)}`);
+  if (a.drift?.length) notes.push(`${driftNote(a.drift)} (${ago(a.drift[0]!.at, now)})`);
   if (a.edited) notes.push("edited since its last run");
   if (config) notes.push(config);
   return [head, ...notes].join(" · ");
