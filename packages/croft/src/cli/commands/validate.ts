@@ -69,6 +69,8 @@ const TSC_TIMEOUT_MS = 180_000;
 const TSC_SHOWN = 50;
 /** Assets named in one `croft preview` next step. */
 const PREVIEW_NEXT = 10;
+/** TS transforms named in the `croft validate --types` next step. */
+const TYPES_NEXT = 3;
 /** Fire times shown for each schedule (§8). */
 const NEXT_FIRES = 3;
 
@@ -95,6 +97,9 @@ export interface ValidateReport {
   data: ValidateData;
   /** Project-level problems first (discovery, CYCLE), then each checked asset's in run order, then tsc's. */
   problems: Problem[];
+  /** The project's TS transforms that read an asset, sorted: only --types (tsc) checks the columns they read, so
+   *  plain validate names it as a next step. */
+  tsReaders?: string[];
 }
 
 /** croft validate. Its spec (usage, options) is in commands/index.ts. */
@@ -142,16 +147,25 @@ function fireTimes(next: readonly string[]): string {
   }).join(", ");
 }
 
-/** What to do after validate: re-check after fixing an error or warning; with none, preview the assets whose
- *  code changed since their last build; in an empty project, a template. */
+/** What to do after validate: re-check after fixing an error or warning; with none, `croft validate --types` when
+ *  it was not asked for and TS transforms read assets (only tsc sees a column they read that was renamed upstream),
+ *  then preview the assets whose code changed since their last build; in an empty project, a template. */
 export function nextSteps(r: ValidateReport): Next[] {
   const fixable = r.problems.some((p) => p.severity === "error" || (p.severity === "warning" && !(p.fix && "requiresHuman" in p.fix && p.fix.requiresHuman)));
   // A check with --types is re-checked with it: only tsc confirms a type error's fix.
   if (fixable) return [{ command: r.data.types ? "croft validate --types" : "croft validate", reason: "re-check after the edit" }];
   if (r.data.order.length === 0) return [{ command: "croft new --list", reason: "assets/ has no assets yet; start from a template" }];
+  const next: Next[] = [];
+  const readers = r.tsReaders ?? [];
+  if (!r.data.types && readers.length) {
+    const names = readers.length > TYPES_NEXT
+      ? `${readers.slice(0, TYPES_NEXT).join(", ")} and ${readers.length - TYPES_NEXT} more`
+      : readers.length === 1 ? readers[0]! : `${readers.slice(0, -1).join(", ")} and ${readers.at(-1)}`;
+    next.push({ command: "croft validate --types", reason: `plain validate does not run tsc: --types checks the input columns read by ${names}` });
+  }
   const changed = r.data.assets.filter((a) => a.codeChanged).map((a) => a.name).slice(0, PREVIEW_NEXT);
-  if (changed.length) return [{ command: `croft preview ${changed.join(" ")}`, reason: "see what the changed code builds before running it" }];
-  return [];
+  if (changed.length) next.push({ command: `croft preview ${changed.join(" ")}`, reason: "see what the changed code builds before running it" });
+  return next;
 }
 
 /**
@@ -237,7 +251,10 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
     data.types = t.types;
     problems.push(...t.problems);
   }
-  return { data, problems: dedupe(problems) };
+  // Every TS transform of the project that reads an asset, selected or not: tsc checks the whole project.
+  const tsReaders = resolved.assets.filter((a) => a.kind === "ts" && a.inputs.some((x) => byName.has(x) && x !== a.name))
+    .map((a) => a.name).sort();
+  return { data, problems: dedupe(problems), tsReaders };
 }
 
 /** runs.sqlite's catalog mirror; empty before the first run (a read-only command creates nothing), or when it

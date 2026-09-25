@@ -199,9 +199,10 @@ describe("c. a transform made by croft new transform", () => {
     expect(typed.data.types).toEqual({ status: "ok", errors: 0 });
 
     p.write("assets/open_issues.sql", OPEN_ISSUES("author AS author_name"));
-    // Plain validate binds the SQL and has nothing to say.
+    // Plain validate binds the SQL and has nothing to say, but it points at --types: a TS transform reads open_issues.
     const plain = golden("validate", await p.croft(["validate", "--json"]));
     expect(plain.problems.filter((x: { severity: string }) => x.severity !== "info")).toEqual([]);
+    expect(plain.next[0]).toMatchObject({ command: "croft validate --types" });
     const r = await p.croft(["validate", "--types", "--json"]);
     typesAfterRename = golden("validate", r, { exit: r.code ?? undefined });
 

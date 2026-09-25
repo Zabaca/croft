@@ -70,6 +70,60 @@ export default transform({
 
 const validateTypes = (p: TestProject) => cli(["validate", "--types", "--json"], { cwd: p.root, env: { PATH: process.env.PATH } });
 
+/** Plain validate's next step when TS transforms read assets (R51-02). */
+const TYPES_REASON = (names: string) => `plain validate does not run tsc: --types checks the input columns read by ${names}`;
+
+describe("plain validate points at --types when a TS transform reads an asset (R51-02)", () => {
+  const ISSUES = built("github_issues", "ingest", ["id"], [col("id", "BIGINT"), col("title", "VARCHAR"), col("user", "JSON")]);
+
+  test("after a clean check: croft validate --types first, then the preview of what changed", async () => {
+    const p = makeProject({
+      files: { "assets/github_issues.ts": ISSUES_TS, "assets/open_issues.sql": OPEN_SQL("author"), "assets/triage.ts": TRIAGE_TS("author") },
+    });
+    catalog(p, [{ ...ISSUES, codeHash: "an older hash" }]);
+    const r = await cli(["validate", "--json"], { cwd: p.root });
+    expect(r.json.problems.filter((x: { severity: string }) => x.severity !== "info")).toEqual([]);
+    expect(r.json.next).toEqual([
+      { command: "croft validate --types", reason: TYPES_REASON("triage") },
+      { command: "croft preview github_issues", reason: "see what the changed code builds before running it" },
+    ]);
+    // Asked for one asset, it still names the check: tsc checks the whole project.
+    const one = await cli(["validate", "open_issues", "--json"], { cwd: p.root });
+    expect(one.json.next[0]).toEqual({ command: "croft validate --types", reason: TYPES_REASON("triage") });
+    // Human output shows it as the next step.
+    expect((await cli(["validate"], { cwd: p.root })).stdout).toContain("next: croft validate --types");
+  }, 60_000);
+
+  test("not after --types, not when there is an error to fix, and not without a TS transform that reads an asset", async () => {
+    const p = makeProject({
+      files: { "assets/github_issues.ts": ISSUES_TS, "assets/open_issues.sql": OPEN_SQL("author"), "assets/triage.ts": TRIAGE_TS("author") },
+    });
+    withTypescript(p);
+    catalog(p, [ISSUES]);
+    const typed = await validateTypes(p);
+    expect(typed.json.problems).toEqual([]);
+    expect(typed.json.next).toEqual([]);
+
+    writeFiles(p.root, { "assets/open_issues.sql": "-- key: id\nSELECT id, titel FROM github_issues\n" });
+    const broken = await cli(["validate", "--json"], { cwd: p.root });
+    expect(broken.exit).toBe(2);
+    expect(broken.json.next).toEqual([{ command: "croft validate", reason: "re-check after the edit" }]);
+
+    const q = makeProject({ files: { "assets/github_issues.ts": ISSUES_TS, "assets/open_issues.sql": OPEN_SQL("author") } });
+    catalog(q, [ISSUES]);
+    expect((await cli(["validate", "--json"], { cwd: q.root })).json.next).toEqual([]);
+  }, 60_000);
+
+  test("several TS transforms are named, up to a few", async () => {
+    const files: Record<string, string> = { "assets/github_issues.ts": ISSUES_TS, "assets/open_issues.sql": OPEN_SQL("author") };
+    for (const n of ["a_triage", "b_triage", "c_triage", "d_triage", "e_triage"]) files[`assets/${n}.ts`] = TRIAGE_TS("author");
+    const p = makeProject({ files });
+    catalog(p, [ISSUES]);
+    const r = await cli(["validate", "--json"], { cwd: p.root });
+    expect(r.json.next).toEqual([{ command: "croft validate --types", reason: TYPES_REASON("a_triage, b_triage, c_triage and 2 more") }]);
+  }, 60_000);
+});
+
 describe("validate --types catches a TS transform reading a column its input does not have", () => {
   test("renamed in the upstream SQL, before any run: UNKNOWN_INPUT_COLUMN at the line, the new name as the fix", async () => {
     const p = makeProject({
@@ -87,9 +141,12 @@ describe("validate --types catches a TS transform reading a column its input doe
     const typesDir = join(p.root, ".croft", "types");
     expect(readFileSync(join(typesDir, "open_issues.d.ts"), "utf8")).toContain("  author: string | null;\n");
 
-    // The SQL renames the column; nothing has run since. Plain validate binds the SQL, which is fine.
+    // The SQL renames the column; nothing has run since. Plain validate binds the SQL, which is fine, and points at
+    // --types: only tsc sees what the TS transform reads.
     writeFiles(p.root, { "assets/open_issues.sql": OPEN_SQL("author_login") });
-    expect((await cli(["validate", "--json"], { cwd: p.root })).json.problems).toEqual([]);
+    const plain = await cli(["validate", "--json"], { cwd: p.root });
+    expect(plain.json.problems).toEqual([]);
+    expect(plain.json.next).toEqual([{ command: "croft validate --types", reason: TYPES_REASON("triage") }]);
     const r = await validateTypes(p);
     expect(r.exit).toBe(2);
     expect(r.json.data.types).toEqual({ status: "failed", errors: 1 });

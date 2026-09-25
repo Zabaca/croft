@@ -65,6 +65,19 @@ describe("the Claude files are DESIGN.md §9, word for word", () => {
     expect(skillMd()).not.toMatch(/croft help <command>|the cursor template in|closest template in `croft docs/);
   });
 
+  test("TS transforms are checked with validate --types: the loop says when, the conventions say how (R51-02)", () => {
+    const lines = skillMd().split("\n");
+    const step2 = lines.findIndex((l) => l.startsWith("2. `croft validate --json` after EVERY edit"));
+    expect(step2).toBeGreaterThan(-1);
+    expect(`${lines[step2]} ${lines[step2 + 1]}`).toContain("add `--types`");
+    expect(lines[step2 + 2]).toStartWith("3. ");
+    const ts = lines.findIndex((l) => l.startsWith("- TS transforms read `newRows(\"x\")`"));
+    expect(ts).toBeGreaterThan(lines.findIndex((l) => l.startsWith("- TS transforms that call an API or LLM per row")));
+    expect(`${lines[ts]} ${lines[ts + 1]}`).toContain("`croft validate --types`");
+    expect(`${lines[ts]} ${lines[ts + 1]}`).toContain("`Number(row.x)`");
+    for (const l of [...lines.slice(step2, step2 + 2), ...lines.slice(ts, ts + 2)]) expect(l.length, l).toBeLessThanOrEqual(116);
+  });
+
   test("what earlier phases added to SKILL.md is in §9 too, in its place", () => {
     const lines = skillMd().split("\n");
     const at = (start: string) => {
