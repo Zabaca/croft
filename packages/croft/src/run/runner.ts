@@ -42,8 +42,10 @@
 //                   discarded, the run marked interrupted, exit 130
 //   finishRun       the whole command result goes into runs.summary, so a detached run's parent and
 //                   `croft wait` print exactly what an in-process run prints
-//   after the run   a run that committed a write refreshes the read copy (db/readcopy.ts); a scheduled run with
-//                   failed steps notifies (schedule/notify.ts). Both are awaited and never fail the run
+//   after the run   a run that committed a write refreshes the read copy (db/readcopy.ts); a run whose steps did not
+//                   all skip regenerates .croft/types, the input row types of TS transforms (project/types-gen.ts);
+//                   a scheduled run with failed steps notifies (schedule/notify.ts). Each is awaited and never fails
+//                   the run
 //
 // A scheduled run (trigger "schedule", `croft run --due`, §8) differs: nobody is asked anything and no code is
 // approved (human false); the plan's holds (SCHEDULE_HELD, LARGE_REPROCESS, paused, leased) skip their steps, and
@@ -85,6 +87,7 @@ import { scheduleHeld } from "../schedule/due.ts";
 import { notifyScheduledFailure, type ScheduledFailure } from "../schedule/notify.ts";
 import { discoverAssets } from "../project/discover.ts";
 import { tsFingerprint } from "../project/ts-asset.ts";
+import { generateInputTypes } from "../project/types-gen.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { loadProject, type Project } from "../project/root.ts";
 import {
@@ -118,10 +121,12 @@ export const LEASE_WAIT_MS = { offTty: 90_000, tty: 600_000 } as const;
 /** A scheduled run waits this long for the database lock (§5 "Default waits": scheduled writes wait 30 min). */
 export const SCHEDULED_LOCK_WAIT_MS = 30 * 60_000;
 
-/** What happens after a run ends (both no-ops until their phase-3 builders land; tests replace them). */
+/** What happens after a run ends (tests replace them). */
 export interface RunHooks {
   refreshReadCopy?: (root: string) => Promise<unknown>;
   notifyScheduledFailure?: (root: string, failure: ScheduledFailure) => Promise<void>;
+  /** .croft/types from the catalog mirror the run left (project/types-gen.ts). */
+  generateInputTypes?: (root: string, stateDir: string) => unknown;
 }
 
 export interface Next { command: string; reason: string }
@@ -563,6 +568,13 @@ async function afterRun(o: RunnerOptions, out: RunOutcome): Promise<void> {
   };
   if (out.data.steps.some((s) => s.status === "ok")) {
     await quietly(() => (o.hooks?.refreshReadCopy ?? refreshReadCopy)(root));
+  }
+  // The generated input types follow the columns the run built (an unchanged file is not rewritten). A step that
+  // failed may still have committed (an incremental transform's chunks), so only a run whose steps all skipped
+  // leaves them alone.
+  if (out.data.steps.some((s) => s.status !== "skipped")) {
+    const stateDir = o.project.paths.stateDir;
+    await quietly(async () => (o.hooks?.generateInputTypes ?? ((r: string, s: string) => generateInputTypes(r, { stateDir: s })))(root, stateDir));
   }
   if (o.trigger === "schedule") {
     const failed = out.data.steps.filter((s) => s.status === "failed").map((s) => ({ asset: s.asset, error: s.error ?? null }));

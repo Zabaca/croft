@@ -44,6 +44,8 @@
 //   approve    a successful preview is human-initiated, so it approves the asset's code for the scheduler
 //              (RunsDb.approveCode in the live runs.sqlite, DESIGN.md §6 "The scheduler only runs code a human
 //              has run")
+//   types      a preview that built something regenerates .croft/types (project/types-gen.ts): an asset never
+//              built gets the row type its preview gave it, so TS transforms that read it are checked by name
 //
 // The step logs of a preview go to .croft/preview/logs/<asset>.log; the preview's run id starts with "p_".
 import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
@@ -64,6 +66,7 @@ import { newRunId, RunsDb } from "../history/runs-db.ts";
 import { isReservedColumn, normalizeType, quoteIdent, quoteLiteral } from "../load/evolve.ts";
 import type { ProjectEnv } from "../project/env.ts";
 import type { Project } from "../project/root.ts";
+import { generateInputTypes } from "../project/types-gen.ts";
 import { isoMicros, wouldShrink } from "../safety/guards.ts";
 import { windowOf } from "./dry-run.ts";
 import { croftError, runIngest, StepProgress } from "./ingest.ts";
@@ -121,6 +124,8 @@ export interface PreviewInput {
   lookupHolder?: WarehouseOptions["lookupHolder"];
   /** Progress for a terminal: "github_issues: fetching…". */
   onProgress?: (line: string) => void;
+  /** Replaces the regeneration of .croft/types after a preview that built something (tests). */
+  generateInputTypes?: (root: string, stateDir: string) => unknown;
 }
 
 export interface PreviewOutcome {
@@ -214,9 +219,10 @@ export async function runPreview(i: PreviewInput): Promise<PreviewOutcome> {
     })
     : null;
   const runId = `p${newRunId(clock(), tz).slice(1)}`;
+  let outcome: PreviewOutcome;
   try {
     // The whole preview holds the preview database, so no other preview (or query --preview) sees it half made.
-    return await pdb.read(async () => {
+    outcome = await pdb.read(async () => {
       rmSync(dir, { recursive: true, force: true });
       mkdirSync(join(dir, "logs"), { recursive: true });
       await emptyPreview(pdb, runId, i.signal);
@@ -237,6 +243,14 @@ export async function runPreview(i: PreviewInput): Promise<PreviewOutcome> {
     await pdb.close();
     await live?.close();
   }
+  // The generated input types (project/types-gen.ts) take the columns of an asset never built from its preview.
+  // Never fails the preview.
+  if (outcome.built.length) {
+    try {
+      (i.generateInputTypes ?? ((root: string, s: string) => generateInputTypes(root, { stateDir: s })))(project.root, stateDir);
+    } catch { /* the preview's result stands */ }
+  }
+  return outcome;
 }
 
 /** --rows as a preview takes it: a whole number from 1 to MAX_PREVIEW_ROWS; DEFAULT_PREVIEW_ROWS when not

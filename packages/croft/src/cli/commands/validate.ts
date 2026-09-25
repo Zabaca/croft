@@ -25,8 +25,13 @@
 //    - an SQL asset's checks are bound against its output columns, so a check naming a missing column is an
 //      UNKNOWN_COLUMN on the check's header line;
 //    - the unoptimized plan's scans join the AST inputs, and the graph (order, CYCLE) is built again with them.
-// 3. --types: the project's own node_modules/.bin/tsc --noEmit. No tsc (or no tsconfig.json) is an info
-//    problem and a skip; croft never installs anything.
+// 3. --types: first .croft/types, the input row types of TS transforms (project/types-gen.ts), from the column
+//    cache with each bound SQL asset's output columns as its code is now; then the project's own
+//    node_modules/.bin/tsc --noEmit. A TS transform that reads a column its input does not have (renamed or
+//    removed upstream, even in SQL not yet run) is a missing property of a generated row type, reported as
+//    UNKNOWN_INPUT_COLUMN with the runtime's did-you-mean and edit fix; every other type error is ASSET_INVALID.
+//    No tsc (or no tsconfig.json) is an info problem and a skip; croft never installs anything. A tsconfig.json
+//    whose "include" leaves out .croft/types is an info problem with the edit.
 // 4. --hook: what Claude Code's PostToolUse hook runs after an edit (agent/hook.ts, §9 item 7): the edited asset
 //    and what it can break, silent unless there is an error, which goes to stderr with exit 2 (validateHook).
 //
@@ -38,7 +43,7 @@ import { HOOK_IO, hookProblems, hookReport, hookSelection, hookTarget, parseHook
 import { probeSql } from "../../checks/parse.ts";
 import { type Code, CroftError, CODES, EXIT, isCode, problem } from "../../core/errors.ts";
 import { formatInstant } from "../../core/time.ts";
-import type { Check, Problem, ValidateAsset, ValidateData } from "../../core/types.ts";
+import type { Check, Fix, Problem, ValidateAsset, ValidateData } from "../../core/types.ts";
 import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
 import { RUNS_DB_FILE, RunsDb } from "../../history/runs-db.ts";
 import { quoteIdent } from "../../load/evolve.ts";
@@ -49,6 +54,8 @@ import { type ResolvedAsset, type ResolvedProject, resolveProject, selectorWords
 import { findRoot, type Project } from "../../project/root.ts";
 import type { LoadedSqlAsset } from "../../project/sql-asset.ts";
 import { didYouMean } from "../../project/suggest.ts";
+import { parseJsonc, toValue } from "../../project/init-tsconfig.ts";
+import { type GeneratedType, generateInputTypes, TYPES_DIR, type TypeSource, type TypesResult } from "../../project/types-gen.ts";
 import { pendingBehavior, resolvedSide } from "../../run/plan.ts";
 import { previewDirectory } from "../../run/preview.ts";
 import { nextFires } from "../../schedule/types.ts";
@@ -139,7 +146,8 @@ function fireTimes(next: readonly string[]): string {
  *  code changed since their last build; in an empty project, a template. */
 export function nextSteps(r: ValidateReport): Next[] {
   const fixable = r.problems.some((p) => p.severity === "error" || (p.severity === "warning" && !(p.fix && "requiresHuman" in p.fix && p.fix.requiresHuman)));
-  if (fixable) return [{ command: "croft validate", reason: "re-check after the edit" }];
+  // A check with --types is re-checked with it: only tsc confirms a type error's fix.
+  if (fixable) return [{ command: r.data.types ? "croft validate --types" : "croft validate", reason: "re-check after the edit" }];
   if (r.data.order.length === 0) return [{ command: "croft docs ingest", reason: "assets/ has no assets yet; start from a template" }];
   const changed = r.data.assets.filter((a) => a.codeChanged).map((a) => a.name).slice(0, PREVIEW_NEXT);
   if (changed.length) return [{ command: `croft preview ${changed.join(" ")}`, reason: "see what the changed code builds before running it" }];
@@ -218,7 +226,14 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
 
   const data: ValidateData = { order: graph.order.slice(), assets };
   if (i.types) {
-    const t = await typecheck(root, i.processEnv ?? {});
+    // The input row types first, with each bound SQL asset's output as its code is now, so tsc checks the TS
+    // transforms against the code that the next run will build.
+    const generated = writeInputTypes(i.project, [...bound.outputs].flatMap(([name, columns]) => {
+      const a = byName.get(name);
+      return a ? [{ asset: name, from: "code" as const, file: a.file, key: a.key, columns }] : [];
+    }));
+    problems.push(...generated.problems);
+    const t = await typecheck(root, i.processEnv ?? {}, generated.types ? { inputTypes: generated.types } : {});
     data.types = t.types;
     problems.push(...t.problems);
   }
@@ -626,8 +641,65 @@ function checkLine(header: readonly string[], c: Check, key: readonly string[]):
 // ---------------------------------------------------------------------------------------------------------
 // --types
 
-/** The project's tsc --noEmit: each type error a problem (ASSET_INVALID, at its file and line). */
-export async function typecheck(root: string, shell: Readonly<Record<string, string | undefined>>, o: { timeoutMs?: number } = {}): Promise<{ types: NonNullable<ValidateData["types"]>; problems: Problem[] }> {
+/**
+ * .croft/types before tsc (project/types-gen.ts): the column cache, with `code` (each bound SQL asset's output
+ * columns as its code is now) in place of the cache for those assets. A folder croft cannot write is a warning:
+ * tsc then checks against the types already there, or none.
+ */
+function writeInputTypes(project: ValidateInput["project"], code: readonly TypeSource[]): { types: TypesResult | null; problems: Problem[] } {
+  try {
+    return { types: generateInputTypes(project.root, { stateDir: project.paths.stateDir, code }), problems: [] };
+  } catch (e) {
+    const p = problem("PROJECT_NOT_WRITABLE", {
+      message: `could not write ${TYPES_DIR}: ${(e as Error).message}`,
+      hint: `tsc checked the TS transforms without their current input row types; make ${TYPES_DIR} writable (or delete it), then run croft validate --types again`,
+      file: TYPES_DIR,
+      fix: { kind: "manual", description: `make ${TYPES_DIR} writable, or delete the folder` },
+      details: { phase: "types" },
+    });
+    return { types: null, problems: [{ ...p, severity: "warning" }] };
+  }
+}
+
+/** Whether tsconfig.json's "include" reaches .croft/types; null when that cannot be told (no "include" but an
+ *  "extends", a file that does not parse). TypeScript's wildcards never enter a folder whose name starts with a
+ *  dot, so only a pattern that names .croft does. */
+export function includesInputTypes(tsconfigText: string): boolean | null {
+  let config: unknown;
+  try {
+    config = toValue(parseJsonc(tsconfigText));
+  } catch {
+    return null;
+  }
+  if (!config || typeof config !== "object" || Array.isArray(config)) return null;
+  const c = config as { include?: unknown; files?: unknown; extends?: unknown };
+  if (c.include === undefined) return c.extends === undefined ? false : null;
+  if (!Array.isArray(c.include)) return null;
+  return c.include.some((p) => {
+    if (typeof p !== "string") return false;
+    const n = p.replace(/^\.\//, "").replace(/\/+$/, "");
+    // ".croft/*" names the files directly in .croft/ only: "*" never crosses a "/".
+    return n === ".croft" || n === TYPES_DIR || n.startsWith(".croft/**") || n.startsWith(`${TYPES_DIR}/`);
+  });
+}
+
+/** An info problem when there are input types and tsconfig.json leaves them out (a project made before them). */
+function typesNotIncluded(root: string, generated: TypesResult | undefined): Problem[] {
+  if (!generated?.assets.length || includesInputTypes(readText(join(root, "tsconfig.json"))) !== false) return [];
+  const p = problem("INSTALL_FAILED", {
+    message: `tsconfig.json does not include ${TYPES_DIR}, so TS transforms read every input row as a Row: tsc cannot catch a column renamed upstream`,
+    hint: `add "${TYPES_DIR}" to "include" in tsconfig.json (croft init writes it that way)`,
+    file: "tsconfig.json",
+    fix: { kind: "edit", description: `add "${TYPES_DIR}" to the "include" list`, file: "tsconfig.json" },
+    details: { phase: "types" },
+  });
+  return [{ ...p, severity: "info" }];
+}
+
+/** The project's tsc --noEmit: each type error a problem (ASSET_INVALID, at its file and line). With the input
+ *  types it ran against, a missing property of a generated row type is UNKNOWN_INPUT_COLUMN instead. */
+export async function typecheck(root: string, shell: Readonly<Record<string, string | undefined>>,
+  o: { timeoutMs?: number; inputTypes?: TypesResult } = {}): Promise<{ types: NonNullable<ValidateData["types"]>; problems: Problem[] }> {
   const skipped = (message: string, hint: string) => {
     const p = problem("INSTALL_FAILED", { message, hint, fix: { kind: "manual", description: hint } });
     return { types: { status: "skipped" as const, errors: 0 }, problems: [{ ...p, severity: "info" as const }] };
@@ -680,7 +752,7 @@ export async function typecheck(root: string, shell: Readonly<Record<string, str
       })],
     };
   }
-  const problems = errors.slice(0, TSC_SHOWN).map(tscProblem);
+  const problems = errors.slice(0, TSC_SHOWN).map((d) => tscProblem(d, root, o.inputTypes));
   if (errors.length > TSC_SHOWN) {
     problems.push(problem("ASSET_INVALID", {
       message: `${errors.length - TSC_SHOWN} more type errors`,
@@ -688,6 +760,7 @@ export async function typecheck(root: string, shell: Readonly<Record<string, str
       details: { hidden: errors.length - TSC_SHOWN },
     }));
   }
+  problems.push(...typesNotIncluded(root, o.inputTypes));
   return { types: { status: errors.length ? "failed" : "ok", errors: errors.length }, problems };
 }
 
@@ -712,14 +785,37 @@ export function parseTsc(output: string): TscDiagnostic[] {
   return out;
 }
 
-function tscProblem(d: TscDiagnostic): Problem {
+/** tsc names a generated row type when code reads a column the input lacks (TS2339, TS2551, and TS7053 for a
+ *  literal index); TS7053 with a string index is a column name computed at run time. */
+const MISSING_PROPERTY = /Property '([^']+)' does not exist on type '([A-Za-z_$][A-Za-z0-9_$]*)'/;
+const COMPUTED_INDEX = /expression of type 'string' can't be used to index type '([A-Za-z_$][A-Za-z0-9_$]*)'/;
+
+function tscProblem(d: TscDiagnostic, root: string, inputTypes?: TypesResult): Problem {
   const file = d.file?.split("\\").join("/");
   const asset = file && /^assets\//.test(file) ? basename(file, extname(file)) : undefined;
+  const at = {
+    ...(asset ? { asset } : {}), ...(file ? { file } : {}),
+    ...(d.line !== undefined ? { line: d.line } : {}), ...(d.column !== undefined ? { column: d.column } : {}),
+  };
+  const missing = MISSING_PROPERTY.exec(d.message);
+  const input = missing && inputTypes && Object.hasOwn(inputTypes.types, missing[2]!) ? inputTypes.types[missing[2]!]! : null;
+  if (missing && input && file) return unknownInputColumn(d, root, { ...at, file }, input, missing[1]!);
+  const computed = COMPUTED_INDEX.exec(d.message);
+  const indexed = computed && inputTypes && Object.hasOwn(inputTypes.types, computed[1]!) ? inputTypes.types[computed[1]!]! : null;
+  if (indexed && file) {
+    const name = JSON.stringify(indexed.asset);
+    return problem("ASSET_INVALID", {
+      message: `${d.code}: ${d.message}`,
+      hint: `${indexed.asset}'s generated row type names its columns; for a column name computed at run time, read the input as a Row: rows<Row>(${name}), or (row as Row)[name]`,
+      ...at,
+      fix: { kind: "edit", description: `read ${indexed.asset} with rows<Row>(${name}) (import type { Row } from "@zabaca/croft")`, file, ...(d.line !== undefined ? { line: d.line } : {}) },
+      details: { tsc: d.code, input: indexed.asset, types: indexed.file },
+    });
+  }
   return problem("ASSET_INVALID", {
     message: `${d.code}: ${d.message}`,
     hint: "fix the type error; the project's own tsc --noEmit reports it",
-    ...(asset ? { asset } : {}), ...(file ? { file } : {}),
-    ...(d.line !== undefined ? { line: d.line } : {}), ...(d.column !== undefined ? { column: d.column } : {}),
+    ...at,
     ...(file ? { fix: { kind: "edit" as const, description: `fix the type error${d.line !== undefined ? ` on line ${d.line}` : ""}`, file, ...(d.line !== undefined ? { line: d.line } : {}) } } : {}),
     details: { tsc: d.code },
   });
@@ -807,4 +903,55 @@ function hookHuman(result: CommandResult<ValidateData>, ctx: Ctx): undefined {
   const run = hookRuns.get(ctx) ?? { target: "the edited file", asset: null, selected: [] };
   ctx.render.errRaw(hookReport({ ...run, problems: result.problems, formatted: formatProblems(result.problems, false) }));
   return undefined;
+}
+
+/**
+ * A column the input does not have, read in TS code, found by tsc against the generated row type: the problem
+ * a run would raise when the code reached that line (run/inputs.ts, UNKNOWN_INPUT_COLUMN), with the same
+ * did-you-mean. The fix replaces the name when it stands once on the line, as a property read; a shorthand
+ * destructuring (`const { author } = row`) keeps its variable with `{ author_login: author }`.
+ */
+function unknownInputColumn(d: TscDiagnostic, root: string, at: Pick<Problem, "asset" | "line" | "column"> & { file: string },
+  input: GeneratedType, column: string): Problem {
+  const guess = didYouMean(column, input.columns.filter((c) => c !== column));
+  const q = JSON.stringify;
+  let fix: Fix;
+  if (guess) {
+    const text = at.line !== undefined ? readText(join(root, at.file)).split("\n")[at.line - 1] ?? "" : "";
+    const shorthand = at.column !== undefined && isShorthand(text, at.column - 1, column);
+    fix = {
+      kind: "edit", file: at.file, ...(at.line !== undefined ? { line: at.line } : {}),
+      description: shorthand
+        ? `read ${q(guess)} instead of ${q(column)}: { ${guess}: ${column} } keeps the name ${column}`
+        : `read ${q(guess)} instead of ${q(column)}`,
+      ...(!shorthand && standsOnce(text, column) ? { replace: { from: column, to: guess } } : {}),
+    };
+  } else {
+    fix = {
+      kind: "edit", file: at.file, ...(at.line !== undefined ? { line: at.line } : {}),
+      description: `read one of the columns of ${input.asset} (${input.file} lists them)`,
+    };
+  }
+  return problem("UNKNOWN_INPUT_COLUMN", {
+    ...at,
+    message: `${input.asset} has no column ${q(column)}${guess ? `; did you mean ${q(guess)}?` : ""}`,
+    hint: guess ? `the column may have been renamed upstream; read ${q(guess)} instead` : `${input.asset} has these columns: ${input.columns.join(", ")}`,
+    fix,
+    details: { tsc: d.code, input: input.asset, column, ...(guess ? { suggestion: guess } : {}), columns: input.columns, types: input.file },
+  });
+}
+
+/** Whether `word` stands exactly once, as a whole name, on the line: a replace fix that is safe to apply as is. */
+function standsOnce(text: string, word: string): boolean {
+  const esc = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return (text.match(new RegExp(`(?<![\\w$])${esc}(?![\\w$])`, "g")) ?? []).length === 1;
+}
+
+/** Whether the name at `index` is a shorthand property of a destructuring pattern (`{ author }`, `{ a, author = x }`),
+ *  which binds a variable of the same name. */
+function isShorthand(text: string, index: number, name: string): boolean {
+  if (text.slice(index, index + name.length) !== name) return false;
+  const before = text.slice(0, index).trimEnd().at(-1);
+  const after = text.slice(index + name.length).trimStart()[0];
+  return (before === "{" || before === ",") && (after === undefined || after === "," || after === "}" || after === "=");
 }
