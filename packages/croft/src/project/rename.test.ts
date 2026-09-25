@@ -14,7 +14,7 @@ import { listTrash, trashTable } from "../safety/trash.ts";
 import { DEAD, cleanup, ISSUES_CATALOG, ISSUES_SEED, ISSUES_TS, makeProject, NOW, OPEN_SQL, runsDb, seed, type TestProject } from "../cli/commands/inspect-testkit.ts";
 import { ProjectEnv } from "./env.ts";
 import {
-  applyRename, findReferences, findRenamed, jsLiterals, planRename, readJournal, RENAME_JOURNAL, renamedProblem,
+  applyRename, findReferences, findRenamed, jsLiterals, planRename, readJournal, RENAME_JOURNAL, renamedProblem, unfinishedRename,
 } from "./rename.ts";
 import { resolveProject } from "./resolve.ts";
 import { loadProject } from "./root.ts";
@@ -281,7 +281,7 @@ describe("applyRename moves the file, table and state together", () => {
     expect(result).toMatchObject({
       from: "github_issues", to: "issues", mode: "file",
       file: { from: "assets/gh/github_issues.ts", to: "assets/gh/issues.ts", moved: true },
-      table: { renamed: true, rows: 3 }, trash: { versions: 1, left: [] }, preview: "cleared", problems: [],
+      table: { renamed: true, rows: 3 }, trash: { versions: 1, left: [], earlier: null }, preview: "cleared", problems: [],
     });
     expect(result.references).toHaveLength(7);
 
@@ -456,6 +456,21 @@ describe("crash safety: every stop leaves a state that the same rename finishes"
     });
   }
 
+  test("unfinishedRename: the error croft delete and croft restore throw for either name while the rename is unfinished", async () => {
+    const p = await built({ trash: false, preview: false });
+    expect(unfinishedRename(p.stateDir, "github_issues")).toBeNull();
+    writeFileSync(join(p.stateDir, RENAME_JOURNAL), JSON.stringify({
+      from: "github_issues", to: "issues", fileFrom: "assets/gh/github_issues.ts", fileTo: "assets/gh/issues.ts", mode: "file",
+      startedAt: "2026-09-22T18:59:00.000Z", runId: "r_0922_1159_dead",
+    }));
+    for (const name of ["github_issues", "issues"]) {
+      expect(unfinishedRename(p.stateDir, name)?.problem).toEqual({
+        ...renamedProblem({ from: "github_issues", to: "issues", file: "assets/gh/issues.ts", unfinished: true }), asset: name, effect: "nothing was changed",
+      });
+    }
+    expect(unfinishedRename(p.stateDir, "open_issues")).toBeNull();
+  });
+
   test("a stop before the commit that left the file moved (a crash): the same rename finishes it", async () => {
     const p = await built({ preview: false });
     // What SIGKILL between the file's move and the COMMIT leaves: the journal, the file moved, the warehouse as it was.
@@ -468,6 +483,100 @@ describe("crash safety: every stop leaves a state that the same rename finishes"
     expect(r).toMatchObject({ mode: "resume", file: { moved: false }, table: { renamed: true, rows: 3 }, trash: { versions: 1 } });
     expect(await q(p.database, "SELECT count(*)::INTEGER FROM issues")).toEqual([[3]]);
   });
+});
+
+describe("the trash of an earlier asset of the new name is kept apart, never mixed with the renamed asset's (R41-09)", () => {
+  /** An earlier asset named `issues`, deleted since (no file, no table, no catalog entry): its versions are still in
+   *  the trash, the newest of them newer than github_issues's version, so `croft restore issues` would pick it. */
+  async function earlierIssues(p: TestProject, at: readonly string[] = ["2026-09-22T12:00:00Z"]): Promise<string[]> {
+    await closeAllWarehouses();
+    await seed(p.database, [
+      "CREATE TABLE issues (sku VARCHAR, title VARCHAR)",
+      "INSERT INTO issues VALUES ('s0', 'old 0'), ('s1', 'old 1')",
+      `INSERT INTO _croft.assets VALUES ('issues', 'ingest', 'replace', ['sku'], 'hash-old', 'behavior-old', NULL, NULL, NULL,
+         '2026-09-20 18:00:00+00', NULL, 2, '2026-09-20 18:00:00+00', '2026-09-20 18:00:00+00')`,
+    ]);
+    const w = openWarehouse({ path: p.database, mode: "read_write", timezone: p.project.timezone, root: p.root, stateDir: p.stateDir });
+    const paths: string[] = [];
+    for (const t of at) paths.push((await trashTable(w, "issues", "delete (r_0922_0500_old1)", { runId: "r_0922_0500_old1", now: new Date(t) }))!.path);
+    await closeAllWarehouses();
+    await seed(p.database, ["DROP TABLE issues", "DELETE FROM _croft.assets WHERE name = 'issues'"]);
+    return paths;
+  }
+
+  /** What `croft restore <asset>` would offer, newest first: its reason, rows and the table and _croft names inside. */
+  async function offered(p: TestProject, asset: string): Promise<unknown[][]> {
+    const out: unknown[][] = [];
+    for (const v of listTrash(p.stateDir, asset)) {
+      const [[inside, state, trash]] = await q(v.path, `SELECT (SELECT string_agg(table_name, ',') FROM duckdb_tables() WHERE schema_name = 'main'),
+        (SELECT string_agg(DISTINCT name, ',') FROM _croft.assets), (SELECT asset FROM _croft.trash)`) as [[unknown, unknown, unknown]];
+      const sidecar = JSON.parse(readFileSync(v.path.replace(/\.duckdb$/, ".json"), "utf8")) as { asset: string; path: string };
+      expect(sidecar).toMatchObject({ asset, path: v.path });
+      out.push([v.asset, v.reason, v.rows, inside, state, trash]);
+    }
+    return out;
+  }
+
+  const OWN = ["issues", "run --allow-shrink (r_0922_1000_aaaa)", 3, "issues", "issues", "issues"];
+  /** An earlier version, kept apart as `name`: the name in the trash folder, the sidecar, the table and _croft. */
+  const earlierAs = (name: string) => [name, "delete (r_0922_0500_old1)", 2, name, name, name];
+  const EARLIER = earlierAs("issues_earlier");
+
+  test("they move to <new>_earlier, renamed inside their files: restore offers only the renamed asset's versions as <new>", async () => {
+    const p = await built({ preview: false });
+    await earlierIssues(p);
+    const plan = await planRename(p.root, "github_issues", "issues");
+    expect(plan.earlier).toEqual({ name: "issues_earlier", versions: [expect.stringMatching(/^20260922T120000/)] });
+    const r = await applyRename(p.root, plan, { now: CLOCK });
+    expect(r.trash).toEqual({ versions: 1, left: [], earlier: { name: "issues_earlier", versions: 1, left: [] } });
+    expect(await offered(p, "issues")).toEqual([OWN]);
+    expect(await offered(p, "issues_earlier")).toEqual([EARLIER]);
+    expect(existsSync(join(p.stateDir, "trash", "github_issues"))).toBe(false);
+    // The earlier versions' lease was taken and released with the others.
+    const db = runsDb(p.stateDir);
+    expect(listLeases(db)).toEqual([]);
+    db.close();
+  });
+
+  test("without versions of its own, the renamed asset has nothing to restore; <new>_earlier is taken, so _earlier_2", async () => {
+    const p = await built({ trash: false, preview: false });
+    await earlierIssues(p, ["2026-09-20T12:00:00Z", "2026-09-22T12:00:00Z"]);
+    writeFiles(p.root, { "assets/issues_earlier.sql": "SELECT 1 AS id\n" });
+    const r = await renameIt(p, "github_issues", "issues");
+    expect(r.trash).toEqual({ versions: 0, left: [], earlier: { name: "issues_earlier_2", versions: 2, left: [] } });
+    expect(listTrash(p.stateDir, "issues")).toEqual([]);
+    expect(await offered(p, "issues_earlier_2")).toEqual([earlierAs("issues_earlier_2"), earlierAs("issues_earlier_2")]);
+  });
+
+  test("an empty trash folder of the new name moves nothing aside", async () => {
+    const p = await built({ preview: false });
+    mkdirSync(join(p.stateDir, "trash", "issues"), { recursive: true });
+    const plan = await planRename(p.root, "github_issues", "issues");
+    expect(plan.earlier).toBeNull();
+    expect((await applyRename(p.root, plan, { now: CLOCK })).trash).toEqual({ versions: 1, left: [], earlier: null });
+    expect(await offered(p, "issues")).toEqual([OWN]);
+  });
+
+  for (const at of ["rename_after_commit", "rename_after_state", "rename_after_earlier", "rename_after_trash"] as const) {
+    test(`a stop at ${at}: the journal keeps the earlier versions apart, and the same rename finishes without mixing them`, async () => {
+      const p = await built({ preview: false });
+      await earlierIssues(p);
+      const e = await refused(renameIt(p, "github_issues", "issues", {
+        onPoint: (point) => {
+          if (point === at) throw new Error("disk full");
+        },
+      }));
+      expect(e.code).toBe("INTERNAL_ERROR");
+      expect(readJournal(p.stateDir)).toMatchObject({ from: "github_issues", to: "issues", earlier: { name: "issues_earlier", versions: [expect.any(String)] } });
+      const plan = await planRename(p.root, "github_issues", "issues");
+      expect(plan).toMatchObject({ mode: "resume", earlier: { name: "issues_earlier" } });
+      const done = await applyRename(p.root, plan, { now: CLOCK });
+      expect(done.trash.earlier).toMatchObject({ name: "issues_earlier", left: [] });
+      expect(await offered(p, "issues")).toEqual([OWN]);
+      expect(await offered(p, "issues_earlier")).toEqual([EARLIER]);
+      expect(readJournal(p.stateDir)).toBeNull();
+    });
+  }
 });
 
 describe("ASSET_RENAMED: findRenamed and the adopt mode", () => {

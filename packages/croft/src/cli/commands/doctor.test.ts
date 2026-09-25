@@ -11,8 +11,11 @@ import { ENGINE_SETTING } from "../../db/backup.ts";
 import type { FsKind } from "../../db/fs-kind.ts";
 import { STATE_DDL } from "../../db/state.ts";
 import { writeIntent } from "../../read/testkit.ts";
+import { tryAcquire } from "../../history/leases.ts";
 import { RunsDb } from "../../history/runs-db.ts";
+import { currentIdentity } from "../../core/proc.ts";
 import { initProject } from "../../project/init.ts";
+import { renamedProblem } from "../../project/rename.ts";
 import { croftHome } from "../../schedule/home.ts";
 import type { OsRunner } from "../../schedule/os.ts";
 import { addProject } from "../../schedule/registry.ts";
@@ -291,6 +294,66 @@ describe("the assets line (croft validate's counts)", () => {
     expect(check(broken.data.checks, "assets")).toMatchObject({
       status: "info", text: "1 asset file, not validated (validating needs the DuckDB binding)",
     });
+  });
+});
+
+describe("a croft rename that did not finish (its journal, .croft/rename.json)", () => {
+  const RUN = "r_0924_1000_dead";
+  function journal(root: string): void {
+    writeFileSync(join(root, ".croft", "rename.json"), JSON.stringify({
+      from: "example_sales", to: "sales", fileFrom: "assets/example_sales.ts", fileTo: "assets/sales.ts", mode: "file",
+      startedAt: "2026-09-24T17:00:00.000Z", runId: RUN, earlier: null,
+    }));
+  }
+
+  test("an error line: ASSET_RENAMED with the fix croft rename <old> <new>, also in next; the rows the catalog knows", async () => {
+    const root = await project();
+    installed(root);
+    journal(root);
+    const db = RunsDb.open(join(root, ".croft"));
+    db.catalogPut("example_sales", { asset: "example_sales", rows: 1000 }, "run");
+    db.close();
+    const { data, problems } = await runDoctor(root, deps());
+    const text = "rename: croft rename example_sales sales did not finish: the table (1,000 rows), its state and the asset file may be under either name";
+    expect(check(data.checks, "rename")).toEqual({
+      id: "rename", section: "project", status: "error", code: "ASSET_RENAMED", text,
+      details: { from: "example_sales", to: "sales", startedAt: "2026-09-24T17:00:00.000Z", runId: RUN },
+    });
+    // Word for word what croft validate and croft status report (doctor reads the journal without loading rename.ts).
+    expect(problems).toEqual([renamedProblem({ from: "example_sales", to: "sales", file: "assets/sales.ts", rows: 1000, unfinished: true })]);
+    expect(problems[0]).toMatchObject({
+      code: "ASSET_RENAMED", severity: "error", fix: { kind: "command", description: "finish renaming example_sales to sales", command: "croft rename example_sales sales" },
+    });
+
+    let out = "";
+    const exit = await main(["doctor", "--json"], { cwd: root, env: {}, stdout: (t) => { out += t; }, stderr: () => {} });
+    const env = JSON.parse(out);
+    expect(exit).toBe(2);
+    expect(env.next).toEqual([{ command: "croft rename example_sales sales", reason: "finish renaming example_sales to sales" }]);
+    out = "";
+    await main(["doctor"], { cwd: root, env: {}, stdout: (t) => { out += t; }, stderr: () => {}, stdoutTTY: false });
+    expect(out).toContain(`  error ASSET_RENAMED ${text}`);
+    expect(out).toContain("croft rename example_sales sales");
+  });
+
+  test("a rename still running (its run holds its leases) is an info line, not a problem; no journal, no line", async () => {
+    const root = await project();
+    expect((await runDoctor(root, deps())).data.checks.some((c) => c.id === "rename")).toBe(false);
+    journal(root);
+    const db = RunsDb.open(join(root, ".croft"));
+    db.createRun({ id: RUN, trigger: "manual", human: true, argv: ["rename", "example_sales", "sales"], identity: currentIdentity() });
+    expect(tryAcquire(db, ["example_sales", "sales"], RUN).ok).toBe(true);
+    db.close();
+    const { data, problems } = await runDoctor(root, deps());
+    expect(check(data.checks, "rename")).toMatchObject({ status: "info", text: `rename: croft rename example_sales sales is running (run ${RUN})` });
+    expect(problems).toEqual([]);
+  });
+
+  test("without the DuckDB binding the journal is still read", async () => {
+    const root = await project();
+    journal(root);
+    const { data } = await runDoctor(root, deps({ probeDuckdb: () => ({ ok: false, message: "simulated" }) }));
+    expect(check(data.checks, "rename")).toMatchObject({ status: "error", code: "ASSET_RENAMED" });
   });
 });
 

@@ -12,8 +12,9 @@
 //   modes      file    `from` has its file: croft moves it next to itself, keeping its extension
 //              adopt   the file was renamed outside croft (ASSET_RENAMED): only the table and state move
 //              resume  a rename that stopped (its journal is still there): whatever is left moves
-//   leases     the asset leases of both names, under a run record (`croft logs --runs` shows it; a run that
-//              meets the leases names it), then the warehouse's write lock (its write intent first)
+//   leases     the asset leases of both names (and of the name an earlier asset's versions are kept under), under
+//              a run record (`croft logs --runs` shows it; a run that meets the leases names it), then the
+//              warehouse's write lock (its write intent first)
 //
 // Crash safety. The stores are the asset file, the warehouse (table and _croft rows), runs.sqlite (catalog mirror,
 // schedule_state with the approved code, steps), the trash folder and the preview. No transaction spans them, so
@@ -28,16 +29,20 @@
 //                file moved: the ASSET_RENAMED state, which findRenamed also finds by code hash
 //   2. runs.sqlite one SQLite transaction: the catalog entry (and the readers' reads and positions), schedule_state
 //                (the approved code travels: the fingerprint ignores the file name, §8), the steps (history)
-//   3. trash     every trashed version is renamed inside its file (so restore finds main.<to>), then moved to
-//                trash/<to>/
+//   3. trash     first the versions of an earlier asset named <to> (one deleted before: <to> has no table) that
+//                trash/<to>/ still holds, which the journal lists: they go to trash/<to>_earlier/ and are renamed
+//                inside their files, so `croft restore <to>` never offers another asset's versions as the renamed
+//                one's, and `croft restore <to>_earlier` still brings them back. Then every trashed version of
+//                <from> is renamed inside its file (so restore finds main.<to>) and moved to trash/<to>/, under a
+//                name the earlier versions never had
 //   4. preview   cleared when it built or read `from` (the next `croft preview` builds it again)
 //   5. journal removed; the read copy is refreshed when it is on
 //
 // Each step reads what is there and does only what is left, so running them again after any stop is safe: a stop
 // between 1 and 2 leaves the warehouse renamed and the mirror stale (a run of `to` reads its state from the
 // warehouse, which is authoritative, and continues from the saved cursor), and the second rename moves the mirror.
-// CROFT_FAULT (rename_before_commit, rename_after_commit, rename_after_state, rename_after_trash) kills the process
-// at those points, as a crash would.
+// CROFT_FAULT (rename_before_commit, rename_after_commit, rename_after_state, rename_after_earlier,
+// rename_after_trash) kills the process at those points, as a crash would.
 import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, extname, join, relative, sep } from "node:path";
 import type { DuckDBConnection } from "@duckdb/node-api";
@@ -81,6 +86,18 @@ export interface RenamePlan {
   mode: RenameMode;
   /** The table's rows as the catalog mirror has them; null when it has none. */
   rows: number | null;
+  /** The versions of an earlier asset named `to` that the trash still holds, and where they are kept apart; null
+   *  when trash/<to>/ holds none. */
+  earlier: EarlierVersions | null;
+}
+
+/** Trashed versions of an earlier asset of the new name (one deleted before), found in trash/<to>/ before the
+ *  rename: they move to trash/<name>/, so the renamed asset's versions and theirs are never mixed (R41-09). */
+export interface EarlierVersions {
+  /** The free name they are kept under: `<to>_earlier`, or `<to>_earlier_2`, … when that one is taken. */
+  name: string;
+  /** Their trash file names without .duckdb (the stamps), oldest first. */
+  versions: string[];
 }
 
 /** A never-built asset whose code matches an orphan table's recorded code hash (ASSET_RENAMED), or a croft rename
@@ -108,8 +125,10 @@ export interface RenameResult {
   /** renamed: the warehouse had a table to rename (false: never built). rows: its rows. */
   table: { renamed: boolean; rows: number | null };
   /** Trashed versions moved to the new name; `left`: versions that could not be rewritten and stay under the old
-   *  name. */
-  trash: { versions: number; left: string[] };
+   *  name. `earlier`: the versions of an earlier asset of the new name, kept apart under `earlier.name` (its
+   *  `left`: those whose table could not be renamed inside their file, which restore cannot read under that name);
+   *  null when there were none. */
+  trash: { versions: number; left: string[]; earlier: { name: string; versions: number; left: string[] } | null };
   /** cleared: the last preview built or read `from`, and was emptied; kept: it could not be (busy); none: it did
    *  not involve `from`. */
   preview: "cleared" | "kept" | "none";
@@ -119,7 +138,7 @@ export interface RenameResult {
 }
 
 /** The points a stop is tested at (CROFT_FAULT, ApplyRenameOptions.onPoint). */
-export type RenamePoint = "rename_before_commit" | "rename_after_commit" | "rename_after_state" | "rename_after_trash";
+export type RenamePoint = "rename_before_commit" | "rename_after_commit" | "rename_after_state" | "rename_after_earlier" | "rename_after_trash";
 
 export interface ApplyRenameOptions {
   /** The project, when the caller has it loaded. */
@@ -151,6 +170,9 @@ export interface RenameJournal {
   /** ISO-8601 UTC. */
   startedAt: string;
   runId: string;
+  /** The earlier versions of `to` the rename keeps apart (RenamePlan.earlier), listed before anything moved, so a
+   *  second run tells them from the versions of `from` it moved into trash/<to>/. */
+  earlier: EarlierVersions | null;
 }
 
 /** The journal of a rename that did not finish, or null. */
@@ -159,9 +181,11 @@ export function readJournal(stateDir: string): RenameJournal | null {
     const v = JSON.parse(readFileSync(join(stateDir, RENAME_JOURNAL), "utf8")) as Partial<RenameJournal>;
     const str = (x: unknown): x is string => typeof x === "string" && x.length > 0;
     if (!str(v.from) || !str(v.to) || !str(v.fileFrom) || !str(v.fileTo)) return null;
+    const e = v.earlier as Partial<EarlierVersions> | null | undefined;
+    const earlier = e && str(e.name) && Array.isArray(e.versions) && e.versions.every(str) ? { name: e.name, versions: [...e.versions] } : null;
     return {
       from: v.from, to: v.to, fileFrom: v.fileFrom, fileTo: v.fileTo, mode: v.mode === "adopt" ? "adopt" : "file",
-      startedAt: str(v.startedAt) ? v.startedAt : "", runId: str(v.runId) ? v.runId : "",
+      startedAt: str(v.startedAt) ? v.startedAt : "", runId: str(v.runId) ? v.runId : "", earlier,
     };
   } catch {
     return null;
@@ -241,6 +265,28 @@ function fileKind(a: Pick<DiscoveredAsset, "kind" | "path">): "ingest" | "sql" |
   }
 }
 
+/**
+ * The versions trash/<to>/ holds before a rename to `to`: an earlier asset of that name (one deleted before, since
+ * planRename refuses a `to` with a table), never the renamed asset's, whose versions are under trash/<from>/. They
+ * are kept apart under the first free name of `<to>_earlier`, `<to>_earlier_2`, …: a name no asset file, table,
+ * trash folder or refused file has. null when there are none (R41-09).
+ */
+function earlierVersions(stateDir: string, from: string, to: string, taken: (name: string) => boolean,
+  keywords: ReadonlySet<string>): EarlierVersions | null {
+  let versions: string[];
+  try {
+    versions = readdirSync(join(stateDir, "trash", to)).filter((f) => f.endsWith(".duckdb")).map((f) => f.slice(0, -".duckdb".length)).sort();
+  } catch {
+    return null;
+  }
+  if (versions.length === 0) return null;
+  for (let k = 1; ; k++) {
+    const name = k === 1 ? `${to}_earlier` : `${to}_earlier_${k}`;
+    if (name === from || taken(name) || existsSync(join(stateDir, "trash", name)) || nameProblem(name, `assets/${name}.ts`, keywords)) continue;
+    return { name, versions };
+  }
+}
+
 /** The rows of a table, in words: " (1,234 rows)", or "" when unknown. */
 function rowsWords(rows: number | null | undefined): string {
   return rows === null || rows === undefined ? "" : ` (${rows.toLocaleString("en-US")} row${rows === 1 ? "" : "s"})`;
@@ -272,6 +318,7 @@ export async function planRename(root: string, from: string, to: string, o: { pr
     const entry = built.get(from) ?? built.get(to) ?? null;
     return {
       from, to, fileFrom: journal.fileFrom, fileTo: journal.fileTo, hasTable: entry !== null, mode: "resume", rows: entry?.rows ?? null,
+      earlier: journal.earlier,
       references: await findReferences(project, from, existsSync(join(project.root, journal.fileFrom)) ? { from: journal.fileFrom, to: journal.fileTo } : undefined),
     };
   }
@@ -336,6 +383,8 @@ export async function planRename(root: string, from: string, to: string, o: { pr
   }
 
   const toFile = files.get(to)?.file ?? null;
+  const taken = (name: string) => files.has(name) || built.has(name) || discovery.problems.some((p) => p.details?.name === name);
+  const earlier = earlierVersions(stateDir, from, to, taken, keywords);
   if (fromFile) {
     if (toFile || existsSync(join(project.root, toGuess))) {
       const at = toFile ?? toGuess;
@@ -347,7 +396,7 @@ export async function planRename(root: string, from: string, to: string, o: { pr
       });
     }
     return {
-      from, to, fileFrom: fromFile, fileTo: toGuess, hasTable: entry !== null, mode: "file", rows: entry?.rows ?? null,
+      from, to, fileFrom: fromFile, fileTo: toGuess, hasTable: entry !== null, mode: "file", rows: entry?.rows ?? null, earlier,
       references: await findReferences(project, from, { from: fromFile, to: toGuess }),
     };
   }
@@ -375,7 +424,7 @@ export async function planRename(root: string, from: string, to: string, o: { pr
     });
   }
   return {
-    from, to, fileFrom: toFile, fileTo: toFile, hasTable: true, mode: "adopt", rows: entry!.rows,
+    from, to, fileFrom: toFile, fileTo: toFile, hasTable: true, mode: "adopt", rows: entry!.rows, earlier,
     references: await findReferences(project, from),
   };
 }
@@ -768,6 +817,22 @@ export function renamedProblem(r: RenamedAsset): Problem {
   });
 }
 
+/**
+ * The error a command that would change `asset` throws (croft delete, croft restore) while a croft rename that did
+ * not finish names it, either name: ASSET_RENAMED, whose fix finishes the rename first. null otherwise. A restore of
+ * the old name meanwhile would bring back a table that the rename then refuses to replace, so it could never finish;
+ * runs and previews refuse the same way (run/plan.ts). Reads only the journal.
+ */
+export function unfinishedRename(stateDir: string, asset: string): CroftError | null {
+  const j = readJournal(stateDir);
+  if (!j || (asset !== j.from && asset !== j.to)) return null;
+  const p = renamedProblem({ from: j.from, to: j.to, file: j.fileTo, unfinished: true });
+  return new CroftError("ASSET_RENAMED", {
+    message: p.message, hint: p.hint, asset, ...(p.file ? { file: p.file } : {}), ...(p.fix ? { fix: p.fix } : {}),
+    effect: "nothing was changed", ...(p.details ? { details: p.details } : {}),
+  });
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Applying
 
@@ -936,8 +1001,50 @@ function moveSidecar(src: string, dst: string, to: string, trashFile: string): v
   }
 }
 
-/** Step 3: trash/<from>/ to trash/<to>/, each version renamed inside its file first. */
-async function moveTrash(w: DuckWarehouse | null, stateDir: string, from: string, to: string, runId: string): Promise<{ versions: number; left: string[] }> {
+/**
+ * Step 3a: the versions of an earlier asset named `to` (EarlierVersions, listed in the journal) from trash/<to>/ to
+ * trash/<earlier.name>/: each file is moved first, so it is never under `to` again, and then renamed inside (its
+ * table and _croft rows), so `croft restore <earlier.name>` finds main.<earlier.name> in it. Each step checks what
+ * is there, so a second run does only what is left (renaming inside again is a no-op). A version whose table could
+ * not be renamed inside stays apart all the same, in `left`: restore says it holds no such table.
+ */
+async function moveEarlier(w: DuckWarehouse | null, stateDir: string, to: string, earlier: EarlierVersions, runId: string):
+  Promise<NonNullable<RenameResult["trash"]["earlier"]>> {
+  const src = join(stateDir, "trash", to);
+  const dst = join(stateDir, "trash", earlier.name);
+  const out = { name: earlier.name, versions: 0, left: [] as string[] };
+  for (const stamp of earlier.versions) {
+    const file = join(src, `${stamp}.duckdb`);
+    const moved = join(dst, `${stamp}.duckdb`);
+    if (!existsSync(moved)) {
+      if (!existsSync(file)) continue;     // gone since the rename started (a prune): nothing to keep apart
+      mkdirSync(dst, { recursive: true });
+      renameSync(file, moved);
+    }
+    if (existsSync(`${file}.wal`) && !existsSync(`${moved}.wal`)) renameSync(`${file}.wal`, `${moved}.wal`);
+    if (existsSync(join(src, `${stamp}.json`)) && !existsSync(join(dst, `${stamp}.json`))) {
+      moveSidecar(join(src, `${stamp}.json`), join(dst, `${stamp}.json`), earlier.name, moved);
+    }
+    try {
+      if (!w) throw new Error("no warehouse to rename it with");
+      await rewriteTrashFile(w, moved, to, earlier.name, runId);
+      out.versions++;
+    } catch {
+      out.left.push(moved);
+    }
+  }
+  try {
+    rmdirSync(src);
+  } catch {
+    // Not empty (or gone): what else is there is not the earlier asset's.
+  }
+  return out;
+}
+
+/** Step 3b: trash/<from>/ to trash/<to>/, each version renamed inside its file first. `reserved`: the stamps of the
+ *  earlier versions of `to` (moveEarlier), which a moved version never takes as its name. */
+async function moveTrash(w: DuckWarehouse | null, stateDir: string, from: string, to: string, runId: string,
+  reserved: ReadonlySet<string> = new Set()): Promise<{ versions: number; left: string[] }> {
   const src = join(stateDir, "trash", from);
   const dst = join(stateDir, "trash", to);
   const out = { versions: 0, left: [] as string[] };
@@ -953,7 +1060,7 @@ async function moveTrash(w: DuckWarehouse | null, stateDir: string, from: string
       continue;
     }
     let name = stamp;
-    for (let k = 2; existsSync(join(dst, `${name}.duckdb`)); k++) name = `${stamp}-${k}`;
+    for (let k = 2; existsSync(join(dst, `${name}.duckdb`)) || reserved.has(name); k++) name = `${stamp}-${k}`;
     const moved = join(dst, `${name}.duckdb`);
     renameSync(file, moved);
     if (existsSync(`${file}.wal`)) renameSync(`${file}.wal`, `${moved}.wal`);
@@ -1118,9 +1225,10 @@ export async function applyRename(root: string, plan: RenamePlan, o: ApplyRename
       problems.push(...rec.problems);
     }
 
-    // Both names, at once: a run that holds either refuses the rename (it never waits for a run).
+    // Both names, at once: a run that holds either refuses the rename (it never waits for a run). And the name the
+    // earlier versions of `to` are kept under, so no restore reads them while they move.
     const id = newRunId(clock(), project.timezone);
-    const got = tryAcquire(runs, [from, to], id);
+    const got = tryAcquire(runs, [from, to, ...(plan.earlier ? [plan.earlier.name] : [])], id);
     if (!got.ok) throw busyError(runs, got.busy[0]!);
     runId = runs.createRun({ id, trigger: "manual", human: true, argv: ["rename", from, to], timeZone: project.timezone }).id;
 
@@ -1128,7 +1236,7 @@ export async function applyRename(root: string, plan: RenamePlan, o: ApplyRename
     const earlier = plan.mode === "resume" ? readJournal(stateDir) : null;
     const journal: RenameJournal = {
       from, to, fileFrom: plan.fileFrom, fileTo: plan.fileTo, mode: earlier?.mode ?? (plan.mode === "adopt" ? "adopt" : "file"),
-      startedAt: earlier?.startedAt || clock().toISOString(), runId,
+      startedAt: earlier?.startedAt || clock().toISOString(), runId, earlier: plan.earlier,
     };
     writeJournal(stateDir, journal, plan.mode === "resume");
     journaled = true;
@@ -1149,8 +1257,10 @@ export async function applyRename(root: string, plan: RenamePlan, o: ApplyRename
     renameInRuns(runs, from, to);
     point("rename_after_state");
 
-    // 3. The trash.
-    const trash = await moveTrash(warehouse, stateDir, from, to, runId);
+    // 3. The trash: an earlier asset's versions of `to` apart first, then the renamed asset's own.
+    const kept = plan.earlier ? await moveEarlier(warehouse, stateDir, to, plan.earlier, runId) : null;
+    point("rename_after_earlier");
+    const trash = { ...await moveTrash(warehouse, stateDir, from, to, runId, new Set(plan.earlier?.versions ?? [])), earlier: kept };
     point("rename_after_trash");
 
     // 4. The preview.
