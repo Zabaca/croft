@@ -8,8 +8,9 @@ older code made. What the next run does depends on the kind of asset:
   croft run <asset>.
 - An ingest: the next run fetches with the new code; rows already loaded are not fetched again.
 - An incremental TypeScript transform: new code applies to new input rows only. The rows built earlier keep
-  their values, so paid calls are never repeated implicitly. This version has no rebuild from scratch.
-  croft preview <asset> --rebuild builds it from scratch in the preview database, within its --rows cap, and
-  shows how the results would differ.
+  their values, so paid calls are never repeated implicitly. croft preview <asset> --rebuild builds it from
+  scratch in the preview database, within its --rows cap, and shows how the results would differ. To redo the
+  rows older code built: croft run <asset> --rebuild, which moves the table to the trash first and asks for a
+  confirmation, since it may pay for every row again. Ask the user before running it.
 
 Before running an edited asset: croft validate --json, then croft preview <asset>.

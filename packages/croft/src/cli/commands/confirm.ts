@@ -127,9 +127,12 @@ function confirmations<T>(ctx: Ctx, token: string, fn: (c: Confirmations) => T):
   }
 }
 
-/** A step that trashed rows: the destructive part of a confirmed run, which must have spent the token. */
+/** A step that trashed rows (a confirmed run), or a delete or restore that acted (its data's status, or rows in the
+ *  trash): the destructive part, which must have spent the token. */
 function destructiveStepRan(result: CommandResult | undefined): boolean {
-  const steps = (result?.data as { steps?: unknown } | null | undefined)?.steps;
+  const data = result?.data as { steps?: unknown; status?: unknown; trashed?: unknown } | null | undefined;
+  if (data?.status === "deleted" || data?.status === "restored" || (typeof data?.trashed === "object" && data.trashed !== null)) return true;
+  const steps = data?.steps;
   return Array.isArray(steps) && steps.some((s) => typeof s === "object" && s !== null && "trashed" in s && !!s.trashed);
 }
 

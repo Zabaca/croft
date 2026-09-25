@@ -778,6 +778,8 @@ describe("validateDefinition: common keys", () => {
     ["columns pin without type", api({ columns: { day: { format: "%d" } } }), "columns", "columns.day.type must be a DuckDB type name, got nothing"],
     ["columns pin format", api({ columns: { day: { type: "DATE", format: 1 } } }), "columns", 'columns.day.format must be a strptime pattern such as "%d/%m/%Y", got 1'],
     ["columns pin a number", api({ columns: { day: 1 } }), "columns", "columns.day must be a type name or { type, format }, got 1"],
+    ["columns pin not a plain type", api({ columns: { tags: "STRUCT(a INT)" } }), "columns", 'columns.tags is "STRUCT(a INT)", which is not a plain SQL type'],
+    ["columns pin type not plain", api({ columns: { day: { type: "DATE; DROP TABLE x" } } }), "columns", 'columns.day.type is "DATE; DROP TABLE x", which is not a plain SQL type'],
     ["secrets a string", api({ secrets: "GITHUB_TOKEN" }), "secrets", 'secrets is a list of .env names, got "GITHUB_TOKEN"'],
     ["secrets a value", api({ secrets: ["ghp_abc-123"] }), "secrets", 'secrets[0] must be an environment variable name such as GITHUB_TOKEN, got "ghp_abc-123"'],
     ["secrets duplicate", api({ secrets: ["A", "A"] }), "secrets", "secrets lists A more than once"],

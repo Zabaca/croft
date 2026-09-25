@@ -1,4 +1,4 @@
-// The agent's side of phases 2 and 3, through the real CLI: what CLAUDE.md, the skill, croft docs and next[] tell an
+// The agent's side of phases 2 to 4, through the real CLI: what CLAUDE.md, the skill, croft docs and next[] tell an
 // agent to run exists and works, and status, context and query tell one story when the warehouse file is gone.
 import { afterAll, describe, expect, test } from "bun:test";
 import { readdirSync, rmSync } from "node:fs";
@@ -35,13 +35,24 @@ describe("the agent contract", () => {
     }
     expect((await p.rows("select count(*) AS n from example_sales"))[0]!.n).toBe(120);
 
-    // Nothing init wrote names a command of a later phase.
+    // Nothing init wrote names a command of a later phase (phase 5's croft new).
     const skill = p.read(".claude/skills/croft/SKILL.md");
     const body = skill.slice(skill.indexOf("## Orient"));                 // after "This version", which lists them on purpose
     for (const text of [claude, body, p.read("assets/example_sales.ts")]) {
-      for (const missing of ["croft new", "croft rename", "croft delete", "croft restore"]) {
+      for (const missing of ["croft new"]) {
         expect(text).not.toContain(missing);
       }
+    }
+    // Phase 4's commands are in the skill, and answer: rename (its recipe and the ask-first line), and every
+    // destructive action behind croft confirm.
+    expect(body).toContain("- Rename: croft rename <old> <new>; fix every reference it lists; validate; preview; run.");
+    expect(body).toContain("- Renaming or deleting files in assets/ (use `croft rename`)");
+    expect(body).toContain("rebuild of an ingest or incremental TS transform,\n  --allow-shrink, delete, restore, lossy pin changes, key conversion");
+    for (const command of ["rename", "delete", "restore"]) expect((await p.json(["help", command])).code).toBe(0);
+    for (const topic of ["rename", "trash", "ASSET_RENAMED", "INGEST_CONFIG_CHANGED", "PIN_CHANGES_DATA"]) {
+      const page = await p.json(["docs", topic]);
+      expect(page.code, show(page)).toBe(0);
+      expect(page.json.data.source, topic).toBe("file");
     }
     // Phase 3's commands are in the skill, and answer: scheduling (ask first), croft serve (the user starts it)
     // and the read copy for GUIs.

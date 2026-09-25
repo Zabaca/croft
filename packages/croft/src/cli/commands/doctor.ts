@@ -1,6 +1,6 @@
 // croft doctor (DESIGN.md §2 "Install-time failures", §4.1): the environment plus a project summary,
 // in under a second, with no writes except the one write test the design asks for (a temp file in the
-// state folder, removed at once).
+// state folder, removed at once) and the trash's retention (checkTrash deletes expired trashed versions).
 //
 // DuckDB is never imported statically here. The binding is checked in a child process first (a missing
 // or foreign-arch binding must be reported, not crash doctor), and only then is db/warehouse.ts imported
@@ -18,16 +18,31 @@
 // With readCopy on, the Environment section has the read copy's line (db/readcopy.ts, which imports DuckDB only to
 // refresh): a refresh that failed, or a copy older than the last run that wrote data, is a warning whose hint
 // names .croft/readcopy.log.
+//
+// The data's health, in the Project section, without writing anything:
+// - tables (§5 "Out-of-band changes"): in the warehouse's read lease, every table croft has a commit of is compared
+//   with its record (safety/out-of-band.ts): OUT_OF_BAND_CHANGE for rows or stamps, TABLE_MODIFIED_OUTSIDE_CROFT for
+//   columns, a warning line each; the next run of the asset takes the change in. Not while a croft writer is live.
+// - drift (§7): the COLUMN_STOPPED_ARRIVING, JSON_KIND_CHANGED and TYPE_WIDENED warnings of the last 7 days' runs
+//   (history/drift.ts), an info line, since the runs reported them.
+// - backups (§6 "Before an engine upgrade", db/backup.ts): the pre-upgrade backups in .croft/backups/, and whether
+//   the next command that writes backs the warehouse up first (this croft's DuckDB is newer than the recorded one).
+// - rename (project/rename.ts): a croft rename that did not finish (its journal, .croft/rename.json) is an error line,
+//   ASSET_RENAMED with `croft rename <old> <new>` as its fix and in next, since neither name runs until it finishes.
 import { accessSync, constants as fsConstants, existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { CroftError, problem } from "../../core/errors.ts";
 import { now, offsetSeconds } from "../../core/time.ts";
 import type { LockHolder, Problem } from "../../core/types.ts";
+import { BACKUPS_KEPT, backupsDir, compareEngineVersions, type EngineRecord, listBackups, recordedEngine } from "../../db/backup.ts";
 import { filesystemKind, folderKind, type FsKind } from "../../db/fs-kind.ts";
 import { isHolderAlive, liveIntents } from "../../db/intent.ts";
 import { readCopyStatus, readCopySummary } from "../../db/readcopy.ts";
 import { CLAUDE_MD, claudeBlock, findBlock, SKILL_PATH, skillStamp } from "../../agent/templates.ts";
+import { type DriftEntry, driftTexts, recentDrift } from "../../history/drift.ts";
+import { listLeases } from "../../history/leases.ts";
+import { RUNS_DB_FILE, RunsDb } from "../../history/runs-db.ts";
 import { ProjectEnv } from "../../project/env.ts";
 import { appRootOf, relocationPlan } from "../../project/init.ts";
 import { configProblems, findRoot, loadProject, syncedLocation, type ConfigIssue, type Project } from "../../project/root.ts";
@@ -85,7 +100,12 @@ export interface DoctorDeps {
   /** How long the warehouse probe waits on a lock before naming the holder. */
   lockWaitMs: number;
   healthTimeoutMs: number;
+  /** How long the tables line may spend comparing tables with croft's record (TABLE_SCAN_MS). */
+  tableScanMs?: number;
 }
+
+/** The tables line compares no more tables once this has passed, so doctor stays quick on a big warehouse. */
+export const TABLE_SCAN_MS = 400;
 
 export function defaultDeps(env: Record<string, string | undefined>): DoctorDeps {
   return {
@@ -121,9 +141,14 @@ export const doctor: CommandImpl<DoctorData> = {
 };
 
 function nextFor(problems: Problem[]): { command: string; reason: string }[] {
-  return problems.some((p) => p.code === "CLAUDE_FILES_OUTDATED")
+  const next = problems.some((p) => p.code === "CLAUDE_FILES_OUTDATED")
     ? [{ command: "croft init --claude", reason: "refresh CLAUDE.md and the croft skill for this version" }]
     : [];
+  // A rename that did not finish (checkRename): the same command finishes it; it fetches and deletes nothing.
+  for (const p of problems) {
+    if (p.code === "ASSET_RENAMED" && p.fix?.kind === "command") next.push({ command: p.fix.command, reason: p.fix.description });
+  }
+  return next;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -156,8 +181,9 @@ export async function runDoctor(cwd: string, d: DoctorDeps): Promise<{ data: Doc
   checkCroft(r, d, root);
   const probe = d.probeDuckdb(d.croftRoot);
   checkDuckdb(r, d, probe, root);
+  const found: { scan: TableScanResult } = { scan: null };
   if (project) {
-    await checkWarehouse(r, d, project, probe.ok);
+    await checkWarehouse(r, d, project, probe.ok, found);
     await checkServe(r, d, project);
     checkReadCopy(r, d, project);
     if (probe.ok) await checkTzdata(r, d, project.timezone);
@@ -174,8 +200,13 @@ export async function runDoctor(cwd: string, d: DoctorDeps): Promise<{ data: Doc
   }
   if (project) {
     await checkAssets(r, d, project, probe.ok);
+    checkRename(r, project);
+    checkTables(r, found.scan);
+    checkDrift(r, d, project);
     checkStorage(r, d, project);
     checkWritable(r, project);
+    await checkTrash(r, d, project);
+    checkBackups(r, d, project, probe);
   }
   if (root) checkEnvFiles(r, root);
   if (project) await checkSecrets(r, d, project, probe.ok);
@@ -363,7 +394,12 @@ function bindingsPresent(croftRoot: string): string[] {
   }
 }
 
-async function checkWarehouse(r: Report, d: DoctorDeps, project: Project, bindingOk: boolean): Promise<void> {
+/** What the warehouse's read lease found of tables changed outside croft (safety/out-of-band.ts scanTables), for the
+ *  Project section: null when the warehouse was not opened or has no croft state, an Error when the comparison failed. */
+type TableScanResult = import("../../safety/out-of-band.ts").TableScan | Error | null;
+
+/** The warehouse line. In the same read lease, the tables croft has a record of are compared with it (`found.scan`). */
+async function checkWarehouse(r: Report, d: DoctorDeps, project: Project, bindingOk: boolean, found: { scan: TableScanResult }): Promise<void> {
   const path = project.paths.database;
   const label = project.databaseLabel;
   if (!existsSync(path)) {
@@ -388,9 +424,11 @@ async function checkWarehouse(r: Report, d: DoctorDeps, project: Project, bindin
   }
   let openWarehouse: typeof import("../../db/warehouse.ts").openWarehouse;
   let readMeta: typeof import("../../db/state.ts").readMeta;
+  let scanTables: typeof import("../../safety/out-of-band.ts").scanTables;
   try {
     ({ openWarehouse } = await import("../../db/warehouse.ts"));
     ({ readMeta } = await import("../../db/state.ts"));
+    ({ scanTables } = await import("../../safety/out-of-band.ts"));
   } catch (e) {
     // The child-process probe loaded the binding, but this process cannot: report it, do not crash.
     const msg = (e as Error).message ?? String(e);
@@ -410,7 +448,17 @@ async function checkWarehouse(r: Report, d: DoctorDeps, project: Project, bindin
   });
   const serve = servePid(project.paths.stateDir);
   try {
-    const meta = await w.read(async (db) => readMeta(db), { waitMs: d.lockWaitMs, purpose: "doctor" });
+    const meta = await w.read(async (db) => {
+      const m = await readMeta(db);
+      if (m.format_version) {
+        try {
+          found.scan = await scanTables(db, { budgetMs: d.tableScanMs ?? TABLE_SCAN_MS });
+        } catch (e) {
+          found.scan = e instanceof Error ? e : new Error(String(e));
+        }
+      }
+      return m;
+    }, { waitMs: d.lockWaitMs, purpose: "doctor" });
     const serveHolds = serve !== null && serve.alive;
     parts.push(serveHolds ? `held read-only by croft's read server (pid ${serve.pid}; steps aside for writes)` : "not held");
     if (meta.format_version) {
@@ -685,6 +733,61 @@ async function checkAssets(r: Report, d: DoctorDeps, project: Project, bindingOk
     undefined, { assets, errors, warnings, info: count("info") });
 }
 
+/** project/rename.ts RENAME_JOURNAL, read here without importing rename.ts, which loads DuckDB. */
+const RENAME_JOURNAL = "rename.json";
+
+/**
+ * A croft rename that did not finish (project/rename.ts): its journal, <state>/rename.json, is written before anything
+ * moves and removed last. Until the same `croft rename <old> <new>` finishes it, neither name runs, so the line is an
+ * error with ASSET_RENAMED, word for word as rename.ts renamedProblem words it for croft validate and croft status
+ * (doctor.test.ts compares them), with the command as its fix and in next. A rename whose run still holds its leases
+ * is running: an info line. No line without a journal, or with one that cannot be read (written by a rename that
+ * stopped before anything moved; the next rename replaces it). Works without the DuckDB binding.
+ */
+function checkRename(r: Report, project: Project): void {
+  const { stateDir } = project.paths;
+  let j: { from: string; to: string; fileTo: string; startedAt: string; runId: string };
+  try {
+    const v = JSON.parse(readFileSync(join(stateDir, RENAME_JOURNAL), "utf8")) as Record<string, unknown>;
+    const str = (x: unknown): x is string => typeof x === "string" && x.length > 0;
+    if (!str(v.from) || !str(v.to) || !str(v.fileFrom) || !str(v.fileTo)) return;
+    j = { from: v.from, to: v.to, fileTo: v.fileTo, startedAt: str(v.startedAt) ? v.startedAt : "", runId: str(v.runId) ? v.runId : "" };
+  } catch {
+    return;
+  }
+  let running = false;
+  let rows: number | null = null;
+  if (existsSync(join(stateDir, RUNS_DB_FILE))) {
+    try {
+      const db = RunsDb.open(stateDir);
+      try {
+        running = j.runId !== "" && listLeases(db).some((l) => l.runId === j.runId && l.alive);
+        const entry = db.catalogGet<{ rows?: unknown }>(j.from) ?? db.catalogGet<{ rows?: unknown }>(j.to);
+        rows = typeof entry?.value.rows === "number" ? entry.value.rows : null;
+      } finally {
+        db.close();
+      }
+    } catch {
+      // runs.sqlite cannot be read: the journal alone says the rename did not finish.
+    }
+  }
+  const details = { from: j.from, to: j.to, startedAt: j.startedAt || null, runId: j.runId || null };
+  if (running) {
+    r.add("project", "rename", "info", `rename: croft rename ${j.from} ${j.to} is running (run ${j.runId})`, undefined, details);
+    return;
+  }
+  const command = `croft rename ${j.from} ${j.to}`;
+  const rowsText = rows === null ? "" : ` (${rows.toLocaleString("en-US")} row${rows === 1 ? "" : "s"})`;
+  const p = problem("ASSET_RENAMED", {
+    asset: j.to, file: j.fileTo,
+    message: `croft rename ${j.from} ${j.to} did not finish: the table${rowsText}, its state and the asset file may be under either name`,
+    hint: `${command} finishes it; run neither ${j.from} nor ${j.to} before that`,
+    fix: { kind: "command", description: `finish renaming ${j.from} to ${j.to}`, command },
+    details: { from: j.from, to: j.to, rows, unfinished: true },
+  });
+  r.add("project", "rename", "error", `rename: ${p.message}`, p, details);
+}
+
 function checkStorage(r: Report, d: DoctorDeps, project: Project): void {
   const { database, stateDir } = project.paths;
   const dbWhy = d.synced(database);
@@ -762,6 +865,140 @@ function checkWritable(r: Report, project: Project): void {
     });
     r.add("project", "writable", "error", `${shown}/ is not writable (${code})`, p, { dir });
   }
+}
+
+/**
+ * The trash (§6 "Trash, restore and delete"): what it holds, once doctor has pruned the versions retention lets go
+ * (older than 30 days, beyond each table's 5 newest). Deleting those files is doctor's one write besides the write
+ * test, as the trash itself does at every trash. No line while the trash is empty. safety/trash.ts's listing and
+ * pruning load no DuckDB binding; it is imported here all the same, so a broken install cannot stop doctor.
+ */
+async function checkTrash(r: Report, d: DoctorDeps, project: Project): Promise<void> {
+  let trash: typeof import("../../safety/trash.ts");
+  try {
+    trash = await import("../../safety/trash.ts");
+  } catch {
+    return;
+  }
+  const stateDir = project.paths.stateDir;
+  let pruned = 0;
+  try {
+    pruned = trash.pruneTrash(stateDir, { now: now(d.env) }).length;
+  } catch {
+    // A bad CROFT_NOW or an unwritable folder: listed as it is; the writable line says why.
+  }
+  const versions = trash.listTrash(stateDir);
+  if (versions.length === 0 && pruned === 0) return;
+  const tables = new Set(versions.map((v) => v.asset)).size;
+  const bytes = versions.reduce((sum, v) => sum + v.bytes, 0);
+  const plural = (n: number, word: string) => `${formatCount(n)} ${word}${n === 1 ? "" : "s"}`;
+  const { days, versions: keep } = trash.TRASH_RETENTION;
+  r.add("project", "trash", "ok",
+    `trash: ${plural(versions.length, "version")} of ${plural(tables, "table")}, ${formatBytes(bytes)}${pruned ? `; removed ${formatCount(pruned)} older than ${days} days` : ""}`
+      + ` (kept: ${days} days, and the ${keep} newest of each table; croft restore lists them)`,
+    undefined, { versions: versions.length, tables, bytes, pruned });
+}
+
+/**
+ * Tables changed outside croft (§5 "Out-of-band changes"), as the warehouse's read lease found them: one warning line
+ * per change, OUT_OF_BAND_CHANGE (rows or stamps) or TABLE_MODIFIED_OUTSIDE_CROFT (columns), and one ok line when every
+ * table is as croft left it. No line when the warehouse was not opened (not built yet, busy, no binding) or holds no
+ * table croft wrote. doctor changes nothing: the next run of the asset takes the change in.
+ */
+function checkTables(r: Report, scan: TableScanResult): void {
+  if (scan === null) return;
+  if (scan instanceof Error) {
+    r.add("project", "tables", "info", `tables: not compared with croft's record (${scan.message.split("\n")[0]!.slice(0, 200)})`);
+    return;
+  }
+  if (scan.checked > 0 && scan.findings.length === 0) {
+    r.add("project", "tables", "ok", `tables: ${formatCount(scan.checked)} as croft last wrote them (rows, newest _loaded_at and columns)`, undefined,
+      { checked: scan.checked });
+  }
+  if (scan.skipped > 0) {
+    r.add("project", "tables", "info", `tables: ${formatCount(scan.skipped)} more not compared with croft's record in the time doctor allows`
+      + " (the next run of each asset compares its table)", undefined, { skipped: scan.skipped });
+  }
+  for (const f of scan.findings) {
+    if (f.outOfBand) r.add("project", "tables", "warn", f.outOfBand.problem.message, f.outOfBand.problem, { asset: f.asset });
+    if (f.schema) {
+      // safety/guards.ts words it for the write that meets it; the fix is the same here: tell the user.
+      const p: Problem = f.schema.fix ? f.schema : {
+        ...f.schema,
+        fix: { kind: "manual", description: `tell the user ${f.asset}'s columns were changed outside croft; croft keeps them as they are from its next run of ${f.asset}` },
+      };
+      r.add("project", "tables", "warn", p.message, p, { asset: f.asset });
+    }
+  }
+}
+
+const DRIFT_DAYS = 7;
+
+/**
+ * Drift of the last 7 days (§7 "Drift that does not fail a load is still reported", history/drift.ts): the
+ * COLUMN_STOPPED_ARRIVING, JSON_KIND_CHANGED and TYPE_WIDENED warnings that runs recorded, per asset. An info line: the
+ * runs already reported them. runs.sqlite is read only when it exists.
+ */
+function checkDrift(r: Report, d: DoctorDeps, project: Project): void {
+  const stateDir = project.paths.stateDir;
+  if (!existsSync(join(stateDir, RUNS_DB_FILE))) return;
+  let at: Date;
+  try { at = now(d.env); } catch { at = new Date(); }
+  let entries: DriftEntry[];
+  try {
+    const db = RunsDb.open(stateDir);
+    try {
+      entries = recentDrift(db, new Date(at.getTime() - DRIFT_DAYS * 86_400_000));
+    } finally {
+      db.close();
+    }
+  } catch {
+    return;                          // runs.sqlite cannot be read: the scheduling line says so
+  }
+  if (entries.length === 0) return;
+  const byAsset = new Map<string, DriftEntry[]>();
+  for (const e of entries) byAsset.set(e.asset, [...(byAsset.get(e.asset) ?? []), e]);
+  const shown = [...byAsset].slice(0, 5).map(([asset, list]) => `${asset}: ${driftTexts(list)} (${agoText(list[0]!.at, at)})`);
+  const more = byAsset.size > 5 ? ` · ${byAsset.size - 5} more assets` : "";
+  r.add("project", "drift", "info", `drift (${DRIFT_DAYS} days): ${shown.join(" · ")}${more}; croft status shows it per asset`, undefined, {
+    entries: entries.map((e) => ({ asset: e.asset, code: e.code, column: e.column, text: e.text, at: e.at, runId: e.runId })),
+  });
+}
+
+/**
+ * Pre-upgrade backups (§6 "Before an engine upgrade", db/backup.ts): how many, their size and the newest, in
+ * .croft/backups/. When the DuckDB this croft loads is newer than the engine runs.sqlite recorded, the next command
+ * that writes backs the warehouse up first, and the line says so (info). No line with neither. Reads only.
+ */
+function checkBackups(r: Report, d: DoctorDeps, project: Project, probe: DuckdbProbe): void {
+  let at: Date;
+  try { at = now(d.env); } catch { at = new Date(); }
+  const stateDir = project.paths.stateDir;
+  const list = listBackups(stateDir);
+  let rec: EngineRecord | null = null;
+  try {
+    rec = recordedEngine(stateDir);
+  } catch { /* runs.sqlite cannot be read: nothing pending that doctor can tell */ }
+  const running = probe.ok ? probe.version : null;
+  const pending = running !== null && rec !== null && existsSync(project.paths.database) && compareEngineVersions(running, rec.version) > 0;
+  if (list.length === 0 && !pending) return;
+  const bare = (v: string) => v.replace(/^v(?=\d)/, "");
+  const dir = backupsDir(stateDir);
+  const shownDir = `${inside(project.root, dir) ? relative(project.root, dir) : dir}/`;
+  const parts: string[] = [];
+  if (list.length) {
+    const bytes = list.reduce((sum, b) => sum + b.bytes, 0);
+    const newest = list[0]!;
+    const count = list.length === 1 ? "1 before a DuckDB upgrade" : `${formatCount(list.length)} before DuckDB upgrades`;
+    parts.push(`backups: ${count}, ${formatBytes(bytes)} in ${shownDir} (newest ${agoText(newest.at, at)}: ${newest.from} → ${newest.to}; the ${BACKUPS_KEPT} newest are kept)`);
+  } else {
+    parts.push("backups: none yet");
+  }
+  if (pending) parts.push(`the next croft command that writes backs the warehouse up first (DuckDB ${bare(rec!.version)} → ${bare(running!)})`);
+  r.add("project", "backups", pending ? "info" : "ok", parts.join(" · "), undefined, {
+    backups: list.map((b) => ({ path: b.path, at: b.at, from: b.from, to: b.to, bytes: b.bytes, wal: b.wal !== null })),
+    recorded: rec?.version ?? null, running, pending,
+  });
 }
 
 function checkEnvFiles(r: Report, root: string): void {

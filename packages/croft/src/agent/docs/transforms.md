@@ -150,8 +150,9 @@ loaded like an ingest's rows (columns: { x: "DECIMAL(18,2)" } pins a type).
   without running the code again while the code, the checks and the input rows are unchanged; change any of
   them and it is computed again.
 - Changing the code applies to new input rows only: rows built earlier keep their values, so paid calls are
-  never repeated implicitly (croft status shows EDITED_SINCE_LAST_RUN). This version has no rebuild from
-  scratch; croft preview <name> --rebuild shows how a rebuild would differ, within its --rows cap.
+  never repeated implicitly (croft status shows EDITED_SINCE_LAST_RUN). croft preview <name> --rebuild shows
+  how a rebuild would differ, within its --rows cap; croft run <name> --rebuild redoes every row, after moving
+  the table to the trash and asking for a confirmation. Ask the user before running it.
 
 ## The cost guard
 

@@ -1,9 +1,12 @@
 import { afterAll, describe, expect, test } from "bun:test";
+import { renameSync } from "node:fs";
+import { join } from "node:path";
 import { putCatalog } from "../../history/catalog.ts";
+import { tsFingerprint } from "../../project/ts-asset.ts";
 import { cleanup as cleanupChildren, spawnHolder } from "../../read/testkit.ts";
 import { behaviorOf, capValue, checksOf, DESCRIBE_TIMING, durationWords, loadConfigs, staticSecrets, type AssetConfig } from "./describe.ts";
 import {
-  busyScenario, CHARGES_TS, cleanup, cli, ISSUES_CATALOG, ISSUES_SEED, ISSUES_TS, makeProject, NOW, OPEN_SQL, runsDb, seed, shape, STATE,
+  busyScenario, CHARGES_TS, cleanup, cli, DEAD, ISSUES_CATALOG, ISSUES_SEED, ISSUES_TS, makeProject, NOW, OPEN_SQL, runsDb, seed, shape, STATE,
 } from "./inspect-testkit.ts";
 
 afterAll(async () => {
@@ -118,6 +121,24 @@ describe("croft describe --json", () => {
       ],
     });
     expect(r.json.next).toEqual([{ command: "croft run open_issues", reason: "build the table" }]);
+  });
+
+  test("an asset croft delete removed: next names the trash, and the run from scratch only in words (R41-06)", async () => {
+    const p = await issues();
+    const db = runsDb(p.stateDir);
+    try {
+      const del = db.createRun({ trigger: "confirm", human: true, argv: ["delete", "open_issues"], identity: DEAD });
+      db.startStep({ runId: del.id, asset: "open_issues", attempt: 1, reason: "deleted" });
+      db.finishStep(del.id, "open_issues", 1, { status: "ok", reason: "deleted" });
+      db.finishRun(del.id, "succeeded");
+    } finally {
+      db.close();
+    }
+    const r = await cli(["describe", "open_issues", "--json"], { cwd: p.root, env: ENV });
+    expect(r.json.next).toEqual([{
+      command: "croft restore",
+      reason: "open_issues was deleted by croft delete: croft restore open_issues brings it back (after confirmation); croft run open_issues, by hand, builds it again from scratch",
+    }]);
   });
 
   const TRIAGE_TS = `import { transform } from "@zabaca/croft";
@@ -501,5 +522,37 @@ describe("helpers", () => {
     const long = capValue({ k: "y".repeat(100) }, { full: false, redact, width: 10 });
     expect(long).toEqual({ value: `{"k":"yyy…`, cut: 1, redacted: false });
     expect(capValue("x".repeat(100), { full: true, redact }).cut).toBe(0);
+  });
+});
+
+describe("ASSET_RENAMED: a file renamed outside croft (§6)", () => {
+  /** github_issues built with the code of its file (the hash a run records), then its file renamed to tickets.ts. */
+  async function renamedOutside() {
+    const p = await issues();
+    const hash = await tsFingerprint(join(p.root, "assets/github_issues.ts"), p.project);
+    const db = runsDb(p.stateDir);
+    putCatalog(db, { ...ISSUES_CATALOG, codeHash: hash });
+    db.close();
+    renameSync(join(p.root, "assets/github_issues.ts"), join(p.root, "assets/tickets.ts"));
+    return p;
+  }
+
+  test("the new name: ASSET_RENAMED with croft rename as the fix, and no croft run next", async () => {
+    const p = await renamedOutside();
+    const r = await cli(["describe", "tickets", "--json"], { cwd: p.root, env: ENV });
+    expect(r.exit).toBe(2);   // a project error, as a broken asset file is
+    expect(r.json.data).toMatchObject({ asset: "tickets", file: "assets/tickets.ts", rows: null });
+    expect(r.json.problems).toEqual([expect.objectContaining({
+      code: "ASSET_RENAMED", asset: "tickets", file: "assets/tickets.ts",
+      fix: { kind: "command", description: "adopt github_issues's table and state as tickets", command: "croft rename github_issues tickets" },
+    })]);
+    expect(r.json.next.map((n: { command: string }) => n.command)).not.toContain("croft run tickets");
+  });
+
+  test("the old name: ASSET_RENAMED instead of ORPHAN_TABLE's manual fix", async () => {
+    const p = await renamedOutside();
+    const r = await cli(["describe", "github_issues", "--json"], { cwd: p.root, env: ENV });
+    expect(r.json.problems.map((x: { code: string }) => x.code)).toEqual(["ASSET_RENAMED"]);
+    expect(r.json.problems[0].fix.command).toBe("croft rename github_issues tickets");
   });
 });

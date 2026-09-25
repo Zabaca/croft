@@ -3,11 +3,13 @@ on:
   push:
     branches: [main]
     tags: ["phase-*", "croft-v*"]
+  pull_request:
   workflow_dispatch:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  # Tier 1 (DESIGN.md §10 item 8): macOS arm64, Linux x64 glibc and Linux arm64, on the Bun floor and latest.
   test:
     name: ${{ matrix.os }} · bun ${{ matrix.bun }}
     runs-on: ${{ matrix.os }}
@@ -15,8 +17,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
-        bun: ["1.3.14"]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+        bun: ["1.3.14", "latest"]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -36,3 +38,41 @@ jobs:
         env:
           CROFT_CI: "1"
         run: bun test
+
+  # Smoke: Alpine (musl) installs, and a fresh project runs its example and answers a query.
+  alpine:
+    name: alpine smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container: oven/bun:1.3.14-alpine
+    steps:
+      - run: apk add --no-cache git
+      - uses: actions/checkout@v4
+      - run: bun install --frozen-lockfile
+      - name: init, run, query
+        run: |
+          set -e
+          dir=$(mktemp -d)/proj
+          bun packages/croft/bin/croft.mjs init "$dir" --no-install
+          mkdir -p "$dir/node_modules/@zabaca" && ln -s "$PWD/packages/croft" "$dir/node_modules/@zabaca/croft"
+          cd "$dir"
+          bun "$GITHUB_WORKSPACE/packages/croft/bin/croft.mjs" run example_sales --foreground
+          bun "$GITHUB_WORKSPACE/packages/croft/bin/croft.mjs" query "select count(*) as n from example_sales"
+
+  # Smoke: native Windows is unsupported in v1 (DESIGN.md §2); croft must say so clearly, not crash.
+  windows:
+    name: windows smoke
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - run: bun install --frozen-lockfile
+      - name: version and doctor
+        shell: bash
+        run: |
+          bun packages/croft/bin/croft.mjs --version
+          bun packages/croft/bin/croft.mjs doctor --json > doctor.json || true
+          cat doctor.json

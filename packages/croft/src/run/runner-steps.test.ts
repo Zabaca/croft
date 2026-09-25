@@ -14,7 +14,8 @@ import { RunsDb } from "../history/runs-db.ts";
 import { resolveProject, stepKindOf } from "../project/resolve.ts";
 import { loadProject } from "../project/root.ts";
 import { Confirmations } from "../safety/confirm.ts";
-import { DEFAULT_RETRIES, DEFAULT_TIMEOUT_MS, type PlannedStep, type RunPlan } from "./plan.ts";
+import { listTrash } from "../safety/trash.ts";
+import { behaviorHash, DEFAULT_RETRIES, DEFAULT_TIMEOUT_MS, type PlannedStep, type RunPlan } from "./plan.ts";
 import { pruneStaging, type RunEvent, runOrder, STAGING_KEEP_MS } from "./runner.ts";
 import { cleanupProjects, makeProject, mockApi, runIn, simpleGet, slowPages } from "./testkit.ts";
 
@@ -414,10 +415,10 @@ export default transform({
     withRuns(root, (db) => expect(new Confirmations(db).get(token)?.usedAt).not.toBeNull());
   });
 
-  test("a confirmation is accepted without --allow-shrink only for one transform named exactly", async () => {
+  test("a confirmation is accepted without --allow-shrink only for one transform or ingest named exactly", async () => {
     const root = project();
     const plan = await phase2Plan(root);
-    await expect(runIn(root, ["issues"], { plan, confirmToken: "c_123456" })).rejects.toMatchObject({ code: "USAGE_ERROR" });
+    await expect(runIn(root, ["report"], { plan, confirmToken: "c_123456" })).rejects.toMatchObject({ code: "USAGE_ERROR" });
     await expect(runIn(root, ["triage", "report"], { plan, confirmToken: "c_123456" })).rejects.toMatchObject({ code: "USAGE_ERROR" });
     await expect(runIn(root, ["tri*"], { plan, confirmToken: "c_123456" })).rejects.toMatchObject({ code: "USAGE_ERROR" });
   });
@@ -472,6 +473,48 @@ export default transform({
     expect(out.confirmation).toBeUndefined();
     expect(out.exit).toBe(0);
     withRuns(root, (db) => expect(db.latestStep("triage")).toMatchObject({ status: "skipped", error: { code: "LARGE_REPROCESS" } }));
+  });
+});
+
+// §6 "Behavior changes": an append ingest that gains a key asks, in its own `croft run`, to be converted in place.
+describe("an ingest's key conversion (convert_key)", () => {
+  const EVENTS = [
+    { id: 1, at: "2026-01-01T00:00:00Z", v: "a" }, { id: 1, at: "2026-01-01T00:00:01Z", v: "a2" }, { id: 2, at: "2026-01-01T00:00:02Z", v: "b" },
+  ];
+  const keyed: Partial<PlannedStep> = {
+    write: "merge", key: ["id"], behaviorHash: behaviorHash("merge", ["id"], { kind: "cursor", field: "at", lookbackMs: 0 }),
+  };
+
+  test("off a TTY: a token for `croft run events` (exit 5), nothing fetched; the confirmed run trashes first and converts", async () => {
+    api.state.zones = EVENTS;
+    const root = makeProject({ "assets/events.ts": simpleGet(api.url, "/zones", `\n  write: "append",\n  incremental: "at",`), "assets/tally.sql": "SELECT count(*) AS n FROM events\n" });
+    expect((await run2(root)).exit).toBe(0);
+    api.state.log.length = 0;
+    const asked = await run2(root, { selectors: ["events"], patch: { events: keyed } });
+    expect(asked.exit).toBe(5);
+    expect(api.state.log).toEqual([]);
+    expect(asked.confirmation).toMatchObject({ command: "croft run events", impact: { asset: "events", rows: 1, downstream: ["tally"] } });
+    expect(asked.step("events")).toMatchObject({ status: "skipped", reason: "needs confirmation" });
+    expect(asked.step("tally").status).toBe("skipped");
+    expect(asked.next.some((n) => n.command.includes("confirm") || n.command.includes("--rebuild"))).toBe(false);
+    const token = asked.confirmation!.token;
+
+    const done = await run2(root, { selectors: ["events"], patch: { events: keyed }, confirmToken: token });
+    expect(done.exit).toBe(0);
+    expect(done.step("events")).toMatchObject({ status: "ok", rows: { total: 2 } });
+    expect(done.step("events").trashed?.rows).toBe(3);
+    expect(done.step("tally").status).toBe("ok");
+    expect(listTrash(join(root, ".croft"), "events")).toHaveLength(1);
+    expect(await rows(root, "select id::INT id, v from events order by id")).toEqual([{ id: 1, v: "a2" }, { id: 2, v: "b" }]);
+    withRuns(root, (db) => expect(new Confirmations(db).get(token)?.usedAt).not.toBeNull());
+  });
+
+  test("a scheduled run has nobody to ask: INGEST_CONFIG_CHANGED fails the step", async () => {
+    api.state.zones = EVENTS;
+    const root = makeProject({ "assets/events.ts": simpleGet(api.url, "/zones", `\n  write: "append",\n  incremental: "at",`) });
+    await run2(root);
+    const out = await run2(root, { selectors: ["events"], patch: { events: keyed }, human: false });
+    expect(out.step("events").error?.code).toBe("INGEST_CONFIG_CHANGED");
   });
 });
 

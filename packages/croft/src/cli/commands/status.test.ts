@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { allCatalog, type CatalogAsset, putCatalog } from "../../history/catalog.ts";
 import { resolveProject } from "../../project/resolve.ts";
@@ -218,6 +218,37 @@ describe("croft status --json", () => {
     const d = (await cli(["status", "--json"], { cwd: p.root, env: ENV })).json.data;
     expect(d.serve).toEqual({ url: "http://127.0.0.1:7447", pid: process.pid });
   });
+
+  test("drift (§7) runs reported in the last 7 days: per asset, newest first, one per column; a note on its row; not a health matter", async () => {
+    const p = await scenario();
+    let clock = Date.parse("2026-09-22T18:57:00.000Z");
+    const db = runsDb(p.stateDir, () => new Date(clock));
+    try {
+      const warn = (code: string, details: Record<string, unknown>) =>
+        ({ severity: "warning", code, message: code, hint: "", docs: "", asset: "github_issues", details });
+      for (const [id, problems] of [
+        ["r_0922_1157_drf1", [warn("COLUMN_STOPPED_ARRIVING", { column: "milestone", readBy: [] })]],
+        ["r_0922_1158_drf2", [warn("COLUMN_STOPPED_ARRIVING", { column: "milestone", readBy: [] }), warn("JSON_KIND_CHANGED", { column: "user", before: ["object"], added: ["string"] })]],
+      ] as const) {
+        clock += 60_000;
+        const run = db.createRun({ id, trigger: "schedule", human: false, argv: ["run", "--due"], identity: DEAD });
+        db.finishRun(run.id, "succeeded", { data: { runId: id, status: "succeeded", steps: [] }, problems, next: [], exit: 0, ok: true });
+      }
+    } finally {
+      db.close();
+    }
+    const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+    expect(byAsset(r.json.data).github_issues.drift).toEqual([
+      { code: "COLUMN_STOPPED_ARRIVING", column: "milestone", text: "milestone stopped arriving", at: "2026-09-22T11:59:00-07:00", runId: "r_0922_1158_drf2" },
+      { code: "JSON_KIND_CHANGED", column: "user", text: "user now also string", at: "2026-09-22T11:59:00-07:00", runId: "r_0922_1158_drf2" },
+    ]);
+    expect(byAsset(r.json.data).stripe_charges.drift).toBeUndefined();
+    const human = await cli(["status"], { cwd: p.root, env: ENV });
+    expect(human.stdout).toMatch(/^github_issues .* ok · schema changed 5 min ago · drift: milestone stopped arriving, user now also string \(1 min ago\)$/m);
+    // Older than 7 days: gone.
+    const later = await cli(["status", "--json"], { cwd: p.root, env: { CROFT_NOW: "2026-10-05T00:00:00Z" } });
+    expect(byAsset(later.json.data).github_issues.drift).toBeUndefined();
+  });
 });
 
 describe("croft status: human output", () => {
@@ -288,6 +319,32 @@ describe("croft status when the warehouse file is missing", () => {
     expect(r.json.problems).toEqual([]);
     expect(r.json.data.healthy).toBe(false);                       // never built: stale, as before
     expect(r.json.data.assets.map((a: { status: string }) => a.status)).toEqual(Array(5).fill("never_run"));
+  });
+
+  test("an asset croft delete removed (its step says deleted, its mirror entry is gone) is never built again", async () => {
+    const p = makeProject({ files: SCENARIO_FILES });
+    let clock = Date.parse("2026-09-22T18:00:00Z");
+    const db = runsDb(p.stateDir, () => new Date((clock += 1000)));
+    try {
+      const built = db.createRun({ id: "r_0922_1100_bld1", trigger: "manual", human: true, argv: ["run", "github_issues"], identity: DEAD });
+      db.startStep({ runId: built.id, asset: "github_issues", attempt: 1, reason: "requested" });
+      db.finishStep(built.id, "github_issues", 1, { status: "ok" });
+      db.finishRun(built.id, "succeeded");
+      const del = db.createRun({ id: "r_0922_1101_del1", trigger: "confirm", human: true, argv: ["delete", "github_issues"], identity: DEAD });
+      db.startStep({ runId: del.id, asset: "github_issues", attempt: 1, reason: "deleted" });
+      db.finishStep(del.id, "github_issues", 1, { status: "ok", reason: "deleted" });
+      db.finishRun(del.id, "succeeded");
+    } finally {
+      db.close();
+    }
+    const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+    const a = r.json.data.assets.find((x: { asset: string }) => x.asset === "github_issues");
+    expect(a).toMatchObject({ status: "never_run", rows: null, stale: true, staleReasons: ["never_built"], lastRun: { runId: "r_0922_1101_del1", status: "ok" }, deleted: true });
+    expect(r.json.problems).toEqual([]);
+    // It says so, naming restore rather than a run that would fetch everything again (R41-06).
+    const human = await cli(["status"], { cwd: p.root, env: ENV });
+    expect(human.stdout).toContain("deleted (croft restore github_issues brings it back)");
+    expect(human.stdout).not.toContain("never run (croft run github_issues)");
   });
 });
 
@@ -427,6 +484,48 @@ describe("croft status: staleness", () => {
     expect(a.issue_triage).toMatchObject({ stale: true, staleReasons: ["input_replaced"] });
   });
 
+  // §6 "Restore": "incremental TS transforms show 'input restored; croft run x --rebuild redoes it'". A plain run of one
+  // processes new input rows only, so the rows it built from the replaced version keep their values.
+  test("an incremental TS transform whose input was restored: its row names the rebuild that redoes it; SQL just reruns", async () => {
+    const p = await pipeline({ entries: { github_issues: { lastReplacedAt: "2026-09-22T18:56:00.000000Z" } } });
+    const db = runsDb(p.stateDir, () => new Date("2026-09-22T18:56:00.000Z"));
+    try {
+      const run = db.createRun({ id: "r_0922_1156_rest", trigger: "confirm", human: true, argv: ["restore", "github_issues"], identity: DEAD });
+      db.startStep({ runId: run.id, asset: "github_issues", attempt: 1, reason: "restored" });
+      db.finishStep(run.id, "github_issues", 1, { status: "ok", reason: "restored" });
+      db.finishRun(run.id, "succeeded");
+    } finally {
+      db.close();
+    }
+    const { a } = await status(p);
+    expect(a.issue_triage).toMatchObject({ stale: true, staleReasons: ["input_replaced"], replaced: [{ input: "github_issues", restored: true }] });
+    expect(a.open_issues.replaced).toBeUndefined();
+    const human = (await cli(["status"], { cwd: p.root, env: ENV })).stdout;
+    expect(human).toMatch(/^issue_triage .* ok · stale: input github_issues restored; croft run issue_triage --rebuild redoes it$/m);
+    expect(human).toMatch(/^open_issues .* ok · stale: an input was replaced \(croft run open_issues\)$/m);
+
+    // Replaced another way (changed outside croft, rows deleted): the same rebuild, without saying "restored".
+    const p2 = await pipeline({ entries: { github_issues: { lastReplacedAt: "2026-09-22T18:56:00.000000Z" } } });
+    expect((await status(p2)).a.issue_triage.replaced).toEqual([{ input: "github_issues", restored: false }]);
+    const text = (await cli(["status"], { cwd: p2.root, env: ENV })).stdout;
+    expect(text).toMatch(/^issue_triage .* ok · stale: input github_issues replaced \(rows deleted or changed\); croft run issue_triage --rebuild redoes it$/m);
+  });
+
+  // §6 "Behavior changes": the run fails before it fetches; status says so from the catalog mirror, with the run's fixes.
+  test("an ingest whose code changed its key: INGEST_CONFIG_CHANGED with the run's fixes, and its row says the run fails", async () => {
+    const p = await pipeline({ hashes: { github_issues: "older-code" }, files: { "assets/github_issues.ts": ISSUES_TS.replace('key: "id"', 'key: "number"') } });
+    const { r } = await status(p);
+    expect(r.json.problems.find((x: { code: string }) => x.code === "INGEST_CONFIG_CHANGED")).toMatchObject({
+      severity: "error", asset: "github_issues", file: "assets/github_issues.ts",
+      message: "github_issues's 18556 stored rows were written as merge by id, but its code now says merge by number (key: id → number); croft does not rewrite stored rows on its own",
+      fix: { kind: "edit", description: "put the key back as it was (key: id → number)", file: "assets/github_issues.ts" },
+      details: { pending: true, convertible: false },
+    });
+    expect(JSON.stringify(r.json.next)).not.toContain("--rebuild");
+    const human = (await cli(["status"], { cwd: p.root, env: ENV })).stdout;
+    expect(human).toMatch(/^github_issues .* ok · .*its code changes how its rows are written: croft run github_issues fails until that is settled \(INGEST_CONFIG_CHANGED\)/m);
+  });
+
   test("code_changed: an SQL transform edited since it was built is stale and edited; EDITED_SINCE_LAST_RUN says the run rebuilds it", async () => {
     const p = await pipeline();
     writeFileSync(join(p.root, "assets/open_issues.sql"), OPEN_SQL.replace("WHERE state = 'open'", "WHERE state <> 'closed'"));
@@ -443,17 +542,18 @@ describe("croft status: staleness", () => {
     expect(human).toContain("EDITED_SINCE_LAST_RUN");
   });
 
-  test("an incremental TS transform edited is forward-only: not stale, and the warning never offers a rebuild", async () => {
+  // §8: "18,556 rows were built by older code; to redo them: croft run issue_triage --rebuild". The rebuild trashes and
+  // asks, so it is a human's fix in the warning, and never in next.
+  test("an incremental TS transform edited is forward-only: not stale; the warning names the rebuild for a human, never in next", async () => {
     const p = await pipeline({ hashes: { issue_triage: "older-code" }, entries: { issue_triage: { rows: 18_556 } } });
     const { r, a } = await status(p);
     expect(a.issue_triage).toMatchObject({ status: "ok", stale: false, staleReasons: [], edited: true });
     expect(r.json.data.healthy).toBe(true);
     const edited = r.json.problems.find((x: { code: string }) => x.code === "EDITED_SINCE_LAST_RUN");
-    expect(edited).toMatchObject({ severity: "warning", asset: "issue_triage", file: "assets/issue_triage.ts" });
-    expect(edited.message).toBe("issue_triage edited since its last run; 18,556 rows were built by older code");
+    expect(edited).toMatchObject({ severity: "warning", asset: "issue_triage", file: "assets/issue_triage.ts", fix: { kind: "manual", requiresHuman: true } });
+    expect(edited.message).toBe("issue_triage edited since its last run; 18,556 rows were built by older code; to redo them: croft run issue_triage --rebuild");
     expect(edited.effect).toBe("the next run processes new input rows with the new code");
-    expect(JSON.stringify(r.json)).not.toContain("--rebuild");
-    expect((await cli(["status"], { cwd: p.root, env: ENV })).stdout).not.toContain("--rebuild");
+    expect(JSON.stringify(r.json.next)).not.toContain("--rebuild");
   });
 
   test("a full-refresh TS transform edited is stale (code_changed)", async () => {
@@ -500,7 +600,7 @@ describe("croft status: staleness", () => {
       expect(a.issue_triage).toMatchObject({ status: "skipped", stale: false, edited: true });
       const edited = r.json.problems.find((x: { code: string }) => x.code === "EDITED_SINCE_LAST_RUN");
       expect(edited).toMatchObject({ severity: "warning", asset: "issue_triage" });
-      expect(edited.message).toBe("issue_triage edited since its last run; 18,556 rows were built by older code");
+      expect(edited.message).toBe("issue_triage edited since its last run; 18,556 rows were built by older code; to redo them: croft run issue_triage --rebuild");
       expect((await cli(["status"], { cwd: p.root, env: ENV })).stdout).toMatch(/^issue_triage .* skipped · edited since its last run$/m);
     });
   }
@@ -827,5 +927,33 @@ describe("croft status: the read copy (R32-11)", () => {
     const [line, hint] = await copyLines(p);
     expect(line).toStartWith("Read copy warehouse.read.duckdb · as of 10:00 (2 h ago), older than the last run that wrote data (r_");
     expect(hint).toBe("  hint: the next croft run that writes data refreshes the copy; no refresh followed that run (readCopy was off then, or the refresh was cut short; .croft/readcopy.log has each failure)");
+  });
+});
+
+describe("ASSET_RENAMED: a file renamed outside croft (§6)", () => {
+  test("the problem has croft rename as its fix, and both rows say so instead of croft run", async () => {
+    const p = await scenario();
+    // github_issues.ts renamed outside croft: a new, never-built asset with the code that built github_issues.
+    renameSync(join(p.root, "assets/github_issues.ts"), join(p.root, "assets/issues.ts"));
+    const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+    expect(r.exit).toBe(0);
+    expect(r.json.problems.filter((x: { code: string }) => x.code === "ASSET_RENAMED")).toEqual([expect.objectContaining({
+      severity: "error", asset: "issues", file: "assets/issues.ts",
+      fix: { kind: "command", description: "adopt github_issues's table and state as issues", command: "croft rename github_issues issues" },
+      details: { from: "github_issues", to: "issues", rows: 18_556, unfinished: false },
+    })]);
+    expect(byAsset(r.json.data).issues.status).toBe("never_run");
+    const human = await cli(["status"], { cwd: p.root, env: ENV });
+    const row = (asset: string) => human.stdout.split("\n").find((l) => l.startsWith(`${asset} `)) ?? "";
+    expect(row("issues")).toContain("never run: looks like github_issues renamed (croft rename github_issues issues)");
+    expect(row("github_issues")).toContain("no asset file: looks renamed to issues (croft rename github_issues issues)");
+    expect(human.stdout).not.toContain("croft run issues");
+  });
+
+  test("an asset of other code is no rename", async () => {
+    const p = await scenario();
+    writeFileSync(join(p.root, "assets/fresh.sql"), "SELECT 1 AS id\n");
+    const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
+    expect(r.json.problems.filter((x: { code: string }) => x.code === "ASSET_RENAMED")).toEqual([]);
   });
 });

@@ -17,13 +17,7 @@ import { CODES, type Code, isCode } from "./errors.ts";
 import { PHASE, PHASE_COMPLETE } from "./phase.ts";
 
 /** Codes no source raises yet, with the phase (DESIGN.md §11) that raises them. */
-const NOT_YET_RAISED: Partial<Record<Code, number>> = {
-  // Phase 4: rename, config and pin changes, drift.
-  ASSET_RENAMED: 4,
-  INGEST_CONFIG_CHANGED: 4,
-  PIN_CHANGES_DATA: 4,
-  EMPTY_EXTRACT: 4,
-};
+const NOT_YET_RAISED: Partial<Record<Code, number>> = {};
 
 const EQUALITY = new Set([ts.SyntaxKind.EqualsEqualsEqualsToken, ts.SyntaxKind.ExclamationEqualsEqualsToken,
   ts.SyntaxKind.EqualsEqualsToken, ts.SyntaxKind.ExclamationEqualsToken]);

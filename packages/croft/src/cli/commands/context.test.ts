@@ -123,6 +123,39 @@ describe("croft context --json", () => {
     expect(r.json.data.recentFailures).toEqual([]);
   });
 
+  test("drift (§7): each asset's, and a column that stopped arriving or a JSON kind change among the recent schema changes", async () => {
+    const p = await scenario();
+    const db = runsDb(p.stateDir, () => new Date("2026-09-22T18:58:00.000Z"));
+    try {
+      const run = db.createRun({ id: "r_0922_1158_drft", trigger: "schedule", human: false, argv: ["run", "--due"] });
+      const warn = (code: string, details: Record<string, unknown>) =>
+        ({ severity: "warning", code, message: code, hint: "", docs: "", asset: "github_issues", runId: run.id, details });
+      db.finishRun(run.id, "succeeded", { data: { runId: run.id, status: "succeeded", steps: [] }, next: [], exit: 0, ok: true, problems: [
+        warn("COLUMN_STOPPED_ARRIVING", { column: "milestone", nonNullShare: 1, batchRows: 120, readBy: ["open_issues"] }),
+        warn("JSON_KIND_CHANGED", { column: "user", before: ["object"], added: ["string"] }),
+        warn("TYPE_WIDENED", { column: "id", from: "BIGINT", to: "HUGEINT" }),
+      ] });
+    } finally {
+      db.close();
+    }
+    const d = (await cli(["context", "--json"], { cwd: p.root, env: ENV })).json.data as ContextData;
+    expect(byAsset(d).github_issues.drift).toEqual([
+      { code: "COLUMN_STOPPED_ARRIVING", column: "milestone", text: "milestone stopped arriving", at: "2026-09-22T11:58:00-07:00", runId: "r_0922_1158_drft" },
+      { code: "JSON_KIND_CHANGED", column: "user", text: "user now also string", at: "2026-09-22T11:58:00-07:00", runId: "r_0922_1158_drft" },
+      { code: "TYPE_WIDENED", column: "id", text: "id BIGINT → HUGEINT", at: "2026-09-22T11:58:00-07:00", runId: "r_0922_1158_drft" },
+    ]);
+    expect(byAsset(d).stripe_charges.drift).toBeUndefined();
+    // Newest first, next to the warehouse's schema change; the widening is not listed twice.
+    expect(d.recentSchemaChanges).toEqual([
+      { asset: "github_issues", at: "2026-09-22T11:58:00-07:00", runId: "r_0922_1158_drft", kind: "column_stopped_arriving", column: "milestone", from: null, to: null, readBy: ["open_issues"] },
+      { asset: "github_issues", at: "2026-09-22T11:58:00-07:00", runId: "r_0922_1158_drft", kind: "json_kind_changed", column: "user", from: "object", to: "object, string", readBy: ["open_issues"] },
+      { asset: "github_issues", at: "2026-09-22T11:00:00-07:00", runId: "r_0922_1100_bbbb", kind: "add_column", column: "updated_at", from: null, to: "TIMESTAMPTZ", readBy: ["open_issues"] },
+    ]);
+    const human = (await cli(["context"], { cwd: p.root, env: ENV })).stdout;
+    expect(human).toContain("ok · schema changed 5 min ago · drift: milestone stopped arriving, user now also string, id BIGINT → HUGEINT (2 min ago)");
+    expect(human).toContain("Recent schema changes (7 days)\n  github_issues milestone stopped arriving 2 min ago\n  github_issues user JSON object → object, string 2 min ago\n");
+  });
+
   test("--asset narrows everything to the named assets; an unknown name is UNKNOWN_TABLE", async () => {
     const p = await scenario();
     const r = await cli(["context", "--asset", "stripe_charges", "--asset", "sales", "--json"], { cwd: p.root, env: ENV });

@@ -2,7 +2,7 @@
 // warehouse, then previews in this process, and reads both databases back through child `croft query` calls, so
 // the warehouse is never opened in two access modes by one process.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { Server } from "bun";
 import { exitCodeFor } from "../core/errors.ts";
@@ -383,6 +383,33 @@ export default ingest({ key: "id", incremental: "updated_at", async *rows() { th
     expect(byName(out.data.assets, "open_issues")).toMatchObject({ status: "skipped", reason: "input issues failed in this preview" });
     expect(exitCodeFor(out.problems)).toBe(1);
     expect(await rows(root, "select count(*) as n from issues")).toEqual([{ n: 1 }]);
+  }, 60_000);
+
+  // §6: a file renamed outside croft is adopted by croft rename; a preview of it would fetch everything again.
+  test("a file renamed outside croft (ASSET_RENAMED): named, it fails before it fetches; a glob skips it; next is the rename", async () => {
+    api.issues = [issue(1, 1)];
+    const root = makeProject({ "assets/issues.ts": ISSUES(), "assets/open_tickets.sql": OPEN.replace("FROM issues", "FROM tickets") });
+    await run(root, "issues");
+    renameSync(join(root, "assets/issues.ts"), join(root, "assets/tickets.ts"));
+    const fetched = api.sinces.length;
+
+    const out = await preview(root, ["tickets"]);
+    expect(byName(out.data.assets, "tickets")).toMatchObject({
+      status: "failed", error: { code: "ASSET_RENAMED", fix: { kind: "command", command: "croft rename issues tickets" } },
+    });
+    expect(out.next[0]).toEqual({ command: "croft rename issues tickets", reason: "adopt issues's table and state as tickets" });
+    expect(exitCodeFor(out.problems)).toBe(2);
+
+    const glob = await preview(root, ["tick*", "open_tickets"]);
+    expect(byName(glob.data.assets, "tickets")).toMatchObject({
+      status: "skipped", reason: "looks like issues renamed outside croft: croft rename issues tickets adopts its table and state (a run would fetch everything again)",
+    });
+    expect(byName(glob.data.assets, "open_tickets")).toMatchObject({
+      status: "skipped", reason: "input tickets has never been built: it looks like issues renamed outside croft (croft rename issues tickets adopts its table)",
+    });
+    expect(glob.problems).toContainEqual(expect.objectContaining({ code: "ASSET_RENAMED", severity: "warning", asset: "tickets" }));
+    expect(glob.next[0]).toEqual({ command: "croft rename issues tickets", reason: "adopt issues's table and state as tickets" });
+    expect(api.sinces.length).toBe(fetched);
   }, 60_000);
 });
 

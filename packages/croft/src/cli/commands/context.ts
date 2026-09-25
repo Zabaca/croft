@@ -12,6 +12,10 @@
 // declared secrets; their problems (a file that does not load, CHECK_INVALID) and EDITED_SINCE_LAST_RUN are
 // the payload's problems.
 //
+// Drift (§7, history/drift.ts): each asset's `drift` is status's; a column that stopped arriving and a JSON column
+// that gained a kind are also recentSchemaChanges (kinds column_stopped_arriving and json_kind_changed), from the run
+// summaries, next to the schema changes (a widening is one already).
+//
 // Scheduling (§8): the project's setting as status shows it, each ingest's schedule and next run, and the assets
 // held from the scheduler (held[], with SCHEDULE_HELD in problems), from the scheduler's view while scheduling is
 // on or paused (status.ts collectStatus; never read while it is off).
@@ -24,6 +28,7 @@ import type { AssetKind, Problem, Reason } from "../../core/types.ts";
 import { liveIntents } from "../../db/intent.ts";
 import { hasState } from "../../db/state.ts";
 import type { CatalogAsset } from "../../history/catalog.ts";
+import { driftChange } from "../../history/drift.ts";
 import { FAILED_STATUSES } from "../../history/runs-db.ts";
 import { didYouMean } from "../../project/suggest.ts";
 import { croftHome } from "../../schedule/home.ts";
@@ -35,8 +40,8 @@ import {
 } from "./describe.ts";
 import { agoText, clockText, fireText } from "./schedule.ts";
 import {
-  ago, collectStatus, effectiveStatus, INSPECT_IMPORT_TIMEOUT_MS, type LastRun, type RunningEntry, type Scheduling, type StatusAsset,
-  type StatusDeps, statusText, zoned,
+  ago, collectStatus, effectiveStatus, epochMs, INSPECT_IMPORT_TIMEOUT_MS, type LastRun, type RunningEntry, type Scheduling, type StatusAsset,
+  renamedRows, type StatusDeps, statusText, zoned,
 } from "./status.ts";
 
 export const CONTEXT_CAP_BYTES = 20 * 1024;
@@ -70,6 +75,7 @@ export interface CompactAsset {
   columns?: { name: string; type: string; jsonKeys?: string[] }[];
   filesGone?: string[];
   schemaChangedAt?: string;
+  drift?: StatusAsset["drift"];
 }
 
 export interface SchemaChangeEntry {
@@ -153,6 +159,7 @@ function compact(s: StatusAsset, config: AssetConfig | null, cat: CatalogAsset |
   };
   if (s.filesGone) out.filesGone = s.filesGone;
   if (s.schemaChangedAt) out.schemaChangedAt = s.schemaChangedAt;
+  if (s.drift) out.drift = s.drift;
   if (cat?.columns.length) {
     out.columns = cat.columns.filter((c) => c.name !== "_loaded_at").map((c) => ({
       name: c.name, type: c.type, ...(c.jsonKeys?.length ? { jsonKeys: [...c.jsonKeys] } : {}),
@@ -187,7 +194,7 @@ export function capContext(d: ContextData, cap = CONTEXT_CAP_BYTES): ContextData
 export const context: CommandImpl<ContextData> = {
   run: (ctx) => runContext(ctx),
   human(result, ctx) {
-    return formatContext(result.data, ctx.now(), ctx.project.timezone);
+    return formatContext(result.data, ctx.now(), ctx.project.timezone, result.problems);
   },
 };
 
@@ -244,6 +251,9 @@ export async function runContext(ctx: Ctx, deps: StatusDeps = {}): Promise<Comma
     schemaChangesFrom = "runs";
     recentSchemaChanges = state.summaryChanges.map((c) => changeEntry(c.asset, zoned(c.at, tz)!, c.runId, c.change));
   }
+  // Drift that is no schema change of the table (§7): newest first with the rest.
+  const drifted = state.drift.filter((e) => e.code !== "TYPE_WIDENED").map((e) => changeEntry(e.asset, zoned(e.at, tz)!, e.runId, driftChange(e)));
+  if (drifted.length) recentSchemaChanges = [...recentSchemaChanges, ...drifted].sort((x, y) => epochMs(y.at) - epochMs(x.at));
   recentSchemaChanges = recentSchemaChanges.filter((c) => keep(c.asset)).slice(0, 50)
     .map((c) => ({ ...c, readBy: readersOf(c.asset, reads) }));
 
@@ -282,7 +292,9 @@ function schedulingWords(s: Scheduling, now: Date, tz: string): string {
   return `scheduling on (${s.lastTickAt ? `last tick ${agoText(s.lastTickAt, now)}` : "no tick yet"}${s.stale ? ", stale" : ""})`;
 }
 
-export function formatContext(d: ContextData, now: Date, tz = d.project.timezone): string {
+export function formatContext(d: ContextData, now: Date, tz = d.project.timezone, problems: readonly Problem[] = []): string {
+  // An ASSET_RENAMED pair's rows say `croft rename`, never `croft run` (status.ts statusText).
+  const renamed = renamedRows(problems);
   const lines = [`${d.project.root} · ${d.project.database} · ${d.project.timezone} · ${d.project.assets} asset${d.project.assets === 1 ? "" : "s"} · ${schedulingWords(d.project.scheduling, now, tz)}`];
   for (const a of d.assets) {
     const status: StatusAsset = {
@@ -290,10 +302,11 @@ export function formatContext(d: ContextData, now: Date, tz = d.project.timezone
       next: { at: null, reason: a.next as StatusAsset["next"]["reason"] }, stale: a.staleReasons.length > 0, staleReasons: a.staleReasons,
       held: a.hold !== undefined && d.held.includes(a.asset), ...(a.hold ? { hold: a.hold } : {}), edited: a.edited === true,
       ...(a.filesGone ? { filesGone: a.filesGone } : {}), ...(a.schemaChangedAt ? { schemaChangedAt: a.schemaChangedAt } : {}),
+      ...(a.drift ? { drift: a.drift } : {}),
     };
     lines.push("");
     const rows = a.rows !== null ? `${formatCount(a.rows)} rows` : a.status === "unknown" || a.lastLoadedAt ? "rows unknown" : "not built";
-    lines.push(`${a.asset} · ${a.kind ?? "unknown kind"} · ${a.file ?? "(no asset file)"} · ${rows} · ${statusText(status, now)}`);
+    lines.push(`${a.asset} · ${a.kind ?? "unknown kind"} · ${a.file ?? "(no asset file)"} · ${rows} · ${statusText(status, now, renamed.get(a.asset))}`);
     if (a.description) lines.push(`  ${a.description}`);
     if (a.schedule) {
       const when = a.next === "schedule" ? (a.nextFireAt ? `next ${fireText(a.nextFireAt, tz, now)}` : "next fire unknown")
@@ -321,7 +334,9 @@ export function formatContext(d: ContextData, now: Date, tz = d.project.timezone
   if (d.recentSchemaChanges.length) {
     lines.push("", "Recent schema changes (7 days)");
     for (const c of d.recentSchemaChanges) {
-      const what = c.kind === "add_column" ? `+ ${c.column} ${c.to ?? ""}` : c.kind === "widen" ? `${c.column} ${c.from} → ${c.to}` : `${c.kind}${c.column ? ` ${c.column}` : ""}`;
+      const what = c.kind === "add_column" ? `+ ${c.column} ${c.to ?? ""}` : c.kind === "widen" ? `${c.column} ${c.from} → ${c.to}`
+        : c.kind === "column_stopped_arriving" ? `${c.column} stopped arriving`
+        : c.kind === "json_kind_changed" ? `${c.column} JSON ${c.from} → ${c.to}` : `${c.kind}${c.column ? ` ${c.column}` : ""}`;
       lines.push(`  ${c.asset} ${what.trim()} ${ago(c.at, now)}`);
     }
   }

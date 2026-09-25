@@ -15,7 +15,9 @@
 // Held (not started, still due), in this order:
 // - paused: scheduling is paused (`croft schedule pause`);
 // - SCHEDULE_HELD: the code is not the code a human last ran (approved_code_hash), new assets included. A hash
-//   that differs only because croft.json's timezone changed says so, rather than "code edited";
+//   that differs only because croft.json's timezone changed says so, rather than "code edited". An asset whose
+//   table croft delete removed (safety/trash.ts deletedByCroft) is held whatever its approval, until a person
+//   restores it or runs it: a scheduled run would build it again from scratch (refetch, re-bill);
 // - LARGE_REPROCESS: a scheduled run met the cost guard, and no person has run the transform since;
 // - leased: another run holds it, or a run a tick started has not taken its leases yet (overlaps skip);
 // - backoff, one of:
@@ -60,6 +62,7 @@ import type { CatalogAsset } from "../history/catalog.ts";
 import { RUNS_DB_FILE, RunsDb, type ScheduleStateRow, type StepRecord } from "../history/runs-db.ts";
 import type { ResolvedAsset } from "../project/resolve.ts";
 import { loadProject, type Project } from "../project/root.ts";
+import { deletedByCroft } from "../safety/trash.ts";
 import type { DuePlanning, StepKind } from "../run/plan.ts";
 import { staleReasons } from "../run/staleness.ts";
 import type { SchedulingSetting } from "./os.ts";
@@ -821,8 +824,27 @@ export function clockWords(at: Date, timezone: string, now: Date): string {
 export function scheduleHeld(o: {
   asset: string; file: string; approved: string | null; editedAt: number | null; loads: boolean; now: Date;
   timeZoneChanged?: { from: string; to: string } | null;
+  /** croft delete removed its table (safety/trash.ts deletedByCroft): held whatever the approved code. */
+  deleted?: boolean;
 }): { reason: string; problem: Problem } {
   const run = `croft run ${o.asset}`;
+  if (o.deleted) {
+    // A person decides between the deleted table (restore, after confirmation) and a build from scratch, which
+    // refetches an ingest's whole history or reprocesses (and re-bills) a transform's every input row.
+    const p = problem("SCHEDULE_HELD", {
+      asset: o.asset, file: o.file,
+      message: `${o.asset} is held from the scheduler: croft delete removed its table, and a scheduled run would build it again from scratch`,
+      hint: `ask the user: croft restore ${o.asset} brings the deleted table back (after confirmation), or ${run}, by hand, builds it again from scratch (an ingest fetches its whole history again)`,
+      effect: "scheduled runs skip it until a person restores it or runs it",
+      fix: {
+        kind: "manual", requiresHuman: true,
+        description: `ask the user whether to bring ${o.asset} back (croft restore ${o.asset}) or build it again from scratch (${run})`,
+      },
+      details: { approvedCodeHash: o.approved, deleted: true },
+    });
+    const reason = `deleted by croft delete: croft restore ${o.asset} brings it back; only ${run}, by hand, builds it again from scratch`;
+    return { reason, problem: { ...p, severity: "warning" } };
+  }
   const zone = o.approved !== null && o.loads && o.timeZoneChanged ? o.timeZoneChanged : null;
   const edited = `${o.approved === null ? "new: " : ""}code edited${o.editedAt !== null ? ` ${ago(o.editedAt, o.now)} ago` : ""}`;
   const reason = zone
@@ -995,7 +1017,7 @@ export async function dueWork(i: DueInput): Promise<DueWork> {
     const hold = holdOf(f, h, {
       project, now, scheduling, approved: h.state?.approvedCodeHash ?? null, leasedBy: leased.get(f.asset) ?? null,
       startingRun: starting.get(f.asset) ?? null, failedStart: failedStartOf(f.asset, h.lastOk), primaryDue: due.has(f.asset),
-      inputs: transform ? inputsOf(f) : [], entry,
+      inputs: transform ? inputsOf(f) : [], entry, deleted: runs ? deletedByCroft(runs, f.asset) : false,
     });
     if (hold) holds.set(f.asset, hold);
     view.held = hold;
@@ -1087,6 +1109,8 @@ interface HoldContext {
   primaryDue: boolean;
   inputs: string[];
   entry: (name: string) => CatalogAsset | null;
+  /** croft delete removed its table (deletedByCroft). */
+  deleted: boolean;
 }
 
 /** The first hold that applies (see the top of this file), or null. Waiting for an input comes after (dueWork). */
@@ -1097,10 +1121,10 @@ function holdOf(f: AssetFacts, h: History, c: HoldContext): { code: HoldCode; re
     const resume = c.scheduling.via === "serve" ? "croft schedule on --no-os-job" : "croft schedule on";
     return { code: "paused", reason: `scheduling is paused${until}; ${resume} resumes it` };
   }
-  if (f.codeHash === null || f.codeHash !== c.approved) {
+  if (c.deleted || f.codeHash === null || f.codeHash !== c.approved) {
     return { code: "SCHEDULE_HELD", reason: scheduleHeld({
       asset: f.asset, file: f.file, approved: c.approved, editedAt: editedAt(c.project.root, f.file), loads: f.ok && f.codeHash !== null, now: c.now,
-      timeZoneChanged: f.timeZoneChanged ?? null,
+      timeZoneChanged: f.timeZoneChanged ?? null, deleted: c.deleted,
     }).reason };
   }
   if (h.reprocess) {
@@ -1266,13 +1290,14 @@ export function duePlanning(o: { project: Project; runs: RunsDb; now: Date; fire
       }
       if (scheduling.state === "off") return { hold: "paused" as Hold, reason: "held: scheduling is off" };
       const approved = runs.approvedCode(step.asset);
-      if (step.codeHash === undefined || step.codeHash !== approved) {
+      const deleted = deletedByCroft(runs, step.asset);
+      if (deleted || step.codeHash === undefined || step.codeHash !== approved) {
         // The tick found (and noted) whether only the time zone moved this code's hash.
         const known = Object.hasOwn(facts, step.asset) ? facts[step.asset] : undefined;
         const zone = known && known.codeHash === (step.codeHash ?? null) && known.approved === approved ? known.timeZoneChanged ?? null : null;
         const h = scheduleHeld({
           asset: step.asset, file: step.file, approved, editedAt: editedAt(project.root, step.file), loads: step.ok && step.codeHash !== undefined, now,
-          timeZoneChanged: zone,
+          timeZoneChanged: zone, deleted,
         });
         return { hold: "code_not_run_by_hand" as Hold, reason: `held: ${h.reason}`, problem: h.problem };
       }

@@ -18,9 +18,23 @@
 //   checks          every write runs checks/run.ts checksHook(step.checks), ingests included, with the check
 //                   sources of the asset's last ok step (a new or edited check covers the whole table once); the
 //                   warnings run after the commit under a read lease (runSqlStep runs its own)
-//   confirmations   one ConfirmDecider for --allow-shrink (SHRINK_GUARD) and the cost guard (LARGE_REPROCESS): a
-//                   y/N question on a TTY, the token `croft confirm` carries, or a new token. One token per run: a
-//                   second step that needs one is skipped, with a next hint to run it afterwards
+//   confirmations   one ConfirmDecider for --allow-shrink (SHRINK_GUARD), the cost guard (LARGE_REPROCESS) and
+//                   --rebuild: a y/N question on a TTY, the token `croft confirm` carries, or a new token. One token
+//                   per run: a second step that needs one is skipped, with a next hint to run it afterwards (never a
+//                   destructive command: that is only named in the skip)
+//   --rebuild       a named ingest or incremental TS transform first goes through run/rebuild.ts, once per run:
+//                   confirmation (the cost guard's rows included; for an ingest, the rows each paid incremental
+//                   reader would process again, whose cost guard the run then grants for them), trash, reset; then
+//                   the step runs as the asset's first build. With --allow-shrink (one ingest), its refetch may
+//                   replace the table with fewer than half of its rows, as the rebuild's confirmation says. An
+//                   ingest's reset rides on its first write (IngestInput.fresh: swap at commit), so a refetch that
+//                   fails before it commits keeps the old table. An SQL or full-refresh TS transform
+//                   just runs. A step that fails after the reset
+//                   says in its hint that the asset is never built (or holds what its rebuild saved so far), that
+//                   a plain run builds it again, and that `croft restore <asset>` brings the previous table back:
+//                   the restore asks first, so it is never in next (afterReset)
+//   renamed         a file renamed outside croft (ASSET_RENAMED, plan.ts) never runs: named, its step fails before
+//                   it runs; otherwise it is skipped with the problem. next leads with `croft rename <old> <new>`
 //   retries         2 by default, after 30 s and 2 min (or the server's longer Retry-After, up to 5 min), for
 //                   retryable errors only
 //   no progress     no row yielded and no request completed for `timeout` (10 min) → TIMEOUT
@@ -48,9 +62,11 @@ import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { checksHook, runWarnings } from "../checks/run.ts";
 import { CroftError, exitCodeFor } from "../core/errors.ts";
-import type { Confirmation, CursorType, Hold, LockHolder, Problem, Reason, StepResult } from "../core/types.ts";
+import type { Confirmation, CursorType, Fix, Hold, LockHolder, Problem, Reason, StepResult } from "../core/types.ts";
 import type { ExampleResult } from "../project/init.ts";
 import { Confirmations } from "../safety/confirm.ts";
+import { deletedByCroft } from "../safety/trash.ts";
+import { canonicalPath } from "../db/connect.ts";
 import { openWarehouse, type DuckWarehouse } from "../db/warehouse.ts";
 import { allCatalog, type CatalogAsset, getCatalog } from "../history/catalog.ts";
 import { acquire, release, tryAcquire } from "../history/leases.ts";
@@ -72,10 +88,11 @@ import { tsFingerprint } from "../project/ts-asset.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { loadProject, type Project } from "../project/root.ts";
 import {
-  croftError, fromSince, isRetryable, type ProgressSnapshot, runIngest, savedCursors, SHRINK_ACTION, shrinkCommand, StepProgress,
+  croftError, type FreshStart, fromSince, isRetryable, type ProgressSnapshot, runIngest, savedCursors, SHRINK_ACTION, shrinkCommand, StepProgress,
 } from "./ingest.ts";
 import { unknownInputs } from "./inputs.ts";
-import { backfillUnsupported, buildFirst, inputNotBuilt, isGlob, loadErrors, planRun, type PlannedStep, type RunPlan } from "./plan.ts";
+import { backfillUnsupported, buildFirst, isGlob, loadErrors, planRun, type PlannedStep, rebuildSelectors, type RunPlan, skipProblem } from "./plan.ts";
+import { rebuildQuestion, Rebuilds, rebuildTrashes } from "./rebuild.ts";
 import { runSqlStep } from "./sql.ts";
 import { staleReasons } from "./staleness.ts";
 import type { ConfirmDecider, ConfirmRequest, StepInput, StepOutcome } from "./step.ts";
@@ -147,6 +164,8 @@ export interface RunnerOptions {
   human?: boolean;
   from?: string;
   allowShrink?: boolean;
+  /** --rebuild: the named assets are built from scratch (run/plan.ts PlannedStep.rebuild, run/rebuild.ts). */
+  rebuild?: boolean;
   /** --only (skip downstream) and --upstream (refresh stale inputs first): handed to the planner. */
   only?: boolean;
   upstream?: boolean;
@@ -176,17 +195,36 @@ export interface RunnerOptions {
 }
 
 /**
- * Flag rules that need the plan: destructive flags take exactly one exact name (§6 "Guards aimed at agents"),
- * and --from on an asset named exactly must apply to it (§8: BACKFILL_UNSUPPORTED). A confirmation carries out
- * --allow-shrink, or the cost guard (LARGE_REPROCESS) of the one transform named: its token is for
+ * Flag rules that need the plan: destructive flags take exact names (§6 "Guards aimed at agents": --allow-shrink
+ * exactly one, --rebuild one or more, never a glob or a bare run), and --from on an asset named exactly must apply to
+ * it (§8: BACKFILL_UNSUPPORTED). --rebuild never goes with --from, and with --allow-shrink only for one ingest (its
+ * refetch's shrink guard, §6). A confirmation carries out
+ * --allow-shrink, --rebuild, or the cost guard (LARGE_REPROCESS) of the one transform named: its token is for
  * `croft run <transform>`. Called before the run exists, by the detached parent too, so such a refusal is never a
  * run or a failed step.
  */
-export function checkRunFlags(plan: RunPlan, o: Pick<RunnerOptions, "selectors" | "from" | "allowShrink" | "confirmToken">): void {
-  const usage = (message: string, hint: string) => new CroftError("USAGE_ERROR", { message, hint });
+export function checkRunFlags(plan: RunPlan, o: Pick<RunnerOptions, "selectors" | "from" | "allowShrink" | "rebuild" | "confirmToken">): void {
+  const usage = (message: string, hint: string, fix?: Fix) => new CroftError("USAGE_ERROR", { message, hint, ...(fix ? { fix } : {}) });
   const named = o.selectors.length === 1 && !isGlob(o.selectors[0]!) ? plan.steps.find((s) => s.asset === o.selectors[0]) : undefined;
-  if (o.confirmToken !== undefined && !o.allowShrink && named?.kind !== "transform") {
-    throw usage("a confirmation applies only to --allow-shrink or to the cost guard of one transform", "croft confirm <token> runs the confirmed command for you");
+  if (o.rebuild) {
+    rebuildSelectors(o.selectors);
+    if (o.from !== undefined) {
+      throw usage("--rebuild and --from do not go together", "--rebuild builds an asset from scratch; --from backfills a merge ingest from a point: croft run <asset> --rebuild, or croft run <asset> --from <when>",
+        { kind: "manual", description: "use one of the two: --rebuild to build the asset from scratch, or --from to backfill a merge ingest" });
+    }
+    if (o.allowShrink) {
+      // The refetch of one ingest may replace its table with fewer than half of its rows (§6 shrink guard); the
+      // rebuild's own confirmation says so, and the table goes to the trash first as for any rebuild.
+      if (!named || (named.kind !== "rows" && named.kind !== "file")) {
+        throw usage("--rebuild --allow-shrink takes exactly one ingest", "only an ingest's refetch has a shrink guard: croft run <ingest> --rebuild --allow-shrink",
+          { kind: "manual", description: "name one ingest: croft run <ingest> --rebuild --allow-shrink" });
+      }
+      return;
+    }
+  }
+  if (o.confirmToken !== undefined && !o.allowShrink && !o.rebuild && (!named || named.kind === "sql")) {
+    throw usage("a confirmation applies only to --allow-shrink, --rebuild, the cost guard of one transform, or a key or pin change of one ingest",
+      "croft confirm <token> runs the confirmed command for you");
   }
   if (o.from !== undefined && !o.allowShrink) {
     for (const s of plan.steps) {
@@ -437,12 +475,16 @@ function nextSteps(steps: StepResult[], problems: Problem[], deferred: ReadonlyM
   for (const p of problems) {
     const build = p.code === "INPUT_NOT_BUILT" && Array.isArray(p.details?.inputs) ? buildFirst(p) : null;
     if (build && !next.some((n) => n.command === build.command)) next.push(build);
+    // A file renamed outside croft: the rename adopts its table (§6: a rename needs no confirmation).
+    const fix = p.code === "ASSET_RENAMED" && p.fix?.kind === "command" ? p.fix : null;
+    if (fix && !next.some((n) => n.command === fix.command)) next.push({ command: fix.command, reason: fix.description });
   }
   const busy = problems.find((p) => p.code === "ASSET_BUSY");
   if (busy?.runId) next.push({ command: `croft wait ${busy.runId} --timeout 100s`, reason: `${busy.asset ?? "an asset"} is held by that run` });
   for (const s of steps) {
     if (s.status !== "failed" || !s.error) continue;
-    if (s.error.code === "INTERRUPTED") continue;
+    // Interrupted: nothing to read. Renamed: it failed before it ran, and its fix is in next already.
+    if (s.error.code === "INTERRUPTED" || s.error.code === "ASSET_RENAMED") continue;
     next.push({ command: `croft logs ${s.asset} --failed`, reason: `see why ${s.asset} failed` });
     if (isRetryable(s.error)) {
       next.push({
@@ -476,6 +518,22 @@ const HOLD_WORDS: Record<Hold, string> = {
 
 /** The reasons a planner gives only because the asset looked stale; the runner re-checks them. */
 const STALENESS: ReadonlySet<Reason> = new Set<Reason>(["never_built", "code_changed", "input_changed", "input_replaced"]);
+
+/**
+ * A --rebuild that failed after its reset (run/rebuild.ts): the table was dropped, its previous version is in the
+ * trash, and the step's error says both ways on in its hint: a plain run builds the asset again (a cursor ingest or a
+ * chunked transform continues from what it saved since the reset), or `croft restore` brings the previous table back.
+ * The restore replaces a table and asks first, so it is named in the hint, never in next (§4.3).
+ */
+function afterReset(p: Problem, step: PlannedStep, trashed: { path: string; rows: number } | null, now: CatalogAsset | null): void {
+  const asset = step.asset;
+  const again = step.kind === "file" ? "loads every file again" : step.kind === "rows" ? "fetches it again" : "builds it again";
+  const state = now ? `${asset} holds the ${now.rows.toLocaleString("en-US")} row${now.rows === 1 ? "" : "s"} its rebuild saved so far: croft run ${asset} continues it`
+    : `${asset} is never built now: croft run ${asset} ${again}`;
+  const back = trashed ? `, or croft restore ${asset} brings the previous table back (it asks first)` : "";
+  p.hint = `${p.hint ? `${p.hint}; ` : ""}${state}${back}`;
+  p.details = { ...p.details, rebuild: { reset: true, ...(trashed ? { trashPath: trashed.path, trashedRows: trashed.rows } : {}) } };
+}
 
 /** A stamp no row carries: warnings of a write that changed no row look at no rows (only whole-table ones run). */
 const NO_ROWS_STAMP = "1970-01-01T00:00:00.000000Z";
@@ -553,7 +611,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
     let fromSkips: Map<string, string>;
     try {
       // --only and --upstream are the planner's; they go through as they are (plan.ts PlanInput).
-      const narrowing = { ...(o.only ? { only: true } : {}), ...(o.upstream ? { upstream: true } : {}) };
+      const narrowing = { ...(o.only ? { only: true } : {}), ...(o.upstream ? { upstream: true } : {}), ...(o.rebuild ? { rebuild: true } : {}) };
       plan = o.plan ?? await planRun({ root: project.root, timezone: project.timezone, selectors: o.selectors, cursorTypes: cursorTypes(runs), ...narrowing });
       checkRunFlags(plan, o);
       plan = await withProjectChecks(plan, project, env);
@@ -601,6 +659,8 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
     /** A scheduled run: steps held as they started (holdAtStart), and why. */
     const heldAtStart = new Map<string, string>();
     const confirms = new ConfirmState();
+    /** --rebuild: what each rebuilt asset's confirmation, trash and reset got to (a retry goes on from there). */
+    const rebuilds = new Rebuilds();
     const order = runOrder(plan);
     const byName = new Map(plan.steps.map((s) => [s.asset, s]));
     // Under --from only the ingests it applies to run; everything else is skipped with the reason (§8).
@@ -725,19 +785,48 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
         const previous = runs.lastCheckSources(asset);
         try {
           if (beforeStart !== undefined) throw beforeStart;
-          const input: StepInput = {
-            step, project, env, warehouse: warehouse!, runs, runId, attempt, maxAttempts, signal, progress, log,
-            ...withChecks(step, previous), ...withReadBy(step, getCatalog(runs, asset)),
-            ...(o.http ? { http: o.http } : {}), ...(o.fault ? { fault: o.fault } : {}), ...(o.now ? { now: o.now } : {}),
-          };
-          let out: StepOutcome;
-          if (step.kind === "sql") {
-            out = await runSqlStep(input);
-          } else if (step.kind === "transform") {
-            // The cost guard asks a person; a scheduled run has nobody to ask, so the guard fails the step.
-            out = await runTransform({ ...input, ...(o.human ?? true ? { confirm: decider } : {}) });
-          } else {
-            out = await runIngest({ ...input, ...(o.from !== undefined ? { from: o.from } : {}), ...(o.allowShrink ? { confirm: decider } : {}) });
+          // --rebuild of an ingest or an incremental TS transform: confirmation, trash and reset first, once per run;
+          // then the step is the asset's first build (run/rebuild.ts).
+          let out: StepOutcome | undefined;
+          /** --rebuild of an ingest: its old table stays until the refetch's first write replaces it (rebuild.ts). */
+          let fresh: FreshStart | undefined;
+          if (step.rebuild && rebuildTrashes(step)) {
+            // Copying a large table to the trash is DuckDB's work, not a stalled source: the watchdog waits.
+            progress.setPhase("write");
+            const prep = await rebuilds.prepare({
+              step, warehouse: warehouse!, runs, runId, stateDir: canonicalPath(paths.stateDir), attempt, maxAttempts, signal, log,
+              ...(o.human ?? true ? { confirm: decider } : {}), ...(o.fault ? { fault: o.fault } : {}), ...(o.allowShrink ? { allowShrink: true } : {}),
+            }).finally(() => progress.setPhase("extract"));
+            if (prep.kind === "pending") out = prep.outcome;
+            else {
+              // One token for both (§6): the cost guard's question for the rows the rebuild's impact counted is answered.
+              if (prep.guard) confirms.grant("large_reprocess", asset, prep.guard.pending);
+              // An ingest's rebuild counted the rows each paid reader would process again: that yes covers their guard.
+              for (const r of prep.paid ?? []) confirms.grant("large_reprocess", r.asset, r.rows);
+              fresh = prep.fresh;
+            }
+          }
+          if (!out) {
+            const input: StepInput = {
+              step, project, env, warehouse: warehouse!, runs, runId, attempt, maxAttempts, signal, progress, log,
+              ...withChecks(step, previous), ...withReadBy(step, getCatalog(runs, asset)),
+              ...(o.http ? { http: o.http } : {}), ...(o.fault ? { fault: o.fault } : {}), ...(o.now ? { now: o.now } : {}),
+            };
+            if (step.kind === "sql") {
+              out = await runSqlStep(input);
+            } else if (step.kind === "transform") {
+              // The cost guard asks a person; a scheduled run has nobody to ask, so the guard fails the step.
+              out = await runTransform({ ...input, ...(o.human ?? true ? { confirm: decider } : {}) });
+            } else {
+              // A changed key or pin asks a person too (load/config-change.ts); a scheduled run has nobody to ask, so it
+              // fails. A --rebuild starts from scratch, so it has no change to settle.
+              out = await runIngest({
+                ...input, ...(o.from !== undefined ? { from: o.from } : {}), ...(o.allowShrink ? { confirm: decider } : {}),
+                ...(o.human ?? true ? { confirmChange: decider } : {}), ...(step.rebuild ? { rebuild: true } : {}), ...(fresh ? { fresh } : {}),
+              });
+            }
+            const trashed = rebuilds.trashed(asset);
+            if (trashed) out.result.trashed = { path: trashed.path, rows: trashed.rows };
           }
           out = confirms.settle(step, out, log);
           // Warnings after the commit (§3f). runSqlStep runs its own.
@@ -771,11 +860,17 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
             return { ok: true as const, out: { result, warnings: [held], problems: [] } };
           }
           const interrupted = p.code === "INTERRUPTED";
+          // A rebuild that failed after its reset: the old version is in the trash, and a plain run builds it again.
+          const reset = rebuilds.effect(asset);
+          if (reset) p.effect = p.effect ? `${reset}; ${p.effect}` : reset;
+          const trashed = rebuilds.trashed(asset);
+          if (reset) afterReset(p, step, trashed, getCatalog(runs, asset));
           runs.finishStep(runId, asset, attempt, { status: interrupted ? "interrupted" : "failed", error: redactValue(jsonSafe(p), env) });
           log.write(`${p.code}: ${p.message}${p.hint ? `\nhint: ${p.hint}` : ""}`);
           const result: StepResult = {
             asset, status: "failed", reason: step.reason, behavior: step.behavior, attempt, maxAttempts,
             rows: emptyRows(getCatalog(runs, asset)?.rows ?? 0), schemaChanges: [], requests: progress.requests, checks: failedChecks(p),
+            ...(trashed ? { trashed: { path: trashed.path, rows: trashed.rows } } : {}),
             logsCommand: `croft logs ${asset} --failed`, durationMs: Date.now() - started, error: p,
           };
           events.emit({ type: "step", runId, asset, attempt, status: "failed", result });
@@ -867,10 +962,10 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
         const idle = fromSkip(step) ?? (step.action === "skip" ? step.reason : undefined);
         if (idle !== undefined) {
           skipped(step, idle);
-          // Skipped for an input that will not exist: the run says so, with the run that builds the input (as the
-          // dry run does).
-          const unbuilt = fromSkip(step) === undefined ? inputNotBuilt(step) : undefined;
-          if (unbuilt) problems.push({ ...unbuilt, asset: unbuilt.asset ?? asset, runId });
+          // Skipped for an input that will not exist, or as a file renamed outside croft: the run says so, with the
+          // run that builds the input or the rename that adopts the table (as the dry run does).
+          const why = fromSkip(step) === undefined ? skipProblem(step) : undefined;
+          if (why) problems.push({ ...why, asset: why.asset ?? asset, runId });
           return null;
         }
         // A held step runs nothing, even when its code does not load (the scheduler met an edit in progress): the
@@ -1029,14 +1124,16 @@ export async function holdAtStart(step: PlannedStep, runs: RunsDb, project: Pick
   const planned = codeHashOf(step);
   const current = step.kind === "sql" ? planned
     : await tsFingerprint(step.path, { root: project.root, timezone: project.timezone }).catch(() => undefined);
-  if (approved !== null && planned === approved && current === approved) return null;
+  // croft delete removed its table since the plan: held whatever the approval (a build from scratch needs a person).
+  const deleted = deletedByCroft(runs, step.asset);
+  if (!deleted && approved !== null && planned === approved && current === approved) return null;
   let editedAt: number | null = null;
   try {
     editedAt = statSync(step.path).mtimeMs;
   } catch {
     // Gone: the hold says it does not load.
   }
-  const h = scheduleHeld({ asset: step.asset, file: step.file, approved, editedAt, loads: current !== undefined, now });
+  const h = scheduleHeld({ asset: step.asset, file: step.file, approved, editedAt, loads: current !== undefined, now, deleted });
   return { why: `held (SCHEDULE_HELD): ${h.reason}`, problem: h.problem };
 }
 
@@ -1238,6 +1335,12 @@ class ConfirmState {
   /** Steps run side by side; the terminal asks one question at a time. */
   readonly asking = new Semaphore(1);
 
+  /** A grant for the rest of the run without asking: a confirmed --rebuild of a paid transform covers its cost
+   *  guard's question for the rows its impact counted (one token for both, §6). */
+  grant(action: ConfirmRequest["action"], asset: string, rows: number): void {
+    this.granted.set(`${action}\u0000${asset}`, rows);
+  }
+
   /** A stand-in for a step that asked after the run's token was issued: the step skips itself as for any pending
    *  confirmation, and settle() then rewrites its result. It is never stored, shown or valid. */
   standIn(req: ConfirmRequest): Confirmation {
@@ -1249,7 +1352,9 @@ class ConfirmState {
   settle(step: PlannedStep, out: StepOutcome, log: LogWriter): StepOutcome {
     const req = this.deferred.get(step.asset);
     if (!req || !out.confirmation || out.confirmation === this.pending) return out;
-    const why = `${step.asset} needs a confirmation too (${ACTION_WORDS[req.action]}); croft asks for one at a time, so run it after confirmation ${this.pending!.token} is settled${req.action === "allow_shrink" ? `: ${req.command}` : ""}`;
+    // A destructive command is named here, never in next (§4.3); the cost guard's `croft run <transform>` goes in next.
+    const named = req.action === "allow_shrink" || req.action === "rebuild";
+    const why = `${step.asset} needs a confirmation too (${ACTION_WORDS[req.action]}); croft asks for one at a time, so run it after confirmation ${this.pending!.token} is settled${named ? `: ${req.command}` : ""}`;
     log.write(`skipped: ${why}`);
     const { confirmation: _c, ...rest } = out;
     return {
@@ -1303,6 +1408,7 @@ function confirmDecider(o: RunnerOptions, runs: RunsDb, state: ConfirmState): Co
 
 /** The y/N question on a TTY: the impact, then "Proceed? [y/N] ". */
 function question(req: ConfirmRequest): string {
+  if (req.action === "rebuild") return rebuildQuestion(req);
   const { asset, impact } = req;
   const down = impact.downstream.length ? [`  then: ${impact.downstream.join(", ")} update`] : [];
   if (req.action === "allow_shrink") {

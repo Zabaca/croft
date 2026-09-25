@@ -4,7 +4,8 @@
 //   the last lease. Every connection is disconnected before closeSync(), because DuckDB keeps the OS lock
 //   while any connection of the instance is open.
 // - One access mode per process and path (connect.ts enforces it); instances only via fromCache.
-// - Read-write opens announce a write intent first and remove it only after closeSync() returned.
+// - Read-write opens announce a write intent first and remove it only after closeSync() returned. A process's first
+//   read-write open backs the file up first when its DuckDB is newer than the one recorded (db/backup.ts).
 // - Lock conflicts are retried with jittered backoff (25 ms doubling to 1 s) and end in DB_BUSY (a croft
 //   holder) or DB_HELD_BY_OTHER_PROGRAM, naming the holder from DuckDB's lock error.
 // - write() wraps BEGIN/COMMIT/ROLLBACK; every statement goes through prepare(), one per call, and the
@@ -16,7 +17,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
 import { type DuckDBConnection, type DuckDBInstance, type DuckDBResultReader, type DuckDBValue, StatementType,
-  blobValue, listValue } from "@duckdb/node-api";
+  blobValue, listValue, version as duckdbVersion } from "@duckdb/node-api";
 import { CroftError } from "../core/errors.ts";
 import type { LockHolder, Sql, Warehouse } from "../core/types.ts";
 import type { Row } from "../types.ts";
@@ -58,6 +59,8 @@ export interface WarehouseOptions {
   register?: boolean;                    // set globalThis[Symbol.for("croft.warehouse")]; default true
   /** How messages name the file: "the warehouse" (default), or "the preview database" for preview.duckdb. */
   label?: string;
+  /** The DuckDB engine this process runs, for the pre-upgrade backup (db/backup.ts); default version(). Tests inject it. */
+  engineVersion?: string;
 }
 
 export interface WriteOptions {
@@ -201,6 +204,7 @@ export class DuckWarehouse implements Warehouse {
   private waitingOn: LockHolder | null = null;
   private idle: (() => void)[] = [];
   private formatChecked = false;
+  private engineChecked = false;
 
   constructor(o: WarehouseOptions) {
     this.o = o;
@@ -381,6 +385,17 @@ export class DuckWarehouse implements Warehouse {
     }
     const start = Date.now();
     const deadline = start + waitMs;
+    // Before this process first opens the file read-write: a backup when its engine is newer than the recorded one.
+    if (this.usesIntent && !this.engineChecked) {
+      try {
+        const { backupBeforeUpgrade } = await import("./backup.ts");
+        await backupBeforeUpgrade(this.stateDir, this.path, this.o.engineVersion ?? duckdbVersion(), { waitMs, signal });
+      } catch (e) {
+        this.dropIntent();
+        throw e;
+      }
+      this.engineChecked = true;
+    }
     let noticed = false;
     const seen = new Map<number, { at: number; d: Described }>();
     // Foreign-holder bookkeeping. A GUI (DuckDB UI, DBeaver) never steps aside for an intent, so after it

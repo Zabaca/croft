@@ -161,3 +161,19 @@ retries, timeout (no-progress timeout, default "10m"), csv: { header, delimiter,
 (rules every load must pass, such as ["not_null(email)", "amount >= 0"]) and warnings (the same rules, reported
 without blocking); croft docs checks. A failing check writes nothing: the table keeps its previous rows and the
 cursor does not move.
+
+## Changing an ingest that has data
+
+Editing rows() or map() changes what is fetched next; rows already loaded are not fetched again. Some edits change
+how the stored rows were written, and croft stops before fetching rather than rewrite them on its own:
+- key, write or the incremental field: INGEST_CONFIG_CHANGED (croft docs INGEST_CONFIG_CHANGED). An append ingest
+  that gains a key can be converted in place, after a confirmation. Adding a lookback applies directly.
+- a columns pin that would change stored values: PIN_CHANGES_DATA (croft docs PIN_CHANGES_DATA).
+- the file's name: rename with croft rename <old> <new>, never by hand (croft docs rename).
+To fetch everything again from scratch: croft run <name> --rebuild. The table goes to the trash first and it asks
+for a confirmation, because the source may no longer have the old history: ask the user first.
+
+A long first load of a cursor ingest is saved in parts, every 50,000 rows or 5 minutes, while the cursor field
+arrives in ascending order (the step's reason says "saved in N commits"). A failure or a kill late in the load then
+continues from the last part saved instead of from the start. A newest-first source is saved in one commit at the
+end. With a lookback, a run that gets no rows although the window held rows last time warns EMPTY_EXTRACT.

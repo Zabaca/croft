@@ -25,6 +25,30 @@
 // why. A code hash that changed only because croft.json's timezone did is "time zone changed", not an edit
 // (project/resolve.ts timeZoneChanged).
 //
+// --rebuild (§4.1, §6): the assets named, by exact name only (a bare --rebuild or a glob is USAGE_ERROR), are built
+// from scratch (PlannedStep.rebuild, reason "rebuild"): an ingest refetches, an incremental TS transform processes
+// every input row again (action rebuild), and an SQL or full-refresh TS transform is recomputed as always. What the
+// run takes besides them (downstream, --upstream) runs as in any run. The runner trashes and asks (run/rebuild.ts).
+//
+// --due in a scheduled run (§6 "The scheduler only runs code a human has run"): with DuePlanning.imports, a TS
+// asset whose code is not the code a human last ran is not imported at all (project/resolve.ts importApproved): its
+// step is planned from what the scheduler knows of it (PlannedStep.notImported) and held.
+//
+// ASSET_RENAMED (§6 "Nothing implicit destroys ingested data", project/rename.ts findRenamed): an asset never built
+// whose code built an orphan table (its file was renamed outside croft), or either name of a croft rename that did
+// not finish, is never built from scratch, which would fetch everything again into a new table. Named exactly, its
+// step fails before it runs with ASSET_RENAMED, whose fix is `croft rename <old> <new>`; in a bare run, a glob or
+// taken for another reason, it is skipped with that problem as a warning, and so is what needs it while it has no
+// table (PlannedStep.renamed).
+//
+// What the catalog mirror shows of an ingest's code change (§6 "Behavior changes", "Pin changes"): pendingBehavior
+// and pendingPins compare the code with the write mode, key, cursor field and column types the mirror recorded at
+// the last commit, for the dry run, validate and status. The run itself decides from _croft (load/config-change.ts):
+// a changed key, write mode or cursor field fails the step before it fetches (INGEST_CONFIG_CHANGED), except an
+// append ingest gaining a key, which the run asks to convert in place (convert_key); a pin that would change stored
+// values asks too (pin_change). The mirror cannot count duplicates or changed values, so those two say what the run
+// counts and when it asks.
+//
 // A static error (a load error, CHECK_INVALID, CYCLE, a bind error) is a problem of its own step: that step
 // fails before it runs, and the rest of the run goes ahead. So is a blocking check that reads a table never built
 // that the run does not build first (unbuiltCheckTables): it names the table. A warning never blocks and does not
@@ -37,11 +61,14 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { CroftError, problem } from "../core/errors.ts";
-import type { Check, CursorType, Hold, Incremental, Problem, Reason, WriteMode } from "../core/types.ts";
+import type { Check, CursorType, Fix, Hold, Incremental, Problem, Reason, WriteMode } from "../core/types.ts";
 import { allCatalog, type CatalogAsset } from "../history/catalog.ts";
 import { RUNS_DB_FILE, RunsDb } from "../history/runs-db.ts";
-import { isReservedColumn } from "../load/evolve.ts";
+import { behaviorChange, type BehaviorChange } from "../load/config-change.ts";
+import { isReservedColumn, safeType } from "../load/evolve.ts";
+import { normalizePins, normalizeType, pinFor } from "../load/types.ts";
 import type { Graph } from "../project/graph.ts";
+import { findRenamed, type RenamedAsset, renamedProblem } from "../project/rename.ts";
 import {
   behaviorHash, behaviorLabel, bindProject, isGlob, neededBy, type ProjectBind, type ResolvedAsset, resolveProject, stepKindOf,
 } from "../project/resolve.ts";
@@ -109,6 +136,20 @@ export interface PlannedStep {
   /** --due: the schedule fire this ingest's step handles (ISO-8601 UTC), recorded as its last_fire_at when the step
    *  starts (§8). */
   fire?: string;
+  /** --rebuild named it: built from scratch (§6). An ingest refetches (no cursor, no file list) and an incremental
+   *  TS transform processes every input row again (its positions reset); both move their table to the trash first,
+   *  after a confirmation (run/rebuild.ts). An SQL or full-refresh TS transform is recomputed as always. */
+  rebuild?: true;
+  /** --rebuild of an ingest: the paid incremental transforms that read it with newRows() (paidReadersOf), which
+   *  would process every row of it again: its confirmation counts them. */
+  paidReaders?: string[];
+  /** --due: a TS asset whose code is not the code a human last ran, so it was not imported (DuePlanning.imports):
+   *  planned from what the scheduler knows of it, with no module, and held. */
+  notImported?: true;
+  /** ASSET_RENAMED (§6): the asset, or an input it needs that was never built, looks like a file renamed outside
+   *  croft (or a croft rename that did not finish). A run never builds it from scratch: named exactly, the step fails
+   *  before it runs with ASSET_RENAMED; otherwise it is skipped, and so is what needs it (see the top of the file). */
+  renamed?: { from: string; to: string; unfinished: boolean };
 }
 
 /**
@@ -122,6 +163,17 @@ export interface DuePlanning {
   hold(step: { asset: string; file: string; kind: StepKind; codeHash?: string; ok: boolean }): { hold: Hold; reason: string; problem?: Problem } | null;
   /** The fire a due ingest handles (its schedule as written), or null. */
   fire(step: { asset: string; schedule?: string }): string | null;
+  /** What the scheduled run may import (§6): a TS asset only when the code hash of its bundle (computed without
+   *  running it) is `approved`; any other is planned from `known` (the scheduler's cached facts) and held. Absent:
+   *  every asset is imported, as in a run by hand. */
+  imports?: ApprovedImports;
+}
+
+/** project/resolve.ts ResolveInput.importApproved: the approved code hash of each asset, and what the scheduler
+ *  knows of one it does not import. */
+export interface ApprovedImports {
+  approved(asset: string): string | null;
+  known?(asset: string): { kind: "ingest" | "sql" | "ts" | null; inputs: readonly string[]; incremental: boolean } | null;
 }
 
 export interface RunPlan {
@@ -156,6 +208,9 @@ export interface PlanInput {
   /** --from: only fetches run. In a bare run or a glob, an ingest it does not apply to is planned as skip (one
    *  named exactly is refused by the runner's checkRunFlags instead), and so is every transform. */
   from?: string;
+  /** --rebuild: the named assets are built from scratch (PlannedStep.rebuild). Names only: a bare run or a glob is
+   *  USAGE_ERROR (rebuildSelectors). */
+  rebuild?: boolean;
   /** The command that was typed, again with other selectors: the did-you-mean fix of a mistyped name
    *  (project/resolve.ts selectAssets). Default: `croft run <selectors>`. */
   retry?: (selectors: readonly string[]) => string;
@@ -171,6 +226,39 @@ export const DEFAULT_RETRIES = 2;
 export const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 /** Why a bare or glob `--from` run skips an asset --from cannot apply to (§8). */
 export const FROM_ONLY_MERGE = "--from applies to merge ingests";
+
+/** The command that rebuilds one asset from scratch; `croft confirm` runs exactly this. `allowShrink`: an ingest's
+ *  refetch may replace its table even with fewer than half of its rows. */
+export function rebuildCommand(asset: string, o: { allowShrink?: boolean } = {}): string {
+  return `croft run ${asset} --rebuild${o.allowShrink ? " --allow-shrink" : ""}`;
+}
+
+/**
+ * The incremental TS transforms that read `ingest` with newRows() and whose code makes requests (the cost guard's
+ * transforms), among `readers`. A --rebuild of the ingest gives every row a new _loaded_at, so each of them would
+ * process every row again and pay for it: the rebuild's confirmation counts them (run/rebuild.ts). Sorted.
+ */
+export function paidReadersOf(ingest: string, readers: readonly string[], byName: ReadonlyMap<string, Pick<ResolvedAsset, "kind" | "ts" | "incremental" | "usesHttp">>): string[] {
+  return readers.filter((r) => {
+    const a = byName.get(r);
+    if (!a || stepKindOf(a) !== "transform" || a.incremental.kind !== "new-rows" || a.usesHttp !== true) return false;
+    const reads = a.ts?.readsNewRows;
+    return !reads || reads.includes(ingest);
+  }).sort();
+}
+
+/** --rebuild takes the exact names of the assets to build from scratch (§6 "Guards aimed at agents": a destructive
+ *  option names what it destroys). USAGE_ERROR for a bare --rebuild or a glob. */
+export function rebuildSelectors(selectors: readonly string[]): void {
+  const glob = selectors.find((s) => isGlob(s));
+  if (selectors.length > 0 && glob === undefined) return;
+  throw new CroftError("USAGE_ERROR", {
+    message: glob === undefined ? "--rebuild takes the names of the assets to build from scratch" : `--rebuild takes exact asset names, not a glob (${glob})`,
+    hint: "name each asset: croft run <asset> --rebuild (an ingest or an incremental transform goes to the trash first, after confirmation)",
+    fix: { kind: "command", description: "list the assets, to name each one to build from scratch", command: "croft status" },
+    details: { selectors: [...selectors] },
+  });
+}
 
 /** Bind errors no column an input gains can fix: they count even when an input the run refreshes first could
  *  still change its columns. */
@@ -361,6 +449,8 @@ function sameColumns(a: readonly { name: string; type: string }[], b: readonly {
 /** Discover, resolve and bind the project, and decide what each asset the run takes does (see the top). Throws
  *  USAGE_ERROR (or the named file's discovery problem) for a selector that names nothing. */
 export async function planRun(i: PlanInput): Promise<RunPlan> {
+  // Before anything is imported: --rebuild names what it rebuilds.
+  if (i.rebuild) rebuildSelectors(i.selectors);
   const catalog = i.catalog ?? mirrorOf(i.root);
   const entries = new Map(catalog.map((c) => [c.asset, c]));
   const entry = (name: string) => entries.get(name) ?? null;
@@ -368,6 +458,7 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
     root: i.root, timezone: i.timezone, selectors: i.selectors, keepOutput: true, cursorTypes: i.cursorTypes ?? cursorTypesOf(catalog),
     builtHashes: (name) => entry(name)?.codeHash ?? null,
     ...(i.importTimeoutMs !== undefined ? { importTimeoutMs: i.importTimeoutMs } : {}), ...(i.retry ? { retry: i.retry } : {}),
+    ...(i.due?.imports ? { importApproved: i.due.imports } : {}),
   });
   const byName = new Map(project.assets.map((a) => [a.name, a]));
   const flags = { bare: i.selectors.length === 0, only: i.only === true, upstream: i.upstream === true, from: i.from !== undefined, due: i.due !== undefined };
@@ -411,6 +502,13 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
     bound = await bind(taken);
   }
   const graph = bound.graph;
+  // --rebuild: the named assets are built from scratch; what else the run takes runs as in any run.
+  if (i.rebuild) {
+    for (const name of project.selected) {
+      const t = taken.get(name);
+      if (t) t.reasons = new Set<Reason>(["requested", "rebuild", ...t.reasons]);
+    }
+  }
 
   const order = [
     ...graph.order.filter((n) => taken.has(n)),
@@ -421,8 +519,12 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
   /** Steps skipped because an input will not exist (INPUT_NOT_BUILT), with the never-built assets at the root of
    *  it: running those builds the rest. */
   const notBuilding = new Map<string, string[]>();
+  /** ASSET_RENAMED: the renamed assets by name, then also what is skipped because it needs one (the cause). */
+  const renamedCause = await renamedIn(i.root, catalog, byName);
+  /** Steps skipped for a rename (their own, or an input's). */
+  const renamedSkip = new Set<string>();
   // This run builds it: taken, with nothing that fails it before it runs, and not skipped for a missing input.
-  const builds = (n: string) => taken.has(n) && !hasErrors(byName.get(n)!) && !notBuilding.has(n);
+  const builds = (n: string) => taken.has(n) && !hasErrors(byName.get(n)!) && !notBuilding.has(n) && !renamedSkip.has(n);
   // A table a blocking check reads exists when the step runs: it was built, or this run builds it first (it is in
   // the step's orderAfter). A warning does not wait for the tables it reads: one this run builds exists for it
   // only when it is built before the asset anyway, through what the asset must run after.
@@ -452,6 +554,11 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
       cycle: graph.cycles.findIndex((c) => c.includes(name)),
       checkTables,
     });
+    if (step.rebuild && (step.kind === "rows" || step.kind === "file")) {
+      // A reader rebuilt in the same run asks for its own reprocessing.
+      const paid = paidReadersOf(name, step.readBy, byName).filter((r) => !taken.get(r)?.reasons.has("rebuild"));
+      if (paid.length) step.paidReaders = paid;
+    }
     // --from: only fetches run (the runner skips every other step). A transform is skipped, whatever reads a
     // backfilled ingest included; in a bare run or a glob, so is an ingest --from cannot apply to (one named
     // exactly is refused by the runner's checkRunFlags instead).
@@ -462,12 +569,30 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
         step.reason = FROM_ONLY_MERGE;
       }
     }
+    // ASSET_RENAMED: never built from scratch. Named exactly, the step fails before it runs; otherwise it is skipped.
+    const own = renamedCause.get(name);
+    if (own && step.action !== "skip" && loadErrors(step).length === 0) {
+      step.renamed = { from: own.from, to: own.to, unfinished: own.unfinished === true };
+      const p: Problem = { ...renamedProblem(own), asset: name, file: step.file };
+      if (exact.has(name)) step.problems.push(p);
+      else {
+        skipRenamed(step, own, p);
+        renamedSkip.add(name);
+      }
+    }
     // An input that will not exist when the step runs: never built, and not built by this run (not taken, or
     // skipped for the same reason). The step would fail with "no table named ..."; it is skipped instead, naming
-    // the run that builds the input. An input the run takes that fails is the runner's news: it skips the step.
+    // the run that builds the input, or the rename that adopts it. An input the run takes that fails is the runner's
+    // news: it skips the step.
     if (step.action !== "skip" && loadErrors(step).length === 0) {
+      const via = step.inputs.find((x) => x !== name && entry(x) === null && renamedCause.has(x) && !builds(x));
       const missing = step.inputs.filter((x) => x !== name && byName.has(x) && entry(x) === null && (!taken.has(x) || notBuilding.has(x)));
-      if (missing.length) {
+      if (via !== undefined) {
+        const cause = renamedCause.get(via)!;
+        skipForRenamedInput(step, via, cause);
+        renamedCause.set(name, cause);
+        renamedSkip.add(name);
+      } else if (missing.length) {
         const roots = [...new Set(missing.flatMap((x) => rootsOf(x)))];
         notBuilding.set(name, roots);
         skipForInputs(step, missing, roots);
@@ -505,6 +630,13 @@ function applyDue(step: PlannedStep, due: DuePlanning): void {
     step.hold = h.hold;
     step.reason = h.reason;
     if (h.problem) step.problems.push({ ...h.problem, asset: h.problem.asset ?? step.asset });
+    return;
+  }
+  // Code the plan did not import is not the code a human ran: it never runs here, whatever the hold said (an
+  // approval between the import and the hold).
+  if (step.notImported) {
+    step.hold = "code_not_run_by_hand";
+    step.reason = "held: its code has not been run by hand yet";
     return;
   }
   const fire = transform ? null : due.fire({ asset: step.asset, ...(step.spec?.schedule !== undefined ? { schedule: step.spec.schedule } : {}) });
@@ -559,8 +691,10 @@ interface StepContext {
 function stepOf(a: ResolvedAsset, t: Taken, c: StepContext): PlannedStep {
   const kind = stepKindOf(a);
   const spec = a.ts?.spec;
+  const rebuild = t.reasons.has("rebuild");
+  // An incremental TS transform rebuilt from scratch processes every input row again: a rebuild, not an update.
   const action: PlannedStep["action"] = kind === "rows" || kind === "file" ? "fetch"
-    : kind === "transform" && a.incremental.kind === "new-rows" ? "update" : "rebuild";
+    : kind === "transform" && a.incremental.kind === "new-rows" && !rebuild ? "update" : "rebuild";
   let problems = [...a.problems];
   const r = c.bind.results.get(a.name);
   if (r) {
@@ -576,13 +710,15 @@ function stepOf(a: ResolvedAsset, t: Taken, c: StepContext): PlannedStep {
   }
   problems.push(...c.checkTables.problems);
   const view = viewOf(a, c.inputs, c.entry);
-  if (kind === "transform" && a.incremental.kind === "new-rows") {
+  // A rebuild redoes the rows older code built: the warning about them does not apply to it.
+  if (kind === "transform" && a.incremental.kind === "new-rows" && !rebuild) {
     const edited = editedProblem(view);
     if (edited) problems.push(edited);
   }
   const reasons = [...t.reasons];
   return {
     asset: a.name, file: a.file, path: a.path, kind, action, reasons, reason: reasonText(a, t, view), problems,
+    ...(rebuild ? { rebuild: true as const } : {}), ...(a.notImported ? { notImported: true as const } : {}),
     ...(t.readers.length ? { neededBy: [...t.readers] } : {}),
     ...(a.ts ? { loaded: a.ts } : {}), ...(spec ? { spec } : {}), ...(a.sql ? { sql: a.sql } : {}),
     inputs: [...c.inputs], orderAfter: [...new Set([...a.orderAfter, ...c.inputs])], readBy: c.readBy,
@@ -675,6 +811,218 @@ export function inputNotBuilt(step: Pick<PlannedStep, "action" | "problems">): P
   return step.action === "skip" ? step.problems.find((p) => p.code === "INPUT_NOT_BUILT" && Array.isArray(p.details?.inputs)) : undefined;
 }
 
+/** The problem a step was skipped with, which the run and the dry run report: INPUT_NOT_BUILT (skipForInputs), or
+ *  ASSET_RENAMED (skipRenamed). A step skipped for a renamed input has none of its own: its input's says it. */
+export function skipProblem(step: Pick<PlannedStep, "action" | "problems">): Problem | undefined {
+  if (step.action !== "skip") return undefined;
+  return inputNotBuilt(step) ?? step.problems.find((p) => p.code === "ASSET_RENAMED");
+}
+
+/**
+ * The assets findRenamed reports (project/rename.ts): the new name of each asset renamed outside croft, and both
+ * names of a croft rename that did not finish, with the code hashes the plan resolved (an asset not imported is
+ * hashed without running it). A project whose files or mirror cannot be read reports none: the run goes on.
+ */
+async function renamedIn(root: string, catalog: readonly CatalogAsset[], byName: ReadonlyMap<string, ResolvedAsset>): Promise<Map<string, RenamedAsset>> {
+  const out = new Map<string, RenamedAsset>();
+  try {
+    const codeHash = (n: string) => {
+      const a = byName.get(n);
+      return a && a.loaded ? a.codeHash ?? null : undefined;
+    };
+    for (const r of await findRenamed(root, { catalog, codeHash })) {
+      if (!out.has(r.to)) out.set(r.to, r);
+      if (r.unfinished && !out.has(r.from)) out.set(r.from, r);
+    }
+  } catch {
+    // Nothing is reported; validate and status say the same when they can read the project.
+  }
+  return out;
+}
+
+/** Skip a renamed asset (a bare run, a glob, or taken for another reason): ASSET_RENAMED as a warning, and the rename
+ *  that adopts its table (never a run, which would build it again from scratch). */
+function skipRenamed(step: PlannedStep, r: RenamedAsset, p: Problem): void {
+  const rename = `croft rename ${r.from} ${r.to}`;
+  const again = step.kind === "rows" || step.kind === "file" ? "fetch everything again" : "build it again from scratch";
+  step.action = "skip";
+  step.reason = r.unfinished
+    ? `${rename} did not finish: ${step.asset} does not run until the same command finishes it`
+    : `looks like ${r.from} renamed outside croft: ${rename} adopts its table and state (a run would ${again})`;
+  step.problems.push({ ...p, severity: "warning" });
+}
+
+/** Skip a step that needs a renamed asset (or a step skipped for one) that has no table. */
+function skipForRenamedInput(step: PlannedStep, input: string, r: RenamedAsset): void {
+  const rename = `croft rename ${r.from} ${r.to}`;
+  step.action = "skip";
+  step.renamed = { from: r.from, to: r.to, unfinished: r.unfinished === true };
+  const what = input === r.to ? "it" : `it needs ${r.to}, which`;
+  step.reason = r.unfinished
+    ? `input ${input} has never been built: ${rename} did not finish (the same command finishes it)`
+    : `input ${input} has never been built: ${what} looks like ${r.from} renamed outside croft (${rename} adopts its table)`;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// What the catalog mirror shows of an ingest's code change (§6 "Behavior changes", "Pin changes"), before a run
+
+/** An ingest as its code says it writes now: a planned step, or a resolved asset (validate, status). */
+export interface BehaviorSide {
+  asset: string;
+  file: string;
+  kind: StepKind;
+  /** The code hash now; unknown (undefined) means nothing is compared. */
+  codeHash?: string;
+  write: WriteMode;
+  key: readonly string[];
+  incremental: Incremental;
+  behaviorHash: string;
+  pins?: Record<string, { type: string; format?: string }>;
+}
+
+/** A resolved asset as the mirror-side checks take it (validate, status): an ingest whose definition loaded, else
+ *  null (a broken one keeps default settings, which would look like a change). */
+export function resolvedSide(a: ResolvedAsset): BehaviorSide | null {
+  if (a.kind !== "ingest" || !a.ts?.spec) return null;
+  return {
+    asset: a.name, file: a.file, kind: stepKindOf(a), ...(a.codeHash ? { codeHash: a.codeHash } : {}), write: a.write, key: a.key,
+    incremental: a.incremental, behaviorHash: a.behaviorHash, pins: a.pins,
+  };
+}
+
+/** A change of how an ingest writes its rows, as the mirror shows it, with the problem a run would raise. */
+export interface PendingBehavior {
+  change: BehaviorChange;
+  /** The stored rows, as the mirror has them. */
+  rows: number;
+  /** An append ingest gaining a key with its cursor field unchanged: the run counts the stored rows with the same key
+   *  and asks to convert them in place (convert_key; applied without asking when none repeats, INGEST_CONFIG_CHANGED
+   *  when one has no key). Otherwise the run fails before it fetches. */
+  convertible: boolean;
+  /** INGEST_CONFIG_CHANGED with the run's fixes: an error when the run would fail, a warning when it would ask. */
+  problem: Problem;
+}
+
+/** Whether the mirror's entry was built by other code than the ingest's now: only then can its behavior or pins
+ *  differ. An unknown hash on either side is no change (§5: unknowns are for the run to find). */
+function editedIngest(a: BehaviorSide, entry: CatalogAsset | null): entry is CatalogAsset {
+  return (a.kind === "rows" || a.kind === "file") && entry !== null && entry.kind === "ingest" && entry.rows > 0
+    && !!a.codeHash && !!entry.codeHash && a.codeHash !== entry.codeHash;
+}
+
+/**
+ * INGEST_CONFIG_CHANGED before a run, from the catalog mirror: the write mode, key and cursor field it recorded at the
+ * last commit against the code now (load/config-change.ts behaviorChange, as the run compares _croft.assets). A file
+ * ingest's incremental setting is not in the mirror, so only its write mode and key count here; the run checks it.
+ * null when nothing that counts changed, or the table has no rows.
+ */
+export function pendingBehavior(a: BehaviorSide, entry: CatalogAsset | null): PendingBehavior | null {
+  if (!editedIngest(a, entry)) return null;
+  const stored: Incremental = entry.cursor ? { kind: "cursor", field: entry.cursor.field, lookbackMs: 0 }
+    : a.kind === "file" && a.incremental.kind !== "cursor" ? a.incremental : { kind: "none" };
+  const change = behaviorChange(
+    { kind: entry.kind, write: entry.write, key: entry.key, behaviorHash: behaviorHash(entry.write, entry.key, stored) },
+    { write: a.write, key: a.key, behaviorHash: a.behaviorHash, hashWith: (w, k) => behaviorHash(w, k, a.incremental) },
+  );
+  if (!change) return null;
+  const incremental = {
+    from: entry.cursor && !(a.incremental.kind === "cursor" && a.incremental.field === entry.cursor.field) ? entry.cursor.field : null,
+    to: incrementalWords(a.incremental),
+  };
+  const convertible = change.appendGainsKey;
+  return { change, rows: entry.rows, convertible, problem: configChangedProblem(a, change, entry.rows, incremental, convertible) };
+}
+
+/** A pin that differs from its column's stored type, as the mirror has it. */
+export interface PendingPin { column: string; from: string; to: string }
+
+/**
+ * Pins that differ from their column's stored type in the mirror (§6 "Pin changes"): the run tests the stored values
+ * first, retypes the column directly when none would change, and asks (pin_change, the table to the trash first)
+ * when some would. A NULL-only placeholder, an alias of the stored type, and a pin that is no plain type (the run's
+ * ASSET_INVALID) are not listed.
+ */
+export function pendingPins(a: BehaviorSide, entry: CatalogAsset | null): PendingPin[] {
+  if (!editedIngest(a, entry) || !a.pins) return [];
+  const pins = normalizePins(a.pins);
+  const out: PendingPin[] = [];
+  for (const c of entry.columns) {
+    if (isReservedColumn(c.name) || c.pending) continue;
+    const pin = pinFor(pins, c.name, c.sourceName);
+    if (!pin) continue;
+    let to: string;
+    try {
+      to = normalizeType(safeType(pin.type, c.name));
+    } catch {
+      continue;
+    }
+    const from = normalizeType(c.type);
+    if (to !== from) out.push({ column: c.name, from, to });
+  }
+  return out;
+}
+
+/** An ingest's incremental setting in words, as the run's INGEST_CONFIG_CHANGED says it. */
+function incrementalWords(i: Incremental): string {
+  return i.kind === "cursor" ? i.field : i.kind === "files" ? "new and changed files" : i.kind === "new-rows" ? "new rows" : "none";
+}
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+/** "merge by id", "append (key id)", "replace": how the run's INGEST_CONFIG_CHANGED names a behavior. */
+function writeLabel(b: { write: WriteMode; key: readonly string[] }): string {
+  const k = b.key.join(", ");
+  if (b.write === "merge") return `merge by ${k}`;
+  return b.key.length ? `${b.write} (key ${k})` : b.write;
+}
+
+/**
+ * INGEST_CONFIG_CHANGED as validate, status and the dry run report it before a run, with the run's fixes and words
+ * (load/config-change.ts configChanged): put the change back (an edit), or ask the user about `croft run x --rebuild`,
+ * and for an append ingest gaining a key, about converting in place. The run's own problem also counts the duplicates
+ * and the rows without a key, which only the warehouse knows.
+ */
+function configChangedProblem(a: BehaviorSide, change: BehaviorChange, rows: number, incremental: { from: string | null; to: string },
+  convertible: boolean): Problem {
+  const { asset, file } = a;
+  const key = (k: readonly string[]) => (k.length ? k.join(", ") : "none");
+  const parts: string[] = [];
+  if (change.changed.includes("write")) parts.push(`write: ${change.from.write} → ${change.to.write}`);
+  if (change.changed.includes("key")) parts.push(`key: ${key(change.from.key)} → ${key(change.to.key)}`);
+  if (change.changed.includes("incremental")) {
+    parts.push(incremental.from !== null ? `incremental: ${incremental.from} → ${incremental.to}` : `incremental: now ${incremental.to}`);
+  }
+  const what = change.changed.map((p) => (p === "write" ? "write mode" : p === "key" ? "key" : "incremental field")).join(" and ");
+  const rebuild = `croft run ${asset} --rebuild refetches everything under the new rules (its table goes to the trash first, and it asks for confirmation)`;
+  const fixes: Fix[] = [
+    { kind: "edit", description: `put the ${what} back as it was (${parts.join("; ")})`, file },
+    { kind: "manual", requiresHuman: true, description: `ask the user whether to refetch from the source: ${rebuild}` },
+  ];
+  const were = rows === 1 ? "was" : "were";
+  const details = { changed: change.changed, from: change.from, to: change.to, rows, convertible, pending: true, fixes };
+  if (convertible) {
+    const k = change.to.key.join(", ");
+    fixes.push({ kind: "manual", requiresHuman: true, description: `ask the user whether to convert in place: croft run ${asset} asks for confirmation, moves the table to the trash first, then keeps the latest row of each ${k}` });
+    return {
+      ...problem("INGEST_CONFIG_CHANGED", {
+        asset, file,
+        message: `${asset} now has the key ${k}, but its ${plural(rows, "stored row")} ${were} appended without one: croft run ${asset} counts the stored rows with the same ${k} and asks before converting them in place (it keeps the latest row of each ${k}, and the table goes to the trash first)`,
+        hint: `ask the user; if they agree, croft run ${asset} asks for the conversion and they confirm it. Otherwise remove the key again, or ${rebuild}`,
+        effect: `croft run ${asset} stops to ask before it fetches anything`,
+        fix: fixes[0], details,
+      }),
+      severity: "warning",
+    };
+  }
+  return problem("INGEST_CONFIG_CHANGED", {
+    asset, file,
+    message: `${asset}'s ${plural(rows, "stored row")} ${were} written as ${writeLabel(change.from)}, but its code now says ${writeLabel(change.to)} (${parts.join("; ")}); croft does not rewrite stored rows on its own`,
+    hint: `put the ${what} back as it was in ${file}, or ${rebuild}`,
+    effect: `croft run ${asset} fails before it fetches anything`,
+    fix: fixes[0], details,
+  });
+}
+
 /** The next step for a step skipped with INPUT_NOT_BUILT: its fix, the run that builds the never-built input. */
 export function buildFirst(p: Problem): { command: string; reason: string } | null {
   if (p.fix?.kind !== "command") return null;
@@ -715,9 +1063,13 @@ function names(list: readonly string[], max = 3): string {
  *  describe its window and behavior instead. */
 function reasonText(a: ResolvedAsset, t: Taken, view: StaleView): string {
   const parts: string[] = [];
+  const rebuild = t.reasons.has("rebuild");
   if (t.reasons.has("requested")) parts.push("requested");
   if (t.reasons.has("schedule_due")) parts.push("scheduled");
+  if (rebuild) parts.push("from scratch (--rebuild)");
   if (!isTransform(a)) return parts.join("; ") || "requested";
+  // Forward-only: an incremental TS transform processes new input rows only, until it is rebuilt.
+  const forwardOnly = a.kind === "ts" && a.incremental.kind === "new-rows" && !rebuild;
   if (t.reasons.has("never_built")) parts.push("never built");
   const zone = a.timeZoneChanged;
   if (t.reasons.has("code_changed")) {
@@ -737,7 +1089,12 @@ function reasonText(a: ResolvedAsset, t: Taken, view: StaleView): string {
   const are = (list: readonly string[], one: string, many: string) =>
     `${list.length === 1 ? "input" : "inputs"} ${names(list)} ${list.length === 1 ? one : many}`;
   if (changed.length) parts.push(are(changed, "has new rows", "have new rows"));
-  if (replaced.length) parts.push(`${are(replaced, "was replaced", "were replaced")} (restored, or changed outside croft)`);
+  // The rows a restore brought back are not new rows to an incremental transform (§6 "Trash, restore and delete":
+  // "input restored; --rebuild offered").
+  if (replaced.length) {
+    parts.push(`${are(replaced, "was replaced", "were replaced")} (restored, or changed outside croft)`
+      + (forwardOnly ? `: only new input rows are processed, and ${rebuildCommand(a.name)} redoes every row` : ""));
+  }
   // What an input the run refreshes first may bring (a transform never built reads all of it anyway).
   const fresh = t.feeding.filter((x) => !changed.includes(x));
   if (fresh.length && !t.reasons.has("never_built")) parts.push(are(fresh, "may have new rows", "may have new rows"));
@@ -745,7 +1102,7 @@ function reasonText(a: ResolvedAsset, t: Taken, view: StaleView): string {
   if (t.readers.length) {
     parts.push(`${names(t.readers)} ${t.readers.length === 1 ? "reads" : "read"} ${t.reasons.has("never_built") ? "it" : "its new columns"}`);
   }
-  if (a.kind === "ts" && a.incremental.kind === "new-rows" && entry?.codeHash && a.codeHash) {
+  if (forwardOnly && entry?.codeHash && a.codeHash) {
     parts.push(entry.codeHash === a.codeHash ? "(TS code unchanged)"
       : zone ? `(time zone changed from ${zone.from}: the new zone applies to new input rows only)`
         : "(code edited: the new code applies to new input rows only)");
@@ -758,21 +1115,37 @@ function reasonText(a: ResolvedAsset, t: Taken, view: StaleView): string {
 
 /**
  * BACKFILL_UNSUPPORTED for everything but cursor ingests; append ingests are checked against the saved
- * cursor by the ingest step (BACKFILL_WOULD_DUPLICATE). null when `--from` applies.
+ * cursor by the ingest step (BACKFILL_WOULD_DUPLICATE). null when `--from` applies. The texts are §8's table:
+ * where a rebuild is the backfill, they name --rebuild. A rebuild that trashes and asks (a file ingest, an
+ * incremental TS transform) is in the hint and a human's fix, never a command fix (§4.3: a destructive command is
+ * the user's to run).
  */
 export function backfillUnsupported(step: Pick<PlannedStep, "asset" | "file" | "kind" | "incremental" | "write">): CroftError | null {
   const at = { asset: step.asset, file: step.file };
+  const rebuild = rebuildCommand(step.asset);
+  const trashFirst = "its table goes to the trash first, after confirmation";
+  if (step.kind === "transform" && step.incremental.kind === "new-rows") {
+    return new CroftError("BACKFILL_UNSUPPORTED", {
+      ...at, message: `${step.asset} is a transform; --from applies to merge ingests`,
+      hint: `use ${rebuild}: it processes every input row again with the code as it is now (${trashFirst})`,
+      fix: {
+        kind: "manual", requiresHuman: true,
+        description: `ask the user whether ${step.asset} should process every input row again (its code may pay per row); only after a yes: ${rebuild}`,
+      },
+    });
+  }
   if (step.kind === "sql" || step.kind === "transform") {
     return new CroftError("BACKFILL_UNSUPPORTED", {
       ...at, message: `${step.asset} is a transform; --from applies to merge ingests`,
-      hint: `transforms are rebuilt from their inputs; there is nothing to backfill: croft run ${step.asset}`,
-      fix: { kind: "command", description: "run the transform", command: `croft run ${step.asset}` },
+      hint: `use ${rebuild}: a transform is recomputed from its inputs`,
+      fix: { kind: "command", description: "recompute the transform", command: rebuild },
     });
   }
   if (step.kind === "file") {
     return new CroftError("BACKFILL_UNSUPPORTED", {
       ...at, message: `${step.asset} is a file ingest; --from applies to merge ingests`,
-      hint: `changed files reload automatically on the next run; there is nothing to backfill: croft run ${step.asset}`,
+      hint: `changed files reload automatically; ${rebuild} reloads all files (${trashFirst})`,
+      fix: { kind: "command", description: "load the new and changed files", command: `croft run ${step.asset}` },
     });
   }
   if (step.incremental.kind !== "cursor" || step.write === "replace") {

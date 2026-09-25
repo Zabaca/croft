@@ -9,7 +9,7 @@
 // Run: `bun test tests/e2e` from packages/croft (it is also part of the whole `bun test`). Journeys that hit a
 // reported product bug keep their assertions in bugTest() (test.failing); `CROFT_E2E_BUGS=1 bun test tests/e2e`
 // runs those as plain tests to show each bug's actual failure.
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { Server } from "bun";
@@ -281,6 +281,26 @@ export function codes(env: Envelope): string[] {
 export function findProblem(env: Envelope, code: string): Record<string, any> | undefined {
   return (env.problems ?? []).find((p: { code: string }) => p.code === code)
     ?? (env.data?.steps ?? []).map((s: { error?: { code: string } }) => s.error).find((e: { code: string } | undefined) => e?.code === code);
+}
+
+/** The step of `asset` in a run envelope, or in the run a `croft confirm` carried out (data.result). */
+export function stepOf(env: Envelope, asset: string): Envelope {
+  const steps = (env.data?.steps ?? env.data?.result?.steps ?? []) as Envelope[];
+  const s = steps.find((x) => x.asset === asset);
+  if (!s) throw new Error(`no step for ${asset} in ${JSON.stringify(env).slice(0, 2000)}`);
+  return s;
+}
+
+/** The next[] commands that destroy or replace data (§4.3: they never appear there; only a person runs them). */
+export function destructiveNext(env: Envelope): string[] {
+  return ((env.next ?? []) as { command: string }[]).map((n) => n.command)
+    .filter((c) => /croft confirm|--rebuild|--allow-shrink|croft delete|croft restore/.test(c));
+}
+
+/** The versions of `asset` in a project's trash (.croft/trash/<asset>/*.duckdb), oldest first. */
+export function trashVersions(p: Project, asset: string): string[] {
+  const dir = join(p.stateDir, "trash", asset);
+  return existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".duckdb")).sort() : [];
 }
 
 export const ISO_WITH_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?[+-]\d{2}:\d{2}$/;

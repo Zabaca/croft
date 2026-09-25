@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tsconfigJson } from "../../agent/templates.ts";
 import { type CatalogAsset, type CatalogColumn, putCatalog } from "../../history/catalog.ts";
@@ -588,5 +588,84 @@ describe("--types", () => {
       { file: "lib/b.ts", line: 10, column: 1, severity: "error", code: "TS2345", message: "Argument of type 'X' is not assignable to parameter of type 'Y'.\nProperty 'z' is missing in type 'X'." },
       { severity: "error", code: "TS5083", message: "Cannot read file '/x/tsconfig.json'." },
     ]);
+  });
+});
+
+describe("ASSET_RENAMED (§6): a file renamed outside croft", () => {
+  test("a never-built asset with an orphan table's code is an error whose fix is croft rename; other code is not", async () => {
+    const p = makeProject({ files: { "assets/daily.sql": "-- key: d\nSELECT 1 AS d\n", "assets/other.sql": "SELECT 2 AS d\n" } });
+    const hash = (await resolveProject({ root: p.root, timezone: p.project.timezone })).assets.find((a) => a.name === "daily")!.codeHash!;
+    catalog(p, [{ ...ISSUES_BUILT, asset: "daily", kind: "sql", write: "replace", key: ["d"], cursor: null, columns: [col("d", "INTEGER")], codeHash: hash, rows: 7 }]);
+    renameSync(join(p.root, "assets/daily.sql"), join(p.root, "assets/per_day.sql"));
+
+    const r = await cli(["validate", "--json"], { cwd: p.root });
+    expect(r.exit).toBe(2);
+    expect(r.json.problems).toEqual([expect.objectContaining({
+      severity: "error", code: "ASSET_RENAMED", asset: "per_day", file: "assets/per_day.sql",
+      message: "assets/per_day.sql has never been built, and its code is the code that built daily (7 rows), whose asset file is gone: daily was renamed outside croft",
+      fix: { kind: "command", description: "adopt daily's table and state as per_day", command: "croft rename daily per_day" },
+    })]);
+    // Only for the selection.
+    expect((await cli(["validate", "other", "--json"], { cwd: p.root })).json.problems).toEqual([]);
+    expect((await cli(["validate", "per_day", "--json"], { cwd: p.root })).json.problems.map((x: { code: string }) => x.code)).toEqual(["ASSET_RENAMED"]);
+  });
+});
+
+// §6 "Behavior changes": a changed key, write mode or cursor field fails the run's step before it fetches; an append
+// ingest gaining a key is converted in place after a confirmation. validate says so first, from the catalog mirror.
+describe("INGEST_CONFIG_CHANGED (§6): an ingest's code changed how its stored rows are written", () => {
+  const EVENTS_TS = (config: string) => `import { ingest } from "@zabaca/croft";
+export default ingest({ ${config} async *rows() { yield []; } });
+`;
+  const EVENTS_BUILT: CatalogAsset = {
+    ...ISSUES_BUILT, asset: "events", write: "append", key: [], rows: 40, columns: [col("seq", "BIGINT"), col("_loaded_at", "TIMESTAMPTZ", { sourceName: null })],
+    cursor: { field: "seq", value: "40", type: "integer", unit: null }, codeHash: "older-code",
+  };
+  const rebuild = (asset: string) => `croft run ${asset} --rebuild refetches everything under the new rules (its table goes to the trash first, and it asks for confirmation)`;
+
+  test("a changed key: an error with the run's fixes, exit 2; the same key again says nothing", async () => {
+    const p = makeProject({ files: { "assets/github_issues.ts": ISSUES_TS.replace('key: "id"', 'key: "number"') } });
+    catalog(p, [ISSUES_BUILT]);
+    const r = await check(p);
+    expect(r.problems).toEqual([expect.objectContaining({
+      code: "INGEST_CONFIG_CHANGED", severity: "error", asset: "github_issues", file: "assets/github_issues.ts",
+      message: "github_issues's 3 stored rows were written as merge by id, but its code now says merge by number (key: id → number); croft does not rewrite stored rows on its own",
+      hint: `put the key back as it was in assets/github_issues.ts, or ${rebuild("github_issues")}`,
+      effect: "croft run github_issues fails before it fetches anything",
+      fix: { kind: "edit", description: "put the key back as it was (key: id → number)", file: "assets/github_issues.ts" },
+    })]);
+    expect(r.problems[0]!.details!.fixes).toEqual([
+      { kind: "edit", description: "put the key back as it was (key: id → number)", file: "assets/github_issues.ts" },
+      { kind: "manual", requiresHuman: true, description: `ask the user whether to refetch from the source: ${rebuild("github_issues")}` },
+    ]);
+    const out = await cli(["validate", "--json"], { cwd: p.root });
+    expect(out.exit).toBe(2);
+    expect(out.json.next).toEqual([{ command: "croft validate", reason: "re-check after the edit" }]);
+    // The rebuild asks first: never in next.
+    expect(JSON.stringify(out.json.next)).not.toContain("--rebuild");
+
+    // The key it was built with (a new project: an asset module, once imported, stays as it was in this process).
+    const same = makeProject({ files: { "assets/github_issues.ts": ISSUES_TS } });
+    catalog(same, [ISSUES_BUILT]);
+    expect(codes((await check(same)).problems)).toEqual([]);
+  });
+
+  test("a key added to an append ingest: a warning (the run asks to convert in place), with the conversion as a third fix", async () => {
+    const p = makeProject({ files: { "assets/events.ts": EVENTS_TS(`key: "id", write: "append", incremental: "seq",`) } });
+    catalog(p, [EVENTS_BUILT]);
+    const r = await check(p);
+    expect(r.problems).toEqual([expect.objectContaining({
+      code: "INGEST_CONFIG_CHANGED", severity: "warning", asset: "events",
+      message: "events now has the key id, but its 40 stored rows were appended without one: croft run events counts the stored rows with the same id and asks before converting them in place (it keeps the latest row of each id, and the table goes to the trash first)",
+    })]);
+    expect((r.problems[0]!.details!.fixes as unknown[]).at(-1)).toEqual({
+      kind: "manual", requiresHuman: true,
+      description: "ask the user whether to convert in place: croft run events asks for confirmation, moves the table to the trash first, then keeps the latest row of each id",
+    });
+    expect((await cli(["validate", "--json"], { cwd: p.root })).exit).toBe(0);
+    // A lookback is no behavior change (§6: it applies directly).
+    const lookback = makeProject({ files: { "assets/events.ts": EVENTS_TS(`write: "append", incremental: { field: "seq", lookback: "1 day" },`) } });
+    catalog(lookback, [{ ...EVENTS_BUILT, cursor: { field: "seq", value: "2026-09-01T00:00:00Z", type: "timestamp", unit: null } }]);
+    expect(codes((await check(lookback)).problems)).toEqual([]);
   });
 });

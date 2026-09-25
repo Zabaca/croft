@@ -7,9 +7,15 @@ import { join, relative, sep } from "node:path";
 import { CODES } from "../../core/errors.ts";
 import { offsetSeconds } from "../../core/time.ts";
 import { CROFT_VERSION, SKILL_PATH, skillMd } from "../../agent/templates.ts";
+import { ENGINE_SETTING } from "../../db/backup.ts";
 import type { FsKind } from "../../db/fs-kind.ts";
+import { STATE_DDL } from "../../db/state.ts";
+import { writeIntent } from "../../read/testkit.ts";
+import { tryAcquire } from "../../history/leases.ts";
 import { RunsDb } from "../../history/runs-db.ts";
+import { currentIdentity } from "../../core/proc.ts";
 import { initProject } from "../../project/init.ts";
+import { renamedProblem } from "../../project/rename.ts";
 import { croftHome } from "../../schedule/home.ts";
 import type { OsRunner } from "../../schedule/os.ts";
 import { addProject } from "../../schedule/registry.ts";
@@ -20,7 +26,7 @@ import { BUN_TESTED } from "../version.ts";
 import {
   type DoctorCheck, type DoctorDeps, type DuckdbProbe, duckdbOffsets, formatBytes, formatDoctor, probeDuckdb, runDoctor,
 } from "./doctor.ts";
-import { SINCE_KEY } from "./schedule.ts";
+import { agoText, SINCE_KEY } from "./schedule.ts";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "doctor-")));
 const children: ChildProcess[] = [];
@@ -291,6 +297,66 @@ describe("the assets line (croft validate's counts)", () => {
   });
 });
 
+describe("a croft rename that did not finish (its journal, .croft/rename.json)", () => {
+  const RUN = "r_0924_1000_dead";
+  function journal(root: string): void {
+    writeFileSync(join(root, ".croft", "rename.json"), JSON.stringify({
+      from: "example_sales", to: "sales", fileFrom: "assets/example_sales.ts", fileTo: "assets/sales.ts", mode: "file",
+      startedAt: "2026-09-24T17:00:00.000Z", runId: RUN, earlier: null,
+    }));
+  }
+
+  test("an error line: ASSET_RENAMED with the fix croft rename <old> <new>, also in next; the rows the catalog knows", async () => {
+    const root = await project();
+    installed(root);
+    journal(root);
+    const db = RunsDb.open(join(root, ".croft"));
+    db.catalogPut("example_sales", { asset: "example_sales", rows: 1000 }, "run");
+    db.close();
+    const { data, problems } = await runDoctor(root, deps());
+    const text = "rename: croft rename example_sales sales did not finish: the table (1,000 rows), its state and the asset file may be under either name";
+    expect(check(data.checks, "rename")).toEqual({
+      id: "rename", section: "project", status: "error", code: "ASSET_RENAMED", text,
+      details: { from: "example_sales", to: "sales", startedAt: "2026-09-24T17:00:00.000Z", runId: RUN },
+    });
+    // Word for word what croft validate and croft status report (doctor reads the journal without loading rename.ts).
+    expect(problems).toEqual([renamedProblem({ from: "example_sales", to: "sales", file: "assets/sales.ts", rows: 1000, unfinished: true })]);
+    expect(problems[0]).toMatchObject({
+      code: "ASSET_RENAMED", severity: "error", fix: { kind: "command", description: "finish renaming example_sales to sales", command: "croft rename example_sales sales" },
+    });
+
+    let out = "";
+    const exit = await main(["doctor", "--json"], { cwd: root, env: {}, stdout: (t) => { out += t; }, stderr: () => {} });
+    const env = JSON.parse(out);
+    expect(exit).toBe(2);
+    expect(env.next).toEqual([{ command: "croft rename example_sales sales", reason: "finish renaming example_sales to sales" }]);
+    out = "";
+    await main(["doctor"], { cwd: root, env: {}, stdout: (t) => { out += t; }, stderr: () => {}, stdoutTTY: false });
+    expect(out).toContain(`  error ASSET_RENAMED ${text}`);
+    expect(out).toContain("croft rename example_sales sales");
+  });
+
+  test("a rename still running (its run holds its leases) is an info line, not a problem; no journal, no line", async () => {
+    const root = await project();
+    expect((await runDoctor(root, deps())).data.checks.some((c) => c.id === "rename")).toBe(false);
+    journal(root);
+    const db = RunsDb.open(join(root, ".croft"));
+    db.createRun({ id: RUN, trigger: "manual", human: true, argv: ["rename", "example_sales", "sales"], identity: currentIdentity() });
+    expect(tryAcquire(db, ["example_sales", "sales"], RUN).ok).toBe(true);
+    db.close();
+    const { data, problems } = await runDoctor(root, deps());
+    expect(check(data.checks, "rename")).toMatchObject({ status: "info", text: `rename: croft rename example_sales sales is running (run ${RUN})` });
+    expect(problems).toEqual([]);
+  });
+
+  test("without the DuckDB binding the journal is still read", async () => {
+    const root = await project();
+    journal(root);
+    const { data } = await runDoctor(root, deps({ probeDuckdb: () => ({ ok: false, message: "simulated" }) }));
+    expect(check(data.checks, "rename")).toMatchObject({ status: "error", code: "ASSET_RENAMED" });
+  });
+});
+
 describe("warehouse checks", () => {
   test("not created yet", async () => {
     const { data } = await runDoctor(await project(), deps());
@@ -481,6 +547,43 @@ describe("project checks", () => {
     } finally {
       chmodSync(join(root, ".croft"), 0o700);
     }
+  });
+
+  describe("the trash (§6: 30 days, and the 5 newest of each table)", () => {
+    /** A trashed version on disk: its file and sidecar, as trash.ts writes them. */
+    function version(root: string, asset: string, at: string, bytes = 1000): string {
+      const dir = join(root, ".croft", "trash", asset);
+      mkdirSync(dir, { recursive: true });
+      const stamp = new Date(at).toISOString().replace(/[-:]/g, "");
+      const path = join(dir, `${stamp}.duckdb`);
+      writeFileSync(path, "x".repeat(bytes));
+      writeFileSync(join(dir, `${stamp}.json`), JSON.stringify({ asset, path, trashedAt: new Date(at).toISOString(), reason: "delete", runId: null, rows: 3, bytes }));
+      return path;
+    }
+    const NOW = "2026-09-22T12:00:00.000Z";
+    const ago = (days: number) => new Date(Date.parse(NOW) - days * 86_400_000).toISOString();
+
+    test("an empty trash has no line", async () => {
+      const root = await project();
+      const { data } = await runDoctor(root, deps({ env: { CROFT_NOW: NOW } }));
+      expect(data.checks.find((c) => c.id === "trash")).toBeUndefined();
+    });
+
+    test("what it holds, after doctor prunes the expired versions (never a table's 5 newest)", async () => {
+      const root = await project();
+      const orders = [1, 40, 50, 60, 70, 80, 90].map((d) => version(root, "orders", ago(d)));
+      const zones = [100, 200].map((d) => version(root, "zones", ago(d)));
+      const { data, problems } = await runDoctor(root, deps({ env: { CROFT_NOW: NOW } }));
+      expect(problems).toEqual([]);
+      const line = check(data.checks, "trash");
+      expect(line).toMatchObject({ section: "project", status: "ok", details: { versions: 7, tables: 2, bytes: 7000, pruned: 2 } });
+      expect(line.text).toBe("trash: 7 versions of 2 tables, 6.8 KB; removed 2 older than 30 days (kept: 30 days, and the 5 newest of each table; croft restore lists them)");
+      expect(orders.map(existsSync)).toEqual([true, true, true, true, true, false, false]);
+      expect(zones.map(existsSync)).toEqual([true, true]);
+      // Nothing left to prune the next time.
+      const again = await runDoctor(root, deps({ env: { CROFT_NOW: NOW } }));
+      expect(check(again.data.checks, "trash").text).toBe("trash: 7 versions of 2 tables, 6.8 KB (kept: 30 days, and the 5 newest of each table; croft restore lists them)");
+    });
   });
 
   test("before the first run the write test uses the project folder", async () => {
@@ -1021,5 +1124,165 @@ describe("storage: filesystems whose locks do not hold across machines (db/fs-ki
     expect(check((await runDoctor(root, deps())).data.checks, "storage").status).toBe("ok");
     const unknown: FsKind = { type: null, mountPoint: null, source: "none", unsafe: null };
     expect(check((await runDoctor(root, deps({ filesystem: () => unknown }))).data.checks, "storage").status).toBe("ok");
+  });
+});
+
+describe("tables changed outside croft, drift and backups (§5 \"Out-of-band changes\", §7, §6 \"Before an engine upgrade\")", () => {
+  const T = "2026-09-22T10:00:00Z";
+  const NOW = "2026-09-24T12:00:00.000Z";
+
+  /** A warehouse as croft leaves it: _croft state, and orders (3 rows) and zones (2 rows) with their records. Then
+   *  `outside`, run by something other than croft. Written with DuckDB directly, then closed. */
+  async function croftWarehouse(root: string, outside: string[] = []): Promise<void> {
+    const db = await DuckDBInstance.create(join(root, "warehouse.duckdb"));
+    const c = await db.connect();
+    const setup = [...STATE_DDL, `INSERT INTO _croft.meta VALUES ('format_version', '3'), ('duckdb_version', 'v1.5.5'), ('croft_version', '${CROFT_VERSION}')`];
+    for (const [name, rows] of [["orders", 3], ["zones", 2]] as const) {
+      setup.push(
+        `CREATE TABLE ${name} AS SELECT range + 1 AS id, '${T}'::TIMESTAMPTZ AS _loaded_at FROM range(${rows})`,
+        `INSERT INTO _croft.assets (name, kind, row_count, max_loaded_at) VALUES ('${name}', 'ingest', ${rows}, '${T}')`,
+        `INSERT INTO _croft.columns (asset, name, type) VALUES ('${name}', 'id', 'BIGINT'), ('${name}', '_loaded_at', 'TIMESTAMPTZ')`,
+      );
+    }
+    for (const s of [...setup, ...outside]) await c.run(s);
+    c.disconnectSync();
+    db.closeSync();
+  }
+
+  test("every table as croft left it: one ok line", async () => {
+    const root = await project();
+    await croftWarehouse(root);
+    const { data, problems } = await runDoctor(root, deps());
+    expect(problems).toEqual([]);
+    expect(data.checks.filter((c) => c.id === "tables")).toEqual([
+      { id: "tables", section: "project", status: "ok", text: "tables: 2 as croft last wrote them (rows, newest _loaded_at and columns)", details: { checked: 2 } },
+    ]);
+  });
+
+  test("OUT_OF_BAND_CHANGE and TABLE_MODIFIED_OUTSIDE_CROFT: a warning line each, with what changed and a fix; nothing is written", async () => {
+    const root = await project();
+    await croftWarehouse(root, [`DELETE FROM orders WHERE id = 3`, `ALTER TABLE zones ADD COLUMN note VARCHAR`]);
+    const before = tree(root);
+    const { data, problems } = await runDoctor(root, deps());
+    expect(tree(root)).toEqual(before);
+    const lines = data.checks.filter((c) => c.id === "tables");
+    expect(lines.map((c) => [c.section, c.status, c.code, c.text])).toEqual([
+      ["project", "warn", "OUT_OF_BAND_CHANGE", "orders was changed outside croft: 1 row removed (3 → 2)"],
+      ["project", "warn", "TABLE_MODIFIED_OUTSIDE_CROFT", "zones's columns were changed outside croft: added note VARCHAR"],
+    ]);
+    expect(problems.map((p) => [p.code, p.severity, p.asset])).toEqual([
+      ["OUT_OF_BAND_CHANGE", "warning", "orders"], ["TABLE_MODIFIED_OUTSIDE_CROFT", "warning", "zones"],
+    ]);
+    for (const p of problems) {
+      expect(p.hint).toBeTruthy();
+      expect(p.fix?.kind).toBe("manual");
+    }
+    expect(problems[0]!.effect).toBe("the next run of orders goes on from the table as it is then, and assets that read it are rebuilt after that");
+    expect(problems[0]!.details).toEqual({
+      expected: { rowCount: 3, maxLoadedAt: "2026-09-22T10:00:00.000000Z" }, actual: { exists: true, rowCount: 2, maxLoadedAt: "2026-09-22T10:00:00.000000Z" },
+    });
+    expect(data.summary.errors).toBe(0);
+    const human = formatDoctor(data, problems);
+    expect(human).toContain("  warn  OUT_OF_BAND_CHANGE orders was changed outside croft: 1 row removed (3 → 2)\n");
+    expect(human).toContain("  warn  OUT_OF_BAND_CHANGE orders was changed outside croft: 1 row removed (3 → 2)\n"
+      + "        fix: tell the user something other than croft (the duckdb CLI, a GUI, a script) wrote orders; croft preview orders --rebuild compares it with a fresh build\n"
+      + "        effect: the next run of orders goes on from the table as it is then, and assets that read it are rebuilt after that\n");
+    expect(human).toContain("  warn  TABLE_MODIFIED_OUTSIDE_CROFT zones's columns were changed outside croft: added note VARCHAR\n");
+  });
+
+  test("a warehouse too big to compare in doctor's time: the tables left out are said, as info", async () => {
+    const root = await project();
+    await croftWarehouse(root, [`DELETE FROM orders WHERE id = 3`]);
+    const { data, problems } = await runDoctor(root, deps({ tableScanMs: 0 }));
+    expect(problems).toEqual([]);
+    expect(data.checks.filter((c) => c.id === "tables")).toEqual([{
+      id: "tables", section: "project", status: "info", details: { skipped: 2 },
+      text: "tables: 2 more not compared with croft's record in the time doctor allows (the next run of each asset compares its table)",
+    }]);
+  });
+
+  test("not compared while a croft run writes: the warehouse line says busy and there is no tables line", async () => {
+    const root = await project();
+    await croftWarehouse(root, [`DELETE FROM orders WHERE id = 3`]);
+    const child = spawn(process.execPath, ["-e", "console.log('up'); setInterval(() => {}, 1000)"], { stdio: ["ignore", "pipe", "pipe"] });
+    children.push(child);
+    await waitForLine(child, "up");
+    writeIntent(join(root, ".croft"), child.pid!, "r_0924_1200_wrte");
+    const { data, problems } = await runDoctor(root, deps());
+    expect(check(data.checks, "warehouse").text).toContain("busy: croft run r_0924_1200_wrte is writing");
+    expect(data.checks.find((c) => c.id === "tables")).toBeUndefined();
+    expect(problems).toEqual([]);
+  });
+
+  test("drift of the last 7 days: an info line naming each asset's drift, from runs.sqlite", async () => {
+    const root = await project();
+    const db = RunsDb.open(join(root, ".croft"), { now: () => new Date("2026-09-24T10:00:00.000Z") });
+    const r = db.createRun({ trigger: "manual", human: true, argv: ["run"] });
+    const warn = (code: string, asset: string, details: Record<string, unknown>) => ({ severity: "warning", code, message: code, hint: "", docs: "", asset, details });
+    db.finishRun(r.id, "succeeded", { data: { runId: r.id, status: "succeeded", steps: [] }, next: [], exit: 0, ok: true, problems: [
+      warn("COLUMN_STOPPED_ARRIVING", "issues", { column: "login", readBy: [] }),
+      warn("JSON_KIND_CHANGED", "issues", { column: "user", before: ["object"], added: ["string"] }),
+      warn("TYPE_WIDENED", "orders", { column: "amount", from: "BIGINT", to: "DOUBLE" }),
+    ] });
+    db.close();
+    const before = tree(root);
+    const { data, problems } = await runDoctor(root, deps({ env: { CROFT_NOW: NOW } }));
+    expect(problems).toEqual([]);
+    expect(check(data.checks, "drift")).toMatchObject({
+      section: "project", status: "info",
+      text: `drift (7 days): issues: login stopped arriving, user now also string (${agoText("2026-09-24T10:00:00.000Z", new Date(NOW))})`
+        + ` · orders: amount BIGINT → DOUBLE (${agoText("2026-09-24T10:00:00.000Z", new Date(NOW))}); croft status shows it per asset`,
+    });
+    expect((check(data.checks, "drift").details as { entries: unknown[] }).entries).toHaveLength(3);
+    expect(tree(root)).toEqual(before);
+  });
+
+  test("no drift, no runs.sqlite: no drift or backups line, and runs.sqlite is not created", async () => {
+    const root = await project();
+    const { data } = await runDoctor(root, deps({ env: { CROFT_NOW: NOW } }));
+    expect(data.checks.find((c) => c.id === "drift")).toBeUndefined();
+    expect(data.checks.find((c) => c.id === "backups")).toBeUndefined();
+    expect(existsSync(join(root, ".croft", "runs.sqlite"))).toBe(false);
+  });
+
+  test("backups: how many, their size and the newest; an engine newer than the recorded one says the next write backs up first", async () => {
+    const root = await project();
+    await croftWarehouse(root);
+    const dir = join(root, ".croft", "backups");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "20260801T100000.000Z-1.5.2-to-1.5.3.duckdb"), "x".repeat(1000));
+    writeFileSync(join(dir, "20260920T100000.000Z-1.5.3-to-1.5.4.duckdb"), "x".repeat(2000));
+    writeFileSync(join(dir, "20260920T100000.000Z-1.5.3-to-1.5.4.duckdb.wal"), "x".repeat(48));
+    const db = RunsDb.open(join(root, ".croft"));
+    db.setSetting(ENGINE_SETTING, { version: "v1.5.4", recordedAt: "2026-09-20T10:00:00.000Z" });
+    db.close();
+    const before = tree(root);
+    const { data, problems } = await runDoctor(root, deps({ env: { CROFT_NOW: NOW } }));
+    expect(problems).toEqual([]);
+    const line = check(data.checks, "backups");
+    expect(line).toMatchObject({ section: "project", status: "info", details: { recorded: "v1.5.4", running: "v1.5.5", pending: true } });
+    const newest = agoText("2026-09-20T10:00:00.000Z", new Date(NOW));
+    expect(line.text).toBe(`backups: 2 before DuckDB upgrades, 3 KB in .croft/backups/ (newest ${newest}: 1.5.3 → 1.5.4; the 3 newest are kept)`
+      + " · the next croft command that writes backs the warehouse up first (DuckDB 1.5.4 → 1.5.5)");
+    expect((line.details as { backups: unknown[] }).backups).toHaveLength(2);
+    expect(tree(root)).toEqual(before);
+
+    // Once the running engine is recorded: an ok line with the backups only.
+    const db2 = RunsDb.open(join(root, ".croft"));
+    db2.setSetting(ENGINE_SETTING, { version: "v1.5.5", recordedAt: "2026-09-24T11:00:00.000Z" });
+    db2.close();
+    const after = check((await runDoctor(root, deps({ env: { CROFT_NOW: NOW } }))).data.checks, "backups");
+    expect(after.status).toBe("ok");
+    expect(after.text).toBe(`backups: 2 before DuckDB upgrades, 3 KB in .croft/backups/ (newest ${newest}: 1.5.3 → 1.5.4; the 3 newest are kept)`);
+  });
+
+  test("an upgrade pending with no backup yet", async () => {
+    const root = await project();
+    await croftWarehouse(root);
+    const db = RunsDb.open(join(root, ".croft"));
+    db.setSetting(ENGINE_SETTING, { version: "v1.5.4", recordedAt: "2026-09-20T10:00:00.000Z" });
+    db.close();
+    const line = check((await runDoctor(root, deps({ env: { CROFT_NOW: NOW } }))).data.checks, "backups");
+    expect(line).toMatchObject({ status: "info", text: "backups: none yet · the next croft command that writes backs the warehouse up first (DuckDB 1.5.4 → 1.5.5)" });
   });
 });
