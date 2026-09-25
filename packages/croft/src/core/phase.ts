@@ -4,9 +4,10 @@
 // - The command manifest below lists every command, and each run, validate and init flag DESIGN.md §4.1 gives a
 //   phase after 1, with the phase that ships it. The registry (cli/commands/index.ts) must register exactly the
 //   commands of this phase and no flag of a later one (a test checks both).
-// - SKILL.md renders its "This version" section from the manifest (agent/templates.ts), and a test scans
-//   CLAUDE.md, SKILL.md, every `croft docs` page, and every string in the source (this file aside) for a
-//   `croft <command>` or `--flag` this build does not have (agent/contract.test.ts).
+// - A test scans CLAUDE.md, SKILL.md, every `croft docs` page, and every string in the source (this file aside)
+//   for a `croft <command>` or `--flag` this build does not have (agent/contract.test.ts). Phases 1–4 shipped the
+//   texts of DESIGN.md §9 cut to their commands, with a "This version" section in SKILL.md rendered from this
+//   manifest; phase 5 has every command, and ships §9 word for word (agent/templates.test.ts).
 // - When a phase lands: raise PHASE, register its commands, and add the skill text for them.
 //
 // phaseStub() is what a module of the next wave throws until it is built: the contract commit gives each one
@@ -81,23 +82,5 @@ export function laterFlags(command: string): string[] {
 export function laterConfigKey(key: string): { phase: number; feature: string } | null {
   const hit = LATER_CONFIG_KEYS.find((k) => (k.prefix.endsWith(".") ? key.startsWith(k.prefix) : key === k.prefix));
   return hit && hit.phase > PHASE ? { phase: hit.phase, feature: hit.feature } : null;
-}
-
-/** What phase 5 does not do yet, in words, for SKILL.md. */
-export const PHASE_LIMITS: string[] = [];
-
-/** SKILL.md's "This version" section: the commands that exist, the ones that do not, and what is not built.
- *  Rendered from the manifest, so it never names a command as available that the registry lacks. */
-export function versionNotes(version: string): string {
-  const flags = Object.keys(LATER_FLAGS).flatMap((c) => {
-    const fs = laterFlags(c);
-    return fs.length ? [`${c} ${fs.map((f) => `--${f}`).join("/")}`] : [];
-  });
-  const later = [...LATER_COMMANDS, ...flags];
-  return [
-    `croft ${version} (phase ${PHASE}) has these commands: ${SHIPPED_COMMANDS.filter((c) => c !== "tick").join(", ")}.`,
-    ...(later.length ? [`Not in this version, so never call them (each exits 2): ${later.join(", ")}.`] : []),
-    ...PHASE_LIMITS,
-  ].join("\n");
 }
 

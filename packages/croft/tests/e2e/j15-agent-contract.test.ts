@@ -35,14 +35,15 @@ describe("the agent contract", () => {
     }
     expect((await p.rows("select count(*) AS n from example_sales"))[0]!.n).toBe(120);
 
-    // Nothing init wrote names a command of a later phase (phase 5's croft new).
+    // Phase 5's croft new is where a new asset starts, in the skill and in the example asset, and it answers. The
+    // skill has no "This version" section: this build lacks nothing the texts name.
     const skill = p.read(".claude/skills/croft/SKILL.md");
-    const body = skill.slice(skill.indexOf("## Orient"));                 // after "This version", which lists them on purpose
-    for (const text of [claude, body, p.read("assets/example_sales.ts")]) {
-      for (const missing of ["croft new"]) {
-        expect(text).not.toContain(missing);
-      }
-    }
+    expect(skill).not.toContain("## This version");
+    const body = skill.slice(skill.indexOf("## Orient"));
+    expect(body).toContain("1. New asset: `croft new api|file|sql|transform <name>`; edit the template, don't invent APIs.");
+    expect(skill).toContain("`croft new --list`");
+    expect(p.read("assets/example_sales.ts")).toContain("croft new file <name>");
+    expect((await p.json(["help", "new"])).code).toBe(0);
     // Phase 4's commands are in the skill, and answer: rename (its recipe and the ask-first line), and every
     // destructive action behind croft confirm.
     expect(body).toContain("- Rename: croft rename <old> <new>; fix every reference it lists; validate; preview; run.");
@@ -70,7 +71,7 @@ describe("the agent contract", () => {
       expect(page.json.data.source, topic).toBe("file");
     }
     expect(skill).toContain("croft run <asset> --dry-run --from -90d");
-    // The version section names what this build lacks, so the agent does not try it.
+    // Nothing is missing from this build, so nothing in the skill says so.
     expect(skill).not.toContain("Not in this version");
 
     // The skill's pointers answer: the template pages, and the backfill recipe (a file ingest refuses --from with

@@ -86,9 +86,7 @@ describe("no text says a phase-4 feature is missing", () => {
     expect(hits).toEqual([]);
   });
 
-  test("SKILL.md, outside its This version section (which names what phase 5 adds)", () => {
-    const text = skillMd();
-    const notes = text.slice(text.indexOf("## This version"), text.indexOf("## Orient"));
-    expect(text.replace(notes, "").split("\n").filter((l) => STALE.test(l))).toEqual([]);
+  test("SKILL.md (phase 5 has no This version section)", () => {
+    expect(skillMd().split("\n").filter((l) => STALE.test(l))).toEqual([]);
   });
 });

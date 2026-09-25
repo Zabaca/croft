@@ -120,7 +120,7 @@ The bin is `bin/croft.mjs`, a small plain-JavaScript entry. Its `#!/bin/sh` firs
 |---|---|
 | `croft.json` | `{"$schema": "./node_modules/@zabaca/croft/croft.schema.json", "database": "warehouse.duckdb", "timezone": "America/Los_Angeles"}`. The timezone is detected at init, so "daily at 06:00" keeps its meaning on a UTC server. Optional keys: `serve` (`{"port": 7447, "host": "127.0.0.1"}`, plus `queryTimeoutMs` 30000, `maxConcurrent` 4, `maxBytes` 64 MB, `maxRows` 100,000 and `allowOrigins` `[]`, §5), `readCopy` (default `false`), `notify` (`{"desktop": true, "webhook": null}`, §8), `concurrency`. Keys that a later phase's feature reads are accepted and validated early, and `croft docs config` marks them unused until then (`core/phase.ts`). The phase-3 keys (`readCopy`, `notify.*`, `serve.*`) were such keys in phases 1 and 2, and phase 3 reads them. |
 | `package.json` | `{"private": true, "type": "module", "dependencies": {"@zabaca/croft": "0.1.0"}, "devDependencies": {"@types/bun": "1.3.14", "typescript": "5.9.2"}}`, with exact pins |
-| `tsconfig.json` | strict, `moduleResolution: "bundler"`, `types: ["bun"]`, includes `assets` and `lib`. Editors and Claude get type errors. |
+| `tsconfig.json` | strict, `moduleResolution: "bundler"`, `types: ["bun"]`, includes `assets`, `lib` and `.croft/types/**/*.d.ts` (the input row types croft generates for TS transforms, which `croft validate --types` checks, §6). Editors and Claude get type errors. |
 | `.env` / `.env.example` | `# Secrets for your assets, e.g. GITHUB_TOKEN=...`. `.env` is git-ignored and created with mode 0600; an existing `.env` is never touched. |
 | `.gitignore` | `warehouse*.duckdb*`, `.croft/`, `.env`, `node_modules/` |
 | `CLAUDE.md` | a managed block between markers (§9); appended if the file already exists |
@@ -2051,6 +2051,8 @@ Phase 4 ships the `CLAUDE.md` block word for word, and its SKILL.md restores the
 
 Phase 4 adds the docs topics `rename` and `trash` (deleting, restoring, retention, asking first, and backups before an engine upgrade), and code pages for `ASSET_RENAMED`, `INGEST_CONFIG_CHANGED`, `PIN_CHANGES_DATA`, `EMPTY_EXTRACT` and `OUT_OF_BAND_CHANGE` (33 code pages in all); the drift warnings have no page yet. `croft docs ingest` gains "Changing an ingest that has data" (behavior and pin changes, rename, `--rebuild`) and the partial-commit rule for large first loads. `croft docs claude-permissions` lists every destructive action that ends in `croft confirm` (run `--rebuild`, `--allow-shrink`, delete, restore, lossy pin change, key conversion, `LARGE_REPROCESS`) instead of "in this version". `agent/docs-pages.test.ts` checks that each page names the command its fix names, that every page that mentions a destructive command says to ask the user, and that no page, and no SKILL.md line outside "This version", still says a phase-4 feature is missing.
 
+Phase 5 ships both texts word for word, with nothing cut: every command and flag they name exists. `templates.test.ts` again compares `claude-md.md`, and SKILL.md stamped `0.1.0`, with items 1 and 2 byte for byte; its cut lists are gone. SKILL.md has no "This version" section, because no command or flag of §4.1 is missing. The `croft new --list` pointer, loop step 1, the line about files in SQL assets (`croft new file x`) and the cursor-pagination pointer (`croft new api x --pagination cursor`) name `croft new`. Item 2 takes in what earlier phases added to the shipped SKILL.md, so that this section is what ships: the `croft status` line of Orient in the command's own words, the Schedule recipe after Held asset, the second Backfill line, and the recipe for a missing warehouse file.
+
 **1. The `CLAUDE.md` managed block:**
 
 ```markdown
@@ -2080,7 +2082,7 @@ croft is not dbt, dlt, SQLMesh or Dagster; do not assume their behavior. Ask the
 
 ## Orient
 croft context --json        # assets, columns, behavior, schedules, running, held, recent failures and schema changes
-croft status                # failed, stale, held, edited, orphaned
+croft status                # failed, stale, held, never run, edited since its last run, no asset file
 
 ## Loop (always)
 1. New asset: `croft new api|file|sql|transform <name>`; edit the template, don't invent APIs.
@@ -2126,7 +2128,10 @@ croft status                # failed, stale, held, edited, orphaned
 - Failed run: croft status --json → croft logs <asset> --failed → fix → croft validate --json → croft preview <asset>
   → croft run <asset> → croft status.
 - Held asset: it was edited and not run by hand; run it by hand once (croft run <asset>) after checking the preview.
+- Schedule: add `schedule: "every hour"` to the ingest (`croft docs scheduling`); `croft validate` shows the next fires;
+  run it by hand once (new code is held until then), then ask the user before `croft schedule on`.
 - Backfill: croft run <asset> --dry-run --from -90d, then the same without --dry-run. Merge ingests only.
+  A date works too (--from 2026-06-24); a text cursor takes a value in its own format. The saved cursor never moves back.
 - Rename: croft rename <old> <new>; fix every reference it lists; validate; preview; run.
 - Wrong number: croft describe <asset> --json → croft preview <asset> --rebuild (drift) → query the upstream
   with the same filter; `croft docs internals` shows how _croft.writes maps rows to runs.
@@ -2134,6 +2139,8 @@ croft status                # failed, stale, held, edited, orphaned
   TYPE_CONFLICT: clean the value in rows()/map() first; a pin can rewrite stored values.
 - Missing secret: ask the user to add NAME=... to .env (or run `croft secrets set NAME` in their terminal);
   check with `croft secrets --json`. Never read .env.
+- Warehouse file missing (DB_NOT_FOUND in status): ask the user where it went before running anything; a run
+  builds a new, empty one and refetches from the sources.
 
 ## Output
 - JSON timestamps carry the project offset; ::DATE uses the croft.json timezone.
@@ -2306,8 +2313,8 @@ src/
   safety/              trash.ts (ATTACH-based trash, sidecars, retention), restore.ts, delete.ts, confirm.ts (tokens,
                        impact hash, detached-run grants), guards.ts (shrink, table stats, out-of-band and schema
                        comparison), out-of-band.ts (its wording; doctor's table scan)
-  agent/               templates/* (api by pagination, file, sql, transform), skill.md, claude-md.md (each phase's
-                       cut of §9), docs/*.md (one page per topic and per error code; embedded; served by
+  agent/               templates/* (api by pagination, file, sql, transform), skill.md, claude-md.md (§9 word
+                       for word), docs/*.md (one page per topic and per error code; embedded; served by
                        `croft docs`; until `croft new`, the templates are docs/ingest.md, sql.md and
                        transforms.md), contract.test.ts (§4.1)
 ```
@@ -3042,6 +3049,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Reason: the v1 texts told a phase-1 agent to run `croft validate` after every edit, `croft preview` before a run and `croft new` for a new asset, and hints pointed at `croft serve`, `croft restore`, `readCopy` and `--rebuild`. Each was a `USAGE_ERROR` at the step the agent was told to take. A test against the registry keeps later edits honest, and the cut list keeps every §9 rule in view until its phase lands.
 - Build (phase 2): the scan reads every string and template literal in the source, not only hints, fixes, `next[]` entries and option descriptions; `query --preview` works; phase 2 ships the `CLAUDE.md` block whole and cuts from SKILL.md only phase 3–5 lines (§9).
 - Build (phase 3): SKILL.md restores its phase-3 lines word for word and cuts only phase 4–5 lines, with 11 cut entries left; it adds a Schedule recipe. The registry marks `tick` and `run --due` hidden, and `PHASE_COMPLETE` tells the codes-raised gate whether the phase is still being built (D78).
+- Build (phase 5): nothing is cut. The `CLAUDE.md` block and SKILL.md are §9 byte for byte, and SKILL.md has no "This version" section. §9's SKILL.md takes in the lines the shipped file added in phases 1–3 (the `croft status` line in the command's own words, the Schedule recipe, a second Backfill line and the missing-warehouse recipe), so the test compares the files with §9 verbatim again.
 
 **D60. Ingest templates before `croft new`. (new, 2026-09-23)**
 - Options: build `croft new` in phase 1; ship the templates as a docs page until `croft new` lands with every template in phase 5.

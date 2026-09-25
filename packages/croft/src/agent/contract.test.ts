@@ -29,24 +29,15 @@ import { quoteIdent } from "../load/evolve.ts";
 import { type LoadedSqlAsset, loadSqlAsset } from "../project/sql-asset.ts";
 import { loadTsAsset } from "../project/ts-asset.ts";
 import { ShadowCatalog, type ShadowColumn } from "../sql/bind.ts";
-import { LATER_COMMANDS, laterFlags, SHIPPED_COMMANDS, versionNotes } from "../core/phase.ts";
+import { LATER_COMMANDS, laterFlags, SHIPPED_COMMANDS } from "../core/phase.ts";
 import type { Ctx } from "../cli/command.ts";
 import { docs } from "../cli/commands/docs.ts";
 import { COMMANDS } from "../cli/commands/index.ts";
 import { EXEMPT, type Finding, registered, scan, sourceFiles, sourceStrings, SRC } from "./contract-testkit.ts";
-import { claudeBlock, CROFT_VERSION, scaffold, skillMd, tsconfigJson } from "./templates.ts";
+import { claudeBlock, scaffold, skillMd, tsconfigJson } from "./templates.ts";
 
 // ---------------------------------------------------------------------------------------------------------
 // What the agent reads
-
-/** SKILL.md without its "This version" section, which names the missing commands on purpose (it is rendered
- *  from the manifest; a test below checks it). */
-function skillBody(): string {
-  const text = skillMd();
-  const notes = versionNotes(CROFT_VERSION);
-  expect(text).toContain(notes);
-  return text.replace(notes, "");
-}
 
 async function docsPage(name: string): Promise<string> {
   const r = await docs.run({ positionals: [name], values: {} } as unknown as Ctx);
@@ -86,17 +77,12 @@ describe("the phase manifest matches the registry", () => {
     expect(flags("preview")).toEqual(["rows", "rebuild"]);
   });
 
-  test("SKILL.md says what this version has and lacks, from the manifest", () => {
-    const notes = versionNotes(CROFT_VERSION);
-    expect(skillMd()).toContain(notes);
-    for (const c of SHIPPED_COMMANDS) if (c !== "tick") expect(notes).toContain(c);
-    expect(notes).not.toMatch(/\btick\b/);   // internal: croft runs it, an agent never does
-    for (const c of LATER_COMMANDS) expect(notes).toContain(c);
-    expect(notes).not.toContain("--rebuild");
-    expect(notes).not.toContain("--due");
-    // Phase 5 ships everything: no "not in this version" line.
-    expect(notes).not.toContain("Not in this version");
-    expect(notes).not.toContain("--dry-run");
+  test("phase 5 lacks no command or flag, so SKILL.md has no This version section", () => {
+    expect(LATER_COMMANDS).toEqual([]);
+    for (const c of COMMANDS) expect(laterFlags(c.name), c.name).toEqual([]);
+    expect(skillMd()).not.toContain("## This version");
+    expect(skillMd()).not.toMatch(/not in this version/i);
+    expect(skillMd()).not.toMatch(/\bcroft tick\b/);   // internal: croft runs it, an agent never does
   });
 });
 
@@ -119,7 +105,7 @@ describe("croft tells the agent to use only what this build has", () => {
     const findings = [
       ...scan("CLAUDE.md", claudeBlock("project")),
       ...scan("CLAUDE.md (app)", claudeBlock("app")),
-      ...scan("SKILL.md", skillBody()),
+      ...scan("SKILL.md", skillMd()),
     ];
     expect(findings).toEqual([]);
   });
@@ -166,8 +152,7 @@ describe("croft tells the agent to use only what this build has", () => {
   });
 
   test("the scaffold's files", () => {
-    const notes = versionNotes(CROFT_VERSION);
-    const findings = scaffold({ timezone: "UTC" }).flatMap((f) => scan(f.path, f.text.replace(notes, "")));
+    const findings = scaffold({ timezone: "UTC" }).flatMap((f) => scan(f.path, f.text));
     expect(findings).toEqual([]);
   });
 

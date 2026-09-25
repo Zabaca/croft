@@ -39,7 +39,7 @@ jobs:
           CROFT_CI: "1"
         run: bun test
 
-  # Smoke: Alpine (musl) installs, and a fresh project runs its example and answers a query.
+  # Smoke: Alpine (musl) installs and prints its version, and a fresh project runs its example and answers a query.
   alpine:
     name: alpine smoke
     runs-on: ubuntu-24.04
@@ -49,9 +49,10 @@ jobs:
       - run: apk add --no-cache git
       - uses: actions/checkout@v4
       - run: bun install --frozen-lockfile
-      - name: init, run, query
+      - name: version, init, run, query
         run: |
           set -e
+          bun packages/croft/bin/croft.mjs --version
           dir=$(mktemp -d)/proj
           bun packages/croft/bin/croft.mjs init "$dir" --no-install
           mkdir -p "$dir/node_modules/@zabaca" && ln -s "$PWD/packages/croft" "$dir/node_modules/@zabaca/croft"
