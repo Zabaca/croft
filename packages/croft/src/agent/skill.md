@@ -6,19 +6,15 @@ description: Build and operate this project's data pipelines with the croft CLI 
 ---
 <!-- croft {{version}} -->
 croft is not dbt, dlt, SQLMesh or Dagster; do not assume their behavior. Ask the CLI: `croft docs <topic>`,
-`croft docs <ERROR_CODE>`, `croft docs --list`, `croft help <command>`. Every command takes `--json` →
+`croft docs <ERROR_CODE>`, `croft docs --list`, `croft new --list`. Every command takes `--json` →
 {ok, data, problems[], next[], confirmation?}.
-
-## This version
-{{phase}}
 
 ## Orient
 croft context --json        # assets, columns, behavior, schedules, running, held, recent failures and schema changes
 croft status                # failed, stale, held, never run, edited since its last run, no asset file
 
 ## Loop (always)
-1. New asset: start from the closest template in `croft docs ingest` (API or file), `croft docs sql` or
-   `croft docs transforms`; don't invent APIs. Checks: `croft docs checks`.
+1. New asset: `croft new api|file|sql|transform <name>`; edit the template, don't invent APIs.
 2. `croft validate --json` after EVERY edit; apply each problem's `fix`.
 3. `croft preview <name>`: read columns, checks, diff and samples.
 4. `croft run <name>`; then verify with `croft query "..."` (one SELECT, 50-row cap).
@@ -27,8 +23,7 @@ croft status                # failed, stale, held, never run, edited since its l
 - One file in assets/ = one table with that name; SQL says `FROM github_issues`. Shared code goes in lib/.
 - SQL assets: `-- name: value` header lines (description, key, check, warn), then ONE SELECT (a trailing `;` is fine).
   SQL transforms are always rebuilt in full; there is no incremental SQL. Only ingests have schedules.
-- SQL assets read assets, never files: to use a file, make a file ingest (`file: "files/x.csv"`, see `croft docs ingest`);
-  `croft query "from 'files/x.csv'"` looks at one first.
+- SQL assets read assets, never files: to use a file, make a file ingest (`croft new file x`).
 - PIVOT needs an IN list: `PIVOT t ON cat IN ('a', 'b') USING sum(x)`, or use `sum(x) FILTER (WHERE cat = 'a')`.
 - Avoid now()/current_date in assets (values freeze until the next rebuild); compute ages at query time.
 - Set `key` whenever records have an id. Incremental API ingests need a key.
@@ -44,7 +39,7 @@ croft status                # failed, stale, held, never run, edited since its l
 ## APIs
 - Keyset paging (re-query with since = newest value seen) ONLY if the API sorts ascending by that field.
   Newest-first APIs (Stripe, most list endpoints): filter by since and follow the API's own cursor
-  (the cursor template in `croft docs ingest`).
+  (`croft new api x --pagination cursor`).
 - Records that change after creation (payments, refunds, orders, tickets) need an updated-since field or a
   lookback: incremental: { field: "created", unit: "s", lookback: "30 days" }. Epoch cursors need `unit`.
 

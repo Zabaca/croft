@@ -1,6 +1,7 @@
 // An example file ingest: this file makes the table example_sales from files/example_sales.csv, so the
 // first run needs no network. Try: croft run example_sales, then croft query "from example_sales limit 5".
-// To bring in your own data, start from a template: croft docs ingest. Delete this file when you no longer need it.
+// To bring in your own data, start from a template: croft new api <name> or croft new file <name> (croft new --list
+// shows them all). Delete this file when you no longer need it.
 import { ingest } from "@zabaca/croft";
 
 export default ingest({

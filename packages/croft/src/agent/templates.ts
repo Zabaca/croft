@@ -1,14 +1,13 @@
 // What `croft init` writes (DESIGN.md §2 "croft init in an empty folder", §9 "Claude Code integration").
 // Text files live next to this module so they can be read and reviewed as they ship: skill.md and
-// claude-md.md are the §9 texts cut to what this build ships (core/phase.ts; SKILL.md's "This version"
-// section is rendered from that manifest, and agent/contract.test.ts checks that every command and flag
-// the texts name exists), and project/ holds the scaffold. Files whose names would change
-// behavior inside this repository are stored under neutral names and renamed on write: a real
-// .gitignore would apply to croft's own source tree (and npm drops .gitignore files when packing), and
-// a real CLAUDE.md or .claude/skills/ folder would be loaded by Claude Code sessions working on croft.
+// claude-md.md are the §9 texts word for word (agent/templates.test.ts compares them byte for byte, and
+// agent/contract.test.ts checks that every command and flag they name exists), and project/ holds the
+// scaffold. Files whose names would change behavior inside this repository are stored under neutral
+// names and renamed on write: a real .gitignore would apply to croft's own source tree (and npm drops
+// .gitignore files when packing), and a real CLAUDE.md or .claude/skills/ folder would be loaded by
+// Claude Code sessions working on croft.
 import { readFileSync } from "node:fs";
 import pkg from "../../package.json" with { type: "json" };
-import { versionNotes } from "../core/phase.ts";
 
 export const CROFT_PACKAGE = "@zabaca/croft";
 export const CROFT_VERSION: string = pkg.version;
@@ -26,10 +25,9 @@ function read(rel: string): string {
   return readFileSync(new URL(rel, import.meta.url), "utf8");
 }
 
-/** SKILL.md stamped with the croft version that wrote it (CLAUDE_FILES_OUTDATED compares the stamp), with
- *  its "This version" section rendered from the phase manifest. */
+/** SKILL.md stamped with the croft version that wrote it (CLAUDE_FILES_OUTDATED compares the stamp). */
 export function skillMd(version: string = CROFT_VERSION): string {
-  return read("./skill.md").replace("{{version}}", version).replace("{{phase}}", versionNotes(version));
+  return read("./skill.md").replace("{{version}}", version);
 }
 
 /** The version stamped into a SKILL.md (`<!-- croft 0.1.0 -->`), or null when there is none. */
@@ -117,8 +115,11 @@ export function packageJson(o: { version?: string } = {}): string {
   }, null, 2)}\n`;
 }
 
-/** tsconfig.json for assets/ and lib/. The package ships TypeScript source, so these options must also
- *  accept croft's own files: .ts import extensions, JSON imports and Bun's types. */
+/** tsconfig.json for assets/ and lib/, and the input row types croft generates in .croft/types
+ *  (project/types-gen.ts), so an editor, Claude and `croft validate --types` check a TS transform's rows
+ *  against its inputs' columns. Only declaration files: nothing else in .croft/ is compiled. The package
+ *  ships TypeScript source, so these options must also accept croft's own files: .ts import extensions,
+ *  JSON imports and Bun's types. */
 export function tsconfigJson(): string {
   return `${JSON.stringify({
     compilerOptions: {
@@ -132,7 +133,7 @@ export function tsconfigJson(): string {
       resolveJsonModule: true,
       types: ["bun"],
     },
-    include: ["assets", "lib"],
+    include: ["assets", "lib", ".croft/types/**/*.d.ts"],
   }, null, 2)}\n`;
 }
 
