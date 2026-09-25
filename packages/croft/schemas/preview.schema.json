@@ -1,0 +1,514 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "croft preview --json",
+  "description": "The envelope croft preview --json prints on stdout (DESIGN.md §4.3). data is null when the command failed before it had any.",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "command": {
+      "const": "preview"
+    },
+    "croftVersion": {
+      "type": "string"
+    },
+    "database": {
+      "type": "string"
+    },
+    "timezone": {
+      "type": "string"
+    },
+    "durationMs": {
+      "type": "number"
+    },
+    "data": {
+      "anyOf": [
+        {
+          "title": "PreviewData",
+          "type": "object",
+          "properties": {
+            "assets": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/PreviewAsset"
+              }
+            },
+            "partial": {
+              "type": "boolean"
+            },
+            "inputsSnapshotAt": {
+              "type": [
+                "null",
+                "string"
+              ]
+            },
+            "rebuild": {
+              "type": "boolean"
+            },
+            "rowCap": {
+              "type": "number"
+            },
+            "redactedValues": {
+              "const": true
+            }
+          },
+          "required": [
+            "assets",
+            "partial",
+            "inputsSnapshotAt",
+            "rebuild",
+            "rowCap"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "problems": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Problem"
+      }
+    },
+    "next": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "reason"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "confirmation": {
+      "$ref": "#/$defs/Confirmation"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "ok",
+    "command",
+    "croftVersion",
+    "database",
+    "timezone",
+    "durationMs",
+    "data",
+    "problems",
+    "next"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "Confirmation": {
+      "type": "object",
+      "properties": {
+        "token": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "impact": {
+          "$ref": "#/$defs/Impact"
+        }
+      },
+      "required": [
+        "token",
+        "expiresAt",
+        "command",
+        "impact"
+      ],
+      "additionalProperties": false
+    },
+    "Fix": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "command"
+            },
+            "description": {
+              "type": "string"
+            },
+            "command": {
+              "type": "string"
+            },
+            "requiresHuman": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "description",
+            "command"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "edit"
+            },
+            "description": {
+              "type": "string"
+            },
+            "file": {
+              "type": "string"
+            },
+            "line": {
+              "type": "number"
+            },
+            "replace": {
+              "type": "object",
+              "properties": {
+                "from": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "from",
+                "to"
+              ],
+              "additionalProperties": false
+            },
+            "insert": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "description",
+            "file"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "manual"
+            },
+            "description": {
+              "type": "string"
+            },
+            "requiresHuman": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "description"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Impact": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        },
+        "rows": {
+          "type": "number"
+        },
+        "bytes": {
+          "type": "number"
+        },
+        "trashPath": {
+          "type": "string"
+        },
+        "downstream": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "estimatedRequests": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "asset",
+        "action",
+        "rows",
+        "downstream"
+      ],
+      "additionalProperties": false
+    },
+    "PreviewAsset": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "ingest",
+            "sql",
+            "ts",
+            null
+          ]
+        },
+        "status": {
+          "enum": [
+            "failed",
+            "ok",
+            "skipped"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "rows": {
+          "type": [
+            "null",
+            "number"
+          ]
+        },
+        "liveRows": {
+          "type": [
+            "null",
+            "number"
+          ]
+        },
+        "partial": {
+          "type": "boolean"
+        },
+        "capped": {
+          "type": "boolean"
+        },
+        "requests": {
+          "type": "number"
+        },
+        "since": {
+          "type": "string"
+        },
+        "diff": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "by": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "added": {
+                  "type": "number"
+                },
+                "removed": {
+                  "type": "number"
+                },
+                "changed": {
+                  "type": "number"
+                },
+                "unchanged": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "by",
+                "added",
+                "removed",
+                "changed",
+                "unchanged"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PreviewColumnChange"
+          }
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "check": {
+                "type": "string"
+              },
+              "ok": {
+                "type": "boolean"
+              },
+              "failing": {
+                "type": "number"
+              },
+              "sample": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/Row"
+                }
+              }
+            },
+            "required": [
+              "check",
+              "ok"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "sample": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Row"
+          }
+        },
+        "downstream": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "durationMs": {
+          "type": "number"
+        },
+        "error": {
+          "$ref": "#/$defs/Problem"
+        }
+      },
+      "required": [
+        "asset",
+        "kind",
+        "status",
+        "reason",
+        "rows",
+        "liveRows",
+        "partial",
+        "capped",
+        "diff",
+        "columns",
+        "checks",
+        "sample",
+        "downstream",
+        "durationMs"
+      ],
+      "additionalProperties": false
+    },
+    "PreviewColumnChange": {
+      "type": "object",
+      "properties": {
+        "column": {
+          "type": "string"
+        },
+        "change": {
+          "enum": [
+            "added",
+            "removed",
+            "retyped"
+          ]
+        },
+        "type": {
+          "type": "string"
+        },
+        "from": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "column",
+        "change",
+        "type"
+      ],
+      "additionalProperties": false
+    },
+    "Problem": {
+      "type": "object",
+      "properties": {
+        "severity": {
+          "enum": [
+            "error",
+            "info",
+            "warning"
+          ]
+        },
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "docs": {
+          "type": "string"
+        },
+        "asset": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "number"
+        },
+        "column": {
+          "type": "number"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "fix": {
+          "$ref": "#/$defs/Fix"
+        },
+        "effect": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "details": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "severity",
+        "code",
+        "message",
+        "hint",
+        "docs"
+      ],
+      "additionalProperties": false
+    },
+    "Row": {
+      "type": "object"
+    }
+  }
+}

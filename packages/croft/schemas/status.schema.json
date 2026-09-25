@@ -1,0 +1,770 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "croft status --json",
+  "description": "The envelope croft status --json prints on stdout (DESIGN.md §4.3). data is null when the command failed before it had any.",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "command": {
+      "const": "status"
+    },
+    "croftVersion": {
+      "type": "string"
+    },
+    "database": {
+      "type": "string"
+    },
+    "timezone": {
+      "type": "string"
+    },
+    "durationMs": {
+      "type": "number"
+    },
+    "data": {
+      "anyOf": [
+        {
+          "title": "StatusData",
+          "type": "object",
+          "properties": {
+            "healthy": {
+              "type": "boolean"
+            },
+            "running": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/RunningEntry"
+              }
+            },
+            "assets": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/StatusAsset"
+              }
+            },
+            "scheduling": {
+              "$ref": "#/$defs/Scheduling"
+            },
+            "serve": {
+              "type": "object",
+              "properties": {
+                "url": {
+                  "type": "string"
+                },
+                "pid": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "url",
+                "pid"
+              ],
+              "additionalProperties": false
+            },
+            "readCopy": {
+              "$ref": "#/$defs/ReadCopyView"
+            },
+            "redactedValues": {
+              "const": true
+            }
+          },
+          "required": [
+            "healthy",
+            "running",
+            "assets",
+            "scheduling"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "problems": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Problem"
+      }
+    },
+    "next": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "reason"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "confirmation": {
+      "$ref": "#/$defs/Confirmation"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "ok",
+    "command",
+    "croftVersion",
+    "database",
+    "timezone",
+    "durationMs",
+    "data",
+    "problems",
+    "next"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "AssetNext": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "reason": {
+          "enum": [
+            "after inputs",
+            "manual",
+            "none",
+            "paused",
+            "schedule",
+            "scheduling off"
+          ]
+        },
+        "schedule": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "Confirmation": {
+      "type": "object",
+      "properties": {
+        "token": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "impact": {
+          "$ref": "#/$defs/Impact"
+        }
+      },
+      "required": [
+        "token",
+        "expiresAt",
+        "command",
+        "impact"
+      ],
+      "additionalProperties": false
+    },
+    "Fix": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "command"
+            },
+            "description": {
+              "type": "string"
+            },
+            "command": {
+              "type": "string"
+            },
+            "requiresHuman": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "description",
+            "command"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "edit"
+            },
+            "description": {
+              "type": "string"
+            },
+            "file": {
+              "type": "string"
+            },
+            "line": {
+              "type": "number"
+            },
+            "replace": {
+              "type": "object",
+              "properties": {
+                "from": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "from",
+                "to"
+              ],
+              "additionalProperties": false
+            },
+            "insert": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "description",
+            "file"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "manual"
+            },
+            "description": {
+              "type": "string"
+            },
+            "requiresHuman": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "description"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Impact": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        },
+        "rows": {
+          "type": "number"
+        },
+        "bytes": {
+          "type": "number"
+        },
+        "trashPath": {
+          "type": "string"
+        },
+        "downstream": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "estimatedRequests": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "asset",
+        "action",
+        "rows",
+        "downstream"
+      ],
+      "additionalProperties": false
+    },
+    "LastRun": {
+      "type": "object",
+      "properties": {
+        "runId": {
+          "type": "string"
+        },
+        "at": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "code": {
+          "type": [
+            "null",
+            "string"
+          ]
+        }
+      },
+      "required": [
+        "runId",
+        "at",
+        "status",
+        "code"
+      ],
+      "additionalProperties": false
+    },
+    "Problem": {
+      "type": "object",
+      "properties": {
+        "severity": {
+          "enum": [
+            "error",
+            "info",
+            "warning"
+          ]
+        },
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "docs": {
+          "type": "string"
+        },
+        "asset": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "number"
+        },
+        "column": {
+          "type": "number"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "fix": {
+          "$ref": "#/$defs/Fix"
+        },
+        "effect": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "details": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "severity",
+        "code",
+        "message",
+        "hint",
+        "docs"
+      ],
+      "additionalProperties": false
+    },
+    "ReadCopyView": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "exists": {
+          "type": "boolean"
+        },
+        "asOf": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "refreshedAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "method": {
+          "enum": [
+            "clone",
+            "copy",
+            "reflink",
+            null
+          ]
+        },
+        "lastError": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "at": {
+                  "type": "string"
+                },
+                "code": {
+                  "type": [
+                    "null",
+                    "string"
+                  ]
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "at",
+                "code",
+                "message"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lastWrite": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "runId": {
+                  "type": "string"
+                },
+                "at": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "runId",
+                "at"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "health": {
+          "enum": [
+            "behind",
+            "failed",
+            "missing",
+            "ok",
+            "refreshing"
+          ]
+        },
+        "log": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "exists",
+        "asOf",
+        "refreshedAt",
+        "method",
+        "lastError",
+        "lastWrite",
+        "health",
+        "log"
+      ],
+      "additionalProperties": false
+    },
+    "RunningEntry": {
+      "type": "object",
+      "properties": {
+        "runId": {
+          "type": "string"
+        },
+        "asset": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "pid": {
+          "type": [
+            "null",
+            "number"
+          ]
+        },
+        "since": {
+          "type": "string"
+        },
+        "phase": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "rowsFetched": {
+          "type": [
+            "null",
+            "number"
+          ]
+        }
+      },
+      "required": [
+        "runId",
+        "asset",
+        "pid",
+        "since",
+        "phase",
+        "rowsFetched"
+      ],
+      "additionalProperties": false
+    },
+    "Scheduling": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "enum": [
+            "off",
+            "on",
+            "paused"
+          ]
+        },
+        "via": {
+          "enum": [
+            "os-job",
+            "serve",
+            null
+          ]
+        },
+        "lastTickAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "stale": {
+          "type": "boolean"
+        },
+        "pausedUntil": {
+          "type": [
+            "null",
+            "string"
+          ]
+        }
+      },
+      "required": [
+        "state",
+        "via",
+        "lastTickAt"
+      ],
+      "additionalProperties": false
+    },
+    "StatusAsset": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "ingest",
+            "sql",
+            "ts",
+            null
+          ]
+        },
+        "file": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "status": {
+          "enum": [
+            "crashed",
+            "failed",
+            "interrupted",
+            "never_run",
+            "no_asset_file",
+            "ok",
+            "running",
+            "skipped",
+            "unknown"
+          ]
+        },
+        "rows": {
+          "type": [
+            "null",
+            "number"
+          ]
+        },
+        "lastRun": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LastRun"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "next": {
+          "$ref": "#/$defs/AssetNext"
+        },
+        "stale": {
+          "type": "boolean"
+        },
+        "staleReasons": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "backfill",
+              "code_changed",
+              "input_changed",
+              "input_replaced",
+              "never_built",
+              "rebuild",
+              "requested",
+              "schedule_due"
+            ]
+          }
+        },
+        "held": {
+          "type": "boolean"
+        },
+        "hold": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "enum": [
+                "LARGE_REPROCESS",
+                "SCHEDULE_HELD",
+                "backoff",
+                "leased",
+                "paused"
+              ]
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "reason"
+          ],
+          "additionalProperties": false
+        },
+        "edited": {
+          "type": "boolean"
+        },
+        "filesGone": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "schemaChangedAt": {
+          "type": "string"
+        },
+        "replaced": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              },
+              "restored": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "input",
+              "restored"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "deleted": {
+          "const": true
+        },
+        "drift": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "enum": [
+                  "COLUMN_STOPPED_ARRIVING",
+                  "JSON_KIND_CHANGED",
+                  "TYPE_WIDENED"
+                ]
+              },
+              "column": {
+                "type": [
+                  "null",
+                  "string"
+                ]
+              },
+              "text": {
+                "type": "string"
+              },
+              "at": {
+                "type": "string"
+              },
+              "runId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "column",
+              "text",
+              "at",
+              "runId"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "asset",
+        "kind",
+        "file",
+        "status",
+        "rows",
+        "lastRun",
+        "next",
+        "stale",
+        "staleReasons",
+        "held",
+        "edited"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

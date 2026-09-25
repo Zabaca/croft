@@ -1,0 +1,551 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "croft init --json",
+  "description": "The envelope croft init --json prints on stdout (DESIGN.md §4.3). data is null when the command failed before it had any.",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "command": {
+      "const": "init"
+    },
+    "croftVersion": {
+      "type": "string"
+    },
+    "database": {
+      "type": "string"
+    },
+    "timezone": {
+      "type": "string"
+    },
+    "durationMs": {
+      "type": "number"
+    },
+    "data": {
+      "anyOf": [
+        {
+          "title": "InitResult",
+          "type": "object",
+          "properties": {
+            "mode": {
+              "enum": [
+                "app",
+                "claude",
+                "new"
+              ]
+            },
+            "base": {
+              "type": "string"
+            },
+            "root": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            },
+            "timezone": {
+              "type": "string"
+            },
+            "files": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/FileChange"
+              }
+            },
+            "relocation": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "reason": {
+                      "type": "string"
+                    },
+                    "dir": {
+                      "type": "string"
+                    },
+                    "database": {
+                      "type": "string"
+                    },
+                    "stateDir": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "reason",
+                    "dir",
+                    "database",
+                    "stateDir"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "tsconfig": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TsconfigEdit"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "appSteps": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "install": {
+              "$ref": "#/$defs/InstallOutcome"
+            },
+            "example": {
+              "$ref": "#/$defs/ExampleOutcome"
+            },
+            "redactedValues": {
+              "const": true
+            }
+          },
+          "required": [
+            "mode",
+            "base",
+            "root",
+            "version",
+            "timezone",
+            "files",
+            "relocation",
+            "tsconfig",
+            "appSteps",
+            "install",
+            "example"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "problems": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Problem"
+      }
+    },
+    "next": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "reason"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "confirmation": {
+      "$ref": "#/$defs/Confirmation"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "ok",
+    "command",
+    "croftVersion",
+    "database",
+    "timezone",
+    "durationMs",
+    "data",
+    "problems",
+    "next"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "Confirmation": {
+      "type": "object",
+      "properties": {
+        "token": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "impact": {
+          "$ref": "#/$defs/Impact"
+        }
+      },
+      "required": [
+        "token",
+        "expiresAt",
+        "command",
+        "impact"
+      ],
+      "additionalProperties": false
+    },
+    "ExampleOutcome": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExampleResult"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ran": {
+              "const": false
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ran",
+            "reason"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ExampleResult": {
+      "type": "object",
+      "properties": {
+        "ran": {
+          "const": true
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "asset": {
+          "type": "string"
+        },
+        "rows": {
+          "type": "number"
+        },
+        "checks": {
+          "enum": [
+            "failed",
+            "ok"
+          ]
+        },
+        "problems": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Problem"
+          }
+        }
+      },
+      "required": [
+        "ran",
+        "ok",
+        "asset",
+        "rows",
+        "checks"
+      ],
+      "additionalProperties": false
+    },
+    "FileChange": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "action": {
+          "enum": [
+            "appended",
+            "created",
+            "merged",
+            "replaced",
+            "skipped",
+            "unchanged"
+          ]
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "action"
+      ],
+      "additionalProperties": false
+    },
+    "Fix": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "command"
+            },
+            "description": {
+              "type": "string"
+            },
+            "command": {
+              "type": "string"
+            },
+            "requiresHuman": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "description",
+            "command"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "edit"
+            },
+            "description": {
+              "type": "string"
+            },
+            "file": {
+              "type": "string"
+            },
+            "line": {
+              "type": "number"
+            },
+            "replace": {
+              "type": "object",
+              "properties": {
+                "from": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "from",
+                "to"
+              ],
+              "additionalProperties": false
+            },
+            "insert": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "description",
+            "file"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "manual"
+            },
+            "description": {
+              "type": "string"
+            },
+            "requiresHuman": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "description"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Impact": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        },
+        "rows": {
+          "type": "number"
+        },
+        "bytes": {
+          "type": "number"
+        },
+        "trashPath": {
+          "type": "string"
+        },
+        "downstream": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "estimatedRequests": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "asset",
+        "action",
+        "rows",
+        "downstream"
+      ],
+      "additionalProperties": false
+    },
+    "InstallOutcome": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/InstallResult"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ran": {
+              "const": false
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ran",
+            "reason"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "InstallResult": {
+      "type": "object",
+      "properties": {
+        "ran": {
+          "const": true
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "command": {
+          "type": "string"
+        },
+        "ms": {
+          "type": "number"
+        },
+        "output": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ran",
+        "ok",
+        "command",
+        "ms"
+      ],
+      "additionalProperties": false
+    },
+    "Problem": {
+      "type": "object",
+      "properties": {
+        "severity": {
+          "enum": [
+            "error",
+            "info",
+            "warning"
+          ]
+        },
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "docs": {
+          "type": "string"
+        },
+        "asset": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "number"
+        },
+        "column": {
+          "type": "number"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "fix": {
+          "$ref": "#/$defs/Fix"
+        },
+        "effect": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "details": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "severity",
+        "code",
+        "message",
+        "hint",
+        "docs"
+      ],
+      "additionalProperties": false
+    },
+    "TsconfigEdit": {
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "applied",
+            "declined",
+            "manual",
+            "suggested"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "diff": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "file",
+        "status",
+        "reason"
+      ],
+      "additionalProperties": false
+    }
+  }
+}
