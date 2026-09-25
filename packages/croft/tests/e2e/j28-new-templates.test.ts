@@ -258,8 +258,9 @@ describe("a. api templates, one per pagination style", () => {
       expect(serious(before).map((x) => x.code), JSON.stringify(before.problems)).toEqual(["SECRET_MISSING"]);
       expect(findProblem(before, "SECRET_MISSING")).toMatchObject({ severity: "warning", asset: c.name, details: expect.objectContaining({ name: c.secret }) });
 
-      // 3. The edits the Edit line names: the URL (the mock pages the way the template expects), the description,
-      //    and the commented checks line (and the page template's schedule) turned on.
+      // 3. The edits the Edit line names: the URL (the mock takes the parameters and pages the way the template
+      //    expects, so nothing else needs to change), and the commented checks line (and the page template's
+      //    schedule) turned on.
       p.edit(file, JSON.stringify(c.placeholder), JSON.stringify(`${api.url}${mockPath}`));
       p.edit(file, "  // checks: [", "  checks: [");
       if (c.style === "page") p.edit(file, "  // schedule: ", "  schedule: ");
