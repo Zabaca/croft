@@ -339,8 +339,8 @@ describe("the types folder", () => {
     expect(r.json.problems).toEqual([expect.objectContaining({
       severity: "info", code: "INSTALL_FAILED", file: "tsconfig.json",
       message: "tsconfig.json does not include .croft/types, so TS transforms read every input row as a Row: tsc cannot catch a column renamed upstream",
-      hint: 'add ".croft/types" to "include" in tsconfig.json (croft init writes it that way)',
-      fix: { kind: "edit", description: 'add ".croft/types" to the "include" list', file: "tsconfig.json" },
+      hint: 'add ".croft/types/**/*.d.ts" to "include" in tsconfig.json, as croft init writes it',
+      fix: { kind: "edit", description: 'add ".croft/types/**/*.d.ts" to the "include" list', file: "tsconfig.json" },
     })]);
     // No catalog, no types: nothing to say.
     const q = makeProject({ files: { "assets/github_issues.ts": ISSUES_TS } });

@@ -702,14 +702,17 @@ export function includesInputTypes(tsconfigText: string): boolean | null {
   });
 }
 
+/** The "include" pattern croft init writes for the input row types (agent/templates.ts tsconfigJson). */
+const TYPES_INCLUDE = `${TYPES_DIR}/**/*.d.ts`;
+
 /** An info problem when there are input types and tsconfig.json leaves them out (a project made before them). */
 function typesNotIncluded(root: string, generated: TypesResult | undefined): Problem[] {
   if (!generated?.assets.length || includesInputTypes(readText(join(root, "tsconfig.json"))) !== false) return [];
   const p = problem("INSTALL_FAILED", {
     message: `tsconfig.json does not include ${TYPES_DIR}, so TS transforms read every input row as a Row: tsc cannot catch a column renamed upstream`,
-    hint: `add "${TYPES_DIR}" to "include" in tsconfig.json (croft init writes it that way)`,
+    hint: `add "${TYPES_INCLUDE}" to "include" in tsconfig.json, as croft init writes it`,
     file: "tsconfig.json",
-    fix: { kind: "edit", description: `add "${TYPES_DIR}" to the "include" list`, file: "tsconfig.json" },
+    fix: { kind: "edit", description: `add "${TYPES_INCLUDE}" to the "include" list`, file: "tsconfig.json" },
     details: { phase: "types" },
   });
   return [{ ...p, severity: "info" }];
