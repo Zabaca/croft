@@ -17,9 +17,10 @@ import { version } from "./version.ts";
 const init = lazyCommand({
   name: "init",
   summary: "create a croft project (or data/ inside an existing app); --claude refreshes the Claude files",
-  usage: "croft init [dir] [--claude] [--no-install]",
+  usage: "croft init [dir] [--claude] [--with-hook] [--no-install]",
   options: {
     claude: { type: "boolean", description: "only refresh CLAUDE.md's croft block and .claude/skills/croft/SKILL.md" },
+    "with-hook": { type: "boolean", description: "also add a Claude Code hook that runs croft validate --hook after each edit under assets/ (.claude/settings.json)" },
     "no-install": { type: "boolean", description: "do not run bun install (the project needs it before its first run)" },
   },
   maxPositionals: 1,
@@ -123,9 +124,10 @@ const query = lazyCommand({
 const validate = lazyCommand({
   name: "validate",
   summary: "static checks and a bind check of every SQL asset (with its output columns); never touches the warehouse",
-  usage: "croft validate [asset…] [--types]",
+  usage: "croft validate [asset…] [--types] [--hook]",
   options: {
     types: { type: "boolean", description: "also type-check the project's TypeScript with its own tsc --noEmit" },
+    hook: { type: "boolean", description: "run as a Claude Code hook: read the edited file from the hook's JSON on stdin and validate that asset" },
   },
   humanShowsProblems: true,
 }, async () => (await import("./validate.ts")).validate);
@@ -220,7 +222,18 @@ const restore = lazyCommand({
   maxPositionals: 1,
 }, async () => (await import("./restore.ts")).restore);
 
+const newCmd = lazyCommand({
+  name: "new",
+  summary: "write a commented, working template for a new asset; --list shows the kinds",
+  usage: "croft new api|file|sql|transform <name> [--pagination keyset|cursor|link|page] | croft new --list",
+  options: {
+    pagination: { type: "string", value: "<style>", description: "for api: keyset (ascending since), cursor (starting_after/has_more), link (Link header) or page (page/per_page)" },
+    list: { type: "boolean", description: "list the kinds and pagination styles" },
+  },
+  maxPositionals: 2,
+}, async () => (await import("./new.ts")).newAsset);
+
 export const COMMANDS: readonly Command[] = [
   docs, help, version, init, doctor, validate, preview, run, wait, status, query, describe, context, logs, secrets, confirm,
-  schedule, serve, tick, rename, del, restore,
+  schedule, serve, tick, rename, del, restore, newCmd,
 ];

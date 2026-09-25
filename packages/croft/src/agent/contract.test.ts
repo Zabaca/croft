@@ -81,7 +81,8 @@ describe("the phase manifest matches the registry", () => {
     const flags = (name: string) => Object.keys(registered.get(name)?.options ?? {});
     expect(flags("run")).toEqual(expect.arrayContaining(["dry-run", "only", "upstream"]));
     expect(flags("query")).toContain("preview");
-    expect(flags("validate")).toEqual(["types"]);
+    expect(flags("validate")).toEqual(["types", "hook"]);
+    expect(flags("init")).toContain("with-hook");
     expect(flags("preview")).toEqual(["rows", "rebuild"]);
   });
 
@@ -93,20 +94,20 @@ describe("the phase manifest matches the registry", () => {
     for (const c of LATER_COMMANDS) expect(notes).toContain(c);
     expect(notes).not.toContain("--rebuild");
     expect(notes).not.toContain("--due");
-    expect(notes).toContain("validate --hook");
+    // Phase 5 ships everything: no "not in this version" line.
+    expect(notes).not.toContain("Not in this version");
     expect(notes).not.toContain("--dry-run");
   });
 });
 
 describe("croft tells the agent to use only what this build has", () => {
   test("the scanner catches what it is meant to", () => {
-    expect(scan("t", "Loop: edit → `croft new api x` → `croft run <asset>`").map((f) => f.problem))
-      .toEqual(["croft new is phase 5; this build is phase 4"]);
+    expect(scan("t", "Loop: edit → `croft new api x` → `croft run <asset>`")).toEqual([]);
     expect(scan("t", "croft rename a b; croft restore a --at 2026-09-01; croft run a --rebuild")).toEqual([]);
     expect(scan("t", "croft schedule on, then croft serve --port 7447")).toEqual([]);
-    expect(scan("t", "Redo: croft run <asset> --rebuild --from -90d, then the same with --with-hook.").map((f) => f.problem))
-      .toEqual(["no command of this build has --with-hook"]);
-    expect(scan("t", "croft validate --hook").map((f) => f.problem)).toEqual(["croft validate --hook comes in a later phase"]);
+    expect(scan("t", "Redo: croft run <asset> --rebuild --from -90d, then croft init --claude --with-hook.")).toEqual([]);
+    expect(scan("t", "croft run x --with-hook").map((f) => f.problem)).toEqual(["croft run has no option --with-hook"]);
+    expect(scan("t", "croft validate --hook")).toEqual([]);
     expect(scan("t", "croft preview x --rows 10 --dry-run").map((f) => f.problem)).toEqual(["croft preview has no option --dry-run"]);
     expect(scan("t", "croft logs x --failed → croft run x --from 2026-01-01; croft status --check")).toEqual([]);
     expect(scan("t", "`croft validate --json` → `croft preview x --rebuild` → croft run x --dry-run --upstream; croft query --preview \"from x\"")).toEqual([]);
