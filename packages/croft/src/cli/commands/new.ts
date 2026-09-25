@@ -108,13 +108,15 @@ export const newAsset: CommandImpl<NewData> = {
     const ext = kind === "sql" ? "sql" : "ts";
     const bad = nameProblem(name, `assets/${name}.${ext}`, keywords);
     if (bad) {
-      const to = String(bad.details?.suggestion ?? "");
+      // A path or a file name ("assets/orders.ts") means the name inside it.
+      const stem = name.replace(/^(\.\/)?assets\//, "").replace(/\.(ts|sql)$/, "");
+      const to = stem !== name && !nameProblem(stem, `assets/${stem}.${ext}`, keywords) ? stem : String(bad.details?.suggestion ?? "");
       throw new CroftError(bad.code === "NAME_RESERVED" ? "NAME_RESERVED" : "NAME_INVALID", {
         message: bad.details?.reason === "keyword" ? bad.message.replace(/; rename to \S+$/, `; use ${to}`) : bad.message,
         hint: `use a name that works as a table name: ${again(to)}`,
         fix: { kind: "command", description: `write the template as ${to}`, command: again(to) },
         effect: "nothing was written",
-        details: { ...bad.details, name },
+        details: { ...bad.details, name, suggestion: to },
       });
     }
 
@@ -294,7 +296,8 @@ function mtimeOf(path: string): number {
  */
 async function chooseInput(project: Project, kind: "sql" | "transform", name: string): Promise<TemplateInput> {
   const resolved = await resolveProject({ root: project.root, timezone: project.timezone });
-  const all = resolved.assets.filter((a) => a.name !== name).map((a) => ({ a, mtime: mtimeOf(a.path) }))
+  // An asset file that did not load and whose text names neither ingest( nor transform( is nothing to read yet.
+  const all = resolved.assets.filter((a) => a.name !== name && a.kind !== null).map((a) => ({ a, mtime: mtimeOf(a.path) }))
     .sort((x, y) => y.mtime - x.mtime || (x.a.name < y.a.name ? -1 : x.a.name > y.a.name ? 1 : 0));
   if (all.length === 0) {
     throw new CroftError("USAGE_ERROR", {
