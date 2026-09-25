@@ -6,6 +6,10 @@ those first, and rebuilds this table whenever one of them changes: there is no l
 date. Use SQL for filters, joins and aggregates; use a TypeScript transform for per-row code such as an API or
 LLM call (croft docs transforms).
 
+Start with croft new sql <name>. It writes the header (description, key, a check) and one SELECT over the asset
+changed most recently, keeping that asset's key; the file passes croft validate as written. Then edit the SELECT,
+the key and the check. The examples below show the whole language.
+
 ## The file
 
 ```sql

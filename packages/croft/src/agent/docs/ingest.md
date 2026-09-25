@@ -2,10 +2,22 @@
 
 An ingest is one file in assets/ that makes one table with the file's name (lowercase letters, digits and
 _; assets/github_issues.ts makes github_issues). It default-exports ingest({...}) from "@zabaca/croft".
-Start from the closest template below and change only what the source needs; do not invent options.
-Then check it with croft validate, try it with croft preview <name> (it fetches at most 1,000 rows, changes no
-real table and does not move the saved cursor), run it with croft run <name>, and look at the result with
-croft describe <name> and croft query.
+
+Start with croft new. It writes a commented, working template that passes croft validate as written, says
+when it applies, and prints what to edit (croft new --list shows them all):
+
+  croft new api <name> --pagination keyset   the API sorts ascending by a field that grows as records change
+                                             (updated_at) and filters by it
+  croft new api <name> --pagination cursor   newest first, paged by the API's own cursor (starting_after/has_more,
+                                             next_page_token): Stripe and most list endpoints; the default
+  croft new api <name> --pagination link     the next page's URL is in the Link header (GitHub, GitLab)
+  croft new api <name> --pagination page     page numbers only: for data that does not change while it is read
+  croft new file <name>                      CSV files dropped into files/<name>/; new and changed files only
+
+The examples below are complete ingests of real APIs and files, to compare with. Change only what the source
+needs; do not invent options. Then check it with croft validate, try it with croft preview <name> (it fetches
+at most 1,000 rows, changes no real table and does not move the saved cursor), run it with croft run <name>,
+and look at the result with croft describe <name> and croft query.
 
 How rows are written follows from key and incremental (croft describe says it in words):
   no key, no incremental   each run replaces the table
@@ -16,7 +28,8 @@ A replace that would remove most of the table's rows stops with SHRINK_GUARD ins
 
 ## API, ascending "updated since" (keyset paging)
 
-Use keyset paging only when the API sorts ascending by the cursor field and filters by it.
+Use keyset paging only when the API sorts ascending by the cursor field and filters by it
+(croft new api <name> --pagination keyset).
 
 ```ts
 // assets/github_issues.ts
@@ -54,7 +67,7 @@ export default ingest({
 
 Most list endpoints (Stripe and the like) return the newest first: filter by since and follow the API's
 cursor. Records that change after creation (payments, refunds, orders, tickets) need a lookback, and epoch
-cursors need unit.
+cursors need unit (croft new api <name> --pagination cursor).
 
 ```ts
 // assets/stripe_charges.ts
@@ -90,7 +103,9 @@ export default ingest({
 ## API with a Link header, fetched in full each run
 
 res.next is the rel="next" URL of the Link header. With a key and no incremental, each run re-reads every
-page and replaces the table (unchanged rows keep their _loaded_at).
+page and replaces the table (unchanged rows keep their _loaded_at). croft new api <name> --pagination link
+writes the same loop with an "updated since" filter and incremental, so each run fetches only what changed;
+remove both where the API has no such filter.
 
 ```ts
 // assets/gitlab_projects.ts
@@ -112,10 +127,42 @@ export default ingest({
 });
 ```
 
+## API with page numbers, fetched in full each run
+
+When the API offers nothing but page numbers, ask for pages until one comes back empty. Records added or removed
+during the fetch shift the pages, so a record can be read twice (the key stores it once) or skipped until the next
+run: use it only for data that does not change while it is read (croft new api <name> --pagination page).
+
+```ts
+// assets/country_codes.ts
+import { ingest } from "@zabaca/croft";
+
+type Country = { code: string; name: string };
+
+export default ingest({
+  description: "Country codes of the example reference API",
+  secrets: ["REFDATA_KEY"],
+  key: "code",
+
+  async *rows({ http, secret }) {
+    for (let page = 1; ; page++) {
+      const res = await http.get("https://api.example.com/v1/countries", {
+        headers: { Authorization: `Bearer ${secret("REFDATA_KEY")}` },
+        query: { page, per_page: 100 },
+      });
+      const countries = res.json<Country[]>();
+      if (countries.length === 0) return;           // an empty page: past the last one
+      yield countries;
+    }
+  },
+});
+```
+
 ## Files: a folder of exports, or a URL
 
 Paths are relative to the project folder; put input files under files/. Formats come from the extension
-(.csv, .tsv, .json, .ndjson/.jsonl, .parquet), or from format:.
+(.csv, .tsv, .json, .ndjson/.jsonl, .parquet), or from format:. croft new file <name> writes the first example
+and makes its folder, files/<name>/.
 
 ```ts
 // assets/sales.ts: every CSV dropped into files/sales/ is loaded once; changed files are reloaded
