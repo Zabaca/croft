@@ -3,6 +3,12 @@
 // impact and refuses with CONFIRMATION_STALE if it changed. Consent is tied to the impact the
 // user was shown: a token is single-use, expires after 15 minutes, and stores a hash of the impact.
 //
+// Consent is for one action, not one token: once a token is carried out (or spent as not needed), every other open
+// token for the same stored command is spent with it ("superseded"), so asking twice and confirming twice cannot
+// run a refetch twice. The hash also covers the table's generation when the command supplies it (a HashedImpact:
+// delete.ts tableGeneration), so a token minted before a rebuild, a delete or a restore of that table is stale
+// afterwards even when the row count is the same. The generation is hashed only, never shown or stored.
+//
 // A token reaches the command that acts only from `croft confirm`: in its own process through the CLI's
 // Dispatch (never argv), and for a detached run through a one-time grant (grantDetached/redeemGrant below).
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
@@ -18,26 +24,42 @@ export const CONFIRMATION_TTL_MS = 15 * 60_000;
 const KEEP_MS = 24 * 60 * 60_000;
 const TOKEN = /^c_[0-9a-f]{6}$/;
 
-export type RecomputeImpact = (stored: { command: string; impact: Impact }) => Impact | Promise<Impact>;
-export type StaleReason = "expired" | "impact_changed" | "used";
+/** An impact with the table's generation (delete.ts tableGeneration): hashed, never shown or stored. */
+export type HashedImpact = Impact & { generation?: string | null };
+
+export type RecomputeImpact = (stored: { command: string; impact: Impact }) => HashedImpact | Promise<HashedImpact>;
+export type StaleReason = "expired" | "impact_changed" | "used" | "superseded";
+
+/** impact_hash of a token spent because another token for the same command was carried out: the prefix, then that
+ *  token (empty when the command was confirmed on a terminal). Such a token has used_at set, so its hash is never
+ *  compared again. */
+const SUPERSEDED = "superseded:";
 
 interface Row { token: string; command: string; impact: string; impact_hash: string; created_at: string;
   expires_at: string; used_at: string | null }
 
 /**
  * Hash of what the user agreed to. It covers what the action does (asset, action, rows,
- * downstream, estimated requests), not bookkeeping that differs on every computation: trashPath
- * embeds a timestamp and bytes shifts with compaction, so including them would make every token stale.
+ * downstream, estimated requests) and, when given, the table's generation; not bookkeeping that
+ * differs on every computation: trashPath embeds a timestamp and bytes shifts with compaction, so
+ * including them would make every token stale.
  */
-export function impactHash(impact: Impact): string {
+export function impactHash(impact: HashedImpact): string {
   const material = {
     asset: impact.asset,
     action: impact.action,
     rows: impact.rows,
     downstream: [...impact.downstream].sort(),
     estimatedRequests: impact.estimatedRequests ?? null,
+    ...(impact.generation !== undefined ? { generation: impact.generation } : {}),
   };
   return createHash("sha256").update(JSON.stringify(material)).digest("hex");
+}
+
+/** The impact as shown and stored: without the generation, which is only hashed. */
+export function shownImpact(impact: HashedImpact): Impact {
+  const { generation: _generation, ...shown } = impact;
+  return shown;
 }
 
 function notFound(token: string): CroftError {
@@ -57,10 +79,11 @@ export class Confirmations {
   constructor(private readonly db: RunsDb) {}
 
   /** Store a token for `command` with its impact. Returned as the envelope's `confirmation`. */
-  create(c: { command: string; impact: Impact }): Confirmation {
+  create(c: { command: string; impact: HashedImpact }): Confirmation {
     const now = this.db.now();
     const expiresAt = new Date(now.getTime() + CONFIRMATION_TTL_MS).toISOString();
     const hash = impactHash(c.impact);
+    const impact = shownImpact(c.impact);
     const insert = this.db.sqlite.query(
       `INSERT INTO confirmations (token, command, impact, impact_hash, created_at, expires_at)
        VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (token) DO NOTHING`,
@@ -70,8 +93,8 @@ export class Confirmations {
       // 24 bits of token: a collision is rare but possible, so retry instead of overwriting.
       for (;;) {
         const token = `c_${randomBytes(3).toString("hex")}`;
-        const res = insert.run(token, c.command, JSON.stringify(c.impact), hash, now.toISOString(), expiresAt);
-        if (res.changes === 1) return { token, expiresAt, command: c.command, impact: c.impact };
+        const res = insert.run(token, c.command, JSON.stringify(impact), hash, now.toISOString(), expiresAt);
+        if (res.changes === 1) return { token, expiresAt, command: c.command, impact };
       }
     });
   }
@@ -86,9 +109,10 @@ export class Confirmations {
 
   /**
    * Spend a token. Recomputes the impact and returns the stored command to carry out. Throws
-   * CONFIRMATION_STALE (with the new impact in details) when the token was used, has expired, or
-   * the impact changed; a stale token is spent too, since its consent no longer applies. If
-   * `recomputeImpact` itself throws, the token is left unspent so the user can retry.
+   * CONFIRMATION_STALE (with the new impact in details) when the token was used or superseded, has
+   * expired, or the impact changed; a stale token is spent too, since its consent no longer applies.
+   * If `recomputeImpact` itself throws, the token is left unspent so the user can retry. A token
+   * carried out spends every other open token for the same command (supersede).
    */
   async consume(token: string, recomputeImpact: RecomputeImpact): Promise<Confirmation> {
     const row = this.row(token);
@@ -97,7 +121,7 @@ export class Confirmations {
     if (row.used_at !== null) throw this.stale(row, stored.impact, null, "used");
 
     const expired = Date.parse(row.expires_at) <= this.db.now().getTime();
-    let current: Impact | null;
+    let current: HashedImpact | null;
     try {
       current = await recomputeImpact(stored);
     } catch (e) {
@@ -107,13 +131,31 @@ export class Confirmations {
     const reason: StaleReason | null = expired ? "expired"
       : impactHash(current!) !== row.impact_hash ? "impact_changed" : null;
 
-    // Claim atomically: of two concurrent `croft confirm`s only one sees changes === 1.
-    const claimed = this.db.sqlite
-      .query("UPDATE confirmations SET used_at = ? WHERE token = ? AND used_at IS NULL")
-      .run(this.db.nowIso(), token).changes === 1;
+    // Claim atomically: of two concurrent `croft confirm`s only one sees changes === 1. A token carried out spends
+    // the other open tokens for its command in the same transaction.
+    const claimed = this.db.transaction(() => {
+      const won = this.claim(token);
+      if (won && !reason) this.supersede(row.command, token);
+      return won;
+    });
     if (!claimed) throw this.stale(this.row(token)!, stored.impact, current, "used");
     if (reason) throw this.stale(row, stored.impact, current, reason);
     return { token, expiresAt: row.expires_at, command: row.command, impact: stored.impact };
+  }
+
+  /**
+   * Spend every open token for `command` but `by`: the action was carried out with `by` (null: confirmed on a
+   * terminal, with no token), and the consent they carry was for that one action. Returns how many were spent.
+   */
+  supersede(command: string, by: string | null): number {
+    return this.db.sqlite
+      .query("UPDATE confirmations SET used_at = ?, impact_hash = ? WHERE command = ? AND used_at IS NULL AND token <> ?")
+      .run(this.db.nowIso(), `${SUPERSEDED}${by ?? ""}`, command, by ?? "").changes;
+  }
+
+  private claim(token: string): boolean {
+    return this.db.sqlite.query("UPDATE confirmations SET used_at = ? WHERE token = ? AND used_at IS NULL")
+      .run(this.db.nowIso(), token).changes === 1;
   }
 
   /**
@@ -136,9 +178,13 @@ export class Confirmations {
    * used one, so it can never run the command a second time. False when it was already spent.
    */
   spendUnused(token: string): boolean {
-    if (!TOKEN.test(token)) return false;
-    return this.db.sqlite.query("UPDATE confirmations SET used_at = ? WHERE token = ? AND used_at IS NULL")
-      .run(this.db.nowIso(), token).changes === 1;
+    const row = this.row(token);
+    if (!row) return false;
+    return this.db.transaction(() => {
+      const won = this.claim(token);
+      if (won) this.supersede(row.command, token);
+      return won;
+    });
   }
 
   private row(token: string): Row | null {
@@ -146,11 +192,19 @@ export class Confirmations {
     return this.db.sqlite.query("SELECT * FROM confirmations WHERE token = ?").get(token) as Row | null;
   }
 
-  private stale(row: Row, previous: Impact, current: Impact | null, reason: StaleReason): CroftError {
+  private stale(row: Row, previous: Impact, now: HashedImpact | null, why: StaleReason): CroftError {
+    const current = now ? shownImpact(now) : null;
+    // A token spent because another one for the same command was carried out says so.
+    const by = why === "used" && row.impact_hash.startsWith(SUPERSEDED) ? row.impact_hash.slice(SUPERSEDED.length) : null;
+    const reason: StaleReason = by !== null ? "superseded" : why;
+    const same = current !== null && summarize(current) === summarize(previous);
     const message = {
       used: `confirmation ${row.token} was already used${row.used_at ? ` at ${row.used_at}` : ""}`,
+      superseded: `confirmation ${row.token} no longer applies: ${by ? `${by} carried out the same command (${row.command})` : "the same command was carried out (confirmed on a terminal)"}${row.used_at ? ` at ${row.used_at}` : ""}`,
       expired: `confirmation ${row.token} expired at ${row.expires_at} (tokens last 15 minutes)`,
-      impact_changed: `the impact changed since it was shown: now ${current ? summarize(current) : "?"} (was ${summarize(previous)})`,
+      impact_changed: same
+        ? `the impact changed since it was shown: the table was written or replaced since (now ${summarize(current!)})`
+        : `the impact changed since it was shown: now ${current ? summarize(current) : "?"} (was ${summarize(previous)})`,
     }[reason];
     return new CroftError("CONFIRMATION_STALE", {
       message,
@@ -159,7 +213,7 @@ export class Confirmations {
       effect: "nothing was changed",
       fix: { kind: "command", description: "get a new token for the current impact", command: row.command },
       details: { reason, token: row.token, command: row.command, impact: current, previousImpact: previous,
-        expiresAt: row.expires_at, usedAt: row.used_at },
+        expiresAt: row.expires_at, usedAt: row.used_at, ...(by ? { supersededBy: by } : {}) },
     });
   }
 }

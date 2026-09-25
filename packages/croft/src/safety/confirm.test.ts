@@ -206,6 +206,53 @@ describe("spendUnused (a confirmed command that never reached its confirmation)"
   });
 });
 
+describe("tokens for the same command do not outlive each other's use (R41-11)", () => {
+  test("carrying out one token spends every other open token for the same command; another command's token stays", async () => {
+    const older = confirms.create({ command: COMMAND, impact: impact() });
+    clock += 60_000;
+    const newer = confirms.create({ command: COMMAND, impact: impact() });
+    const other = confirms.create({ command: "croft delete taxi_zones", impact: impact({ action: "delete the whole table" }) });
+    clock += 60_000;
+    await confirms.consume(newer.token, () => impact());
+    const err = await stale(confirms.consume(older.token, () => impact()));
+    expect(err.problem.details).toMatchObject({ reason: "superseded", token: older.token, supersededBy: newer.token });
+    expect(err.message).toBe(`confirmation ${older.token} no longer applies: ${newer.token} carried out the same command (${COMMAND}) at 2026-09-22T18:42:00.000Z`);
+    expect(() => confirms.usable(older.token)).toThrow("no longer applies");
+    expect(confirms.usable(other.token).token).toBe(other.token);
+  });
+
+  test("a token spent as not needed spends the others too; a stale one does not", async () => {
+    const a = confirms.create({ command: COMMAND, impact: impact() });
+    const b = confirms.create({ command: COMMAND, impact: impact() });
+    const c = confirms.create({ command: COMMAND, impact: impact({ rows: 300 }) });
+    // a is stale (the impact is now 300 rows): b's consent is as stale, but c, minted for 300 rows, still stands.
+    await stale(confirms.consume(a.token, () => impact({ rows: 300 })));
+    expect(confirms.usable(c.token).token).toBe(c.token);
+    expect(confirms.spendUnused(c.token)).toBe(true);
+    expect((await stale(confirms.consume(b.token, () => impact()))).problem.details).toMatchObject({ reason: "superseded", supersededBy: c.token });
+  });
+
+  test("a token for a whole command line is superseded when the same action was confirmed on a terminal", async () => {
+    const a = confirms.create({ command: COMMAND, impact: impact() });
+    expect(confirms.supersede(COMMAND, null)).toBe(1);
+    const err = await stale(confirms.consume(a.token, () => impact()));
+    expect(err.message).toContain("the same command was carried out");
+  });
+
+  test("the table's generation is part of the hash, but not of the impact shown or stored", async () => {
+    const shown = { ...impact(), generation: "100/-" };
+    const c = confirms.create({ command: COMMAND, impact: shown });
+    expect(c.impact).toEqual(impact());
+    expect(confirms.get(c.token)!.impact).toEqual(impact());
+    expect(impactHash(shown)).not.toBe(impactHash(impact()));
+    const err = await stale(confirms.consume(c.token, () => ({ ...impact(), generation: "200/150" })));
+    expect(err.problem.details).toMatchObject({ reason: "impact_changed" });
+    expect(err.message).toContain("the table was written or replaced since");
+    const d = confirms.create({ command: COMMAND, impact: shown });
+    expect(await confirms.consume(d.token, () => ({ ...impact(), generation: "100/-" }))).toMatchObject({ token: d.token });
+  });
+});
+
 describe("detached grants (croft confirm → its detached run)", () => {
   const RUN = "r_0922_1140_a1b2";
 

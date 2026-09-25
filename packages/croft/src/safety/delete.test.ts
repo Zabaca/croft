@@ -71,10 +71,13 @@ describe("deleteImpact", () => {
   test("a whole table: every row; with --where: the rows it matches; downstream from _croft.inputs, transitively", async () => {
     const { w } = warehouse();
     await seed(w);
-    expect(await deleteImpact(w, "orders", null)).toEqual({ asset: "orders", rows: 5, rowsBefore: 5, where: null, downstream: ["daily", "report"] });
-    expect(await deleteImpact(w, "orders", "amount >= 30")).toEqual({ asset: "orders", rows: 2, rowsBefore: 5, where: "amount >= 30", downstream: ["daily", "report"] });
+    const generation = `${BigInt(Date.parse("2026-09-20T14:00:00Z")) * 1000n}/-`;
+    expect(await deleteImpact(w, "orders", null)).toEqual({ asset: "orders", rows: 5, rowsBefore: 5, where: null, downstream: ["daily", "report"], kind: "ingest", generation });
+    expect(await deleteImpact(w, "orders", "amount >= 30")).toEqual({
+      asset: "orders", rows: 2, rowsBefore: 5, where: "amount >= 30", downstream: ["daily", "report"], kind: "ingest", generation,
+    });
     expect((await deleteImpact(w, "orders", "  amount > 100 -- none\n")).rows).toBe(0);
-    expect(await deleteImpact(w, "other", null)).toEqual({ asset: "other", rows: 1, rowsBefore: 1, where: null, downstream: [] });
+    expect(await deleteImpact(w, "other", null)).toEqual({ asset: "other", rows: 1, rowsBefore: 1, where: null, downstream: [], kind: null, generation: null });
     expect(await w.read((db) => downstreamOf(db, "report"))).toEqual([]);
   });
 
@@ -203,5 +206,103 @@ describe("replacedStamp", () => {
     expect(await w.read((db) => replacedStamp(db, "orders", late))).toBe(BigInt(late.getTime()) * 1000n);
     expect(await w.read((db) => replacedStamp(db, "orders", new Date("2026-01-01T00:00:00Z")))).toBe(BigInt(Date.parse("2026-09-25T00:00:00Z")) * 1000n + 1n);
     expect(await w.read((db) => replacedStamp(db, "daily", new Date("2026-01-01T00:00:00Z")))).toBe(BigInt(Date.parse("2026-09-20T15:00:00Z")) * 1000n + 1n);
+  });
+});
+
+describe("deleteWhere deletes exactly the rows it trashed (R41-01)", () => {
+  const trashIds = async (path: string) => (await readTrash(path, `SELECT id::INT id FROM orders ORDER BY id`)).map((r) => r.id);
+  const idsNow = (w: DuckWarehouse) => w.read(async (db) => (await db.all<{ id: number }>(`SELECT id::INT id FROM orders ORDER BY id`)).map((r) => r.id));
+
+  test("a condition that picks other rows at the delete (a subquery over a table written between the commits) deletes the trashed rows", async () => {
+    const { w } = warehouse();
+    await seed(w);
+    // other.n = 1 when the rows go to the trash; 3 by the time the delete runs.
+    const r = await deleteWhere(w, "orders", "id IN (SELECT n FROM other)", {
+      now: new Date("2026-09-22T18:40:00Z"),
+      afterTrash: () => w.write("other writer", (tx) => tx.exec(`UPDATE other SET n = 3`), { runId: "r_other" }),
+    });
+    expect(r).toMatchObject({ rows: 1, rowsAfter: 4 });
+    expect(await idsNow(w)).toEqual([0, 2, 3, 4]);
+    await closeAllWarehouses();
+    expect(await trashIds(r.trashed.path)).toEqual([1]);
+  });
+
+  test("rows that match the condition but were written between the commits stay; so do extra copies of a trashed row", async () => {
+    const { w } = warehouse();
+    await w.write("seed", async (tx) => {
+      await ensureState(tx);
+      await tx.exec(`CREATE TABLE events AS SELECT * FROM (VALUES ('a', 1), ('a', 1), ('a', 1), ('b', 2)) v(k, n)`);
+    }, { runId: "r_seed" });
+    const r = await deleteWhere(w, "events", "k = 'a'", {
+      now: new Date("2026-09-22T18:40:00Z"),
+      afterTrash: () => w.write("other writer", (tx) => tx.exec(`INSERT INTO events VALUES ('a', 1), ('a', 9)`), { runId: "r_other" }),
+    });
+    expect(r).toMatchObject({ rows: 3, rowsAfter: 3 });
+    expect(await w.read((db) => db.all(`SELECT k, n::INT n, count(*)::INT c FROM events GROUP BY ALL ORDER BY ALL`)))
+      .toEqual([{ k: "a", n: 1, c: 1 }, { k: "a", n: 9, c: 1 }, { k: "b", n: 2, c: 1 }]);
+  });
+
+  test("a trashed row the table lost between the commits refuses the delete: nothing is deleted, and the version says it was not applied", async () => {
+    const { w, state } = warehouse();
+    await seed(w);
+    const e = await expectCode(deleteWhere(w, "orders", "id < 2", {
+      now: new Date("2026-09-22T18:40:00Z"),
+      afterTrash: () => w.write("outside", (tx) => tx.exec(`DELETE FROM orders WHERE id = 1`), { runId: "r_other" }),
+    }), "CONFIRMATION_STALE");
+    expect(e.problem.message).toContain("nothing was deleted");
+    expect(e.problem.effect).toContain("not deleted");
+    expect(await idsNow(w)).toEqual([0, 2, 3, 4]);
+    const [v] = listTrash(state, "orders");
+    expect(v).toMatchObject({ kind: "rows", rows: 2, applied: false });
+  });
+
+  test("the rows the trash got must be as many as the confirmation was for", async () => {
+    const { w, state } = warehouse();
+    await seed(w);
+    const e = await expectCode(deleteWhere(w, "orders", "id < 2", { now: new Date("2026-09-22T18:40:00Z"), expectRows: 3 }), "CONFIRMATION_STALE");
+    expect(e.problem.message).toContain("not the 3 the confirmation was for");
+    expect(await idsNow(w)).toEqual([0, 1, 2, 3, 4]);
+    expect(listTrash(state, "orders")[0]).toMatchObject({ applied: false });
+  });
+
+  test("a delete that commits marks its version applied", async () => {
+    const { w, state } = warehouse();
+    await seed(w);
+    const r = await deleteWhere(w, "orders", "id < 2", { now: new Date("2026-09-22T18:40:00Z"), expectRows: 2 });
+    expect(r.trashed.applied).toBeUndefined();
+    expect(listTrash(state, "orders")[0]!.applied).toBeUndefined();
+  });
+
+  test("USING SAMPLE / TABLESAMPLE anywhere in the condition is refused, like random()", async () => {
+    const { w } = warehouse();
+    await seed(w);
+    for (const where of ["id IN (SELECT id FROM orders USING SAMPLE 2 ROWS)", "id IN (SELECT id FROM orders TABLESAMPLE 50%)",
+      "id IN (SELECT id FROM (SELECT * FROM other) TABLESAMPLE reservoir(1 ROWS))"]) {
+      const e = await expectCode(deleteImpact(w, "orders", where), "USAGE_ERROR");
+      expect(e.problem.message, where).toContain("samples rows");
+    }
+  });
+
+  test("a change made outside croft before the delete is reported (OUT_OF_BAND_CHANGE), not folded in silently", async () => {
+    const { w } = warehouse();
+    await seed(w);
+    await w.write("outside", (tx) => tx.exec(`INSERT INTO orders VALUES (9, 90, TIMESTAMPTZ '2026-09-21 00:00:00+00')`), { runId: "r_other" });
+    const r = await deleteWhere(w, "orders", "id = 0", { now: new Date("2026-09-22T18:40:00Z") });
+    expect(r.problems.map((p) => p.code)).toEqual(["OUT_OF_BAND_CHANGE"]);
+    expect(r.problems[0]!.message).toContain("1 row added (5 → 6)");
+    const clean = await deleteWhere(w, "orders", "id = 1", { now: new Date("2026-09-22T18:41:00Z") });
+    expect(clean.problems).toEqual([]);
+  });
+});
+
+describe("tableGeneration", () => {
+  test("moves with a write or a replacement, so a token for the same row count goes stale", async () => {
+    const { w } = warehouse();
+    await seed(w);
+    const g1 = (await deleteImpact(w, "orders", null)).generation;
+    expect(g1).not.toBeNull();
+    await w.write("x", (tx) => tx.exec(`UPDATE _croft.assets SET last_replaced_at = '2026-09-21 00:00:00+00' WHERE name = 'orders'`), { runId: "r_x" });
+    expect((await deleteImpact(w, "orders", null)).generation).not.toBe(g1);
+    expect((await deleteImpact(w, "other", null)).generation).toBeNull();
   });
 });

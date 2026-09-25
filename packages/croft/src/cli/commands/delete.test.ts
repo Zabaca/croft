@@ -7,7 +7,7 @@ import { listLeases, tryAcquire } from "../../history/leases.ts";
 import { cliEnv, cli as spawnCli } from "../../run/testkit.ts";
 import { listTrash, versionNote } from "../../safety/trash.ts";
 import { deleteCommand, MAINTAIN_WAITS, prompter } from "./delete.ts";
-import { cleanup, cli, DEAD, makeProject, runsDb, seed, STATE, type TestProject } from "./inspect-testkit.ts";
+import { cleanup, cli, DEAD, makeProject, runsDb, seed, STATE, type TestProject, writeFiles } from "./inspect-testkit.ts";
 
 const NOW = "2026-09-22T18:40:00.000Z";
 const env = { CROFT_NOW: NOW };
@@ -134,14 +134,17 @@ describe("croft delete <asset>", () => {
       "needs confirmation: delete orders, the whole table: 5 rows",
       "  first: the 5 rows go to the trash (croft restore orders brings them back)",
       "  then:  daily read it: they keep their tables, and croft run skips them until orders is built again",
+      "         the scheduler leaves orders alone from now on: only croft run orders, by hand, builds it again, fetching its whole history from the source",
       `  ask the user; if they agree: croft confirm ${token}    (valid 15 min)`,
     ].join("\n"));
     expect(r.stdout).toContain(`error CONFIRMATION_REQUIRED  orders\n      needs confirmation: delete orders, the whole table: 5 rows\n`
-      + `      fix: first the 5 rows go to the trash (croft restore orders brings them back); ask the user, and only if they agree: croft confirm ${token} (valid 15 min)`);
+      + `      fix: first the 5 rows go to the trash (croft restore orders brings them back); then the scheduler leaves orders alone from now on: `
+      + `only croft run orders, by hand, builds it again, fetching its whole history from the source; ask the user, and only if they agree: croft confirm ${token} (valid 15 min)`);
     const done = await cli(["confirm", token], { cwd: p.root, env });
     expect(done.exit).toBe(0);
     expect(done.stdout).toContain("ok    orders   deleted the whole table (5 rows)");
     expect(done.stdout).toMatch(/in the trash: \.croft\/trash\/orders\/20260922T184000\.000Z\.duckdb \(croft restore orders brings it back\)/);
+    expect(done.stdout).toContain("      the scheduler leaves orders alone from now on: only croft run orders, by hand, builds it again");
   });
 
   test("on a terminal it asks y/N: yes deletes at once, no changes nothing", async () => {
@@ -155,7 +158,8 @@ describe("croft delete <asset>", () => {
     expect(no.exit).toBe(1);
     expect(no.stdout).toContain("not deleted: delete orders, the whole table: 5 rows was not confirmed; nothing was changed");
     expect(asked[0]).toBe("delete orders, the whole table: 5 rows\n  first: the 5 rows go to the trash (croft restore orders brings them back)\n"
-      + "  then:  daily read it: they keep their tables, and croft run skips them until orders is built again\nProceed? [y/N] ");
+      + "  then:  daily read it: they keep their tables, and croft run skips them until orders is built again\n"
+      + "         the scheduler leaves orders alone from now on: only croft run orders, by hand, builds it again, fetching its whole history from the source\nProceed? [y/N] ");
     expect(await ids(p)).toEqual([0, 1, 2, 3, 4]);
 
     prompter.ask = async () => true;
@@ -233,6 +237,87 @@ describe("croft delete <asset> --where", () => {
     const empty = await cli(["delete", "orders", "--where", "  ", "--json"], { cwd: p.root, env });
     expect(empty.json.problems[0]).toMatchObject({ code: "USAGE_ERROR", message: "--where is empty" });
     expect(await ids(p)).toEqual([0, 1, 2, 3, 4]);
+  });
+});
+
+describe("croft delete: the scheduler, readers and tokens (R41-06, R41-11)", () => {
+  test("a whole-table delete holds the asset from the scheduler: its approved code goes to the trash with it, and a restore brings it back", async () => {
+    const p = await project();
+    let db = runsDb(p.stateDir);
+    db.approveCode("orders", "hash-1");
+    db.close();
+    const r = await cli(["delete", "orders"], { cwd: p.root, env });
+    expect(r.stdout).toContain("  then:  daily read it: they keep their tables, and croft run skips them until orders is built again\n"
+      + "         the scheduler leaves orders alone from now on: only croft run orders, by hand, builds it again, fetching its whole history from the source");
+    const token = /croft confirm (c_[0-9a-f]{6})/.exec(r.stdout)![1]!;
+    const json = await cli(["delete", "orders", "--json"], { cwd: p.root, env });
+    expect(json.json.problems[0].hint).toContain("then the scheduler leaves orders alone from now on");
+    const done = await cli(["confirm", json.json.confirmation.token, "--json"], { cwd: p.root, env });
+    expect(done.exit).toBe(0);
+    expect(done.json.data.result).toMatchObject({ status: "deleted", held: true });
+    // The other token for the same command no longer applies.
+    const other = await cli(["confirm", token, "--json"], { cwd: p.root, env });
+    expect(other.json.problems[0]).toMatchObject({ code: "CONFIRMATION_STALE", details: { reason: "superseded" } });
+    db = runsDb(p.stateDir);
+    try {
+      expect(db.approvedCode("orders")).toBeNull();
+      const [v] = listTrash(p.stateDir, "orders");
+      expect(versionNote(v!.path, "approvedCodeHash")).toBe("hash-1");
+    } finally {
+      db.close();
+    }
+    const human = await cli(["restore", "orders", "--json"], { cwd: p.root, env });
+    expect((await cli(["confirm", human.json.confirmation.token, "--json"], { cwd: p.root, env })).exit).toBe(0);
+    db = runsDb(p.stateDir);
+    try {
+      expect(db.approvedCode("orders")).toBe("hash-1");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("a delete confirmed on a terminal spends the open tokens for the same command", async () => {
+    const p = await project();
+    const token = (await cli(["delete", "orders", "--where", "id = 0", "--json"], { cwd: p.root, env })).json.confirmation.token as string;
+    prompter.ask = async () => true;
+    expect((await cli(["delete", "orders", "--where", "id = 0"], { cwd: p.root, env, stdinTTY: true, stdoutTTY: true })).exit).toBe(0);
+    const stale = await cli(["confirm", token, "--json"], { cwd: p.root, env });
+    expect(stale.json.problems[0]).toMatchObject({ code: "CONFIRMATION_STALE", details: { reason: "superseded" } });
+    expect(await ids(p)).toEqual([1, 2, 3, 4]);
+  });
+
+  test("a token minted before the table was written is stale, although the rows it would delete are as many", async () => {
+    const p = await project();
+    const token = (await cli(["delete", "orders", "--where", "id < 2", "--json"], { cwd: p.root, env })).json.confirmation.token as string;
+    await closeAllWarehouses();
+    await seed(p.database, [`UPDATE orders SET amount = amount + 1`, `UPDATE _croft.assets SET last_loaded_at = '2026-09-21 00:00:00+00' WHERE name = 'orders'`]);
+    const r = await cli(["confirm", token, "--json"], { cwd: p.root, env });
+    expect(r.json.problems[0]).toMatchObject({ code: "CONFIRMATION_STALE", details: { reason: "impact_changed" } });
+    expect(await ids(p)).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  test("a change made outside croft is reported by the delete that takes it in", async () => {
+    const p = await project();
+    await seed(p.database, [`INSERT INTO orders VALUES (9, 90, TIMESTAMPTZ '2026-09-20 12:00:00+00')`]);
+    const token = (await cli(["delete", "orders", "--where", "id = 0", "--json"], { cwd: p.root, env })).json.confirmation.token as string;
+    const r = await cli(["confirm", token, "--json"], { cwd: p.root, env });
+    expect(r.exit).toBe(0);
+    expect(r.json.problems.map((x: { code: string }) => x.code)).toEqual(["OUT_OF_BAND_CHANGE"]);
+  });
+
+  test("an incremental TS transform that read the rows is named with --rebuild in the text, never in next", async () => {
+    const p = await project();
+    writeFiles(p.root, {
+      "assets/triage.ts": `import { transform } from "@zabaca/croft";\nexport default transform({ inputs: ["orders"], key: "id", incremental: true, async *rows() { yield []; } });\n`,
+    });
+    await seed(p.database, [`INSERT INTO _croft.inputs (asset, input, seen_loaded_at) VALUES ('triage', 'orders', '2026-09-20 14:00:00+00')`]);
+    const r = await cli(["delete", "orders", "--where", "id = 0"], { cwd: p.root, env });
+    expect(r.stdout).toContain("  then:  daily go stale: the next croft run rebuilds them\n"
+      + "         triage keeps what it made from the deleted rows: croft run triage --rebuild redoes it (it asks first)");
+    const token = /croft confirm (c_[0-9a-f]{6})/.exec(r.stdout)![1]!;
+    const done = await cli(["confirm", token, "--json"], { cwd: p.root, env });
+    expect(done.json.next.map((n: { command: string }) => n.command)).toEqual(["croft status"]);
+    expect(JSON.stringify(done.json.next)).not.toContain("--rebuild\"");
   });
 });
 
