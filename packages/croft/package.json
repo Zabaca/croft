@@ -1,6 +1,6 @@
 {
   "name": "@zabaca/croft",
-  "version": "0.1.0-dev.0",
+  "version": "0.1.0",
   "description": "Local-first data pipelines in TypeScript: ingest APIs and files, transform with SQL or TypeScript, keep DuckDB tables fresh.",
   "license": "MIT",
   "type": "module",
