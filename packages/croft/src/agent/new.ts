@@ -16,6 +16,7 @@
 // templateFor is pure: it renders text. The command (cli/commands/new.ts) checks the name, picks the input an sql
 // or transform template reads, writes the file and says what to do next. agent/contract.test.ts reads every
 // string here like any other agent-facing text; new.test.ts validates every rendered template in a project.
+import { cleanColumnName } from "../load/stage.ts";
 
 export type NewKind = "api" | "file" | "sql" | "transform";
 export type Pagination = "keyset" | "cursor" | "link" | "page";
@@ -466,12 +467,30 @@ function sqlTemplate(name: string, input: TemplateInput): Template {
 // ---------------------------------------------------------------------------------------------------------
 // TypeScript transform (§3e)
 
+/**
+ * The names a transform yields its input's key columns under: each cleaned as a TS asset's output column names
+ * are (§7 "Column names", load/stage.ts cleanColumnName), so `key:` names a column every row has ("Region Name" is
+ * read as row["Region Name"] and written as Region_Name). DuckDB names are case-insensitive, so a cleaned name
+ * another one took gets _2, _3, … as the loader would; `taken` holds the lower-case names in use.
+ */
+function outputNames(key: readonly string[], taken = new Set<string>()): string[] {
+  return key.map((k, i) => {
+    const clean = cleanColumnName(k, i + 1);
+    let out = clean;
+    for (let n = 2; taken.has(out.toLowerCase()); n++) out = `${clean}_${n}`;
+    taken.add(out.toLowerCase());
+    return out;
+  });
+}
+
 function transformTemplate(name: string, input: TemplateInput): Template {
   if (input.key.length === 0) throw new Error(`templateFor(transform): the input ${input.asset} has no key; newRows() needs one`);
   const why = input.why ? ` (${input.why})` : "";
+  const taken = new Set<string>();
+  const outKey = outputNames(input.key, taken);
   // The output column the placeholder computes; never one of the key columns it copies.
-  const result = input.key.includes("result") ? "result_value" : "result";
-  const keyCopy = input.key.map((k) => `${tsProp(k)}: ${tsAccess("row", k)}`).join(", ");
+  const result = taken.has("result") ? "result_value" : "result";
+  const keyCopy = input.key.map((k, i) => `${tsProp(outKey[i]!)}: ${tsAccess("row", k)}`).join(", ");
   const label = input.key.map((k) => `\${${tsAccess("row", k)}}`).join(" ");
   const lines = [
     `// assets/${name}.ts: a TypeScript transform (croft new transform ${name}).`,
@@ -495,7 +514,7 @@ function transformTemplate(name: string, input: TemplateInput): Template {
     "export default transform({",
     note(`  description: ${JSON.stringify(titleWords(name))},`, "one line: what a row is (croft describe shows it)"),
     note(`  inputs: [${JSON.stringify(input.asset)}],`, "the assets this code reads; croft builds them first"),
-    note(`  key: ${tsKey(input.key)},`, `one output row per input row, by the key of ${input.asset}`),
+    note(`  key: ${tsKey(outKey)},`, `one output row per input row, by the key of ${input.asset}`),
     note("  incremental: true,", "newRows() gives only rows not processed yet; results merge"),
     note("", "by key, committed in chunks, so a failure loses little"),
     note("  confirmAbove: 1000,", "the cost guard: a run that would send more input rows than"),

@@ -6,6 +6,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import ts from "typescript";
 import { putCatalog, type CatalogAsset } from "../history/catalog.ts";
+import { cleanColumnName } from "../load/stage.ts";
 import { renderTypes, type TypeSource } from "../project/types-gen.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { parseSqlHeader } from "../project/sql-asset.ts";
@@ -239,12 +240,31 @@ describe("file, sql and transform templates", () => {
     const composite = templateFor("transform", "t_items", { input: { asset: "daily_sales", key: ["day", "region"] } }).content;
     expect(composite).toContain("key: [\"day\", \"region\"],");
     expect(composite).toContain("yield { day: row.day, region: row.region, result };");
-    const odd = templateFor("transform", "t_items", { input: { asset: "zones", key: ["Location ID"] } }).content;
-    expect(odd).toContain("yield { \"Location ID\": row[\"Location ID\"], result };");
     const clash = templateFor("transform", "t_items", { input: { asset: "scores", key: ["result"] } }).content;
     expect(clash).toContain("yield { result: row.result, result_value };");
     expect(clash).toContain("checks: [\"not_null(result_value)\"],");
+    // DuckDB names are case-insensitive: Result and result would be one column.
+    expect(templateFor("transform", "t_items", { input: { asset: "scores", key: ["Result"] } }).content).toContain("yield { Result: row.Result, result_value };");
     expect(() => templateFor("transform", "t_items", { input: { asset: "events", key: [] } })).toThrow(/has no key/);
+  });
+
+  test("transform: an input key that is no clean column name is read by its name and written by its cleaned name (§7, R51-08)", () => {
+    // A TS asset's output names are cleaned ("Region Name" becomes Region_Name): the key must name the cleaned
+    // column, or it is missing from every row (KEY_NULL at the first preview).
+    const odd = templateFor("transform", "t_items", { input: { asset: "zones", key: ["Location ID"] } }).content;
+    expect(odd).toContain("  key: \"Location_ID\",");
+    expect(odd).toContain("yield { Location_ID: row[\"Location ID\"], result };");
+    const mixed = templateFor("transform", "t_items", { input: { asset: "daily_region", key: ["day", "Region Name"] } }).content;
+    expect(mixed).toContain("  key: [\"day\", \"Region_Name\"],");
+    expect(mixed).toContain("yield { day: row.day, Region_Name: row[\"Region Name\"], result };");
+    expect(mixed).toContain("const result = `${row.day} ${row[\"Region Name\"]}`;");
+    // A leading digit, a $ (an identifier, but no clean name), and two keys that clean to one name.
+    const digits = templateFor("transform", "t_items", { input: { asset: "x", key: ["2024 total", "$id"] } }).content;
+    expect(digits).toContain("  key: [\"col_2024_total\", \"id\"],");
+    expect(digits).toContain("yield { col_2024_total: row[\"2024 total\"], id: row.$id, result };");
+    const twins = templateFor("transform", "t_items", { input: { asset: "x", key: ["a b", "a_b"] } }).content;
+    expect(twins).toContain("  key: [\"a_b\", \"a_b_2\"],");
+    expect(twins).toContain("yield { a_b: row[\"a b\"], a_b_2: row.a_b, result };");
   });
 });
 
@@ -494,5 +514,19 @@ describe("every api template pages correctly as written", () => {
       { day: "2026-09-01", region: "West", result: "2026-09-01 West" },
     ]);
     expect(asked).toEqual(["daily_sales"]);
+  });
+
+  test("transform: an input key that is no clean name is yielded under the cleaned name its key: says", async () => {
+    const t = templateFor("transform", "t_odd", { input: { asset: "daily_region", key: ["day", "Region Name"] } });
+    const p = makeProject({ timezone: "UTC", files: { [t.path]: t.content } });
+    const newRows = async function* () {
+      yield { day: "2026-09-01", "Region Name": "East", total: 3 };
+    };
+    const rows = await rowsOf(p, t, { newRows });
+    expect(rows).toEqual([{ day: "2026-09-01", Region_Name: "East", result: "2026-09-01 East" }]);
+    const mod = await import(join(p.root, t.path)) as { default: AssetDefinition };
+    expect(mod.default.config.key).toEqual(["day", "Region_Name"]);
+    // The loader keeps a clean name as it is (load/stage.ts), so the key names a column every row has.
+    for (const k of Object.keys(rows[0]!)) expect(cleanColumnName(k, 1)).toBe(k);
   });
 });
