@@ -65,7 +65,8 @@ What croft validate --hook does:
 - Otherwise it validates that asset, plus the assets that read it when it is SQL (a renamed column breaks
   them), or, for a file in lib/, the TS assets that import it. It never opens the warehouse or the network.
 - With an error, it prints the problems on stderr and exits with exit code 2, which Claude Code shows to
-  Claude after the edit (the edit itself is already made).
+  Claude after the edit (the edit itself is already made). Files are named from the folder Claude works in:
+  data/assets/x.sql when Claude Code runs in the app folder around a project in data/.
 - With warnings only (a transform that pays for every row again on each rebuild, a secret not set yet), it
   exits with exit code 0 and prints one line of JSON on stdout,
   {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "..."}}: Claude Code hands the

@@ -6,7 +6,7 @@
 // - any other exit is a non-blocking "hook error" notice for the user: croft's own failures (exit 1).
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { HOOK_IO, hookCommand } from "../../agent/hook.ts";
 import { putCatalog } from "../../history/catalog.ts";
 import { cleanup, cli, ISSUES_CATALOG, ISSUES_TS, makeProject, PKG, runsDb, type TestProject, writeFiles } from "./inspect-testkit.ts";
@@ -244,6 +244,47 @@ describe("croft validate --hook: problems go to Claude", () => {
     const r = await hook(p, "assets/open_issues.sql", { cwd: join(p.root, "assets") });
     expect(r.exit).toBe(2);
     expect(r.stderr).toContain("error UNKNOWN_COLUMN  assets/open_issues.sql:1:12");
+  });
+
+  test("paths are named from the folder Claude works in (the input's cwd): data/assets/x.sql from an app folder", async () => {
+    const p = project();
+    writeFiles(p.root, {
+      "assets/open_issues.sql": `SELECT id, titel, "user"->>'login' AS author FROM github_issues\n`,
+      "assets/enriched.ts": `import { transform } from "@zabaca/croft";\nexport default transform({ inputs: ["github_issue"], async *rows() { yield []; } });\n`,
+    });
+    const at = (cwd: string, file: string) => {
+      const stdin = JSON.parse(input(p, file));
+      return JSON.stringify({ ...stdin, cwd });
+    };
+    // Claude Code started in the folder above the project (an app whose croft project is data/).
+    const app = dirname(p.root);
+    const sub = basename(p.root);
+    const fromApp = await hook(p, "", { stdin: at(app, "assets/open_issues.sql") });
+    expect(fromApp.exit).toBe(2);
+    expect(fromApp.stderr).toStartWith(`croft validate --hook: 1 error after the edit to ${sub}/assets/open_issues.sql (also checked the assets that read it: by_author)\n`);
+    expect(fromApp.stderr).toContain(`error UNKNOWN_COLUMN  ${sub}/assets/open_issues.sql:1:12`);
+    const ts = await hook(p, "", { stdin: at(app, "assets/enriched.ts") });
+    expect(ts.stderr).toContain(`error UNKNOWN_TABLE  ${sub}/assets/enriched.ts:2`);
+    // Claude has moved into assets/: names relative to it.
+    const fromAssets = await hook(p, "", { stdin: at(join(p.root, "assets"), "assets/open_issues.sql") });
+    expect(fromAssets.stderr).toStartWith("croft validate --hook: 1 error after the edit to open_issues.sql (");
+    expect(fromAssets.stderr).toContain("error UNKNOWN_COLUMN  open_issues.sql:1:12");
+    // Claude works outside the project: absolute paths.
+    const elsewhere = join(dirname(app), "elsewhere-for-hook");
+    mkdirSync(elsewhere, { recursive: true });
+    const outside = await hook(p, "", { stdin: at(elsewhere, "assets/open_issues.sql") });
+    expect(outside.stderr).toContain(`error UNKNOWN_COLUMN  ${join(p.root, "assets/open_issues.sql")}:1:12`);
+    // --json keeps the envelope's project-relative paths.
+    const j = await hook(p, "", { stdin: at(app, "assets/open_issues.sql"), json: true });
+    expect(j.json.problems[0]).toMatchObject({ code: "UNKNOWN_COLUMN", file: "assets/open_issues.sql" });
+  });
+
+  test("a warning's path, from an app folder, too", async () => {
+    const p = project();
+    const stdin = JSON.stringify({ ...JSON.parse(input(p, "assets/github_issues.ts")), cwd: dirname(p.root) });
+    const r = await hook(p, "", { stdin });
+    const context = JSON.parse(r.stdout).hookSpecificOutput.additionalContext as string;
+    expect(context).toStartWith(`croft validate --hook: 1 warning after the edit to ${basename(p.root)}/assets/github_issues.ts\n`);
   });
 
   test("a broken croft.json is reported for an asset edit (Claude can fix it)", async () => {

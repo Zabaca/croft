@@ -2,7 +2,8 @@
 //   a. `croft init --claude --with-hook` merges the PostToolUse hook into a .claude/settings.json the user already
 //      has (their permissions, model, other hooks and indentation stay); a second run changes nothing, and init
 //      without --with-hook never touches the file. A new project, and an app's data/ project, get it too; until
-//      data/ is installed, the app's hook does nothing (exit 0, silent), for app files and data/ assets alike.
+//      data/ is installed, the app's hook does nothing (exit 0, silent), for app files and data/ assets alike;
+//      once it is, its report names data/assets/x.sql, the path from the app folder where Claude works.
 //   b. The hook command from settings.json runs exactly as Claude Code runs it (`sh -c`, CLAUDE_PROJECT_DIR set,
 //      the PostToolUse JSON on stdin), with node_modules/.bin/croft as `bun install` links it:
 //      - an asset edit with an error: exit 2, stdout empty, stderr names the file, the code and the fix;
@@ -109,7 +110,9 @@ describe("a. croft init --with-hook writes the hook into .claude/settings.json",
     linkCroftBin(data);
     const r = await hookShell(app, appCommand, { env: { CLAUDE_PROJECT_DIR: app }, stdin: postToolUse({ tool: "Write", file: join(data.root, "assets/broken.sql"), cwd: app }) });
     expect(r.code, show(r)).toBe(2);
-    expect(r.stderr).toContain("assets/broken.sql");
+    // Paths are named from the app folder, where Claude works: data/assets/broken.sql.
+    expect(r.stderr).toStartWith("croft validate --hook: 1 error after the edit to data/assets/broken.sql\n");
+    expect(r.stderr).toContain("  data/assets/broken.sql:2");
     expect(r.stdout).toBe("");
   }, 120_000);
 });

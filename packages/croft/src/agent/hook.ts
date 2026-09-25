@@ -344,6 +344,31 @@ export function hookTarget(stdin: string, root: string): string | null {
   return null;
 }
 
+/**
+ * How the hook names a project file (root-relative, "/" separators) for Claude: relative to the folder Claude
+ * works in, the hook input's `cwd`. In an app whose croft project is data/, Claude Code starts in the app folder,
+ * so an asset is data/assets/x.sql; after Claude has moved into assets/, it is x.sql. A folder that is neither
+ * inside the project nor above it gets absolute paths. Without a usable cwd, paths stay root-relative.
+ */
+export function hookPaths(root: string, cwd: string | undefined): (file: string) => string {
+  if (!cwd || !isAbsolute(cwd)) return (file) => file;
+  const from = physical(cwd);
+  const to = physical(root);
+  const below = (rel: string) => rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  const abs = (dir: string, file: string) => (isAbsolute(file) ? file : join(dir, ...file.split("/")));
+  if (!below(relative(to, from)) && !below(relative(from, to))) return (file) => abs(root, file);
+  return (file) => relative(from, abs(to, file)).split(sep).join("/") || file;
+}
+
+/** The problems with their files named by `show` (hookPaths): the file, and an edit fix's file. */
+export function showPaths(problems: readonly Problem[], show: (file: string) => string): Problem[] {
+  return problems.map((p) => ({
+    ...p,
+    ...(p.file !== undefined ? { file: show(p.file) } : {}),
+    ...(p.fix?.kind === "edit" ? { fix: { ...p.fix, file: show(p.fix.file) } } : {}),
+  }));
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // What an edit affects, and what Claude reads
 

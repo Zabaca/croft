@@ -8,7 +8,7 @@ import { docs } from "../cli/commands/docs.ts";
 import type { Ctx } from "../cli/command.ts";
 import {
   HOOK_CONTEXT_MAX, HOOK_IO, HOOK_MATCHER, hookCommand, hookContext, hookOutput, hookPlaces, hookProblems, hookReport, hookSelection,
-  hookSettings, hookTarget, installHook, mergeHookSettings, parseHookInput, readAll, SETTINGS_FILE,
+  hookPaths, hookSettings, hookTarget, installHook, mergeHookSettings, parseHookInput, readAll, SETTINGS_FILE, showPaths,
 } from "./hook.ts";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "croft-hook-")));
@@ -256,6 +256,30 @@ describe("hookTarget", () => {
     expect(hookTarget(edit(join(link, "assets/orders.sql")), root)).toBe("assets/orders.sql");
     expect(hookTarget(edit(join(root, "assets/orders.sql")), link)).toBe("assets/orders.sql");
     expect(hookTarget(edit(join(link, "assets/new_one.sql")), root)).toBe("assets/new_one.sql");
+  });
+
+  test("hookPaths: files named from where Claude works (the input's cwd); showPaths renames a problem's files", () => {
+    const app = fresh();
+    const root = join(app, "data");
+    mkdirSync(join(root, "assets"), { recursive: true });
+    expect(hookPaths(root, root)("assets/x.sql")).toBe("assets/x.sql");
+    expect(hookPaths(root, app)("assets/x.sql")).toBe("data/assets/x.sql");
+    expect(hookPaths(root, join(root, "assets"))("assets/x.sql")).toBe("x.sql");
+    expect(hookPaths(root, join(root, "assets"))("lib/fmt.ts")).toBe("../lib/fmt.ts");
+    expect(hookPaths(root, fresh())("assets/x.sql")).toBe(join(root, "assets", "x.sql"));
+    expect(hookPaths(root, undefined)("assets/x.sql")).toBe("assets/x.sql");
+    expect(hookPaths(root, "relative/cwd")("assets/x.sql")).toBe("assets/x.sql");
+    // A symlinked spelling of the same folders (macOS: /var is /private/var).
+    const link = join(fresh(), "link");
+    symlinkSync(app, link);
+    expect(hookPaths(root, link)("assets/x.sql")).toBe("data/assets/x.sql");
+
+    const p = { severity: "error" as const, code: "UNKNOWN_COLUMN", message: "m", hint: "h", docs: "d", file: "assets/x.sql", line: 2,
+      fix: { kind: "edit" as const, description: "d", file: "assets/y.sql" } };
+    expect(showPaths([p, { ...p, file: undefined, fix: undefined }], hookPaths(root, app))).toEqual([
+      { ...p, file: "data/assets/x.sql", fix: { ...p.fix, file: "data/assets/y.sql" } },
+      { ...p, file: undefined, fix: undefined },
+    ]);
   });
 
   test("input without a file path (another tool or event) is nothing to check", () => {
