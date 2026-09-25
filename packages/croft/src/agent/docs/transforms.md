@@ -7,6 +7,11 @@ SQL does badly: an API or LLM call per row, parsing, scoring with a library. For
 write an SQL asset instead (croft docs sql). Shared code goes in lib/, imported with a relative path
 (import { triage } from "../lib/triage.ts"); an edit there counts as an edit of every asset that imports it.
 
+Start with croft new transform <name>. It writes the per-row kind below: keyed and incremental, reading with
+newRows() the asset with a key that changed most recently, with confirmAbove set and a comment where the paid call
+goes. The file passes croft validate as written; then edit the input, the per-row work, what each row yields and
+the checks. Preview it with croft preview <name> --rows 20 once it makes paid calls.
+
 There are two kinds:
 
   incremental: true   processes each input row once, read with newRows(); an input row that changed comes
