@@ -59,10 +59,32 @@ export interface IngestContext extends BaseContext {
   readonly since?: string | number;          // saved cursor (minus lookback) in its own JSON type, or --from
   query<T extends Row = Row>(sql: string, ...params: unknown[]): Promise<T[]>;   // one SELECT over its own table
 }
+/**
+ * The row type of every built asset, by name: the hook generated input types augment (DESIGN.md §3e, D96).
+ * Empty here. croft writes .croft/types/<asset>.d.ts after each run and preview, and at `croft validate
+ * --types`, and .croft/types/index.d.ts adds each asset to this interface (project/types-gen.ts):
+ *
+ *   declare module "@zabaca/croft" {
+ *     interface CroftAssets { github_issues: import("./github_issues.js").GithubIssuesRow }
+ *   }
+ *
+ * A project whose tsconfig.json includes .croft/types then gets checked column names from `rows("x")`,
+ * `newRows("x")` and `query<"x">(sql)`; without the folder every input row is a Row, as before.
+ */
+export interface CroftAssets {}
+
+/** The generated row type of asset `N` (Row when the project has none): `InputRow<"github_issues">`. */
+export type InputRow<N extends string> = N extends keyof CroftAssets ? CroftAssets[N] : Row;
+
 export interface TransformContext extends BaseContext {
+  // A built asset's name gives its generated row type (CroftAssets); any other name, or an explicit row type
+  // (`rows<Issue>("x")`, `rows<Row>("x")` for dynamic column names), gives that type.
+  rows<N extends keyof CroftAssets>(input: N): AsyncIterable<CroftAssets[N]>;
   rows<T extends Row = Row>(input: string): AsyncIterable<T>;      // rows are Proxy-guarded (§3e)
+  newRows<N extends keyof CroftAssets>(input: N): AsyncIterable<CroftAssets[N]>;
   newRows<T extends Row = Row>(input: string): AsyncIterable<T>;
   query<T extends Row = Row>(sql: string, ...params: unknown[]): Promise<T[]>;   // one SELECT over inputs
+  query<N extends keyof CroftAssets>(sql: string, ...params: unknown[]): Promise<CroftAssets[N][]>;   // query<"x">: x's rows
 }
 export interface HttpInit {
   headers?: Record<string, string>;
