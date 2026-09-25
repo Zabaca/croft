@@ -176,7 +176,7 @@ describe("croft new <kind> <name>", () => {
     expect(readFileSync(join(p.root, "assets/sale_labels.ts"), "utf8")).toContain("newRows(\"example_sales\")");
     expect(r.json.next).toEqual([{
       command: "croft preview sale_labels --rows 20",
-      reason: "after your edits pass croft validate: at most 20 input rows reach the code (keep --rows small once it makes paid calls); nothing real changes",
+      reason: "after your edits pass croft validate --types (tsc checks the columns it reads): at most 20 input rows reach the code (keep --rows small once it makes paid calls); nothing real changes",
     }]);
     const v = await cli(["validate", "--json"], { cwd: p.root });
     expect(v.json.problems.filter((x: { severity: string }) => x.severity !== "info")).toEqual([]);

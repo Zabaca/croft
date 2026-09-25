@@ -127,7 +127,7 @@ const validate = lazyCommand({
   usage: "croft validate [asset…] [--types] [--hook]",
   options: {
     types: { type: "boolean", description: "also type-check the project's TypeScript with its own tsc --noEmit" },
-    hook: { type: "boolean", description: "run as a Claude Code hook: read the edited file from the hook's JSON on stdin, validate that asset and what reads it; errors on stderr with exit 2, otherwise silent" },
+    hook: { type: "boolean", description: "run as a Claude Code hook: read the edited file from the hook's JSON on stdin, validate that asset and what reads it; errors on stderr with exit 2, warnings to Claude as JSON context on stdout with exit 0, croft's own failures exit 1" },
   },
   humanShowsProblems: true,
 }, async () => (await import("./validate.ts")).validate);

@@ -26,7 +26,7 @@ export const PHASE: number = 5;
 
 /** Whether PHASE is finished. False while its waves are being built: its error codes may still be unraised
  *  (core/codes-raised.test.ts). Set to true when the phase ends; a release requires it. */
-export const PHASE_COMPLETE: boolean = false;
+export const PHASE_COMPLETE: boolean = true;
 
 /** Every command DESIGN.md §4.1 names (and the internal `tick`), with the phase that ships it. */
 export const COMMAND_PHASE = {

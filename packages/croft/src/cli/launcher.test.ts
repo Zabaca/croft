@@ -151,6 +151,13 @@ describe("launch", () => {
     expect(human.join("")).toStartWith("error NEEDS_BUN  croft runs on Bun, not Node or another runtime\n");
   });
 
+  test("croft validate --hook: a refusal exits 1, which Claude Code does not block on (agent/hook.ts)", async () => {
+    const quiet = { main: async () => 0, commandNames: [...names, "validate"], cwd: dir(), env: {}, stdout: () => {}, stderr: () => {} };
+    expect(await launch({ ...quiet, argv: ["validate", "--hook"] })).toBe(1);                     // no project here
+    expect(await launch({ ...quiet, argv: ["validate", "--hook"], isBun: false })).toBe(1);      // NEEDS_BUN
+    expect(await launch({ ...quiet, argv: ["validate"] })).toBe(2);
+  });
+
   test("local plans run main with the same argv", async () => {
     const seen: (readonly string[])[] = [];
     const exit = await launch({ main: async (argv) => { seen.push(argv); return 3; }, commandNames: names, argv: ["docs", "x"], cwd: dir(), env: {} });

@@ -363,7 +363,7 @@ function nextSteps(t: Template, name: string, secrets: NewAssetData["secrets"], 
     case "sql":
       return [{ command: `croft preview ${name}`, reason: `after editing the SELECT (croft validate binds it against the columns of ${t.reads}): builds it in a sandbox and diffs it; nothing real changes` }];
     case "transform":
-      return [{ command: `croft preview ${name} --rows 20`, reason: "after your edits pass croft validate: at most 20 input rows reach the code (keep --rows small once it makes paid calls); nothing real changes" }];
+      return [{ command: `croft preview ${name} --rows 20`, reason: "after your edits pass croft validate --types (tsc checks the columns it reads): at most 20 input rows reach the code (keep --rows small once it makes paid calls); nothing real changes" }];
   }
 }
 

@@ -27,7 +27,6 @@ There are two kinds:
 // assets/issue_labels.ts
 import { transform } from "@zabaca/croft";
 
-type Issue = { id: number; title: string; body: string | null };
 type Answer = { label: string; confidence: number };
 
 export default transform({
@@ -40,7 +39,7 @@ export default transform({
 
   async *rows({ newRows, http, secret, log }) {
     let n = 0;
-    for await (const issue of newRows<Issue>("github_issues")) {
+    for await (const issue of newRows("github_issues")) {
       const res = await http.post("https://api.example.com/v1/classify", {
         text: `${issue.title}\n\n${issue.body ?? ""}`,
         labels: ["bug", "feature", "question"],
@@ -64,8 +63,6 @@ integers exact.
 // assets/issue_triage.ts
 import { transform } from "@zabaca/croft";
 
-type Issue = { id: number; title: string; body: string | null; labels: { name: string }[] | null };
-
 function triage(text: string, labels: string[]): { priority: string; reason: string } {
   if (labels.includes("crash") || /segfault|panic/i.test(text)) return { priority: "p0", reason: "crash" };
   if (labels.includes("bug")) return { priority: "p1", reason: "bug label" };
@@ -80,8 +77,9 @@ export default transform({
   checks: ["priority IN ('p0', 'p1', 'p2')", "not_null(reason)"],
 
   async *rows({ newRows }) {
-    for await (const issue of newRows<Issue>("github_issues")) {
-      const labels = (issue.labels ?? []).map((l) => l.name);
+    for await (const issue of newRows("github_issues")) {
+      // labels is a JSON column: its type is unknown until the code says its shape.
+      const labels = ((issue.labels ?? []) as { name: string }[]).map((l) => l.name);
       yield { issue_id: issue.id, ...triage(`${issue.title}\n${issue.body ?? ""}`, labels) };
     }
   },
@@ -136,6 +134,15 @@ Values arrive as JavaScript values that load back unchanged: JSON columns parsed
 with Z ("2026-03-01T07:30:00.123456Z"); TIMESTAMP as an ISO string without an offset; DATE as "YYYY-MM-DD";
 integers as number, or bigint beyond ±2^53 (HUGEINT always bigint); DECIMAL of up to 15 digits as number,
 wider as its exact text. new Date(row.created_at) when you need date arithmetic.
+
+Rows are typed: once an input has been run or previewed, croft writes its row type to .croft/types/<input>.d.ts,
+and rows("x"), newRows("x") and query<"x">(sql) hand over that type, so croft validate --types (the project's
+tsc) reports code that reads a column the input does not have, such as one renamed upstream; before that, every
+column is unknown. Read without a type argument: newRows<Issue>("x") replaces the generated type, so only the run
+finds the rename (newRows<Row>("x") is for column names computed at run time). The types say what arrives: every
+column but the key may be null, so give it a default (row.amount ?? 0); a BIGINT is number | bigint, a bigint
+only beyond ±2^53, so write Number(row.quantity) before arithmetic; a JSON column is unknown until the code says
+its shape (row.meta as { plan?: string } | null).
 
 Rows are guarded: reading a column the input does not have throws UNKNOWN_INPUT_COLUMN with a did-you-mean,
 instead of storing NULL. Copy a row with { ...row } (structuredClone does not work on it); croft's _loaded_at

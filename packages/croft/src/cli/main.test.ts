@@ -437,6 +437,23 @@ describe("lazy commands", () => {
     expect(p.message).toContain(platform);
   });
 
+  test("croft validate --hook: Bun too old, or a binding that does not load, exits 1 (Claude Code does not block on it); a finding keeps its 2", async () => {
+    const hook = { hook: { type: "boolean" as const, description: "hook" } };
+    const finding = testCommand("validate", async () => ({ data: null, next: [], problems: [problem("UNKNOWN_COLUMN", { message: "no column x", hint: "h" })] }), { options: hook });
+    const old = await run(["validate", "--hook"], { bunVersion: "1.2.20", commands: [finding] });
+    expect(old.exit).toBe(1);
+    expect(old.stderr).toStartWith("error BUN_TOO_OLD");
+    expect((await run(["validate"], { bunVersion: "1.2.20", commands: [finding] })).exit).toBe(2);
+    const [, error] = bindingErrors[0]!;
+    const binding = lazy(async () => { throw error; }, { name: "validate", options: hook });
+    const r = await run(["validate", "--hook", "--json"], { commands: [binding.cmd] });
+    expect(r.exit).toBe(1);
+    expect(envelope(r.stdout).problems[0].code).toBe("DUCKDB_BINDING_MISSING");
+    expect((await run(["validate", "--json"], { commands: [binding.cmd] })).exit).toBe(2);
+    expect((await run(["validate", "--hook"], { commands: [finding] })).exit).toBe(2);
+    expect((await run(["validate", "--", "--hook"], { bunVersion: "1.2.20", commands: [finding] })).exit).toBe(2);
+  });
+
   test("the same failure inside run() (a dynamic import there) is mapped too; other errors stay INTERNAL_ERROR", async () => {
     const [, error] = bindingErrors[0]!;
     const inRun = testCommand("inrun", async () => { throw error; });

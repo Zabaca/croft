@@ -407,7 +407,7 @@ export class DuckWarehouse implements Warehouse {
     // would keep reopening and starve the writer. So the intent also comes back every
     // foreignReannounceMs, giving such readers the chance to step aside.
     let foreignPid: number | null = null;
-    let foreignSince = 0;
+    let foreignSince: number | null = null;
     let withdrawnAt: number | null = null;
     for (let attempt = 0; ; attempt++) {
       if (signal?.aborted) {
@@ -434,10 +434,12 @@ export class DuckWarehouse implements Warehouse {
         if (this.intentHeld) {
           if (croft) {
             foreignPid = null;
+            foreignSince = null;
             if (withdrawnAt !== null) intents.resume(this.stateDir);
             withdrawnAt = null;
           } else if (known) {
-            if (foreignPid !== holder.pid) {
+            // The clock starts at the first conflict with this holder (never at 0, which withdrew at once).
+            if (foreignSince === null || foreignPid !== holder.pid) {
               foreignPid = holder.pid;
               foreignSince = now;
             }
@@ -525,7 +527,8 @@ export class DuckWarehouse implements Warehouse {
 
   private async describe(c: LockConflict): Promise<Described> {
     const pid = c.pid;
-    if (pid === null) return { holder: { pid: null, program: c.program }, croft: false, known: true };
+    // A lock error that names no PID identifies no holder: it is never taken for a foreign program.
+    if (pid === null) return { holder: { pid: null, program: c.program }, croft: false, known: false };
     const intent = intents.liveIntents(this.stateDir).find((i) => i.pid === pid);
     const base: LockHolder = intent
       ? { pid, program: "croft", runId: intent.runId ?? undefined, action: "write", since: intent.since }

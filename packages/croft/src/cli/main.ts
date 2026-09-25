@@ -6,6 +6,7 @@
 // stack. The package's bin is bin/croft.mjs, which checks for Bun and then calls cli().
 import { parseArgs, type ParseArgsConfig } from "node:util";
 import { fileURLToPath } from "node:url";
+import { isHookArgv } from "../agent/hook.ts";
 import { CODES, CroftError, EXIT, exitCodeFor, problem } from "../core/errors.ts";
 import type { Envelope, Problem } from "../core/types.ts";
 import { didYouMean } from "../project/suggest.ts";
@@ -131,6 +132,10 @@ export async function main(argv: readonly string[], io: MainIO = {}): Promise<nu
     if (io.dispatch) io.dispatch.result = result;
   } catch (e) {
     failure = toFailure(bindingFailure(e, cmd?.name ?? name) ?? e);
+    // croft validate --hook runs after every edit Claude Code makes (agent/hook.ts): a failure here (Bun too old,
+    // the DuckDB binding) is never a finding about the edit, so it exits 1, a notice for the user that does not
+    // block Claude; exit 2 would feed it to Claude after every edit.
+    if (isHookArgv(argv)) failure = { ...failure, exit: EXIT.FAILED };
   }
 
   try {

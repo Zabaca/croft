@@ -13,7 +13,8 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { constants } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CODES, CroftError } from "../core/errors.ts";
+import { isHookArgv } from "../agent/hook.ts";
+import { CODES, CroftError, EXIT } from "../core/errors.ts";
 import type { Problem } from "../core/types.ts";
 import { systemTimeZone } from "../core/time.ts";
 import { parseDotenv } from "../project/env.ts";
@@ -148,7 +149,9 @@ export async function launch(o: LaunchOptions): Promise<number> {
   }
   if (plan.kind === "refuse") {
     emitRefusal(plan.problem, scanCommand(argv), o.stdout ?? ((t) => void process.stdout.write(t)), stderr);
-    return plan.exit;
+    // croft validate --hook (agent/hook.ts): a refusal is not a finding about the edit, so exit 1 (a notice for
+    // the user) rather than 2, which Claude Code would feed to Claude after every edit.
+    return isHookArgv(argv) ? EXIT.FAILED : plan.exit;
   }
   if (plan.kind === "delegate") {
     const childEnv = launcherEnv(env, cwd);

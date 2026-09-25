@@ -226,13 +226,16 @@ export function sandboxOf(key: string): string | undefined {
 
 export interface LockConflict { path: string | null; program: string | null; pid: number | null }
 
-/** Parse DuckDB's lock error: `Could not set lock on file "<db>": Conflicting lock is held in <program> (PID n)`. */
+/** Parse DuckDB's lock error: `Could not set lock on file "<db>": Conflicting lock is held in <program> (PID n)`, or
+ *  `… held in PID n` when DuckDB could not name the program, as while the holder is being killed [V] (croft serve
+ *  releases the file by killing its query worker): the PID is known, the program is not. */
 export function lockConflict(err: unknown): LockConflict | null {
   const msg = err instanceof Error ? err.message : String(err);
   if (!/Could not set lock on file|Conflicting lock is held/.test(msg)) return null;
   const file = msg.match(/Could not set lock on file "([^"]+)"/)?.[1] ?? null;
-  const held = msg.match(/Conflicting lock is held in (.+?) \(PID (\d+)\)/);
-  return { path: file, program: held?.[1] ?? null, pid: held ? Number(held[2]) : null };
+  const held = msg.match(/Conflicting lock is held in (?:(.+?) \(PID (\d+)\)|PID (\d+)\b)/);
+  const pid = held?.[2] ?? held?.[3];
+  return { path: file, program: held?.[1] ?? null, pid: pid !== undefined ? Number(pid) : null };
 }
 
 /** True for DuckDB's sandbox refusal ("file system operations are disabled by configuration"). */
