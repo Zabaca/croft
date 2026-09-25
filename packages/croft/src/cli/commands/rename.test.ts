@@ -2,12 +2,14 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { DuckDBInstance } from "@duckdb/node-api";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { closeAllWarehouses } from "../../db/warehouse.ts";
+import { closeAllWarehouses, openWarehouse } from "../../db/warehouse.ts";
+import { trashTable } from "../../safety/trash.ts";
 import { getCatalog, putCatalog } from "../../history/catalog.ts";
 import { tryAcquire } from "../../history/leases.ts";
 import { currentIdentity } from "../../core/proc.ts";
 import { readJournal } from "../../project/rename.ts";
-import { cli as spawnCli, cliEnv } from "../../run/testkit.ts";
+import { RunsDb } from "../../history/runs-db.ts";
+import { cleanupProjects, cli as spawnCli, cliEnv, makeProject as makeRunProject } from "../../run/testkit.ts";
 import { cleanup, cli, ISSUES_CATALOG, ISSUES_SEED, ISSUES_TS, makeProject, NOW, OPEN_SQL, runsDb, seed, type TestProject } from "./inspect-testkit.ts";
 import { formatRename, renameNext } from "./rename.ts";
 
@@ -51,7 +53,7 @@ describe("croft rename", () => {
     expect(d).toMatchObject({
       from: "github_issues", to: "issues", mode: "file",
       file: { from: "assets/github_issues.ts", to: "assets/issues.ts", moved: true },
-      table: { renamed: true, rows: 3 }, trash: { versions: 0, left: [] }, preview: "none",
+      table: { renamed: true, rows: 3 }, trash: { versions: 0, left: [], earlier: null }, preview: "none",
       references: [{ file: "assets/open_issues.sql", line: 6, kind: "sql", text: `SELECT id, title, "user"->>'login' AS author FROM github_issues WHERE state = 'open'` }],
     });
     expect(r.json.next).toEqual([{ command: "croft validate", reason: "after updating the 1 reference to github_issues listed above, check the project" }]);
@@ -74,7 +76,7 @@ describe("croft rename", () => {
   test("formatRename: adopt, never built, trash and preview lines; renameNext without references", () => {
     const text = formatRename({
       from: "a", to: "b", mode: "adopt", runId: "r_0922_1200_abcd", file: { from: "assets/b.ts", to: "assets/b.ts", moved: false },
-      table: { renamed: true, rows: 1 }, trash: { versions: 2, left: [] }, preview: "kept", references: [],
+      table: { renamed: true, rows: 1 }, trash: { versions: 2, left: [], earlier: null }, preview: "kept", references: [],
     });
     expect(text).toBe([
       "Renamed a to b.",
@@ -87,9 +89,46 @@ describe("croft rename", () => {
     ].join("\n"));
     expect(formatRename({
       from: "a", to: "b", mode: "file", runId: "r", file: { from: "assets/a.sql", to: "assets/b.sql", moved: true },
-      table: { renamed: false, rows: null }, trash: { versions: 0, left: [] }, preview: "none", references: [],
+      table: { renamed: false, rows: null }, trash: { versions: 0, left: [], earlier: null }, preview: "none", references: [],
     })).toContain("  table    none yet: b has never been built");
     expect(renameNext({ from: "a", references: [] })).toEqual([{ command: "croft validate", reason: "check the project" }]);
+    const kept = (earlier: { name: string; versions: number; left: string[] }) => formatRename({
+      from: "a", to: "b", mode: "file", runId: "r", file: { from: "assets/a.sql", to: "assets/b.sql", moved: true },
+      table: { renamed: true, rows: 4 }, trash: { versions: 1, left: [], earlier }, preview: "none", references: [],
+    });
+    expect(kept({ name: "b_earlier", versions: 2, left: [] })).toContain([
+      "  trash    1 version moved",
+      "  trash    2 versions of an earlier b (deleted before) kept apart as b_earlier: croft restore b never offers them; croft restore b_earlier can",
+    ].join("\n"));
+    expect(kept({ name: "b_earlier_2", versions: 0, left: ["/p/.croft/trash/b_earlier_2/x.duckdb"] })).toContain([
+      "  trash    1 version of an earlier b (deleted before) kept apart as b_earlier_2: croft restore b never offers it; croft restore b_earlier_2 can",
+      "  trash    1 of them could not be renamed inside and cannot be restored as b_earlier_2: /p/.croft/trash/b_earlier_2/x.duckdb",
+    ].join("\n"));
+  });
+
+  test("R41-09: the trash of an earlier asset of the new name is kept apart; croft restore never offers it as the renamed asset's", async () => {
+    const p = await issues();
+    // An earlier asset named issues, deleted since: no file, no table, its version still in the trash.
+    await seed(p.database, ["CREATE TABLE issues (sku VARCHAR)", "INSERT INTO issues VALUES ('s0'), ('s1')"]);
+    const w = openWarehouse({ path: p.database, mode: "read_write", timezone: p.project.timezone, root: p.root, stateDir: p.stateDir });
+    await trashTable(w, "issues", "delete (r_0922_0500_old1)", { now: new Date("2026-09-22T12:00:00Z") });
+    await closeAllWarehouses();
+    await seed(p.database, ["DROP TABLE issues"]);
+
+    const r = await cli(["rename", "github_issues", "issues", "--json"], { cwd: p.root, env: ENV });
+    expect(r.exit).toBe(0);
+    expect(r.json.data.trash).toEqual({ versions: 0, left: [], earlier: { name: "issues_earlier", versions: 1, left: [] } });
+    const list = await cli(["restore", "--json"], { cwd: p.root, env: ENV });
+    expect(list.json.data.versions.map((v: { asset: string; rows: number; reason: string }) => [v.asset, v.rows, v.reason]))
+      .toEqual([["issues_earlier", 2, "delete (r_0922_0500_old1)"]]);
+    // github_issues had no version of its own: there is nothing to restore as issues.
+    const mine = await cli(["restore", "issues", "--json"], { cwd: p.root, env: ENV });
+    expect(mine.exit).toBe(2);
+    expect(mine.json.problems[0]).toMatchObject({ code: "USAGE_ERROR", message: "the trash holds nothing of issues" });
+    // The earlier asset's version comes back under the name it is kept as, after confirmation.
+    const theirs = await cli(["restore", "issues_earlier", "--json"], { cwd: p.root, env: ENV });
+    expect(theirs.exit).toBe(5);
+    expect(theirs.json.data).toMatchObject({ asset: "issues_earlier", status: "needs_confirmation", rows: 2 });
   });
 
   test("refusals: usage (exit 2), a taken name (NAME_CONFLICT, exit 2), a run holding the asset (ASSET_BUSY, exit 4)", async () => {
@@ -153,4 +192,64 @@ describe("a killed rename (CROFT_FAULT) is reported and finished by the same com
       expect(after.json.problems.filter((x: { code: string }) => x.code === "ASSET_RENAMED")).toEqual([]);
     });
   }
+});
+
+describe("R41-05: while a croft rename is unfinished, no run or preview fetches either name again", () => {
+  afterAll(() => cleanupProjects());
+
+  // An ingest that counts its fetches (each one would bill the source again).
+  const LOGGED = `import { ingest } from "@zabaca/croft";
+import { appendFileSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+export default ingest({
+  key: "id",
+  schedule: "every day at 6:00",
+  async *rows() {
+    appendFileSync(join(process.cwd(), "fetches.log"), "fetch\\n");
+    yield JSON.parse(readFileSync(join(process.cwd(), "data.json"), "utf8"));
+  },
+});
+`;
+
+  test("killed after runs.sqlite moved (the approval too): a named, bare, scheduled run and a preview fetch nothing; the rename then finishes", async () => {
+    const root = makeRunProject({ "assets/tickets.ts": LOGGED, "data.json": JSON.stringify([1, 2, 3, 4, 5].map((id) => ({ id }))) });
+    const env = (extra: Record<string, string> = {}) => cliEnv({ CROFT_NOW: NOW, CROFT_FORBID_OS_JOBS: "1", CROFT_NOTIFY_DRY: "1", ...extra });
+    const fetches = () => readFileSync(join(root, "fetches.log"), "utf8").trim().split("\n").length;
+    const stepOf = (r: { json?: Record<string, any> }) => r.json?.data?.steps?.find((s: { asset: string }) => s.asset === "support");
+    const fix = { kind: "command", command: "croft rename tickets support" };
+    expect((await spawnCli(root, ["run", "tickets", "--json"], env())).code).toBe(0);
+    expect(fetches()).toBe(1);
+    const db = RunsDb.open(join(root, ".croft"));
+    db.setScheduling({ state: "on", via: "serve" });
+    db.close();
+    const killed = await spawnCli(root, ["rename", "tickets", "support", "--json"], env({ CROFT_FAULT: "rename_after_state" }));
+    expect(killed.signal).toBe("SIGKILL");
+
+    // Named: the step fails before it fetches, with the rename as its fix.
+    const named = await spawnCli(root, ["run", "support", "--json"], env());
+    expect(named.code).toBe(2);
+    expect(stepOf(named)).toMatchObject({ status: "failed", error: { code: "ASSET_RENAMED", fix } });
+    // Bare: skipped, with ASSET_RENAMED as a warning.
+    const bare = await spawnCli(root, ["run", "--json"], env());
+    expect(bare.code).toBe(0);
+    expect(stepOf(bare)).toMatchObject({ status: "skipped" });
+    expect(bare.json?.problems).toContainEqual(expect.objectContaining({ code: "ASSET_RENAMED", severity: "warning", fix: expect.objectContaining(fix) }));
+    // The scheduler's run of it (the approval moved with the state, so nothing holds it): no fetch either.
+    const due = await spawnCli(root, ["run", "--due", "support", "--json"], env());
+    expect(stepOf(due)).toMatchObject({ status: "failed", error: { code: "ASSET_RENAMED", fix } });
+    // A preview of it.
+    const preview = await spawnCli(root, ["preview", "support", "--json"], env());
+    expect(preview.code).toBe(2);
+    expect(preview.json?.problems).toContainEqual(expect.objectContaining({ code: "ASSET_RENAMED", fix: expect.objectContaining(fix) }));
+    expect(fetches()).toBe(1);
+
+    // The same rename finishes it; then support runs from the adopted table (a normal run).
+    const again = await spawnCli(root, ["rename", "tickets", "support", "--json"], env());
+    expect(again.code).toBe(0);
+    expect(again.json?.data).toMatchObject({ mode: "resume", table: { rows: 5 } });
+    const after = await spawnCli(root, ["run", "support", "--json"], env());
+    expect(after.code).toBe(0);
+    expect(stepOf(after)).toMatchObject({ status: "ok", rows: { added: 0, total: 5 } });
+    expect(fetches()).toBe(2);
+  }, 90_000);
 });

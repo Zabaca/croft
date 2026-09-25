@@ -27,6 +27,8 @@
 //   (history/drift.ts), an info line, since the runs reported them.
 // - backups (§6 "Before an engine upgrade", db/backup.ts): the pre-upgrade backups in .croft/backups/, and whether
 //   the next command that writes backs the warehouse up first (this croft's DuckDB is newer than the recorded one).
+// - rename (project/rename.ts): a croft rename that did not finish (its journal, .croft/rename.json) is an error line,
+//   ASSET_RENAMED with `croft rename <old> <new>` as its fix and in next, since neither name runs until it finishes.
 import { accessSync, constants as fsConstants, existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
@@ -39,6 +41,7 @@ import { isHolderAlive, liveIntents } from "../../db/intent.ts";
 import { readCopyStatus, readCopySummary } from "../../db/readcopy.ts";
 import { CLAUDE_MD, claudeBlock, findBlock, SKILL_PATH, skillStamp } from "../../agent/templates.ts";
 import { type DriftEntry, driftTexts, recentDrift } from "../../history/drift.ts";
+import { listLeases } from "../../history/leases.ts";
 import { RUNS_DB_FILE, RunsDb } from "../../history/runs-db.ts";
 import { ProjectEnv } from "../../project/env.ts";
 import { appRootOf, relocationPlan } from "../../project/init.ts";
@@ -138,9 +141,14 @@ export const doctor: CommandImpl<DoctorData> = {
 };
 
 function nextFor(problems: Problem[]): { command: string; reason: string }[] {
-  return problems.some((p) => p.code === "CLAUDE_FILES_OUTDATED")
+  const next = problems.some((p) => p.code === "CLAUDE_FILES_OUTDATED")
     ? [{ command: "croft init --claude", reason: "refresh CLAUDE.md and the croft skill for this version" }]
     : [];
+  // A rename that did not finish (checkRename): the same command finishes it; it fetches and deletes nothing.
+  for (const p of problems) {
+    if (p.code === "ASSET_RENAMED" && p.fix?.kind === "command") next.push({ command: p.fix.command, reason: p.fix.description });
+  }
+  return next;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -192,6 +200,7 @@ export async function runDoctor(cwd: string, d: DoctorDeps): Promise<{ data: Doc
   }
   if (project) {
     await checkAssets(r, d, project, probe.ok);
+    checkRename(r, project);
     checkTables(r, found.scan);
     checkDrift(r, d, project);
     checkStorage(r, d, project);
@@ -722,6 +731,61 @@ async function checkAssets(r: Report, d: DoctorDeps, project: Project, bindingOk
   r.add("project", "assets", errors > 0 ? "error" : "ok",
     `${plural(assets, "asset")} · ${plural(errors, "error")}, ${plural(warnings, "warning")} (details: croft validate)`,
     undefined, { assets, errors, warnings, info: count("info") });
+}
+
+/** project/rename.ts RENAME_JOURNAL, read here without importing rename.ts, which loads DuckDB. */
+const RENAME_JOURNAL = "rename.json";
+
+/**
+ * A croft rename that did not finish (project/rename.ts): its journal, <state>/rename.json, is written before anything
+ * moves and removed last. Until the same `croft rename <old> <new>` finishes it, neither name runs, so the line is an
+ * error with ASSET_RENAMED, word for word as rename.ts renamedProblem words it for croft validate and croft status
+ * (doctor.test.ts compares them), with the command as its fix and in next. A rename whose run still holds its leases
+ * is running: an info line. No line without a journal, or with one that cannot be read (written by a rename that
+ * stopped before anything moved; the next rename replaces it). Works without the DuckDB binding.
+ */
+function checkRename(r: Report, project: Project): void {
+  const { stateDir } = project.paths;
+  let j: { from: string; to: string; fileTo: string; startedAt: string; runId: string };
+  try {
+    const v = JSON.parse(readFileSync(join(stateDir, RENAME_JOURNAL), "utf8")) as Record<string, unknown>;
+    const str = (x: unknown): x is string => typeof x === "string" && x.length > 0;
+    if (!str(v.from) || !str(v.to) || !str(v.fileFrom) || !str(v.fileTo)) return;
+    j = { from: v.from, to: v.to, fileTo: v.fileTo, startedAt: str(v.startedAt) ? v.startedAt : "", runId: str(v.runId) ? v.runId : "" };
+  } catch {
+    return;
+  }
+  let running = false;
+  let rows: number | null = null;
+  if (existsSync(join(stateDir, RUNS_DB_FILE))) {
+    try {
+      const db = RunsDb.open(stateDir);
+      try {
+        running = j.runId !== "" && listLeases(db).some((l) => l.runId === j.runId && l.alive);
+        const entry = db.catalogGet<{ rows?: unknown }>(j.from) ?? db.catalogGet<{ rows?: unknown }>(j.to);
+        rows = typeof entry?.value.rows === "number" ? entry.value.rows : null;
+      } finally {
+        db.close();
+      }
+    } catch {
+      // runs.sqlite cannot be read: the journal alone says the rename did not finish.
+    }
+  }
+  const details = { from: j.from, to: j.to, startedAt: j.startedAt || null, runId: j.runId || null };
+  if (running) {
+    r.add("project", "rename", "info", `rename: croft rename ${j.from} ${j.to} is running (run ${j.runId})`, undefined, details);
+    return;
+  }
+  const command = `croft rename ${j.from} ${j.to}`;
+  const rowsText = rows === null ? "" : ` (${rows.toLocaleString("en-US")} row${rows === 1 ? "" : "s"})`;
+  const p = problem("ASSET_RENAMED", {
+    asset: j.to, file: j.fileTo,
+    message: `croft rename ${j.from} ${j.to} did not finish: the table${rowsText}, its state and the asset file may be under either name`,
+    hint: `${command} finishes it; run neither ${j.from} nor ${j.to} before that`,
+    fix: { kind: "command", description: `finish renaming ${j.from} to ${j.to}`, command },
+    details: { from: j.from, to: j.to, rows, unfinished: true },
+  });
+  r.add("project", "rename", "error", `rename: ${p.message}`, p, details);
 }
 
 function checkStorage(r: Report, d: DoctorDeps, project: Project): void {

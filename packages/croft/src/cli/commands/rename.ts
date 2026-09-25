@@ -68,6 +68,12 @@ export function formatRename(d: RenameData): string {
   }
   if (d.trash.versions > 0) row("trash", `${d.trash.versions} version${d.trash.versions === 1 ? "" : "s"} moved`);
   if (d.trash.left.length > 0) row("trash", `${d.trash.left.length} version${d.trash.left.length === 1 ? "" : "s"} could not be renamed and stay under ${d.from}: ${d.trash.left.join(", ")}`);
+  const e = d.trash.earlier;
+  if (e) {
+    const n = e.versions + e.left.length;
+    row("trash", `${n} version${n === 1 ? "" : "s"} of an earlier ${d.to} (deleted before) kept apart as ${e.name}: croft restore ${d.to} never offers ${n === 1 ? "it" : "them"}; croft restore ${e.name} can`);
+    if (e.left.length > 0) row("trash", `${e.left.length} of them could not be renamed inside and cannot be restored as ${e.name}: ${e.left.join(", ")}`);
+  }
   if (d.preview === "cleared") row("preview", `cleared (it used ${d.from}); croft preview ${d.to} builds it again`);
   if (d.preview === "kept") row("preview", `not cleared (the preview database was busy); the last preview still shows ${d.from} until croft preview ${d.to}`);
   lines.push("");
