@@ -29,7 +29,6 @@ import { now as clockNow, toEpochMicros } from "../core/time.ts";
 import type { AssetKind, Problem, Sql } from "../core/types.ts";
 import { hasState } from "../db/state.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
-import type { RunsDb } from "../history/runs-db.ts";
 import { quoteIdent, readTableSchema } from "../load/evolve.ts";
 import { didYouMean } from "../project/suggest.ts";
 import { finiteJson, volatileUses, walk } from "../sql/ast.ts";
@@ -150,19 +149,6 @@ export async function countWhere(sql: Sql, asset: string, where: string): Promis
     }
     throw whereError(asset, where, `does not run: ${first}`, { details: { duckdb: first } });
   }
-}
-
-/**
- * Whether `croft delete` removed the asset's whole table and nothing has built it since: the latest step that ran
- * (a step skipped for a hold did not) is the delete's, reason "deleted", and its catalog mirror entry is gone
- * (cli/commands/delete.ts). Such an asset is held from the scheduler until a person acts, and status, describe and
- * the hold say so: `croft restore <asset>` brings it back, and only `croft run <asset>` by hand builds it again from
- * scratch. Reads runs.sqlite only.
- */
-export function deletedByCroft(runs: Pick<RunsDb, "sqlite" | "catalogGet">, asset: string): boolean {
-  const ran = runs.sqlite.query(`SELECT reason FROM steps WHERE asset = ? AND attempt >= 1 AND status <> 'skipped'
-    ORDER BY started_at DESC, attempt DESC LIMIT 1`).get(asset) as { reason: string | null } | null;
-  return ran?.reason === "deleted" && runs.catalogGet(asset) === null;
 }
 
 /** Every asset that has read `asset`, directly or through another, from _croft.inputs; sorted. */

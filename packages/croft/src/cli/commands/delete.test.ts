@@ -5,8 +5,7 @@ import { closeAllWarehouses } from "../../db/warehouse.ts";
 import { type CatalogAsset, getCatalog, putCatalog } from "../../history/catalog.ts";
 import { listLeases, tryAcquire } from "../../history/leases.ts";
 import { cliEnv, cli as spawnCli } from "../../run/testkit.ts";
-import { deletedByCroft } from "../../safety/delete.ts";
-import { listTrash, versionNote } from "../../safety/trash.ts";
+import { deletedByCroft, listTrash, versionNote } from "../../safety/trash.ts";
 import { deleteCommand, MAINTAIN_WAITS, prompter } from "./delete.ts";
 import { cleanup, cli, DEAD, makeProject, runsDb, seed, STATE, type TestProject, writeFiles } from "./inspect-testkit.ts";
 

@@ -28,6 +28,7 @@ import { now as clockNow } from "../core/time.ts";
 import type { Sql } from "../core/types.ts";
 import { CROFT_VERSION } from "../db/state.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
+import type { RunsDb } from "../history/runs-db.ts";
 import { currentDatabase, quoteIdent, quoteLiteral, readTableSchema } from "../load/evolve.ts";
 
 export const TRASH_DIR = "trash";
@@ -288,6 +289,19 @@ export function pruneTrash(stateDir: string, o: { asset?: string; now?: Date; ke
 /** Where the next trash file of an asset would go (for a confirmation's impact; the stamp is a guess). */
 export function plannedTrashPath(stateDir: string, asset: string, at: Date = clockNow()): string {
   return join(trashDir(stateDir, asset), `${trashStamp(at)}.duckdb`);
+}
+
+/**
+ * Whether `croft delete` removed the asset's whole table and nothing has built it since: the latest step that ran
+ * (a step skipped for a hold did not) is the delete's, reason "deleted", and its catalog mirror entry is gone
+ * (cli/commands/delete.ts). Such an asset is held from the scheduler until a person acts, and status, describe and
+ * the hold say so: `croft restore <asset>` brings it back, and only `croft run <asset>` by hand builds it again from
+ * scratch. Reads runs.sqlite only (no DuckDB), so the tick can ask.
+ */
+export function deletedByCroft(runs: Pick<RunsDb, "sqlite" | "catalogGet">, asset: string): boolean {
+  const ran = runs.sqlite.query(`SELECT reason FROM steps WHERE asset = ? AND attempt >= 1 AND status <> 'skipped'
+    ORDER BY started_at DESC, attempt DESC LIMIT 1`).get(asset) as { reason: string | null } | null;
+  return ran?.reason === "deleted" && runs.catalogGet(asset) === null;
 }
 
 /** INTERNAL_ERROR when the trash could not be written: the destructive change must not go ahead. */
