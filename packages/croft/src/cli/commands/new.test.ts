@@ -173,7 +173,7 @@ describe("croft new <kind> <name>", () => {
     const only = newProject({ "assets/events.ts": KEYLESS });
     const o = await cli(["new", "transform", "sale_labels", "--json"], { cwd: only.root });
     expect(o.json.data.edit).toContain("they read example_sales, the project's only asset with a key");
-    expect(readFileSync(join(p.root, "assets/sale_labels.ts"), "utf8")).toContain("newRows<Input>(\"example_sales\")");
+    expect(readFileSync(join(p.root, "assets/sale_labels.ts"), "utf8")).toContain("newRows(\"example_sales\")");
     expect(r.json.next).toEqual([{
       command: "croft preview sale_labels --rows 20",
       reason: "after your edits pass croft validate: at most 20 input rows reach the code (keep --rows small once it makes paid calls); nothing real changes",

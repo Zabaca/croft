@@ -451,17 +451,17 @@ describe("b.–d. file, transform and sql templates", () => {
     const text = p.read(file);
     expect(text).toContain("When this applies");
     expect(text).toContain("confirmAbove: 1000,");
-    expect(text).toContain('newRows<Input>("sales")');
+    // No type argument: the rows get sales's generated row type (.croft/types), which validate --types checks.
+    expect(text).toContain('newRows("sales")');
 
     // As written it validates (a placeholder result per row, no requests).
     const asWritten = (await croftJson("validate", ["validate", "sales_labels"])).env;
     expect(serious(asWritten), JSON.stringify(asWritten.problems)).toEqual([]);
 
     // The comment's own steps: add http and secret to the arguments of rows, secrets: [...] to the config, the call
-    // uncommented and pointed at the service, the placeholder result removed; the Input type names what it reads.
+    // uncommented and pointed at the service, the placeholder result removed; the call reads a column of sales.
     p.edit(file, "async *rows({ newRows, log })", "async *rows({ newRows, log, http, secret })");
     p.edit(file, '  inputs: ["sales"],', '  secrets: ["LLM_KEY"],\n  inputs: ["sales"],');
-    p.edit(file, "type Input = { order_id: unknown };", "type Input = { order_id: number; region: string; amount: number };");
     p.edit(file, "      //   ", "      ", { all: true });
     p.edit(file, '"https://api.example.com/v1/classify"', JSON.stringify(`${api.url}/llm/v1/classify`));
     p.edit(file, "String(row.title)", "String(row.region)");

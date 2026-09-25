@@ -9,7 +9,9 @@
 // - file (§3b): a CSV glob under files/<name>/, incremental (new and changed files only), with a key.
 // - sql (§3c): the header (description, key, a check) and one SELECT over an existing asset.
 // - transform (§3e): keyed, incremental, newRows() over an existing asset with a key, the paid call as a comment,
-//   and confirmAbove (the cost guard).
+//   and confirmAbove (the cost guard). newRows("x") takes no type argument, so its rows get x's generated row type
+//   (.croft/types) and validate --types sees a column renamed upstream; the key and the yielded names are the
+//   cleaned names (§7) a TS asset's output columns get.
 //
 // templateFor is pure: it renders text. The command (cli/commands/new.ts) checks the name, picks the input an sql
 // or transform template reads, writes the file and says what to do next. agent/contract.test.ts reads every
@@ -479,14 +481,16 @@ function transformTemplate(name: string, input: TemplateInput): Template {
       + "summarize, geocode), or parsing and scoring with a library. It is incremental: newRows() hands each input row over "
       + "once, and again only when it changes upstream, so a paid call is never repeated for rows already done. For "
       + "filters, joins and aggregates, write SQL instead (croft new sql <name>).",
-      `It reads ${input.asset}${why}. To edit: inputs and newRows() for the asset it should read, the Input type, the per-row `
-      + "work (the paid call goes where the comment shows), what each row yields, and the checks. Once it makes paid calls, "
-      + `preview it with croft preview ${name} --rows 20: each input row is one call.`,
+      `It reads ${input.asset}${why}. To edit: inputs and newRows() for the asset it should read, the per-row work (the `
+      + "paid call goes where the comment shows), what each row yields, and the checks. Once it makes paid calls, preview "
+      + `it with croft preview ${name} --rows 20: each input row is one call.`,
+      `Each row has the columns of ${input.asset} (croft describe ${input.asset} lists them). Once ${input.asset} has been `
+      + `run or previewed they are typed by name (.croft/types/${input.asset}.d.ts), and croft validate --types reports `
+      + `code that reads a column ${input.asset} does not have, such as one renamed upstream; until then each column is `
+      + `unknown. So keep newRows(${JSON.stringify(input.asset)}) without a type argument: newRows<T>() replaces the `
+      + "generated type, and tsc no longer sees a rename.",
     ]),
     "import { transform } from \"@zabaca/croft\";",
-    "",
-    `// The columns of ${input.asset} this code reads (croft describe ${input.asset} lists them all).`,
-    `type Input = { ${input.key.map((k) => `${tsProp(k)}: unknown`).join("; ")} };`,
     "",
     "export default transform({",
     note(`  description: ${JSON.stringify(titleWords(name))},`, "one line: what a row is (croft describe shows it)"),
@@ -501,7 +505,7 @@ function transformTemplate(name: string, input: TemplateInput): Template {
     "",
     "  async *rows({ newRows, log }) {",
     "    let n = 0;",
-    `    for await (const row of newRows<Input>(${JSON.stringify(input.asset)})) {`,
+    `    for await (const row of newRows(${JSON.stringify(input.asset)})) {`,
     "      // A paid call per row goes here, for example a classification API (add http and secret to the arguments",
     "      // of rows above, and secrets: [\"EXAMPLE_KEY\"] to the config, then ask the user to add it to .env):",
     "      //   const res = await http.post(\"https://api.example.com/v1/classify\", { text: String(row.title) }, {",

@@ -8,14 +8,14 @@
 //   b. the column is renamed in the SQL asset between them: plain validate is clean (the SQL binds), and before
 //      any run validate --types reports UNKNOWN_INPUT_COLUMN at the transform's line, with a did-you-mean edit fix.
 //      The fix, applied as written, passes, and the run after it works.
-//   c. the same rename under a transform made by `croft new transform`, edited the way its comments say: only the
-//      run catches it (bugTest: the template's own Input type bypasses the generated row types).
+//   c. the same rename under a transform made by `croft new transform`, edited the way its comments say: it reads
+//      newRows("open_issues") with no type argument, so validate --types catches it too (it was a bugTest, R51-01).
 // Every --json envelope is checked against its published schema with the golden tests' validator.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { golden } from "../golden/kit.ts";
-import { bugTest, cleanupAll, type Envelope, findProblem, initProject, linkTypescript, type Project, projectTsc, show, stepOf } from "./harness.ts";
+import { cleanupAll, type Envelope, findProblem, initProject, linkTypescript, type Project, projectTsc, show, stepOf } from "./harness.ts";
 
 afterAll(cleanupAll);
 
@@ -168,7 +168,7 @@ describe("c. a transform made by croft new transform", () => {
   /** validate --types after the rename, before any run. */
   let typesAfterRename: Envelope | undefined;
 
-  test("edited the way its comments say, it runs and passes tsc; after the rename, the run stops at the first row", async () => {
+  test("edited the way its comments say, it type-checks before and after its input has types, and runs", async () => {
     p = (await initProject("typed-template")).project;
     linkTypescript(p);
     golden("new", await p.croft(["new", "file", "issues", "--json"]));
@@ -177,23 +177,35 @@ describe("c. a transform made by croft new transform", () => {
     // The asset changed most recently with a key is open_issues: the template reads it.
     const made = golden("new", await p.croft(["new", "transform", "triage", "--json"]));
     expect(made.data.reads).toBe("open_issues");
-    // The edits its comments ask for: the Input type names the columns the code reads, and the result uses one.
+    // It reads newRows("open_issues") with no type argument, so its rows are OpenIssuesRow once that exists.
     const file = "assets/triage.ts";
-    expect(p.read(file)).toContain('newRows<Input>("open_issues")');
-    p.edit(file, "type Input = { id: unknown };", "type Input = { id: number; author: string | null };");
+    expect(p.read(file)).toContain('for await (const row of newRows("open_issues")) {');
+    expect(p.read(file)).not.toMatch(/newRows<\w+>\("/);
+    // The edit its comments ask for: the per-row work, here from a column of the input.
     const result = p.read(file).split("\n").find((l) => l.includes("replace with what you compute for this row"))!;
     p.edit(file, result, '      const result = row.author ?? "nobody";');
+
+    // Before anything was built there are no row types: every column is unknown, and tsc passes.
+    const cold = golden("validate", await p.croft(["validate", "--types", "--json"]));
+    expect(cold.data.types).toEqual({ status: "ok", errors: 0 });
+    expect(existsSync(join(p.root, ".croft", "types", "open_issues.d.ts"))).toBe(false);
+
     const ran = await p.croft(["run", "--json"]);
     expect(stepOf(golden("run", ran), "triage").status, show(ran)).toBe("ok");
     expect(p.read(".croft/types/open_issues.d.ts")).toContain("  author: string | null;\n");
     const tsc = await projectTsc(p);
     expect(tsc.code, tsc.out).toBe(0);
+    const typed = golden("validate", await p.croft(["validate", "--types", "--json"]));
+    expect(typed.data.types).toEqual({ status: "ok", errors: 0 });
 
     p.write("assets/open_issues.sql", OPEN_ISSUES("author AS author_name"));
+    // Plain validate binds the SQL and has nothing to say.
+    const plain = golden("validate", await p.croft(["validate", "--json"]));
+    expect(plain.problems.filter((x: { severity: string }) => x.severity !== "info")).toEqual([]);
     const r = await p.croft(["validate", "--types", "--json"]);
     typesAfterRename = golden("validate", r, { exit: r.code ?? undefined });
 
-    // What catches it today: the run, at the first row the transform reads (the runtime guard of §3e).
+    // The run still has its own guard (§3e): the transform stops at the first row it reads.
     const after = await p.croft(["run", "--json"]);
     const env = golden("run", after, { exit: after.code ?? undefined });
     expect(stepOf(env, "open_issues").status, show(after)).toBe("ok");
@@ -201,13 +213,9 @@ describe("c. a transform made by croft new transform", () => {
     expect(findProblem(env, "UNKNOWN_INPUT_COLUMN"), show(after)).toMatchObject({ asset: "triage", details: expect.objectContaining({ column: "author" }) });
   }, 180_000);
 
-  // BUG (the transform template bypasses the generated row types): the croft new transform template reads its input
-  // with an explicit row type, `newRows<Input>("open_issues")` over its own `type Input = { id: unknown }`, and an
-  // explicit type argument picks the `newRows<T extends Row>(input: string)` overload, not the generated
-  // OpenIssuesRow. So in a transform made the way croft tells an agent to make one, validate --types never sees a
-  // column renamed upstream (types ok, no problem): tsc checks the code against the template's Input type, which
-  // still says `author`. Only the run catches it, at the first row.
-  bugTest("validate --types catches the rename in a template-made transform too (UNKNOWN_INPUT_COLUMN with the edit fix), before any run", () => {
+  // Was a bug (R51-01): the template read newRows<Input>("open_issues") over its own `type Input`, and an explicit type
+  // argument picks the untyped overload, so validate --types never saw the rename. It reads newRows("open_issues") now.
+  test("validate --types catches the rename in a template-made transform too (UNKNOWN_INPUT_COLUMN with the edit fix), before any run", () => {
     expect(typesAfterRename?.data.types).toEqual({ status: "failed", errors: 1 });
     expect(findProblem(typesAfterRename ?? {}, "UNKNOWN_INPUT_COLUMN")?.fix).toMatchObject({
       kind: "edit", file: "assets/triage.ts", replace: { from: "author", to: "author_name" },
