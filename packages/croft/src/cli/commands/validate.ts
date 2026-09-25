@@ -33,13 +33,14 @@
 //    No tsc (or no tsconfig.json) is an info problem and a skip; croft never installs anything. A tsconfig.json
 //    whose "include" leaves out .croft/types is an info problem with the edit.
 // 4. --hook: what Claude Code's PostToolUse hook runs after an edit (agent/hook.ts, §9 item 7): the edited asset
-//    and what it can break, silent unless there is an error, which goes to stderr with exit 2 (validateHook).
+//    and what it can break. Errors go to stderr with exit 2; warnings only, to Claude as additionalContext (JSON
+//    on stdout, exit 0); croft's own failures exit 1, which never blocks Claude (validateHook, hookHuman).
 //
 // Data: ValidateData (core/types.ts). Every finding is a problem of the envelope, grouped by asset in run order.
 // Human output is the §4.2 layout: "checked N assets in 0.6 s", each problem, then the counts.
 import { existsSync, readFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
-import { hookProblems, hookReport, hookSelection, hookTarget, parseHookInput, readHookStdin } from "../../agent/hook.ts";
+import { hookContext, hookOutput, hookProblems, hookReport, hookSelection, hookTarget, parseHookInput, readHookStdin } from "../../agent/hook.ts";
 import { probeSql } from "../../checks/parse.ts";
 import { type Code, CroftError, CODES, EXIT, isCode, problem } from "../../core/errors.ts";
 import { formatInstant } from "../../core/time.ts";
@@ -61,7 +62,7 @@ import { previewDirectory } from "../../run/preview.ts";
 import { nextFires } from "../../schedule/types.ts";
 import { ShadowCatalog, type ShadowColumn } from "../../sql/bind.ts";
 import type { CommandImpl, CommandResult, Ctx, Next } from "../command.ts";
-import { formatDuration, formatProblems, problemSummary } from "../render.ts";
+import { formatDuration, formatProblem, formatProblems, problemSummary } from "../render.ts";
 
 /** How long the project's tsc may take before --types gives up. */
 const TSC_TIMEOUT_MS = 180_000;
@@ -911,17 +912,25 @@ function hookUsage(ctx: Ctx): void {
   }
 }
 
-/** --hook's human output: nothing unless there is an error; then the report goes to stderr, which is what
- *  Claude Code shows Claude on exit 2, and stdout stays empty. croft's own failure (exit 1) is its problem block
- *  on stderr, whose first line Claude Code shows the user. */
+/**
+ * --hook's human output, per Claude Code's PostToolUse contract (agent/hook.ts):
+ * - errors: the report on stderr, which Claude Code shows Claude on exit 2; stdout stays empty;
+ * - warnings only: one line of JSON on stdout whose additionalContext Claude reads next to the edit, exit 0;
+ * - a clean check, or nothing to check: nothing at all;
+ * - croft's own failure (exit 1): its problem block on stderr, whose first line Claude Code shows the user.
+ */
 function hookHuman(result: CommandResult<ValidateData>, ctx: Ctx): undefined {
   const run = hookRuns.get(ctx) ?? { target: "the edited file", asset: null, selected: [] };
   if (run.failed) {
     ctx.render.errRaw(formatProblems(result.problems, ctx.render.errColor));
     return undefined;
   }
-  if (!result.problems.some((p) => p.severity === "error")) return undefined;
-  ctx.render.errRaw(hookReport({ ...run, problems: result.problems, formatted: formatProblems(result.problems, false) }));
+  if (!result.problems.length) return undefined;
+  if (result.problems.some((p) => p.severity === "error")) {
+    ctx.render.errRaw(hookReport({ ...run, problems: result.problems, formatted: formatProblems(result.problems, false) }));
+  } else {
+    ctx.render.outRaw(hookOutput(hookContext({ ...run, problems: result.problems, formatted: result.problems.map((p) => formatProblem(p, false)) })));
+  }
   return undefined;
 }
 

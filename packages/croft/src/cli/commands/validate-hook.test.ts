@@ -1,7 +1,9 @@
 // croft validate --hook (DESIGN.md §9 item 7): the PostToolUse hook's side. Claude Code runs it after each Edit,
-// Write or MultiEdit with the tool call's JSON on stdin; exit 2 shows its stderr to Claude, exit 0 is silent
-// (code.claude.com/docs/en/hooks, "Exit code 2 behavior per event": PostToolUse "Shows stderr to Claude; the
-// tool already ran").
+// Write or MultiEdit with the tool call's JSON on stdin (code.claude.com/docs/en/hooks):
+// - exit 2 shows its stderr to Claude ("Exit code 2 behavior per event": PostToolUse "Shows stderr to Claude;
+//   the tool already ran"): errors in the edited assets;
+// - exit 0 with hookSpecificOutput.additionalContext on stdout hands text to Claude without blocking: warnings;
+// - any other exit is a non-blocking "hook error" notice for the user: croft's own failures (exit 1).
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -81,15 +83,75 @@ describe("croft validate --hook: nothing to check", () => {
     expect(whole.exit).toBe(2);                        // broken.sql: the full validate still reports it
   });
 
-  test("warnings alone do not stop Claude: exit 0, silent (--json still carries them)", async () => {
+  test("warnings alone do not stop Claude: exit 0, and they reach Claude as context, one line of JSON on stdout (--json still carries them)", async () => {
     const p = project();
     const r = await hook(p, "assets/github_issues.ts");
-    expect([r.exit, r.stdout, r.stderr]).toEqual([0, "", ""]);
+    expect([r.exit, r.stderr]).toEqual([0, ""]);
+    expect(r.stdout.endsWith("\n")).toBe(true);
+    expect(r.stdout.trimEnd()).not.toContain("\n");
+    const out = JSON.parse(r.stdout);
+    expect(Object.keys(out)).toEqual(["hookSpecificOutput"]);
+    expect(out.hookSpecificOutput.hookEventName).toBe("PostToolUse");
+    const context = (out.hookSpecificOutput.additionalContext as string).split("\n");
+    expect(context[0]).toBe("croft validate --hook: 1 warning after the edit to assets/github_issues.ts");
+    expect(context[1]).toStartWith("warn  SECRET_MISSING  ");
+    expect(context.at(-1)).toBe("A warning does not stop the edit or croft run; it says what the asset will cost or risk as written.");
     const j = await hook(p, "assets/github_issues.ts", { json: true });
     expect(j.exit).toBe(0);
     expect(j.json).toMatchObject({ ok: true, command: "validate", next: [] });
     expect(j.json.problems.map((x: { code: string }) => x.code)).toEqual(["SECRET_MISSING"]);
     expect(j.json.data.assets.map((a: { name: string }) => a.name)).toEqual(["github_issues"]);
+  });
+
+  test("a full-refresh transform that makes requests: TRANSFORM_MAKES_REQUESTS reaches Claude as context, with its fix", async () => {
+    const p = project({
+      "assets/labelled.ts": `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["github_issues"], key: "id",
+  async *rows({ rows, http }) {
+    for await (const r of rows("github_issues")) {
+      const res = await http.post("https://api.example.com/v1/classify", { text: String(r.title) });
+      yield { id: r.id, label: res.json<{ label: string }>().label };
+    }
+  },
+});
+`,
+    });
+    const r = await hook(p, "assets/labelled.ts", { stdin: input(p, "assets/labelled.ts", "Write") });
+    expect([r.exit, r.stderr]).toEqual([0, ""]);
+    const context = JSON.parse(r.stdout).hookSpecificOutput.additionalContext as string;
+    expect(context).toStartWith("croft validate --hook: 1 warning after the edit to assets/labelled.ts\n");
+    expect(context).toContain("warn  TRANSFORM_MAKES_REQUESTS  assets/labelled.ts:");
+    expect(context).toContain("every rebuild pays for every row again");
+    expect(context).not.toContain("\x1b[");
+  });
+
+  test("errors and warnings together: exit 2 with both on stderr, nothing on stdout", async () => {
+    const p = project({
+      "assets/enriched.ts": `import { transform } from "@zabaca/croft";\nexport default transform({ inputs: ["github_issue"], async *rows(ctx) { await ctx.http.get("https://example.com"); yield []; } });\n`,
+    });
+    const r = await hook(p, "assets/enriched.ts");
+    expect(r.exit).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toStartWith("croft validate --hook: 1 error, 1 warning after the edit to assets/enriched.ts\n");
+    expect(r.stderr).toContain("error UNKNOWN_TABLE");
+    expect(r.stderr).toContain("warn  TRANSFORM_MAKES_REQUESTS");
+  });
+
+  test("many warnings: the context stays under Claude Code's 10,000-character cap and says how many were left out", async () => {
+    const files: Record<string, string> = {};
+    const readers: string[] = [];
+    for (let i = 0; i < 60; i++) {
+      readers.push(`reader_${i}`);
+      files[`assets/reader_${i}.ts`] = `import { transform } from "@zabaca/croft";\nexport default transform({ inputs: ["open_issues"], key: "id", async *rows({ rows, http }) { for await (const r of rows("open_issues")) { await http.get("https://example.com/${"x".repeat(80)}"); yield { id: r.id }; } } });\n`;
+    }
+    const p = project(files);
+    const r = await hook(p, "assets/open_issues.sql");
+    expect(r.exit).toBe(0);
+    const context = JSON.parse(r.stdout).hookSpecificOutput.additionalContext as string;
+    expect(context.length).toBeLessThanOrEqual(10_000);
+    expect(context).toStartWith("croft validate --hook: 60 warnings after the edit to assets/open_issues.sql (also checked the assets that read it: ");
+    expect(context).toMatch(/\n\.\.\. and \d+ more warnings; croft validate lists them all\n/);
   });
 });
 

@@ -7,8 +7,8 @@ import type { Problem } from "../core/types.ts";
 import { docs } from "../cli/commands/docs.ts";
 import type { Ctx } from "../cli/command.ts";
 import {
-  HOOK_IO, HOOK_MATCHER, hookCommand, hookPlaces, hookProblems, hookReport, hookSelection, hookSettings, hookTarget, installHook,
-  mergeHookSettings, parseHookInput, readAll, SETTINGS_FILE,
+  HOOK_CONTEXT_MAX, HOOK_IO, HOOK_MATCHER, hookCommand, hookContext, hookOutput, hookPlaces, hookProblems, hookReport, hookSelection,
+  hookSettings, hookTarget, installHook, mergeHookSettings, parseHookInput, readAll, SETTINGS_FILE,
 } from "./hook.ts";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "croft-hook-")));
@@ -341,6 +341,29 @@ describe("what an edit affects, and what Claude reads", () => {
       .toStartWith("croft validate --hook: 1 error after the edit to lib/money.ts (checked the assets that import it: weekly)\n");
     expect(hookReport({ target: "assets/Bad.sql", asset: null, selected: [], problems: two.slice(0, 1), formatted: "x" }))
       .toStartWith("croft validate --hook: 1 error after the edit to assets/Bad.sql\n");
+  });
+
+  test("hookContext and hookOutput: warnings for Claude as PostToolUse additionalContext, under Claude Code's cap", () => {
+    const warn = (code: string) => p({ severity: "warning", code });
+    const one = hookContext({ target: "assets/paid.ts", asset: "paid", selected: ["paid"], problems: [warn("TRANSFORM_MAKES_REQUESTS")], formatted: ["<w1>"] });
+    expect(one.split("\n")).toEqual([
+      "croft validate --hook: 1 warning after the edit to assets/paid.ts",
+      "<w1>",
+      "A warning does not stop the edit or croft run; it says what the asset will cost or risk as written.",
+    ]);
+    expect(JSON.parse(hookOutput(one))).toEqual({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: one } });
+    expect(hookOutput(one)).not.toContain("\n");
+
+    const many = Array.from({ length: 50 }, (_, i) => warn(`W${i}`));
+    const formatted = many.map((_, i) => `warn  W${i}  ${"x".repeat(400)}`);
+    const text = hookContext({ target: "assets/orders.sql", asset: "orders", selected: ["orders", "daily"], problems: many, formatted });
+    expect(text.length).toBeLessThanOrEqual(HOOK_CONTEXT_MAX);
+    const lines = text.split("\n");
+    expect(lines[0]).toBe("croft validate --hook: 50 warnings after the edit to assets/orders.sql (also checked the assets that read it: daily)");
+    const shown = lines.filter((l) => l.startsWith("warn  ")).length;
+    expect(shown).toBeGreaterThan(10);
+    expect(lines.at(-2)).toBe(`... and ${50 - shown} more warnings; croft validate lists them all`);
+    expect(lines.at(-1)).toBe("Warnings do not stop the edit or croft run; each says what its asset will cost or risk as written.");
   });
 });
 

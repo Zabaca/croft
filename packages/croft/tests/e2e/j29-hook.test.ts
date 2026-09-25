@@ -9,7 +9,10 @@
 //      - an SQL edit that breaks the asset reading it: exit 2, and stderr says the reader was checked too;
 //      - a TS asset that does not compile, and a second file for one asset name: exit 2; a path through a symlink
 //        (macOS's /var) is the same file;
-//      - a clean edit, and an edit whose only finding is a warning: exit 0, nothing printed;
+//      - a clean edit: exit 0, nothing printed;
+//      - an edit whose only findings are warnings (a secret not set yet; a full-refresh transform that pays for
+//        every row on every rebuild): exit 0, stderr empty, one line of PostToolUse JSON on stdout whose
+//        hookSpecificOutput.additionalContext carries them to Claude without blocking it;
 //      - a file outside assets/ (README, a CSV, croft.json, a script, a file outside the project), even while an
 //        asset is broken: exit 0, nothing printed;
 //      - a lib/ edit that breaks the asset importing it: exit 2 naming that asset; fixed: exit 0, silent;
@@ -222,7 +225,17 @@ SELECT order_id, region, ${column} FROM example_sales WHERE amount > 100
     }
   }, 60_000);
 
-  test("an edit whose only finding is a warning (a secret not set yet): exit 0, silent", async () => {
+  /** The context a warnings-only edit hands Claude: exit 0, stderr empty, one line of PostToolUse JSON on stdout. */
+  const context = (r: CliResult): string => {
+    expect(r.code, show(r)).toBe(0);
+    expect(r.stderr, show(r)).toBe("");
+    expect(r.stdout.trimEnd().split("\n"), show(r)).toHaveLength(1);
+    const out = JSON.parse(r.stdout);
+    expect(out.hookSpecificOutput.hookEventName).toBe("PostToolUse");
+    return out.hookSpecificOutput.additionalContext as string;
+  };
+
+  test("an edit whose only finding is a warning (a secret not set yet): exit 0, the warning reaches Claude as context", async () => {
     p.write("assets/partners.ts", `import { ingest } from "@zabaca/croft";
 
 export default ingest({
@@ -233,9 +246,34 @@ export default ingest({
   },
 });
 `);
-    silent(await hook("assets/partners.ts", { tool: "Write" }));
+    const text = context(await hook("assets/partners.ts", { tool: "Write" }));
+    expect(text).toStartWith("croft validate --hook: 1 warning after the edit to assets/partners.ts\n");
+    expect(text).toContain("SECRET_MISSING");
+    expect(text).toContain("PARTNER_KEY");
     const v = golden("validate", await p.croft(["validate", "partners", "--json"]));
     expect(v.problems.map((x: { code: string }) => x.code)).toEqual(["SECRET_MISSING"]);
+    p.remove("assets/partners.ts");
+  }, 60_000);
+
+  test("a full-refresh transform that makes requests (pays for every row on every rebuild): TRANSFORM_MAKES_REQUESTS reaches Claude", async () => {
+    p.write(".env", "API_TOKEN=tok-abc-123456\n");
+    p.write("assets/paid_full.ts", `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["example_sales"], key: "order_id", secrets: ["API_TOKEN"],
+  async *rows({ rows, http, secret }) {
+    for await (const r of rows("example_sales")) {
+      const res = await http.post("https://api.example.com/v1/classify", { text: String(r.product) }, { headers: { Authorization: \`Bearer \${secret("API_TOKEN")}\` } });
+      yield { order_id: r.order_id, label: res.json<{ label: string }>().label };
+    }
+  },
+});
+`);
+    const text = context(await hook("assets/paid_full.ts", { tool: "Write" }));
+    expect(text).toStartWith("croft validate --hook: 1 warning after the edit to assets/paid_full.ts\n");
+    expect(text).toContain("TRANSFORM_MAKES_REQUESTS  assets/paid_full.ts:");
+    expect(text).toContain("every rebuild pays for every row again");
+    expect(text).not.toContain("tok-abc-123456");
+    p.remove("assets/paid_full.ts");
   }, 60_000);
 
   test("a lib/ edit: exit 2 naming the asset that imports it while it is broken; exit 0, silent, once fixed", async () => {

@@ -65,7 +65,11 @@ What croft validate --hook does:
 - Otherwise it validates that asset, plus the assets that read it when it is SQL (a renamed column breaks
   them), or, for a file in lib/, the TS assets that import it. It never opens the warehouse or the network.
 - With an error, it prints the problems on stderr and exits with exit code 2, which Claude Code shows to
-  Claude after the edit (the edit itself is already made). Warnings and a clean check print nothing.
+  Claude after the edit (the edit itself is already made).
+- With warnings only (a transform that pays for every row again on each rebuild, a secret not set yet), it
+  exits with exit code 0 and prints one line of JSON on stdout,
+  {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "..."}}: Claude Code hands the
+  warnings to Claude next to the edit's result, without blocking it. A clean check prints nothing.
 - Exit code 2 is only for problems in the edited assets. When croft itself cannot check the edit (bun is
   not on the PATH Claude Code gives its hooks, Bun is too old, the DuckDB binding does not load, stdin is
   not the hook's JSON), it exits with exit code 1: Claude Code shows you a non-blocking "hook error" notice

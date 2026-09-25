@@ -8,12 +8,21 @@
 //   .claude/settings.json it read;
 // - the input is JSON on stdin: hook_event_name, tool_name, cwd, tool_input (file_path, always absolute, for the
 //   file tools) and tool_response;
-// - PostToolUse and exit 2: "Shows stderr to Claude; the tool already ran". Exit 0: stdout and stderr go to the
-//   debug log only. Any other exit: a "hook error" notice for the user with the first line of stderr, and
-//   Claude carries on;
+// - PostToolUse and exit 2: "Shows stderr to Claude; the tool already ran". Exit 0: stderr goes to the debug log
+//   only, and stdout that starts with { and ends with } is read as JSON: hookSpecificOutput.additionalContext
+//   (hookEventName "PostToolUse") reaches Claude as a system reminder next to the tool result, capped at 10,000
+//   characters. Any other exit: a "hook error" notice for the user with the first line of stderr ("Failed with
+//   non-blocking status code: ..."), and Claude carries on;
 // - a command that cannot start (a missing file: sh exits 127) is such a non-blocking error;
 // - the same handler defined in several settings files runs once; a command hook times out after 600 s unless
 //   `timeout` (seconds) says otherwise.
+// [V: code.claude.com/docs/en/hooks.md, read 2026-09-24.] So croft validate --hook exits 2 only for errors in the
+// edited assets, hands warnings to Claude as additionalContext with exit 0, and exits 1 for its own failures
+// (NEEDS_BUN, BUN_TOO_OLD, the DuckDB binding, a usage error), which never block Claude.
+//
+// Not used: a handler's `if` field (a permission rule such as "Edit(/assets/**)") would spare the spawn for other
+// edits, but whether an Edit(...) rule matches Write calls there, and whether older Claude Code versions accept the
+// field, is [U]; croft filters the edited path itself.
 //
 // The command runs the project's pinned croft (node_modules/.bin/croft, the copy `bun install` put there) from
 // the project folder: no network, no global croft, and the version the project runs. For a project in data/
@@ -365,12 +374,10 @@ export function hookProblems(problems: readonly Problem[], selected: ReadonlySet
   return problems.filter((p) => p.severity !== "info" && (p.asset ? selected.has(p.asset) : p.file === target || p.code === "CYCLE"));
 }
 
-/**
- * The stderr Claude reads when an edit left errors (exit 2): one line saying what was checked, each problem as
- * croft prints it (file:line, message, fix: `formatted`), and what to do next. `asset` is the edited asset's
- * name (null for a lib/ file); `selected` is every asset checked.
- */
-export function hookReport(o: { target: string; asset: string | null; selected: readonly string[]; problems: readonly Problem[]; formatted: string }): string {
+interface HookFindings { target: string; asset: string | null; selected: readonly string[]; problems: readonly Problem[] }
+
+/** The first line Claude reads: what the edit left, and what was checked besides the edited file. */
+function hookHeader(o: HookFindings): string {
   const count = (sev: Problem["severity"], word: string) => {
     const k = o.problems.filter((p) => p.severity === sev).length;
     return k ? [`${k} ${word}${k === 1 ? "" : "s"}`] : [];
@@ -380,9 +387,57 @@ export function hookReport(o: { target: string; asset: string | null; selected: 
   const checked = !others.length ? ""
     : o.target.startsWith("lib/") ? ` (checked the assets that import it: ${others.join(", ")})`
       : ` (also checked the assets that read it: ${others.join(", ")})`;
+  return `croft validate --hook: ${found} after the edit to ${o.target}${checked}`;
+}
+
+/**
+ * The stderr Claude reads when an edit left errors (exit 2): one line saying what was checked, each problem as
+ * croft prints it (file:line, message, fix: `formatted`), and what to do next. `asset` is the edited asset's
+ * name (null for a lib/ file); `selected` is every asset checked.
+ */
+export function hookReport(o: HookFindings & { formatted: string }): string {
   return [
-    `croft validate --hook: ${found} after the edit to ${o.target}${checked}`,
+    hookHeader(o),
     o.formatted,
     `Fix ${o.problems.length === 1 ? "it" : "them"}, then carry on: croft checks each edit under assets/ and lib/ again.`,
   ].join("\n");
+}
+
+/** Claude Code's cap on a hook's additionalContext: longer text goes to a file Claude is not asked to read
+ *  [V: code.claude.com/docs/en/hooks, "JSON output", 2026-09-24]. */
+export const HOOK_CONTEXT_MAX = 10_000;
+
+/**
+ * What Claude reads when an edit left warnings only (exit 0, hookOutput): the header, each warning as croft prints
+ * it (`formatted`, one per problem), and a closing line that says what warnings mean. Written as facts, not
+ * orders, as the docs advise for additionalContext. Warnings that would pass HOOK_CONTEXT_MAX are counted
+ * instead of shown.
+ */
+export function hookContext(o: HookFindings & { formatted: readonly string[] }): string {
+  const n = o.problems.length;
+  const head = hookHeader(o);
+  const tail = n === 1
+    ? "A warning does not stop the edit or croft run; it says what the asset will cost or risk as written."
+    : "Warnings do not stop the edit or croft run; each says what its asset will cost or risk as written.";
+  const more = (k: number) => `... and ${k} more warning${k === 1 ? "" : "s"}; croft validate lists them all`;
+  const shown: string[] = [];
+  let length = head.length + tail.length + 2;
+  for (let i = 0; i < n; i++) {
+    const text = o.formatted[i] ?? "";
+    const reserve = i < n - 1 ? more(n).length + 1 : 0;       // room to say what was left out
+    if (length + text.length + 1 + reserve > HOOK_CONTEXT_MAX) {
+      shown.push(more(n - i));
+      break;
+    }
+    shown.push(text);
+    length += text.length + 1;
+  }
+  return [head, ...shown, tail].join("\n");
+}
+
+/** The one line of JSON on stdout that hands `context` to Claude without blocking it: PostToolUse
+ *  hookSpecificOutput.additionalContext, read on exit 0, which Claude sees next to the tool's result as a system
+ *  reminder [V: code.claude.com/docs/en/hooks, "PostToolUse decision control" and "Add context for Claude"]. */
+export function hookOutput(context: string): string {
+  return JSON.stringify({ hookSpecificOutput: { hookEventName: HOOK_EVENT, additionalContext: context } });
 }
