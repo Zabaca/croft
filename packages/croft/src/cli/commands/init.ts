@@ -1,8 +1,14 @@
-// croft init [dir] [--claude] [--no-install] (DESIGN.md §2, §4.1, §9). Its spec (usage, options) is in
-// commands/index.ts.
+// croft init [dir] [--claude] [--with-hook] [--no-install] (DESIGN.md §2, §4.1, §9). Its spec (usage, options) is
+// in commands/index.ts.
+//
+// --with-hook (§9 item 7, D27): after the Claude files, merge the PostToolUse hook that runs croft validate --hook
+// into .claude/settings.json of the project, and of the app around a project in data/ (agent/hook.ts
+// installHook). Without it init never writes .claude/settings.json. Each settings file is a FileChange of the
+// result; one croft cannot read is left as it is, with a USAGE_ERROR (the rest of init stands).
 import { createInterface } from "node:readline/promises";
 import { relative, resolve } from "node:path";
-import { problem } from "../../core/errors.ts";
+import { installHook, SETTINGS_FILE } from "../../agent/hook.ts";
+import { CroftError, problem } from "../../core/errors.ts";
 import type { Problem } from "../../core/types.ts";
 import { initProject, type InitResult } from "../../project/init.ts";
 import { findRoot } from "../../project/root.ts";
@@ -40,6 +46,7 @@ export const init: CommandImpl<InitData> = {
     // init says it already exists) rather than a new project nested in whatever subfolder the user is in.
     const target = dir !== undefined ? resolve(from, dir) : findRoot(from) ?? from;
     const interactive = ctx.isTTY.stdin && ctx.isTTY.stdout && !ctx.json;
+    const withHook = ctx.values["with-hook"] === true;
     const result = await initProject({
       target,
       ...(dir !== undefined ? { displayTarget: shellQuote(dir) } : {}),
@@ -55,13 +62,31 @@ export const init: CommandImpl<InitData> = {
       } : {}),
       // HOOK(example): the run engine loads example_sales in the new project (imported only when it runs).
       runExample: async (root: string) => (await import("../../run/runner.ts")).runExample(root, { env: ctx.processEnv }),
-    });
-    return { data: result, problems: initProblems(result, from), next: nextSteps(result, from) };
+    }).catch((e: unknown) => { throw withHook ? keepHookFlag(e) : e; });
+    const problems = initProblems(result, from);
+    if (withHook) {
+      const hook = installHook(result.root, result.base);
+      result.files.push(...hook.files);
+      problems.push(...hook.problems);
+    }
+    return { data: result, problems, next: nextSteps(result, from) };
   },
   human(result, ctx) {
     return describe(result.data, callerCwd(ctx));
   },
 };
+
+/** An existing project's refusal says to run croft init --claude; with --with-hook, the hook flag goes along. */
+function keepHookFlag(e: unknown): unknown {
+  if (!(e instanceof CroftError) || e.code !== "USAGE_ERROR") return e;
+  const { severity: _s, code: _c, docs: _d, ...init } = e.problem;
+  const fix = init.fix;
+  if (fix?.kind !== "command" || !fix.command.endsWith(" --claude")) return e;
+  const command = `${fix.command} --with-hook`;
+  return new CroftError("USAGE_ERROR", {
+    ...init, hint: init.hint.split(fix.command).join(command), fix: { ...fix, description: "refresh the Claude files and add the hook", command },
+  });
+}
 
 /** INSTALL_FAILED when bun install ran and failed: the project exists, but nothing can run in it yet. */
 export function initProblems(r: InitResult, from: string): Problem[] {
@@ -105,6 +130,14 @@ const ACTION_WORDS: Record<string, string> = {
   skipped: "kept as it was",
 };
 
+/** What init --with-hook set up, in one line (the settings files are listed with the other files). */
+export const HOOK_LINE = "Claude Code hook: after each edit under assets/ or lib/, croft validate --hook checks the asset and what reads it; croft docs claude-permissions explains it.";
+
+/** Whether init left the hook in place: a settings file it created, merged into, or found with the hook. */
+function hookInstalled(r: InitResult): boolean {
+  return r.files.some((f) => (f.path === SETTINGS_FILE || f.path.endsWith(`/${SETTINGS_FILE}`)) && f.action !== "skipped");
+}
+
 export function describe(r: InitResult, from: string): string {
   const lines: string[] = [];
   const where = (p: string) => {
@@ -116,7 +149,8 @@ export function describe(r: InitResult, from: string): string {
     lines.push(changed.length
       ? `Refreshed the Claude files for croft ${r.version}:`
       : `The Claude files already match croft ${r.version}:`);
-    for (const f of r.files) lines.push(`  ${f.path}  ${ACTION_WORDS[f.action]}`);
+    for (const f of r.files) lines.push(`  ${f.path}  ${ACTION_WORDS[f.action]}${f.note ? ` (${f.note})` : ""}`);
+    if (hookInstalled(r)) lines.push(HOOK_LINE);
     return lines.join("\n");
   }
 
@@ -158,5 +192,6 @@ export function describe(r: InitResult, from: string): string {
   }
   const claudeFiles = r.mode === "app" ? "CLAUDE.md (here and in data/) and the croft skill" : "CLAUDE.md and .claude/skills/croft/SKILL.md";
   lines.push(`Claude Code: ${claudeFiles} are ready. croft docs claude-permissions suggests permission rules.`);
+  if (hookInstalled(r)) lines.push(HOOK_LINE);
   return lines.join("\n");
 }
