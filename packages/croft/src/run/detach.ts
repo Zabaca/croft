@@ -306,6 +306,20 @@ export async function followRun(i: FollowInput): Promise<FollowResult> {
       let grace: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([i.spawned.exited, new Promise<void>((r) => (grace = setTimeout(r, i.exitGraceMs ?? 3000)))]);
       clearTimeout(grace);
+    } else if (final && final.status !== "running" && !i.spawned && final.pid !== null && final.pid !== process.pid) {
+      // croft wait, which did not start the run: the same grace, watching the recorded process instead.
+      const until = Date.now() + (i.exitGraceMs ?? 3000);
+      const pid = final.pid;
+      const alive = () => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch (e) {
+          return (e as NodeJS.ErrnoException).code === "EPERM";
+        }
+      };
+      // The PID alone: within a few seconds of the run's end it cannot have been reused.
+      while (Date.now() < until && alive()) await Bun.sleep(25);
     }
     // The child exited while its run still says running: it died (a finished run is recorded before exit).
     if (final && final.status === "running" && (child.exit || gone.rec)) {

@@ -199,6 +199,33 @@ describe("followRun", () => {
     expect(exitedAt - Number(followedAt)).toBeLessThan(1000);
   });
 
+  test("croft wait (a follower that did not start the run) also returns once the run's process has exited", async () => {
+    const s = stateDir();
+    const script = join(s, "linger-wait.ts");
+    const marker = join(s, "exited");
+    writeFileSync(script, `
+      import { writeFileSync } from "node:fs";
+      import { RunsDb } from ${JSON.stringify(join(import.meta.dir, "../history/runs-db.ts"))};
+      const db = RunsDb.open(${JSON.stringify(s)});
+      db.createRun({ id: "r_0101_0000_lnwt", trigger: "manual", human: false, argv: ["run"] });
+      db.finishRun("r_0101_0000_lnwt", "succeeded", { data: { runId: "r_0101_0000_lnwt", status: "succeeded", steps: [] }, problems: [], next: [], exit: 0, ok: true });
+      db.close();
+      await Bun.sleep(400);
+      process.on("exit", () => writeFileSync(${JSON.stringify(marker)}, "1"));
+    `);
+    const spawned = spawnDetachedRun({ root: s, stateDir: s, args: [], runId: "r_0101_0000_lnwt", env: { PATH: process.env.PATH }, entry: script });
+    const db = RunsDb.open(s);
+    try {
+      for (let n = 0; n < 200 && db.getRun("r_0101_0000_lnwt")?.status !== "succeeded"; n++) await Bun.sleep(10);
+    } finally {
+      db.close();
+    }
+    const res = await followRun({ stateDir: s, runId: "r_0101_0000_lnwt", timeoutMs: 10_000, pollMs: 20 });
+    expect(res).toMatchObject({ kind: "finished", summary: { exit: 0 } });
+    expect(existsSync(marker)).toBe(true);
+    await spawned.exited;
+  });
+
   test("an unknown run with no process log is not_started; with one it is still starting", async () => {
     const s = stateDir();
     const none = await followRun({ stateDir: s, runId: "r_0101_0000_abcd", timeoutMs: 50, pollMs: 10 });
