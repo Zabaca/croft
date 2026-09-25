@@ -3,8 +3,15 @@
 // payment dashboard. Done means daily_revenue is right for every day, rebuilt, with the raw data and the ingests
 // untouched. sum(DISTINCT total_cents) is a wrong fix: two paid orders on 2026-09-17 have the same total.
 import type { EvalTask, Fixture } from "../harness.ts";
-import { cents, check, composeSql, needColumns, sameRows, unchanged, verdict } from "../verify.ts";
-import { dailyRevenue, dollars, fannedOut, ITEMS, ORDERS, setupShop } from "./shop.ts";
+import { cents, check, composeSql, needColumns, sameRows, type SelfTest, scriptedSession, unchanged, verdict } from "../verify.ts";
+import { dailyRevenue, dollars, fannedOut, ITEMS, ORDERS, setupShop, SHOP_TOKEN } from "./shop.ts";
+
+export const CHECKS = {
+  daily: "daily_revenue is right for every day",
+  dailyCode: "daily_revenue's SQL computes the right numbers",
+  raw: "the raw orders and items are intact",
+  ingests: "the ingests are unchanged",
+} as const;
 
 const DAILY_REVENUE = `-- description: Paid orders, revenue (dollars) and items sold per day
 -- key: day
@@ -77,10 +84,10 @@ export const wrongNumber: EvalTask = {
 
   async verify(f) {
     return verdict([
-      await check("daily_revenue is right for every day", "warehouse", () => daily(f, "SELECT * FROM daily_revenue", "daily_revenue")),
-      await check("daily_revenue's SQL computes the right numbers", "code", () =>
+      await check(CHECKS.daily, "warehouse", () => daily(f, "SELECT * FROM daily_revenue", "daily_revenue")),
+      await check(CHECKS.dailyCode, "code", () =>
         daily(f, composeSql(f, ["daily_revenue"], "SELECT * FROM daily_revenue"), "daily_revenue (its SQL now)")),
-      await check("the raw orders and items are intact", "data", async () => {
+      await check(CHECKS.raw, "data", async () => {
         const { rows } = await f.query("SELECT (SELECT count(*) FROM shop_orders) AS orders, (SELECT count(*) FROM shop_order_items) AS items");
         const r = rows[0] ?? {};
         if (Number(r.orders) !== ORDERS.length || Number(r.items) !== ITEMS.length) {
@@ -88,7 +95,7 @@ export const wrongNumber: EvalTask = {
         }
         return `${ORDERS.length} orders, ${ITEMS.length} items`;
       }),
-      await check("the ingests are unchanged", "files", () => unchanged(f, INGESTS)),
+      await check(CHECKS.ingests, "files", () => unchanged(f, INGESTS)),
     ]);
   },
 
@@ -96,4 +103,19 @@ export const wrongNumber: EvalTask = {
     f.write("assets/daily_revenue.sql", FIXED);
     return f.croft(["run", "--json"]);
   },
+};
+
+export const selfTest: SelfTest = {
+  secret: { name: "SHOP_TOKEN", value: SHOP_TOKEN },
+  built: ["daily_revenue", "shop_order_items", "shop_orders"],
+  untouched: ["code", "warehouse"],
+  session: scriptedSession(["croft context --json", "croft describe daily_revenue --json", "croft validate --json", "croft run daily_revenue"], "Fixed daily_revenue: the join counted every order once per line item."),
+  diff: ["assets/daily_revenue.sql"],
+  wrong: [{
+    // sum(DISTINCT total_cents), not run: wrong on the day two paid orders have the same total.
+    what: "sum(DISTINCT total_cents)",
+    apply: async (f) => f.write("assets/daily_revenue.sql", DISTINCT_FIX),
+    fails: [CHECKS.daily, CHECKS.dailyCode],
+    detail: /2026-09-17/,
+  }],
 };

@@ -8,8 +8,9 @@
 // - a `croft` shim on PATH that runs this package's bin/croft.mjs, and `bun` next to it;
 // - a Bun.serve mock API on 127.0.0.1 (port 0) that the task's ingests read, with its secret in .env;
 // - .claude/settings.json: allow croft, bun and the file tools; ask before `croft confirm`; deny reading .env;
-// - the task's assets, one `croft run` so the warehouse holds what a user's would, and a git commit of the
-//   result, so the agent's changes are a `git diff` afterwards.
+// - the task's assets, one `croft run` so the warehouse holds what a user's would, the task's `after` step (the
+//   API changing, a run failing: whatever the user's story says happened since), and a git commit of the result,
+//   so the agent's changes are a `git diff` afterwards.
 //
 // The session is `claude -p <prompt> --output-format stream-json ...` (claudeArgs) in the fixture, with an
 // explicit environment (agentEnv): the real HOME, so Claude Code finds the user's login, and nothing else of
@@ -52,9 +53,10 @@ export const AWAY_NOTE = [
 
 export interface VerifyCheck {
   name: string;
-  /** warehouse: what the tables hold. code: what the project's SQL computes now (over the raw ingest tables),
-   *  built or not. data: ingested data left intact. files: files left as they were. */
-  kind: "warehouse" | "code" | "data" | "files";
+  /** warehouse: what the tables hold. code: what the project's code does now (its SQL over the raw ingest tables,
+   *  an ingest's preview or declared behavior), built or not. data: ingested data left intact, or brought in.
+   *  files: files left as they were. session: what the agent ran and told the user (its transcript's score). */
+  kind: "warehouse" | "code" | "data" | "files" | "session";
   ok: boolean;
   detail: string;
 }
@@ -74,12 +76,16 @@ export interface EvalTask {
   prompt: string;
   /** Add the task's assets, secrets and mock routes to a fresh project. The harness runs croft afterwards. */
   setup(f: Fixture): void | Promise<void>;
-  /** Decide from the project and its warehouse whether the task was done. */
-  verify(f: Fixture): Promise<Verdict>;
+  /** After that first run and before the baseline: the world moves on (the API changes, a run fails), so the
+   *  session starts where the user's story does. */
+  after?(f: Fixture): Promise<void>;
+  /** Decide from the project, its warehouse and the session (the transcript's score; null or left out when there
+   *  was none) whether the task was done. */
+  verify(f: Fixture, session?: Score | null): Promise<Verdict>;
   /** A scripted solution: what a good agent would do, ending with the croft run it would make (returned). The
    *  self-test checks the verifier against it; evals never call it. */
   solve(f: Fixture): Promise<CliResult>;
-  /** The SQL assets the task's transforms build (the self-test tells built from skipped by these). */
+  /** The SQL transforms whose tables the verifier checks (for listings; the fixture may not have them yet). */
   transforms: string[];
 }
 
@@ -113,7 +119,13 @@ export function show(r: CliResult): string {
 // ---------------------------------------------------------------------------------------------------------
 // The mock API
 
-export interface ApiRequest { method: string; path: string; at: number }
+export interface ApiRequest {
+  method: string;
+  path: string;
+  /** The query parameters (a repeated one's last value). */
+  query: Record<string, string>;
+  at: number;
+}
 export type Handler = (req: Request, url: URL) => Response | Promise<Response>;
 
 export interface MockApi {
@@ -131,7 +143,7 @@ export function mockApi(): MockApi {
     hostname: "127.0.0.1",
     fetch(req) {
       const url = new URL(req.url);
-      log.push({ method: req.method, path: url.pathname, at: Date.now() });
+      log.push({ method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams), at: Date.now() });
       const h = routes.get(url.pathname);
       return h ? h(req, url) : new Response("not found", { status: 404 });
     },
@@ -294,6 +306,9 @@ export class Fixture {
   setupRun: CliResult | null = null;
   /** The git baseline, when git is installed. */
   git = false;
+  /** CROFT_NOW for the croft commands the harness runs, never the session's: a task dates its fixture's history
+   *  with it ("last night's run"). setupFixture sets it back to null (the real clock) before the session. */
+  clock: string | null = null;
 
   constructor(
     readonly task: string,
@@ -308,7 +323,9 @@ export class Fixture {
 
   /** The environment of croft commands the harness runs. */
   get env(): Record<string, string> {
-    return croftEnv(this.binDir);
+    const env = croftEnv(this.binDir);
+    if (this.clock !== null) env.CROFT_NOW = this.clock;
+    return env;
   }
 
   async croft(args: string[], o: { timeoutMs?: number } = {}): Promise<CliResult> {
@@ -451,6 +468,8 @@ export async function setupFixture(task: EvalTask, o: { keep?: boolean; tmpRoot?
     f.setupRun = run;
     const failed = (run.json?.data?.steps ?? []).filter((s: { status: string }) => s.status === "failed");
     if (run.code !== 0 || failed.length > 0) throw new Error(`the fixture's first croft run failed\n${show(run)}`);
+    if (task.after) await task.after(f);
+    f.clock = null;
     for (const rel of f.projectFiles()) f.originals.set(rel, f.read(rel));
     if (Bun.which("git", { PATH: f.env.PATH })) {
       const steps = [["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", `fixture: ${task.name}`]];
@@ -559,14 +578,17 @@ export async function runTask(task: EvalTask, o: AgentOptions & { keep?: boolean
     const before = f.api.log.length;
     const run = await runAgent(f, taskPrompt(task), o);
     await f.settle();
-    const verdict = await task.verify(f);
+    // Counted before verifying: a verifier may run the project's ingests itself.
+    const apiRequests = f.api.log.length - before;
+    const score = scoreTranscript(run.events);
+    const verdict = await task.verify(f, score);
     return {
       ...empty,
       pass: verdict.pass,
       verdict,
-      score: scoreTranscript(run.events),
+      score,
       agent: { exitCode: run.exitCode, signal: run.signal, timedOut: run.timedOut, wallMs: run.wallMs, stderrTail: run.stderr.slice(-2000) },
-      apiRequests: f.api.log.length - before,
+      apiRequests,
       diff: await f.diff(),
       transcript: o.transcriptPath ?? null,
       fixture: o.keep ? f.root : null,

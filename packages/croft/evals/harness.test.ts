@@ -6,7 +6,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  AGENT_TIMEOUT_MS, agentEnv, AWAY_NOTE, claudeArgs, croftEnv, findClaude, Fixture, FIXTURE_SETTINGS, FIXTURE_TZ, fixtureSettings, MAX_TURNS, mockApi, runAgent, runTask, taskPrompt, writeShims,
+  AGENT_TIMEOUT_MS, agentEnv, AWAY_NOTE, claudeArgs, croftEnv, type EvalTask, findClaude, Fixture, FIXTURE_SETTINGS, FIXTURE_TZ, fixtureSettings, MAX_TURNS, mockApi, runAgent, runTask, taskPrompt, writeShims,
 } from "./harness.ts";
 import { parseOptions, resultLine, resultsBase, summarize } from "./run.ts";
 import { TASKS } from "./tasks/index.ts";
@@ -98,8 +98,8 @@ describe("the session's command line and environment", () => {
     expect(AWAY_NOTE).toMatch(/approval/);
   });
 
-  test("the tasks: unique names, the two phase-2 tasks, and transforms named", () => {
-    expect(TASKS.map((t) => t.name)).toEqual(["rename-column", "wrong-number"]);
+  test("the tasks: the six of DESIGN §10 item 9, unique names, and transforms named", () => {
+    expect(TASKS.map((t) => t.name)).toEqual(["rename-column", "wrong-number", "stripe-hourly", "failed-last-night", "backfill-90d", "api-type-change"]);
     for (const t of TASKS) expect(t.transforms.length).toBeGreaterThan(0);
   });
 });
@@ -176,6 +176,56 @@ describe("runTask with a fake claude", () => {
     });
   }, 180_000);
 
+  test("a task's after step runs on the harness clock before the baseline; verify gets the session's score", async () => {
+    const dir = tempDir();
+    const bin = fakeClaude(dir, join(dir, "log"));
+    const seen: { afterNow?: string; afterRequests?: number; verifyNow?: string | undefined; verifyCommands?: string[] | null; verifyClock?: string | null } = {};
+    const task: EvalTask = {
+      name: "clock", summary: "", project: "clock", prompt: "p", transforms: ["x"],
+      setup(f) {
+        f.api.route("/v1/ping", () => Response.json({ ok: true }));
+        f.clock = "2026-09-20T09:00:00-07:00";
+      },
+      async after(f) {
+        seen.afterNow = f.env.CROFT_NOW;
+        await fetch(`${f.api.url}/v1/ping?page=2&since=2026-09-01`);
+        seen.afterRequests = f.api.log.length;
+        f.write("assets/after.sql", "SELECT 1 AS x\n");
+      },
+      async verify(f, session) {
+        seen.verifyNow = f.env.CROFT_NOW;
+        seen.verifyClock = f.clock;
+        seen.verifyCommands = session?.commands ?? null;
+        return { pass: true, checks: [{ name: "n", kind: "session", ok: true, detail: "" }] };
+      },
+      async solve(f) {
+        return f.croft(["version", "--json"]);
+      },
+    };
+    const r = await runTask(task, { claudeBin: bin, tmpRoot: dir });
+    expect(r.error).toBeNull();
+    expect(r.pass).toBe(true);
+    expect(seen.afterNow).toBe("2026-09-20T09:00:00-07:00");
+    expect(seen.afterRequests).toBe(1);
+    expect(seen.verifyNow).toBeUndefined();
+    expect(seen.verifyClock).toBeNull();
+    expect(seen.verifyCommands).toEqual(["croft version --json"]);
+    expect(r.apiRequests).toBe(0);
+    // The after step's file is in the baseline: the fake agent's edit is the whole diff.
+    if (Bun.which("git")) expect(r.diff ?? "").not.toContain("after.sql");
+  }, 180_000);
+
+  test("the mock API logs each request's query", async () => {
+    const api = mockApi();
+    try {
+      api.route("/v1/x", () => new Response("ok"));
+      await fetch(`${api.url}/v1/x?limit=100&created%5Bgte%5D=1790000000&starting_after=ch_1`);
+      expect(api.log).toEqual([{ method: "GET", path: "/v1/x", query: { limit: "100", "created[gte]": "1790000000", starting_after: "ch_1" }, at: expect.any(Number) }]);
+    } finally {
+      api.stop();
+    }
+  });
+
   test("a missing claude is a harness error, found before any fixture is set up", async () => {
     const dir = tempDir();
     const task = TASKS.find((t) => t.name === "wrong-number")!;
@@ -190,7 +240,7 @@ describe("runTask with a fake claude", () => {
 describe("evals/run.ts options and results", () => {
   test("parseOptions: all tasks by default; names, tag and numbers checked", () => {
     const o = parseOptions([]);
-    expect(o).toMatchObject({ tasks: ["rename-column", "wrong-number"], tag: "local", maxTurns: 60, timeoutMs: 20 * 60_000, keep: false, list: false });
+    expect(o).toMatchObject({ tasks: TASKS.map((t) => t.name), tag: "local", maxTurns: 60, timeoutMs: 20 * 60_000, keep: false, list: false });
     expect(o.out.endsWith(join("evals", "results"))).toBe(true);
     expect(parseOptions(["wrong-number", "--tag", "p2-gate", "--model", "opus", "--max-turns", "30", "--timeout-min", "5", "--keep"]))
       .toMatchObject({ tasks: ["wrong-number"], tag: "p2-gate", model: "opus", maxTurns: 30, timeoutMs: 300_000, keep: true });
