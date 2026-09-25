@@ -10,16 +10,19 @@
 //              code point order (DuckDB compares VARCHAR as UTF-8 bytes). Anything whose order would depend on how
 //              the column ends up typed (dates next to zoned date-times, numbers next to text, ...) breaks it, so
 //              the load falls back to one transaction rather than trusting a guess.
-//   parts      stageInParts: the rows go through writeStage as before, but while the order holds, a part ends
-//              once it holds PARTIAL_COMMIT.rows rows or has been open PARTIAL_COMMIT.ms, at the end of the batch
-//              that reached it; the caller commits it (the cursor is then the typed maximum of what committed,
-//              computed by the write as always), and staging continues with the next part. The last part is
-//              left to the caller's ordinary write.
-//   rewind     when the order breaks after a commit, the rows still to come may hold cursor values below the one
-//              saved, and a crash before the end would resume past them. So the caller moves the saved cursor
-//              back to where the run started, at once, before the rows that broke the order are even staged;
-//              the load then finishes in one transaction, whose cursor is kept at least where the parts saved
-//              it (keepCursorAtLeast), so a finished load never re-reads what its parts already covered.
+//   parts      stageInParts: the rows go through writeStage as before, but while the order holds, a part that
+//              holds PARTIAL_COMMIT.rows rows or has been open PARTIAL_COMMIT.ms ends right before a value strictly
+//              above everything in it: never inside a run of equal cursor values. The rows of the batch that made
+//              it due that tie with its maximum are held back until a later batch shows the ties have ended; they
+//              then join the part, and the rest of that batch starts the next one (see Cutter). The caller commits
+//              the part (the cursor is then the typed maximum of what committed, computed by the write as always),
+//              which is strictly below every value not committed yet: a run resuming from it, even against an API
+//              whose `since` is exclusive, skips no row. The last part is left to the caller's ordinary write.
+//   broken     when the order breaks after a commit, no part commits any more: the rest is the last part, one
+//              transaction. The saved cursor stays where the commits put it, never lower (a rewind would make the
+//              next run fetch again, and an append ingest store again, what the parts saved). The tracker counts
+//              the rows that came at or below it (`late`): a failure before the end loses them for the next run,
+//              which starts from the saved cursor, so the caller's problem names them and the backfill.
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
@@ -27,13 +30,12 @@ import type { CursorType, Sql } from "../core/types.ts";
 import { type RealColumn, readTableSchema } from "./evolve.ts";
 import { cleanColumnName, type KnownName, MANIFEST_FILE, type StageManifestFile, type StageOptions, writeStage } from "./stage.ts";
 import { RE } from "./types.ts";
-import type { WriteResult } from "./write.ts";
 
 export const PARTIAL_COMMIT_ROWS = 50_000;
 export const PARTIAL_COMMIT_MS = 5 * 60_000;
 
 /** When a cursor ingest commits the parts staged so far: once they hold `rows` rows or `ms` milliseconds have
- *  passed since the last commit, at the end of the batch that reached it. Tests shrink it (as transform.ts CHUNK). */
+ *  passed since the last commit, before the first later value above them. Tests shrink it (as transform.ts CHUNK). */
 export const PARTIAL_COMMIT = { rows: PARTIAL_COMMIT_ROWS, ms: PARTIAL_COMMIT_MS };
 
 // ---------------------------------------------------------------------------------------------------------
@@ -49,6 +51,18 @@ export interface MonotoneTracker {
   /** The first value that broke the order, the maximum it came after (null: nothing comparable before it), and
    *  its position among every value added (0-based, NULLs included: with one value per row, its row). */
   readonly broken: { value: string; after: string | null; index: number } | null;
+  /** Where the last add() rose: the index of its first value strictly above every value added before it; -1 when
+   *  none did (only ties and NULLs, nothing comparable before, or the order is broken). A part may end right
+   *  before it. */
+  readonly rise: number;
+  /** The same for the last such value of the last add(): from there on, its values tie with its maximum. */
+  readonly lastRise: number;
+  /** A part holding every value added before the last add() committed: from now on add() counts the values at or
+   *  below their maximum (`late`). */
+  save(): void;
+  /** Values at or below the maximum saved, added after it was saved (the order broke): how many, and the lowest
+   *  (the first one no cursor could compare, when none could). null when there are none. */
+  readonly late: { rows: number; lowest: string } | null;
 }
 
 /** How values compare: exact integers, instants, wall clocks (naive date-times and dates), or text. */
@@ -186,6 +200,13 @@ function familiesOf(type: CursorType | null): readonly Family[] | null {
 class Tracker implements MonotoneTracker {
   #monotone = true;
   #max: Point | null = null;
+  /** The maximum before the last add(). */
+  #before: Point | null = null;
+  #rise = -1;
+  #lastRise = -1;
+  /** The maximum of what committed (save()). */
+  #saved: Point | null = null;
+  #late: { rows: number; lowest: Point | null; first: string } | null = null;
   #family: Family | null = null;
   #broken: MonotoneTracker["broken"] = null;
   /** Values added so far, NULLs included. */
@@ -210,21 +231,60 @@ class Tracker implements MonotoneTracker {
     return this.#broken;
   }
 
+  get rise(): number {
+    return this.#rise;
+  }
+
+  get lastRise(): number {
+    return this.#lastRise;
+  }
+
+  get late(): MonotoneTracker["late"] {
+    const l = this.#late;
+    return l ? { rows: l.rows, lowest: l.lowest?.text ?? l.first } : null;
+  }
+
+  save(): void {
+    this.#saved = this.#before;
+  }
+
   add(values: readonly unknown[]): boolean {
-    for (const v of values) {
+    this.#before = this.#max;
+    this.#rise = -1;
+    this.#lastRise = -1;
+    for (const [i, v] of values.entries()) {
       this.#count++;
       if (v === null || v === undefined) continue;
       const p = pointOf(v, this.#asText);
       if (p && this.#family === null && (this.#families === null || this.#families.includes(p.family))) this.#family = p.family;
       if (!p || p.family !== this.#family) {
         this.#break(shown(v));
+        this.#lateOne(null, shown(v));
         continue;
       }
-      if (this.#max && compare(p, this.#max) < 0) this.#break(p.text);
+      this.#lateOne(p, p.text);
+      const c = this.#max ? compare(p, this.#max) : 0;
+      if (c < 0) {
+        this.#break(p.text);
+        continue;
+      }
+      if (c > 0) {
+        if (this.#rise < 0) this.#rise = i;
+        this.#lastRise = i;
+      }
       // Ties move the maximum to the later value, as the cursor keeps the last row yielded among equals.
-      else this.#max = p;
+      this.#max = p;
     }
+    if (!this.#monotone) this.#rise = this.#lastRise = -1;
     return this.#monotone;
+  }
+
+  /** A value added after a save: late when it is at or below what was saved (or cannot be compared with it). */
+  #lateOne(p: Point | null, text: string): void {
+    if (!this.#saved || (p && compare(p, this.#saved) > 0)) return;
+    const l = (this.#late ??= { rows: 0, lowest: null, first: text });
+    l.rows++;
+    if (p && (!l.lowest || compare(p, l.lowest) < 0)) l.lowest = p;
   }
 
   #break(value: string): void {
@@ -284,8 +344,11 @@ export interface StageInPartsOptions {
   /** Commit the rows staged since the last commit (the n-th commit), with the cursor at their typed maximum;
    *  resolves to the columns now stored, which name the next part's columns. */
   commit(manifest: StageManifestFile, n: number): Promise<KnownName[]>;
-  /** The order broke after at least one commit: move the saved cursor back to where the run started. */
-  rewind(): Promise<void>;
+  /** The order broke: called once, as the batch that broke it is read, with the parts committed so far. */
+  broke?(b: NonNullable<StagedInParts["broken"]>, commits: number): void;
+  /** No part commits before the load has staged this many rows (a --rebuild: its first commit replaces the old
+   *  table, which must not shrink to fewer than half of its rows). Default 0. */
+  holdRows?: number;
   /** Default Date.now. */
   clock?: () => number;
 }
@@ -327,23 +390,41 @@ function iteratorOf(source: unknown): AnyIterator | null {
   return null;
 }
 
-/** Hands the source's batches to writeStage one part at a time, checking the cursor order as they pass. */
+/**
+ * Hands the source's batches to writeStage one part at a time, checking the cursor order as they pass.
+ *
+ * A part that reaches a threshold (`due`) may end only where a value rises strictly above everything in it. The batch
+ * that makes it due goes to staging up to its last rise; from there on its values tie with its maximum, and those rows
+ * are held back (`tail`), with the ties of later batches, until a batch rises above them: the tail then joins the part,
+ * which ends there, and the rest of that batch starts the next part (`carry`). A source that fails while a tail is held
+ * still gets the part committed, without the tail: everything in it is below the tail's value, so a run resuming from
+ * its cursor fetches the tail again. A batch that breaks the order ends all of that: nothing commits any more.
+ */
 class Cutter {
-  /** The current part reached a threshold while the order held: it ends, and commits. */
+  /** The current part ended: it commits. */
   cut = false;
   done = false;
   large = false;
   broken: StagedInParts["broken"] = null;
-  /** Rows of the whole load so far. */
+  /** Rows handed to staging over the whole load. */
   rows = 0;
   commits = 0;
+  /** The source's error that ended a due part: thrown once the part committed. */
+  failure: { error: unknown } | null = null;
   #partRows = 0;
   #startedAt = 0;
+  /** The current part reached a threshold: it ends at the next safe point. */
+  #due = false;
+  /** Rows held back from the due part: values tied with its maximum, which the next batch may continue. */
+  #tail: unknown[] | null = null;
+  /** Rows read from the source for the next part (the tracker has seen them), and where they last rise. */
+  #carry: { rows: unknown[]; lastRise: number } | null = null;
 
   constructor(private readonly src: AnyIterator, private readonly o: StageInPartsOptions, private readonly clock: () => number) {}
 
   start(): void {
     this.cut = false;
+    this.#due = false;
     this.#partRows = 0;
     this.#startedAt = this.clock();
   }
@@ -351,23 +432,7 @@ class Cutter {
   part(): AsyncIterableIterator<unknown> {
     const it: AsyncIterableIterator<unknown> = {
       [Symbol.asyncIterator]: () => it,
-      next: async () => {
-        if (this.cut || this.done) return DONE;
-        const r = await this.src.next();
-        if (r.done) {
-          this.done = true;
-          return DONE;
-        }
-        const batch: unknown[] = Array.isArray(r.value) ? r.value : [r.value];
-        await this.#check(batch);
-        this.rows += batch.length;
-        this.#partRows += batch.length;
-        // A part with no rows never commits: an empty page (or time alone) makes no part.
-        const due = this.#partRows > 0 && (this.#partRows >= PARTIAL_COMMIT.rows || this.clock() - this.#startedAt >= PARTIAL_COMMIT.ms);
-        if (due) this.large = true;
-        if (due && this.o.tracker.monotone) this.cut = true;
-        return { done: false, value: r.value };
-      },
+      next: () => this.#next(),
       // writeStage gives up on the source (an unserializable row, an abort): stop the generator too, without
       // waiting for one that may be stuck on the network.
       return: async () => {
@@ -378,16 +443,87 @@ class Cutter {
     return it;
   }
 
-  /** Feed the batch's cursor values to the tracker (one per row, so a break's index is its row); the first break
-   *  after a commit rewinds the saved cursor before the batch reaches staging. */
-  async #check(batch: unknown[]): Promise<void> {
+  async #next(): Promise<IteratorResult<unknown>> {
+    if (this.cut || this.done) return DONE;
+    const t = this.o.tracker;
+    if (this.#carry) {
+      const { rows, lastRise } = this.#carry;
+      this.#carry = null;
+      return this.#part(rows, lastRise, t.monotone);
+    }
+    for (;;) {
+      let r: IteratorResult<unknown>;
+      try {
+        r = await this.src.next();
+      } catch (e) {
+        // Ctrl-C (or a timeout) stops the load as it is: nothing more commits.
+        if (!this.#tail || this.#partRows === 0 || this.o.signal?.aborted) throw e;
+        this.#tail = null;
+        this.failure = { error: e };
+        this.cut = true;
+        return DONE;
+      }
+      if (r.done) {
+        this.done = true;
+        const tail = this.#tail;
+        this.#tail = null;
+        return tail ? this.#give(tail) : DONE;
+      }
+      const batch: unknown[] = Array.isArray(r.value) ? r.value : [r.value];
+      this.#check(batch);
+      if (this.#tail) {
+        const tail = this.#tail;
+        if (!t.monotone) {
+          // Nothing commits any more: the tail and this batch stay in the part, which is now the rest of the load.
+          this.#tail = null;
+          return this.#give([...tail, ...batch]);
+        }
+        if (t.rise < 0) {
+          tail.push(...batch);
+          continue;
+        }
+        // The ties end here: they join the part, which ends; the rest starts the next part.
+        this.#tail = null;
+        this.#carry = { rows: batch.slice(t.rise), lastRise: t.lastRise - t.rise };
+        this.cut = true;
+        return this.#give([...tail, ...batch.slice(0, t.rise)]);
+      }
+      return this.#part(batch, t.lastRise, t.monotone);
+    }
+  }
+
+  /** Rows for the current part, whose last rise is at `lastRise` (-1: none). Once the part is due, it goes up to that
+   *  rise and the ties after it are held back. A part with no rows never commits (an empty page, or time alone, makes
+   *  no part), and while a --rebuild holds its first commit back, neither does a part smaller than that. */
+  #part(batch: unknown[], lastRise: number, monotone: boolean): IteratorResult<unknown> {
+    const n = this.#partRows + batch.length;
+    if (!this.#due && n > 0 && (n >= PARTIAL_COMMIT.rows || this.clock() - this.#startedAt >= PARTIAL_COMMIT.ms)) {
+      this.#due = true;
+      this.large = true;
+    }
+    const s = lastRise;
+    if (this.#due && monotone && s >= 0 && this.#partRows + s > 0 && (this.commits > 0 || this.rows + s >= (this.o.holdRows ?? 0))) {
+      this.#tail = batch.slice(s);
+      return this.#give(batch.slice(0, s));
+    }
+    return this.#give(batch);
+  }
+
+  #give(batch: unknown[]): IteratorResult<unknown> {
+    this.rows += batch.length;
+    this.#partRows += batch.length;
+    return { done: false, value: batch };
+  }
+
+  /** Feed the batch's cursor values to the tracker (one per row, so a break's index is its row). */
+  #check(batch: unknown[]): void {
     const t = this.o.tracker;
     const was = t.monotone;
     t.add(cursorValues(batch, this.o.field));
     if (!was || t.monotone) return;
     const b = t.broken!;
     this.broken = { value: b.value, after: b.after, row: b.index + 1 };
-    if (this.commits > 0) await this.o.rewind();
+    this.o.broke?.(this.broken, this.commits);
   }
 }
 
@@ -451,11 +587,15 @@ export async function stageInParts(o: StageInPartsOptions): Promise<StagedInPart
     cutter.commits++;
     committedRows += manifest.rows;
     removeStaged(manifest, dir, n > 1);
+    // The source failed while the part waited for its ties to end: it committed without them, and the load ends.
+    if (cutter.failure) throw cutter.failure.error;
+    // Nothing was added since the cut: the part holds every value before the batch that rose above it.
+    o.tracker.save();
   }
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// The cursor after a rewind
+// The cursor column
 
 /** The asset's cursor column in its table: the incremental field by column name, or by the source name
  *  _croft.columns recorded for it. null when the table or the column is not there. */
@@ -467,24 +607,4 @@ export async function cursorColumn(sql: Sql, asset: string, field: string): Prom
      ORDER BY lower(name) = lower($2) DESC LIMIT 1`, [asset, field]);
   const name = (known?.name ?? field).toLowerCase();
   return schema.find((c) => c.name.toLowerCase() === name) ?? null;
-}
-
-/**
- * The last write of a load whose order broke after parts committed: the rewind moved the saved cursor back only
- * while the rest was in flight, so the cursor ends at least where the parts saved it (`floor`), compared on the
- * typed column. Runs inside that write's transaction, after writeBatch; returns the step's cursor.
- */
-export async function keepCursorAtLeast(tx: Sql, o: { asset: string; field: string; floor: string; loadedAt: string; cursor: WriteResult["cursor"] }):
-  Promise<WriteResult["cursor"]> {
-  const col = await cursorColumn(tx, o.asset, o.field);
-  if (!col) return o.cursor;
-  const after = o.cursor?.after;
-  if (after !== undefined) {
-    const [row] = await tx.all<{ higher: boolean | null }>(
-      `SELECT try_cast($1::VARCHAR AS ${col.type}) > try_cast($2::VARCHAR AS ${col.type}) AS higher`, [o.floor, after]);
-    if (row?.higher !== true) return o.cursor;
-  }
-  await tx.exec(`UPDATE _croft.assets SET cursor_value = $1 WHERE name = $2`, [o.floor, o.asset]);
-  await tx.exec(`UPDATE _croft.writes SET cursor_after = $1 WHERE asset = $2 AND loaded_at = $3::TIMESTAMPTZ`, [o.floor, o.asset, o.loadedAt]);
-  return { ...o.cursor, after: o.floor };
 }

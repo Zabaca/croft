@@ -225,6 +225,37 @@ export default transform({
     await expect(run({ selectors: ["zones"], rebuild: true, allowShrink: true })).rejects.toMatchObject({ code: "USAGE_ERROR" });
   });
 
+  // R41-07, R41-12: what an ingest's rebuild costs besides its own rows.
+  test("--rebuild of an ingest names the paid readers that would process every row again, and a file ingest's gone files", async () => {
+    const paid = (input: string) => `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["${input}"], key: "id", incremental: true,
+  async *rows({ newRows, http }) { for await (const r of newRows("${input}")) { await http.get("https://example.test/" + r.id); yield r; } },
+});
+`;
+    const seen = { issues: { seenLoadedAt: T1, seenKey: [7], inputLastLoadedAt: T1 } };
+    const built = [
+      ...CATALOG,
+      entry("triage", { kind: "ts", write: "merge", key: ["id"], rows: 800, inputsSeen: seen }),
+      entry("sales", { write: "merge", key: ["order_id"], rows: 40, filesGone: ["files/sales/jan.csv"] }),
+    ];
+    // `later` reads issues too, but has never read it: its first build processes every row anyway.
+    const { run } = setup({ ...FILES, "assets/triage.ts": paid("issues"), "assets/later.ts": paid("issues") }, built);
+    const out = await run({ selectors: ["issues", "sales"], rebuild: true, only: true });
+    const s = stepsOf(out.data);
+    expect(s.issues.confirmation.impact).toMatchObject({
+      action: "ingest; --rebuild refetches from scratch; then triage processes all 5,000 rows of issues again, and its code makes requests for them (about 5,000)",
+      rows: 5000, downstream: ["later", "triage"], estimatedRequests: 5000,
+    });
+    expect(s.sales.confirmation.impact).toMatchObject({
+      action: "file ingest; --rebuild loads every file again; the rows of 1 file no longer on disk (files/sales/jan.csv) do not come back, and stay only in the trash",
+      rows: 40,
+    });
+    const text = formatDryRun(out.data);
+    expect(text).toContain("needs confirmation: its 5,000 rows go to the trash first, then it is fetched from scratch; then triage processes all 5,000 rows of issues again");
+    expect(text).toContain("needs confirmation: its 40 rows go to the trash first, then every file is loaded again; the rows of 1 file no longer on disk (files/sales/jan.csv)");
+  });
+
   test("the cost guard: an incremental transform that makes requests shows its pending rows, estimated from runs.sqlite", async () => {
     const triage = (above = "") => `import { transform } from "@zabaca/croft";
 export default transform({

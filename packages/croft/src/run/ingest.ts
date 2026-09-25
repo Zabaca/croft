@@ -18,11 +18,13 @@
 // trashes the table first and then converts or retypes it.
 // A --rebuild (run/rebuild.ts) starts from no state at all, while the old table stays in the warehouse: the step's
 // first write drops it and its state in the transaction that writes the new rows (IngestInput.fresh), so a refetch
-// that fails before it commits keeps the old table (the trash holds a copy too).
+// that fails before it commits keeps the old table (the trash holds a copy too). That write also has the rebuild's
+// shrink guard (FreshStart.replaced): a refetch with fewer than half of the old rows rolls it back.
 // A cursor ingest saves its parts as they come while its cursor values arrive in order (monotone partial commits,
 // DESIGN.md §8 "Large first loads", load/partial.ts): each part goes through the same write, and a kill resumes
-// from the cursor the last part saved (PartialRun below). An empty answer where the lookback window held rows is
-// EMPTY_EXTRACT (§3a).
+// from the cursor the last part saved (PartialRun below), which is below every row not saved yet. The saved cursor
+// never goes back: when the order breaks after parts committed, the rest is one commit. An empty answer where the
+// lookback window held rows is EMPTY_EXTRACT (§3a).
 // CROFT_FAULT=after_stage|before_commit|after_commit_before_sqlite|between_trash_and_drop|after_partial_commit
 // (the first part; after_partial_commit_<n>: the n-th) kills the process at that point (crash tests, DESIGN.md §10
 // "Crash tests").
@@ -46,7 +48,7 @@ import { cursorTypeFor, parseFrom, renderSince } from "../load/cursor.ts";
 import { detectEmptyExtract } from "../load/empty-extract.ts";
 import { isReservedColumn, quoteIdent, readTableSchema, tempRef } from "../load/evolve.ts";
 import { buildFileBatch, extractFiles, type FileExtract, type KnownFile, recordFiles } from "../load/files.ts";
-import { keepCursorAtLeast, monotoneTracker, PartialCommitFailed, stageInParts, type StagedInParts,
+import { type MonotoneTracker, monotoneTracker, PartialCommitFailed, stageInParts, type StagedInParts,
   type StageInPartsOptions } from "../load/partial.ts";
 import { type KnownName, type StageManifestFile, writeStage } from "../load/stage.ts";
 import type { KnownColumn } from "../load/types.ts";
@@ -207,8 +209,15 @@ export interface IngestInput extends StepInput {
  */
 export interface FreshStart {
   readonly done: boolean;
+  /** No monotone part commits before the refetch holds this many rows: its first commit replaces the old table,
+   *  which the shrink guard keeps from falling below half of its rows (0: nothing held back). */
+  readonly holdRows: number;
   /** Drop the table and its _croft state, inside the write's transaction, before anything else in it. */
   reset(tx: Sql): Promise<void>;
+  /** In the same transaction, after the write: the rebuild's shrink guard (SHRINK_GUARD, which rolls the whole swap
+   *  back, when the new table holds fewer than half of the old one's rows), and the replacement stamp. Returns the
+   *  warning of a shrink that was allowed, or null. */
+  replaced(tx: Sql, o: { rows: number; unfinished: boolean; extract: ExtractInfo; now: Date }): Promise<Problem | null>;
   /** The write that carried the reset committed. */
   committed(): void;
 }
@@ -635,15 +644,17 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
         ...(i.readBy ? { readBy: i.readBy } : {}),
         ...(i.now ? { now: i.now() } : {}),
       });
+      // --rebuild: the old table went in this transaction; a refetch with fewer than half of its rows rolls it back.
+      if (swap) {
+        const shrank = await fresh!.replaced(tx, { rows: res.rows.total, unfinished: part?.unfinished === true, extract: progress.extractInfo(), now: i.now?.() ?? clockNow() });
+        if (shrank) res.warnings.push(shrank);
+      }
       // writeBatch saved greatest(saved, loaded). After a --from beyond the saved cursor that would jump over the
       // rows in between, so the cursor goes back to where it was, in the same transaction (§8).
       if (since.holdCursor !== undefined && res.cursor && res.cursor.after !== since.holdCursor) {
         await tx.exec(`UPDATE _croft.assets SET cursor_value = $1 WHERE name = $2`, [since.holdCursor, asset]);
         await tx.exec(`UPDATE _croft.writes SET cursor_after = $1 WHERE asset = $2 AND loaded_at = $3::TIMESTAMPTZ`, [since.holdCursor, asset, res.loadedAt]);
         res.cursor = { ...res.cursor, after: since.holdCursor };
-      }
-      if (part?.floor !== undefined && step.incremental.kind === "cursor") {
-        res.cursor = await keepCursorAtLeast(tx, { asset, field: step.incremental.field, floor: part.floor, loadedAt: res.loadedAt, cursor: res.cursor });
       }
       if (files) await recordFiles(tx, asset, files, res.loadedAt);
       // Read-only, but inside the transaction: a failed statement would abort it, so these stay simple.
@@ -662,7 +673,7 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
     }
     return out;
   });
-  const parts = partialCommits(i, state, write, (c) => (previous = c));
+  const parts = partialCommits(i, state, write, (c) => (previous = c), fresh?.holdRows ?? 0);
 
   try {
     ({ manifest, files } = await captureOutput(output, async (): Promise<{ manifest: typeof manifest; files: typeof files }> => {
@@ -736,10 +747,11 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
   // the rows a shrink removes stay recoverable. It wins over --allow-shrink, which would only ask again.
   const standing = spec.allowShrink === true;
   try {
-    out = await write(false, parts?.last());
+    out = await write(false);
   } catch (e) {
     const err = croftError(e);
-    if (!err || err.code !== "SHRINK_GUARD" || (!standing && !i.confirm)) throw err && parts ? parts.saved(err) : e;
+    // A --rebuild's own shrink guard is settled by its confirmation (--allow-shrink) or allowShrink: true, never here.
+    if (!err || err.code !== "SHRINK_GUARD" || fresh || (!standing && !i.confirm)) throw err && parts ? parts.saved(err) : e;
     const rowsBefore = Number(err.problem.details?.rowsBefore ?? 0);
     const rowsAfter = Number(err.problem.details?.rowsAfter ?? 0);
     let why: string;
@@ -842,8 +854,6 @@ interface CommitPart {
   manifest?: StageManifestFile;
   /** Not the load's last commit: checks on the finished table's row count wait (checks/run.ts ChunkCheckContext). */
   unfinished?: boolean;
-  /** The cursor the parts saved before the order broke: the last write keeps the cursor at least there. */
-  floor?: string;
 }
 
 type WriteStep = (allowShrink: boolean, part?: CommitPart) => Promise<{ res: WriteResult; catalog: CatalogAsset }>;
@@ -876,33 +886,33 @@ function cursorTypeKnown(step: PlannedStep, state: IngestState, field: string): 
 
 /** The step's partial commits: a rows ingest with a cursor, outside a preview (which never saves anything real);
  *  null for every other step, which keeps one transaction. */
-function partialCommits(i: IngestInput, state: IngestState, write: WriteStep, onCatalog: (c: CatalogAsset) => void): PartialRun | null {
+function partialCommits(i: IngestInput, state: IngestState, write: WriteStep, onCatalog: (c: CatalogAsset) => void, holdRows: number): PartialRun | null {
   const inc = i.step.incremental;
   if (i.step.kind !== "rows" || inc.kind !== "cursor" || i.preview) return null;
-  return new PartialRun(i, { field: inc.field, type: cursorTypeKnown(i.step, state, inc.field), unit: inc.unit ?? null, before: state.cursorValue, write, onCatalog });
+  return new PartialRun(i, { field: inc.field, type: cursorTypeKnown(i.step, state, inc.field), unit: inc.unit ?? null, write, onCatalog, holdRows });
 }
 
 /**
  * A cursor ingest's commits on its way (load/partial.ts stageInParts): each part goes through the step's own write
  * with the checks of an unfinished load, its catalog entry is mirrored at once, and the step's result, reason and
- * failures account for every commit.
+ * failures account for every commit. The cursor a part saved is never moved back (R41-04): after the order breaks,
+ * a failure names the rows at or below it that came late and were not saved, with their backfill.
  */
 class PartialRun {
   /** What each part's commit wrote, in order. */
   readonly results: WriteResult[] = [];
   #staged: StagedInParts | null = null;
-  /** The order broke after parts committed: the saved cursor is going back to `before`, and went back. */
-  #rewinding = false;
-  #rewound = false;
-  #floor: string | undefined;
+  readonly #tracker: MonotoneTracker;
 
   constructor(private readonly i: IngestInput, private readonly o: {
     field: string; type: CursorType | null; unit: "s" | "ms" | null;
-    /** The saved cursor when the step began. */
-    before: string | null;
     write: WriteStep;
     onCatalog: (c: CatalogAsset) => void;
-  }) {}
+    /** No part commits before the load holds this many rows (a --rebuild's first commit replaces the old table). */
+    holdRows: number;
+  }) {
+    this.#tracker = monotoneTracker(o.type, o.unit);
+  }
 
   /** Parts committed so far. */
   get committed(): number {
@@ -914,10 +924,10 @@ class PartialRun {
   }
 
   /** Stage the rows, committing parts on the way; resolves to the part left for the step's last write. */
-  async stage(stage: Omit<StageInPartsOptions, "field" | "tracker" | "commit" | "rewind">): Promise<StageManifestFile> {
+  async stage(stage: Omit<StageInPartsOptions, "field" | "tracker" | "commit" | "broke" | "holdRows">): Promise<StageManifestFile> {
     this.#staged = await stageInParts({
-      ...stage, field: this.o.field, tracker: monotoneTracker(this.o.type, this.o.unit),
-      commit: (m, n) => this.#commit(m, n), rewind: () => this.#rewind(),
+      ...stage, field: this.o.field, tracker: this.#tracker, holdRows: this.o.holdRows,
+      commit: (m, n) => this.#commit(m, n), broke: (b, commits) => this.#broke(b, commits),
     });
     const s = this.#staged;
     if (s.broken && (s.commits > 0 || s.large)) {
@@ -945,43 +955,12 @@ class PartialRun {
     }
   }
 
-  /** The order broke after parts committed: the rows still to come may have cursor values below the one they
-   *  saved, which a run resuming from it would never fetch. So the saved cursor goes back to where the step began,
-   *  at once, in its own commit; the last write puts it back up (CommitPart.floor). */
-  async #rewind(): Promise<void> {
-    const { warehouse, runs, runId, signal, progress, log } = this.i;
-    const asset = this.i.step.asset;
-    const before = this.o.before;
-    this.#rewinding = true;
-    this.#floor = this.results.at(-1)?.cursor?.after;
-    progress.setPhase("write");
-    try {
-      await warehouse.write(`ingest ${asset}`, async (raw) => {
-        runs.setLockHolder({ runId, asset, action: "write" });
-        try {
-          await abortable(raw, signal, asset).exec(`UPDATE _croft.assets SET cursor_value = $1 WHERE name = $2`, [before, asset]);
-        } finally {
-          runs.clearLockHolder();
-        }
-      }, { runId, asset, signal });
-    } finally {
-      progress.setPhase("extract");
-    }
-    this.#rewound = true;
-    const c = getCatalog(runs, asset);
-    if (c?.cursor) {
-      const back = { ...c, cursor: { ...c.cursor, value: before } };
-      putCatalog(runs, back, "run");
-      this.o.onCatalog(back);
-    }
-    log.write(`${this.o.field} stopped arriving in order after ${this.committed} commit(s): the saved position goes back to ${before ?? "none"} until the load finishes`);
-  }
-
-  /** The step's last write after parts committed: the rest of the rows, with the cursor kept at least where the
-   *  parts saved it when the order broke after them. undefined when nothing committed on the way. */
-  last(): CommitPart | undefined {
-    if (!this.committed) return undefined;
-    return this.#floor !== undefined ? { floor: this.#floor } : {};
+  /** The order broke. After commits, nothing commits any more and the saved cursor stays where they put it, never
+   *  lower: a rewind would make the next run fetch again (and an append ingest store twice) what they saved. */
+  #broke(b: NonNullable<StagedInParts["broken"]>, commits: number): void {
+    if (!commits) return;
+    const cursor = this.results.at(-1)?.cursor?.after ?? null;
+    this.i.log.write(`${this.o.field} stopped arriving in order after ${commits} commit(s), at row ${b.row} (${outOfOrder(b)}): the rest is saved in one commit, and the saved position stays at ${cursor ?? "none"}; rows at or below it that come now are saved only if the load finishes`);
   }
 
   /** The step's reason, when parts committed or a large load could not commit in parts. */
@@ -1026,24 +1005,40 @@ class PartialRun {
     };
   }
 
-  /** A failure after parts committed: they stay, and the problem says so and where the next run starts. */
+  /**
+   * A failure after parts committed: they stay, and the problem says so and where the next run starts: the cursor
+   * they saved. Rows that came after the order broke at or below it (`late`) were in the rest, which this failure
+   * undid, and a run from the saved cursor never fetches them again: the problem names them and the backfill, and is
+   * not retried (a retry would continue from the saved cursor too, and lose them without a word).
+   */
   saved(err: CroftError): CroftError {
     const k = this.committed;
     if (!k) return err;
     const rows = this.committedRows;
     const f = this.o.field;
-    const before = this.o.before;
+    const asset = this.i.step.asset;
     const cursor = this.results.at(-1)!.cursor?.after ?? null;
-    const lead = `${rows} row${rows === 1 ? "" : "s"} from ${k} earlier commit${k === 1 ? "" : "s"} ${rows === 1 ? "was" : "were"} saved`;
-    if (this.#rewound) {
-      err.problem.effect = `${lead}; ${f} stopped arriving in order after them, so the saved position went back to ${before === null
-        ? "none, and the next run fetches from the start again" : `${before}, and the next run fetches from there again`}`;
-    } else if (this.#rewinding) {
-      err.problem.effect = `${lead}; ${f} stopped arriving in order after them and the saved position could not be moved back, so the next run starts from ${cursor}: rows with an earlier ${f} that this run had not saved are fetched only by a backfill (croft run ${this.i.step.asset} --from <when>)`;
-    } else {
-      err.problem.effect = `${lead}, with ${f} up to ${cursor}; the next run continues from there`;
+    const lead = `${rows} row${rows === 1 ? "" : "s"} from ${k} earlier commit${k === 1 ? "" : "s"} ${rows === 1 ? "was" : "were"} saved, with ${f} up to ${cursor}`;
+    const late = this.#tracker.late;
+    const b = this.#tracker.broken;
+    if (!late || !b) {
+      err.problem.effect = `${lead}; the next run continues from there`;
+      err.problem.details = { ...err.problem.details, savedRows: rows, savedCommits: k, cursor };
+      return err;
     }
-    err.problem.details = { ...err.problem.details, savedRows: rows, savedCommits: k, cursor: this.#rewound ? before : cursor };
+    const merge = this.i.step.write === "merge";
+    const backfill = `croft run ${asset} --from ${late.lowest}`;
+    const them = late.rows === 1 ? "it" : "them";
+    const remedy = merge
+      ? `${backfill} fetches ${them} again (an upsert)`
+      : `An append ingest cannot fetch ${them} again without storing the rows after ${them} twice; with a key it becomes a merge, and then ${backfill} fetches ${them}`;
+    err.problem.effect = `${lead}; then ${f} stopped arriving in order (${outOfOrder({ ...b, row: b.index + 1 })}), and ${late.rows} row${late.rows === 1 ? "" : "s"} `
+      + `with ${f} at or below ${cursor} (the lowest ${late.lowest}) came after them and ${late.rows === 1 ? "was" : "were"} not saved: the next run continues from ${cursor}, `
+      + `so it does not fetch ${them} again. ${remedy}`;
+    err.problem.retryable = false;
+    err.problem.details = {
+      ...err.problem.details, savedRows: rows, savedCommits: k, cursor, lateRows: late.rows, lateLowest: late.lowest, ...(merge ? { backfill } : {}),
+    };
     return err;
   }
 }

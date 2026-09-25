@@ -19,8 +19,8 @@ interface Ev { id: number; ts: string; [k: string]: unknown }
 
 const state = {
   rows: [] as Ev[],
-  /** /pages serves these in order; "fail" answers 401. */
-  pages: [] as (Ev[] | "fail")[],
+  /** /pages serves these in order; "fail" answers 401, "fail5" 503 (retried by ctx.http, then retryable). */
+  pages: [] as (Ev[] | "fail" | "fail5")[],
   /** /asc answers 401 from this request on (0: never). */
   failAt: 0,
   requests: 0,
@@ -60,8 +60,16 @@ const server: Server<undefined> = Bun.serve({
         if (state.empty) return json([]);
         return json([...state.rows].sort(byTs).reverse().map((r) => ({ id: r.id, created: Date.parse(r.ts) / 1000 })));
       }
+      case "/list": {
+        // state.rows in the order given (not sorted), `since` exclusive (ts > since), numbered pages.
+        state.requests++;
+        if (state.failAt && state.requests >= state.failAt) return new Response("token expired", { status: 401 });
+        const rows = state.rows.filter((r) => q.since === undefined || Date.parse(r.ts) > Date.parse(q.since));
+        return json(rows.slice((page - 1) * per, page * per));
+      }
       case "/pages": {
         const p = state.pages[page - 1] ?? [];
+        if (p === "fail5") return new Response("unavailable", { status: 503 });
         return p === "fail" ? new Response("token expired", { status: 401 }) : json(p);
       }
       default:
@@ -195,7 +203,7 @@ describe("monotone partial commits", () => {
     const root = makeProject({ "assets/events.ts": pagedIngest("/asc") });
     const out = await runIn(root, ["events"]);
     expect(out.exit).toBe(0);
-    expect((await writesOf(root)).map((w) => w.rows_in)).toEqual([2, 2, 1, 0]);
+    expect((await writesOf(root)).map((w) => w.rows_in)).toEqual([2, 2, 1]);
     expect(step(out).rows.total).toBe(5);
   }, 30_000);
 
@@ -227,19 +235,21 @@ describe("monotone partial commits", () => {
     const root = makeProject({ "assets/events.ts": pagedIngest("/asc") });
     const first = await runIn(root, ["events"], { retryDelaysMs: [] });
     expect(first.exit).toBe(1);
+    // The first part committed once the second page showed the order rising past it; the second part was waiting for
+    // the third page to show its 4 had no ties left when the request failed, so it committed without the 4.
     const p = first.problems.find((x) => x.code === "HTTP_ERROR")!;
-    expect(p.effect).toBe(`4 rows from 2 earlier commits were saved, with ts up to ${at(4)}; the next run continues from there`);
-    expect(p.details).toMatchObject({ savedRows: 4, savedCommits: 2, cursor: at(4) });
-    expect(await countOf(root)).toBe(4);
-    expect(await cursorOf(root)).toBe(at(4));
-    withRuns(root, (db) => expect(getCatalog(db, "events")).toMatchObject({ rows: 4, cursor: { value: at(4) } }));
+    expect(p.effect).toBe(`3 rows from 2 earlier commits were saved, with ts up to ${at(3)}; the next run continues from there`);
+    expect(p.details).toMatchObject({ savedRows: 3, savedCommits: 2, cursor: at(3) });
+    expect(await countOf(root)).toBe(3);
+    expect(await cursorOf(root)).toBe(at(3));
+    withRuns(root, (db) => expect(getCatalog(db, "events")).toMatchObject({ rows: 3, cursor: { value: at(3) } }));
 
     state.failAt = 0;
     state.log = [];
     const next = await runIn(root, ["events"]);
     expect(next.exit).toBe(0);
     // From the saved cursor, minus the 1 s a keyed timestamp cursor re-reads.
-    expect(sinceOf("/asc")[0]).toBe(at(3));
+    expect(sinceOf("/asc")[0]).toBe(at(2));
     expect(await countOf(root)).toBe(7);
     expect(await cursorOf(root)).toBe(at(7));
   }, 30_000);
@@ -282,33 +292,66 @@ describe("monotone partial commits", () => {
     expect(await countOf(root)).toBe(4);
   }, 30_000);
 
-  test("the order breaks after commits: the saved cursor goes back at once, so a failure before the end loses nothing", async () => {
+  test("the order breaks after commits: the saved cursor stays where they put it; rows below it that came after are named", async () => {
     PARTIAL_COMMIT.rows = 2;
     const [e1, e2, e3, e4] = events(4);
     const e0 = { id: 10, ts: "2026-08-31T23:59:59Z", n: 0 };
-    state.pages = [[e1!, e2!], [e3!, e4!], [e0], "fail"];
+    state.pages = [[e1!, e2!], [e3!, e4!], [e0], "fail5"];
     const root = makeProject({ "assets/events.ts": pagesIngest() });
-    const first = await runIn(root, ["events"], { retryDelaysMs: [] });
+    const first = await runIn(root, ["events"], { retryDelaysMs: [0, 0] });
     expect(first.exit).toBe(1);
-    // Two parts committed, then a value older than the cursor they saved: it went back to where the run began
-    // (nothing, a first load), so the next run fetches everything again instead of skipping the rows before it.
-    expect(await countOf(root)).toBe(4);
-    expect(await cursorOf(root)).toBeNull();
-    withRuns(root, (db) => expect(getCatalog(db, "events")!.cursor!.value).toBeNull());
+    // One part committed (1, 2); the 3 and 4 were in the part that e0 turned into the rest of the load, one
+    // transaction, which the failure undid. The saved cursor stays at 2: never back to where the run began, which
+    // would make the next run fetch the saved rows again.
+    expect(await countOf(root)).toBe(2);
+    expect(await cursorOf(root)).toBe(at(2));
+    withRuns(root, (db) => expect(getCatalog(db, "events")!.cursor!.value).toBe(at(2)));
     const p = first.problems.find((x) => x.code === "HTTP_ERROR")!;
-    expect(p.effect).toContain("4 rows from 2 earlier commits were saved");
-    expect(p.effect).toContain("ts stopped arriving in order");
-    expect(p.effect).toContain("the next run fetches from the start again");
+    expect(p.effect).toBe(`2 rows from 1 earlier commit were saved, with ts up to ${at(2)}; then ts stopped arriving in order (${e0.ts} after ${at(4)}), `
+      + `and 1 row with ts at or below ${at(2)} (the lowest ${e0.ts}) came after them and was not saved: the next run continues from ${at(2)}, so it does not `
+      + `fetch it again. croft run events --from ${e0.ts} fetches it again (an upsert)`);
+    expect(p.details).toMatchObject({ savedRows: 2, cursor: at(2), lateRows: 1, lateLowest: e0.ts, backfill: `croft run events --from ${e0.ts}` });
+    // Not retried: a retry would continue from the saved cursor too, and lose e0 without a word.
+    expect(p.retryable).toBe(false);
+    expect(step(first).attempt).toBe(1);
 
-    // A run that finishes keeps the highest cursor any part saved, not the maximum of its last part.
+    // A run that finishes keeps the highest cursor, and the rows that came late are in.
     state.pages = [[e1!, e2!], [e3!, e4!], [e0]];
     const next = await runIn(root, ["events"]);
     expect(next.exit).toBe(0);
     expect(await cursorOf(root)).toBe(at(4));
     expect(await countOf(root)).toBe(5);
     const s = step(next);
-    expect(s.reason).toContain(`saved in 3 commits: ts stopped arriving in order at row 5 (${e0.ts} after ${at(4)})`);
+    expect(s.reason).toContain(`saved in 2 commits: ts stopped arriving in order at row 5 (${e0.ts} after ${at(4)})`);
     expect(s.cursor).toMatchObject({ after: at(4) });
+  }, 30_000);
+
+  test("an append ingest whose order breaks after commits never stores a row twice when the next run resumes (R41-04)", async () => {
+    PARTIAL_COMMIT.rows = 2;
+    // Ascending, then one event from before the rest, then ascending again; the API's `since` is exclusive.
+    const ev = events(8);
+    const late = { id: 100, ts: "2026-09-01T00:00:00Z", n: 0 };
+    state.rows = [...ev.slice(0, 6), late, ...ev.slice(6)];
+    state.failAt = 5;
+    const root = makeProject({ "assets/events.ts": pagedIngest("/list", { key: null }) });
+    const first = await runIn(root, ["events"], { retryDelaysMs: [] });
+    expect(first.exit).toBe(1);
+    expect(await countOf(root)).toBe(4);
+    expect(await cursorOf(root)).toBe(at(4));
+    const p = first.problems.find((x) => x.code === "HTTP_ERROR")!;
+    expect(p.effect).toContain(`and 1 row with ts at or below ${at(4)} (the lowest ${late.ts}) came after them and was not saved`);
+    expect(p.effect).toContain(". An append ingest cannot fetch it again without storing the rows after it twice");
+    expect(p.details).toMatchObject({ savedRows: 4, cursor: at(4), lateRows: 1 });
+    expect(p.details!.backfill).toBeUndefined();
+
+    state.failAt = 0;
+    state.requests = 0;
+    state.log = [];
+    const next = await runIn(root, ["events"]);
+    expect(next.exit).toBe(0);
+    expect(sinceOf("/list")[0]).toBe(at(4));
+    // Every row once: the saved parts are not fetched (or appended) again.
+    expect(await sql<{ n: number; d: number }>(root, "SELECT count(*)::INTEGER AS n, count(DISTINCT id)::INTEGER AS d FROM events")).toEqual([{ n: 8, d: 8 }]);
   }, 30_000);
 
   test("after a break, a last part that reaches higher sets the cursor itself", async () => {
@@ -320,7 +363,7 @@ describe("monotone partial commits", () => {
     const out = await runIn(root, ["events"]);
     expect(out.exit).toBe(0);
     expect(await cursorOf(root)).toBe(at(9));
-    expect((await writesOf(root)).map((w) => w.cursor_after)).toEqual([at(2), at(4), at(9)]);
+    expect((await writesOf(root)).map((w) => w.cursor_after)).toEqual([at(2), at(9)]);
   }, 30_000);
 
   test("--from after the saved cursor holds it there through every part (§8)", async () => {
@@ -332,9 +375,73 @@ describe("monotone partial commits", () => {
     const out = await runIn(root, ["events"], { from: at(6) });
     expect(out.exit).toBe(0);
     expect(step(out).rows).toMatchObject({ in: 4, added: 4, total: 7 });
-    expect((await writesOf(root)).slice(1).map((w) => w.cursor_after)).toEqual([at(3), at(3), at(3)]);
+    expect((await writesOf(root)).slice(1).map((w) => w.cursor_after)).toEqual([at(3), at(3)]);
     expect(await cursorOf(root)).toBe(at(3));
   }, 30_000);
+});
+
+/** Run `croft run events` in a child process with PARTIAL_COMMIT.rows = `rows` and CROFT_FAULT = `fault`: it is
+ *  killed there (SIGKILL). */
+async function killedRun(root: string, rows: number, fault: string): Promise<{ code: number | null; signal: string | null; output: string }> {
+  const script = join(root, "child.ts");
+  const src = (p: string) => JSON.stringify(join(PKG, "src", p));
+  writeFileSync(script, `
+import { PARTIAL_COMMIT } from ${src("load/partial.ts")};
+import { main } from ${src("cli/main.ts")};
+PARTIAL_COMMIT.rows = ${rows};
+await main(["run", "events", "--foreground", "--json"], {
+  cwd: ${JSON.stringify(root)}, env: { CROFT_FAULT: ${JSON.stringify(fault)}, HOME: ${JSON.stringify(root)} },
+  stdinTTY: false, stdoutTTY: false, stderrTTY: false,
+});
+console.log("finished without the fault");
+`);
+  const child = spawn(process.execPath, ["--no-env-file", script], {
+    cwd: root, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root, CROFT_FORBID_OS_JOBS: "1", CROFT_NOTIFY_DRY: "1" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let output = "";
+  child.stdout!.on("data", (d) => (output += d));
+  child.stderr!.on("data", (d) => (output += d));
+  const [code, signal] = await new Promise<[number | null, string | null]>((r) => child.on("exit", (c, s) => r([c, s])));
+  return { code, signal, output };
+}
+
+describe("equal cursor values across a part boundary (R41-02)", () => {
+  test("a part never ends inside the ties: after a kill, an exclusive `since` resumes with no row skipped or stored twice", async () => {
+    // An append-only log whose API answers ts > since. Four events share the second 2; the part is due inside them.
+    const ts = [1, 2, 2, 2, 2, 3, 4, 5];
+    state.rows = ts.map((t, k) => ({ id: k + 1, ts: at(t), n: k + 1 }));
+    const root = makeProject({ "assets/events.ts": pagedIngest("/list", { key: null }) });
+    const killed = await killedRun(root, 2, "after_partial_commit");
+    expect(killed).toMatchObject({ code: null, signal: "SIGKILL" });
+    // The first part took every tie: the cursor it saved is below everything not saved.
+    expect(await sql<{ id: number }>(root, "SELECT id::INTEGER AS id FROM events ORDER BY id")).toEqual([1, 2, 3, 4, 5].map((id) => ({ id })));
+    expect(await cursorOf(root)).toBe(at(2));
+
+    state.log = [];
+    const next = await runIn(root, ["events"]);
+    expect(next.exit).toBe(0);
+    expect(sinceOf("/list")[0]).toBe(at(2));
+    expect(await sql<{ n: number; d: number }>(root, "SELECT count(*)::INTEGER AS n, count(DISTINCT id)::INTEGER AS d FROM events")).toEqual([{ n: 8, d: 8 }]);
+  }, 60_000);
+
+  test("the same with an integer cursor on a merge ingest, and a failure instead of a kill", async () => {
+    PARTIAL_COMMIT.rows = 2;
+    // seq ties 2, 2, 2; the source fails on the fourth page, after the first part committed.
+    state.rows = [1, 2, 2, 2, 3, 4, 5].map((q, k) => ({ id: k + 1, ts: at(q), n: q }));
+    state.failAt = 4;
+    const root = makeProject({ "assets/events.ts": pagedIngest("/list", { incremental: `"n"` }).replace("query: { per_page: 2, page, since }", "query: { per_page: 2, page, since: since === undefined ? undefined : new Date(Date.parse(\"2026-09-01T00:00:00Z\") + Number(since) * 1000).toISOString() }") });
+    const first = await runIn(root, ["events"], { retryDelaysMs: [] });
+    expect(first.exit).toBe(1);
+    // The first part took the three 2s (it ended at the 3); the second waited on the page that failed to show its 4
+    // had no ties left, so it committed without the 4.
+    expect(await cursorOf(root)).toBe("3");
+    expect(await sql<{ id: number }>(root, "SELECT id::INTEGER AS id FROM events ORDER BY id")).toEqual([1, 2, 3, 4, 5].map((id) => ({ id })));
+    state.failAt = 0;
+    const next = await runIn(root, ["events"]);
+    expect(next.exit).toBe(0);
+    expect(await sql<{ n: number; d: number }>(root, "SELECT count(*)::INTEGER AS n, count(DISTINCT id)::INTEGER AS d FROM events")).toEqual([{ n: 7, d: 7 }]);
+  }, 60_000);
 });
 
 describe("a kill between two partial commits (CROFT_FAULT)", () => {
@@ -369,7 +476,8 @@ console.log("finished without the fault");
       expect(getCatalog(db, "events")).toMatchObject({ rows: 4, cursor: { value: at(4) } });
       return db.listRuns()[0]!.id;
     });
-    expect(state.log.filter((l) => l.path === "/asc")).toHaveLength(2);
+    // The second part committed once the third page showed its 4 had no ties left.
+    expect(state.log.filter((l) => l.path === "/asc")).toHaveLength(3);
 
     state.log = [];
     const next = await runIn(root, ["events"]);

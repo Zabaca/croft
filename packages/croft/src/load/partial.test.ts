@@ -130,6 +130,47 @@ describe("monotoneTracker: every cursor value is at least every value before it"
     expect(t.add([])).toBe(true);
     expect(t.max).toBeNull();
   });
+
+  test("rise and lastRise: where an add() first and last goes strictly above everything before; ties and NULLs never rise", () => {
+    const t = monotoneTracker("integer", null);
+    t.add([1, 2, 2]);
+    // The first value has nothing to rise above; the 2 rises above the 1.
+    expect([t.rise, t.lastRise]).toEqual([1, 1]);
+    t.add([2, null, 2, 3, 3, 4, 4]);
+    expect([t.rise, t.lastRise]).toEqual([3, 5]);
+    t.add([4, 4]);
+    expect([t.rise, t.lastRise]).toEqual([-1, -1]);
+    t.add([5]);
+    expect([t.rise, t.lastRise]).toEqual([0, 0]);
+    // Instants compare as instants: 01:00+01:00 is 00:00Z, a tie.
+    const ts = monotoneTracker("timestamp", null);
+    ts.add(["2026-01-01T00:00:00Z"]);
+    ts.add(["2026-01-01T01:00:00+01:00", "2026-01-01T00:00:00.000001Z"]);
+    expect(ts.rise).toBe(1);
+    // A batch that rises and then breaks the order has no rise: nothing may commit.
+    t.add([6, 1]);
+    expect(t.monotone).toBe(false);
+    expect([t.rise, t.lastRise]).toEqual([-1, -1]);
+  });
+
+  test("late: after save(), the values at or below what was saved (the order broke), and the lowest", () => {
+    const t = monotoneTracker("integer", null);
+    t.add([1, 2, 3]);
+    t.add([3, 4]);
+    // A part holding 1..3 committed (the cut was at the 4): what came after it and is at or below 3 is late.
+    t.save();
+    expect(t.late).toBeNull();
+    t.add([5, 3, 2, 6, null, 7]);
+    expect(t.monotone).toBe(false);
+    expect(t.late).toEqual({ rows: 2, lowest: "2" });
+    // A value no cursor can compare counts too.
+    t.add([1.5]);
+    expect(t.late).toEqual({ rows: 3, lowest: "2" });
+    const none = monotoneTracker("integer", null);
+    none.add([1, 2]);
+    none.add([2, 5, 4]);
+    expect(none.late).toBeNull();
+  });
 });
 
 describe("cursorValues", () => {
@@ -164,8 +205,8 @@ function options(source: unknown, o: Partial<StageInPartsOptions> & { failCommit
       rec.commits.push({ n, rows: m.rows, ids: lines(m).map((r) => r.id), dir: m.parts[0]?.path ?? "" });
       return [...m.columns.map((c) => ({ name: c.name.toUpperCase() === "TS" ? "TS" : c.name, sourceName: c.sourceName }))];
     },
-    rewind: async () => {
-      rec.events.push("rewind");
+    broke: (b, commits) => {
+      rec.events.push(`broke at row ${b.row} after ${commits} commit(s)`);
     },
     ...o,
   };
@@ -182,12 +223,13 @@ async function* pages(list: Record<string, unknown>[][], events?: string[]): Asy
 const rows = (...ts: number[]) => ts.map((t) => ({ id: t, ts: t }));
 
 describe("stageInParts: parts commit as they come while the order holds", () => {
-  test("every `rows` rows, at the end of the page that reaches it; the rest is the last part, left to the caller", async () => {
+  test("every `rows` rows, once the next page shows the part's maximum is behind it; the rest is the last part, left to the caller", async () => {
     PARTIAL_COMMIT.rows = 3;
     const o = options(null);
     o.source = pages([rows(1, 2), rows(3, 4), rows(5), rows(6, 7), rows(8)], o.events);
     const out = await stageInParts(o);
-    expect(o.events).toEqual(["page 1", "page 2", "commit 1", "page 3", "page 4", "commit 2", "page 5"]);
+    // Page 2 reaches 3 rows; page 3 starts above 4, so the part ends before it, and page 3 starts the next one.
+    expect(o.events).toEqual(["page 1", "page 2", "page 3", "commit 1", "page 4", "page 5", "commit 2"]);
     expect(o.commits.map((c) => c.ids)).toEqual([[1, 2, 3, 4], [5, 6, 7]]);
     expect(lines(out.manifest).map((r) => r.id)).toEqual([8]);
     expect(out).toMatchObject({ commits: 2, committedRows: 7, monotone: true, broken: null, large: true });
@@ -201,7 +243,7 @@ describe("stageInParts: parts commit as they come while the order holds", () => 
 
   test("a later part names its columns after what the earlier commits stored", async () => {
     PARTIAL_COMMIT.rows = 1;
-    const o = options(pages([[{ id: 1, ts: 1 }], [{ id: 2, ts: 2 }]]));
+    const o = options(pages([1, 2, 3, 4, 5].map((n) => [{ id: n, ts: n }])));
     const seen: string[][] = [];
     const commit = o.commit;
     o.commit = async (m, n) => {
@@ -212,13 +254,66 @@ describe("stageInParts: parts commit as they come while the order holds", () => 
     expect(seen).toEqual([["id", "ts"], ["id", "TS"]]);
   });
 
-  test("every `ms` milliseconds too; a part with no rows never commits", async () => {
+  test("every `ms` milliseconds too; a part with no rows never commits, and the last one is the caller's", async () => {
     PARTIAL_COMMIT.ms = 0;
+    // The part is due at once; it ends before the 3, the first value above its 2 (empty pages change nothing).
     const o = options(pages([rows(1), [], rows(2), [], [], rows(3)]));
     const out = await stageInParts(o);
-    expect(o.commits.map((c) => c.ids)).toEqual([[1], [2], [3]]);
-    expect(out.manifest.rows).toBe(0);
-    expect(out.commits).toBe(3);
+    expect(o.commits.map((c) => c.ids)).toEqual([[1, 2]]);
+    expect(lines(out.manifest).map((r) => r.id)).toEqual([3]);
+    expect(out.commits).toBe(1);
+  });
+
+  test("a part never ends inside a run of equal cursor values: the ties go with it, the next part starts above them", async () => {
+    PARTIAL_COMMIT.rows = 3;
+    // The part reaches 3 rows ending in two 2s; the next page repeats 2 (a NULL among them), then rises.
+    const o = options(pages([
+      [{ id: 1, ts: 1 }, { id: 2, ts: 2 }, { id: 3, ts: 2 }],
+      [{ id: 4, ts: 2 }, { id: 5, ts: null }, { id: 6, ts: 2 }, { id: 7, ts: 3 }, { id: 8, ts: 4 }],
+      [{ id: 9, ts: 5 }],
+      [{ id: 10, ts: 6 }],
+    ]));
+    const out = await stageInParts(o);
+    expect(o.commits.map((c) => c.ids)).toEqual([[1, 2, 3, 4, 5, 6], [7, 8, 9]]);
+    expect(lines(out.manifest).map((r) => r.id)).toEqual([10]);
+    // Every row staged is in exactly one part.
+    expect(out).toMatchObject({ commits: 2, committedRows: 9, monotone: true });
+  });
+
+  test("a whole page of ties keeps the part open until a value rises above them", async () => {
+    PARTIAL_COMMIT.rows = 2;
+    const o = options(pages([rows(1, 2), [{ id: 3, ts: 2 }, { id: 4, ts: 2 }], [{ id: 5, ts: 2 }], [{ id: 6, ts: 3 }], [{ id: 7, ts: 4 }]]));
+    const out = await stageInParts(o);
+    expect(o.commits.map((c) => c.ids)).toEqual([[1, 2, 3, 4, 5]]);
+    expect(lines(out.manifest).map((r) => r.id)).toEqual([6, 7]);
+  });
+
+  test("a source that fails while the part waits for its ties to end: the part commits without them, then the error", async () => {
+    PARTIAL_COMMIT.rows = 3;
+    const source = (async function* () {
+      yield [{ id: 1, ts: 1 }, { id: 2, ts: 2 }, { id: 3, ts: 3 }, { id: 4, ts: 3 }];
+      throw new Error("rate limited");
+    })();
+    const o = options(source);
+    await expect(stageInParts(o)).rejects.toThrow("rate limited");
+    // The 3s may go on in the page that failed: they are left for the next run, which resumes from 2.
+    expect(o.commits.map((c) => c.ids)).toEqual([[1, 2]]);
+  });
+
+  test("single rows of a sync iterable: the cut waits for the next row above the part", async () => {
+    PARTIAL_COMMIT.rows = 2;
+    const o = options([{ id: 1, ts: 1 }, { id: 2, ts: 2 }, { id: 3, ts: 2 }, { id: 4, ts: 3 }, { id: 5, ts: 3 }]);
+    const out = await stageInParts(o);
+    expect(o.commits.map((c) => c.ids)).toEqual([[1, 2, 3]]);
+    expect(lines(out.manifest).map((r) => r.id)).toEqual([4, 5]);
+  });
+
+  test("holdRows: no part commits before the load has staged that many rows", async () => {
+    PARTIAL_COMMIT.rows = 2;
+    const o = options(pages([rows(1, 2), rows(3, 4), rows(5, 6), rows(7)]), { holdRows: 5 });
+    await stageInParts(o);
+    // The first cut after 5 rows is before 7 (rows 1..6 staged); later parts commit as usual.
+    expect(o.commits.map((c) => c.ids)).toEqual([[1, 2, 3, 4, 5, 6]]);
   });
 
   test("NULL cursor values and rows without the field neither break the order nor move it; breaks name their row", async () => {
@@ -242,29 +337,31 @@ describe("stageInParts: parts commit as they come while the order holds", () => 
     PARTIAL_COMMIT.rows = 2;
     const o = options(pages([rows(9, 8), rows(7, 6), rows(5)]));
     const out = await stageInParts(o);
-    expect(o.events).toEqual([]);
+    expect(o.events).toEqual(["broke at row 2 after 0 commit(s)"]);
     expect(out).toMatchObject({ commits: 0, monotone: false, large: true, broken: { value: "8", after: "9", row: 2 } });
     expect(lines(out.manifest).map((r) => r.id)).toEqual([9, 8, 7, 6, 5]);
   });
 
-  test("the order breaks after a commit: the saved position goes back at once, before the rows that broke it are staged", async () => {
+  test("the order breaks after a commit: nothing commits any more, and the rest is the last part", async () => {
     PARTIAL_COMMIT.rows = 2;
     const o = options(null);
-    o.source = pages([rows(1, 2), rows(3, 4), rows(0), rows(5)], o.events);
+    o.source = pages([rows(1, 2), rows(3, 4), rows(5, 6), rows(7, 8), rows(0), rows(9)], o.events);
     const out = await stageInParts(o);
-    expect(o.events).toEqual(["page 1", "commit 1", "page 2", "commit 2", "page 3", "rewind", "page 4"]);
-    expect(out).toMatchObject({ commits: 2, committedRows: 4, monotone: false, broken: { value: "0", after: "4", row: 5 } });
-    expect(lines(out.manifest).map((r) => r.id)).toEqual([0, 5]);
+    expect(o.events).toEqual(["page 1", "page 2", "commit 1", "page 3", "commit 2", "page 4", "commit 3", "page 5", "broke at row 9 after 3 commit(s)", "page 6"]);
+    expect(out).toMatchObject({ commits: 3, committedRows: 6, monotone: false, broken: { value: "0", after: "8", row: 9 } });
+    expect(lines(out.manifest).map((r) => r.id)).toEqual([7, 8, 0, 9]);
+    // The 0 came after commits that saved up to 6: late, and lost to a run resuming from 6 if the load does not finish.
+    expect(o.tracker.late).toEqual({ rows: 1, lowest: "0" });
   });
 
   test("a failed commit is PartialCommitFailed around the commit's own error; its part stays staged", async () => {
     PARTIAL_COMMIT.rows = 1;
-    const o = options(pages([rows(1), rows(2), rows(3)]), { failCommit: 2 });
+    const o = options(pages([rows(1), rows(2), rows(3), rows(4), rows(5)]), { failCommit: 2 });
     const err = await stageInParts(o).catch((e) => e);
     expect(err).toBeInstanceOf(PartialCommitFailed);
     expect((err as PartialCommitFailed).cause).toBeInstanceOf(CroftError);
     expect((err as PartialCommitFailed).commits).toBe(1);
-    expect(o.commits.map((c) => c.ids)).toEqual([[1]]);
+    expect(o.commits.map((c) => c.ids)).toEqual([[1, 2]]);
     expect(existsSync(join(o.dir, "commit-2", "manifest.json"))).toBe(true);
   });
 
@@ -282,14 +379,22 @@ describe("stageInParts: parts commit as they come while the order holds", () => 
     let asked = 0;
     const source = (async function* () {
       asked++;
-      yield rows(1);
+      yield rows(1, 2);
       asked++;
       throw new Error("boom");
     })();
     const o = options(source);
     await expect(stageInParts(o)).rejects.toThrow("boom");
     expect(asked).toBe(2);
+    // The 2 may have ties in the page that failed: only the 1 commits.
     expect(o.commits.map((c) => c.ids)).toEqual([[1]]);
+    // A lone value has nothing below it to commit.
+    const lone = options((async function* () {
+      yield rows(1);
+      throw new Error("boom");
+    })());
+    await expect(stageInParts(lone)).rejects.toThrow("boom");
+    expect(lone.commits).toEqual([]);
   });
 
   test("a source that is one promise, or no rows at all, is staged in one part", async () => {

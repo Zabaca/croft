@@ -140,6 +140,9 @@ export interface PlannedStep {
    *  TS transform processes every input row again (its positions reset); both move their table to the trash first,
    *  after a confirmation (run/rebuild.ts). An SQL or full-refresh TS transform is recomputed as always. */
   rebuild?: true;
+  /** --rebuild of an ingest: the paid incremental transforms that read it with newRows() (paidReadersOf), which
+   *  would process every row of it again: its confirmation counts them. */
+  paidReaders?: string[];
   /** --due: a TS asset whose code is not the code a human last ran, so it was not imported (DuePlanning.imports):
    *  planned from what the scheduler knows of it, with no module, and held. */
   notImported?: true;
@@ -224,9 +227,24 @@ export const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 /** Why a bare or glob `--from` run skips an asset --from cannot apply to (§8). */
 export const FROM_ONLY_MERGE = "--from applies to merge ingests";
 
-/** The command that rebuilds one asset from scratch; `croft confirm` runs exactly this. */
-export function rebuildCommand(asset: string): string {
-  return `croft run ${asset} --rebuild`;
+/** The command that rebuilds one asset from scratch; `croft confirm` runs exactly this. `allowShrink`: an ingest's
+ *  refetch may replace its table even with fewer than half of its rows. */
+export function rebuildCommand(asset: string, o: { allowShrink?: boolean } = {}): string {
+  return `croft run ${asset} --rebuild${o.allowShrink ? " --allow-shrink" : ""}`;
+}
+
+/**
+ * The incremental TS transforms that read `ingest` with newRows() and whose code makes requests (the cost guard's
+ * transforms), among `readers`. A --rebuild of the ingest gives every row a new _loaded_at, so each of them would
+ * process every row again and pay for it: the rebuild's confirmation counts them (run/rebuild.ts). Sorted.
+ */
+export function paidReadersOf(ingest: string, readers: readonly string[], byName: ReadonlyMap<string, Pick<ResolvedAsset, "kind" | "ts" | "incremental" | "usesHttp">>): string[] {
+  return readers.filter((r) => {
+    const a = byName.get(r);
+    if (!a || stepKindOf(a) !== "transform" || a.incremental.kind !== "new-rows" || a.usesHttp !== true) return false;
+    const reads = a.ts?.readsNewRows;
+    return !reads || reads.includes(ingest);
+  }).sort();
 }
 
 /** --rebuild takes the exact names of the assets to build from scratch (§6 "Guards aimed at agents": a destructive
@@ -536,6 +554,11 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
       cycle: graph.cycles.findIndex((c) => c.includes(name)),
       checkTables,
     });
+    if (step.rebuild && (step.kind === "rows" || step.kind === "file")) {
+      // A reader rebuilt in the same run asks for its own reprocessing.
+      const paid = paidReadersOf(name, step.readBy, byName).filter((r) => !taken.get(r)?.reasons.has("rebuild"));
+      if (paid.length) step.paidReaders = paid;
+    }
     // --from: only fetches run (the runner skips every other step). A transform is skipped, whatever reads a
     // backfilled ingest included; in a bare run or a glob, so is an ingest --from cannot apply to (one named
     // exactly is refused by the runner's checkRunFlags instead).
