@@ -166,7 +166,8 @@ describe("mergeHookSettings", () => {
     expect(JSON.parse(empty.text)).toEqual(hookSettings());
     const bom = mergeHookSettings(`﻿{"model":"opus"}`);
     if (!bom.ok) throw new Error("refused");
-    expect(JSON.parse(bom.text)).toEqual({ model: "opus", ...hookSettings() });
+    expect(bom.text).toStartWith(`﻿{"model":"opus"`);                  // the mark is kept
+    expect(JSON.parse(bom.text.slice(1))).toEqual({ model: "opus", ...hookSettings() });
   });
 
   test("refused, with the reason, when the file is not settings croft can merge into", () => {
@@ -174,7 +175,87 @@ describe("mergeHookSettings", () => {
     expect(mergeHookSettings(`// comment\n{}`)).toMatchObject({ ok: false, reason: expect.stringContaining("not valid JSON") });
     expect(mergeHookSettings(`[]`)).toMatchObject({ ok: false, reason: expect.stringContaining("not a JSON object") });
     expect(mergeHookSettings(`{"hooks": []}`)).toMatchObject({ ok: false, reason: expect.stringContaining(`"hooks" is not an object`) });
+    expect(mergeHookSettings(`{"hooks": null}`)).toMatchObject({ ok: false, reason: expect.stringContaining(`"hooks" is not an object`) });
     expect(mergeHookSettings(`{"hooks": {"PostToolUse": {}}}`)).toMatchObject({ ok: false, reason: expect.stringContaining(`"hooks.PostToolUse" is not a list`) });
+  });
+
+  // R51-04: the user's settings.json is usually committed and shared, so adding the hook changes nothing else in
+  // it, byte for byte: line endings, indentation, compact arrays, number spelling, escapes, key order.
+  /** `after` is `before` with one run of text inserted: what was inserted, or null when anything else changed. */
+  const insertion = (before: string, after: string): string | null => {
+    let p = 0;
+    while (p < before.length && before[p] === after[p]) p++;
+    const s = before.length - p;
+    return after.length >= before.length && after.slice(after.length - s) === before.slice(p) ? after.slice(p, after.length - s) : null;
+  };
+  const merged = (before: string): string => {
+    const r = mergeHookSettings(before);
+    if (!r.ok) throw new Error(`refused: ${r.reason}`);
+    expect(r.action).toBe("merged");
+    return r.text;
+  };
+
+  test("a hand-formatted file with CRLF, compact arrays and 1.50: only the hook is inserted, in the file's style", () => {
+    const before = `{\r\n    "permissions": { "allow": ["Bash(npm test)", "Read(./src/**)"], "deny": ["Read(./.env)"] },\r\n    "env": { "RATIO": 1.50 }\r\n}\r\n`;
+    const after = merged(before);
+    const added = insertion(before, after);
+    expect(added).not.toBeNull();
+    expect(after.replace(/\r\n/g, "")).not.toContain("\n");                // every line still ends in CRLF
+    expect(after).toContain(`"env": { "RATIO": 1.50 },\r\n    "hooks": {\r\n        "PostToolUse": [\r\n            {\r\n                "matcher": "Edit|Write|MultiEdit",`);
+    expect(after).toEndWith(`            }\r\n        ]\r\n    }\r\n}\r\n`);
+    expect(JSON.parse(after)).toEqual({
+      permissions: { allow: ["Bash(npm test)", "Read(./src/**)"], deny: ["Read(./.env)"] }, env: { RATIO: 1.5 }, ...hookSettings(),
+    });
+  });
+
+  test("big integers, \\u escapes and a key written twice outside hooks stay as written", () => {
+    for (const before of [
+      `{\n  "cleanupPeriodDays": 12345678901234567890\n}\n`,
+      `{\n  "env": {"PATH_SEP": "\\u002F", "X": "\\ud83d\\ude00"}\n}\n`,
+      `{\n  "env": {"A": "1"},\n  "env": {"B": "2"}\n}\n`,
+    ]) {
+      const after = merged(before);
+      expect(insertion(before, after), before).toStartWith(",\n  \"hooks\": {\n    \"PostToolUse\": [");
+    }
+  });
+
+  test("into hooks the file already has: a PostToolUse list gains the group, a hooks object gains PostToolUse", () => {
+    const list = `{\n  "hooks": {\n    "PostToolUse": [\n      {"matcher": "Write", "hooks": [{"type": "command", "command": "prettier --write"}]}\n    ]\n  },\n  "model": "opus"\n}\n`;
+    const a = merged(list);
+    expect(insertion(list, a)).toBe(`,\n      {\n        "matcher": "Edit|Write|MultiEdit",\n        "hooks": [\n          {\n            "type": "command",\n            "command": ${JSON.stringify(hookCommand())},\n            "timeout": 120\n          }\n        ]\n      }`);
+    expect(Object.keys(JSON.parse(a))).toEqual(["hooks", "model"]);
+    const noGroup = `{"hooks": {"PostToolUse": [{"matcher": "Edit"}]}}`;
+    expect(JSON.parse(merged(noGroup)).hooks.PostToolUse).toEqual([{ matcher: "Edit" }, hookSettings().hooks.PostToolUse[0]]);
+    const other = `{\n\t"hooks": {\n\t\t"Stop": []\n\t}\n}`;
+    const b = merged(other);
+    expect(insertion(other, b)).toStartWith(`,\n\t\t"PostToolUse": [\n\t\t\t{\n\t\t\t\t"matcher"`);
+    const empty = `{\n  "hooks": {\n    "PostToolUse": []\n  }\n}\n`;
+    const c = merged(empty);
+    expect(c).toStartWith(`{\n  "hooks": {\n    "PostToolUse": [\n      {\n        "matcher": "Edit|Write|MultiEdit",`);
+    expect(c).toEndWith(`      }\n    ]\n  }\n}\n`);
+    expect(JSON.parse(c)).toEqual(hookSettings());
+  });
+
+  test("a one-line file stays on one line; {} becomes the hook, indented", () => {
+    const one = `{"model":"opus","permissions":{"allow":[]}}`;
+    const a = merged(one);
+    expect(a).not.toContain("\n");
+    expect(insertion(one, a)).toBe(`,"hooks":${JSON.stringify(hookSettings().hooks)}`);
+    const spaced = `{"model": "opus", "hooks": {"PostToolUse": [{"matcher": "Edit"}]}}`;
+    expect(insertion(spaced, merged(spaced))).toBe(`, {"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command", "command": ${JSON.stringify(hookCommand())}, "timeout": 120}]}`);
+    expect(merged(`{"hooks":{}}`)).toBe(`{"hooks":{"PostToolUse":[${JSON.stringify(hookSettings().hooks.PostToolUse[0])}]}}`);
+    expect(merged(`{}\n`)).toBe(`${JSON.stringify(hookSettings(), null, 2)}\n`);
+    expect(merged(`{\r\n}`)).toBe(JSON.stringify(hookSettings(), null, 2).replace(/\n/g, "\r\n"));
+  });
+
+  test("hooks or hooks.PostToolUse written twice: refused, since croft cannot tell which one Claude Code reads", () => {
+    expect(mergeHookSettings(`{"hooks": {}, "hooks": {"Stop": []}}`)).toMatchObject({ ok: false, reason: expect.stringContaining(`"hooks" is written twice`) });
+    expect(mergeHookSettings(`{"hooks": {"PostToolUse": [], "PostToolUse": []}}`)).toMatchObject({ ok: false, reason: expect.stringContaining(`"hooks.PostToolUse" is written twice`) });
+  });
+
+  test("disableAllHooks: the hook is added, and the note says Claude Code will not run it", () => {
+    const r = mergeHookSettings(`{\n  "disableAllHooks": true\n}\n`);
+    expect(r).toMatchObject({ ok: true, action: "merged", note: expect.stringContaining(`"disableAllHooks" is true`) });
   });
 });
 
@@ -219,6 +300,36 @@ describe("installHook", () => {
     expect(p.message).toContain("the hook was not added");
     expect(p.hint).toContain("croft init --claude --with-hook");
     expect(p.fix!.description).toContain(JSON.stringify(hookSettings()));
+  });
+
+  test("a file croft cannot change by one insertion (hooks written twice) is left byte for byte; the fix is the snippet", () => {
+    const root = fresh();
+    mkdirSync(join(root, ".claude"));
+    const text = `{\r\n  "hooks": {},\r\n  "hooks": {"Stop": []}\r\n}\r\n`;
+    writeFileSync(join(root, SETTINGS_FILE), text);
+    const r = installHook(root, root);
+    expect(r.files).toEqual([{ path: SETTINGS_FILE, action: "skipped", note: expect.stringContaining(`"hooks" is written twice`) }]);
+    expect(readFileSync(join(root, SETTINGS_FILE), "utf8")).toBe(text);
+    const p = r.problems[0]!;
+    expect(p.message).toStartWith(`${SETTINGS_FILE}: "hooks" is written twice in it, so croft left it as it was`);
+    expect(p.hint).not.toContain("strict JSON");
+    expect(p.fix).toEqual({ kind: "manual", description: `add this to ${SETTINGS_FILE} by hand, merged into "hooks" and "hooks.PostToolUse" where the file has them: ${JSON.stringify(hookSettings())}` });
+  });
+
+  test("an app's hand-formatted settings (CRLF, compact arrays, 1.50) gain the hook and nothing else changes", () => {
+    const app = fresh();
+    const root = join(app, "data");
+    mkdirSync(join(app, ".claude"), { recursive: true });
+    mkdirSync(root);
+    const text = `{\r\n    "permissions": { "allow": ["Bash(npm test)", "Read(./src/**)"], "deny": ["Read(./.env)"] },\r\n    "env": { "RATIO": 1.50 }\r\n}\r\n`;
+    writeFileSync(join(app, SETTINGS_FILE), text);
+    installHook(root, app);
+    const after = readFileSync(join(app, SETTINGS_FILE), "utf8");
+    const cut = text.indexOf("\r\n}\r\n");
+    expect(after.slice(0, cut)).toBe(text.slice(0, cut));
+    expect(after).toEndWith(text.slice(cut));
+    expect(after.slice(cut)).toStartWith(`,\r\n    "hooks": {\r\n        "PostToolUse": [`);
+    expect(JSON.parse(after).hooks).toEqual(hookSettings("data").hooks);
   });
 });
 

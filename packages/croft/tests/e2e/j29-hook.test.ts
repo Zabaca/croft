@@ -1,7 +1,9 @@
 // Journey 29: the opt-in Claude Code hook (DESIGN.md §9 item 7, D27), through the real CLI and the real shell.
 //   a. `croft init --claude --with-hook` merges the PostToolUse hook into a .claude/settings.json the user already
 //      has (their permissions, model, other hooks and indentation stay); a second run changes nothing, and init
-//      without --with-hook never touches the file. A new project, and an app's data/ project, get it too; until
+//      without --with-hook never touches the file. The hook goes in as one insertion: CRLF, compact arrays and
+//      1.50 stay as written; a file croft cannot change that way ("hooks" written twice) is left byte for byte,
+//      with the snippet to add by hand. A new project, and an app's data/ project, get it too; until
 //      data/ is installed, the app's hook does nothing (exit 0, silent), for app files and data/ assets alike;
 //      once it is, its report names data/assets/x.sql, the path from the app folder where Claude works.
 //   b. The hook command from settings.json runs exactly as Claude Code runs it (`sh -c`, CLAUDE_PROJECT_DIR set,
@@ -76,6 +78,29 @@ describe("a. croft init --with-hook writes the hook into .claude/settings.json",
     // Without --claude in an existing project, init refuses, and its fix keeps the hook flag.
     const refused = golden("init", await p.croft(["init", "--with-hook", "--json"]), { failed: true, exit: 2 });
     expect(refused.problems[0]).toMatchObject({ code: "USAGE_ERROR", fix: { command: "croft init --claude --with-hook" } });
+  }, 120_000);
+
+  test("hand-formatted settings (CRLF, compact arrays, 1.50) keep every byte; hooks written twice: left alone, the snippet to add by hand", async () => {
+    const { project: p } = await initProject("byte-for-byte");
+    const before = `{\r\n    "permissions": { "allow": ["Bash(npm test)", "Read(./src/**)"], "deny": ["Read(./.env)"] },\r\n    "env": { "RATIO": 1.50 }\r\n}\r\n`;
+    p.write(".claude/settings.json", before);
+    golden("init", await p.croft(["init", "--claude", "--with-hook", "--json"]));
+    const after = p.read(".claude/settings.json");
+    const cut = before.indexOf("\r\n}\r\n");
+    expect(after.slice(0, cut)).toBe(before.slice(0, cut));
+    expect(after).toEndWith(before.slice(cut));
+    expect(after.replace(/\r\n/g, "")).not.toContain("\n");
+    expect(JSON.parse(after).hooks).toEqual({ PostToolUse: [CROFT_GROUP] });
+
+    const twice = `{\n  "hooks": {},\n  "hooks": {"Stop": []}\n}\n`;
+    p.write(".claude/settings.json", twice);
+    const refused = golden("init", await p.croft(["init", "--claude", "--with-hook", "--json"]), { exit: 2 });
+    expect(refused.ok).toBe(false);
+    expect(p.read(".claude/settings.json")).toBe(twice);
+    expect(refused.data.files).toContainEqual(expect.objectContaining({ path: ".claude/settings.json", action: "skipped" }));
+    expect(refused.problems[0]).toMatchObject({ code: "USAGE_ERROR", fix: { kind: "manual", description: expect.stringContaining(JSON.stringify({ hooks: { PostToolUse: [CROFT_GROUP] } })) } });
+    const human = await p.croft(["init", "--claude", "--with-hook"]);
+    expect(human.stdout + human.stderr).toContain('"hooks" is written twice');
   }, 120_000);
 
   test("a new project, and an app's data/ project (the app's settings cd into data/)", async () => {

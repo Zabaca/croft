@@ -36,6 +36,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { CroftError, problem } from "../core/errors.ts";
 import type { Problem } from "../core/types.ts";
 import type { FileChange } from "../project/init.ts";
+import { type Node as JsonNode, parseJsonc } from "../project/init-tsconfig.ts";
 
 export const HOOK_EVENT = "PostToolUse";
 /** Claude Code's file-editing tools. MultiEdit is gone from current Claude Code's tool list and kept for the
@@ -168,23 +169,26 @@ function existingHandler(groups: readonly unknown[]): string | null {
 }
 
 /**
- * Merge the hook into the text of a settings file (null: there is none). Everything already there stays, in its
- * order; the hook is appended to hooks.PostToolUse as a group of its own, in the file's indentation. A file
- * that already runs croft validate --hook (this command or another way of writing it) is left as it is, so a
- * second run never doubles the hook. Refused, with the reason, when the file is not a JSON object whose hooks
- * croft can extend: croft never rewrites what it cannot read.
+ * Merge the hook into the text of a settings file (null: there is none). The file is usually committed and
+ * shared, so the hook goes in as one text insertion and every other byte stays as written: line endings,
+ * indentation, compact arrays, number spelling, escapes, key order. The group is appended to hooks.PostToolUse
+ * (or a "PostToolUse" list, or a "hooks" object, is added), laid out like the file: its indentation and line
+ * endings, or on one line in a one-line file. A file that already runs croft validate --hook (this command or
+ * another way of writing it) is left as it is, so a second run never doubles the hook. Refused, with the reason,
+ * when croft cannot make that one insertion: the file is not strict JSON (Claude Code reads it that way), not an
+ * object, "hooks" or "hooks.PostToolUse" has another shape or is written twice. croft never rewrites the file.
  */
 export function mergeHookSettings(existing: string | null, sub = ""): MergeResult {
   const entry = hookSettings(sub);
-  if (existing === null) return { ok: true, action: "created", text: `${JSON.stringify(entry, null, 2)}\n`, note: ADDED };
+  const created = `${JSON.stringify(entry, null, 2)}\n`;
+  if (existing === null) return { ok: true, action: "created", text: created, note: ADDED };
   const source = existing.replace(/^﻿/, "");
-  let settings: unknown = {};
-  if (source.trim()) {
-    try {
-      settings = JSON.parse(source);
-    } catch (e) {
-      return { ok: false, reason: `it is not valid JSON (${(e as Error).message})` };
-    }
+  if (!source.trim()) return { ok: true, action: "merged", text: created, note: ADDED };
+  let settings: unknown;
+  try {
+    settings = JSON.parse(source);
+  } catch (e) {
+    return { ok: false, reason: `it is not valid JSON (${(e as Error).message})` };
   }
   if (!isObject(settings)) return { ok: false, reason: "it is not a JSON object" };
   if (settings.hooks !== undefined && !isObject(settings.hooks)) return { ok: false, reason: `"hooks" is not an object` };
@@ -196,12 +200,83 @@ export function mergeHookSettings(existing: string | null, sub = ""): MergeResul
     const note = found === hookCommand(sub) ? "already runs croft validate --hook" : `already runs croft validate --hook (as ${JSON.stringify(found)}); left as it was`;
     return { ok: true, action: "unchanged", text: existing, note };
   }
-  const merged: Json = { ...settings, hooks: { ...hooks, [HOOK_EVENT]: [...(groups ?? []), ...entry.hooks.PostToolUse] } };
-  return { ok: true, action: "merged", text: `${JSON.stringify(merged, null, indentOf(source))}\n`, note: ADDED };
+  const group = entry.hooks.PostToolUse[0]!;
+  const inserted = insertHook(existing, group);
+  if (typeof inserted !== "string") return inserted;
+  // The one insertion must read back as the settings plus the group, and nothing else.
+  const expected: Json = { ...settings, hooks: { ...hooks, [HOOK_EVENT]: [...(groups ?? []), group] } };
+  let check: unknown;
+  try {
+    check = JSON.parse(inserted.replace(/^﻿/, ""));
+  } catch {
+    check = undefined;
+  }
+  if (JSON.stringify(check) !== JSON.stringify(expected)) return { ok: false, reason: "croft could not add the hook to it without changing anything else" };
+  const off = settings.disableAllHooks === true ? `; "disableAllHooks" is true in it, so Claude Code runs no hooks until that is removed` : "";
+  return { ok: true, action: "merged", text: inserted, note: `${ADDED}${off}` };
 }
 
-/** The indentation a JSON file uses: its first indented line's, else two spaces. */
-function indentOf(text: string): string {
+type ObjectNode = Extract<JsonNode, { type: "object" }>;
+type ArrayNode = Extract<JsonNode, { type: "array" }>;
+
+/** `text` with the hook group inserted where it goes (see mergeHookSettings), or the refusal. */
+function insertHook(text: string, group: HookGroup): string | Extract<MergeResult, { ok: false }> {
+  let root: JsonNode;
+  try {
+    root = parseJsonc(text);
+  } catch (e) {
+    return { ok: false, reason: `it is not valid JSON (${(e as Error).message})` };
+  }
+  if (root.type !== "object") return { ok: false, reason: "it is not a JSON object" };
+  const twice = (obj: ObjectNode, key: string) => obj.props.filter((p) => p.key === key).length > 1;
+  if (twice(root, "hooks")) return { ok: false, reason: `"hooks" is written twice in it` };
+  const hooks = root.props.find((p) => p.key === "hooks")?.value;
+  if (!hooks) return insertMember(text, root, `"hooks": `, { [HOOK_EVENT]: [group] });
+  if (hooks.type !== "object") return { ok: false, reason: `"hooks" is not an object` };
+  if (twice(hooks, HOOK_EVENT)) return { ok: false, reason: `"hooks.${HOOK_EVENT}" is written twice in it` };
+  const list = hooks.props.find((p) => p.key === HOOK_EVENT)?.value;
+  if (!list) return insertMember(text, hooks, `${JSON.stringify(HOOK_EVENT)}: `, [group]);
+  if (list.type !== "array") return { ok: false, reason: `"hooks.${HOOK_EVENT}" is not a list` };
+  return insertMember(text, list, "", group);
+}
+
+/**
+ * Add a member (`key` is `"name": ` for an object, "" for a list) as the last one of `node`, laid out like the
+ * file: in a container that spans lines, on its own line at the indentation of the members before it (one step
+ * deeper than the container's line when it has none), with the file's line endings and indentation step; in a
+ * one-line file, on the same line.
+ */
+function insertMember(text: string, node: ObjectNode | ArrayNode, key: string, value: unknown): string {
+  const eol = text.includes("\r\n") ? "\r\n" : "\n";
+  const members = node.type === "object" ? node.props.map((p) => p.value) : node.items;
+  const last = members.at(-1);
+  const multiline = text.slice(node.start, node.end).includes("\n") || (!last && /\n\s*\S/.test(text.trim()));
+  if (!multiline && (last || text.trim() !== text.slice(node.start, node.end))) {
+    // One line (the container, or the whole file when the container is empty): stay on it, spaced like it.
+    const spaced = /":\s/.test(last ? text.slice(node.start, node.end) : text);
+    const member = spaced
+      ? `${key}${JSON.stringify(value, null, 1).replace(/,\n\s*/g, ", ").replace(/\n\s*/g, "")}`
+      : `${key.replace(/: $/, ":")}${JSON.stringify(value)}`;
+    return last
+      ? `${text.slice(0, last.end)}${spaced ? ", " : ","}${member}${text.slice(last.end)}`
+      : `${text.slice(0, node.start + 1)}${member}${text.slice(node.end - 1)}`;
+  }
+  const step = indentStep(text);
+  const indent = last ? lineIndent(text, last.start) : lineIndent(text, node.start) + step;
+  const member = key + JSON.stringify(value, null, step).split("\n").join(eol + indent);
+  if (last) return `${text.slice(0, last.end)},${eol}${indent}${member}${text.slice(last.end)}`;
+  // Empty: the member on its own line, the closing bracket back at the container's indentation.
+  return `${text.slice(0, node.start + 1)}${eol}${indent}${member}${eol}${lineIndent(text, node.start)}${text.slice(node.end - 1)}`;
+}
+
+/** The whitespace that starts the line holding offset `at`. */
+function lineIndent(text: string, at: number): string {
+  const start = text.lastIndexOf("\n", at - 1) + 1;
+  return /^[ \t]*/.exec(text.slice(start))![0];
+}
+
+/** The indentation step a JSON file uses: its first indented line's, else two spaces. */
+function indentStep(text: string): string {
   const m = /\n([ \t]+)\S/.exec(text);
   return m ? m[1]! : "  ";
 }
@@ -259,13 +334,21 @@ export function installHook(root: string, base: string): { files: FileChange[]; 
   return { files, problems };
 }
 
+/** A settings file croft cannot add the hook to with one insertion: nothing is written, and the fix is the snippet
+ *  to add by hand. */
 function unmergeable(path: string, reason: string, sub: string): Problem {
   const snippet = JSON.stringify(hookSettings(sub));
+  const invalid = reason.startsWith("it is not valid JSON");
   return problem("USAGE_ERROR", {
     message: `${path}: ${reason}, so croft left it as it was and the hook was not added; everything else croft init does was done`,
-    hint: `fix ${path} (Claude Code reads it as strict JSON: no comments, no trailing commas), then run croft init --claude --with-hook again`,
+    hint: invalid
+      ? `fix ${path} (Claude Code reads it as strict JSON: no comments, no trailing commas), then run croft init --claude --with-hook again`
+      : `croft changes ${path} only by one insertion that keeps the rest as written; add the hook by hand, or fix what is named above and run croft init --claude --with-hook again`,
     file: path,
-    fix: { kind: "manual", description: `make ${path} valid JSON and run croft init --claude --with-hook, or add this to it by hand: ${snippet}` },
+    fix: {
+      kind: "manual",
+      description: `add this to ${path} by hand, merged into "hooks" and "hooks.PostToolUse" where the file has them: ${snippet}${invalid ? `; or make ${path} valid JSON and run croft init --claude --with-hook` : ""}`,
+    },
     details: { reason, hook: hookSettings(sub) },
   });
 }

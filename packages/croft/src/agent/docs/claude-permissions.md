@@ -83,10 +83,13 @@ The command,
 runs the project's own croft (node_modules/.bin/croft, from bun install) from the folder Claude Code
 started in ($CLAUDE_PROJECT_DIR), wherever Claude has moved since. For a project in data/ inside an app,
 the app's settings say cd "$CLAUDE_PROJECT_DIR"/data instead, and data/.claude/settings.json gets the plain
-form for sessions started in data/. croft merges the hook into settings you already have and keeps
-everything else in them; running it again adds nothing twice. Until bun install has run (a fresh clone, a
-teammate who pulled the settings, an app whose data/ is not installed yet), test -x finds no pinned croft
-and the hook does nothing.
+form for sessions started in data/. croft adds the hook to settings you already have as one insertion,
+and every other byte of the file stays as you wrote it: line endings, indentation, compact arrays, number
+spelling, key order. Running it again adds nothing twice. A file croft cannot change that way (not strict
+JSON, or "hooks" written twice) is left alone, and croft init prints the snippet to add by hand.
+
+Until bun install has run (a fresh clone, a teammate who pulled the settings, an app whose data/ is not
+installed yet), test -x finds no pinned croft and the hook does nothing.
 
 Claude Code started from the Dock, Finder or an IDE may not have Bun's folder (~/.bun/bin) on its PATH. Then
 each edit shows the notice "croft validate --hook did not run: bun is not on the PATH Claude Code gives its
