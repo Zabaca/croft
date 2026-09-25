@@ -27,7 +27,109 @@
     },
     "data": {
       "anyOf": [
-        {},
+        {
+          "title": "NewAssetData",
+          "type": "object",
+          "properties": {
+            "asset": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "api",
+                "file",
+                "sql",
+                "transform"
+              ]
+            },
+            "pagination": {
+              "enum": [
+                "cursor",
+                "keyset",
+                "link",
+                "page",
+                null
+              ]
+            },
+            "file": {
+              "type": "string"
+            },
+            "what": {
+              "type": "string"
+            },
+            "edit": {
+              "type": "string"
+            },
+            "reads": {
+              "type": [
+                "null",
+                "string"
+              ]
+            },
+            "secrets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "enum": [
+                      "missing",
+                      "set"
+                    ]
+                  }
+                },
+                "required": [
+                  "name",
+                  "status"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "created": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "redactedValues": {
+              "const": true
+            }
+          },
+          "required": [
+            "asset",
+            "kind",
+            "pagination",
+            "file",
+            "what",
+            "edit",
+            "reads",
+            "secrets",
+            "created"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "NewListData",
+          "type": "object",
+          "properties": {
+            "templates": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/NewTemplateEntry"
+              }
+            },
+            "redactedValues": {
+              "const": true
+            }
+          },
+          "required": [
+            "templates"
+          ],
+          "additionalProperties": false
+        },
         {
           "type": "null"
         }
@@ -221,6 +323,45 @@
         "action",
         "rows",
         "downstream"
+      ],
+      "additionalProperties": false
+    },
+    "NewTemplateEntry": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "enum": [
+            "api",
+            "file",
+            "sql",
+            "transform"
+          ]
+        },
+        "pagination": {
+          "enum": [
+            "cursor",
+            "keyset",
+            "link",
+            "page",
+            null
+          ]
+        },
+        "default": {
+          "type": "boolean"
+        },
+        "command": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "pagination",
+        "default",
+        "command",
+        "description"
       ],
       "additionalProperties": false
     },
