@@ -5,7 +5,8 @@
 // - exit 0 with hookSpecificOutput.additionalContext on stdout hands text to Claude without blocking: warnings;
 // - any other exit is a non-blocking "hook error" notice for the user: croft's own failures (exit 1).
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { HOOK_IO, hookCommand } from "../../agent/hook.ts";
 import { putCatalog } from "../../history/catalog.ts";
@@ -269,11 +270,15 @@ describe("croft validate --hook: problems go to Claude", () => {
     const fromAssets = await hook(p, "", { stdin: at(join(p.root, "assets"), "assets/open_issues.sql") });
     expect(fromAssets.stderr).toStartWith("croft validate --hook: 1 error after the edit to open_issues.sql (");
     expect(fromAssets.stderr).toContain("error UNKNOWN_COLUMN  open_issues.sql:1:12");
-    // Claude works outside the project: absolute paths.
-    const elsewhere = join(dirname(app), "elsewhere-for-hook");
-    mkdirSync(elsewhere, { recursive: true });
-    const outside = await hook(p, "", { stdin: at(elsewhere, "assets/open_issues.sql") });
-    expect(outside.stderr).toContain(`error UNKNOWN_COLUMN  ${join(p.root, "assets/open_issues.sql")}:1:12`);
+    // Claude works outside the project: absolute paths. A temp folder of its own: the app folder's parent can be
+    // / (the project in /tmp on Linux), which a normal user cannot write.
+    const elsewhere = realpathSync(mkdtempSync(join(tmpdir(), "croft-elsewhere-")));
+    try {
+      const outside = await hook(p, "", { stdin: at(elsewhere, "assets/open_issues.sql") });
+      expect(outside.stderr).toContain(`error UNKNOWN_COLUMN  ${join(p.root, "assets/open_issues.sql")}:1:12`);
+    } finally {
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
     // --json keeps the envelope's project-relative paths.
     const j = await hook(p, "", { stdin: at(app, "assets/open_issues.sql"), json: true });
     expect(j.json.problems[0]).toMatchObject({ code: "UNKNOWN_COLUMN", file: "assets/open_issues.sql" });
