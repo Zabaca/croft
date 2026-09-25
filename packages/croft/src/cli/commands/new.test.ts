@@ -142,6 +142,15 @@ describe("croft new <kind> <name>", () => {
     expect(v.exit).toBe(0);
   }, 30_000);
 
+  test("sql: an asset file that is neither an ingest nor a transform is not read, however recent", async () => {
+    const p = newProject({ "assets/scratch.ts": "export const x = 1;\n" });
+    touch(p, "assets/example_sales.ts", 1);
+    touch(p, "assets/scratch.ts", 2);
+    const r = await cli(["new", "sql", "sales_list", "--json"], { cwd: p.root });
+    expect(r.json.data).toMatchObject({ reads: "example_sales" });
+    expect(r.json.data.edit).toContain("the project's only asset");
+  }, 30_000);
+
   test("sql: an input without a key gets no key line; the only asset is named as such", async () => {
     const p = makeProject({ timezone: "UTC", files: { "assets/events.ts": KEYLESS } });
     const r = await cli(["new", "sql", "event_list", "--json"], { cwd: p.root });
@@ -264,6 +273,11 @@ describe("refusals: nothing is written", () => {
         code, fix: { kind: "command", command: `croft new sql ${to}` }, effect: "nothing was written", details: { name, suggestion: to },
       });
       expect(r.json.problems[0].hint, name).toBe(`use a name that works as a table name: croft new sql ${to}`);
+    }
+    // A file name or a path means the name inside it.
+    for (const [name, to] of [["stripe_charges.ts", "stripe_charges"], ["assets/daily.sql", "daily"], ["orders.csv", "orders_csv"]]) {
+      const r = await cli(["new", "sql", name!, "--json"], { cwd: p.root });
+      expect(r.json.problems[0], name).toMatchObject({ code: "NAME_INVALID", fix: { command: `croft new sql ${to}` }, details: { name, suggestion: to } });
     }
     const keyword = await cli(["new", "api", "order", "--pagination", "keyset", "--json"], { cwd: p.root });
     expect(keyword.json.problems[0].message).toBe("\"order\" is an SQL keyword, so `FROM order` would be a syntax error in every asset that reads it; use orders");
