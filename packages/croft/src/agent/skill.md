@@ -15,7 +15,8 @@ croft status                # failed, stale, held, never run, edited since its l
 
 ## Loop (always)
 1. New asset: `croft new api|file|sql|transform <name>`; edit the template, don't invent APIs.
-2. `croft validate --json` after EVERY edit; apply each problem's `fix`.
+2. `croft validate --json` after EVERY edit; apply each problem's `fix`. When the edit is to a TS transform or
+   an asset one reads, add `--types`: tsc then checks the columns the transform reads.
 3. `croft preview <name>`: read columns, checks, diff and samples.
 4. `croft run <name>`; then verify with `croft query "..."` (one SELECT, 50-row cap).
 
@@ -29,6 +30,8 @@ croft status                # failed, stale, held, never run, edited since its l
 - Set `key` whenever records have an id. Incremental API ingests need a key.
 - TS transforms that call an API or LLM per row: keep `incremental: true` + `newRows()` (the template default).
   Preview them with `--rows 20`: by default a preview hands them up to 1,000 input rows, each a paid call.
+- TS transforms read `newRows("x")` with no type argument: rows get x's column types, and `croft validate --types`
+  catches a column renamed upstream. A BIGINT is `number | bigint`: `Number(row.x)` before arithmetic.
 - Use `ctx.http` and `res.json()` (lossless numbers), never raw fetch + JSON.parse for API data.
 - Nested fields are JSON: `col->>'field'`, `col->>'$[*].name'`, `json_each(col)`. `croft describe` lists keys.
 - Columns named like SQL keywords must be quoted: `"order"`.

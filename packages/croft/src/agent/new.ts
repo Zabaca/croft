@@ -9,11 +9,14 @@
 // - file (§3b): a CSV glob under files/<name>/, incremental (new and changed files only), with a key.
 // - sql (§3c): the header (description, key, a check) and one SELECT over an existing asset.
 // - transform (§3e): keyed, incremental, newRows() over an existing asset with a key, the paid call as a comment,
-//   and confirmAbove (the cost guard).
+//   and confirmAbove (the cost guard). newRows("x") takes no type argument, so its rows get x's generated row type
+//   (.croft/types) and validate --types sees a column renamed upstream; the key and the yielded names are the
+//   cleaned names (§7) a TS asset's output columns get.
 //
 // templateFor is pure: it renders text. The command (cli/commands/new.ts) checks the name, picks the input an sql
 // or transform template reads, writes the file and says what to do next. agent/contract.test.ts reads every
 // string here like any other agent-facing text; new.test.ts validates every rendered template in a project.
+import { cleanColumnName } from "../load/stage.ts";
 
 export type NewKind = "api" | "file" | "sql" | "transform";
 export type Pagination = "keyset" | "cursor" | "link" | "page";
@@ -464,12 +467,30 @@ function sqlTemplate(name: string, input: TemplateInput): Template {
 // ---------------------------------------------------------------------------------------------------------
 // TypeScript transform (§3e)
 
+/**
+ * The names a transform yields its input's key columns under: each cleaned as a TS asset's output column names
+ * are (§7 "Column names", load/stage.ts cleanColumnName), so `key:` names a column every row has ("Region Name" is
+ * read as row["Region Name"] and written as Region_Name). DuckDB names are case-insensitive, so a cleaned name
+ * another one took gets _2, _3, … as the loader would; `taken` holds the lower-case names in use.
+ */
+function outputNames(key: readonly string[], taken = new Set<string>()): string[] {
+  return key.map((k, i) => {
+    const clean = cleanColumnName(k, i + 1);
+    let out = clean;
+    for (let n = 2; taken.has(out.toLowerCase()); n++) out = `${clean}_${n}`;
+    taken.add(out.toLowerCase());
+    return out;
+  });
+}
+
 function transformTemplate(name: string, input: TemplateInput): Template {
   if (input.key.length === 0) throw new Error(`templateFor(transform): the input ${input.asset} has no key; newRows() needs one`);
   const why = input.why ? ` (${input.why})` : "";
+  const taken = new Set<string>();
+  const outKey = outputNames(input.key, taken);
   // The output column the placeholder computes; never one of the key columns it copies.
-  const result = input.key.includes("result") ? "result_value" : "result";
-  const keyCopy = input.key.map((k) => `${tsProp(k)}: ${tsAccess("row", k)}`).join(", ");
+  const result = taken.has("result") ? "result_value" : "result";
+  const keyCopy = input.key.map((k, i) => `${tsProp(outKey[i]!)}: ${tsAccess("row", k)}`).join(", ");
   const label = input.key.map((k) => `\${${tsAccess("row", k)}}`).join(" ");
   const lines = [
     `// assets/${name}.ts: a TypeScript transform (croft new transform ${name}).`,
@@ -479,19 +500,21 @@ function transformTemplate(name: string, input: TemplateInput): Template {
       + "summarize, geocode), or parsing and scoring with a library. It is incremental: newRows() hands each input row over "
       + "once, and again only when it changes upstream, so a paid call is never repeated for rows already done. For "
       + "filters, joins and aggregates, write SQL instead (croft new sql <name>).",
-      `It reads ${input.asset}${why}. To edit: inputs and newRows() for the asset it should read, the Input type, the per-row `
-      + "work (the paid call goes where the comment shows), what each row yields, and the checks. Once it makes paid calls, "
-      + `preview it with croft preview ${name} --rows 20: each input row is one call.`,
+      `It reads ${input.asset}${why}. To edit: inputs and newRows() for the asset it should read, the per-row work (the `
+      + "paid call goes where the comment shows), what each row yields, and the checks. Once it makes paid calls, preview "
+      + `it with croft preview ${name} --rows 20: each input row is one call.`,
+      `Each row has the columns of ${input.asset} (croft describe ${input.asset} lists them). Once ${input.asset} has been `
+      + `run or previewed they are typed by name (.croft/types/${input.asset}.d.ts), and croft validate --types reports `
+      + `code that reads a column ${input.asset} does not have, such as one renamed upstream; until then each column is `
+      + `unknown. So keep newRows(${JSON.stringify(input.asset)}) without a type argument: newRows<T>() replaces the `
+      + "generated type, and tsc no longer sees a rename.",
     ]),
     "import { transform } from \"@zabaca/croft\";",
-    "",
-    `// The columns of ${input.asset} this code reads (croft describe ${input.asset} lists them all).`,
-    `type Input = { ${input.key.map((k) => `${tsProp(k)}: unknown`).join("; ")} };`,
     "",
     "export default transform({",
     note(`  description: ${JSON.stringify(titleWords(name))},`, "one line: what a row is (croft describe shows it)"),
     note(`  inputs: [${JSON.stringify(input.asset)}],`, "the assets this code reads; croft builds them first"),
-    note(`  key: ${tsKey(input.key)},`, `one output row per input row, by the key of ${input.asset}`),
+    note(`  key: ${tsKey(outKey)},`, `one output row per input row, by the key of ${input.asset}`),
     note("  incremental: true,", "newRows() gives only rows not processed yet; results merge"),
     note("", "by key, committed in chunks, so a failure loses little"),
     note("  confirmAbove: 1000,", "the cost guard: a run that would send more input rows than"),
@@ -501,7 +524,7 @@ function transformTemplate(name: string, input: TemplateInput): Template {
     "",
     "  async *rows({ newRows, log }) {",
     "    let n = 0;",
-    `    for await (const row of newRows<Input>(${JSON.stringify(input.asset)})) {`,
+    `    for await (const row of newRows(${JSON.stringify(input.asset)})) {`,
     "      // A paid call per row goes here, for example a classification API (add http and secret to the arguments",
     "      // of rows above, and secrets: [\"EXAMPLE_KEY\"] to the config, then ask the user to add it to .env):",
     "      //   const res = await http.post(\"https://api.example.com/v1/classify\", { text: String(row.title) }, {",

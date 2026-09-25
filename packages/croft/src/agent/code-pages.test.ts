@@ -86,6 +86,25 @@ describe("a docs page per code", () => {
   });
 });
 
+describe("a page covers every case its code is raised for", () => {
+  const words = async (code: string) => (await page(code)).page.replace(/\s+/g, " ");
+
+  test("INSTALL_FAILED: what validate --types reports as info (no tsc, no tsconfig.json, one without .croft/types) (R51-06)", async () => {
+    const text = await words("INSTALL_FAILED");
+    for (const s of [
+      "croft validate --types", "as info", "node_modules/.bin/tsc", "run bun install in the project folder", "no tsconfig.json",
+      "\"include\" leaves out .croft/types", "add \".croft/types/**/*.d.ts\" to \"include\"", "column renamed upstream",
+    ]) expect(text, s).toContain(s);
+  });
+
+  test("UNKNOWN_INPUT_COLUMN: validate --types sees the rows' generated type only without a type argument", async () => {
+    const text = await words("UNKNOWN_INPUT_COLUMN");
+    expect(text).toContain("newRows(\"x\") with no type argument");
+    expect(text).toContain("newRows<Issue>(\"x\")");
+    expect(text).toContain("tsconfig.json");
+  });
+});
+
 describe("the CLI serves them", () => {
   const cli = async (args: string[]): Promise<{ exit: number; out: string }> => {
     const cwd = mkdtempSync(join(tmpdir(), "croft-code-pages-"));

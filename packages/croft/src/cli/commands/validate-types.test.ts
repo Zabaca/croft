@@ -70,6 +70,60 @@ export default transform({
 
 const validateTypes = (p: TestProject) => cli(["validate", "--types", "--json"], { cwd: p.root, env: { PATH: process.env.PATH } });
 
+/** Plain validate's next step when TS transforms read assets (R51-02). */
+const TYPES_REASON = (names: string) => `plain validate does not run tsc: --types checks the input columns read by ${names}`;
+
+describe("plain validate points at --types when a TS transform reads an asset (R51-02)", () => {
+  const ISSUES = built("github_issues", "ingest", ["id"], [col("id", "BIGINT"), col("title", "VARCHAR"), col("user", "JSON")]);
+
+  test("after a clean check: croft validate --types first, then the preview of what changed", async () => {
+    const p = makeProject({
+      files: { "assets/github_issues.ts": ISSUES_TS, "assets/open_issues.sql": OPEN_SQL("author"), "assets/triage.ts": TRIAGE_TS("author") },
+    });
+    catalog(p, [{ ...ISSUES, codeHash: "an older hash" }]);
+    const r = await cli(["validate", "--json"], { cwd: p.root });
+    expect(r.json.problems.filter((x: { severity: string }) => x.severity !== "info")).toEqual([]);
+    expect(r.json.next).toEqual([
+      { command: "croft validate --types", reason: TYPES_REASON("triage") },
+      { command: "croft preview github_issues", reason: "see what the changed code builds before running it" },
+    ]);
+    // Asked for one asset, it still names the check: tsc checks the whole project.
+    const one = await cli(["validate", "open_issues", "--json"], { cwd: p.root });
+    expect(one.json.next[0]).toEqual({ command: "croft validate --types", reason: TYPES_REASON("triage") });
+    // Human output shows it as the next step.
+    expect((await cli(["validate"], { cwd: p.root })).stdout).toContain("next: croft validate --types");
+  }, 60_000);
+
+  test("not after --types, not when there is an error to fix, and not without a TS transform that reads an asset", async () => {
+    const p = makeProject({
+      files: { "assets/github_issues.ts": ISSUES_TS, "assets/open_issues.sql": OPEN_SQL("author"), "assets/triage.ts": TRIAGE_TS("author") },
+    });
+    withTypescript(p);
+    catalog(p, [ISSUES]);
+    const typed = await validateTypes(p);
+    expect(typed.json.problems).toEqual([]);
+    expect(typed.json.next).toEqual([]);
+
+    writeFiles(p.root, { "assets/open_issues.sql": "-- key: id\nSELECT id, titel FROM github_issues\n" });
+    const broken = await cli(["validate", "--json"], { cwd: p.root });
+    expect(broken.exit).toBe(2);
+    expect(broken.json.next).toEqual([{ command: "croft validate", reason: "re-check after the edit" }]);
+
+    const q = makeProject({ files: { "assets/github_issues.ts": ISSUES_TS, "assets/open_issues.sql": OPEN_SQL("author") } });
+    catalog(q, [ISSUES]);
+    expect((await cli(["validate", "--json"], { cwd: q.root })).json.next).toEqual([]);
+  }, 60_000);
+
+  test("several TS transforms are named, up to a few", async () => {
+    const files: Record<string, string> = { "assets/github_issues.ts": ISSUES_TS, "assets/open_issues.sql": OPEN_SQL("author") };
+    for (const n of ["a_triage", "b_triage", "c_triage", "d_triage", "e_triage"]) files[`assets/${n}.ts`] = TRIAGE_TS("author");
+    const p = makeProject({ files });
+    catalog(p, [ISSUES]);
+    const r = await cli(["validate", "--json"], { cwd: p.root });
+    expect(r.json.next).toEqual([{ command: "croft validate --types", reason: TYPES_REASON("a_triage, b_triage, c_triage and 2 more") }]);
+  }, 60_000);
+});
+
 describe("validate --types catches a TS transform reading a column its input does not have", () => {
   test("renamed in the upstream SQL, before any run: UNKNOWN_INPUT_COLUMN at the line, the new name as the fix", async () => {
     const p = makeProject({
@@ -87,9 +141,12 @@ describe("validate --types catches a TS transform reading a column its input doe
     const typesDir = join(p.root, ".croft", "types");
     expect(readFileSync(join(typesDir, "open_issues.d.ts"), "utf8")).toContain("  author: string | null;\n");
 
-    // The SQL renames the column; nothing has run since. Plain validate binds the SQL, which is fine.
+    // The SQL renames the column; nothing has run since. Plain validate binds the SQL, which is fine, and points at
+    // --types: only tsc sees what the TS transform reads.
     writeFiles(p.root, { "assets/open_issues.sql": OPEN_SQL("author_login") });
-    expect((await cli(["validate", "--json"], { cwd: p.root })).json.problems).toEqual([]);
+    const plain = await cli(["validate", "--json"], { cwd: p.root });
+    expect(plain.json.problems).toEqual([]);
+    expect(plain.json.next).toEqual([{ command: "croft validate --types", reason: TYPES_REASON("triage") }]);
     const r = await validateTypes(p);
     expect(r.exit).toBe(2);
     expect(r.json.data.types).toEqual({ status: "failed", errors: 1 });
@@ -117,6 +174,23 @@ describe("validate --types catches a TS transform reading a column its input doe
     const fixed = await validateTypes(p);
     expect(fixed.json.problems).toEqual([]);
     expect(fixed.exit).toBe(0);
+  }, 60_000);
+
+  test("a tsconfig.json with \"pretty\": true: tsc still prints lines croft parses (--pretty false wins), no escapes", async () => {
+    const p = makeProject({
+      files: { "assets/github_issues.ts": ISSUES_TS, "assets/open_issues.sql": OPEN_SQL("author_login"), "assets/triage.ts": TRIAGE_TS("author") },
+    });
+    const pretty = JSON.parse(TSCONFIG()) as { compilerOptions: Record<string, unknown> };
+    pretty.compilerOptions.pretty = true;
+    withTypescript(p, JSON.stringify(pretty, null, 2));
+    catalog(p, [built("github_issues", "ingest", ["id"], [col("id", "BIGINT"), col("title", "VARCHAR"), col("user", "JSON")])]);
+    const r = await validateTypes(p);
+    expect(r.exit).toBe(2);
+    expect(r.json.data.types).toEqual({ status: "failed", errors: 1 });
+    expect(r.json.problems).toEqual([expect.objectContaining({
+      code: "UNKNOWN_INPUT_COLUMN", file: "assets/triage.ts", line: 6, message: 'open_issues has no column "author"; did you mean "author_login"?',
+    })]);
+    expect(JSON.stringify(r.json)).not.toContain("\\u001b");
   }, 60_000);
 
   test("removed from a built input: the hint lists its columns; a destructured name keeps its binding; a computed name needs Row", async () => {
@@ -166,6 +240,76 @@ export default transform({
   }, 60_000);
 });
 
+describe("type errors on a generated row type's columns get a hint that says what to write (R51-09)", () => {
+  const REVENUE_TS = (expr: string) => `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["sales"],
+  key: "id",
+  incremental: true,
+  async *rows({ newRows }) {
+    for await (const row of newRows("sales")) {
+      yield { id: row.id, revenue: ${expr} };
+    }
+  },
+});
+`;
+
+  test("arithmetic on a BIGINT (number | bigint): Number(row.x); a column that may be NULL: a default", async () => {
+    // Every integer from CSV or JSON is BIGINT: a number, and a bigint only beyond ±2^53 (db/values.ts).
+    const p = makeProject({ files: { "assets/sales.ts": ISSUES_TS, "assets/revenue.ts": REVENUE_TS("row.quantity * row.unit_price") } });
+    withTypescript(p);
+    catalog(p, [built("sales", "ingest", ["id"], [col("id", "BIGINT"), col("quantity", "BIGINT"), col("unit_price", "DOUBLE")])]);
+    const r = await validateTypes(p);
+    expect(r.exit).toBe(2);
+    expect(r.json.data.types).toEqual({ status: "failed", errors: 3 });
+    const [quantityNull, bigint, priceNull] = r.json.problems;
+    expect(quantityNull).toMatchObject({
+      code: "ASSET_INVALID", asset: "revenue", file: "assets/revenue.ts", line: 8,
+      message: "TS18047: 'row.quantity' is possibly 'null'.",
+      hint: "quantity of sales may be NULL (every column but the key may): give it a default, (row.quantity ?? 0), or skip the rows where it is null",
+      fix: { kind: "edit", description: "handle a NULL row.quantity on line 8", file: "assets/revenue.ts", line: 8 },
+      details: { tsc: "TS18047", input: "sales", column: "quantity" },
+    });
+    expect(bigint).toMatchObject({
+      code: "ASSET_INVALID", line: 8,
+      message: "TS2365: Operator '*' cannot be applied to types 'number | bigint' and 'number'.",
+      hint: "a BIGINT column is number | bigint (a bigint only beyond ±2^53): for arithmetic, write Number(row.quantity), exact up to ±2^53",
+      fix: { kind: "edit", description: "convert the BIGINT value with Number(row.quantity) on line 8", file: "assets/revenue.ts", line: 8 },
+      details: { tsc: "TS2365", input: "sales", column: "quantity" },
+    });
+    expect(priceNull).toMatchObject({ message: "TS18047: 'row.unit_price' is possibly 'null'.", details: { column: "unit_price" } });
+
+    // What the hints say to write passes.
+    writeFiles(p.root, { "assets/revenue.ts": REVENUE_TS("Number(row.quantity ?? 0) * (row.unit_price ?? 0)") });
+    const fixed = await validateTypes(p);
+    expect(fixed.json.problems).toEqual([]);
+    expect(fixed.exit).toBe(0);
+  }, 60_000);
+
+  test("a number | bigint anywhere else still gets the Number() hint; other errors keep the generic one", async () => {
+    const p = makeProject({ files: { "assets/sales.ts": ISSUES_TS, "assets/revenue.ts": REVENUE_TS("Math.round(row.id) + ([] as string[]).length.nope") } });
+    withTypescript(p);
+    catalog(p, [built("sales", "ingest", ["id"], [col("id", "BIGINT")])]);
+    const r = await validateTypes(p);
+    expect(r.json.problems.map((x: { message: string; hint: string }) => [x.message.slice(0, 7), x.hint.slice(0, 40)])).toEqual([
+      ["TS2345:", "a BIGINT column is number | bigint (a bi"],
+      ["TS2339:", "fix the type error; the project's own ts"],
+    ]);
+    expect(r.json.problems[0].fix.description).toBe("convert the BIGINT value with Number(row.id) on line 8");
+  }, 60_000);
+
+  test("a quoted column name, and a text column's default", async () => {
+    const p = makeProject({ files: { "assets/sales.ts": ISSUES_TS, "assets/revenue.ts": REVENUE_TS("row[\"Unit Price\"] * 2 + row.region.length") } });
+    withTypescript(p);
+    catalog(p, [built("sales", "ingest", ["id"], [col("id", "BIGINT"), col("Unit Price", "DOUBLE"), col("region", "VARCHAR")])]);
+    const r = await validateTypes(p);
+    expect(r.json.problems.map((x: { hint: string }) => x.hint)).toEqual([
+      "Unit Price of sales may be NULL (every column but the key may): give it a default, (row[\"Unit Price\"] ?? 0), or skip the rows where it is null",
+      "region of sales may be NULL (every column but the key may): give it a default, (row.region ?? \"\"), or skip the rows where it is null",
+    ]);
+  }, 60_000);
+});
+
 describe("includesInputTypes: whether tsconfig.json reaches .croft/types", () => {
   test("only a pattern naming .croft does: TypeScript's wildcards skip dot folders", () => {
     expect(includesInputTypes(TSCONFIG())).toBe(true);
@@ -206,8 +350,8 @@ describe("the types folder", () => {
     expect(r.json.problems).toEqual([expect.objectContaining({
       severity: "info", code: "INSTALL_FAILED", file: "tsconfig.json",
       message: "tsconfig.json does not include .croft/types, so TS transforms read every input row as a Row: tsc cannot catch a column renamed upstream",
-      hint: 'add ".croft/types" to "include" in tsconfig.json (croft init writes it that way)',
-      fix: { kind: "edit", description: 'add ".croft/types" to the "include" list', file: "tsconfig.json" },
+      hint: 'add ".croft/types/**/*.d.ts" to "include" in tsconfig.json, as croft init writes it',
+      fix: { kind: "edit", description: 'add ".croft/types/**/*.d.ts" to the "include" list', file: "tsconfig.json" },
     })]);
     // No catalog, no types: nothing to say.
     const q = makeProject({ files: { "assets/github_issues.ts": ISSUES_TS } });

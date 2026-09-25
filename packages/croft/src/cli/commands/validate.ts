@@ -27,11 +27,13 @@
 //    - the unoptimized plan's scans join the AST inputs, and the graph (order, CYCLE) is built again with them.
 // 3. --types: first .croft/types, the input row types of TS transforms (project/types-gen.ts), from the column
 //    cache with each bound SQL asset's output columns as its code is now; then the project's own
-//    node_modules/.bin/tsc --noEmit. A TS transform that reads a column its input does not have (renamed or
-//    removed upstream, even in SQL not yet run) is a missing property of a generated row type, reported as
-//    UNKNOWN_INPUT_COLUMN with the runtime's did-you-mean and edit fix; every other type error is ASSET_INVALID.
-//    No tsc (or no tsconfig.json) is an info problem and a skip; croft never installs anything. A tsconfig.json
-//    whose "include" leaves out .croft/types is an info problem with the edit.
+//    node_modules/.bin/tsc --noEmit --pretty false. A TS transform that reads a column its input does not have
+//    (renamed or removed upstream, even in SQL not yet run) is a missing property of a generated row type,
+//    reported as UNKNOWN_INPUT_COLUMN with the runtime's did-you-mean and edit fix; every other type error is
+//    ASSET_INVALID, worded for the two a generated type causes most: a column that may be NULL, and arithmetic on
+//    a BIGINT (number | bigint: Number(row.x)). No tsc (or no tsconfig.json) is an info problem and a skip; croft
+//    never installs anything. A tsconfig.json whose "include" leaves out .croft/types is an info problem with the
+//    edit. Plain validate names --types as the next step when TS transforms read assets (nextSteps).
 // 4. --hook: what Claude Code's PostToolUse hook runs after an edit (agent/hook.ts, §9 item 7): the edited asset
 //    and what it can break. Errors go to stderr with exit 2; warnings only, to Claude as additionalContext (JSON
 //    on stdout, exit 0); croft's own failures exit 1, which never blocks Claude (validateHook, hookHuman).
@@ -70,6 +72,8 @@ const TSC_TIMEOUT_MS = 180_000;
 const TSC_SHOWN = 50;
 /** Assets named in one `croft preview` next step. */
 const PREVIEW_NEXT = 10;
+/** TS transforms named in the `croft validate --types` next step. */
+const TYPES_NEXT = 3;
 /** Fire times shown for each schedule (§8). */
 const NEXT_FIRES = 3;
 
@@ -96,6 +100,9 @@ export interface ValidateReport {
   data: ValidateData;
   /** Project-level problems first (discovery, CYCLE), then each checked asset's in run order, then tsc's. */
   problems: Problem[];
+  /** The project's TS transforms that read an asset, sorted: only --types (tsc) checks the columns they read, so
+   *  plain validate names it as a next step. */
+  tsReaders?: string[];
 }
 
 /** croft validate. Its spec (usage, options) is in commands/index.ts. */
@@ -143,16 +150,25 @@ function fireTimes(next: readonly string[]): string {
   }).join(", ");
 }
 
-/** What to do after validate: re-check after fixing an error or warning; with none, preview the assets whose
- *  code changed since their last build; in an empty project, a template. */
+/** What to do after validate: re-check after fixing an error or warning; with none, `croft validate --types` when
+ *  it was not asked for and TS transforms read assets (only tsc sees a column they read that was renamed upstream),
+ *  then preview the assets whose code changed since their last build; in an empty project, a template. */
 export function nextSteps(r: ValidateReport): Next[] {
   const fixable = r.problems.some((p) => p.severity === "error" || (p.severity === "warning" && !(p.fix && "requiresHuman" in p.fix && p.fix.requiresHuman)));
   // A check with --types is re-checked with it: only tsc confirms a type error's fix.
   if (fixable) return [{ command: r.data.types ? "croft validate --types" : "croft validate", reason: "re-check after the edit" }];
   if (r.data.order.length === 0) return [{ command: "croft new --list", reason: "assets/ has no assets yet; start from a template" }];
+  const next: Next[] = [];
+  const readers = r.tsReaders ?? [];
+  if (!r.data.types && readers.length) {
+    const names = readers.length > TYPES_NEXT
+      ? `${readers.slice(0, TYPES_NEXT).join(", ")} and ${readers.length - TYPES_NEXT} more`
+      : readers.length === 1 ? readers[0]! : `${readers.slice(0, -1).join(", ")} and ${readers.at(-1)}`;
+    next.push({ command: "croft validate --types", reason: `plain validate does not run tsc: --types checks the input columns read by ${names}` });
+  }
   const changed = r.data.assets.filter((a) => a.codeChanged).map((a) => a.name).slice(0, PREVIEW_NEXT);
-  if (changed.length) return [{ command: `croft preview ${changed.join(" ")}`, reason: "see what the changed code builds before running it" }];
-  return [];
+  if (changed.length) next.push({ command: `croft preview ${changed.join(" ")}`, reason: "see what the changed code builds before running it" });
+  return next;
 }
 
 /**
@@ -238,7 +254,10 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
     data.types = t.types;
     problems.push(...t.problems);
   }
-  return { data, problems: dedupe(problems) };
+  // Every TS transform of the project that reads an asset, selected or not: tsc checks the whole project.
+  const tsReaders = resolved.assets.filter((a) => a.kind === "ts" && a.inputs.some((x) => byName.has(x) && x !== a.name))
+    .map((a) => a.name).sort();
+  return { data, problems: dedupe(problems), tsReaders };
 }
 
 /** runs.sqlite's catalog mirror; empty before the first run (a read-only command creates nothing), or when it
@@ -684,14 +703,17 @@ export function includesInputTypes(tsconfigText: string): boolean | null {
   });
 }
 
+/** The "include" pattern croft init writes for the input row types (agent/templates.ts tsconfigJson). */
+const TYPES_INCLUDE = `${TYPES_DIR}/**/*.d.ts`;
+
 /** An info problem when there are input types and tsconfig.json leaves them out (a project made before them). */
 function typesNotIncluded(root: string, generated: TypesResult | undefined): Problem[] {
   if (!generated?.assets.length || includesInputTypes(readText(join(root, "tsconfig.json"))) !== false) return [];
   const p = problem("INSTALL_FAILED", {
     message: `tsconfig.json does not include ${TYPES_DIR}, so TS transforms read every input row as a Row: tsc cannot catch a column renamed upstream`,
-    hint: `add "${TYPES_DIR}" to "include" in tsconfig.json (croft init writes it that way)`,
+    hint: `add "${TYPES_INCLUDE}" to "include" in tsconfig.json, as croft init writes it`,
     file: "tsconfig.json",
-    fix: { kind: "edit", description: `add "${TYPES_DIR}" to the "include" list`, file: "tsconfig.json" },
+    fix: { kind: "edit", description: `add "${TYPES_INCLUDE}" to the "include" list`, file: "tsconfig.json" },
     details: { phase: "types" },
   });
   return [{ ...p, severity: "info" }];
@@ -715,10 +737,11 @@ export async function typecheck(root: string, shell: Readonly<Record<string, str
       "add a tsconfig.json that includes assets and lib (croft init writes one for a new project)");
   }
   // A JavaScript entry (Bun's .bin links to typescript/bin/tsc) runs with this Bun, so no Node is needed; a
-  // shell shim (other package managers) runs as it is. Its output is a pipe, so tsc prints plain
-  // `file(line,col): error TSnnnn: text` lines.
+  // shell shim (other package managers) runs as it is. --pretty false makes tsc print plain
+  // `file(line,col): error TSnnnn: text` lines even when tsconfig.json says "pretty": true (the flag wins).
   const shim = /^#!\s*\/(usr\/)?bin\/(env\s+)?(ba|z)?sh\b/.test(readText(bin).slice(0, 64));
-  const cmd = shim ? [bin, "--noEmit"] : [process.execPath, bin, "--noEmit"];
+  const args = ["--noEmit", "--pretty", "false"];
+  const cmd = shim ? [bin, ...args] : [process.execPath, bin, ...args];
   const env: Record<string, string> = { NO_COLOR: "1" };
   for (const k of ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SYSTEMROOT"]) {
     const v = shell[k];
@@ -813,12 +836,105 @@ function tscProblem(d: TscDiagnostic, root: string, inputTypes?: TypesResult): P
       details: { tsc: d.code, input: indexed.asset, types: indexed.file },
     });
   }
+  if (file) {
+    const worded = nullableColumn(d, root, at, file, inputTypes) ?? bigintValue(d, root, at, file, inputTypes);
+    if (worded) return worded;
+  }
   return problem("ASSET_INVALID", {
     message: `${d.code}: ${d.message}`,
     hint: "fix the type error; the project's own tsc --noEmit reports it",
     ...at,
     ...(file ? { fix: { kind: "edit" as const, description: `fix the type error${d.line !== undefined ? ` on line ${d.line}` : ""}`, file, ...(d.line !== undefined ? { line: d.line } : {}) } } : {}),
     details: { tsc: d.code },
+  });
+}
+
+/** tsc on a value that may be NULL: `'row.amount' is possibly 'null'.` (TS18047; TS18049 adds undefined), or, for
+ *  an element access such as row["Unit Price"], `Object is possibly 'null'.` at it (TS2531, TS2533). */
+const POSSIBLY_NULL = /^'(.+)' is possibly 'null'(?: or 'undefined')?\.$/;
+const OBJECT_POSSIBLY_NULL = /^Object is possibly 'null'(?: or 'undefined')?\.$/;
+/** The property an expression ends with: row.amount, row?.amount, row["Unit Price"]. */
+const LAST_PROPERTY = /(?:\??\.([A-Za-z_$][\w$]*)|\[("(?:[^"\\]|\\.)*")\])$/;
+/** A property read in code: row.amount, row?.amount, row["Unit Price"]. */
+const PROPERTY_READ = /[A-Za-z_$][\w$]*(?:\??\.([A-Za-z_$][\w$]*)|\[("(?:[^"\\]|\\.)*")\])/g;
+/** A default of a column's type, for the NULL hint. */
+const DEFAULTS: Record<string, string> = { number: "0", "number | bigint": "0", bigint: "0n", string: "\"\"", boolean: "false" };
+
+const locate = (file: string, line: number | undefined) => ({ file, ...(line !== undefined ? { line } : {}) });
+const onLine = (line: number | undefined) => (line !== undefined ? ` on line ${line}` : "");
+/** A column's TS type in a generated row type, or undefined (never an Object.prototype member). */
+const typeOf = (t: GeneratedType, column: string): string | undefined => (Object.hasOwn(t.columnTypes, column) ? t.columnTypes[column] : undefined);
+/** The column a property read names: `amount`, or the text of `["Unit Price"]`; null for a string JSON refuses. */
+function propertyName(plain: string | undefined, quoted: string | undefined): string | null {
+  if (plain !== undefined) return plain;
+  try {
+    return JSON.parse(quoted!) as string;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A column of a generated row type that may be NULL, used as if it could not be (R51-09): every column but the
+ * key and croft's own may hold NULL, so the type says `| null`. The hint names the column and a default of its
+ * type. Null when the expression does not end with such a column.
+ */
+function nullableColumn(d: TscDiagnostic, root: string, at: Pick<Problem, "asset" | "line" | "column">, file: string, types?: TypesResult): Problem | null {
+  if (!types) return null;
+  const first = d.message.split("\n")[0]!;
+  let expr = POSSIBLY_NULL.exec(first)?.[1];
+  if (expr === undefined && OBJECT_POSSIBLY_NULL.test(first) && at.line !== undefined && at.column !== undefined) {
+    const text = readText(join(root, file)).split("\n")[at.line - 1] ?? "";
+    const read = new RegExp(PROPERTY_READ.source, "y");
+    read.lastIndex = at.column - 1;
+    expr = read.exec(text)?.[0];
+  }
+  const p = expr === undefined ? null : LAST_PROPERTY.exec(expr);
+  const column = p ? propertyName(p[1], p[2]) : null;
+  if (expr === undefined || column === null) return null;
+  const owners = Object.values(types.types).filter((t) => typeOf(t, column)?.endsWith(" | null"));
+  if (!owners.length) return null;
+  const input = owners.length === 1 ? owners[0]! : null;
+  const base = input ? typeOf(input, column)!.slice(0, -" | null".length) : "";
+  const fallback = Object.hasOwn(DEFAULTS, base) ? DEFAULTS[base] : undefined;
+  return problem("ASSET_INVALID", {
+    message: `${d.code}: ${d.message}`,
+    hint: `${column}${input ? ` of ${input.asset}` : ""} may be NULL (every column but the key may): give it a default, `
+      + `${fallback ? `(${expr} ?? ${fallback})` : `${expr} ?? <default>`}, or skip the rows where it is null`,
+    ...at,
+    fix: { kind: "edit", description: `handle a NULL ${expr}${onLine(at.line)}`, ...locate(file, at.line) },
+    details: { tsc: d.code, ...(input ? { input: input.asset, types: input.file } : {}), column },
+  });
+}
+
+/**
+ * Arithmetic (or a number parameter) on a BIGINT (R51-09). A BIGINT reaches a TS transform as a number, and as a
+ * bigint only beyond ±2^53 (db/values.ts), so its generated type is `number | bigint`: honest, but `row.qty * 2`
+ * does not compile. The hint says to convert it with Number(), naming the first BIGINT column read from where
+ * tsc points on. Null when tsc's message names no `number | bigint`.
+ */
+function bigintValue(d: TscDiagnostic, root: string, at: Pick<Problem, "asset" | "line" | "column">, file: string, types?: TypesResult): Problem | null {
+  if (!d.message.includes("number | bigint")) return null;
+  const text = at.line !== undefined ? readText(join(root, file)).split("\n")[at.line - 1] ?? "" : "";
+  let found: { expr: string; column: string; owners: GeneratedType[] } | null = null;
+  for (const m of text.slice(Math.max(0, (at.column ?? 1) - 1)).matchAll(PROPERTY_READ)) {
+    const column = propertyName(m[1], m[2]);
+    const owners = column === null ? [] : Object.values(types?.types ?? {}).filter((t) => typeOf(t, column)?.startsWith("number | bigint"));
+    if (column !== null && owners.length) {
+      found = { expr: m[0], column, owners };
+      break;
+    }
+  }
+  const convert = `Number(${found?.expr ?? "…"})`;
+  return problem("ASSET_INVALID", {
+    message: `${d.code}: ${d.message}`,
+    hint: `a BIGINT column is number | bigint (a bigint only beyond ±2^53): for arithmetic, write ${convert}, exact up to ±2^53`,
+    ...at,
+    fix: { kind: "edit", description: `convert the BIGINT value with ${convert}${onLine(at.line)}`, ...locate(file, at.line) },
+    details: {
+      tsc: d.code,
+      ...(found ? { ...(found.owners.length === 1 ? { input: found.owners[0]!.asset } : {}), column: found.column } : {}),
+    },
   });
 }
 

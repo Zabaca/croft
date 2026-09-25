@@ -6,10 +6,12 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import ts from "typescript";
 import { putCatalog, type CatalogAsset } from "../history/catalog.ts";
+import { cleanColumnName } from "../load/stage.ts";
+import { renderTypes, type TypeSource } from "../project/types-gen.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { parseSqlHeader } from "../project/sql-asset.ts";
 import { validateProject } from "../cli/commands/validate.ts";
-import { cleanup, makeProject, runsDb, SRC } from "../cli/commands/inspect-testkit.ts";
+import { cleanup, makeProject, runsDb, SRC, writeFiles } from "../cli/commands/inspect-testkit.ts";
 import { scan } from "./contract-testkit.ts";
 import {
   DEFAULT_PAGINATION, EXAMPLE_INPUT, NEW_KINDS, type NewKind, type Pagination, PAGINATIONS, secretNameFor, type Template,
@@ -212,26 +214,57 @@ describe("file, sql and transform templates", () => {
     expect(t).toMatchObject({ kind: "transform", reads: "stripe_charges", secrets: [] });
     for (const s of [
       "inputs: [\"stripe_charges\"],", "key: \"id\",", "incremental: true,", "confirmAbove: 1000,",
-      "for await (const row of newRows<Input>(\"stripe_charges\")) {", "yield { id: row.id, result };", "checks: [\"not_null(result)\"],",
-      "//   const res = await http.post(", "type Input = { id: unknown };", "croft preview charge_labels --rows 20",
+      "for await (const row of newRows(\"stripe_charges\")) {", "yield { id: row.id, result };", "checks: [\"not_null(result)\"],",
+      "//   const res = await http.post(", "croft preview charge_labels --rows 20",
     ]) expect(t.content, s).toContain(s);
     // The paid call is only a comment: as written it makes no request, so it reads no secret and is not paid work.
     const code = t.content.split("\n").filter((l) => !/^\s*\/\//.test(l)).map((l) => l.replace(/\s+\/\/.*$/, "")).join("\n");
     expect(code).not.toMatch(/\bhttp\b|\bsecret\(|fetch\(/);
-    expect(templateFor("transform", "x_items").content).toContain("newRows<Input>(\"example_sales\")");
+    expect(templateFor("transform", "x_items").content).toContain("newRows(\"example_sales\")");
+  });
+
+  test("transform: newRows() without a type argument, so rows get the input's generated row type, and it says so", () => {
+    const t = templateFor("transform", "charge_labels", { input: { asset: "stripe_charges", key: ["id"] } });
+    const code = t.content.split("\n").filter((l) => !/^\s*\/\//.test(l)).map((l) => l.replace(/\s+\/\/.*$/, "")).join("\n");
+    // An explicit type argument picks the untyped overload: validate --types would never see a rename (R51-01).
+    expect(code).not.toMatch(/newRows\s*</);
+    expect(code).not.toMatch(/\btype Input\b/);
+    const text = t.content.replace(/\n\/\/ /g, " ");
+    expect(text).toContain("croft validate --types");
+    expect(text).toContain(".croft/types/stripe_charges.d.ts");
+    expect(text).toContain("croft describe stripe_charges");
+    expect(t.edit).not.toContain("Input");
   });
 
   test("transform: a composite key is copied column by column, odd names are quoted, and result never shadows the key", () => {
     const composite = templateFor("transform", "t_items", { input: { asset: "daily_sales", key: ["day", "region"] } }).content;
     expect(composite).toContain("key: [\"day\", \"region\"],");
     expect(composite).toContain("yield { day: row.day, region: row.region, result };");
-    expect(composite).toContain("type Input = { day: unknown; region: unknown };");
-    const odd = templateFor("transform", "t_items", { input: { asset: "zones", key: ["Location ID"] } }).content;
-    expect(odd).toContain("yield { \"Location ID\": row[\"Location ID\"], result };");
     const clash = templateFor("transform", "t_items", { input: { asset: "scores", key: ["result"] } }).content;
     expect(clash).toContain("yield { result: row.result, result_value };");
     expect(clash).toContain("checks: [\"not_null(result_value)\"],");
+    // DuckDB names are case-insensitive: Result and result would be one column.
+    expect(templateFor("transform", "t_items", { input: { asset: "scores", key: ["Result"] } }).content).toContain("yield { Result: row.Result, result_value };");
     expect(() => templateFor("transform", "t_items", { input: { asset: "events", key: [] } })).toThrow(/has no key/);
+  });
+
+  test("transform: an input key that is no clean column name is read by its name and written by its cleaned name (§7, R51-08)", () => {
+    // A TS asset's output names are cleaned ("Region Name" becomes Region_Name): the key must name the cleaned
+    // column, or it is missing from every row (KEY_NULL at the first preview).
+    const odd = templateFor("transform", "t_items", { input: { asset: "zones", key: ["Location ID"] } }).content;
+    expect(odd).toContain("  key: \"Location_ID\",");
+    expect(odd).toContain("yield { Location_ID: row[\"Location ID\"], result };");
+    const mixed = templateFor("transform", "t_items", { input: { asset: "daily_region", key: ["day", "Region Name"] } }).content;
+    expect(mixed).toContain("  key: [\"day\", \"Region_Name\"],");
+    expect(mixed).toContain("yield { day: row.day, Region_Name: row[\"Region Name\"], result };");
+    expect(mixed).toContain("const result = `${row.day} ${row[\"Region Name\"]}`;");
+    // A leading digit, a $ (an identifier, but no clean name), and two keys that clean to one name.
+    const digits = templateFor("transform", "t_items", { input: { asset: "x", key: ["2024 total", "$id"] } }).content;
+    expect(digits).toContain("  key: [\"col_2024_total\", \"id\"],");
+    expect(digits).toContain("yield { col_2024_total: row[\"2024 total\"], id: row.$id, result };");
+    const twins = templateFor("transform", "t_items", { input: { asset: "x", key: ["a b", "a_b"] } }).content;
+    expect(twins).toContain("  key: [\"a_b\", \"a_b_2\"],");
+    expect(twins).toContain("yield { a_b: row[\"a b\"], a_b_2: row.a_b, result };");
   });
 });
 
@@ -249,6 +282,50 @@ const EXAMPLE_CATALOG: CatalogAsset = {
   ],
   cursor: null, lastLoadedAt: "2026-09-22T18:00:00.000000Z", lastReplacedAt: null, lastRunId: "r_0922_1100_aaaa", codeHash: "hash-example",
 };
+
+/** An input's row type as a run leaves it (project/types-gen.ts renderTypes). */
+const source = (asset: string, key: string[], columns: [string, string][]): TypeSource =>
+  ({ asset, key, from: "run", columns: columns.map(([name, type]) => ({ name, type })) });
+
+/** tsc over the files in a project with the tsconfig croft init writes, with .croft/types rendered from `types`
+ *  (none: the folder does not exist yet). Each error as "<file>: <message>". */
+function typeErrors(files: Record<string, string>, types: TypeSource[] = []): string[] {
+  const p = makeProject({ timezone: "UTC", files });
+  const rendered = renderTypes(types).files;
+  for (const [name, text] of rendered) writeFiles(p.root, { [`.croft/types/${name}`]: text });
+  const paths = Object.keys(files).filter((f) => f.endsWith(".ts")).map((f) => join(p.root, f));
+  writeFileSync(join(p.root, "tsconfig.json"), tsconfigJson());
+  const options = {
+    ...(JSON.parse(tsconfigJson()).compilerOptions as object),
+    target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler,
+    typeRoots: [join(SRC, "..", "node_modules", "@types")],
+  } as ts.CompilerOptions;
+  const program = ts.createProgram([...paths, ...[...rendered.keys()].map((n) => join(p.root, ".croft", "types", n))], options);
+  return ts.getPreEmitDiagnostics(program)
+    .filter((d) => d.file && paths.includes(d.file.fileName))
+    .map((d) => `${d.file!.fileName.split("/").pop()}: ${ts.flattenDiagnosticMessageText(d.messageText, "\n")}`);
+}
+
+describe("the transform template reads its input's generated row type, so validate --types sees a rename (R51-01)", () => {
+  const t = templateFor("transform", "labels", { input: { asset: "orders", key: ["order_id"] } });
+  /** The template edited the way its comments say: the result computed from a column of the input. */
+  const edited = t.content.replace(/^( *)const result = `.*$/m, "$1const result = String(row.region).toUpperCase();");
+  const orders = (region: string) => source("orders", ["order_id"], [["order_id", "BIGINT"], [region, "VARCHAR"], ["_loaded_at", "TIMESTAMPTZ"]]);
+
+  test("as written and edited, it type-checks before the input has types (first run) and after", () => {
+    expect(edited).toContain("String(row.region)");
+    for (const text of [t.content, edited]) {
+      expect(typeErrors({ [t.path]: text })).toEqual([]);
+      expect(typeErrors({ [t.path]: text }, [orders("region")])).toEqual([]);
+    }
+  }, 60_000);
+
+  test("a column renamed upstream is a type error on the generated row type", () => {
+    expect(typeErrors({ [t.path]: edited }, [orders("area")])).toEqual([
+      "labels.ts: Property 'region' does not exist on type 'OrdersRow'.",
+    ]);
+  }, 60_000);
+});
 
 describe("every template passes croft validate as written", () => {
   test("in a new project (example_sales built): no error, and the only warning is the api secret not set yet", async () => {
@@ -304,25 +381,21 @@ describe("every template passes croft validate as written", () => {
     expect(assets.get("sql_over_zones")).toMatchObject({ behavior: "replace; key LocationID" });
   }, 60_000);
 
-  test("every TypeScript template type-checks against the real API with the project's tsconfig", () => {
+  test("every TypeScript template type-checks against the real API with the project's tsconfig, before and after the input types exist", () => {
     const templates = [
       ...every(named).filter((t) => t.kind !== "sql"),
       templateFor("transform", "composite_items", { input: { asset: "daily_sales", key: ["day", "region"] } }),
       templateFor("transform", "odd_items", { input: { asset: "zones", key: ["Location ID"] } }),
     ];
-    const p = makeProject({ timezone: "UTC", files: Object.fromEntries(templates.map((t) => [t.path, t.content])) });
-    const paths = templates.map((t) => join(p.root, t.path));
-    writeFileSync(join(p.root, "tsconfig.json"), tsconfigJson());
-    const options = {
-      ...(JSON.parse(tsconfigJson()).compilerOptions as object),
-      target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler,
-      typeRoots: [join(SRC, "..", "node_modules", "@types")],
-    } as ts.CompilerOptions;
-    const program = ts.createProgram(paths, options);
-    const diagnostics = ts.getPreEmitDiagnostics(program)
-      .filter((d) => d.file && paths.includes(d.file.fileName))
-      .map((d) => `${d.file!.fileName.split("/").pop()}: ${ts.flattenDiagnosticMessageText(d.messageText, "\n")}`);
-    expect(diagnostics).toEqual([]);
+    const files = Object.fromEntries(templates.map((t) => [t.path, t.content]));
+    // The first run: no .croft/types yet, so every input row is a Row.
+    expect(typeErrors(files)).toEqual([]);
+    // After the inputs were run or previewed: each transform's rows are its input's generated row type.
+    expect(typeErrors(files, [
+      source("example_sales", ["order_id"], [["order_id", "BIGINT"], ["region", "VARCHAR"], ["amount", "DOUBLE"]]),
+      source("daily_sales", ["day", "region"], [["day", "DATE"], ["region", "VARCHAR"], ["amount", "DOUBLE"]]),
+      source("zones", ["Location ID"], [["Location ID", "BIGINT"], ["Zone", "VARCHAR"]]),
+    ])).toEqual([]);
   }, 60_000);
 
   test("the default input is what croft init makes", () => {
@@ -441,5 +514,19 @@ describe("every api template pages correctly as written", () => {
       { day: "2026-09-01", region: "West", result: "2026-09-01 West" },
     ]);
     expect(asked).toEqual(["daily_sales"]);
+  });
+
+  test("transform: an input key that is no clean name is yielded under the cleaned name its key: says", async () => {
+    const t = templateFor("transform", "t_odd", { input: { asset: "daily_region", key: ["day", "Region Name"] } });
+    const p = makeProject({ timezone: "UTC", files: { [t.path]: t.content } });
+    const newRows = async function* () {
+      yield { day: "2026-09-01", "Region Name": "East", total: 3 };
+    };
+    const rows = await rowsOf(p, t, { newRows });
+    expect(rows).toEqual([{ day: "2026-09-01", Region_Name: "East", result: "2026-09-01 East" }]);
+    const mod = await import(join(p.root, t.path)) as { default: AssetDefinition };
+    expect(mod.default.config.key).toEqual(["day", "Region_Name"]);
+    // The loader keeps a clean name as it is (load/stage.ts), so the key names a column every row has.
+    for (const k of Object.keys(rows[0]!)) expect(cleanColumnName(k, 1)).toBe(k);
   });
 });

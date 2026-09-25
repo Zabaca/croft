@@ -143,7 +143,13 @@ declare module "@zabaca/croft" {
 }
 `);
     expect(r.types).toEqual({
-      GithubIssuesRow: { asset: "github_issues", file: ".croft/types/github_issues.d.ts", columns: ["id", "title", "user", "closed_at", "Weird Name", "_loaded_at"] },
+      GithubIssuesRow: {
+        asset: "github_issues", file: ".croft/types/github_issues.d.ts", columns: ["id", "title", "user", "closed_at", "Weird Name", "_loaded_at"],
+        // As the file writes them: validate --types words its hints from them.
+        columnTypes: {
+          id: "number | bigint", title: "string | null", user: "unknown", closed_at: "unknown", "Weird Name": "number | null", _loaded_at: "string",
+        },
+      },
     });
   });
 

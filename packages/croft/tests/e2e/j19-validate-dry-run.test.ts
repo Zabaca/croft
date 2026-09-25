@@ -327,7 +327,8 @@ test("journey 19b: after the first run, validate binds every SQL asset against t
   const v = await p.json(["validate"]);
   expect(v.code, show(v)).toBe(0);
   expect(v.json.problems).toEqual([]);
-  expect(v.json.next).toEqual([]);
+  // Nothing to fix or preview; issue_triage is a TS transform, and only tsc checks the columns it reads (R51-02).
+  expect(v.json.next).toEqual([{ command: "croft validate --types", reason: "plain validate does not run tsc: --types checks the input columns read by issue_triage" }]);
   expect(assetOf(v.json, "open_issues")).toEqual({
     name: "open_issues", kind: "sql", inputs: ["github_issues"], behavior: "replace; key id", codeChanged: false,
     outputColumns: [
@@ -391,7 +392,10 @@ test("journey 19c: the §4.2 validate JSON: UNKNOWN_COLUMN with an edit fix that
   expect(fixed.json.problems).toEqual([]);
   expect(assetOf(fixed.json, "open_issues")).toMatchObject({ codeChanged: true });
   expect(assetOf(fixed.json, "open_issues").outputColumns.at(-1)).toEqual({ name: "updated_at", type: "TIMESTAMPTZ" });
-  expect(fixed.json.next).toEqual([{ command: "croft preview open_issues", reason: "see what the changed code builds before running it" }]);
+  expect(fixed.json.next).toEqual([
+    { command: "croft validate --types", reason: "plain validate does not run tsc: --types checks the input columns read by issue_triage" },
+    { command: "croft preview open_issues", reason: "see what the changed code builds before running it" },
+  ]);
 
   // A misspelled column in a check is reported on its header line, where the check text has it.
   const withCheck = p.read("assets/open_issues.sql").replace("-- check: not_null(author)", "-- check: not_null(author)\n-- check: comments >= 0 AND numbr > 0");
