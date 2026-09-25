@@ -20,7 +20,7 @@ const init = lazyCommand({
   usage: "croft init [dir] [--claude] [--with-hook] [--no-install]",
   options: {
     claude: { type: "boolean", description: "only refresh CLAUDE.md's croft block and .claude/skills/croft/SKILL.md" },
-    "with-hook": { type: "boolean", description: "also add a Claude Code hook that runs croft validate --hook after each edit under assets/ (.claude/settings.json)" },
+    "with-hook": { type: "boolean", description: "also add a Claude Code hook that runs croft validate --hook after each edit under assets/ or lib/ (merged into .claude/settings.json)" },
     "no-install": { type: "boolean", description: "do not run bun install (the project needs it before its first run)" },
   },
   maxPositionals: 1,
@@ -127,7 +127,7 @@ const validate = lazyCommand({
   usage: "croft validate [asset…] [--types] [--hook]",
   options: {
     types: { type: "boolean", description: "also type-check the project's TypeScript with its own tsc --noEmit" },
-    hook: { type: "boolean", description: "run as a Claude Code hook: read the edited file from the hook's JSON on stdin and validate that asset" },
+    hook: { type: "boolean", description: "run as a Claude Code hook: read the edited file from the hook's JSON on stdin, validate that asset and what reads it; errors on stderr with exit 2, otherwise silent" },
   },
   humanShowsProblems: true,
 }, async () => (await import("./validate.ts")).validate);
