@@ -19,25 +19,32 @@
 //             question on a TTY, the token `croft confirm` carries, or a new token: the step is skipped with
 //             CONFIRMATION_REQUIRED and nothing changes). A "no" fails the step with CONFIRMATION_REQUIRED
 //   trash     the table and its _croft rows to .croft/trash/<asset>/ (safety/trash.ts), its own commit
-//   reset     a second commit (one transaction cannot write two database files): the table dropped, and its state
+//   reset     a later commit (one transaction cannot write two database files): the table dropped, and its state
 //             deleted as for an asset never built: _croft.assets (the cursor), _croft.columns, _croft.files, and its
 //             own positions in _croft.inputs. _croft.writes stays: the history of its writes, and stamps that keep
-//             increasing. The catalog mirror's entry goes too, and a transform's staged chunk
-// The step then runs as the asset's first build. A failure after the reset leaves the asset never built: its previous
-// version is in the trash (Rebuilds.effect says where), and a plain `croft run <asset>` builds it again.
+//             increasing.
+//             - An ingest swaps at commit: the step reads no stored state (FreshStart), its first write resets the
+//               asset in the transaction that writes the new rows, and the catalog mirror is then that write's. A
+//               refetch that fails before it commits leaves the old table as it was (§5: a failed asset keeps its
+//               old data), with a copy in the trash; one that fails after a monotone part committed keeps that part.
+//             - An incremental TS transform is reset in its own commit before its code runs (its chunks commit as
+//               they go); the catalog mirror's entry goes too, and its staged chunk.
+// The step then runs as the asset's first build. A failure after the reset leaves the asset without its old table
+// (never built, or holding what the rebuild saved): its previous version is in the trash (Rebuilds.effect says where),
+// a plain `croft run <asset>` builds it again, and `croft restore <asset>` brings the old version back.
 //
 // CROFT_FAULT=between_trash_and_reset kills the process after the trash committed (crash tests): the table is as it
 // was, with an extra trash file.
 import { rmSync } from "node:fs";
 import { CroftError, problem } from "../core/errors.ts";
-import type { Confirmation, Impact, Problem, StepResult } from "../core/types.ts";
+import type { Confirmation, Impact, Problem, Sql, StepResult } from "../core/types.ts";
 import { hasState } from "../db/state.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
 import type { LogWriter } from "../history/logs.ts";
 import type { RunsDb } from "../history/runs-db.ts";
 import { currentDatabase, readTableSchema, tableRef } from "../load/evolve.ts";
 import { plannedTrashPath, trashFailed, trashTable, type TrashEntry } from "../safety/trash.ts";
-import { croftError, fault } from "./ingest.ts";
+import { croftError, fault, type FreshStart } from "./ingest.ts";
 import { type PlannedStep, rebuildCommand, type StepKind } from "./plan.ts";
 import type { ConfirmDecider, ConfirmRequest, StepOutcome } from "./step.ts";
 import { type GuardCount, pendingChunkDir, rebuildGuard } from "./transform.ts";
@@ -144,10 +151,11 @@ export interface RebuildInput {
   fault?: string;
 }
 
-/** ready: the table is in the trash (when it had rows) and the asset is reset; run the step as its first build.
- *  pending: a token was issued (or deferred); the step is skipped with this outcome. */
+/** ready: the table is in the trash (when it had rows); run the step as its first build. A transform is reset already;
+ *  an ingest gets `fresh`, and its first write resets it in the same transaction (swap at commit). pending: a token
+ *  was issued (or deferred); the step is skipped with this outcome. */
 export type RebuildPrep =
-  | { kind: "ready"; trashed: TrashEntry | null; guard: GuardCount | null }
+  | { kind: "ready"; trashed: TrashEntry | null; guard: GuardCount | null; fresh?: FreshStart }
   | { kind: "pending"; outcome: StepOutcome };
 
 interface Progress { rows: number; guard: GuardCount | null; trashed: TrashEntry | null; reset: boolean }
@@ -216,11 +224,26 @@ export class Rebuilds {
         fault("between_trash_and_reset", i.fault);
       }
     }
+    if (!p.reset && step.kind !== "transform") {
+      // An ingest keeps its old table until the refetch commits: its first write drops it (swap at commit).
+      const progress = p;
+      const fresh: FreshStart = {
+        get done() {
+          return progress.reset;
+        },
+        reset: (tx) => resetInTx(tx, asset),
+        committed: () => {
+          progress.reset = true;
+          log.write(`reset ${asset} for --rebuild with its first commit: ${rebuildWords(step.kind)}`);
+        },
+      };
+      return { kind: "ready", trashed: p.trashed, guard: p.guard, fresh };
+    }
     if (!p.reset) {
       await resetAsset(i.warehouse, asset, { runId: i.runId, signal: i.signal });
       p.reset = true;
       i.runs.catalogDelete(asset);
-      if (step.kind === "transform") rmSync(pendingChunkDir(i.stateDir, asset), { recursive: true, force: true });
+      rmSync(pendingChunkDir(i.stateDir, asset), { recursive: true, force: true });
       log.write(`reset ${asset} for --rebuild: ${rebuildWords(step.kind, p.guard ? { estimatedRequests: p.guard.pending } : {})}`);
     }
     return { kind: "ready", trashed: p.trashed, guard: p.guard };
@@ -243,12 +266,15 @@ async function tableRows(warehouse: DuckWarehouse, asset: string, signal: AbortS
  * the next one increasing. What other assets recorded about reading it (their positions) stays theirs.
  */
 export async function resetAsset(warehouse: DuckWarehouse, asset: string, o: { runId: string; signal?: AbortSignal }): Promise<void> {
-  await warehouse.write(`reset ${asset} for --rebuild`, async (tx) => {
-    await tx.exec(`DROP TABLE IF EXISTS ${tableRef(await currentDatabase(tx), asset)}`);
-    if (!(await hasState(tx))) return;
-    await tx.exec(`DELETE FROM _croft.assets WHERE name = $1`, [asset]);
-    for (const table of ["columns", "files", "inputs"]) await tx.exec(`DELETE FROM _croft.${table} WHERE asset = $1`, [asset]);
-  }, { runId: o.runId, asset, ...(o.signal ? { signal: o.signal } : {}) });
+  await warehouse.write(`reset ${asset} for --rebuild`, (tx) => resetInTx(tx, asset), { runId: o.runId, asset, ...(o.signal ? { signal: o.signal } : {}) });
+}
+
+/** resetAsset's statements, inside a transaction the caller commits: an ingest's first write of a --rebuild. */
+export async function resetInTx(tx: Sql, asset: string): Promise<void> {
+  await tx.exec(`DROP TABLE IF EXISTS ${tableRef(await currentDatabase(tx), asset)}`);
+  if (!(await hasState(tx))) return;
+  await tx.exec(`DELETE FROM _croft.assets WHERE name = $1`, [asset]);
+  for (const table of ["columns", "files", "inputs"]) await tx.exec(`DELETE FROM _croft.${table} WHERE asset = $1`, [asset]);
 }
 
 const count = (n: number) => n.toLocaleString("en-US");

@@ -24,7 +24,9 @@
 //                   destructive command: that is only named in the skip)
 //   --rebuild       a named ingest or incremental TS transform first goes through run/rebuild.ts, once per run:
 //                   confirmation (the cost guard's rows included), trash, reset; then the step runs as the asset's
-//                   first build. An SQL or full-refresh TS transform just runs. A step that fails after the reset
+//                   first build. An ingest's reset rides on its first write (IngestInput.fresh: swap at commit), so
+//                   a refetch that fails before it commits keeps the old table. An SQL or full-refresh TS transform
+//                   just runs. A step that fails after the reset
 //                   says in its hint that the asset is never built (or holds what its rebuild saved so far), that
 //                   a plain run builds it again, and that `croft restore <asset>` brings the previous table back:
 //                   the restore asks first, so it is never in next (afterReset)
@@ -82,7 +84,7 @@ import { tsFingerprint } from "../project/ts-asset.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { loadProject, type Project } from "../project/root.ts";
 import {
-  croftError, fromSince, isRetryable, type ProgressSnapshot, runIngest, savedCursors, SHRINK_ACTION, shrinkCommand, StepProgress,
+  croftError, type FreshStart, fromSince, isRetryable, type ProgressSnapshot, runIngest, savedCursors, SHRINK_ACTION, shrinkCommand, StepProgress,
 } from "./ingest.ts";
 import { unknownInputs } from "./inputs.ts";
 import { backfillUnsupported, buildFirst, isGlob, loadErrors, planRun, type PlannedStep, rebuildSelectors, type RunPlan, skipProblem } from "./plan.ts";
@@ -776,6 +778,8 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
           // --rebuild of an ingest or an incremental TS transform: confirmation, trash and reset first, once per run;
           // then the step is the asset's first build (run/rebuild.ts).
           let out: StepOutcome | undefined;
+          /** --rebuild of an ingest: its old table stays until the refetch's first write replaces it (rebuild.ts). */
+          let fresh: FreshStart | undefined;
           if (step.rebuild && rebuildTrashes(step)) {
             // Copying a large table to the trash is DuckDB's work, not a stalled source: the watchdog waits.
             progress.setPhase("write");
@@ -784,8 +788,11 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
               ...(o.human ?? true ? { confirm: decider } : {}), ...(o.fault ? { fault: o.fault } : {}),
             }).finally(() => progress.setPhase("extract"));
             if (prep.kind === "pending") out = prep.outcome;
-            // One token for both (§6): the cost guard's question for the rows the rebuild's impact counted is answered.
-            else if (prep.guard) confirms.grant("large_reprocess", asset, prep.guard.pending);
+            else {
+              // One token for both (§6): the cost guard's question for the rows the rebuild's impact counted is answered.
+              if (prep.guard) confirms.grant("large_reprocess", asset, prep.guard.pending);
+              fresh = prep.fresh;
+            }
           }
           if (!out) {
             const input: StepInput = {
@@ -803,7 +810,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
               // fails. A --rebuild starts from scratch, so it has no change to settle.
               out = await runIngest({
                 ...input, ...(o.from !== undefined ? { from: o.from } : {}), ...(o.allowShrink ? { confirm: decider } : {}),
-                ...(o.human ?? true ? { confirmChange: decider } : {}), ...(step.rebuild ? { rebuild: true } : {}),
+                ...(o.human ?? true ? { confirmChange: decider } : {}), ...(step.rebuild ? { rebuild: true } : {}), ...(fresh ? { fresh } : {}),
               });
             }
             const trashed = rebuilds.trashed(asset);

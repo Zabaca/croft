@@ -380,7 +380,8 @@ console.log("finished without the fault");
     withRuns(root, (db) => {
       expect(db.getRun(deadId)!.status).toBe("crashed");
       expect(db.stepsFor(deadId)[0]).toMatchObject({ status: "ok" });
-      expect(db.stepsFor(deadId)[0]!.reason).toContain("recovered: 2 commits");
+      expect(db.stepsFor(deadId)[0]!.reason)
+        .toBe("requested (recovered: 2 commits; the extraction did not finish: 4 rows were saved, and the next run continues from ts 2026-09-01T00:00:04Z)");
     });
     expect(existsSync(join(root, ".croft", "staging", deadId))).toBe(false);
   }, 60_000);

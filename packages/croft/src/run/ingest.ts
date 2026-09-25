@@ -16,6 +16,9 @@
 // A changed key, write mode, incremental field or pin is settled before anything is fetched (load/config-change.ts):
 // INGEST_CONFIG_CHANGED, or a confirmation (IngestInput.confirmChange, actions "convert_key" and "pin_change") that
 // trashes the table first and then converts or retypes it.
+// A --rebuild (run/rebuild.ts) starts from no state at all, while the old table stays in the warehouse: the step's
+// first write drops it and its state in the transaction that writes the new rows (IngestInput.fresh), so a refetch
+// that fails before it commits keeps the old table (the trash holds a copy too).
 // A cursor ingest saves its parts as they come while its cursor values arrive in order (monotone partial commits,
 // DESIGN.md §8 "Large first loads", load/partial.ts): each part goes through the same write, and a kill resumes
 // from the cursor the last part saved (PartialRun below). An empty answer where the lookback window held rows is
@@ -190,6 +193,24 @@ export interface IngestInput extends StepInput {
   confirmChange?: ConfirmDecider;
   /** --rebuild: the table is rebuilt from scratch, so a changed behavior or pin needs no check of its own. */
   rebuild?: boolean;
+  /** --rebuild, after its table went to the trash (run/rebuild.ts): the table and its state stay in the warehouse,
+   *  unread, until the step's first write replaces them in its own transaction (swap at commit). */
+  fresh?: FreshStart;
+}
+
+/**
+ * An ingest rebuilt from scratch whose old table stays until the rebuild commits (run/rebuild.ts Rebuilds). Until
+ * `done`, the step reads none of the stored state (no cursor, no file list, no stored columns, no table of its own for
+ * ctx.query), and its first write drops the table and its state (`reset`) in the transaction that writes the new
+ * rows. So a refetch that fails before it commits leaves the old table as it was. Once a write carrying the reset has
+ * committed (a monotone part, say), `done` is true and a retry goes on from what it saved.
+ */
+export interface FreshStart {
+  readonly done: boolean;
+  /** Drop the table and its _croft state, inside the write's transaction, before anything else in it. */
+  reset(tx: Sql): Promise<void>;
+  /** The write that carried the reset committed. */
+  committed(): void;
 }
 
 export interface IngestOutcome {
@@ -214,6 +235,9 @@ interface IngestState {
   known: KnownColumn[];
   files: KnownFile[];
 }
+
+/** The state of an asset never built: what a --rebuild starts from (FreshStart). */
+const NO_STATE: IngestState = { exists: false, cursorValue: null, cursorType: null, rowCount: null, known: [], files: [] };
 
 /** CROFT_FAULT: kill this process at a named point, as a crash would. */
 export function fault(at: string, want: string | undefined): void {
@@ -552,8 +576,10 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
   // 0. A changed behavior or pin, before anything is fetched (load/config-change.ts).
   const settled = await settleConfig(i, { started, hashWith: (w, k) => behaviorHash(w, k, step.incremental) });
   if ("outcome" in settled) return settled.outcome;
+  // --rebuild: from scratch, with the old table left in place until the first write replaces it (FreshStart).
+  const fresh = i.fresh && !i.fresh.done ? i.fresh : null;
   // 1. State, under a short read lease.
-  const state = await readState(warehouse, asset, isFile, signal);
+  const state = fresh ? NO_STATE : await readState(warehouse, asset, isFile, signal);
   // 2. since.
   const since = sinceFor(i, state);
   const held = since.holdCursor !== undefined
@@ -566,7 +592,7 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
   const http = trackedHttp(createHttp({
     ...i.http, signal, redact: (t) => i.env.redact(t), log: (line) => log.write(line),
   }), progress, (t) => i.env.redact(t));
-  const own = new OwnTableQuery({ warehouse, asset, dir: stageDir, stateDir, timezone: project.timezone, signal });
+  const own = new OwnTableQuery({ warehouse, asset, dir: stageDir, stateDir, timezone: project.timezone, signal, ...(fresh ? { absent: true } : {}) });
   let manifest: Awaited<ReturnType<typeof writeStage>> | null = null;
   let files: FileExtract | null = null;
   // rows() and map() print to the step log (redacted), never to croft's stdout (core/output.ts); a callback
@@ -575,12 +601,15 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
 
   // The write (step 4): one lease, one transaction. A cursor ingest also saves its parts through it while they
   // arrive in cursor order (`part`, PartialRun below); its last write then carries the rest of the rows.
-  let previous = getCatalog(runs, asset);
+  let previous = fresh ? null : getCatalog(runs, asset);
+  /** --rebuild: the old table is still there, and the next write drops it with its state before its own rows. */
+  let swap = fresh !== null;
   const write: WriteStep = (allowShrink, part) => warehouse.write(`ingest ${asset}`, async (raw) => {
     // Who holds the file, for other processes' lock messages; set only once this lease has it.
     runs.setLockHolder({ runId, asset, action: "write" });
     try {
       const tx = abortable(raw, signal, asset);
+      if (swap) await fresh!.reset(tx);
       const known = toKnown(await readStoredColumns(tx, asset));
       let batch: TypedBatch;
       let replaceFiles: string[] | undefined;
@@ -625,7 +654,14 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
     } finally {
       runs.clearLockHolder();
     }
-  }, { runId, asset, signal });
+  }, { runId, asset, signal }).then((out) => {
+    // The old table went with this commit: from now on the step (and a retry) goes on from what it saved.
+    if (swap) {
+      swap = false;
+      fresh!.committed();
+    }
+    return out;
+  });
   const parts = partialCommits(i, state, write, (c) => (previous = c));
 
   try {

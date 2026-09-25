@@ -71,6 +71,9 @@ export interface OwnTableOptions {
   timezone: string;
   /** The step's signal: Ctrl-C ends the wait for the snapshot's read lease. */
   signal?: AbortSignal;
+  /** --rebuild: the step builds the table from scratch, so ctx.query sees none of its own, as on a first load (its
+   *  old table stays in the warehouse until the step's first write replaces it). */
+  absent?: boolean;
 }
 
 /** ctx.query for one ingest step. Lazy: nothing is copied unless the asset calls ctx.query. */
@@ -114,7 +117,7 @@ export class OwnTableQuery {
       }));
     }
     this.#init ??= (async () => {
-      const snap = await snapshotTable(this.o.warehouse, this.o.asset, this.o.dir, this.o.signal);
+      const snap: SnapshotResult = this.o.absent ? { path: null, columns: [] } : await snapshotTable(this.o.warehouse, this.o.asset, this.o.dir, this.o.signal);
       const db = await openMemory({ timezone: this.o.timezone, stateDir: this.o.stateDir });
       this.#db = db;
       const conn = await db.connect();

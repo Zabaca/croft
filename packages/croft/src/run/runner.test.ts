@@ -10,6 +10,7 @@ import { getCatalog } from "../history/catalog.ts";
 import { acquire } from "../history/leases.ts";
 import { logPath } from "../history/logs.ts";
 import { RunsDb } from "../history/runs-db.ts";
+import { PARTIAL_COMMIT, PARTIAL_COMMIT_ROWS } from "../load/partial.ts";
 import { loadProject } from "../project/root.ts";
 import { listTrash } from "../safety/trash.ts";
 import { planRun } from "./plan.ts";
@@ -589,7 +590,9 @@ export default transform({
     }
   });
 
-  test("a refetch that fails after the reset leaves the asset never built; the old rows are in the trash, and a plain run builds it again", async () => {
+  // §5 "A failed asset keeps its old data": an ingest's rebuild swaps at commit. The old table goes to the trash first
+  // (its own commit), stays in place while the source is read, and its first write drops it with the new rows.
+  test("a refetch that fails before it commits keeps the old table (a copy is in the trash); one that succeeds replaces it in one commit", async () => {
     const root = makeProject({ "assets/flaky.ts": simpleGet(api.url, "/flaky", `\n  key: "id",\n  retries: 0,`) });
     api.state.failures = 0;
     expect((await runIn(root, ["flaky"])).exit).toBe(0);
@@ -599,22 +602,58 @@ export default transform({
     expect(out.exit).toBe(1);
     const step = out.data.steps[0]!;
     expect(step).toMatchObject({ status: "failed", trashed: { rows: 2 }, error: { code: "HTTP_ERROR" } });
-    expect(step.error!.effect).toStartWith(`flaky was reset for --rebuild before this failure: its previous 2 rows are in the trash (${step.trashed!.path}); croft run flaky builds it again`);
-    // The way back is croft restore, which asks first: in the hint, never in next (§4.3).
-    expect(step.error!.hint).toEndWith("; flaky is never built now: croft run flaky fetches it again, or croft restore flaky brings the previous table back (it asks first)");
-    expect(step.error!.details).toMatchObject({ rebuild: { reset: true, trashPath: step.trashed!.path, trashedRows: 2 } });
-    expect(out.problems.find((p) => p.code === "HTTP_ERROR")!.hint).toContain("croft restore flaky");
-    expect(JSON.stringify(out.next)).not.toContain("restore");
-    expect(await rows(root, "select count(*)::INT n from duckdb_tables() where table_name = 'flaky'")).toEqual([{ n: 0 }]);
+    // Nothing was reset, so nothing needs restoring.
+    expect(step.error!.effect ?? "").not.toContain("reset");
+    expect(step.error!.hint ?? "").not.toContain("croft restore");
+    expect(step.error!.details?.rebuild).toBeUndefined();
+    expect(await rows(root, "select count(*)::INT n from flaky")).toEqual([{ n: 2 }]);
     const db = runsDb(root);
     try {
-      expect(getCatalog(db, "flaky")).toBeNull();
+      expect(getCatalog(db, "flaky")).toMatchObject({ rows: 2 });
     } finally {
       db.close();
     }
-    const again = await runIn(root, ["flaky"]);
+    const again = await runIn(root, ["flaky"], { rebuild: true, interactive: true, prompt: async () => true });
     expect(again.exit).toBe(0);
-    expect(again.data.steps[0]).toMatchObject({ status: "ok", rows: { total: 2 } });
+    expect(again.data.steps[0]).toMatchObject({ status: "ok", rows: { added: 2, total: 2 }, trashed: { rows: 2 } });
+    expect(listTrash(join(root, ".croft"), "flaky")).toHaveLength(2);
+  });
+
+  test("a refetch that fails after a monotone part committed: the part stays; the hint names the run that continues and croft restore", async () => {
+    const g = globalThis as { __int_fail?: boolean };
+    const root = makeProject({ "assets/events.ts": `import { ingest } from "@zabaca/croft";
+const g = globalThis as { __int_fail?: boolean };
+export default ingest({
+  key: "id", incremental: "ts", retries: 0,
+  async *rows() {
+    yield [{ id: 1, ts: "2026-09-01T00:00:01Z" }, { id: 2, ts: "2026-09-01T00:00:02Z" }];
+    if (g.__int_fail) throw new Error("token expired");
+    yield [{ id: 3, ts: "2026-09-01T00:00:03Z" }];
+  },
+});
+` });
+    expect((await runIn(root, ["events"])).exit).toBe(0);
+    PARTIAL_COMMIT.rows = 2;
+    g.__int_fail = true;
+    try {
+      const out = await runIn(root, ["events"], { rebuild: true, interactive: true, prompt: async () => true });
+      expect(out.exit).toBe(1);
+      const step = out.data.steps[0]!;
+      expect(step).toMatchObject({ status: "failed", trashed: { rows: 3 }, error: { code: "ASSET_CODE_ERROR" } });
+      expect(step.error!.effect).toStartWith(`events was reset for --rebuild before this failure: its previous 3 rows are in the trash (${step.trashed!.path})`);
+      // The way back is croft restore, which asks first: in the hint, never in next (§4.3).
+      expect(step.error!.hint).toEndWith("; events holds the 2 rows its rebuild saved so far: croft run events continues it, or croft restore events brings the previous table back (it asks first)");
+      expect(step.error!.details).toMatchObject({ rebuild: { reset: true, trashPath: step.trashed!.path, trashedRows: 3 } });
+      expect(JSON.stringify(out.next)).not.toContain("restore");
+      expect(await rows(root, "select id::INT id from events order by id")).toEqual([{ id: 1 }, { id: 2 }]);
+    } finally {
+      PARTIAL_COMMIT.rows = PARTIAL_COMMIT_ROWS;
+      delete g.__int_fail;
+    }
+    // A plain run continues from the part's cursor.
+    const next = await runIn(root, ["events"]);
+    expect(next.exit).toBe(0);
+    expect(await rows(root, "select count(*)::INT n from events")).toEqual([{ n: 3 }]);
   });
 
   test("two rebuilds that each need a yes: one token per run; the other is skipped naming its command, never in next", async () => {
