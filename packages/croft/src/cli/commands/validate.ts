@@ -930,7 +930,7 @@ function hookHuman(result: CommandResult<ValidateData>, ctx: Ctx): undefined {
   if (!result.problems.length) return undefined;
   const show = run.show ?? ((file: string) => file);
   const problems = showPaths(result.problems, show);
-  const findings = { ...run, target: show(run.target), problems };
+  const findings = { ...run, shown: show(run.target), problems };
   if (problems.some((p) => p.severity === "error")) {
     ctx.render.errRaw(hookReport({ ...findings, formatted: formatProblems(problems, false) }));
   } else {

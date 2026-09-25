@@ -443,13 +443,23 @@ export function hookPaths(root: string, cwd: string | undefined): (file: string)
   return (file) => relative(from, abs(to, file)).split(sep).join("/") || file;
 }
 
-/** The problems with their files named by `show` (hookPaths): the file, and an edit fix's file. */
+/** A project path written in a sentence: assets/… or lib/… with an extension, not part of a longer path. */
+const PATH_IN_TEXT = /(?<![\w./-])(?:assets|lib)\/[\w./-]*\.[A-Za-z0-9]+(?![\w/-])/g;
+
+/**
+ * The problems with their files named by `show` (hookPaths): the file, an edit fix's file, and the paths written
+ * in the first line of the message, the hint and the fix's description (the lines after a message's first quote
+ * code, which stays as written).
+ */
 export function showPaths(problems: readonly Problem[], show: (file: string) => string): Problem[] {
-  return problems.map((p) => ({
-    ...p,
-    ...(p.file !== undefined ? { file: show(p.file) } : {}),
-    ...(p.fix?.kind === "edit" ? { fix: { ...p.fix, file: show(p.fix.file) } } : {}),
-  }));
+  const text = (s: string) => s.replace(PATH_IN_TEXT, (path) => show(path));
+  return problems.map((p) => {
+    const [first = "", ...rest] = p.message.split("\n");
+    const out: Problem = { ...p, message: [text(first), ...rest].join("\n"), hint: text(p.hint) };
+    if (p.file !== undefined) out.file = show(p.file);
+    if (p.fix) out.fix = p.fix.kind === "edit" ? { ...p.fix, file: show(p.fix.file), description: text(p.fix.description) } : { ...p.fix, description: text(p.fix.description) };
+    return out;
+  });
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -482,7 +492,9 @@ export function hookProblems(problems: readonly Problem[], selected: ReadonlySet
   return problems.filter((p) => p.severity !== "info" && (p.asset ? selected.has(p.asset) : p.file === target || p.code === "CYCLE"));
 }
 
-interface HookFindings { target: string; asset: string | null; selected: readonly string[]; problems: readonly Problem[] }
+/** What the hook found: `target` is the edited file relative to the project root, `shown` the same file as Claude
+ *  reads it (hookPaths; default `target`). */
+interface HookFindings { target: string; shown?: string; asset: string | null; selected: readonly string[]; problems: readonly Problem[] }
 
 /** The first line Claude reads: what the edit left, and what was checked besides the edited file. */
 function hookHeader(o: HookFindings): string {
@@ -495,7 +507,7 @@ function hookHeader(o: HookFindings): string {
   const checked = !others.length ? ""
     : o.target.startsWith("lib/") ? ` (checked the assets that import it: ${others.join(", ")})`
       : ` (also checked the assets that read it: ${others.join(", ")})`;
-  return `croft validate --hook: ${found} after the edit to ${o.target}${checked}`;
+  return `croft validate --hook: ${found} after the edit to ${o.shown ?? o.target}${checked}`;
 }
 
 /**

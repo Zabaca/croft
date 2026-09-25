@@ -279,6 +279,21 @@ describe("croft validate --hook: problems go to Claude", () => {
     expect(j.json.problems[0]).toMatchObject({ code: "UNKNOWN_COLUMN", file: "assets/open_issues.sql" });
   });
 
+  test("from an app folder, paths inside a message are named the same way", async () => {
+    const p = project({
+      "lib/fmt.ts": "export const label = (s: string) => s.toUpperCase(;\n",
+      "assets/labelled.ts": `import { transform } from "@zabaca/croft";\nimport { label } from "../lib/fmt.ts";\nexport default transform({ inputs: ["github_issues"], async *rows() { yield { l: label("x") }; } });\n`,
+    });
+    const sub = basename(p.root);
+    const stdin = JSON.stringify({ ...JSON.parse(input(p, "lib/fmt.ts")), cwd: dirname(p.root) });
+    const r = await hook(p, "", { stdin });
+    expect(r.exit).toBe(2);
+    expect(r.stderr).toContain(`after the edit to ${sub}/lib/fmt.ts (checked the assets that import it: labelled)`);
+    expect(r.stderr).toContain(`error ASSET_INVALID  ${sub}/lib/fmt.ts:1:51`);
+    expect(r.stderr).toContain(`${sub}/assets/labelled.ts does not compile`);
+    expect(r.stderr).not.toMatch(/(^|[^/\w])assets\/labelled\.ts/m);
+  });
+
   test("a warning's path, from an app folder, too", async () => {
     const p = project();
     const stdin = JSON.stringify({ ...JSON.parse(input(p, "assets/github_issues.ts")), cwd: dirname(p.root) });

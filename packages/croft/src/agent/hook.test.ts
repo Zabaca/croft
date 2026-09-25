@@ -391,6 +391,15 @@ describe("hookTarget", () => {
       { ...p, file: "data/assets/x.sql", fix: { ...p.fix, file: "data/assets/y.sql" } },
       { ...p, file: undefined, fix: undefined },
     ]);
+    // Paths in the first line of a message, the hint and a fix's description; quoted code after it stays.
+    const said = {
+      ...p, message: "assets/b.ts does not compile: Unexpected ; at lib/fmt.ts:1:5.\n  const f = \"assets/x.csv\";",
+      hint: "see lib/fmt.ts, not ../lib/fmt.ts or assets/", fix: { kind: "manual" as const, description: "fix lib/fmt.ts:1:5" },
+    };
+    expect(showPaths([said], hookPaths(root, app))[0]).toMatchObject({
+      message: "data/assets/b.ts does not compile: Unexpected ; at data/lib/fmt.ts:1:5.\n  const f = \"assets/x.csv\";",
+      hint: "see data/lib/fmt.ts, not ../lib/fmt.ts or assets/", fix: { kind: "manual", description: "fix data/lib/fmt.ts:1:5" },
+    });
   });
 
   test("input without a file path (another tool or event) is nothing to check", () => {
