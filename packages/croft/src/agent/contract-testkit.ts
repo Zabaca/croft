@@ -20,9 +20,9 @@ export const optionsOf = (name: string): Set<string> => new Set([
 // Hidden options exist (a hint may say "leave --run-id out"); they are never valid in a suggested command.
 const everyFlag = new Set([...COMMANDS.flatMap((c) => Object.keys(c.options)), ...Object.keys(GLOBAL_OPTIONS)]);
 
-// Flags of other programs that croft's texts quote (bun, git, curl). A camelCase flag (tsc --noEmit) is never
-// croft's: FLAG matches only whole lower-case kebab words.
-const FOREIGN_FLAGS = new Set(["no-env-file"]);
+// Flags of other programs that croft's texts quote (bun, git, curl, and tsc's --pretty, which validate --types
+// passes). A camelCase flag (tsc --noEmit) is never croft's: FLAG matches only whole lower-case kebab words.
+const FOREIGN_FLAGS = new Set(["no-env-file", "pretty"]);
 const FLAG = /(?<![\w-])--([a-z][a-z-]*)(?![\w])/g;
 
 /** Where a command's span ends: the next backtick, arrow, clause break or command. */
