@@ -195,27 +195,41 @@ describe("croft validate --hook: problems go to Claude", () => {
   });
 });
 
-describe("croft validate --hook: usage", () => {
-  test("typed at a terminal: USAGE_ERROR pointing at croft validate, and stdin is never read", async () => {
+describe("croft validate --hook: usage, and croft's own failures", () => {
+  // Exit 2 is kept for findings about the edited assets: Claude Code feeds it to Claude after the edit. croft's
+  // own failures exit 1, which Claude Code shows the user as a non-blocking hook error.
+  test("typed at a terminal: USAGE_ERROR pointing at croft validate, exit 1, and stdin is never read", async () => {
     const p = project();
     const r = await hook(p, "assets/open_issues.sql", { stdinTTY: true });
-    expect(r.exit).toBe(2);
+    expect(r.exit).toBe(1);
     expect(r.reads).toBe(0);
-    expect(r.stderr).toContain("error USAGE_ERROR");
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toStartWith("error USAGE_ERROR  croft validate --hook is what Claude Code's PostToolUse hook runs");
     expect(r.stderr).toContain("croft validate");
   });
 
-  test("stdin that is not hook JSON, asset names, or --types alongside: USAGE_ERROR", async () => {
+  test("stdin that is not hook JSON, asset names, or --types alongside: USAGE_ERROR, exit 1", async () => {
     const p = project();
     const bad = await hook(p, "", { stdin: "hello", json: true });
-    expect(bad.exit).toBe(2);
+    expect(bad.exit).toBe(1);
+    expect(bad.json).toMatchObject({ ok: false, command: "validate" });
     expect(bad.json.problems[0]).toMatchObject({ code: "USAGE_ERROR", fix: { kind: "command", command: "croft validate" } });
+    const human = await hook(p, "", { stdin: "hello" });
+    expect([human.exit, human.stdout]).toEqual([1, ""]);
+    expect(human.stderr).toStartWith("error USAGE_ERROR  croft validate --hook reads the JSON Claude Code sends");
     const named = await hook(p, "assets/open_issues.sql", { args: ["open_issues"], json: true });
-    expect(named.exit).toBe(2);
+    expect(named.exit).toBe(1);
     expect(named.json.problems[0]).toMatchObject({ code: "USAGE_ERROR", fix: { kind: "command", command: "croft validate open_issues" } });
     const types = await hook(p, "assets/open_issues.sql", { args: ["--types"], json: true });
-    expect(types.exit).toBe(2);
+    expect(types.exit).toBe(1);
     expect(types.json.problems[0]).toMatchObject({ code: "USAGE_ERROR", fix: { kind: "command", command: "croft validate --types" } });
+  });
+
+  test("outside a croft project, stdin that is not hook JSON is still a usage error, exit 1", async () => {
+    const p = project();
+    const r = await hook(p, "", { stdin: "hello", cwd: dirname(p.root) });
+    expect(r.exit).toBe(1);
+    expect(r.stderr).toContain("USAGE_ERROR");
   });
 });
 

@@ -1,5 +1,5 @@
 #!/bin/sh
-':' //; command -v bun >/dev/null 2>&1 && exec bun "$0" "$@"; command -v node >/dev/null 2>&1 && exec node "$0" "$@"; printf '%s\n' 'error NEEDS_BUN  croft runs on Bun, not Node or another runtime' '      fix: curl -fsSL https://bun.sh/install | bash (ask the user to run it in their terminal)' >&2; exit 2
+':' //; command -v bun >/dev/null 2>&1 && exec bun "$0" "$@"; case " $* " in *" --hook "*) printf '%s\n' 'error NEEDS_BUN  croft validate --hook did not run: bun is not on the PATH Claude Code gives its hooks, so this edit was not checked' '      fix: if Bun is installed, start Claude Code from a terminal where bun works, or add the folder that holds bun (~/.bun/bin) to the PATH Claude Code starts with; otherwise install Bun: curl -fsSL https://bun.sh/install | bash' >&2; exit 1;; esac; command -v node >/dev/null 2>&1 && exec node "$0" "$@"; printf '%s\n' 'error NEEDS_BUN  croft runs on Bun, not Node or another runtime' '      fix: curl -fsSL https://bun.sh/install | bash (ask the user to run it in their terminal)' >&2; exit 2
 //
 // The croft bin (package.json "bin"; DESIGN.md §2 "Install-time failures"). Plain JavaScript on purpose:
 // croft is TypeScript that Bun runs, and Node cannot even parse it, so this file checks the runtime
@@ -10,6 +10,10 @@
 // file with bun when bun is on PATH, with node otherwise (which gets NEEDS_BUN below), and prints the
 // problem itself when neither is there (`npx croft` on a machine without Bun). The launcher starts a
 // project's pinned copy as `bun --no-env-file <this file>`, which does not go through sh.
+//
+// `croft validate --hook` (the Claude Code hook, src/agent/hook.ts) without bun gets its own NEEDS_BUN, from sh
+// or from node alike: Bun is usually installed but missing from the PATH of an app started from the Dock or an
+// IDE, and exit 1 shows the user a notice where exit 2 would block Claude after every edit.
 import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -24,19 +28,31 @@ if (typeof globalThis.Bun === "undefined") {
   process.exitCode = await cli();
 }
 
-/** Print NEEDS_BUN (one envelope with --json, else the problem block on stderr) and return exit code 2. */
+/** Print NEEDS_BUN (one envelope with --json, else the problem block on stderr) and return exit code 2; 1 for
+ *  `croft validate --hook`, which Claude Code shows the user without blocking Claude (src/agent/hook.ts). */
 function needsBun(argv) {
   let name;
   let json = false;
   let version = false;
+  let hook = false;
   for (const a of argv) {
     if (a === "--") break;
     if (a === "--json") json = true;
     else if (a === "--version" || a === "-V") version = true;
+    else if (a === "--hook") hook = true;
     else if (name === undefined && !a.startsWith("-")) name = a;
   }
   const install = "curl -fsSL https://bun.sh/install | bash";
-  const problem = {
+  const problem = hook ? {
+    // Run by the Claude Code hook: Bun is usually installed but missing from the PATH of an app started from the
+    // Dock or an IDE. Line 2 prints the same two lines when there is no node either (bin.test.ts).
+    severity: "error",
+    code: "NEEDS_BUN",
+    message: "croft validate --hook did not run: bun is not on the PATH Claude Code gives its hooks, so this edit was not checked",
+    hint: `if Bun is installed, start Claude Code from a terminal where bun works, or add the folder that holds bun (~/.bun/bin) to the PATH Claude Code starts with; otherwise install Bun: ${install}`,
+    docs: "croft docs NEEDS_BUN",
+    fix: { kind: "manual", description: "put bun on the PATH Claude Code starts with, or install Bun", requiresHuman: true },
+  } : {
     severity: "error",
     code: "NEEDS_BUN",
     message: "croft runs on Bun, not Node or another runtime",
@@ -55,8 +71,10 @@ function needsBun(argv) {
       data: null, problems: [problem], next: [],
     };
     process.stdout.write(`${JSON.stringify(envelope)}\n`);
+  } else if (hook) {
+    process.stderr.write(`error ${problem.code}  ${problem.message}\n      fix: ${problem.hint}\n`);
   } else {
     process.stderr.write(`error ${problem.code}  ${problem.message}\n      fix: ${install} (ask the user to run it in their terminal)\n`);
   }
-  return 2;
+  return hook ? 1 : 2;
 }

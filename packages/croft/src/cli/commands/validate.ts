@@ -824,8 +824,9 @@ function tscProblem(d: TscDiagnostic, root: string, inputTypes?: TypesResult): P
 // ---------------------------------------------------------------------------------------------------------
 // --hook
 
-/** What a --hook run checked, for its human output (the edit, the edited asset's name, what was selected). */
-interface HookRun { target: string; asset: string | null; selected: string[] }
+/** What a --hook run checked, for its human output (the edit, the edited asset's name, what was selected), and
+ *  whether croft itself failed (not a finding about the edit). */
+interface HookRun { target: string; asset: string | null; selected: string[]; failed?: boolean }
 const hookRuns = new WeakMap<object, HookRun>();
 
 /**
@@ -834,8 +835,22 @@ const hookRuns = new WeakMap<object, HookRun>();
  * Otherwise the edited asset is validated, with the assets that read it when it is SQL (a lib/ file: the TS
  * assets that import it), and only their errors and warnings count: exit 2 when there is an error, which shows
  * stderr to Claude; 0 otherwise, with nothing printed. Never the warehouse, never the network.
+ *
+ * Exit 2 is only for findings about the edited assets. croft's own failures (a usage error, stdin that is not the
+ * hook's JSON, anything else croft raises that is not a problem in the project) exit 1, which Claude Code shows
+ * the user as a non-blocking hook error: exit 2 would feed them to Claude after every edit it makes.
  */
 async function validateHook(ctx: Ctx): Promise<CommandResult<ValidateData>> {
+  try {
+    return await checkEdit(ctx);
+  } catch (e) {
+    if (!(e instanceof CroftError)) throw e;
+    hookRuns.set(ctx, { target: "the edited file", asset: null, selected: [], ...hookRuns.get(ctx), failed: true });
+    return { data: { order: [], assets: [] }, problems: [e.problem], next: [], exit: EXIT.FAILED };
+  }
+}
+
+async function checkEdit(ctx: Ctx): Promise<CommandResult<ValidateData>> {
   hookUsage(ctx);
   const none: CommandResult<ValidateData> = { data: { order: [], assets: [] }, problems: [], next: [], exit: EXIT.OK };
   const stdin = await HOOK_IO.readStdin();
@@ -871,7 +886,7 @@ async function validateHook(ctx: Ctx): Promise<CommandResult<ValidateData>> {
     return { ...found(hookProblems(report.problems, new Set(run.selected), target)), data: report.data };
   } catch (e) {
     // A problem Claude can fix in the project (a croft.json that does not load, say) is reported like the
-    // others; anything else fails as croft fails, which Claude Code shows the user and does not block on.
+    // others; anything else is croft's own failure (validateHook: exit 1).
     if (e instanceof CroftError && CODES[e.code].category === "project") return found([e.problem]);
     throw e;
   }
@@ -897,10 +912,15 @@ function hookUsage(ctx: Ctx): void {
 }
 
 /** --hook's human output: nothing unless there is an error; then the report goes to stderr, which is what
- *  Claude Code shows Claude on exit 2, and stdout stays empty. */
+ *  Claude Code shows Claude on exit 2, and stdout stays empty. croft's own failure (exit 1) is its problem block
+ *  on stderr, whose first line Claude Code shows the user. */
 function hookHuman(result: CommandResult<ValidateData>, ctx: Ctx): undefined {
-  if (!result.problems.some((p) => p.severity === "error")) return undefined;
   const run = hookRuns.get(ctx) ?? { target: "the edited file", asset: null, selected: [] };
+  if (run.failed) {
+    ctx.render.errRaw(formatProblems(result.problems, ctx.render.errColor));
+    return undefined;
+  }
+  if (!result.problems.some((p) => p.severity === "error")) return undefined;
   ctx.render.errRaw(hookReport({ ...run, problems: result.problems, formatted: formatProblems(result.problems, false) }));
   return undefined;
 }

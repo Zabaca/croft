@@ -1,7 +1,8 @@
 // Journey 29: the opt-in Claude Code hook (DESIGN.md §9 item 7, D27), through the real CLI and the real shell.
 //   a. `croft init --claude --with-hook` merges the PostToolUse hook into a .claude/settings.json the user already
 //      has (their permissions, model, other hooks and indentation stay); a second run changes nothing, and init
-//      without --with-hook never touches the file. A new project, and an app's data/ project, get it too.
+//      without --with-hook never touches the file. A new project, and an app's data/ project, get it too; until
+//      data/ is installed, the app's hook does nothing (exit 0, silent), for app files and data/ assets alike.
 //   b. The hook command from settings.json runs exactly as Claude Code runs it (`sh -c`, CLAUDE_PROJECT_DIR set,
 //      the PostToolUse JSON on stdin), with node_modules/.bin/croft as `bun install` links it:
 //      - an asset edit with an error: exit 2, stdout empty, stderr names the file, the code and the fix;
@@ -23,7 +24,7 @@ import {
 
 afterAll(cleanupAll);
 
-const HOOK_COMMAND = 'cd "$CLAUDE_PROJECT_DIR" && ./node_modules/.bin/croft validate --hook';
+const HOOK_COMMAND = 'cd "$CLAUDE_PROJECT_DIR" && test -x ./node_modules/.bin/croft || exit 0; ./node_modules/.bin/croft validate --hook';
 const CROFT_GROUP = { matcher: "Edit|Write|MultiEdit", hooks: [{ type: "command", command: HOOK_COMMAND, timeout: 120 }] };
 
 /** A user's own settings, written with four-space indentation. */
@@ -88,14 +89,21 @@ describe("a. croft init --with-hook writes the hook into .claude/settings.json",
     const dataSettings = JSON.parse(readFileSync(join(app, "data", ".claude", "settings.json"), "utf8"));
     expect(dataSettings).toEqual({ hooks: { PostToolUse: [CROFT_GROUP] } });
     const appCommand = appSettings.hooks.PostToolUse[0].hooks[0].command as string;
-    expect(appCommand).toBe('cd "$CLAUDE_PROJECT_DIR"/data && ./node_modules/.bin/croft validate --hook');
+    expect(appCommand).toBe('cd "$CLAUDE_PROJECT_DIR"/data && test -x ./node_modules/.bin/croft || exit 0; ./node_modules/.bin/croft validate --hook');
+
+    // Until data/ is installed, the app's hook does nothing: no "hook error" after every edit of the app.
+    const data = new Project(join(app, "data"));
+    data.write("assets/broken.sql", "-- key: id\nSELECT id FROM no_such_asset\n");
+    writeFileSync(join(app, "page.ts"), "export const x = 1;\n");
+    for (const file of [join(app, "page.ts"), join(data.root, "assets/broken.sql")]) {
+      const before = await hookShell(app, appCommand, { env: { CLAUDE_PROJECT_DIR: app }, stdin: postToolUse({ tool: "Edit", file, cwd: app }) });
+      expect({ code: before.code, stdout: before.stdout, stderr: before.stderr }, show(before)).toEqual({ code: 0, stdout: "", stderr: "" });
+    }
 
     // The app's hook, run from the app folder (where Claude Code started), checks the data/ project's assets.
-    const data = new Project(join(app, "data"));
     mkdirSync(join(data.root, "node_modules", "@zabaca"), { recursive: true });
     symlinkSync(PKG, join(data.root, "node_modules", "@zabaca", "croft"));
     linkCroftBin(data);
-    data.write("assets/broken.sql", "-- key: id\nSELECT id FROM no_such_asset\n");
     const r = await hookShell(app, appCommand, { env: { CLAUDE_PROJECT_DIR: app }, stdin: postToolUse({ tool: "Write", file: join(data.root, "assets/broken.sql"), cwd: app }) });
     expect(r.code, show(r)).toBe(2);
     expect(r.stderr).toContain("assets/broken.sql");

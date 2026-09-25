@@ -56,10 +56,34 @@ function shellQuote(arg: string): string {
  * The hook's shell command: the project's pinned croft, run from the project folder. `sub` is the project's
  * folder relative to where Claude Code starts (CLAUDE_PROJECT_DIR): "" for the project itself, "data" for a
  * project inside an app.
+ *
+ * Until `bun install` has linked node_modules/.bin/croft (a fresh clone, a teammate who pulled the settings, an
+ * app whose data/ is not installed yet), or when the folder is gone, the guard exits 0: nothing to check, and no
+ * "hook error" after every edit. With the pinned croft present but no bun on the hook's PATH, bin/croft.mjs
+ * answers NEEDS_BUN with exit 1, a notice for the user that does not block Claude.
  */
 export function hookCommand(sub = ""): string {
   const dir = sub ? `"$CLAUDE_PROJECT_DIR"/${sub.split("/").map(shellQuote).join("/")}` : `"$CLAUDE_PROJECT_DIR"`;
-  return `cd ${dir} && ./node_modules/.bin/croft validate --hook`;
+  return `cd ${dir} && test -x ${PINNED_BIN} || exit 0; ${PINNED_BIN} validate --hook`;
+}
+
+/** The project's pinned croft, as `bun install` links it. */
+const PINNED_BIN = "./node_modules/.bin/croft";
+
+/**
+ * Whether argv runs croft validate --hook: then a failure that is not a finding about the edited assets (croft's
+ * own, or the machine's: Bun too old, the DuckDB binding) exits 1, never 2 (main.ts; bin/croft.mjs has the same
+ * test for NEEDS_BUN). Flags before a bare `--` count; the first argument that is not a flag names the command.
+ */
+export function isHookArgv(argv: readonly string[]): boolean {
+  let name: string | undefined;
+  let hook = false;
+  for (const a of argv) {
+    if (a === "--") break;
+    if (a === "--hook") hook = true;
+    else if (name === undefined && !a.startsWith("-")) name = a;
+  }
+  return hook && name === "validate";
 }
 
 /** The hook entry merged into .claude/settings.json. */

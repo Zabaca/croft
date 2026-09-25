@@ -80,8 +80,28 @@ describe.skipIf(!NODE)("under Node", () => {
     const r = run([BIN, "status"], cleanEnv({ PATH: `${onlyNode}:/usr/bin:/bin` }));
     expect(r.exit).toBe(2);
     expect(r.stderr).toStartWith("error NEEDS_BUN  croft runs on Bun");
+    // The Claude Code hook: the notice sh prints, exit 1 (non-blocking), without starting node.
+    expect(run([BIN, "validate", "--hook"], cleanEnv({ PATH: `${onlyNode}:/usr/bin:/bin` }))).toEqual({ exit: 1, stdout: "", stderr: HOOK_NEEDS_BUN });
+  });
+
+  test("croft validate --hook under Node: the hook's notice, exit 1 (Claude Code does not block on it)", () => {
+    expect(run([NODE!, BIN, "validate", "--hook"])).toEqual({ exit: 1, stdout: "", stderr: HOOK_NEEDS_BUN });
+    const j = run([NODE!, BIN, "validate", "--hook", "--json"]);
+    expect(j.exit).toBe(1);
+    const env = JSON.parse(j.stdout);
+    expect(env).toMatchObject({ ok: false, command: "validate", data: null });
+    expect(env.problems).toEqual([expect.objectContaining({ code: "NEEDS_BUN", message: expect.stringContaining("croft validate --hook did not run") })]);
+    // --hook after `--` is an argument, not the flag.
+    expect(run([NODE!, BIN, "validate", "--", "--hook"]).exit).toBe(2);
   });
 });
+
+/** What the bin prints when the Claude Code hook starts it without Bun on PATH: sh and node print the same. */
+const HOOK_NEEDS_BUN = [
+  "error NEEDS_BUN  croft validate --hook did not run: bun is not on the PATH Claude Code gives its hooks, so this edit was not checked",
+  "      fix: if Bun is installed, start Claude Code from a terminal where bun works, or add the folder that holds bun (~/.bun/bin) to the PATH Claude Code starts with; otherwise install Bun: curl -fsSL https://bun.sh/install | bash",
+  "",
+].join("\n");
 
 test("started as an executable with bun on PATH, it runs under Bun", () => {
   const onlyBun = join(base, "only-bun");
@@ -102,4 +122,6 @@ test("with neither runtime on PATH it says how to install Bun", () => {
   expect(r.exit).toBe(2);
   expect(r.stderr).toContain("NEEDS_BUN");
   expect(r.stderr).toContain("curl -fsSL https://bun.sh/install | bash");
+  // As the Claude Code hook: exit 1, which Claude Code shows the user without blocking Claude.
+  expect(run([BIN, "validate", "--hook"], cleanEnv({ PATH: "/usr/bin:/bin" }))).toEqual({ exit: 1, stdout: "", stderr: HOOK_NEEDS_BUN });
 });

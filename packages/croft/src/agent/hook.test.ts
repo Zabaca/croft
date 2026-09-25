@@ -32,9 +32,44 @@ const edit = (file_path: string, o: { cwd?: string; tool?: string } = {}) => JSO
 
 describe("the hook entry", () => {
   test("the project's pinned croft, started from the project folder (a data/ project from the app folder)", () => {
-    expect(hookCommand()).toBe(`cd "$CLAUDE_PROJECT_DIR" && ./node_modules/.bin/croft validate --hook`);
-    expect(hookCommand("data")).toBe(`cd "$CLAUDE_PROJECT_DIR"/data && ./node_modules/.bin/croft validate --hook`);
-    expect(hookCommand("my data")).toBe(`cd "$CLAUDE_PROJECT_DIR"/'my data' && ./node_modules/.bin/croft validate --hook`);
+    const guard = "test -x ./node_modules/.bin/croft || exit 0; ./node_modules/.bin/croft validate --hook";
+    expect(hookCommand()).toBe(`cd "$CLAUDE_PROJECT_DIR" && ${guard}`);
+    expect(hookCommand("data")).toBe(`cd "$CLAUDE_PROJECT_DIR"/data && ${guard}`);
+    expect(hookCommand("my data")).toBe(`cd "$CLAUDE_PROJECT_DIR"/'my data' && ${guard}`);
+  });
+
+  test("before bun install (no pinned croft), or with the project folder gone, the hook does nothing: exit 0, silent", async () => {
+    const app = fresh();
+    const project = join(app, "data");
+    mkdirSync(project);
+    for (const [dir, sub] of [[project, ""], [app, "data"], [app, "gone"]] as const) {
+      const proc = Bun.spawn(["sh", "-c", hookCommand(sub)], {
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", CLAUDE_PROJECT_DIR: dir }, cwd: fresh(),
+        stdin: new TextEncoder().encode(edit(join(project, "assets/x.sql"))), stdout: "pipe", stderr: "pipe",
+      });
+      const [stdout, exit] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+      expect({ sub, exit, stdout }).toEqual({ sub, exit: 0, stdout: "" });
+    }
+  });
+
+  test("no bun on the PATH Claude Code gives the hook (an app started from the Dock): exit 1, a one-line notice for the user, never 2", async () => {
+    const PATH = "/usr/bin:/bin";
+    if (Bun.which("bun", { PATH }) || Bun.which("node", { PATH })) return;       // a system-wide runtime
+    const project = fresh();
+    const bin = join(project, "node_modules", ".bin");
+    mkdirSync(bin, { recursive: true });
+    symlinkSync(join(import.meta.dir, "..", "..", "bin", "croft.mjs"), join(bin, "croft"));
+    const proc = Bun.spawn(["sh", "-c", hookCommand()], {
+      env: { PATH, CLAUDE_PROJECT_DIR: project }, cwd: project,
+      stdin: new TextEncoder().encode(edit(join(project, "README.md"))), stdout: "pipe", stderr: "pipe",
+    });
+    const [stdout, stderr, exit] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    expect(exit).toBe(1);
+    expect(stdout).toBe("");
+    // Claude Code shows the user the first line of stderr, prefixed with "Failed with non-blocking status code:".
+    const first = stderr.split("\n")[0]!;
+    expect(first).toStartWith("error NEEDS_BUN  croft validate --hook did not run: bun is not on the PATH");
+    expect(stderr).toContain("~/.bun/bin");
   });
 
   test("a PostToolUse group for Edit|Write|MultiEdit with one command handler", () => {
