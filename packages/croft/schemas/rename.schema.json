@@ -1,0 +1,454 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "croft rename --json",
+  "description": "The envelope croft rename --json prints on stdout (DESIGN.md §4.3). data is null when the command failed before it had any.",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "command": {
+      "const": "rename"
+    },
+    "croftVersion": {
+      "type": "string"
+    },
+    "database": {
+      "type": "string"
+    },
+    "timezone": {
+      "type": "string"
+    },
+    "durationMs": {
+      "type": "number"
+    },
+    "data": {
+      "anyOf": [
+        {
+          "title": "RenameData",
+          "type": "object",
+          "properties": {
+            "from": {
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            },
+            "mode": {
+              "enum": [
+                "adopt",
+                "file",
+                "resume"
+              ]
+            },
+            "runId": {
+              "type": "string"
+            },
+            "file": {
+              "type": "object",
+              "properties": {
+                "from": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                },
+                "moved": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "from",
+                "to",
+                "moved"
+              ],
+              "additionalProperties": false
+            },
+            "table": {
+              "type": "object",
+              "properties": {
+                "renamed": {
+                  "type": "boolean"
+                },
+                "rows": {
+                  "type": [
+                    "null",
+                    "number"
+                  ]
+                }
+              },
+              "required": [
+                "renamed",
+                "rows"
+              ],
+              "additionalProperties": false
+            },
+            "trash": {
+              "type": "object",
+              "properties": {
+                "versions": {
+                  "type": "number"
+                },
+                "left": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "earlier": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "type": "string"
+                        },
+                        "versions": {
+                          "type": "number"
+                        },
+                        "left": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "versions",
+                        "left"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "versions",
+                "left",
+                "earlier"
+              ],
+              "additionalProperties": false
+            },
+            "preview": {
+              "enum": [
+                "cleared",
+                "kept",
+                "none"
+              ]
+            },
+            "references": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/RenameReference"
+              }
+            },
+            "redactedValues": {
+              "const": true
+            }
+          },
+          "required": [
+            "from",
+            "to",
+            "mode",
+            "runId",
+            "file",
+            "table",
+            "trash",
+            "preview",
+            "references"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "problems": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Problem"
+      }
+    },
+    "next": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "reason"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "confirmation": {
+      "$ref": "#/$defs/Confirmation"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "ok",
+    "command",
+    "croftVersion",
+    "database",
+    "timezone",
+    "durationMs",
+    "data",
+    "problems",
+    "next"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "Confirmation": {
+      "type": "object",
+      "properties": {
+        "token": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "impact": {
+          "$ref": "#/$defs/Impact"
+        }
+      },
+      "required": [
+        "token",
+        "expiresAt",
+        "command",
+        "impact"
+      ],
+      "additionalProperties": false
+    },
+    "Fix": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "command"
+            },
+            "description": {
+              "type": "string"
+            },
+            "command": {
+              "type": "string"
+            },
+            "requiresHuman": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "description",
+            "command"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "edit"
+            },
+            "description": {
+              "type": "string"
+            },
+            "file": {
+              "type": "string"
+            },
+            "line": {
+              "type": "number"
+            },
+            "replace": {
+              "type": "object",
+              "properties": {
+                "from": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "from",
+                "to"
+              ],
+              "additionalProperties": false
+            },
+            "insert": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "description",
+            "file"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "manual"
+            },
+            "description": {
+              "type": "string"
+            },
+            "requiresHuman": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "description"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Impact": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        },
+        "rows": {
+          "type": "number"
+        },
+        "bytes": {
+          "type": "number"
+        },
+        "trashPath": {
+          "type": "string"
+        },
+        "downstream": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "estimatedRequests": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "asset",
+        "action",
+        "rows",
+        "downstream"
+      ],
+      "additionalProperties": false
+    },
+    "Problem": {
+      "type": "object",
+      "properties": {
+        "severity": {
+          "enum": [
+            "error",
+            "info",
+            "warning"
+          ]
+        },
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "docs": {
+          "type": "string"
+        },
+        "asset": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "number"
+        },
+        "column": {
+          "type": "number"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "fix": {
+          "$ref": "#/$defs/Fix"
+        },
+        "effect": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "details": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "severity",
+        "code",
+        "message",
+        "hint",
+        "docs"
+      ],
+      "additionalProperties": false
+    },
+    "RenameReference": {
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "number"
+        },
+        "text": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "check",
+            "import",
+            "sql",
+            "ts_input"
+          ]
+        }
+      },
+      "required": [
+        "file",
+        "line",
+        "text",
+        "kind"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

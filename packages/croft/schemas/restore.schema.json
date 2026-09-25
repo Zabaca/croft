@@ -1,0 +1,474 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "croft restore --json",
+  "description": "The envelope croft restore --json prints on stdout (DESIGN.md §4.3). data is null when the command failed before it had any.",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "command": {
+      "const": "restore"
+    },
+    "croftVersion": {
+      "type": "string"
+    },
+    "database": {
+      "type": "string"
+    },
+    "timezone": {
+      "type": "string"
+    },
+    "durationMs": {
+      "type": "number"
+    },
+    "data": {
+      "anyOf": [
+        {
+          "title": "RestoreData",
+          "type": "object",
+          "properties": {
+            "asset": {
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "declined",
+                "needs_confirmation",
+                "restored"
+              ]
+            },
+            "version": {
+              "$ref": "#/$defs/TrashVersion"
+            },
+            "rows": {
+              "type": "number"
+            },
+            "skipped": {
+              "type": "number"
+            },
+            "replacedRows": {
+              "type": [
+                "null",
+                "number"
+              ]
+            },
+            "rowsAfter": {
+              "type": [
+                "null",
+                "number"
+              ]
+            },
+            "downstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "rebuild": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "trashed": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "path": {
+                      "type": "string"
+                    },
+                    "rows": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "rows"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "runId": {
+              "type": [
+                "null",
+                "string"
+              ]
+            },
+            "redactedValues": {
+              "const": true
+            }
+          },
+          "required": [
+            "asset",
+            "status",
+            "version",
+            "rows",
+            "skipped",
+            "replacedRows",
+            "rowsAfter",
+            "downstream",
+            "rebuild",
+            "trashed",
+            "runId"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "TrashListData",
+          "type": "object",
+          "properties": {
+            "versions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TrashVersion"
+              }
+            },
+            "retention": {
+              "type": "object",
+              "properties": {
+                "days": {
+                  "type": "number"
+                },
+                "versions": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "days",
+                "versions"
+              ],
+              "additionalProperties": false
+            },
+            "redactedValues": {
+              "const": true
+            }
+          },
+          "required": [
+            "versions",
+            "retention"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "problems": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Problem"
+      }
+    },
+    "next": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "reason"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "confirmation": {
+      "$ref": "#/$defs/Confirmation"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "ok",
+    "command",
+    "croftVersion",
+    "database",
+    "timezone",
+    "durationMs",
+    "data",
+    "problems",
+    "next"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "Confirmation": {
+      "type": "object",
+      "properties": {
+        "token": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "impact": {
+          "$ref": "#/$defs/Impact"
+        }
+      },
+      "required": [
+        "token",
+        "expiresAt",
+        "command",
+        "impact"
+      ],
+      "additionalProperties": false
+    },
+    "Fix": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "command"
+            },
+            "description": {
+              "type": "string"
+            },
+            "command": {
+              "type": "string"
+            },
+            "requiresHuman": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "description",
+            "command"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "edit"
+            },
+            "description": {
+              "type": "string"
+            },
+            "file": {
+              "type": "string"
+            },
+            "line": {
+              "type": "number"
+            },
+            "replace": {
+              "type": "object",
+              "properties": {
+                "from": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "from",
+                "to"
+              ],
+              "additionalProperties": false
+            },
+            "insert": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "description",
+            "file"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "manual"
+            },
+            "description": {
+              "type": "string"
+            },
+            "requiresHuman": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "description"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Impact": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        },
+        "rows": {
+          "type": "number"
+        },
+        "bytes": {
+          "type": "number"
+        },
+        "trashPath": {
+          "type": "string"
+        },
+        "downstream": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "estimatedRequests": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "asset",
+        "action",
+        "rows",
+        "downstream"
+      ],
+      "additionalProperties": false
+    },
+    "Problem": {
+      "type": "object",
+      "properties": {
+        "severity": {
+          "enum": [
+            "error",
+            "info",
+            "warning"
+          ]
+        },
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "docs": {
+          "type": "string"
+        },
+        "asset": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "number"
+        },
+        "column": {
+          "type": "number"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "fix": {
+          "$ref": "#/$defs/Fix"
+        },
+        "effect": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "details": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "severity",
+        "code",
+        "message",
+        "hint",
+        "docs"
+      ],
+      "additionalProperties": false
+    },
+    "TrashVersion": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": "string"
+        },
+        "trashedAt": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "rows": {
+          "type": "number"
+        },
+        "bytes": {
+          "type": "number"
+        },
+        "kind": {
+          "enum": [
+            "rows",
+            "table"
+          ]
+        },
+        "where": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "applied": {
+          "type": "boolean"
+        },
+        "runId": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "asset",
+        "trashedAt",
+        "reason",
+        "rows",
+        "bytes",
+        "kind",
+        "where",
+        "applied",
+        "runId",
+        "path"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,650 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "croft schedule --json",
+  "description": "The envelope croft schedule --json prints on stdout (DESIGN.md §4.3). data is null when the command failed before it had any.",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "command": {
+      "const": "schedule"
+    },
+    "croftVersion": {
+      "type": "string"
+    },
+    "database": {
+      "type": "string"
+    },
+    "timezone": {
+      "type": "string"
+    },
+    "durationMs": {
+      "type": "number"
+    },
+    "data": {
+      "anyOf": [
+        {
+          "title": "ScheduleData",
+          "type": "object",
+          "properties": {
+            "action": {
+              "enum": [
+                "off",
+                "on",
+                "pause",
+                "status"
+              ]
+            },
+            "root": {
+              "type": "string"
+            },
+            "scheduling": {
+              "$ref": "#/$defs/Scheduling"
+            },
+            "job": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/JobInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "registry": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "file": {
+                      "type": "string"
+                    },
+                    "projects": {
+                      "type": "number"
+                    },
+                    "osJob": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "file",
+                    "projects",
+                    "osJob"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "serve": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "url": {
+                      "type": "string"
+                    },
+                    "pid": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "url",
+                    "pid"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "firstTick": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "at": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "waitedMs": {
+                      "type": "number"
+                    },
+                    "alreadyTicking": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "at",
+                    "waitedMs"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "assets": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ScheduleAsset"
+              }
+            },
+            "assetsUnavailable": {
+              "const": true
+            },
+            "redactedValues": {
+              "const": true
+            }
+          },
+          "required": [
+            "action",
+            "root",
+            "scheduling",
+            "job",
+            "registry",
+            "serve",
+            "assets"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "problems": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Problem"
+      }
+    },
+    "next": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "reason"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "confirmation": {
+      "$ref": "#/$defs/Confirmation"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "ok",
+    "command",
+    "croftVersion",
+    "database",
+    "timezone",
+    "durationMs",
+    "data",
+    "problems",
+    "next"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "Confirmation": {
+      "type": "object",
+      "properties": {
+        "token": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "impact": {
+          "$ref": "#/$defs/Impact"
+        }
+      },
+      "required": [
+        "token",
+        "expiresAt",
+        "command",
+        "impact"
+      ],
+      "additionalProperties": false
+    },
+    "Fix": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "command"
+            },
+            "description": {
+              "type": "string"
+            },
+            "command": {
+              "type": "string"
+            },
+            "requiresHuman": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "description",
+            "command"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "edit"
+            },
+            "description": {
+              "type": "string"
+            },
+            "file": {
+              "type": "string"
+            },
+            "line": {
+              "type": "number"
+            },
+            "replace": {
+              "type": "object",
+              "properties": {
+                "from": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "from",
+                "to"
+              ],
+              "additionalProperties": false
+            },
+            "insert": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "description",
+            "file"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "manual"
+            },
+            "description": {
+              "type": "string"
+            },
+            "requiresHuman": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "description"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Impact": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        },
+        "rows": {
+          "type": "number"
+        },
+        "bytes": {
+          "type": "number"
+        },
+        "trashPath": {
+          "type": "string"
+        },
+        "downstream": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "estimatedRequests": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "asset",
+        "action",
+        "rows",
+        "downstream"
+      ],
+      "additionalProperties": false
+    },
+    "JobInfo": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "enum": [
+            "crontab",
+            "launchd"
+          ]
+        },
+        "label": {
+          "type": "string"
+        },
+        "file": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "installed": {
+          "type": "boolean"
+        },
+        "loaded": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "bun": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "bunVersion": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "bunExists": {
+          "type": "boolean"
+        },
+        "bunStable": {
+          "type": "boolean"
+        },
+        "bunSkipped": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkippedBun"
+          }
+        },
+        "changed": {
+          "type": "boolean"
+        },
+        "removed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kind",
+        "label",
+        "file",
+        "installed",
+        "loaded",
+        "bun",
+        "bunVersion",
+        "bunExists"
+      ],
+      "additionalProperties": false
+    },
+    "Problem": {
+      "type": "object",
+      "properties": {
+        "severity": {
+          "enum": [
+            "error",
+            "info",
+            "warning"
+          ]
+        },
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "docs": {
+          "type": "string"
+        },
+        "asset": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "number"
+        },
+        "column": {
+          "type": "number"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "fix": {
+          "$ref": "#/$defs/Fix"
+        },
+        "effect": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "details": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "severity",
+        "code",
+        "message",
+        "hint",
+        "docs"
+      ],
+      "additionalProperties": false
+    },
+    "ScheduleAsset": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "ingest",
+            "sql",
+            "ts"
+          ]
+        },
+        "schedule": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "cron": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "nextFireAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "lastFireAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "lastAttemptAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "due": {
+          "type": "boolean"
+        },
+        "dueReason": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "held": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "enum": [
+                    "LARGE_REPROCESS",
+                    "SCHEDULE_HELD",
+                    "backoff",
+                    "leased",
+                    "paused"
+                  ]
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "code",
+                "reason"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "asset",
+        "kind",
+        "schedule",
+        "cron",
+        "nextFireAt",
+        "lastFireAt",
+        "lastAttemptAt",
+        "due",
+        "dueReason",
+        "held"
+      ],
+      "additionalProperties": false
+    },
+    "Scheduling": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "enum": [
+            "off",
+            "on",
+            "paused"
+          ]
+        },
+        "via": {
+          "enum": [
+            "os-job",
+            "serve",
+            null
+          ]
+        },
+        "lastTickAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "stale": {
+          "type": "boolean"
+        },
+        "pausedUntil": {
+          "type": [
+            "null",
+            "string"
+          ]
+        }
+      },
+      "required": [
+        "state",
+        "via",
+        "lastTickAt"
+      ],
+      "additionalProperties": false
+    },
+    "SkippedBun": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "version",
+        "reason"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

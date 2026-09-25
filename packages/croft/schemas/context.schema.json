@@ -1,0 +1,838 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "croft context --json",
+  "description": "The envelope croft context --json prints on stdout (DESIGN.md §4.3). data is null when the command failed before it had any.",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "command": {
+      "const": "context"
+    },
+    "croftVersion": {
+      "type": "string"
+    },
+    "database": {
+      "type": "string"
+    },
+    "timezone": {
+      "type": "string"
+    },
+    "durationMs": {
+      "type": "number"
+    },
+    "data": {
+      "anyOf": [
+        {
+          "title": "ContextData",
+          "type": "object",
+          "properties": {
+            "project": {
+              "type": "object",
+              "properties": {
+                "root": {
+                  "type": "string"
+                },
+                "database": {
+                  "type": "string"
+                },
+                "timezone": {
+                  "type": "string"
+                },
+                "assets": {
+                  "type": "number"
+                },
+                "scheduling": {
+                  "$ref": "#/$defs/Scheduling"
+                }
+              },
+              "required": [
+                "root",
+                "database",
+                "timezone",
+                "assets",
+                "scheduling"
+              ],
+              "additionalProperties": false
+            },
+            "assets": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/CompactAsset"
+              }
+            },
+            "running": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/RunningEntry"
+              }
+            },
+            "held": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "recentFailures": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/FailureEntry"
+              }
+            },
+            "recentSchemaChanges": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SchemaChangeEntry"
+              }
+            },
+            "schemaChangesFrom": {
+              "enum": [
+                "runs",
+                "warehouse"
+              ]
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "omitted": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "redactedValues": {
+              "const": true
+            }
+          },
+          "required": [
+            "project",
+            "assets",
+            "running",
+            "held",
+            "recentFailures",
+            "recentSchemaChanges",
+            "schemaChangesFrom",
+            "truncated"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "problems": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Problem"
+      }
+    },
+    "next": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "reason"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "confirmation": {
+      "$ref": "#/$defs/Confirmation"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "ok",
+    "command",
+    "croftVersion",
+    "database",
+    "timezone",
+    "durationMs",
+    "data",
+    "problems",
+    "next"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "CompactAsset": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "ingest",
+            "sql",
+            "ts",
+            null
+          ]
+        },
+        "file": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "description": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "behavior": {
+          "type": "string"
+        },
+        "key": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "field": {
+                  "type": [
+                    "null",
+                    "string"
+                  ]
+                },
+                "value": {
+                  "type": [
+                    "null",
+                    "string"
+                  ]
+                }
+              },
+              "required": [
+                "field",
+                "value"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rows": {
+          "type": [
+            "null",
+            "number"
+          ]
+        },
+        "lastLoadedAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "status": {
+          "enum": [
+            "crashed",
+            "failed",
+            "interrupted",
+            "never_run",
+            "no_asset_file",
+            "ok",
+            "running",
+            "skipped",
+            "unknown"
+          ]
+        },
+        "lastRun": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LastRun"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "next": {
+          "type": "string"
+        },
+        "schedule": {
+          "type": "string"
+        },
+        "nextFireAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "hold": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "enum": [
+                "LARGE_REPROCESS",
+                "SCHEDULE_HELD",
+                "backoff",
+                "leased",
+                "paused"
+              ]
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "reason"
+          ],
+          "additionalProperties": false
+        },
+        "staleReasons": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "backfill",
+              "code_changed",
+              "input_changed",
+              "input_replaced",
+              "never_built",
+              "rebuild",
+              "requested",
+              "schedule_due"
+            ]
+          }
+        },
+        "edited": {
+          "const": true
+        },
+        "reads": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "jsonKeys": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "name",
+              "type"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "filesGone": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "schemaChangedAt": {
+          "type": "string"
+        },
+        "drift": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "enum": [
+                  "COLUMN_STOPPED_ARRIVING",
+                  "JSON_KIND_CHANGED",
+                  "TYPE_WIDENED"
+                ]
+              },
+              "column": {
+                "type": [
+                  "null",
+                  "string"
+                ]
+              },
+              "text": {
+                "type": "string"
+              },
+              "at": {
+                "type": "string"
+              },
+              "runId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "column",
+              "text",
+              "at",
+              "runId"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "asset",
+        "kind",
+        "file",
+        "description",
+        "behavior",
+        "key",
+        "cursor",
+        "rows",
+        "lastLoadedAt",
+        "status",
+        "lastRun",
+        "next",
+        "staleReasons",
+        "reads",
+        "checks"
+      ],
+      "additionalProperties": false
+    },
+    "Confirmation": {
+      "type": "object",
+      "properties": {
+        "token": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "impact": {
+          "$ref": "#/$defs/Impact"
+        }
+      },
+      "required": [
+        "token",
+        "expiresAt",
+        "command",
+        "impact"
+      ],
+      "additionalProperties": false
+    },
+    "FailureEntry": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "at": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "code": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "message": {
+          "type": [
+            "null",
+            "string"
+          ]
+        }
+      },
+      "required": [
+        "asset",
+        "runId",
+        "at",
+        "status",
+        "code",
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    "Fix": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "command"
+            },
+            "description": {
+              "type": "string"
+            },
+            "command": {
+              "type": "string"
+            },
+            "requiresHuman": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "description",
+            "command"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "edit"
+            },
+            "description": {
+              "type": "string"
+            },
+            "file": {
+              "type": "string"
+            },
+            "line": {
+              "type": "number"
+            },
+            "replace": {
+              "type": "object",
+              "properties": {
+                "from": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "from",
+                "to"
+              ],
+              "additionalProperties": false
+            },
+            "insert": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "description",
+            "file"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "manual"
+            },
+            "description": {
+              "type": "string"
+            },
+            "requiresHuman": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "description"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Impact": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        },
+        "rows": {
+          "type": "number"
+        },
+        "bytes": {
+          "type": "number"
+        },
+        "trashPath": {
+          "type": "string"
+        },
+        "downstream": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "estimatedRequests": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "asset",
+        "action",
+        "rows",
+        "downstream"
+      ],
+      "additionalProperties": false
+    },
+    "LastRun": {
+      "type": "object",
+      "properties": {
+        "runId": {
+          "type": "string"
+        },
+        "at": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "code": {
+          "type": [
+            "null",
+            "string"
+          ]
+        }
+      },
+      "required": [
+        "runId",
+        "at",
+        "status",
+        "code"
+      ],
+      "additionalProperties": false
+    },
+    "Problem": {
+      "type": "object",
+      "properties": {
+        "severity": {
+          "enum": [
+            "error",
+            "info",
+            "warning"
+          ]
+        },
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "docs": {
+          "type": "string"
+        },
+        "asset": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "number"
+        },
+        "column": {
+          "type": "number"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "fix": {
+          "$ref": "#/$defs/Fix"
+        },
+        "effect": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "details": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "severity",
+        "code",
+        "message",
+        "hint",
+        "docs"
+      ],
+      "additionalProperties": false
+    },
+    "RunningEntry": {
+      "type": "object",
+      "properties": {
+        "runId": {
+          "type": "string"
+        },
+        "asset": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "pid": {
+          "type": [
+            "null",
+            "number"
+          ]
+        },
+        "since": {
+          "type": "string"
+        },
+        "phase": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "rowsFetched": {
+          "type": [
+            "null",
+            "number"
+          ]
+        }
+      },
+      "required": [
+        "runId",
+        "asset",
+        "pid",
+        "since",
+        "phase",
+        "rowsFetched"
+      ],
+      "additionalProperties": false
+    },
+    "Scheduling": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "enum": [
+            "off",
+            "on",
+            "paused"
+          ]
+        },
+        "via": {
+          "enum": [
+            "os-job",
+            "serve",
+            null
+          ]
+        },
+        "lastTickAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "stale": {
+          "type": "boolean"
+        },
+        "pausedUntil": {
+          "type": [
+            "null",
+            "string"
+          ]
+        }
+      },
+      "required": [
+        "state",
+        "via",
+        "lastTickAt"
+      ],
+      "additionalProperties": false
+    },
+    "SchemaChangeEntry": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": "string"
+        },
+        "at": {
+          "type": "string"
+        },
+        "runId": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "column": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "from": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "to": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "readBy": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "asset",
+        "at",
+        "runId",
+        "kind",
+        "column",
+        "from",
+        "to",
+        "readBy"
+      ],
+      "additionalProperties": false
+    }
+  }
+}
