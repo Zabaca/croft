@@ -215,7 +215,8 @@ describe("the types folder", () => {
     expect((await validateTypes(q)).json.problems).toEqual([]);
   }, 60_000);
 
-  test("a folder croft cannot write: a warning, and tsc still runs", async () => {
+  // Root writes through any mode bits (the Linux CI container runs as root), so the refusal cannot be staged there.
+  test.skipIf(process.getuid?.() === 0)("a folder croft cannot write: a warning, and tsc still runs", async () => {
     const p = makeProject({ files: { "assets/github_issues.ts": ISSUES_TS } });
     withTypescript(p);
     catalog(p, [built("github_issues", "ingest", ["id"], [col("id", "BIGINT")])]);
