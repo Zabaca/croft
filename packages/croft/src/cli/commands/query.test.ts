@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { cleanup as cleanupChildren, spawnHolder } from "../../read/testkit.ts";
 import { putCatalog } from "../../history/catalog.ts";
@@ -363,5 +363,121 @@ describe("croft query: usage and state", () => {
     expect(r.exit).toBe(0);
     expect(r.json.data.rows).toEqual([{ n: 3 }]);
     expect(Date.now() - started).toBeGreaterThan(500);
+  });
+});
+
+// Once the warehouse exists, a table it does not have (e2e j28, bug 2 of W5.2): an asset never built is DB_NOT_FOUND with
+// its run, as before the first run (§3b "Zero-asset path"); another name stays UNKNOWN_TABLE and suggests the closest
+// asset (§5 "Errors from user queries"). Before, both were UNKNOWN_TABLE "list the tables with: croft status", no fix.
+describe("croft query: a table the warehouse does not have", () => {
+  /** github_issues is built (the seeded warehouse); stripe_charges is an asset that has not been built. */
+  const both = () => issues({ "assets/stripe_charges.ts": CHARGES_TS });
+  const problemOf = async (p: { root: string }, sql: string) => {
+    const r = await cli(["query", sql, "--json"], { cwd: p.root });
+    expect(r.exit).toBe(2);
+    expect(r.json.problems).toHaveLength(1);
+    return r.json.problems[0];
+  };
+  /** A finished run with one step of stripe_charges. */
+  function stripeStep(p: { stateDir: string }, id: string, finish: { status: "failed" | "ok"; reason?: string; error?: { code: string } }) {
+    const db = runsDb(p.stateDir);
+    try {
+      const run = db.createRun({ id, trigger: "manual", human: true, argv: ["run", "stripe_charges"], identity: DEAD });
+      db.startStep({ runId: run.id, asset: "stripe_charges", attempt: 1, reason: finish.reason ?? "requested" });
+      db.finishStep(run.id, "stripe_charges", 1, { status: finish.status, ...(finish.error ? { error: finish.error as never } : {}) });
+      db.finishRun(run.id, finish.status === "ok" ? "succeeded" : "failed");
+    } finally {
+      db.close();
+    }
+  }
+
+  test("an asset never built: it is not built yet, and the fix is its run", async () => {
+    const p = await both();
+    expect(await problemOf(p, "select count(*) from stripe_charges")).toMatchObject({
+      code: "DB_NOT_FOUND", message: "stripe_charges is not built yet: it has never run, so warehouse.duckdb has no table stripe_charges",
+      hint: "build it first: croft run stripe_charges",
+      fix: { kind: "command", description: "build stripe_charges", command: "croft run stripe_charges" },
+      details: { table: "stripe_charges", asset: "stripe_charges", duckdbErrorType: "Catalog" },
+    });
+    // Whatever case it is written in.
+    expect(await problemOf(p, `select count(*) from "Stripe_Charges"`)).toMatchObject({ code: "DB_NOT_FOUND", fix: { command: "croft run stripe_charges" } });
+  });
+
+  test("an asset whose run failed: not built yet, the logs say why, and the fix is still its run", async () => {
+    const p = await both();
+    stripeStep(p, "r_0922_1156_bad1", { status: "failed", error: { code: "HTTP_ERROR" } });
+    expect(await problemOf(p, "select count(*) from stripe_charges")).toMatchObject({
+      code: "DB_NOT_FOUND", message: "stripe_charges is not built yet: its last run failed (HTTP_ERROR, r_0922_1156_bad1)",
+      hint: "croft logs stripe_charges --failed says why; once that is fixed, croft run stripe_charges builds it",
+      fix: { kind: "command", command: "croft run stripe_charges" },
+    });
+  });
+
+  test("an asset croft delete removed: croft restore brings it back", async () => {
+    const p = await both();
+    stripeStep(p, "r_0922_1156_del1", { status: "ok", reason: "deleted" });
+    expect(await problemOf(p, "select count(*) from stripe_charges")).toMatchObject({
+      code: "DB_NOT_FOUND", message: "stripe_charges has no table: croft delete removed it (r_0922_1156_del1)",
+      hint: "croft restore stripe_charges brings it back from the trash; croft run stripe_charges would build it from scratch",
+      fix: { kind: "command", command: "croft restore stripe_charges" },
+    });
+  });
+
+  test("an asset croft built whose table is gone: not \"not built yet\"; croft doctor checks the tables", async () => {
+    const p = await both();
+    const db = runsDb(p.stateDir);
+    putCatalog(db, { ...ISSUES_CATALOG, asset: "stripe_charges", lastRunId: "r_0922_1155_ok02" });
+    db.close();
+    const problem = await problemOf(p, "select count(*) from stripe_charges");
+    expect(problem).toMatchObject({ code: "DB_NOT_FOUND", fix: { kind: "command", command: "croft doctor" } });
+    expect(problem.message).toBe("warehouse.duckdb has no table stripe_charges, although croft built it (run r_0922_1155_ok02): it was dropped or replaced outside croft");
+  });
+
+  test("a file renamed outside croft: ASSET_RENAMED with croft rename, never a run that fetches everything again", async () => {
+    const p = await issues();
+    const { resolveProject } = await import("../../project/resolve.ts");
+    const hash = (await resolveProject({ root: p.root, timezone: "America/Los_Angeles" })).assets.find((a) => a.name === "github_issues")!.codeHash!;
+    const db = runsDb(p.stateDir);
+    putCatalog(db, { ...ISSUES_CATALOG, codeHash: hash });
+    db.close();
+    renameSync(join(p.root, "assets/github_issues.ts"), join(p.root, "assets/issues.ts"));
+    expect(await problemOf(p, "select count(*) from issues")).toMatchObject({
+      code: "ASSET_RENAMED", fix: { kind: "command", command: "croft rename github_issues issues" }, details: { table: "issues", from: "github_issues", to: "issues" },
+    });
+  });
+
+  test("a typo in a built table's name: UNKNOWN_TABLE suggesting the asset, with the query corrected", async () => {
+    const p = await both();
+    expect(await problemOf(p, "select count(*) from github_issue where state = 'open'")).toMatchObject({
+      code: "UNKNOWN_TABLE", message: "no table named github_issue",
+      hint: "did you mean github_issues?",
+      fix: { kind: "command", description: "query github_issues", command: `croft query "select count(*) from github_issues where state = 'open'"` },
+      details: { table: "github_issue", suggestion: "github_issues" },
+    });
+    // Named twice: the suggestion, but no rewritten query.
+    const twice = await problemOf(p, "select github_issue.id from github_issue");
+    expect(twice).toMatchObject({ code: "UNKNOWN_TABLE", hint: "did you mean github_issues?", details: { suggestion: "github_issues" } });
+    expect(twice.fix).toBeUndefined();
+  });
+
+  test("a typo in the name of an asset not built yet: the suggestion, and its run", async () => {
+    const p = await both();
+    expect(await problemOf(p, "select count(*) from stripe_charge")).toMatchObject({
+      code: "UNKNOWN_TABLE", message: "no table named stripe_charge",
+      hint: "did you mean stripe_charges? It is not built yet: croft run stripe_charges builds it",
+      fix: { kind: "command", description: "build stripe_charges", command: "croft run stripe_charges" },
+      details: { table: "stripe_charge", suggestion: "stripe_charges" },
+    });
+  });
+
+  test("a name like no asset's: UNKNOWN_TABLE naming the assets", async () => {
+    const p = await both();
+    const problem = await problemOf(p, "select * from customers");
+    expect(problem).toMatchObject({
+      code: "UNKNOWN_TABLE", message: "no table named customers",
+      hint: "no asset is named customers; the assets are github_issues, stripe_charges (croft status shows which are built)",
+      details: { table: "customers" },
+    });
+    expect(problem.fix).toBeUndefined();
   });
 });
