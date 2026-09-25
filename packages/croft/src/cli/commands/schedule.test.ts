@@ -634,7 +634,7 @@ describe("croft schedule status", () => {
     expect(r.json.data).toMatchObject({ scheduling: { state: "off", via: null, lastTickAt: null }, job: null });
     expect(r.json.data.scheduling).not.toHaveProperty("stale");
     expect(r.json.problems).toEqual([]);
-    expect(r.json.next).toEqual([{ command: "croft schedule on", reason: "run the scheduled ingests on their schedules" }]);
+    expect(r.json.next).toEqual([{ command: "croft schedule on", reason: "ask the user first: it runs the scheduled ingests on their schedules, unattended" }]);
     expect((await sched(["status"], deps().deps)).stdout.split("\n")[0]).toBe("Scheduling off · never ticked");
   });
 

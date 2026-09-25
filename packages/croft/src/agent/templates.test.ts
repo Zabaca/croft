@@ -80,7 +80,8 @@ describe("the Claude files are DESIGN.md §9, word for word", () => {
       "- API changed:", "- Missing secret:", "- Warehouse file missing"].map(at);
     expect(order).toEqual([...order].sort((a, b) => a - b));
     expect(lines[at("- Schedule:") + 1]).toBe("  run it by hand once (new code is held until then), then ask the user before `croft schedule on`.");
-    expect(lines[at("- Backfill:") + 1]).toBe("  A date works too (--from 2026-06-24); a text cursor takes a value in its own format. The saved cursor never moves back.");
+    expect(lines[at("- Backfill:") + 1]).toBe("  Then run the transforms it skipped (its next[] names them), or they stay stale.");
+    expect(lines[at("- Backfill:") + 2]).toBe("  A date works too (--from 2026-06-24); a text cursor takes a value in its own format. The saved cursor never moves back.");
     expect(lines[at("- Warehouse file missing") + 1]).toBe("  builds a new, empty one and refetches from the sources.");
     expect(at("## Output")).toBeGreaterThan(at("- Warehouse file missing"));
   });

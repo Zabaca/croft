@@ -533,9 +533,11 @@ export function guardRealHome(home: CroftHome, env: Env): void {
     return;
   }
   if (resolve(home.userHome) === real || resolve(home.dir) === join(real, ".croft")) {
-    throw new CroftError("INTERNAL_ERROR", {
-      message: `refusing to change the scheduler of the real user (${real}): CROFT_FORBID_OS_JOBS=1 (tests must set HOME and CROFT_HOME to a temp folder)`,
-      hint: "report this croft bug",
+    // A sandbox (a test run, an agent eval) sets CROFT_FORBID_OS_JOBS; the user's own terminal does not.
+    throw new CroftError("USAGE_ERROR", {
+      message: `refusing to change the scheduler of the real user (${real}): CROFT_FORBID_OS_JOBS=1 says this environment must not install OS jobs`,
+      hint: "ask the user to run croft schedule on in their own terminal; tests set HOME and CROFT_HOME to a temp folder",
+      fix: { kind: "manual", requiresHuman: true, description: "ask the user to run croft schedule on in their own terminal" },
     });
   }
 }
@@ -896,7 +898,8 @@ async function status(e: Invocation): Promise<CommandResult<ScheduleData>> {
     problems.push(...holds.problems);
     next.push(...holds.next);
   } else {
-    next.push({ command: "croft schedule on", reason: "run the scheduled ingests on their schedules" });
+    // Turning scheduling on is on the skill's ask-first list (§9): the reason says so.
+    next.push({ command: "croft schedule on", reason: "ask the user first: it runs the scheduled ingests on their schedules, unattended" });
   }
   const data: ScheduleData = {
     action: "status", root: project.root, scheduling: schedulingJson(rec, tz), job, registry: registrySummary(home), serve, assets,

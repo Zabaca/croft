@@ -340,9 +340,14 @@ function conflictFixes(d: ColumnDecision, stored: string): Fix[] {
       kind: "manual",
       description: temporal
         ? `pin a type with its format: columns: { ${key}: { type: "${stored}", format: "%Y-%m-%d %H:%M:%S" } }`
-        : `pin a type: columns: { ${key}: "${stored}" }`,
+        : fam === "integer" || fam === "hugeint" || fam === "double" || fam === "decimal"
+          ? `pin a type: columns: { ${key}: "${stored}" } (text of digits such as "2450" is stored exactly as the number)`
+          : `pin a type: columns: { ${key}: "${stored}" }`,
     },
-    { kind: "manual", description: `pin VARCHAR to accept text on purpose: columns: { ${key}: "VARCHAR" }; min, max and ORDER BY then compare as text ('9' > '10')` },
+    {
+      kind: "manual",
+      description: `pin VARCHAR only for values that really are text: columns: { ${key}: "VARCHAR" }; this retypes the stored column after a confirmation, SQL that reads it as a number (sum, >) then fails or needs a cast, and min, max and ORDER BY compare as text ('9' > '10')`,
+    },
   ];
 }
 

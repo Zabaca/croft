@@ -984,6 +984,23 @@ describe("--from backfills", () => {
     expect(log).toContain("--from 2026-06-24: since: 2026-06-24T07:00:00Z (2026-06-24T00:00:00-07:00)");
   });
 
+  test("the transforms a backfill skipped are named in next[]: they read what it changed", async () => {
+    api.state.issues = [{ id: 1, title: "a", updated_at: "2026-09-10T10:00:00Z" }];
+    const root = makeProject({
+      "assets/issues.ts": keysetIssues(api.url),
+      "assets/titles.sql": "-- key: id\nSELECT id, upper(title) AS t FROM issues\n",
+      "assets/other.sql": "SELECT 1 AS x\n",
+    });
+    await runIn(root, []);
+    api.state.issues.push({ id: 2, title: "b", updated_at: "2026-09-01T10:00:00Z" });
+    const out = await runIn(root, [], { from: "2026-08-01" });
+    expect(out.exit).toBe(0);
+    expect(out.next[0]).toEqual({
+      command: "croft run titles",
+      reason: "the backfill changed issues; --from skipped what reads it, which is stale until it runs",
+    });
+  });
+
   test("an epoch-seconds cursor gets a number; relative values count back from now", async () => {
     api.state.raw = `[{"id": "a", "created": 1782000000}]`;
     const root = makeProject({ "assets/charges.ts": `import { ingest } from "@zabaca/croft";

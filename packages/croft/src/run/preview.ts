@@ -543,7 +543,7 @@ class Engine {
     const started = Date.now();
     const log = new LogWriter(join(this.c.dir, "logs", `${asset}.log`), { redact: (t) => this.i.env.redact(t) });
     for (const line of step.output ?? []) log.write(line);
-    log.write(`${new Date().toISOString()} preview of ${asset} (${runId}): ${step.behavior}`);
+    log.write(`${formatInstant(new Date(), this.project.timezone)} preview of ${asset} (${runId}): ${step.behavior}`);
     const progress = new StepProgress(asset);
     const stepAc = new AbortController();
     const stepSignal = signal ? AbortSignal.any([signal, stepAc.signal]) : stepAc.signal;

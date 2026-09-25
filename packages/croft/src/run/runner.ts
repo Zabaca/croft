@@ -81,7 +81,7 @@ import { redactProblem } from "../cli/render.ts";
 import { currentDatabase, isReservedColumn, quoteIdent, tableRef } from "../load/evolve.ts";
 import type { CheckHookResult, WriteBatchInput } from "../load/write.ts";
 import { outsideCapture, setOutputRedactor } from "../core/output.ts";
-import { now as clockNow } from "../core/time.ts";
+import { formatInstant, now as clockNow } from "../core/time.ts";
 import { refreshReadCopy } from "../db/readcopy.ts";
 import { scheduleHeld } from "../schedule/due.ts";
 import { notifyScheduledFailure, type ScheduledFailure } from "../schedule/notify.ts";
@@ -475,7 +475,8 @@ const ACTION_WORDS: Record<ConfirmRequest["action"], string> = {
   pin_change: "the new pin would change stored values",
 };
 
-function nextSteps(steps: StepResult[], problems: Problem[], deferred: ReadonlyMap<string, ConfirmRequest>): Next[] {
+function nextSteps(steps: StepResult[], problems: Problem[], deferred: ReadonlyMap<string, ConfirmRequest>,
+  o: { fromSkipped?: readonly string[] } = {}): Next[] {
   const next: Next[] = [];
   for (const p of problems) {
     const build = p.code === "INPUT_NOT_BUILT" && Array.isArray(p.details?.inputs) ? buildFirst(p) : null;
@@ -503,6 +504,15 @@ function nextSteps(steps: StepResult[], problems: Problem[], deferred: ReadonlyM
   for (const [asset, req] of deferred) {
     if (req.action !== "large_reprocess") continue;
     next.push({ command: req.command, reason: `${asset} needs its own confirmation; run it after the pending one is settled` });
+  }
+  // A backfill (--from) runs the merge ingests only: the transforms it skipped read what it changed, and stay stale
+  // until they run.
+  const backfilled = steps.filter((s) => s.status === "ok" && (s.rows.added > 0 || s.rows.updated > 0)).map((s) => s.asset);
+  if (backfilled.length && o.fromSkipped?.length) {
+    next.push({
+      command: `croft run ${o.fromSkipped.join(" ")}`,
+      reason: `the backfill changed ${backfilled.join(", ")}; --from skipped what reads ${backfilled.length === 1 ? "it" : "them"}, which is stale until it runs`,
+    });
   }
   const ok = steps.find((s) => s.status === "ok" && s.rows.total > 0);
   if (ok && next.length === 0) next.push({ command: `croft query "from ${ok.asset} limit 5"`, reason: `look at ${ok.asset}` });
@@ -679,6 +689,19 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
     const fromSkip = (s: PlannedStep) => fromSkips.get(s.asset) ?? (o.from !== undefined && s.action !== "fetch" ? FROM_ONLY_MERGE : undefined);
     const mayRun = (s: PlannedStep) => s.action !== "skip" && !s.hold && loadErrors(s).length === 0 && fromSkip(s) === undefined;
     const runnable = order.map((n) => byName.get(n)!).filter(mayRun);
+    /** The transforms --from skipped that read, directly or not, an ingest the backfill changed. */
+    const skippedReaders = (done: readonly StepResult[]): string[] => {
+      const changed = new Set(done.filter((s) => s.status === "ok" && (s.rows.added > 0 || s.rows.updated > 0)).map((s) => s.asset));
+      const out: string[] = [];
+      for (const n of order) {
+        const s = byName.get(n)!;
+        if ((s.kind === "sql" || s.kind === "transform") && fromSkip(s) !== undefined && s.inputs.some((x) => changed.has(x))) {
+          changed.add(s.asset);
+          out.push(s.asset);
+        }
+      }
+      return out;
+    };
     const finish = (): RunOutcome => {
       const steps = order.map((n) => results.get(n)).filter((r): r is StepResult => r !== undefined);
       const interrupted = runSignal.aborted && (croftError(runSignal.reason)?.code ?? "INTERRUPTED") === "INTERRUPTED";
@@ -690,7 +713,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
       const summary: RunSummary = jsonSafe({
         data: { runId, status, steps },
         problems: clean,
-        next: nextSteps(steps, clean, confirms.deferred),
+        next: nextSteps(steps, clean, confirms.deferred, { fromSkipped: o.from === undefined ? [] : skippedReaders(steps) }),
         ...(confirmation ? { confirmation } : {}),
         exit: exitCodeFor(clean, { pendingConfirmation: confirmation !== undefined }),
         ok: !clean.some((p) => p.severity === "error"),
@@ -773,7 +796,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
         runs.startStep({ runId, asset, attempt, reason: step.reason, ...(codeHash ? { codeHash } : {}), logPath: logPath(paths.stateDir, runId, asset) });
         // What the asset's top-level code printed when the plan imported it (core/output.ts).
         if (attempt === 1) for (const line of step.output ?? []) log.write(line);
-        log.write(`${new Date().toISOString()} ${asset} attempt ${attempt} of ${maxAttempts} (run ${runId}): ${step.behavior}`);
+        log.write(`${formatInstant(new Date(), project.timezone)} ${asset} attempt ${attempt} of ${maxAttempts} (run ${runId}): ${step.behavior}`);
         events.emit({ type: "step", runId, asset, attempt, status: "running" });
         const progress = new StepProgress(asset, (p) => {
           events.emit({ type: "progress", runId, ...p });
