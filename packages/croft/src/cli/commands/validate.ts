@@ -836,7 +836,7 @@ function tscProblem(d: TscDiagnostic, root: string, inputTypes?: TypesResult): P
     });
   }
   if (file) {
-    const worded = nullableColumn(d, at, file, inputTypes) ?? bigintValue(d, root, at, file, inputTypes);
+    const worded = nullableColumn(d, root, at, file, inputTypes) ?? bigintValue(d, root, at, file, inputTypes);
     if (worded) return worded;
   }
   return problem("ASSET_INVALID", {
@@ -848,8 +848,10 @@ function tscProblem(d: TscDiagnostic, root: string, inputTypes?: TypesResult): P
   });
 }
 
-/** tsc on a value that may be NULL: `'row.amount' is possibly 'null'.` (TS18047; TS18049 adds undefined). */
+/** tsc on a value that may be NULL: `'row.amount' is possibly 'null'.` (TS18047; TS18049 adds undefined), or, for
+ *  an element access such as row["Unit Price"], `Object is possibly 'null'.` at it (TS2531, TS2533). */
 const POSSIBLY_NULL = /^'(.+)' is possibly 'null'(?: or 'undefined')?\.$/;
+const OBJECT_POSSIBLY_NULL = /^Object is possibly 'null'(?: or 'undefined')?\.$/;
 /** The property an expression ends with: row.amount, row?.amount, row["Unit Price"]. */
 const LAST_PROPERTY = /(?:\??\.([A-Za-z_$][\w$]*)|\[("(?:[^"\\]|\\.)*")\])$/;
 /** A property read in code: row.amount, row?.amount, row["Unit Price"]. */
@@ -859,22 +861,41 @@ const DEFAULTS: Record<string, string> = { number: "0", "number | bigint": "0", 
 
 const locate = (file: string, line: number | undefined) => ({ file, ...(line !== undefined ? { line } : {}) });
 const onLine = (line: number | undefined) => (line !== undefined ? ` on line ${line}` : "");
+/** A column's TS type in a generated row type, or undefined (never an Object.prototype member). */
+const typeOf = (t: GeneratedType, column: string): string | undefined => (Object.hasOwn(t.columnTypes, column) ? t.columnTypes[column] : undefined);
+/** The column a property read names: `amount`, or the text of `["Unit Price"]`; null for a string JSON refuses. */
+function propertyName(plain: string | undefined, quoted: string | undefined): string | null {
+  if (plain !== undefined) return plain;
+  try {
+    return JSON.parse(quoted!) as string;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * A column of a generated row type that may be NULL, used as if it could not be (R51-09): every column but the
  * key and croft's own may hold NULL, so the type says `| null`. The hint names the column and a default of its
  * type. Null when the expression does not end with such a column.
  */
-function nullableColumn(d: TscDiagnostic, at: Pick<Problem, "asset" | "line" | "column">, file: string, types?: TypesResult): Problem | null {
-  const m = POSSIBLY_NULL.exec(d.message.split("\n")[0]!);
-  const p = m ? LAST_PROPERTY.exec(m[1]!) : null;
-  if (!m || !p || !types) return null;
-  const column = p[1] ?? (JSON.parse(p[2]!) as string);
-  const owners = Object.values(types.types).filter((t) => t.columnTypes[column]?.endsWith(" | null"));
+function nullableColumn(d: TscDiagnostic, root: string, at: Pick<Problem, "asset" | "line" | "column">, file: string, types?: TypesResult): Problem | null {
+  if (!types) return null;
+  const first = d.message.split("\n")[0]!;
+  let expr = POSSIBLY_NULL.exec(first)?.[1];
+  if (expr === undefined && OBJECT_POSSIBLY_NULL.test(first) && at.line !== undefined && at.column !== undefined) {
+    const text = readText(join(root, file)).split("\n")[at.line - 1] ?? "";
+    const read = new RegExp(PROPERTY_READ.source, "y");
+    read.lastIndex = at.column - 1;
+    expr = read.exec(text)?.[0];
+  }
+  const p = expr === undefined ? null : LAST_PROPERTY.exec(expr);
+  const column = p ? propertyName(p[1], p[2]) : null;
+  if (expr === undefined || column === null) return null;
+  const owners = Object.values(types.types).filter((t) => typeOf(t, column)?.endsWith(" | null"));
   if (!owners.length) return null;
   const input = owners.length === 1 ? owners[0]! : null;
-  const expr = m[1]!;
-  const fallback = input ? DEFAULTS[input.columnTypes[column]!.slice(0, -" | null".length)] : undefined;
+  const base = input ? typeOf(input, column)!.slice(0, -" | null".length) : "";
+  const fallback = Object.hasOwn(DEFAULTS, base) ? DEFAULTS[base] : undefined;
   return problem("ASSET_INVALID", {
     message: `${d.code}: ${d.message}`,
     hint: `${column}${input ? ` of ${input.asset}` : ""} may be NULL (every column but the key may): give it a default, `
@@ -896,9 +917,9 @@ function bigintValue(d: TscDiagnostic, root: string, at: Pick<Problem, "asset" |
   const text = at.line !== undefined ? readText(join(root, file)).split("\n")[at.line - 1] ?? "" : "";
   let found: { expr: string; column: string; owners: GeneratedType[] } | null = null;
   for (const m of text.slice(Math.max(0, (at.column ?? 1) - 1)).matchAll(PROPERTY_READ)) {
-    const column = m[1] ?? (JSON.parse(m[2]!) as string);
-    const owners = Object.values(types?.types ?? {}).filter((t) => t.columnTypes[column]?.startsWith("number | bigint"));
-    if (owners.length) {
+    const column = propertyName(m[1], m[2]);
+    const owners = column === null ? [] : Object.values(types?.types ?? {}).filter((t) => typeOf(t, column)?.startsWith("number | bigint"));
+    if (column !== null && owners.length) {
       found = { expr: m[0], column, owners };
       break;
     }

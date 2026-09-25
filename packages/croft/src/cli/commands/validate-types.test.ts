@@ -297,6 +297,17 @@ export default transform({
     ]);
     expect(r.json.problems[0].fix.description).toBe("convert the BIGINT value with Number(row.id) on line 8");
   }, 60_000);
+
+  test("a quoted column name, and a text column's default", async () => {
+    const p = makeProject({ files: { "assets/sales.ts": ISSUES_TS, "assets/revenue.ts": REVENUE_TS("row[\"Unit Price\"] * 2 + row.region.length") } });
+    withTypescript(p);
+    catalog(p, [built("sales", "ingest", ["id"], [col("id", "BIGINT"), col("Unit Price", "DOUBLE"), col("region", "VARCHAR")])]);
+    const r = await validateTypes(p);
+    expect(r.json.problems.map((x: { hint: string }) => x.hint)).toEqual([
+      "Unit Price of sales may be NULL (every column but the key may): give it a default, (row[\"Unit Price\"] ?? 0), or skip the rows where it is null",
+      "region of sales may be NULL (every column but the key may): give it a default, (row.region ?? \"\"), or skip the rows where it is null",
+    ]);
+  }, 60_000);
 });
 
 describe("includesInputTypes: whether tsconfig.json reaches .croft/types", () => {
