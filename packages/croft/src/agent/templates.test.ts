@@ -1,6 +1,12 @@
-import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import pkg from "../../package.json" with { type: "json" };
+import { LATER_COMMANDS, LATER_FLAGS, laterFlags } from "../core/phase.ts";
+import { initProject } from "../project/init.ts";
 import { parseConfig } from "../project/root.ts";
 import { parseDotenv } from "../project/env.ts";
 import {
@@ -13,101 +19,70 @@ const DESIGN = readFileSync(new URL("../../../../DESIGN.md", import.meta.url), "
 /** The body of the first ```markdown fence after `marker` in DESIGN.md. */
 function designBlock(marker: string): string {
   const at = DESIGN.indexOf(marker);
+  expect(at, marker).toBeGreaterThan(-1);
   const open = DESIGN.indexOf("```markdown\n", at) + "```markdown\n".length;
   return DESIGN.slice(open, DESIGN.indexOf("\n```\n", open) + 1);
 }
 
-// DESIGN.md §9 holds the v1 texts, for all five phases. This build ships phase 4, so its texts leave out or
-// reword every line that sends the agent to a command, flag or feature phase 4 lacks (agent/contract.test.ts
-// checks the commands and flags): only phase 5's `croft new` is missing. Every other §9 line ships word for word,
-// and each line that does not is listed here with the reason, so no rule of §9 disappears unnoticed. Match: the
-// start of the §9 line.
-const CUT_FROM_CLAUDE_MD: [string, string][] = [];
-const CUT_FROM_SKILL: [string, string][] = [
-  ["`croft docs <ERROR_CODE>`, `croft docs --list`, `croft new --list`.", "new is phase 5: croft help <command> instead"],
-  ["croft status                # failed, stale, held, edited, orphaned", "worded as status says it: never run, edited since its last run, no asset file (orphaned)"],
-  ["1. New asset: `croft new api|file|sql|transform <name>`", "new is phase 5: the templates are croft docs ingest, sql and transforms"],
-  ["- SQL assets read assets, never files", "new is phase 5: the file ingest template is in croft docs ingest"],
-  ["  (`croft new api x --pagination cursor`).", "new is phase 5: the cursor template in croft docs ingest"],
-];
+const CLAUDE_MD_9 = designBlock("**1. The `CLAUDE.md` managed block:**");
+const SKILL_MD_9 = designBlock("**2. `.claude/skills/croft/SKILL.md`:**");
 
-// Phase 3's lines: each ships word for word (a reworded one would be missing from SKILL.md, and checkCuts would
-// ask for a cut entry).
-const PHASE_3_LINES = [
-  "  source, writing SQL or TypeScript transforms, adding checks, scheduling, debugging a failed run, backfilling,",
-  "croft context --json        # assets, columns, behavior, schedules, running, held, recent failures and schema changes",
-  "  SQL transforms are always rebuilt in full; there is no incremental SQL. Only ingests have schedules.",
-  "- `croft serve` runs until stopped: ask the user to start it in their own terminal instead of running it in your shell.",
-  "- For a GUI (DuckDB UI, DBeaver), set \"readCopy\": true in croft.json and open warehouse.read.duckdb, never warehouse.duckdb.",
-  "- `croft serve` (it runs scheduled work unattended, and a `--host` other than 127.0.0.1 exposes data beyond this machine).",
-  "- Held asset: it was edited and not run by hand; run it by hand once (croft run <asset>) after checking the preview.",
-];
-
-// Phase 4's lines (rename, restore, delete, --rebuild, key and pin changes, pre-upgrade backups): the lines phase 3
-// cut or reworded, restored word for word.
-const PHASE_4_LINES = [
-  "  renaming, or answering a question from project data.",
-  "- `croft confirm <token>` (every destructive action ends here: rebuild of an ingest or incremental TS transform,",
-  "  --allow-shrink, delete, restore, lossy pin changes, key conversion, large paid reprocessing).",
-  "- Renaming or deleting files in assets/ (use `croft rename`); `croft schedule on|off|pause`.",
-  "- Deleting .croft/ or warehouse*.duckdb, or `git clean -X` (the trash and backups live in .croft/).",
-  "- Rename: croft rename <old> <new>; fix every reference it lists; validate; preview; run.",
-];
-
-/** The §9 lines missing from `shipped`, each matched to exactly one entry of `cuts` (and each entry used). */
-function checkCuts(design: string, shipped: string, cuts: [string, string][]): void {
-  const lines = new Set(shipped.split("\n"));
-  const missing = design.split("\n").filter((l) => !lines.has(l));
-  const unexplained = missing.filter((l) => cuts.filter(([start]) => l.startsWith(start)).length !== 1);
-  expect(unexplained).toEqual([]);
-  const unused = cuts.filter(([start]) => missing.filter((l) => l.startsWith(start)).length !== 1).map(([start]) => start);
-  expect(unused).toEqual([]);
-}
-
-describe("the Claude files are DESIGN.md §9, cut to what this build ships", () => {
+// Phase 5 ships every command and flag DESIGN.md §9 names, so both texts ship word for word: no line is cut or
+// reworded, and SKILL.md has no "This version" section (earlier phases rendered one from core/phase.ts to name what
+// they lacked). Where the shipped SKILL.md grew beyond §9 in earlier phases (the Schedule recipe, a second Backfill
+// line, the missing-warehouse recipe, the status line in the command's own words), §9 took the shipped text in, so
+// a byte comparison covers every line. agent/contract.test.ts checks that each command and flag they name exists.
+describe("the Claude files are DESIGN.md §9, word for word", () => {
   test("CLAUDE.md managed block", () => {
-    checkCuts(designBlock("**1. The `CLAUDE.md` managed block:**"), claudeBlock("project"), CUT_FROM_CLAUDE_MD);
-    expect(claudeBlock("project").split("\n")).toHaveLength(designBlock("**1. The `CLAUDE.md` managed block:**").split("\n").length);
-    // Phase 2 has every command the block names, so it ships word for word.
-    if (CUT_FROM_CLAUDE_MD.length === 0) expect(claudeBlock("project")).toBe(designBlock("**1. The `CLAUDE.md` managed block:**"));
+    expect(claudeBlock("project")).toBe(CLAUDE_MD_9);
   });
 
   test("SKILL.md, stamped with the version", () => {
-    checkCuts(designBlock("**2. `.claude/skills/croft/SKILL.md`:**"), skillMd("0.1.0"), CUT_FROM_SKILL);
-    expect(skillMd()).toContain(`<!-- croft ${CROFT_VERSION} -->`);
-    expect(skillMd()).not.toContain("{{version}}");
-    expect(skillMd()).not.toContain("{{phase}}");
+    expect(skillMd("0.1.0")).toBe(SKILL_MD_9);
+    expect(skillMd()).toBe(SKILL_MD_9.replace("<!-- croft 0.1.0 -->", `<!-- croft ${CROFT_VERSION} -->`));
+    expect(skillMd()).not.toMatch(/\{\{\w*\}\}/);
   });
 
-  test("SKILL.md ships phase 3's and phase 4's lines of §9: schedules, holds, croft serve, the read copy, rename, the trash", () => {
-    const design = designBlock("**2. `.claude/skills/croft/SKILL.md`:**").split("\n");
-    const lines = skillMd("0.1.0").split("\n");
-    for (const line of [...PHASE_3_LINES, ...PHASE_4_LINES]) {
-      expect(design, "a §9 line").toContain(line);
+  test("phase 5 has every command and flag, so SKILL.md has no This version section", () => {
+    expect(LATER_COMMANDS).toEqual([]);
+    for (const command of Object.keys(LATER_FLAGS)) expect(laterFlags(command), command).toEqual([]);
+    const text = skillMd();
+    expect(text).not.toContain("## This version");
+    expect(text.split("\n").filter((l) => /this version|not built|later (phase|version)|phase \d/i.test(l))).toEqual([]);
+  });
+
+  test("a new asset starts from croft new: the header, loop step 1, files in SQL assets, cursor paging", () => {
+    const lines = skillMd().split("\n");
+    for (const line of [
+      "`croft docs <ERROR_CODE>`, `croft docs --list`, `croft new --list`. Every command takes `--json` →",
+      "1. New asset: `croft new api|file|sql|transform <name>`; edit the template, don't invent APIs.",
+      "- SQL assets read assets, never files: to use a file, make a file ingest (`croft new file x`).",
+      "  (`croft new api x --pagination cursor`).",
+    ]) {
       expect(lines).toContain(line);
     }
-    // The Apps line, word for word: apps read through croft serve when it runs.
-    const apps = design.find((l) => l.startsWith("- Apps read with"))!;
-    expect(apps).toContain("`croft serve`");
-    expect(lines).toContain(apps);
-    // Reworded for a reason that is not a phase: the status line uses the command's own words.
-    expect(lines).toContain("croft status                # failed, stale, held, never run, edited since its last run, no asset file");
-    // Nothing is left of phase 3's rewordings ("this version cannot rename or drop it", "in this version: …").
-    expect(lines.filter((l) => /this version cannot|in this version:|stays under the old name/.test(l))).toEqual([]);
-    // The rename recipe comes after the backfill recipe and before "Wrong number", as in §9.
-    const at = (start: string) => lines.findIndex((l) => l.startsWith(start));
-    expect(at("- Rename: croft rename")).toBeGreaterThan(at("- Backfill:"));
-    expect(at("- Rename: croft rename")).toBeLessThan(at("- Wrong number:"));
-    // Added to §9: how an ingest gets on a schedule, which the eval task "schedule hourly" needs in one place.
-    expect(lines).toContain("- Schedule: add `schedule: \"every hour\"` to the ingest (`croft docs scheduling`); `croft validate` shows the next fires;");
-    expect(lines).toContain("  run it by hand once (new code is held until then), then ask the user before `croft schedule on`.");
+    // What stood in for croft new in phases 1–4 is gone.
+    expect(skillMd()).not.toMatch(/croft help <command>|the cursor template in|closest template in `croft docs/);
   });
 
-  test("only phase 5 is cut: every cut line is about croft new, or is the status line in the command's own words", () => {
-    for (const [start, why] of CUT_FROM_SKILL) {
-      expect(why, start).toMatch(/^new is phase 5|^worded as status says it/);
-    }
-    expect(CUT_FROM_SKILL).toHaveLength(5);
+  test("what earlier phases added to SKILL.md is in §9 too, in its place", () => {
+    const lines = skillMd().split("\n");
+    const at = (start: string) => {
+      const i = lines.findIndex((l) => l.startsWith(start));
+      expect(i, start).toBeGreaterThan(-1);
+      return i;
+    };
+    // Orient: status in the command's own words.
+    expect(lines).toContain("croft status                # failed, stale, held, never run, edited since its last run, no asset file");
+    // Recipes: Failed run, Held asset, Schedule, Backfill (two lines), Rename, Wrong number, API changed, Missing
+    // secret, Warehouse file missing.
+    const order = ["- Failed run:", "- Held asset:", "- Schedule:", "- Backfill:", "- Rename:", "- Wrong number:",
+      "- API changed:", "- Missing secret:", "- Warehouse file missing"].map(at);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    expect(lines[at("- Schedule:") + 1]).toBe("  run it by hand once (new code is held until then), then ask the user before `croft schedule on`.");
+    expect(lines[at("- Backfill:") + 1]).toBe("  A date works too (--from 2026-06-24); a text cursor takes a value in its own format. The saved cursor never moves back.");
+    expect(lines[at("- Warehouse file missing") + 1]).toBe("  builds a new, empty one and refetches from the sources.");
+    expect(at("## Output")).toBeGreaterThan(at("- Warehouse file missing"));
   });
 
   test("the app block differs from the project block only where the project lives in data/", () => {
@@ -195,10 +170,10 @@ describe("project templates", () => {
     expect(JSON.parse(packageJson()).dependencies["@zabaca/croft"]).toBe(CROFT_VERSION);
   });
 
-  test("tsconfig.json is strict, bundler-resolved, Bun-typed and covers assets and lib", () => {
+  test("tsconfig.json is strict, bundler-resolved, Bun-typed and covers assets, lib and the generated input types", () => {
     const t = JSON.parse(tsconfigJson());
     expect(t.compilerOptions).toMatchObject({ strict: true, moduleResolution: "bundler", types: ["bun"], allowImportingTsExtensions: true, noEmit: true });
-    expect(t.include).toEqual(["assets", "lib"]);
+    expect(t.include).toEqual(["assets", "lib", ".croft/types/**/*.d.ts"]);
   });
 
   test(".gitignore has exactly the four patterns", () => {
@@ -240,12 +215,117 @@ describe("project templates", () => {
     expect(ids.size).toBe(120);
   });
 
-  test("the example asset is a file ingest of files/example_sales.csv", async () => {
+  test("the example asset is a file ingest of files/example_sales.csv, and points at croft new for more", async () => {
     const text = scaffold({ timezone: "UTC" }).find((f) => f.path === "assets/example_sales.ts")!.text;
     expect(text).toContain('import { ingest } from "@zabaca/croft";');
+    expect(text).toContain("croft new api <name>");
+    expect(text).toContain("croft new file <name>");
     // It also type-checks against the real API: tsconfig includes src/agent/project/assets.
     const mod = (await import("./project/assets/example_sales.ts")).default;
     expect(mod.__croft).toBe("ingest");
     expect(mod.config).toMatchObject({ file: "files/example_sales.csv", key: "order_id" });
   });
+});
+
+// The input types croft generates for TS transforms live in .croft/types (DESIGN.md §11 phase 5; project/types-gen.ts).
+// The project's own tsconfig.json takes them in, so an editor, Claude and `croft validate --types` (the project's tsc)
+// all check a transform's rows against its inputs' columns. These tests type-check a project exactly as croft init
+// writes it, with the TypeScript this package pins, against this package's own source.
+describe("the tsconfig.json croft init writes takes in .croft/types", () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "croft-tsconfig-")));
+  afterAll(() => rmSync(base, { recursive: true, force: true }));
+  const PKG = fileURLToPath(new URL("../../", import.meta.url));
+  let n = 0;
+
+  /** A project from initProject (no install), with node_modules linked to this package and its Bun types. */
+  async function project(): Promise<string> {
+    const root = join(base, `p${n++}`);
+    await initProject({ target: root, install: false, timezone: "UTC", synced: () => null });
+    mkdirSync(join(root, "node_modules", "@zabaca"), { recursive: true });
+    symlinkSync(PKG, join(root, "node_modules", "@zabaca", "croft"));
+    symlinkSync(join(PKG, "node_modules", "@types"), join(root, "node_modules", "@types"));
+    return root;
+  }
+
+  const write = (root: string, path: string, text: string) => {
+    mkdirSync(dirname(join(root, path)), { recursive: true });
+    writeFileSync(join(root, path), text);
+  };
+
+  /** `tsc --noEmit -p <root>`: the project files the tsconfig takes in, and every error (croft's own source too). */
+  function typecheck(root: string): { files: string[]; errors: string[] } {
+    const read = ts.readConfigFile(join(root, "tsconfig.json"), ts.sys.readFile);
+    expect(read.error).toBeUndefined();
+    const parsed = ts.parseJsonConfigFileContent(read.config, ts.sys, root);
+    const rel = (f: string) => relative(root, f).split(sep).join("/");
+    const program = ts.createProgram(parsed.fileNames, parsed.options);
+    const errors = [...parsed.errors, ...ts.getPreEmitDiagnostics(program)].map((d) =>
+      `${d.file ? rel(d.file.fileName) : "tsconfig.json"}: ${ts.flattenDiagnosticMessageText(d.messageText, "\n")}`);
+    return { files: parsed.fileNames.map(rel).sort(), errors };
+  }
+
+  // What types-gen writes, and how rows() picks it up, is its builder's. What the tsconfig owes it: a declaration
+  // under .croft/types is part of the project, so a type it declares checks an asset's reads. The transform casts
+  // its rows so this holds whatever rows() itself returns.
+  const salesType = (region: string) => `// Generated by croft from the catalog: the columns of example_sales.
+type ExampleSalesRow = { order_id: number; order_date: string; customer: string; ${region}: string; amount: number };
+`;
+  const byRegion = `import { transform } from "@zabaca/croft";
+
+export default transform({
+  inputs: ["example_sales"],
+  async *rows(ctx) {
+    for await (const row of ctx.rows("example_sales")) {
+      const r = row as ExampleSalesRow;
+      yield { region: r.region, amount: r.amount };
+    }
+  },
+});
+`;
+
+  test("init writes it, in a new project and in an app's data/", async () => {
+    const root = await project();
+    expect(readFileSync(join(root, "tsconfig.json"), "utf8")).toBe(tsconfigJson());
+    const app = join(base, `app${n++}`);
+    write(app, "package.json", "{}\n");
+    await initProject({ target: app, install: false, timezone: "UTC", synced: () => null });
+    expect(readFileSync(join(app, "data", "tsconfig.json"), "utf8")).toBe(tsconfigJson());
+  });
+
+  test("a new project type-checks, before any types are generated", async () => {
+    const root = await project();
+    expect(typecheck(root)).toEqual({ files: ["assets/example_sales.ts"], errors: [] });
+  }, 60_000);
+
+  test("a transform typed by a generated row type type-checks, and a renamed column is a type error", async () => {
+    const root = await project();
+    write(root, ".croft/types/example_sales.d.ts", salesType("region"));
+    write(root, "assets/by_region.ts", byRegion);
+    expect(typecheck(root)).toEqual({
+      files: [".croft/types/example_sales.d.ts", "assets/by_region.ts", "assets/example_sales.ts"], errors: [],
+    });
+
+    // The column is renamed upstream and the types are generated again: tsc names the transform's stale read.
+    write(root, ".croft/types/example_sales.d.ts", salesType("sales_region"));
+    const { errors } = typecheck(root);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toStartWith("assets/by_region.ts: Property 'region' does not exist on type 'ExampleSalesRow'.");
+  }, 60_000);
+
+  test("only declaration files under .croft/types: croft's other state is never compiled", async () => {
+    const root = await project();
+    write(root, ".croft/types/example_sales.d.ts", salesType("region"));
+    write(root, ".croft/types/stray.ts", "export const x: number = 'not a number';\n");
+    write(root, ".croft/preview/notes.d.ts", "declare const broken: ;\n");
+    expect(typecheck(root)).toEqual({ files: [".croft/types/example_sales.d.ts", "assets/example_sales.ts"], errors: [] });
+  }, 60_000);
+
+  test("without the include, the generated types are not seen", async () => {
+    const root = await project();
+    write(root, ".croft/types/example_sales.d.ts", salesType("region"));
+    write(root, "assets/by_region.ts", byRegion);
+    const t = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8"));
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify({ ...t, include: ["assets", "lib"] }));
+    expect(typecheck(root).errors).toEqual(["assets/by_region.ts: Cannot find name 'ExampleSalesRow'."]);
+  }, 60_000);
 });
