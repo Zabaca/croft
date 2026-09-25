@@ -8,7 +8,7 @@ import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/war
 import { deleteTable, deleteWhere } from "./delete.ts";
 import { detectOutOfBand } from "./guards.ts";
 import { listVersions, restoreImpact, restoreVersion } from "./restore.ts";
-import { listTrash, trashStamp, trashTable } from "./trash.ts";
+import { listTrash, type TrashEntry, trashStamp, trashTable } from "./trash.ts";
 
 const dirs: string[] = [];
 afterAll(async () => {
@@ -166,6 +166,74 @@ describe("restoreVersion: the rows of a delete --where", () => {
     const e = await expectCode(restoreVersion(w, rows.trashed, { now: T2 }), "USAGE_ERROR");
     expect(e.problem.message).toContain("does not exist");
     expect(e.problem.hint).toContain("croft restore orders");
+  });
+});
+
+describe("restoreVersion: a rows version whose delete never happened (R41-10)", () => {
+  /** A keyless append table of 10 events; n < 3 goes to the trash as a delete --where would, but is not deleted. */
+  async function stopped(): Promise<{ w: DuckWarehouse; state: string; v: TrashEntry }> {
+    const { w, state } = warehouse();
+    await w.write("seed", async (tx) => {
+      await ensureState(tx);
+      await tx.exec(`CREATE TABLE events AS SELECT range AS n, 'e' || range AS v FROM range(10)`);
+      await tx.exec(`INSERT INTO _croft.assets (name, kind, write_mode, key_columns, row_count) VALUES ('events', 'ingest', 'append', [], 10)`);
+    }, { runId: "r_seed" });
+    const v = (await trashTable(w, "events", `delete --where "n < 3" (r_0921_1000_dddd)`, { now: T1, where: "n < 3", pending: true }))!;
+    return { w, state, v: listTrash(state, "events").find((e) => e.path === v.path)! };
+  }
+  const count = (w: DuckWarehouse) => w.read(async (db) => (await db.all<{ n: number; d: number }>(`SELECT count(*)::INT n, count(DISTINCT n)::INT d FROM events`))[0]);
+
+  test("it is listed as not applied; with every row still in the table it is refused and nothing changes", async () => {
+    const { w, state, v } = await stopped();
+    expect(v).toMatchObject({ kind: "rows", rows: 3, applied: false });
+    const e = await expectCode(restoreImpact(w, v), "USAGE_ERROR");
+    expect(e.problem.message).toContain("did not finish");
+    expect(e.problem.message).toContain("all 3 are still in the table");
+    await expectCode(restoreVersion(w, v, { now: T2 }), "USAGE_ERROR");
+    expect(await count(w)).toEqual({ n: 10, d: 10 });
+    expect(listTrash(state, "events")).toHaveLength(1);
+  });
+
+  test("with some of its rows gone since, only the missing ones go back (a keyless table gets no second copy)", async () => {
+    const { w, v } = await stopped();
+    await w.write("gone", (tx) => tx.exec(`DELETE FROM events WHERE n = 1`), { runId: "r_x" });
+    expect(await restoreImpact(w, v)).toMatchObject({ kind: "rows", rows: 1, skipped: 2 });
+    const r = await restoreVersion(w, v, { now: T2 });
+    expect(r).toMatchObject({ rows: 1, skipped: 2, rowsAfter: 10 });
+    expect(await count(w)).toEqual({ n: 10, d: 10 });
+  });
+
+  test("a version with no sidecar (a crash right after the trash commit) is treated the same way", async () => {
+    const { w, state, v } = await stopped();
+    rmSync(v.path.replace(/\.duckdb$/, ".json"));
+    const [bare] = listTrash(state, "events");
+    expect(bare).toMatchObject({ kind: "table", applied: false });
+    const e = await expectCode(restoreImpact(w, bare!), "USAGE_ERROR");
+    expect(e.problem.message).toContain("did not finish");
+  });
+
+  test("a delete that finished restores as before, and its rows are not compared with the table", async () => {
+    const { w } = warehouse();
+    await w.write("seed", async (tx) => {
+      await ensureState(tx);
+      await tx.exec(`CREATE TABLE events AS SELECT * FROM (VALUES (1, 'a'), (1, 'a'), (2, 'b')) v(n, v)`);
+    }, { runId: "r_seed" });
+    const del = await deleteWhere(w, "events", "n = 1", { now: T1 });
+    // Another copy of a deleted row arrives (an append): the version still puts both of its copies back.
+    await w.write("append", (tx) => tx.exec(`INSERT INTO events VALUES (1, 'a')`), { runId: "r_x" });
+    expect(await restoreImpact(w, del.trashed)).toMatchObject({ rows: 2, skipped: 0 });
+  });
+});
+
+describe("restoreVersion: changes made outside croft", () => {
+  test("are reported (OUT_OF_BAND_CHANGE) before the restore takes the table's numbers", async () => {
+    const { w } = warehouse();
+    await seed(w);
+    const del = await deleteWhere(w, "orders", "amount >= 30", { now: T1 });
+    await w.write("outside", (tx) => tx.exec(`DELETE FROM orders WHERE id = 0`), { runId: "r_x" });
+    const r = await restoreVersion(w, del.trashed, { now: T2 });
+    expect(r.problems.map((p) => p.code)).toEqual(["OUT_OF_BAND_CHANGE"]);
+    expect(r.problems[0]!.message).toContain("1 row removed (3 → 2)");
   });
 });
 

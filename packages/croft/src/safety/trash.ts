@@ -11,6 +11,10 @@
 // - A small <time>.json next to each file lets listTrash() work without opening DuckDB.
 // - A version holds the whole table (kind "table": --allow-shrink, --rebuild, delete, restore) or the rows a
 //   predicate matched (kind "rows": delete --where), recorded in the sidecar and in the file's _croft.trash.
+// - A "rows" version is written `pending`: its sidecar says `applied: false` until the delete that follows has
+//   committed and marks it (markApplied). One whose delete stopped (a crash between the commits, or a delete refused
+//   because the table changed) still says so, and listTrash reports `applied: false`: restore does not offer it as
+//   rows to put back, since they were most likely never deleted (safety/restore.ts checks the table).
 // - Retention (§6, "30 days or 5 versions per asset"): a version is kept for 30 days, and each asset's 5 newest
 //   versions are kept however old; so a version goes only when it is older than 30 days and 5 newer versions of
 //   its asset exist. trashTable prunes the asset it trashed, once the new version is safe; croft doctor prunes
@@ -21,8 +25,10 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { now as clockNow } from "../core/time.ts";
+import type { Sql } from "../core/types.ts";
 import { CROFT_VERSION } from "../db/state.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
+import type { RunsDb } from "../history/runs-db.ts";
 import { currentDatabase, quoteIdent, quoteLiteral, readTableSchema } from "../load/evolve.ts";
 
 export const TRASH_DIR = "trash";
@@ -50,6 +56,9 @@ export interface TrashEntry {
   kind: TrashKind;
   /** The predicate of a "rows" version; null for a whole table. */
   where: string | null;
+  /** false: a "rows" version whose delete was never recorded as done (it stopped between the two commits, or was
+   *  refused), or a version with no sidecar (a crash right after the trash commit). Absent otherwise. */
+  applied?: false;
 }
 
 export function trashDir(stateDir: string, asset?: string): string {
@@ -72,6 +81,9 @@ export interface TrashOptions {
   where?: string;
   /** Versions the retention pass after the trash must not prune (the one a restore is about to read). */
   keep?: readonly string[];
+  /** The destructive change that follows has not happened yet: the sidecar says `applied: false` until the caller
+   *  marks the version done (markApplied) after its own commit. */
+  pending?: boolean;
 }
 
 /**
@@ -133,7 +145,7 @@ export async function trashTable(warehouse: DuckWarehouse, asset: string, reason
   if (!entry) return null;
   const out: TrashEntry = {
     asset, path, trashedAt: at.toISOString(), reason, runId: o.runId ?? null, rows: entry.rows,
-    bytes: fileSize(path), croftVersion: CROFT_VERSION, kind, where,
+    bytes: fileSize(path), croftVersion: CROFT_VERSION, kind, where, ...(o.pending ? { applied: false as const } : {}),
   };
   const meta = join(dir, `${stamp}.json`);
   writeFileSync(`${meta}.tmp`, JSON.stringify(out, null, 1));
@@ -173,17 +185,21 @@ export function listTrash(stateDir: string, asset?: string): TrashEntry[] {
       if (!f.endsWith(".duckdb")) continue;
       const path = join(dir, f);
       const stamp = f.slice(0, -".duckdb".length);
-      let meta: Partial<TrashEntry> = {};
+      let meta: Partial<Omit<TrashEntry, "applied">> & { applied?: unknown } = {};
+      let sidecar = true;
       try {
-        meta = JSON.parse(readFileSync(join(dir, `${stamp}.json`), "utf8")) as Partial<TrashEntry>;
+        meta = JSON.parse(readFileSync(join(dir, `${stamp}.json`), "utf8")) as typeof meta;
       } catch {
-        // A crash between the trash commit and its sidecar: the file is still a valid trashed version.
+        // A crash between the trash commit and its sidecar: the file is still a valid trashed version, but what
+        // was to follow it (a delete of its rows) never ran.
+        sidecar = false;
       }
       out.push({
         asset: a, path, trashedAt: meta.trashedAt ?? stampTime(stamp) ?? new Date(statSync(path).mtimeMs).toISOString(),
         reason: meta.reason ?? "unknown", runId: meta.runId ?? null, rows: meta.rows ?? 0, bytes: fileSize(path),
         croftVersion: meta.croftVersion ?? "unknown", kind: meta.kind === "rows" ? "rows" : "table",
         where: meta.kind === "rows" && typeof meta.where === "string" ? meta.where : null,
+        ...(!sidecar || meta.applied === false ? { applied: false as const } : {}),
       });
     }
   }
@@ -207,6 +223,28 @@ export function annotateVersion(path: string, extra: Record<string, unknown>): v
   }
   writeFileSync(`${meta}.tmp`, JSON.stringify({ ...current, ...extra }, null, 1));
   renameSync(`${meta}.tmp`, meta);
+}
+
+/** The destructive change a `pending` version was written for has committed: its sidecar says `applied: true`. */
+export function markApplied(path: string): void {
+  annotateVersion(path, { applied: true });
+}
+
+/**
+ * Run `fn` with the trash file at `path` ATTACHed read-only under a fresh alias, and DETACH it after (also when `fn`
+ * throws). The warehouse's own connection reads it; the file is never opened a second way. ATTACH must run outside
+ * a transaction: `fn` begins its own.
+ */
+export async function withTrashFile<T>(sql: Sql, path: string, fn: (alias: string) => Promise<T>): Promise<T> {
+  const { canonicalPath } = await import("../db/connect.ts");
+  const alias = `croft_trash_ro_${process.pid}_${++attachSeq}`;
+  // The sandbox allows the state folder by its canonical path.
+  await sql.exec(`ATTACH ${quoteLiteral(canonicalPath(path))} AS ${quoteIdent(alias)} (READ_ONLY)`);
+  try {
+    return await fn(alias);
+  } finally {
+    await sql.exec(`DETACH ${quoteIdent(alias)}`).catch(() => {});
+  }
 }
 
 /** A field croft kept in a version's sidecar (annotateVersion), or undefined. */
@@ -251,6 +289,19 @@ export function pruneTrash(stateDir: string, o: { asset?: string; now?: Date; ke
 /** Where the next trash file of an asset would go (for a confirmation's impact; the stamp is a guess). */
 export function plannedTrashPath(stateDir: string, asset: string, at: Date = clockNow()): string {
   return join(trashDir(stateDir, asset), `${trashStamp(at)}.duckdb`);
+}
+
+/**
+ * Whether `croft delete` removed the asset's whole table and nothing has built it since: the latest step that ran
+ * (a step skipped for a hold did not) is the delete's, reason "deleted", and its catalog mirror entry is gone
+ * (cli/commands/delete.ts). Such an asset is held from the scheduler until a person acts, and status, describe and
+ * the hold say so: `croft restore <asset>` brings it back, and only `croft run <asset>` by hand builds it again from
+ * scratch. Reads runs.sqlite only (no DuckDB), so the tick can ask.
+ */
+export function deletedByCroft(runs: Pick<RunsDb, "sqlite" | "catalogGet">, asset: string): boolean {
+  const ran = runs.sqlite.query(`SELECT reason FROM steps WHERE asset = ? AND attempt >= 1 AND status <> 'skipped'
+    ORDER BY started_at DESC, attempt DESC LIMIT 1`).get(asset) as { reason: string | null } | null;
+  return ran?.reason === "deleted" && runs.catalogGet(asset) === null;
 }
 
 /** INTERNAL_ERROR when the trash could not be written: the destructive change must not go ahead. */

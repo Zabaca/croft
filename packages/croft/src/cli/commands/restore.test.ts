@@ -2,9 +2,10 @@ import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { DuckDBInstance } from "@duckdb/node-api";
 import { closeAllWarehouses, openWarehouse } from "../../db/warehouse.ts";
 import { type CatalogAsset, getCatalog, putCatalog } from "../../history/catalog.ts";
+import { cliEnv, cli as spawnCli } from "../../run/testkit.ts";
 import { listTrash, type TrashEntry, trashTable } from "../../safety/trash.ts";
 import { prompter } from "./delete.ts";
-import { cleanup, cli, makeProject, runsDb, seed, STATE, type TestProject } from "./inspect-testkit.ts";
+import { cleanup, cli, makeProject, runsDb, seed, STATE, type TestProject, writeFiles } from "./inspect-testkit.ts";
 import { localTime, pickVersion } from "./restore.ts";
 
 const NOW = "2026-09-22T18:40:00.000Z";
@@ -227,6 +228,80 @@ describe("croft restore <asset>", () => {
     const one = await cli(["restore", "orders", "--at", "2026-09-22 11:40:05", "--json"], { cwd: p.root, env });
     expect(one.exit).toBe(5);
     expect(one.json.data.version.trashedAt).toBe("2026-09-22T11:40:05.000-07:00");
+  });
+});
+
+describe("croft restore: readers, unfinished deletes, tokens (R41-10, R41-11, INT)", () => {
+  const TRIAGE = `import { transform } from "@zabaca/croft";\nexport default transform({ inputs: ["orders"], key: "id", incremental: true, async *rows() { yield []; } });\n`;
+
+  test("an incremental TS reader is named with --rebuild in the text and next's reason, never as a next command", async () => {
+    const p = await project();
+    writeFiles(p.root, { "assets/triage.ts": TRIAGE });
+    await seed(p.database, [`INSERT INTO _croft.inputs (asset, input, seen_loaded_at) VALUES ('triage', 'orders', '2026-09-20 14:00:00+00')`]);
+    const del = await cli(["delete", "orders", "--where", "amount >= 30", "--json"], { cwd: p.root, env });
+    expect((await cli(["confirm", del.json.confirmation.token, "--json"], { cwd: p.root, env })).exit).toBe(0);
+    const r = await cli(["restore", "orders"], { cwd: p.root, env });
+    expect(r.stdout).toContain("  then:  daily go stale: the next croft run rebuilds them\n"
+      + "         triage processes new input rows only: croft run triage --rebuild redoes the restored rows (it asks first)");
+    const token = /croft confirm (c_[0-9a-f]{6})/.exec(r.stdout)![1]!;
+    const done = await cli(["confirm", token, "--json"], { cwd: p.root, env });
+    expect(done.exit).toBe(0);
+    expect(done.json.data.result.rebuild).toEqual(["triage"]);
+    expect(done.json.next).toEqual([{
+      command: "croft run daily",
+      reason: "they read orders, which was restored; triage processes new input rows only: croft run triage --rebuild redoes the restored rows (it asks first)",
+    }]);
+  });
+
+  test("with only incremental TS readers, next is croft status, with the --rebuild in its reason", async () => {
+    const p = await project();
+    writeFiles(p.root, { "assets/triage.ts": TRIAGE });
+    await seed(p.database, [`DELETE FROM _croft.inputs`, `INSERT INTO _croft.inputs (asset, input, seen_loaded_at) VALUES ('triage', 'orders', '2026-09-20 14:00:00+00')`]);
+    await trashAt(p, "2026-09-21T17:00:00.000Z");
+    const r = await cli(["restore", "orders", "--json"], { cwd: p.root, env });
+    const done = await cli(["confirm", r.json.confirmation.token, "--json"], { cwd: p.root, env });
+    expect(done.json.next).toEqual([{ command: "croft status", reason: "triage processes new input rows only: croft run triage --rebuild redoes the restored rows (it asks first)" }]);
+  });
+
+  test("a delete --where that stopped between its commits: listed as not deleted, skipped by default, refused by name", async () => {
+    const p = await project();
+    await trashAt(p, "2026-09-21T17:00:00.000Z");
+    const token = (await cli(["delete", "orders", "--where", "amount >= 30", "--json"], { cwd: p.root, env })).json.confirmation.token as string;
+    await closeAllWarehouses();
+    const killed = await spawnCli(p.root, ["confirm", token, "--json"], cliEnv({ CROFT_FAULT: "between_trash_and_drop" }));
+    expect(killed.signal).toBe("SIGKILL");
+    expect(await ids(p)).toEqual([0, 1, 2, 3, 4]);
+    const list = await cli(["restore", "--json"], { cwd: p.root, env });
+    expect(list.json.data.versions.map((v: { kind: string; applied: boolean }) => [v.kind, v.applied])).toEqual([["rows", false], ["table", true]]);
+    const human = await cli(["restore"], { cwd: p.root, env });
+    expect(human.stdout).toMatch(/orders\s+\d{4}-\d\d-\d\d \d\d:\d\d\s+2\s+.*delete --where "amount >= 30" \(r_\w+\), not applied: the delete did not finish/);
+    // The latest version it restores is the last one whose change happened.
+    const r = await cli(["restore", "orders", "--json"], { cwd: p.root, env });
+    expect(r.json.data.version).toMatchObject({ kind: "table", trashedAt: "2026-09-21T10:00:00.000-07:00" });
+    const at = list.json.data.versions[0].trashedAt as string;
+    const named = await cli(["restore", "orders", "--at", at, "--json"], { cwd: p.root, env });
+    expect(named.exit).toBe(2);
+    expect(named.json.problems[0]).toMatchObject({ code: "USAGE_ERROR" });
+    expect(named.json.problems[0].message).toContain("did not finish: all 2 are still in the table");
+    expect(await ids(p)).toEqual([0, 1, 2, 3, 4]);
+  }, 30_000);
+
+  test("a restore token minted before the table was written is stale; a change made outside croft is reported", async () => {
+    const p = await project();
+    const del = await cli(["delete", "orders", "--where", "amount >= 30", "--json"], { cwd: p.root, env });
+    await cli(["confirm", del.json.confirmation.token, "--json"], { cwd: p.root, env });
+    const first = (await cli(["restore", "orders", "--json"], { cwd: p.root, env })).json.confirmation.token as string;
+    await closeAllWarehouses();
+    await seed(p.database, [`UPDATE _croft.assets SET last_loaded_at = '2026-09-22 00:00:00+00' WHERE name = 'orders'`]);
+    const stale = await cli(["confirm", first, "--json"], { cwd: p.root, env });
+    expect(stale.json.problems[0]).toMatchObject({ code: "CONFIRMATION_STALE", details: { reason: "impact_changed" } });
+    await closeAllWarehouses();
+    await seed(p.database, [`DELETE FROM orders WHERE id = 0`]);
+    const again = (await cli(["restore", "orders", "--json"], { cwd: p.root, env })).json.confirmation.token as string;
+    const done = await cli(["confirm", again, "--json"], { cwd: p.root, env });
+    expect(done.exit).toBe(0);
+    expect(done.json.problems.map((x: { code: string }) => x.code)).toEqual(["OUT_OF_BAND_CHANGE"]);
+    expect(await ids(p)).toEqual([1, 2, 3, 4]);
   });
 });
 

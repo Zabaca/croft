@@ -11,14 +11,22 @@
 //   (delete.ts: y/N on a terminal, otherwise exit 5 with a token that only `croft confirm` carries out, the impact
 //   counted again under the asset's lease). The stored command names the version exactly (--at), so a newer
 //   version trashed meanwhile cannot change what the token restores. The current table goes to the trash first.
-// - Downstream goes stale (last_replaced_at); its run record's step reason is "restored".
+// - Downstream goes stale (last_replaced_at); its run record's step reason is "restored". next[] runs the readers
+//   a plain run redoes; an incremental TS transform that reads the asset processes new input rows only, so the text
+//   (and next's reason) names `croft run <t> --rebuild` for it, which asks first. next[] never holds it (§4.3).
+// - A "rows" version whose delete did not finish (trash.ts `applied: false`) is listed as such; `croft restore
+//   <asset>` without --at takes the newest version whose change happened, and one named with --at is refused while
+//   the table still holds its rows (safety/restore.ts).
+// - The impact carries the current table's generation, hashed into the token (safety/confirm.ts): a token minted
+//   before the table was written is stale. A whole-table version croft delete trashed carries the code the
+//   scheduler was allowed to run (delete.ts): restoring it puts that approval back, unless a person ran the asset
+//   since.
 import { CroftError } from "../../core/errors.ts";
 import { formatInstant, parseInstant, zonedParts } from "../../core/time.ts";
-import type { Impact } from "../../core/types.ts";
 import { type CatalogAsset, getCatalog } from "../../history/catalog.ts";
 import type { Project } from "../../project/root.ts";
 import { didYouMean } from "../../project/suggest.ts";
-import { Confirmations } from "../../safety/confirm.ts";
+import { Confirmations, type HashedImpact } from "../../safety/confirm.ts";
 import { listVersions, type RestoreImpact, restoreImpact, type RestoreResult, restoreVersion } from "../../safety/restore.ts";
 import { plannedTrashPath, TRASH_RETENTION, type TrashEntry, versionNote } from "../../safety/trash.ts";
 import type { CommandImpl, CommandResult, Ctx } from "../command.ts";
@@ -26,7 +34,7 @@ import { shellQuote } from "../main.ts";
 import { formatCount, table } from "../render.ts";
 import {
   afterWrite, carryOut, closeSession, confirmationProblem, confirmationText, exactAsset, names, openSession, plural, prompter, questionText,
-  refreshCatalog, shownPath,
+  rebuildCommands, rebuildReaders, refreshCatalog, shownPath,
 } from "./delete.ts";
 
 const USAGE = "croft restore [asset] [--at <time>]";
@@ -42,6 +50,9 @@ export interface TrashVersion {
   /** "table": the whole table; "rows": the rows a delete --where removed. */
   kind: "table" | "rows";
   where: string | null;
+  /** false: the delete that trashed these rows did not finish (a crash between its commits, or refused), so they
+   *  were most likely never deleted; also a version with no sidecar. */
+  applied: boolean;
   runId: string | null;
   path: string;
 }
@@ -61,12 +72,15 @@ export interface RestoreData {
   version: TrashVersion;
   /** The rows that come back (a "rows" version: those whose key is not in the table again). */
   rows: number;
-  /** A "rows" version: trashed rows left out because their key is in the table again. */
+  /** A "rows" version: trashed rows left out because they are in the table again (their key, or the same row). */
   skipped: number;
   /** The table's rows before (they go to the trash first); null when there is no table. */
   replacedRows: number | null;
   rowsAfter: number | null;
   downstream: string[];
+  /** The incremental TS transforms among them that read it: a plain run processes new input rows only, so only
+   *  `croft run <t> --rebuild` (it asks first) redoes the restored rows. */
+  rebuild: string[];
   /** Where the table it replaced went. */
   trashed: { path: string; rows: number } | null;
   runId: string | null;
@@ -116,10 +130,14 @@ function atKey(at: string, tz: string): { stamp: string } | { prefix: string } |
   return { prefix };
 }
 
-/** The version `--at` names (the latest without it). USAGE_ERROR for none or several, with the choices. */
+/** A "rows" version whose delete did not finish: its rows were most likely never deleted. */
+const unfinished = (v: { kind: TrashEntry["kind"]; applied?: boolean }) => v.kind === "rows" && v.applied === false;
+
+/** The version `--at` names; without it the latest whose change happened (not an unfinished delete's rows), else the
+ *  latest. USAGE_ERROR for none or several, with the choices. */
 export function pickVersion(versions: readonly TrashEntry[], asset: string, at: string | undefined, tz: string): TrashEntry {
   if (versions.length === 0) throw nothingInTrash(asset, []);
-  if (at === undefined) return versions[0]!;
+  if (at === undefined) return versions.find((v) => !unfinished(v)) ?? versions[0]!;
   const key = atKey(at, tz);
   const choices = versions.slice(0, 8).map((v) => localTime(v.trashedAt, tz));
   const fix = { kind: "command" as const, description: "list the versions in the trash", command: "croft restore" };
@@ -166,7 +184,10 @@ function pin(v: TrashEntry, all: readonly TrashEntry[], tz: string): string {
 }
 
 function versionJson(v: TrashEntry, tz: string): TrashVersion {
-  return { asset: v.asset, trashedAt: zonedMs(v.trashedAt, tz), reason: v.reason, rows: v.rows, bytes: v.bytes, kind: v.kind, where: v.where, runId: v.runId, path: v.path };
+  return {
+    asset: v.asset, trashedAt: zonedMs(v.trashedAt, tz), reason: v.reason, rows: v.rows, bytes: v.bytes, kind: v.kind, where: v.where,
+    applied: v.applied !== false, runId: v.runId, path: v.path,
+  };
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -179,34 +200,42 @@ function restoreAction(i: RestoreImpact, tz: string): string {
     : `restore its version of ${when} (${plural(i.rows, "row")})`;
 }
 
-function toImpact(project: Project, i: RestoreImpact, at: Date): Impact {
+function toImpact(project: Project, i: RestoreImpact, at: Date): HashedImpact {
   // What is at stake: the table the restore replaces (a whole version), or the rows it adds (a "rows" version).
   const rows = i.kind === "table" ? i.currentRows ?? 0 : i.rows;
   return {
     asset: i.asset, action: restoreAction(i, project.timezone), rows, bytes: i.version.bytes,
     ...(i.currentRows !== null ? { trashPath: plannedTrashPath(project.paths.stateDir, i.asset, at) } : {}), downstream: i.downstream,
+    generation: i.generation,
   };
 }
 
-function impactLines(i: { asset: string; kind: "table" | "rows"; rows: number; skipped: number; currentRows: number | null; downstream: string[] }, when: string):
-  { head: string; first: string | null; then: string | null } {
+/** What the incremental TS readers of a restored asset need (rebuildReaders): a plain run skips the restored rows. */
+function rebuildText(rebuild: readonly string[]): string {
+  const one = rebuild.length === 1;
+  return `${names(rebuild)} ${one ? "processes" : "process"} new input rows only: ${rebuildCommands(rebuild)} ${one ? "redoes" : "redo"} the restored rows (${one ? "it asks" : "they ask"} first)`;
+}
+
+function impactLines(i: { asset: string; kind: "table" | "rows"; rows: number; skipped: number; currentRows: number | null; downstream: string[] }, when: string,
+  rebuild: readonly string[]): { head: string; first: string | null; then: string[] } {
   const head = i.kind === "rows"
-    ? `restore ${i.asset}: put back the ${plural(i.rows, "row")} deleted from it at ${when}${i.skipped ? ` (${formatCount(i.skipped)} more are back already: their key is in the table)` : ""}`
+    ? `restore ${i.asset}: put back the ${plural(i.rows, "row")} deleted from it at ${when}${i.skipped ? ` (${formatCount(i.skipped)} more are back already: they are in the table)` : ""}`
     : `restore ${i.asset} to its version of ${when}: ${plural(i.rows, "row")}`;
   const first = i.currentRows === null ? null : `the current ${plural(i.currentRows, "row")} of ${i.asset} go to the trash`;
-  const then = i.downstream.length ? `${names(i.downstream)} go stale: the next croft run rebuilds them` : null;
+  const stale = i.downstream.filter((d) => !rebuild.includes(d));
+  const then = [...(stale.length ? [`${names(stale)} go stale: the next croft run rebuilds them`] : []), ...(rebuild.length ? [rebuildText(rebuild)] : [])];
   return { head, first, then };
 }
 
-function question(i: RestoreImpact, tz: string): string {
-  const { head, first, then } = impactLines(i, localTime(i.version.trashedAt, tz).slice(0, 19));
+function question(i: RestoreImpact, tz: string, rebuild: readonly string[]): string {
+  const { head, first, then } = impactLines(i, localTime(i.version.trashedAt, tz).slice(0, 19), rebuild);
   return questionText(head, first, then);
 }
 
-function data(i: RestoreImpact, status: RestoreData["status"], tz: string, o: { r?: RestoreResult; runId?: string } = {}): RestoreData {
+function data(i: RestoreImpact, status: RestoreData["status"], tz: string, rebuild: string[], o: { r?: RestoreResult; runId?: string } = {}): RestoreData {
   return {
     asset: i.asset, status, version: versionJson(i.version, tz), rows: o.r?.rows ?? i.rows, skipped: o.r?.skipped ?? i.skipped,
-    replacedRows: i.currentRows, rowsAfter: o.r?.rowsAfter ?? null, downstream: i.downstream,
+    replacedRows: i.currentRows, rowsAfter: o.r?.rowsAfter ?? null, downstream: i.downstream, rebuild,
     trashed: o.r?.trashed ? { path: o.r.trashed.path, rows: o.r.trashed.rows } : null, runId: o.runId ?? null,
   };
 }
@@ -232,17 +261,20 @@ async function restoreOne(ctx: Ctx, asset: string, at: string | undefined): Prom
   let wrote = false;
   try {
     const problems = [...s.problems];
-    let shown: Impact | null = null;
+    let shown: HashedImpact | null = null;
+    let rebuild: string[] | null = null;
+    const rebuildOf = async (downstream: readonly string[]) => (rebuild ??= await rebuildReaders(project, asset, downstream));
     if (s.token === undefined) {
       const i = await restoreImpact(s.warehouse, version);
       const impact = toImpact(project, i, ctx.now());
+      const readers = await rebuildOf(i.downstream);
       if (!s.ask) {
         const c = new Confirmations(s.runs).create({ command, impact });
-        const { head, first } = impactLines(i, localTime(version.trashedAt, tz).slice(0, 19));
+        const { head, first } = impactLines(i, localTime(version.trashedAt, tz).slice(0, 19), readers);
         problems.push(confirmationProblem(c, head, first));
-        return { data: data(i, "needs_confirmation", tz), problems, next: [], confirmation: c };
+        return { data: data(i, "needs_confirmation", tz, readers), problems, next: [], confirmation: c };
       }
-      if (!(await prompter.ask(question(i, tz)))) return { data: data(i, "declined", tz), problems, next: [], ok: false, exit: 1 };
+      if (!(await prompter.ask(question(i, tz, readers)))) return { data: data(i, "declined", tz, readers), problems, next: [], ok: false, exit: 1 };
       shown = impact;
     }
     // The entry of a deleted asset is kept with its trashed version (delete.ts).
@@ -266,7 +298,7 @@ async function restoreOne(ctx: Ctx, asset: string, at: string | undefined): Prom
         lines: [
           `${ctx.now().toISOString()} ${command}`,
           x.kind === "rows"
-            ? `put back ${plural(x.rows, "row")} of ${asset}${x.skipped ? ` (${formatCount(x.skipped)} skipped: their key is in the table)` : ""}; ${plural(x.rowsAfter, "row")} now`
+            ? `put back ${plural(x.rows, "row")} of ${asset}${x.skipped ? ` (${formatCount(x.skipped)} skipped: already in the table)` : ""}; ${plural(x.rowsAfter, "row")} now`
             : `restored ${asset} to its version of ${zonedMs(version.trashedAt, tz)}: ${plural(x.rows, "row")}`,
           `from: ${version.path}`,
           ...(x.trashed ? [`the table it replaced (${plural(x.trashed.rows, "row")}) went to the trash: ${x.trashed.path}`] : []),
@@ -276,8 +308,26 @@ async function restoreOne(ctx: Ctx, asset: string, at: string | undefined): Prom
     });
     wrote = true;
     await refreshCatalog(s, asset, runId, prev);
-    const next = r.downstream.length ? [{ command: `croft run ${r.downstream.join(" ")}`, reason: `they read ${asset}, which was restored` }] : [];
-    return { data: data(impact!, "restored", tz, { r, runId }), problems, next };
+    // A version croft delete trashed carries the code the scheduler was allowed to run: the table is back, so the
+    // scheduler may go on from where it was, unless a person has run the asset since (their approval stands).
+    const approved = r.kind === "table" ? versionNote(version.path, "approvedCodeHash") : undefined;
+    if (typeof approved === "string" && s.runs.approvedCode(asset) === null) {
+      try {
+        s.runs.approveCode(asset, approved);
+      } catch {
+        // The asset stays held: a run by hand releases it.
+      }
+    }
+    problems.push(...r.problems);
+    // A plain run redoes the SQL and full-refresh readers; an incremental TS reader skips the restored rows (--rebuild,
+    // which asks first, is named in the reason, never as a command of its own).
+    const readers = await rebuildOf(r.downstream);
+    const runs = r.downstream.filter((d) => !readers.includes(d));
+    const also = readers.length ? rebuildText(readers) : null;
+    const next = runs.length
+      ? [{ command: `croft run ${runs.join(" ")}`, reason: `they read ${asset}, which was restored${also ? `; ${also}` : ""}` }]
+      : also ? [{ command: "croft status", reason: also }] : [];
+    return { data: data(impact!, "restored", tz, readers, { r, runId }), problems, next };
   } finally {
     await closeSession(s);
     if (wrote) await afterWrite(project);
@@ -304,7 +354,8 @@ export const restore: CommandImpl<TrashListData | RestoreData> = {
     const tz = project.timezone;
     if ("versions" in d) {
       if (d.versions.length === 0) return `the trash is empty (it keeps versions ${d.retention.days} days, and the ${d.retention.versions} newest of each table)`;
-      const rows = d.versions.map((v) => [v.asset, listedTime(v, d.versions, tz), formatCount(v.rows), formatBytes(v.bytes), v.reason]);
+      const rows = d.versions.map((v) => [v.asset, listedTime(v, d.versions, tz), formatCount(v.rows), formatBytes(v.bytes),
+        unfinished(v) ? `${v.reason}, not applied: the delete did not finish` : v.reason]);
       return [
         table(["TABLE", "TRASHED", "ROWS", "SIZE", "WHY"], rows, { limit: Number.POSITIVE_INFINITY, maxWidth: 100 }).text,
         `(kept ${d.retention.days} days, and the ${d.retention.versions} newest of each table; croft restore <table> [--at <time>] brings one back, after confirmation)`,
@@ -312,7 +363,7 @@ export const restore: CommandImpl<TrashListData | RestoreData> = {
     }
     const when = localTime(d.version.trashedAt, tz).slice(0, 19);
     const i = { asset: d.asset, kind: d.version.kind, rows: d.rows, skipped: d.skipped, currentRows: d.replacedRows, downstream: d.downstream };
-    const { head, first, then } = impactLines(i, when);
+    const { head, first, then } = impactLines(i, when, d.rebuild);
     switch (d.status) {
       case "needs_confirmation":
         return confirmationText(result.confirmation, head, first, then);
@@ -320,11 +371,11 @@ export const restore: CommandImpl<TrashListData | RestoreData> = {
         return `not restored: ${head} was not confirmed; nothing was changed`;
       case "restored": {
         const what = d.version.kind === "rows"
-          ? `put back ${plural(d.rows, "row")} deleted at ${when}${d.skipped ? ` (${formatCount(d.skipped)} skipped: their key is in the table)` : ""}; ${plural(d.rowsAfter ?? 0, "row")} now`
+          ? `put back ${plural(d.rows, "row")} deleted at ${when}${d.skipped ? ` (${formatCount(d.skipped)} skipped: already in the table)` : ""}; ${plural(d.rowsAfter ?? 0, "row")} now`
           : `restored the version of ${when}: ${plural(d.rows, "row")}`;
         const lines = [`ok    ${d.asset}   ${what}`];
         if (d.trashed) lines.push(`      the table it replaced (${plural(d.trashed.rows, "row")}) is in the trash: ${shownPath(project, d.trashed.path)}`);
-        if (then) lines.push(`      ${then}`);
+        for (const line of then) lines.push(`      ${line}`);
         return lines.join("\n");
       }
     }
