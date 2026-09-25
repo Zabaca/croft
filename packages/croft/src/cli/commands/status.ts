@@ -332,6 +332,73 @@ export function lastRanStep(db: RunsDb, asset: string): StepRecord | null {
   return row ? db.getStep(row.run_id, row.asset, row.attempt) : null;
 }
 
+/** A step skipped because an input was not built in its run (runner.ts records only those, at attempt 0). */
+function inputSkip(s: StepRecord | null): s is StepRecord {
+  return !!s && s.status === "skipped" && s.attempt === 0;
+}
+
+/**
+ * The step each asset's row shows: its latest, except a step skipped because an input failed once that is no longer
+ * so. Such a skip is recorded so that status shows it (DESIGN §4.3), but a transform a later run found up to date is
+ * not recorded (runner.ts), so the skip would otherwise outlive its cause (eval stumble 6: "skipped" with healthy
+ * true, after the input was fixed). It is the news while any input's own shown step is not a success (ok or
+ * unchanged; an input with no step counts when the catalog has built it), or while nothing upstream has run since
+ * it (another input-caused skip is no run). After that, the row shows the asset's step before its input-caused
+ * skips (null when it has none: then the catalog decides), which is what a run found: up to date, or stale, which
+ * the row says with the run that updates it. `inputsOf`: what the asset reads (its definition's and its last build's
+ * inputs); an asset with none known keeps its skip. Memoized per status call; a cycle keeps the recorded step.
+ */
+export function shownSteps(db: RunsDb, o: { dead: Set<string>; built: (asset: string) => boolean; inputsOf: (asset: string) => readonly string[] }):
+  (asset: string) => StepRecord | null {
+  const memo = new Map<string, StepRecord | null>();
+  const visiting = new Set<string>();
+  const fine = (input: string): boolean => {
+    const s = shown(input);
+    return s ? ["ok", "unchanged"].includes(effectiveStatus(s, o.dead)) : o.built(input);
+  };
+  /** Whether an asset upstream of `asset` (through its inputs, transitively) has a step that ran after `skip`:
+   *  later by its start, or recorded after it at the same instant (a frozen clock). */
+  const ranUpstreamSince = (asset: string, skip: StepRecord): boolean => {
+    const at = db.sqlite.query("SELECT rowid AS id FROM steps WHERE run_id = ? AND asset = ? AND attempt = ?")
+      .get(skip.runId, skip.asset, skip.attempt) as { id: number } | null;
+    const later = db.sqlite.query(`SELECT 1 AS yes FROM steps WHERE asset = ? AND NOT (status = 'skipped' AND attempt = 0)
+      AND (started_at > ? OR (started_at = ? AND rowid > ?)) LIMIT 1`);
+    const seen = new Set<string>([asset]);
+    const queue = [...o.inputsOf(asset)];
+    while (queue.length) {
+      const u = queue.shift()!;
+      if (seen.has(u)) continue;
+      seen.add(u);
+      if (later.get(u, skip.startedAt, skip.startedAt, at?.id ?? Number.MAX_SAFE_INTEGER)) return true;
+      queue.push(...o.inputsOf(u));
+    }
+    return false;
+  };
+  const before = (asset: string): StepRecord | null => {
+    const row = db.sqlite
+      .query(`SELECT run_id, attempt FROM steps WHERE asset = ? AND NOT (status = 'skipped' AND attempt = 0)
+              ORDER BY started_at DESC, attempt DESC LIMIT 1`)
+      .get(asset) as { run_id: string; attempt: number } | null;
+    return row ? db.getStep(row.run_id, asset, row.attempt) : null;
+  };
+  const shown = (asset: string): StepRecord | null => {
+    if (memo.has(asset)) return memo.get(asset)!;
+    const latest = db.latestStep(asset);
+    if (!inputSkip(latest) || visiting.has(asset)) return latest;
+    visiting.add(asset);
+    try {
+      const inputs = o.inputsOf(asset);
+      const over = inputs.length > 0 && inputs.every(fine) && ranUpstreamSince(asset, latest);
+      const step = over ? before(asset) : latest;
+      memo.set(asset, step);
+      return step;
+    } finally {
+      visiting.delete(asset);
+    }
+  };
+  return shown;
+}
+
 function serveOf(stateDir: string): { url: string; pid: number } | undefined {
   const rec = readServeRecord(stateDir);
   if (!rec) return undefined;
@@ -506,12 +573,19 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
     const files = new Map(discovery.assets.map((a) => [a.name, a]));
     const edits: Problem[] = [];
     const configChanges: Problem[] = [];
+    // What each asset reads: its definition's inputs and what its last build recorded reading.
+    const inputsOf = (name: string): string[] => {
+      const def = definitions.get(name);
+      return [...new Set([...(defined(def ?? null) ? def!.inputs : []), ...(byName.get(name)?.reads ?? [])])];
+    };
+    const shown = db ? shownSteps(db, { dead, built: (n) => byName.has(n), inputsOf }) : null;
     const assets: StatusAsset[] = names.map((name) => {
       const file = files.get(name) ?? null;
       const cat = byName.get(name) ?? null;
       const def = definitions.get(name) ?? null;
       const kind = kindOf(def, cat, file, sniffKind);
-      const step = db?.latestStep(name) ?? null;
+      // Its latest step, or the one before a skip for an input that has been fixed since (shownSteps).
+      const step = shown?.(name) ?? null;
       const stepStatus = step ? effectiveStatus(step, dead) : null;
       let lastRun: LastRun | null = null;
       if (step) {
