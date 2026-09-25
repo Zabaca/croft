@@ -7,9 +7,9 @@
 //      newest first; also the default without --pagination, and §4.2's human output), link (the Link header's
 //      rel="next") and page (page/per_page until an empty page). The second run writes only the three records
 //      that changed. The keyset template stops with KEYSET_STUCK on a full page of one updated_at, and the file
-//      template's other case, one file at a URL, is downloaded and skipped while unchanged. (bugTest: once the
-//      warehouse exists, croft query of an asset never built, or of a typo in a table's name, says only "no table
-//      named …", with no fix and no did-you-mean);
+//      template's other case, one file at a URL, is downloaded and skipped while unchanged. croft query of an asset
+//      never built says it is not built yet, with its run, before the first run and once the warehouse exists; a
+//      typo in a built table's name gets the asset as its did-you-mean;
 //   b. file: CSV files dropped into files/<name>/, key set to their id column, a new file loaded on its own;
 //   c. transform over the file ingest, with the paid call the template's comment shows made for real against a
 //      mock "LLM": preview --rows 20 bills 20 calls, 1,205 new rows are over confirmAbove (1,000), so the run asks
@@ -25,7 +25,7 @@ import { join } from "node:path";
 import type { SchemaCommand } from "../../src/cli/schemas.ts";
 import { golden, type GoldenOptions } from "../golden/kit.ts";
 import {
-  bugTest, type CliResult, cleanupAll, type Envelope, findProblem, initProject, json, type MockApi, mockApi, type Project, type Req, show, stepOf,
+  type CliResult, cleanupAll, type Envelope, findProblem, initProject, json, type MockApi, mockApi, type Project, type Req, show, stepOf,
 } from "./harness.ts";
 
 let api: MockApi;
@@ -286,9 +286,9 @@ describe("a. api templates, one per pagination style", () => {
       expect(pa, JSON.stringify(previewed)).toMatchObject({ status: "ok", rows: 250, liveRows: null, capped: false, requests: c.fullRead });
       expect(api.requests(mockPath).length).toBe(c.fullRead);
       const noTable = await croftJson("query", ["query", `SELECT count(*) FROM ${c.name}`], { failed: true, exit: 2 });
-      // Before anything ran in the project, DB_NOT_FOUND ("… is not built yet", fix croft run <asset>); once the
-      // warehouse exists, UNKNOWN_TABLE (see the bugTest after these journeys).
-      expect(noTable.env.problems.map((x: { code: string }) => x.code), show(noTable.r)).toEqual([c.style === "keyset" ? "DB_NOT_FOUND" : "UNKNOWN_TABLE"]);
+      // DB_NOT_FOUND ("… is not built yet", fix croft run <asset>), before anything ran in the project (keyset, the
+      // first journey) and once the warehouse exists (the others; see the tests after these journeys).
+      expect(noTable.env.problems.map((x: { code: string }) => x.code), show(noTable.r)).toEqual(["DB_NOT_FOUND"]);
       notBuilt.set(c.name, noTable.env.problems[0]);
 
       // 7. run, then query.
@@ -323,22 +323,22 @@ describe("a. api templates, one per pagination style", () => {
     notBuilt.set("tracker_issue", typo.env.problems[0]);
   });
 
-  // BUG (query of an asset not built yet, once the warehouse exists): `croft query "SELECT … FROM stripe_charges"`
-  // after `croft new` and `croft preview stripe_charges` says UNKNOWN_TABLE "no table named stripe_charges", hint
-  // "list the tables with: croft status", with no fix. Before the project's first run the same query says
-  // DB_NOT_FOUND "stripe_charges is not built yet: nothing has run in this project, …" with the fix
-  // `croft run stripe_charges` (§3b "Zero-asset path"). Once any other asset has run, the agent is no longer told
-  // that the name is an asset that has not been built, nor how to build it; and a typo in a built table's name
-  // (tracker_issue) gets no did-you-mean either (§5 "Errors from user queries": UNKNOWN_TABLE suggests the
-  // project's asset names). read/select.ts mapQueryError words every such error alike; query.ts notBuiltYet, which
-  // knows the assets, only runs when the warehouse file does not exist.
-  bugTest("croft query of an asset never built, once the warehouse exists: it is not built yet, and the fix is its run", () => {
+  // Once the warehouse exists (a bug of W5.2, fixed): `croft query "SELECT … FROM stripe_charges"` after `croft new`
+  // and `croft preview stripe_charges` said UNKNOWN_TABLE "no table named stripe_charges", hint "list the tables with:
+  // croft status", with no fix, and a typo in a built table's name (tracker_issue) got no did-you-mean (§5 "Errors
+  // from user queries"). Now both say what they say before the project's first run (§3b "Zero-asset path").
+  test("croft query of an asset never built, once the warehouse exists: it is not built yet, and the fix is its run", () => {
     for (const name of ["stripe_charges", "forge_commits", "catalog_products"]) {
-      expect(notBuilt.get(name)).toMatchObject({ message: expect.stringContaining(`${name} is not built yet`), fix: { kind: "command", command: `croft run ${name}` } });
+      expect(notBuilt.get(name)).toMatchObject({
+        code: "DB_NOT_FOUND", message: expect.stringContaining(`${name} is not built yet`), fix: { kind: "command", command: `croft run ${name}` },
+      });
     }
   });
-  bugTest("croft query of a typo in a built table's name suggests the asset", () => {
-    expect(notBuilt.get("tracker_issue")).toMatchObject({ details: { suggestion: "tracker_issues" }, hint: expect.stringContaining("tracker_issues") });
+  test("croft query of a typo in a built table's name suggests the asset", () => {
+    expect(notBuilt.get("tracker_issue")).toMatchObject({
+      code: "UNKNOWN_TABLE", details: { suggestion: "tracker_issues" }, hint: expect.stringContaining("tracker_issues"),
+      fix: { kind: "command", command: `croft query "SELECT count(*) FROM tracker_issues"` },
+    });
   });
 
   test("keyset: a full page on one updated_at stops with KEYSET_STUCK instead of asking for the same page forever", async () => {

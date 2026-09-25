@@ -14,6 +14,10 @@
 //   The wording follows runs.sqlite: "nothing has run" only when no run is recorded; "no run has written a
 //   table" when runs failed before writing; and when the catalog lists tables, the warehouse file is missing
 //   although croft built it before (deleted or moved), which needs the user rather than a new run.
+// - Once the warehouse exists, a table it does not have is worded the same way (notInWarehouse): an asset not built
+//   yet is DB_NOT_FOUND with its run (its last run's failure named, with the logs); one croft delete removed, a
+//   file renamed outside croft, or a table dropped outside croft each get their own fix (restore, rename, doctor).
+//   Another name is UNKNOWN_TABLE with the closest asset: a built one with the query corrected, else its run.
 // - Rows are capped at 50 and values at 80 characters (--limit N and --full-values lift the caps), and the
 //   result is streamed: rows past the cap are counted in chunks, never converted to JavaScript.
 // - Values are redacted before they are cut (so a cut never leaves half a secret behind), after the
@@ -26,19 +30,22 @@
 import { type DuckDBConnection, DuckDBInstance, DuckDBResultReader } from "@duckdb/node-api";
 import { existsSync } from "node:fs";
 import { CroftError } from "../../core/errors.ts";
+import type { Problem } from "../../core/types.ts";
 import { connect, instanceConfig } from "../../db/connect.ts";
 import { openWarehouse } from "../../db/warehouse.ts";
 import type { ColumnInfo } from "../../db/values.ts";
 import { renderValue, resultColumns } from "../../db/values.ts";
+import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
 import type { Project } from "../../project/root.ts";
 import { didYouMean } from "../../project/suggest.ts";
 import { mapQueryError } from "../../read/select.ts";
+import { deletedByCroft } from "../../safety/trash.ts";
 import { assertOneSelect } from "../../sql/gate.ts";
 import type { Row } from "../../types.ts";
 import type { CommandImpl, Ctx } from "../command.ts";
 import { formatCount, formatDuration, table } from "../render.ts";
 import { type AssetConfig, capValue, declareProjectSecrets, holderText, readOnlyWarehouse } from "./describe.ts";
-import { missingWarehouse, openRunsDb, type WarehouseHistory, warehouseHistory } from "./status.ts";
+import { effectiveStatus, missingWarehouse, openRunsDb, runningEntries, type WarehouseHistory, warehouseHistory } from "./status.ts";
 
 export interface QueryData {
   columns: ColumnInfo[];
@@ -102,7 +109,7 @@ export const query: CommandImpl<QueryData> = {
     const raw = ctx.values.preview === true
       ? await fromPreview(ctx, project, run)
       : existsSync(project.paths.database)
-        ? await readOnlyWarehouse(ctx, project).read((db) => run(db.connection), { purpose: "croft query" })
+        ? await fromWarehouse(ctx, project, configs, run)
         : await withoutWarehouse(project, configs, run);
 
     const redact = (s: string) => ctx.env.redactData(s);
@@ -298,6 +305,163 @@ function notBuiltYet(e: unknown, project: Project, configs: readonly AssetConfig
     ...(guess ? { fix: { kind: "command" as const, description: `build ${guess}`, command: `croft run ${guess}` } } : {}),
     details: { ...e.problem.details, table, ...(guess ? { suggestion: guess } : {}) },
   });
+}
+
+/** The table an UNKNOWN_TABLE from read/select.ts mapQueryError names ("no table named x"), unquoted. */
+function missingTable(e: CroftError): string | null {
+  return /^no table named (\S+)/.exec(e.problem.message)?.[1]?.replace(/^"|"$/g, "") ?? null;
+}
+
+/**
+ * The query on the warehouse, read-only. A table it does not have is worded by notInWarehouse; the names of the
+ * tables and views it has are read inside the same read lease (it is released before anything slower runs).
+ */
+async function fromWarehouse(ctx: Ctx, project: Project, configs: readonly AssetConfig[], run: (conn: DuckDBConnection) => Promise<Raw>): Promise<Raw> {
+  let tables: Set<string> | null = null;
+  try {
+    return await readOnlyWarehouse(ctx, project).read(async (lease) => {
+      try {
+        return await run(lease.connection);
+      } catch (e) {
+        if (e instanceof CroftError && e.code === "UNKNOWN_TABLE") {
+          const held = await lease.all<{ name: string }>(
+            `SELECT table_name AS name FROM duckdb_tables() WHERE database_name = current_database() AND schema_name = 'main' AND NOT internal
+             UNION SELECT view_name FROM duckdb_views() WHERE database_name = current_database() AND schema_name = 'main' AND NOT internal`,
+          ).catch(() => null);
+          if (held) tables = new Set(held.map((h) => h.name.toLowerCase()));
+        }
+        throw e;
+      }
+    }, { purpose: "croft query" });
+  } catch (e) {
+    throw await notInWarehouse(e, { ctx, project, configs, tables });
+  }
+}
+
+/**
+ * A table named that the warehouse does not have (§3b, §5 "Errors from user queries"). When it is an asset's, the
+ * problem says why its table is not there, from runs.sqlite, with what brings it:
+ * - a file renamed outside croft (or a rename that stopped): ASSET_RENAMED, whose fix is `croft rename`; a run would
+ *   refuse, since it would fetch everything again into a new table;
+ * - croft built it (the catalog mirror lists it) and the table is gone: it was dropped or replaced outside croft,
+ *   which `croft doctor` examines (never "not built yet");
+ * - croft delete removed it: `croft restore <asset>` brings it back;
+ * - otherwise it is not built yet, as before the first run: DB_NOT_FOUND with the run that builds that one asset,
+ *   worded by its last step (never run, failed: the logs say why, a run building it now).
+ * Another name stays UNKNOWN_TABLE and suggests the closest of the project's assets and the tables croft built
+ * (never DuckDB's own suggestion, which can name a system view): a built one with the query corrected when the name
+ * appears once in it, one not built yet with its run.
+ */
+async function notInWarehouse(e: unknown, o: { ctx: Ctx; project: Project; configs: readonly AssetConfig[]; tables: Set<string> | null }): Promise<unknown> {
+  if (!(e instanceof CroftError) || e.code !== "UNKNOWN_TABLE") return e;
+  const table = missingTable(e);
+  if (!table) return e;
+  const { project } = o;
+  const label = project.databaseLabel;
+  const names = o.configs.map((c) => c.name);
+  const asset = names.find((n) => n === table.toLowerCase());
+  const db = openRunsDb(project.paths.stateDir);
+  try {
+    const catalog = db ? allCatalog(db) : [];
+    const base = { ...e.problem.details, table };
+    if (asset) {
+      const renamed = await renamedAs(project, asset, catalog);
+      if (renamed) {
+        return new CroftError("ASSET_RENAMED", {
+          message: renamed.message, hint: renamed.hint, asset, ...(renamed.file ? { file: renamed.file } : {}), ...(renamed.fix ? { fix: renamed.fix } : {}),
+          effect: "nothing was read", details: { ...base, ...renamed.details },
+        });
+      }
+      const entry = catalog.find((c) => c.asset === asset);
+      if (entry) {
+        return new CroftError("DB_NOT_FOUND", {
+          message: `${label} has no table ${asset}, although croft built it${entry.lastRunId ? ` (run ${entry.lastRunId})` : ""}: it was dropped or replaced outside croft`,
+          hint: `croft doctor compares every table with what croft last wrote; ask the user what happened before rebuilding it, which can fetch everything again`,
+          fix: { kind: "command", description: "check the warehouse's tables against croft's record", command: "croft doctor" },
+          details: { ...base, asset, lastRunId: entry.lastRunId ?? null },
+        });
+      }
+      const build = { kind: "command" as const, description: `build ${asset}`, command: `croft run ${asset}` };
+      if (db && deletedByCroft(db, asset)) {
+        const step = db.latestStep(asset);
+        return new CroftError("DB_NOT_FOUND", {
+          message: `${asset} has no table: croft delete removed it${step ? ` (${step.runId})` : ""}`,
+          hint: `croft restore ${asset} brings it back from the trash; croft run ${asset} would build it from scratch`,
+          fix: { kind: "command", description: `bring ${asset} back from the trash`, command: `croft restore ${asset}` },
+          details: { ...base, asset },
+        });
+      }
+      const step = db?.latestStep(asset) ?? null;
+      const status = step && db ? effectiveStatus(step, runningEntries(db, project.timezone).dead) : null;
+      if (step && status === "running") {
+        return new CroftError("DB_NOT_FOUND", {
+          message: `${asset} is not built yet: run ${step.runId} is building it now`,
+          hint: "query it again once that run is done (croft status shows it)",
+          details: { ...base, asset, runId: step.runId },
+        });
+      }
+      const failed = status === "failed" || status === "crashed" || status === "interrupted";
+      const why = !step ? `it has never run, so ${label} has no table ${asset}`
+        : failed ? `its last run ${status} (${step.error?.code ? `${step.error.code}, ` : ""}${step.runId})`
+        : status === "skipped" ? `its last run skipped it (${step.runId})`
+        : `no run has built it yet (its last step, in ${step.runId}, is ${status})`;
+      return new CroftError("DB_NOT_FOUND", {
+        message: `${asset} is not built yet: ${why}`,
+        hint: failed ? `croft logs ${asset} --failed says why; once that is fixed, croft run ${asset} builds it` : `build it first: croft run ${asset}`,
+        fix: build, details: { ...base, asset },
+      });
+    }
+    const candidates = [...new Set([...names, ...catalog.map((c) => c.asset)])];
+    const guess = didYouMean(table, candidates);
+    if (!guess) {
+      const list = candidates.length > 12 ? `${candidates.slice(0, 12).join(", ")}, …` : candidates.join(", ");
+      return new CroftError("UNKNOWN_TABLE", {
+        message: `no table named ${table}`,
+        hint: candidates.length ? `no asset is named ${table}; the assets are ${list} (croft status shows which are built)`
+          : "the project has no assets yet; files under files/ can be queried already, and croft new --list shows how to make an asset",
+        details: base,
+      });
+    }
+    const built = o.tables ? o.tables.has(guess.toLowerCase()) : catalog.some((c) => c.asset === guess);
+    const sql = built ? correctedSql(String(o.ctx.positionals[0] ?? ""), table, guess) : null;
+    const flags = [
+      ...(o.ctx.values.limit !== undefined ? [`--limit ${String(o.ctx.values.limit).trim()}`] : []),
+      ...(o.ctx.values["full-values"] === true ? ["--full-values"] : []),
+    ];
+    const fix = !built ? { kind: "command" as const, description: `build ${guess}`, command: `croft run ${guess}` }
+      : sql ? { kind: "command" as const, description: `query ${guess}`, command: ["croft query", shellArg(sql), ...flags].join(" ") }
+      : null;
+    return new CroftError("UNKNOWN_TABLE", {
+      message: `no table named ${table}`,
+      hint: built ? `did you mean ${guess}?` : `did you mean ${guess}? It is not built yet: croft run ${guess} builds it`,
+      ...(fix ? { fix } : {}),
+      details: { ...base, suggestion: guess },
+    });
+  } finally {
+    db?.close();
+  }
+}
+
+/** The ASSET_RENAMED problem when `asset` is the new name of a file renamed outside croft, or of a rename that did
+ *  not finish (project/rename.ts findRenamed); null otherwise, or when that cannot be told. */
+async function renamedAs(project: Project, asset: string, catalog: readonly CatalogAsset[]): Promise<Problem | null> {
+  try {
+    const { findRenamed, renamedProblem } = await import("../../project/rename.ts");
+    const found = (await findRenamed(project.root, { project, catalog })).find((r) => r.to === asset);
+    return found ? renamedProblem(found) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** `sql` with `from` replaced by `to` where it is named, when it is named exactly once as a whole word (any case,
+ *  quoted or not); null otherwise, when a rewrite could change something else. */
+function correctedSql(sql: string, from: string, to: string): string | null {
+  const word = new RegExp(`(?<![\\w$])${from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w$])`, "gi");
+  const hits = [...sql.matchAll(word)];
+  if (hits.length !== 1) return null;
+  const at = hits[0]!.index!;
+  return `${sql.slice(0, at)}${to}${sql.slice(at + from.length)}`;
 }
 
 function shellArg(s: string): string {

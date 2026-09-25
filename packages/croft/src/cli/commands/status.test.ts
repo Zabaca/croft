@@ -654,6 +654,86 @@ describe("croft status: staleness", () => {
   });
 });
 
+// A transform skipped because its input failed is recorded (attempt 0) so that status shows it; a transform a later run
+// found up to date is not recorded (runner.ts `skipped`). Eval stumble 6: after the input was fixed and a run found the
+// transform up to date, status still said "skipped" (healthy true), the news of the failed run.
+describe("croft status: a step skipped because its input failed", () => {
+  type Recorded = [asset: string, status: "ok" | "unchanged" | "failed" | "skipped"];
+  /** A finished run at `at`, its steps recorded as the runner records them: a skip at attempt 0 (its input failed). */
+  function recordRun(p: TestProject, id: string, at: string, steps: Recorded[]) {
+    const db = runsDb(p.stateDir, () => new Date(at));
+    try {
+      const run = db.createRun({ id, trigger: "manual", human: true, argv: ["run"], identity: DEAD });
+      for (const [asset, status] of steps) {
+        const attempt = status === "skipped" ? 0 : 1;
+        db.startStep({ runId: run.id, asset, attempt, reason: "requested" });
+        db.finishStep(run.id, asset, attempt, { status, ...(status === "failed" ? { error: { code: "CHECK_FAILED" } as never } : {}) });
+      }
+      db.finishRun(run.id, steps.some(([, s]) => s === "failed") ? "failed" : "succeeded");
+    } finally {
+      db.close();
+    }
+  }
+  const TRANSFORMS = ["open_issues", "issue_triage", "issue_report"] as const;
+  /** Last night: github_issues failed its check; everything that reads it, directly or not, was skipped. */
+  const lastNight = (p: TestProject) => recordRun(p, "r_0922_1156_bad1", "2026-09-22T18:56:00.000Z",
+    [["github_issues", "failed"], ["open_issues", "skipped"], ["issue_triage", "skipped"], ["issue_report", "skipped"]]);
+
+  test("while the input's last step failed, what reads it is skipped", async () => {
+    const p = await pipeline();
+    lastNight(p);
+    const { r, a } = await status(p);
+    expect(a.github_issues).toMatchObject({ status: "failed" });
+    for (const t of TRANSFORMS) expect(a[t], t).toMatchObject({ status: "skipped", lastRun: { runId: "r_0922_1156_bad1", status: "skipped" } });
+    expect(r.json.data.healthy).toBe(false);
+  });
+
+  test("the input fails again: still skipped", async () => {
+    const p = await pipeline();
+    lastNight(p);
+    recordRun(p, "r_0922_1158_bad2", "2026-09-22T18:58:00.000Z",
+      [["github_issues", "failed"], ["open_issues", "skipped"], ["issue_triage", "skipped"], ["issue_report", "skipped"]]);
+    const { a } = await status(p);
+    for (const t of TRANSFORMS) expect(a[t], t).toMatchObject({ status: "skipped", lastRun: { runId: "r_0922_1158_bad2" } });
+  });
+
+  test("the input fixed and a later run found the transforms up to date: ok again, with the build they have (eval stumble 6)", async () => {
+    const p = await pipeline();
+    lastNight(p);
+    // The runner records only the ingest: a transform found up to date on its re-check is not recorded.
+    recordRun(p, "r_0922_1158_good", "2026-09-22T18:58:00.000Z", [["github_issues", "unchanged"]]);
+    const { r, a } = await status(p);
+    expect(a.github_issues).toMatchObject({ status: "ok", lastRun: { runId: "r_0922_1158_good", status: "unchanged" } });
+    // issue_report reads open_issues, itself skipped last night: it is ok by the same token.
+    for (const t of TRANSFORMS) {
+      expect(a[t], t).toMatchObject({ status: "ok", stale: false, lastRun: { runId: "r_0922_1155_all1", status: "ok", code: null } });
+    }
+    expect(r.json.data.healthy).toBe(true);
+    const human = (await cli(["status"], { cwd: p.root, env: ENV })).stdout;
+    for (const t of TRANSFORMS) expect(human).toMatch(new RegExp(`^${t} .* ok$`, "m"));
+  });
+
+  test("the input fixed with new rows by a run that did not take the transforms: stale, with the run that updates them", async () => {
+    const p = await pipeline({ seen: { "open_issues.github_issues": EARLIER, "issue_triage.github_issues": EARLIER } });
+    lastNight(p);
+    recordRun(p, "r_0922_1158_only", "2026-09-22T18:58:00.000Z", [["github_issues", "ok"]]);
+    const { a } = await status(p);
+    expect(a.open_issues).toMatchObject({ status: "ok", stale: true, staleReasons: ["input_changed"] });
+    expect(a.issue_triage).toMatchObject({ status: "ok", stale: true, staleReasons: ["input_changed"] });
+    const human = (await cli(["status"], { cwd: p.root, env: ENV })).stdout;
+    expect(human).toMatch(/^open_issues .* ok · stale: inputs changed \(croft run open_issues\)$/m);
+  });
+
+  test("a transform that last failed on its own, then was skipped for its input: the input fixed, it shows its own failure", async () => {
+    const p = await pipeline();
+    recordRun(p, "r_0922_1156_own1", "2026-09-22T18:56:00.000Z", [["github_issues", "ok"], ["open_issues", "failed"]]);
+    recordRun(p, "r_0922_1157_bad1", "2026-09-22T18:57:00.000Z", [["github_issues", "failed"], ["open_issues", "skipped"]]);
+    recordRun(p, "r_0922_1158_good", "2026-09-22T18:58:00.000Z", [["github_issues", "unchanged"]]);
+    const { a } = await status(p);
+    expect(a.open_issues).toMatchObject({ status: "failed", lastRun: { runId: "r_0922_1156_own1", status: "failed", code: "CHECK_FAILED" } });
+  });
+});
+
 describe("helpers", () => {
   test("schemaChangesFromRuns reads the run engine's stored result ({data: {steps}}) and a bare {steps}", () => {
     const p = makeProject({ files: {} });

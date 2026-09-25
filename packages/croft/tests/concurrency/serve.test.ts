@@ -14,6 +14,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { connect, type Socket } from "node:net";
 import { join } from "node:path";
 import { bootId } from "../../src/core/proc.ts";
+import { listIntents } from "../../src/db/intent.ts";
 import {
   addSale, cleanupAll, foreignHolder, GRACE_MS, initProject, intentFiles, killChildren, LONG_QUERY, placeOf, probeWriter,
   type Project, type Reply, rowsVia, type Serve, show, SLACK, sleep, slowSqlAsset, startServe, stopServes, until, WRITER_SHARE,
@@ -241,32 +242,54 @@ describe("croft serve with writers (slow: real processes)", () => {
     expect(existsSync(again)).toBe(false);
   }, 60_000);
 
+  // The run announces its intent (croft serve steps aside for it), keeps it for 2 s of the foreign holder (an app on
+  // @zabaca/croft/read honors intents but is not recognizable, so it gets that long to step aside), then withdraws it
+  // and croft serve answers again. Times are measured from the intent's own `since`, which the run writes as it
+  // announces: a loaded machine delays when this test sees the intent, never when the run withdrew it. (Measured
+  // from the spawn, the bound failed at 355–849 ms under load: the run had withdrawn at once on a lock error that
+  // named only a PID, which is what DuckDB reports while croft serve's worker is being killed to hand the file over;
+  // tests/concurrency/pidless-conflict.test.ts has the deterministic repro.)
   test("a croft run blocked by a foreign program withdraws its intent, so croft serve keeps answering; it writes once the program lets go", async () => {
     const { p, s } = await served();
     addSale(p, 7001);
     const holder = foreignHolder(placeOf(p).database, "READ_ONLY");
     await holder.waitFor("held");
     const run = p.start(["run", "example_sales", "--only", "--json", "--follow", "60s"]);
-    const started = Date.now();
-    await until(() => intentFiles(p).length > 0, 5000, 10);
+    // Every few milliseconds, whether the intent is there: when it first appears (with its since), and when it is first
+    // gone after that.
+    let since: number | null = null;
+    let withdrawnAt: number | null = null;
+    let watching = true;
+    const watcher = (async () => {
+      while (watching && withdrawnAt === null) {
+        const live = listIntents(p.stateDir);
+        if (since === null && live[0]) since = Date.parse(live[0].since);
+        else if (since !== null && live.length === 0) withdrawnAt = Date.now();
+        await sleep(3);
+      }
+    })();
+    // Starting the run is not what is measured: under load it can take seconds.
+    await until(() => since !== null, 30_000 + SLACK, 10);
 
-    // For 4.5 s, a query every 150 ms: all answered, while the run still waits for the foreign program.
-    const replies: Reply[] = [];
-    const withdrawnSeen: number[] = [];
-    while (Date.now() - started < 4500) {
-      const r = await s.query(COUNT);
-      replies.push(r);
-      if (intentFiles(p).length === 0) withdrawnSeen.push(Date.now() - started);
+    // A query every 150 ms while the run waits for the foreign program, until five were answered after the withdrawal.
+    const replies: (Reply & { at: number })[] = [];
+    const deadline = since! + 15_000 + SLACK;
+    while (Date.now() < deadline && (withdrawnAt === null || replies.filter((r) => r.at > withdrawnAt!).length < 5)) {
+      const at = Date.now();
+      replies.push({ ...(await s.query(COUNT)), at });
       await sleep(150);
     }
+    watching = false;
+    await watcher;
     expect(run.proc.exitCode).toBeNull();
     expect(replies.map((r) => r.status).filter((x) => x !== 200)).toEqual([]);
     expect(replies.every((r) => r.body.data.rows[0].n === 120)).toBe(true);
-    // The intent was withdrawn after 2 s of the foreign holder, and the queries after that were answered promptly.
-    expect(withdrawnSeen.length).toBeGreaterThan(0);
-    expect(Math.min(...withdrawnSeen)).toBeGreaterThanOrEqual(1500);
-    const late = replies.slice(-5);
-    expect(Math.max(...late.map((r) => r.ms)), JSON.stringify(replies.map((r) => Math.round(r.ms)))).toBeLessThanOrEqual(2500 + SLACK);
+    // Withdrawn, and not before 2 s of the foreign holder (DESIGN §5 "Foreign holders").
+    expect(withdrawnAt, "the intent was never withdrawn").not.toBeNull();
+    expect(withdrawnAt! - since!).toBeGreaterThanOrEqual(2000);
+    // The queries sent after it were answered promptly.
+    const late = replies.filter((r) => r.at > withdrawnAt!);
+    expect(Math.max(...late.map((r) => r.ms)), JSON.stringify(replies.map((r) => [r.at - since!, Math.round(r.ms)]))).toBeLessThanOrEqual(2500 + SLACK);
 
     holder.send();
     const r = await run.done;
