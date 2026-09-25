@@ -24,11 +24,16 @@ what is past that for its table, and croft doctor for every table.
 
 - Exact names only: no patterns, one table per command.
 - --where is one SQL condition over the table's columns, as in a WHERE clause: --where "created_at < '2024-01-01'".
-  It may read other tables of the project in a subquery; it may not call random(), read files or run a second
-  statement. A condition that matches no rows deletes nothing and asks nothing.
-- The asset file stays. After deleting a whole table the asset shows as never built; the next croft run of it
-  builds it from scratch (an ingest fetches everything again). Assets that read it have no input until then.
-- After deleting rows, what reads the table goes stale and rebuilds on the next croft run.
+  It may read other tables of the project in a subquery; it may not call random(), sample rows (USING SAMPLE,
+  TABLESAMPLE), read files or run a second statement. A condition that matches no rows deletes nothing and asks
+  nothing. The rows deleted are exactly the rows that went to the trash, even if the condition would pick others
+  by then.
+- The asset file stays. After deleting a whole table, croft status shows it as deleted (croft restore <table>
+  brings it back), and the scheduler leaves it alone: only croft run <table>, run by hand, builds it from scratch
+  (an ingest fetches everything again, which may cost money: ask the user first). Assets that read it have no input
+  until then.
+- After deleting rows, what reads the table goes stale and rebuilds on the next croft run. An incremental TS
+  transform keeps what it made from the deleted rows until croft run <transform> --rebuild (it asks first).
 
 ## Restoring
 
@@ -42,6 +47,9 @@ what is past that for its table, and croft doctor for every table.
   it replaces goes to the trash first, so a restore can be undone the same way.
 - A version holding the rows of a delete --where puts those rows back into the table as it is now. With a key,
   rows whose key is in the table again (fetched since) are left out and counted.
+- A delete --where that stopped halfway (a crash, or the table changed under it) leaves a copy of rows that were
+  never deleted: croft restore lists it as "not applied: the delete did not finish", croft restore <table> skips
+  it, and naming it with --at is refused while the table still has those rows.
 - What reads the table goes stale: SQL transforms rebuild on the next croft run. An incremental TS transform
   processes new rows only, so rows it built before the restore keep their values; croft run <transform> --rebuild
   redoes them (it asks first).
@@ -55,11 +63,14 @@ path, the assets that read the table) and a token:
   needs confirmation: delete orders, the whole table: 1,130 rows
     first: the 1,130 rows go to the trash (croft restore orders brings them back)
     then:  daily_orders read it: they keep their tables, and croft run skips them until orders is built again
+           the scheduler leaves orders alone from now on: only croft run orders, by hand, builds it again, fetching its whole history from the source
     ask the user; if they agree: croft confirm c_7f3a9e    (valid 15 min)
 
 Show the user the impact and run croft confirm <token> only after their explicit yes in this conversation. confirm
 counts the impact again first: when it changed meanwhile (the scheduler added rows, say) it stops with
-CONFIRMATION_STALE and changes nothing; run the command again for a new token. A token works once, for 15 minutes.
+CONFIRMATION_STALE and changes nothing; run the command again for a new token. A token works once, for 15 minutes,
+and consent is for one action: once one token carries a command out, every other token for the same command is
+spent too, and a token minted before the table was written, rebuilt or restored is stale.
 
 ## Backups before an engine upgrade
 

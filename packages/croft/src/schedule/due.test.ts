@@ -170,6 +170,35 @@ describe("held assets are skipped and stay due", () => {
     expect((await work(p, "2026-09-22T11:00:40Z")).groups).toEqual([["issues"]]);
   });
 
+  test("SCHEDULE_HELD: an asset croft delete removed is held even with its code approved, naming restore; a person decides", async () => {
+    const p = await pipeline();
+    const db = p.db(at("2026-09-22T10:30:00Z"));
+    try {
+      const run = db.createRun({ trigger: "manual", human: true, argv: ["delete", "issues"], identity: DEAD });
+      db.startStep({ runId: run.id, asset: "issues", attempt: 1, reason: "deleted" });
+      db.finishStep(run.id, "issues", 1, { status: "ok", reason: "deleted" });
+      db.finishRun(run.id, "succeeded");
+      db.catalogDelete("issues");
+    } finally {
+      db.close();
+    }
+    // Its code is still approved (a preview since, say): a scheduled run would fetch its whole history again.
+    const w = await work(p, "2026-09-22T11:00:30Z");
+    expect(view(w, "issues").held).toEqual({
+      code: "SCHEDULE_HELD", reason: "deleted by croft delete: croft restore issues brings it back; only croft run issues, by hand, builds it again from scratch",
+    });
+    expect(w.groups).toEqual([]);
+    const plan = p.db(at("2026-09-22T11:00:30Z"));
+    try {
+      scheduling(p, "on");
+      const h = duePlanning({ project: p.project, runs: plan, now: at("2026-09-22T11:00:30Z") })
+        .hold({ asset: "issues", file: "assets/issues.ts", kind: "rows", codeHash: plan.approvedCode("issues") ?? "x", ok: true });
+      expect(h?.problem).toMatchObject({ code: "SCHEDULE_HELD", severity: "warning", fix: { kind: "manual", requiresHuman: true }, details: { deleted: true } });
+    } finally {
+      plan.close();
+    }
+  });
+
   test("SCHEDULE_HELD: a file that no longer loads stays scheduled, and held", async () => {
     const p = await pipeline();
     writeFileSync(join(p.root, "assets/issues.ts"), scheduledIngest().replace("export default", "export default oops("));

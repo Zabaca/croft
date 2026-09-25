@@ -44,6 +44,7 @@ import { parseSqlHeader } from "../../project/sql-asset.ts";
 import { didYouMean } from "../../project/suggest.ts";
 import { loadTsAsset } from "../../project/ts-asset.ts";
 import { countAfter, readInputFacts } from "../../run/snapshot.ts";
+import { deletedByCroft } from "../../safety/trash.ts";
 import { parseSchedule, type Schedule } from "../../schedule/types.ts";
 import type { Row } from "../../types.ts";
 import type { CommandImpl, Ctx } from "../command.ts";
@@ -648,6 +649,8 @@ export const describe: CommandImpl<DescribeData> = {
     let catalogAll: CatalogAsset[] = [];
     let catalogRefreshedAt: string | null = null;
     let steps: StepRecord[] = [];
+    /** croft delete removed its table (safety/trash.ts deletedByCroft). */
+    let deleted = false;
     let dead = new Set<string>();
     const now = ctx.now();
     let scheduling: SchedulingRecord = SCHEDULING_OFF;
@@ -663,6 +666,7 @@ export const describe: CommandImpl<DescribeData> = {
         catalogAll = runs.catalogAll<CatalogAsset>().map((e) => e.value);
         steps = runs.sqlite.query("SELECT run_id, asset, attempt FROM steps WHERE asset = ? ORDER BY started_at DESC, attempt DESC LIMIT 5")
           .all(name).map((r) => { const x = r as { run_id: string; asset: string; attempt: number }; return runs.getStep(x.run_id, x.asset, x.attempt)!; });
+        deleted = deletedByCroft(runs, name);
         dead = runningEntries(runs, tz).dead;
       }
     } finally {
@@ -775,7 +779,13 @@ export const describe: CommandImpl<DescribeData> = {
     // it never appears in next (§4.3): only the user decides that.
     if (!found) {
       if (!renamed) problems.push(orphanTable(name, kind, data.rows));
-    } else if (!renamed && !wh?.tableExists && source !== "catalog" && !cat) next.push({ command: `croft run ${name}`, reason: "build the table" });
+    } else if (!renamed && !wh?.tableExists && source !== "catalog" && !cat) {
+      // A table croft delete removed comes back from the trash; a run would build it from scratch (an ingest fetches
+      // its whole history again), which the user decides: named in the reason, not as the command (§6).
+      if (deleted) {
+        next.push({ command: "croft restore", reason: `${name} was deleted by croft delete: croft restore ${name} brings it back (after confirmation); croft run ${name}, by hand, builds it again from scratch` });
+      } else next.push({ command: `croft run ${name}`, reason: "build the table" });
+    }
     if (samples.cut > 0) next.push({ command: `croft describe ${name} --full-values`, reason: "sample values were cut to 80 characters" });
     return { data, problems, next };
   },

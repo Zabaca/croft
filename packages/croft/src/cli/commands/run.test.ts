@@ -424,6 +424,28 @@ describe("--rebuild through the CLI", () => {
     expect(due.code).toBe(2);
     expect(due.json!.problems[0]).toMatchObject({ code: "USAGE_ERROR", message: "--due runs what the scheduler would; it does not go with --rebuild" });
   }, 60_000);
+
+  test("a token minted before the table was written again is stale, though the rows are as many (R41-11)", async () => {
+    api.state.issues = [1, 2, 3].map((id) => ({ id, title: `t${id}`, updated_at: `2026-09-0${id}T10:00:00Z` }));
+    const root = makeProject({ "assets/issues.ts": keysetIssues(api.url) });
+    expect((await cli(root, ["run", "issues", "--json"])).code).toBe(0);
+    const asked = await cli(root, ["run", "issues", "--rebuild", "--json"]);
+    expect(asked.code).toBe(5);
+    // Written since (a rebuild, a delete and a run, a restore...): the same 3 rows, another table.
+    await closeAllWarehouses();
+    const db = await DuckDBInstance.create(join(root, "warehouse.duckdb"), { access_mode: "READ_WRITE" });
+    const c = await db.connect();
+    try {
+      await c.run(`UPDATE _croft.assets SET last_replaced_at = now() WHERE name = 'issues'`);
+    } finally {
+      c.disconnectSync();
+      db.closeSync();
+    }
+    const stale = await cli(root, ["confirm", asked.json!.confirmation.token, "--json"]);
+    expect(stale.code).toBe(5);
+    expect(stale.json!.problems.find((p: { code: string }) => p.code === "CONFIRMATION_STALE")).toMatchObject({ details: { reason: "impact_changed" } });
+    expect(listTrash(join(root, ".croft"))).toEqual([]);
+  }, 60_000);
 });
 
 describe("--dry-run, --only and --upstream", () => {

@@ -12,6 +12,10 @@ It moves everything that belongs to the asset, together:
 - its versions in the trash (croft restore lists them under the new name; ask the user before restoring one);
 - the last preview, which is cleared if it built or read the old name.
 
+If the trash still holds versions of an earlier asset with the new name (one deleted before), they are kept apart
+under <new>_earlier, so croft restore <new> never offers them as the renamed asset's; croft restore <new>_earlier
+brings one back (the rename's data.trash.earlier names it).
+
 Nothing is fetched, rebuilt or deleted, so it needs no confirmation. It refuses a new name that is taken, by a file
 or a table (NAME_CONFLICT), or that is not a valid asset name (NAME_INVALID, NAME_RESERVED, with a suggestion). While
 a run is writing either name it stops with ASSET_BUSY: croft wait <runId>, then the same croft rename again.
@@ -33,5 +37,6 @@ run would fetch everything again into a new table. The kinds must match (an SQL 
 ## A rename that stopped
 
 croft rename writes .croft/rename.json before it moves anything and removes it last. If it is killed or fails on
-the way, croft validate and croft status report ASSET_RENAMED ("did not finish"), and the same command,
-croft rename <old> <new>, finishes it from where it stopped. Run neither name, and no other rename, until then.
+the way, croft validate, croft status and croft doctor report ASSET_RENAMED ("did not finish"), and the same
+command, croft rename <old> <new>, finishes it from where it stopped. Until then croft run, croft preview,
+croft delete and croft restore refuse either name with ASSET_RENAMED, and no other rename starts.

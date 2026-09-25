@@ -57,6 +57,7 @@ import { baseFrom, type CatalogBase, getCatalog, putCatalog, readCatalogEntry } 
 import type { IngestInput, IngestOutcome } from "../run/ingest.ts";
 import type { ConfirmRequest } from "../run/step.ts";
 import { isoMicros, readStoredColumns, type StoredColumn, tableStats } from "../safety/guards.ts";
+import { checkOutOfBand } from "../safety/out-of-band.ts";
 import { plannedTrashPath, trashFailed, trashTable, type TrashEntry } from "../safety/trash.ts";
 import { castExpr, lossExpr } from "./cast.ts";
 import { RESERVED } from "./contract.ts";
@@ -449,11 +450,14 @@ export interface ConfigChangeInput {
 /**
  * The confirmed change, in one write transaction after the trash committed: every retype (DDL first), then the
  * deduplication, then _croft.assets (the new behavior, the table's numbers so OUT_OF_BAND_CHANGE stays quiet, and
- * last_replaced_at, so what reads the table is rebuilt) and _croft.columns. Returns the rows removed.
+ * last_replaced_at, so what reads the table is rebuilt) and _croft.columns. Returns the rows removed, and
+ * OUT_OF_BAND_CHANGE when something other than croft changed the table first: compared before anything changes, so
+ * it is reported once rather than folded into the numbers recorded.
  */
-export async function applyConfigChange(tx: Sql, o: ConfigChangeInput): Promise<{ removed: number; changes: SchemaChange[] }> {
+export async function applyConfigChange(tx: Sql, o: ConfigChangeInput): Promise<{ removed: number; changes: SchemaChange[]; outOfBand: Problem | null }> {
   const db = await currentDatabase(tx);
   const ref = tableRef(db, o.asset);
+  const oob = await checkOutOfBand(tx, o.asset);
   const changes: SchemaChange[] = [];
   for (const c of o.pins) {
     await retype(tx, ref, c);
@@ -499,7 +503,7 @@ export async function applyConfigChange(tx: Sql, o: ConfigChangeInput): Promise<
   for (const c of o.pins) {
     await tx.exec(`UPDATE _croft.columns SET type = $3, pinned = true, pending = false WHERE asset = $1 AND lower(name) = lower($2)`, [o.asset, c.column, c.to]);
   }
-  return { removed, changes };
+  return { removed, changes, outOfBand: oob?.problem ?? null };
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -709,7 +713,7 @@ export async function settleConfig(i: IngestInput, o: { started: number; hashWit
 
   const where = trashed ? `; the previous table is in the trash: ${trashed.path}` : preview ? "; a real run asks for confirmation first" : "";
   const extra = { ...(trashed ? { trashPath: trashed.path, trashedRows: trashed.rows } : {}), ...(preview ? { preview: true } : {}) };
-  const warnings: Problem[] = [];
+  const warnings: Problem[] = applied.outOfBand ? [applied.outOfBand] : [];
   if (converting) {
     warnings.push({
       ...problem("INGEST_CONFIG_CHANGED", {

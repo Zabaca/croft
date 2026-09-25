@@ -6,7 +6,7 @@ import { tsFingerprint } from "../../project/ts-asset.ts";
 import { cleanup as cleanupChildren, spawnHolder } from "../../read/testkit.ts";
 import { behaviorOf, capValue, checksOf, DESCRIBE_TIMING, durationWords, loadConfigs, staticSecrets, type AssetConfig } from "./describe.ts";
 import {
-  busyScenario, CHARGES_TS, cleanup, cli, ISSUES_CATALOG, ISSUES_SEED, ISSUES_TS, makeProject, NOW, OPEN_SQL, runsDb, seed, shape, STATE,
+  busyScenario, CHARGES_TS, cleanup, cli, DEAD, ISSUES_CATALOG, ISSUES_SEED, ISSUES_TS, makeProject, NOW, OPEN_SQL, runsDb, seed, shape, STATE,
 } from "./inspect-testkit.ts";
 
 afterAll(async () => {
@@ -121,6 +121,24 @@ describe("croft describe --json", () => {
       ],
     });
     expect(r.json.next).toEqual([{ command: "croft run open_issues", reason: "build the table" }]);
+  });
+
+  test("an asset croft delete removed: next names the trash, and the run from scratch only in words (R41-06)", async () => {
+    const p = await issues();
+    const db = runsDb(p.stateDir);
+    try {
+      const del = db.createRun({ trigger: "confirm", human: true, argv: ["delete", "open_issues"], identity: DEAD });
+      db.startStep({ runId: del.id, asset: "open_issues", attempt: 1, reason: "deleted" });
+      db.finishStep(del.id, "open_issues", 1, { status: "ok", reason: "deleted" });
+      db.finishRun(del.id, "succeeded");
+    } finally {
+      db.close();
+    }
+    const r = await cli(["describe", "open_issues", "--json"], { cwd: p.root, env: ENV });
+    expect(r.json.next).toEqual([{
+      command: "croft restore",
+      reason: "open_issues was deleted by croft delete: croft restore open_issues brings it back (after confirmation); croft run open_issues, by hand, builds it again from scratch",
+    }]);
   });
 
   const TRIAGE_TS = `import { transform } from "@zabaca/croft";

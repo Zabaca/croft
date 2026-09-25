@@ -491,7 +491,9 @@ describe("handing the file to a writer", () => {
   test("queries queued during the handoff succeed after the reopen and see the writer's commit", async () => {
     const p = await seeded();
     const { e } = await engine(p);
-    const w = warehouseWriter(p, "r_hold", 400);
+    // Held long enough that a loaded machine (the whole suite in parallel) cannot let the writer finish, and the engine
+    // reopen, between the writer's "acquired" and this check.
+    const w = warehouseWriter(p, "r_hold", 2000);
     await w.waitFor("acquired");
     expect(e.status().state).toBe("closed_for_write");
     const queued = [1, 2, 3].map(() => e.query(q("SELECT count(*) AS c FROM log")));

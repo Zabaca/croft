@@ -59,7 +59,8 @@ import type { LogWriter } from "../history/logs.ts";
 import type { RunsDb } from "../history/runs-db.ts";
 import { RESERVED } from "../load/contract.ts";
 import { currentDatabase, quoteIdent, readTableSchema, tableRef } from "../load/evolve.ts";
-import { replacedStamp } from "../safety/delete.ts";
+import type { HashedImpact } from "../safety/confirm.ts";
+import { replacedStamp, tableGeneration } from "../safety/delete.ts";
 import { type ExtractInfo, isoMicros, shrinkGuardDisabled, wouldShrink } from "../safety/guards.ts";
 import { plannedTrashPath, trashFailed, trashTable, type TrashEntry } from "../safety/trash.ts";
 import type { FileIngest } from "../types.ts";
@@ -106,11 +107,14 @@ export interface RebuildExtra {
   paid?: readonly PaidReader[];
   gone?: readonly GoneFile[];
   allowShrink?: boolean;
+  /** safety/delete.ts tableGeneration: hashed only, never shown. A token minted before the table was written, rebuilt,
+   *  deleted or restored is stale afterwards (R41-11). */
+  generation?: string | null;
 }
 
 /** The impact a rebuild's confirmation shows and hashes: the rows that go to the trash, what reads the asset, for a
  *  paid transform the requests it would make, and for an ingest the clauses of RebuildExtra. */
-export function rebuildImpact(stateDir: string, step: Pick<PlannedStep, "asset" | "kind" | "readBy">, rows: number, extra: RebuildExtra = {}): Impact {
+export function rebuildImpact(stateDir: string, step: Pick<PlannedStep, "asset" | "kind" | "readBy">, rows: number, extra: RebuildExtra = {}): HashedImpact {
   const base = step.kind === "file" ? REBUILD_ACTIONS.file : step.kind === "transform" ? REBUILD_ACTIONS.transform : REBUILD_ACTIONS.rows;
   const paid = step.kind === "transform" ? [] : extra.paid ?? [];
   const notes = step.kind === "transform" ? [] : [goneNote(extra.gone ?? []), paidNote(step.asset, paid), extra.allowShrink ? SHRINK_NOTE : null];
@@ -119,6 +123,7 @@ export function rebuildImpact(stateDir: string, step: Pick<PlannedStep, "asset" 
     asset: step.asset, action: [base, ...notes.filter((n): n is string => n !== null)].join("; "), rows,
     ...(rows > 0 ? { trashPath: plannedTrashPath(stateDir, step.asset) } : {}),
     downstream: [...step.readBy], ...(estimatedRequests !== undefined ? { estimatedRequests } : {}),
+    ...(extra.generation !== undefined ? { generation: extra.generation } : {}),
   };
 }
 
@@ -306,6 +311,7 @@ export class Rebuilds {
       if (rows > 0 || (guard !== null && guard.pending > guard.limit)) {
         const impact = rebuildImpact(i.stateDir, step, rows, {
           ...(guard ? { estimatedRequests: guard.pending } : {}), paid, gone: facts.gone, ...(ingest && i.allowShrink ? { allowShrink: true } : {}),
+          generation: facts.generation,
         });
         const refused = declined(step, impact);
         if (!i.confirm) throw refused;
@@ -391,12 +397,12 @@ export class Rebuilds {
 /** What a rebuild's confirmation counts, under one read lease: the table's rows (0 when it has none, or no table),
  *  the paid readers (PlannedStep.paidReaders) that have read it, and for a file ingest the files gone from disk
  *  whose rows the table holds. */
-async function readFacts(warehouse: DuckWarehouse, step: PlannedStep, signal: AbortSignal): Promise<{ rows: number; readers: string[]; gone: GoneFile[] }> {
+async function readFacts(warehouse: DuckWarehouse, step: PlannedStep, signal: AbortSignal): Promise<{ rows: number; readers: string[]; gone: GoneFile[]; generation: string | null }> {
   const asset = step.asset;
   return warehouse.read(async (db) => {
     const database = await currentDatabase(db);
     const schema = await readTableSchema(db, asset, database);
-    if (!schema) return { rows: 0, readers: [], gone: [] };
+    if (!schema) return { rows: 0, readers: [], gone: [], generation: null };
     const ref = tableRef(database, asset);
     const [r] = await db.all<{ n: number | bigint }>(`SELECT count(*) AS n FROM ${ref}`);
     const rows = Number(r?.n ?? 0);
@@ -418,7 +424,7 @@ async function readFacts(warehouse: DuckWarehouse, step: PlannedStep, signal: Ab
       const root = projectRoot(step);
       gone = files.filter((f) => f.f !== null && !stillThere(root, specs, f.f)).map((f) => ({ path: f.f!, rows: Number(f.n) }));
     }
-    return { rows, readers, gone };
+    return { rows, readers, gone, generation: await tableGeneration(db, asset) };
   }, { purpose: `count the rows of ${asset}`, signal });
 }
 

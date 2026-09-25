@@ -279,6 +279,17 @@ describe("an append ingest gaining a key is converted in place", () => {
     expect(out.result.reason).toContain("converted in place");
   });
 
+  test("a change made outside croft before the conversion is reported (OUT_OF_BAND_CHANGE), not folded in silently", async () => {
+    const h = await appended();
+    await h.w.write("outside", (tx) => tx.exec(`INSERT INTO events BY NAME SELECT 9 AS id, 'z' AS v`), { runId: "r_outside" });
+    const { fn } = decider("granted");
+    const out = await ingestStep(h, await plan(h, "events", { key: ["id"] }), { confirmChange: fn });
+    expect(out.result.status).toBe("ok");
+    const oob = out.warnings.filter((w) => w.code === "OUT_OF_BAND_CHANGE");
+    expect(oob).toHaveLength(1);
+    expect(oob[0]!.message).toContain("1 row added (4 → 5)");
+  });
+
   test("rows written together keep the one with the highest cursor", async () => {
     const h = harness({ "assets/events.ts": APPEND });
     g.__cfg_rows = [{ id: 1, at: at(2), v: "late" }, { id: 1, at: at(1), v: "early" }, { id: 2, at: at(0), v: "x" }];

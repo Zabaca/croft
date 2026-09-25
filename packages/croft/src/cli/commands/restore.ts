@@ -24,6 +24,7 @@
 import { CroftError } from "../../core/errors.ts";
 import { formatInstant, parseInstant, zonedParts } from "../../core/time.ts";
 import { type CatalogAsset, getCatalog } from "../../history/catalog.ts";
+import { unfinishedRename } from "../../project/rename.ts";
 import type { Project } from "../../project/root.ts";
 import { didYouMean } from "../../project/suggest.ts";
 import { Confirmations, type HashedImpact } from "../../safety/confirm.ts";
@@ -346,7 +347,11 @@ export const restore: CommandImpl<TrashListData | RestoreData> = {
       }
       return list(ctx);
     }
-    return restoreOne(ctx, exactAsset("restore", ctx.positionals[0], USAGE), at);
+    const asset = exactAsset("restore", ctx.positionals[0], USAGE);
+    // A croft rename that did not finish names it: the rename finishes first (project/rename.ts, R41-05).
+    const renaming = unfinishedRename(ctx.project.paths.stateDir, asset);
+    if (renaming) throw renaming;
+    return restoreOne(ctx, asset, at);
   },
   human(result, ctx) {
     const d = result.data;

@@ -40,6 +40,7 @@ import { logPath, openLog } from "../../history/logs.ts";
 import { reconcile } from "../../history/reconcile.ts";
 import { RunsDb } from "../../history/runs-db.ts";
 import { NAME_PATTERN } from "../../project/discover.ts";
+import { unfinishedRename } from "../../project/rename.ts";
 import type { Project } from "../../project/root.ts";
 import { Confirmations, type HashedImpact, impactHash, shownImpact } from "../../safety/confirm.ts";
 import { deleteImpact, deleteTable, deleteWhere, type DeleteImpact, type DeleteResult } from "../../safety/delete.ts";
@@ -451,6 +452,9 @@ function data(i: DeleteImpact, status: DeleteData["status"], rebuild: string[],
 export const del: CommandImpl<DeleteData> = {
   async run(ctx): Promise<CommandResult<DeleteData>> {
     const asset = exactAsset("delete", ctx.positionals[0], USAGE);
+    // A croft rename that did not finish names it: the rename finishes first (project/rename.ts, R41-05).
+    const renaming = unfinishedRename(ctx.project.paths.stateDir, asset);
+    if (renaming) throw renaming;
     const raw = ctx.values.where;
     const where = typeof raw === "string" ? raw.trim() : null;
     if (where === "") {

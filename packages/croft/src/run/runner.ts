@@ -23,9 +23,12 @@
 //                   per run: a second step that needs one is skipped, with a next hint to run it afterwards (never a
 //                   destructive command: that is only named in the skip)
 //   --rebuild       a named ingest or incremental TS transform first goes through run/rebuild.ts, once per run:
-//                   confirmation (the cost guard's rows included), trash, reset; then the step runs as the asset's
-//                   first build. An ingest's reset rides on its first write (IngestInput.fresh: swap at commit), so
-//                   a refetch that fails before it commits keeps the old table. An SQL or full-refresh TS transform
+//                   confirmation (the cost guard's rows included; for an ingest, the rows each paid incremental
+//                   reader would process again, whose cost guard the run then grants for them), trash, reset; then
+//                   the step runs as the asset's first build. With --allow-shrink (one ingest), its refetch may
+//                   replace the table with fewer than half of its rows, as the rebuild's confirmation says. An
+//                   ingest's reset rides on its first write (IngestInput.fresh: swap at commit), so a refetch that
+//                   fails before it commits keeps the old table. An SQL or full-refresh TS transform
 //                   just runs. A step that fails after the reset
 //                   says in its hint that the asset is never built (or holds what its rebuild saved so far), that
 //                   a plain run builds it again, and that `croft restore <asset>` brings the previous table back:
@@ -62,6 +65,7 @@ import { CroftError, exitCodeFor } from "../core/errors.ts";
 import type { Confirmation, CursorType, Fix, Hold, LockHolder, Problem, Reason, StepResult } from "../core/types.ts";
 import type { ExampleResult } from "../project/init.ts";
 import { Confirmations } from "../safety/confirm.ts";
+import { deletedByCroft } from "../safety/trash.ts";
 import { canonicalPath } from "../db/connect.ts";
 import { openWarehouse, type DuckWarehouse } from "../db/warehouse.ts";
 import { allCatalog, type CatalogAsset, getCatalog } from "../history/catalog.ts";
@@ -193,7 +197,8 @@ export interface RunnerOptions {
 /**
  * Flag rules that need the plan: destructive flags take exact names (§6 "Guards aimed at agents": --allow-shrink
  * exactly one, --rebuild one or more, never a glob or a bare run), and --from on an asset named exactly must apply to
- * it (§8: BACKFILL_UNSUPPORTED). --rebuild goes with neither --from nor --allow-shrink. A confirmation carries out
+ * it (§8: BACKFILL_UNSUPPORTED). --rebuild never goes with --from, and with --allow-shrink only for one ingest (its
+ * refetch's shrink guard, §6). A confirmation carries out
  * --allow-shrink, --rebuild, or the cost guard (LARGE_REPROCESS) of the one transform named: its token is for
  * `croft run <transform>`. Called before the run exists, by the detached parent too, so such a refusal is never a
  * run or a failed step.
@@ -208,8 +213,13 @@ export function checkRunFlags(plan: RunPlan, o: Pick<RunnerOptions, "selectors" 
         { kind: "manual", description: "use one of the two: --rebuild to build the asset from scratch, or --from to backfill a merge ingest" });
     }
     if (o.allowShrink) {
-      throw usage("--rebuild and --allow-shrink do not go together", "a rebuild moves the table to the trash first, so no shrink guard applies: croft run <asset> --rebuild",
-        { kind: "manual", description: "drop --allow-shrink: a rebuild moves the table to the trash first" });
+      // The refetch of one ingest may replace its table with fewer than half of its rows (§6 shrink guard); the
+      // rebuild's own confirmation says so, and the table goes to the trash first as for any rebuild.
+      if (!named || (named.kind !== "rows" && named.kind !== "file")) {
+        throw usage("--rebuild --allow-shrink takes exactly one ingest", "only an ingest's refetch has a shrink guard: croft run <ingest> --rebuild --allow-shrink",
+          { kind: "manual", description: "name one ingest: croft run <ingest> --rebuild --allow-shrink" });
+      }
+      return;
     }
   }
   if (o.confirmToken !== undefined && !o.allowShrink && !o.rebuild && (!named || named.kind === "sql")) {
@@ -785,12 +795,14 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
             progress.setPhase("write");
             const prep = await rebuilds.prepare({
               step, warehouse: warehouse!, runs, runId, stateDir: canonicalPath(paths.stateDir), attempt, maxAttempts, signal, log,
-              ...(o.human ?? true ? { confirm: decider } : {}), ...(o.fault ? { fault: o.fault } : {}),
+              ...(o.human ?? true ? { confirm: decider } : {}), ...(o.fault ? { fault: o.fault } : {}), ...(o.allowShrink ? { allowShrink: true } : {}),
             }).finally(() => progress.setPhase("extract"));
             if (prep.kind === "pending") out = prep.outcome;
             else {
               // One token for both (§6): the cost guard's question for the rows the rebuild's impact counted is answered.
               if (prep.guard) confirms.grant("large_reprocess", asset, prep.guard.pending);
+              // An ingest's rebuild counted the rows each paid reader would process again: that yes covers their guard.
+              for (const r of prep.paid ?? []) confirms.grant("large_reprocess", r.asset, r.rows);
               fresh = prep.fresh;
             }
           }
@@ -1112,14 +1124,16 @@ export async function holdAtStart(step: PlannedStep, runs: RunsDb, project: Pick
   const planned = codeHashOf(step);
   const current = step.kind === "sql" ? planned
     : await tsFingerprint(step.path, { root: project.root, timezone: project.timezone }).catch(() => undefined);
-  if (approved !== null && planned === approved && current === approved) return null;
+  // croft delete removed its table since the plan: held whatever the approval (a build from scratch needs a person).
+  const deleted = deletedByCroft(runs, step.asset);
+  if (!deleted && approved !== null && planned === approved && current === approved) return null;
   let editedAt: number | null = null;
   try {
     editedAt = statSync(step.path).mtimeMs;
   } catch {
     // Gone: the hold says it does not load.
   }
-  const h = scheduleHeld({ asset: step.asset, file: step.file, approved, editedAt, loads: current !== undefined, now });
+  const h = scheduleHeld({ asset: step.asset, file: step.file, approved, editedAt, loads: current !== undefined, now, deleted });
   return { why: `held (SCHEDULE_HELD): ${h.reason}`, problem: h.problem };
 }
 

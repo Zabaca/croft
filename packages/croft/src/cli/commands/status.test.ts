@@ -339,8 +339,12 @@ describe("croft status when the warehouse file is missing", () => {
     }
     const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
     const a = r.json.data.assets.find((x: { asset: string }) => x.asset === "github_issues");
-    expect(a).toMatchObject({ status: "never_run", rows: null, stale: true, staleReasons: ["never_built"], lastRun: { runId: "r_0922_1101_del1", status: "ok" } });
+    expect(a).toMatchObject({ status: "never_run", rows: null, stale: true, staleReasons: ["never_built"], lastRun: { runId: "r_0922_1101_del1", status: "ok" }, deleted: true });
     expect(r.json.problems).toEqual([]);
+    // It says so, naming restore rather than a run that would fetch everything again (R41-06).
+    const human = await cli(["status"], { cwd: p.root, env: ENV });
+    expect(human.stdout).toContain("deleted (croft restore github_issues brings it back)");
+    expect(human.stdout).not.toContain("never run (croft run github_issues)");
   });
 });
 

@@ -222,7 +222,12 @@ export default transform({
     await expect(run({ selectors: [], rebuild: true })).rejects.toMatchObject({ code: "USAGE_ERROR" });
     await expect(run({ selectors: ["iss*"], rebuild: true })).rejects.toMatchObject({ code: "USAGE_ERROR" });
     await expect(run({ selectors: ["issues"], rebuild: true, from: "-7d" })).rejects.toMatchObject({ code: "USAGE_ERROR" });
-    await expect(run({ selectors: ["zones"], rebuild: true, allowShrink: true })).rejects.toMatchObject({ code: "USAGE_ERROR" });
+    await expect(run({ selectors: ["consts"], rebuild: true, allowShrink: true })).rejects.toMatchObject({ code: "USAGE_ERROR" });
+    // --allow-shrink with the rebuild of one ingest: its confirmation says the refetch may shrink.
+    expect(stepsOf((await run({ selectors: ["zones"], rebuild: true, allowShrink: true })).data).zones.confirmation).toMatchObject({
+      action: "rebuild", command: "croft run zones --rebuild --allow-shrink",
+      impact: { action: "ingest; --rebuild refetches from scratch; --allow-shrink: the refetch replaces the table even with fewer than half of its rows", rows: 265 },
+    });
   });
 
   // R41-07, R41-12: what an ingest's rebuild costs besides its own rows.

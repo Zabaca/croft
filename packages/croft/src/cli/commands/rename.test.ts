@@ -1,13 +1,13 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { DuckDBInstance } from "@duckdb/node-api";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { closeAllWarehouses, openWarehouse } from "../../db/warehouse.ts";
 import { trashTable } from "../../safety/trash.ts";
 import { getCatalog, putCatalog } from "../../history/catalog.ts";
 import { tryAcquire } from "../../history/leases.ts";
 import { currentIdentity } from "../../core/proc.ts";
-import { readJournal } from "../../project/rename.ts";
+import { readJournal, RENAME_JOURNAL } from "../../project/rename.ts";
 import { RunsDb } from "../../history/runs-db.ts";
 import { cleanupProjects, cli as spawnCli, cliEnv, makeProject as makeRunProject } from "../../run/testkit.ts";
 import { cleanup, cli, ISSUES_CATALOG, ISSUES_SEED, ISSUES_TS, makeProject, NOW, OPEN_SQL, runsDb, seed, type TestProject } from "./inspect-testkit.ts";
@@ -192,6 +192,25 @@ describe("a killed rename (CROFT_FAULT) is reported and finished by the same com
       expect(after.json.problems.filter((x: { code: string }) => x.code === "ASSET_RENAMED")).toEqual([]);
     });
   }
+});
+
+describe("R41-05: croft delete and croft restore wait for a croft rename that did not finish", () => {
+  test("either name: ASSET_RENAMED (exit 2) with the rename as its fix, and nothing changes; another asset is not affected", async () => {
+    const p = await issues();
+    writeFileSync(join(p.stateDir, RENAME_JOURNAL), JSON.stringify({
+      from: "github_issues", to: "issues", fileFrom: "assets/github_issues.ts", fileTo: "assets/issues.ts", mode: "file",
+      startedAt: "2026-09-22T18:59:00.000Z", runId: "r_0922_1159_dead",
+    }));
+    const fix = { kind: "command", command: "croft rename github_issues issues" };
+    for (const argv of [["delete", "github_issues"], ["delete", "issues", "--where", "id = 1"], ["restore", "github_issues"], ["restore", "issues"]]) {
+      const r = await cli([...argv, "--json"], { cwd: p.root, env: ENV });
+      expect(r.exit).toBe(2);
+      expect(r.json.problems[0]).toMatchObject({ code: "ASSET_RENAMED", fix, effect: "nothing was changed" });
+    }
+    expect(await names(p.database)).toEqual(["github_issues"]);
+    const other = await cli(["delete", "open_issues", "--json"], { cwd: p.root, env: ENV });
+    expect(other.json.problems[0].code).not.toBe("ASSET_RENAMED");
+  });
 });
 
 describe("R41-05: while a croft rename is unfinished, no run or preview fetches either name again", () => {

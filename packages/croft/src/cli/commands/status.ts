@@ -65,6 +65,7 @@ import { discoverAssets, type DiscoveredAsset } from "../../project/discover.ts"
 import type { ResolvedAsset, ResolvedProject } from "../../project/resolve.ts";
 import type { Project } from "../../project/root.ts";
 import { readServeRecord } from "../../read/locate.ts";
+import { deletedByCroft } from "../../safety/trash.ts";
 import { editedProblem, staleReasons, type StaleView } from "../../run/staleness.ts";
 import type { AssetScheduleView, HoldCode } from "../../schedule/due.ts";
 import { croftHome, type CroftHome } from "../../schedule/home.ts";
@@ -115,6 +116,10 @@ export interface StatusAsset {
   /** An incremental TS transform whose input was replaced since it read it (input_replaced): each such input, and
    *  whether `croft restore` replaced it. A plain run processes new input rows only; `--rebuild` redoes every row. */
   replaced?: { input: string; restored: boolean }[];
+  /** croft delete removed its whole table (safety/trash.ts deletedByCroft; status never_run, or skipped by a held
+   *  scheduled run since): `croft restore <asset>` brings it back, and the scheduler holds it until a person restores
+   *  it or runs it by hand. */
+  deleted?: true;
   /** Drift its runs of the last 7 days reported (§7), newest first, one per code and column; `at` in the project zone. */
   drift?: { code: DriftEntry["code"]; column: string | null; text: string; at: string; runId: string }[];
 }
@@ -515,8 +520,8 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
         lastRun = { runId: cat.lastRunId, at: zoned(cat.lastLoadedAt, tz) ?? "", status: "ok", code: null };
       }
       // croft delete's step (reason "deleted") dropped the whole table and its mirror entry: the asset is never built
-      // again until it runs, although that step is ok.
-      const deleted = !cat && step?.reason === "deleted";
+      // again until it runs, although that step is ok. A scheduled step skipped since (held) does not change that.
+      const deleted = !cat && (step?.reason === "deleted" || (!!db && deletedByCroft(db, name)));
       let status: StatusAsset["status"];
       if (!file) status = "no_asset_file";
       else if (stepStatus === "running") status = "running";
@@ -571,6 +576,7 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
         stale: reasons.length > 0, staleReasons: reasons, held: !!file && hold !== null && HUMAN_HOLDS.has(hold.code), edited,
       };
       if (file && hold) out.hold = { code: hold.code, reason: hold.reason };
+      if (file && deleted && (status === "never_run" || status === "skipped")) out.deleted = true;
       // §6 "Restore": an incremental TS transform processes new input rows only, so a replaced input's older rows
       // are redone by `--rebuild` alone; the row says which input, and whether a restore replaced it.
       if (view?.incremental && reasons.includes("input_replaced")) {
@@ -802,6 +808,8 @@ export function statusText(a: StatusAsset, now: Date, renamed?: RenamedRow, conf
     default:
       head = "ok";
   }
+  // A table croft delete removed: the trash has it back; a run would build it from scratch (§6).
+  if (a.deleted) head = `deleted (croft restore ${a.asset} brings it back)`;
   if (renamed) {
     const words = renamed.unfinished ? `the rename of ${renamed.from} to ${renamed.to} did not finish`
       : a.asset === renamed.to ? `looks like ${renamed.from} renamed` : `looks renamed to ${renamed.to}`;

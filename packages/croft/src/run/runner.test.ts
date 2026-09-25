@@ -490,15 +490,18 @@ describe("--rebuild (§4.1, §6 destructive operations, §8)", () => {
     expect(listTrash(join(root, ".croft"))).toEqual([]);
   });
 
-  test("names only, and not with --from or --allow-shrink: USAGE_ERROR before a run exists", async () => {
-    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones"), "assets/issues.ts": keysetIssues(api.url) });
+  test("names only, never with --from, and with --allow-shrink one ingest only: USAGE_ERROR before a run exists", async () => {
+    const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones"), "assets/issues.ts": keysetIssues(api.url), "assets/open.sql": "select id from issues\n" });
     await expect(runIn(root, [], { rebuild: true })).rejects.toMatchObject({ code: "USAGE_ERROR" });
     await expect(runIn(root, ["z*"], { rebuild: true })).rejects.toMatchObject({ code: "USAGE_ERROR" });
     await expect(runIn(root, ["issues"], { rebuild: true, from: "-1d" })).rejects.toMatchObject({
       code: "USAGE_ERROR", problem: { message: "--rebuild and --from do not go together" },
     });
-    await expect(runIn(root, ["zones"], { rebuild: true, allowShrink: true })).rejects.toMatchObject({
-      code: "USAGE_ERROR", problem: { message: "--rebuild and --allow-shrink do not go together" },
+    await expect(runIn(root, ["open"], { rebuild: true, allowShrink: true })).rejects.toMatchObject({
+      code: "USAGE_ERROR", problem: { message: "--rebuild --allow-shrink takes exactly one ingest" },
+    });
+    await expect(runIn(root, ["zones", "issues"], { rebuild: true, allowShrink: true })).rejects.toMatchObject({
+      code: "USAGE_ERROR", problem: { message: "--rebuild --allow-shrink takes exactly one ingest" },
     });
     // Refused before the run exists: no run is recorded.
     if (existsSync(join(root, ".croft", "runs.sqlite"))) {
@@ -723,6 +726,23 @@ export default ingest({
     expect(half.data.steps.find((s) => s.asset === "issues")).toMatchObject({ status: "ok", rows: { total: 2 } });
   });
 
+  test("--rebuild --allow-shrink: one confirmation says the refetch may shrink; an empty refetch then replaces the table (R41-08)", async () => {
+    api.state.issues = issues([1, 2, 3]);
+    const root = makeProject({ "assets/issues.ts": keysetIssues(api.url) });
+    expect((await runIn(root, ["issues"])).exit).toBe(0);
+    api.state.issues = [];
+    const asked = await runIn(root, ["issues"], { rebuild: true, allowShrink: true });
+    expect(asked.exit).toBe(5);
+    expect(asked.confirmation).toMatchObject({
+      command: "croft run issues --rebuild --allow-shrink",
+      impact: { action: "ingest; --rebuild refetches from scratch; --allow-shrink: the refetch replaces the table even with fewer than half of its rows", rows: 3 },
+    });
+    const done = await runIn(root, ["issues"], { rebuild: true, allowShrink: true, confirmToken: asked.confirmation!.token });
+    expect(done.exit).toBe(0);
+    expect(done.data.steps[0]).toMatchObject({ status: "ok", rows: { total: 0 }, trashed: { rows: 3 } });
+    expect(done.problems.some((p) => p.code === "SHRINK_GUARD_DISABLED" && p.details?.rebuild === true)).toBe(true);
+  });
+
   test("allowShrink: true lets a rebuild shrink; the swap marks the table replaced, so what read it is stale even when nothing was written (R41-08)", async () => {
     api.state.zones = [{ zone: 1 }, { zone: 2 }, { zone: 3 }, { zone: 4 }];
     const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones", "\n  allowShrink: true,"), "assets/zone_count.sql": "select count(*) as n from zones\n" });
@@ -824,14 +844,10 @@ export default transform({
     const done = await runIn(root, ["issues"], { rebuild: true, confirmToken: asked.confirmation!.token });
     const labels = done.data.steps.find((s) => s.asset === "labels")!;
     const paidCalls = api.state.log.filter((l) => l.path === "/zones").length;
-    if (labels.status === "ok") {
-      // The runner granted labels' cost guard for the 3 rows the rebuild's confirmation named.
-      expect(labels.requests).toBe(3);
-    } else {
-      // Or labels asks for itself: skipped, nothing paid.
-      expect(labels).toMatchObject({ status: "skipped", reason: "needs confirmation" });
-      expect(paidCalls).toBe(0);
-    }
+    // The runner granted labels' cost guard for the 3 rows the rebuild's confirmation named: one yes, no second token.
+    expect(labels).toMatchObject({ status: "ok", requests: 3 });
+    expect(paidCalls).toBe(3);
+    expect(done.confirmation).toBeUndefined();
   });
 
   test("a file ingest: the confirmation names the files gone from disk, whose rows do not come back (R41-12)", async () => {
