@@ -119,6 +119,23 @@ describe("validate --types catches a TS transform reading a column its input doe
     expect(fixed.exit).toBe(0);
   }, 60_000);
 
+  test("a tsconfig.json with \"pretty\": true: tsc still prints lines croft parses (--pretty false wins), no escapes", async () => {
+    const p = makeProject({
+      files: { "assets/github_issues.ts": ISSUES_TS, "assets/open_issues.sql": OPEN_SQL("author_login"), "assets/triage.ts": TRIAGE_TS("author") },
+    });
+    const pretty = JSON.parse(TSCONFIG()) as { compilerOptions: Record<string, unknown> };
+    pretty.compilerOptions.pretty = true;
+    withTypescript(p, JSON.stringify(pretty, null, 2));
+    catalog(p, [built("github_issues", "ingest", ["id"], [col("id", "BIGINT"), col("title", "VARCHAR"), col("user", "JSON")])]);
+    const r = await validateTypes(p);
+    expect(r.exit).toBe(2);
+    expect(r.json.data.types).toEqual({ status: "failed", errors: 1 });
+    expect(r.json.problems).toEqual([expect.objectContaining({
+      code: "UNKNOWN_INPUT_COLUMN", file: "assets/triage.ts", line: 6, message: 'open_issues has no column "author"; did you mean "author_login"?',
+    })]);
+    expect(JSON.stringify(r.json)).not.toContain("\\u001b");
+  }, 60_000);
+
   test("removed from a built input: the hint lists its columns; a destructured name keeps its binding; a computed name needs Row", async () => {
     const p = makeProject({
       files: {

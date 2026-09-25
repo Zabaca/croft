@@ -714,10 +714,11 @@ export async function typecheck(root: string, shell: Readonly<Record<string, str
       "add a tsconfig.json that includes assets and lib (croft init writes one for a new project)");
   }
   // A JavaScript entry (Bun's .bin links to typescript/bin/tsc) runs with this Bun, so no Node is needed; a
-  // shell shim (other package managers) runs as it is. Its output is a pipe, so tsc prints plain
-  // `file(line,col): error TSnnnn: text` lines.
+  // shell shim (other package managers) runs as it is. --pretty false makes tsc print plain
+  // `file(line,col): error TSnnnn: text` lines even when tsconfig.json says "pretty": true (the flag wins).
   const shim = /^#!\s*\/(usr\/)?bin\/(env\s+)?(ba|z)?sh\b/.test(readText(bin).slice(0, 64));
-  const cmd = shim ? [bin, "--noEmit"] : [process.execPath, bin, "--noEmit"];
+  const args = ["--noEmit", "--pretty", "false"];
+  const cmd = shim ? [bin, ...args] : [process.execPath, bin, ...args];
   const env: Record<string, string> = { NO_COLOR: "1" };
   for (const k of ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SYSTEMROOT"]) {
     const v = shell[k];
