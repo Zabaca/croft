@@ -66,6 +66,9 @@ export interface GeneratedType {
   /** Root-relative: ".croft/types/github_issues.d.ts". */
   file: string;
   columns: string[];
+  /** Each column's TypeScript type as the file writes it ("number | bigint | null"): validate --types words its
+   *  hints from them (a column that may be NULL, a BIGINT in arithmetic). */
+  columnTypes: Record<string, string>;
 }
 
 export interface TypesResult {
@@ -207,8 +210,8 @@ function commentLines(text: string): string[] {
   return out;
 }
 
-function columnLine(c: TypedColumn, key: readonly string[]): string[] {
-  const name = IDENTIFIER.test(c.name) ? c.name : JSON.stringify(c.name);
+/** A column's TypeScript type, and the comment above it. */
+function columnType(c: TypedColumn, key: readonly string[]): { ts: string; note: string } {
   const type = c.type.trim() || "unknown";
   const isKey = key.some((k) => sameName(k, c.name));
   const own = sameName(c.name, RESERVED.loadedAt) ? "when croft loaded the row" : sameName(c.name, RESERVED.file) ? "the file the row came from" : null;
@@ -224,6 +227,12 @@ function columnLine(c: TypedColumn, key: readonly string[]): string[] {
       : isKey ? `${type}, the key`
         : c.jsonKeys?.length ? `${type} (keys seen: ${c.jsonKeys.join(", ")})` : type;
   }
+  return { ts, note };
+}
+
+function columnLine(c: TypedColumn, key: readonly string[]): string[] {
+  const name = IDENTIFIER.test(c.name) ? c.name : JSON.stringify(c.name);
+  const { ts, note } = columnType(c, key);
   return [`  /** ${commentSafe(note)} */`, `  ${name}: ${ts};`];
 }
 
@@ -259,7 +268,10 @@ export function renderTypes(sources: readonly TypeSource[]): { files: Map<string
     const typeName = names.get(s.asset)!;
     const columns = withLoadedAt(s);
     const inIndex = `${s.asset}.d.ts` === TYPES_INDEX;
-    types[typeName] = { asset: s.asset, file: `${TYPES_DIR}/${s.asset}.d.ts`, columns: columns.map((c) => c.name) };
+    types[typeName] = {
+      asset: s.asset, file: `${TYPES_DIR}/${s.asset}.d.ts`, columns: columns.map((c) => c.name),
+      columnTypes: Object.fromEntries(columns.map((c) => [c.name, columnType(c, s.key).ts])),
+    };
     const q = JSON.stringify(s.asset);
     const header = commentLines(`${s.asset}: its rows as TS transforms read them: ctx.rows(${q}), ctx.newRows(${q}) and ctx.query<${q}>(sql). ${origin(s)}`);
     if (inIndex) {

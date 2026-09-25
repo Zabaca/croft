@@ -240,6 +240,65 @@ export default transform({
   }, 60_000);
 });
 
+describe("type errors on a generated row type's columns get a hint that says what to write (R51-09)", () => {
+  const REVENUE_TS = (expr: string) => `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["sales"],
+  key: "id",
+  incremental: true,
+  async *rows({ newRows }) {
+    for await (const row of newRows("sales")) {
+      yield { id: row.id, revenue: ${expr} };
+    }
+  },
+});
+`;
+
+  test("arithmetic on a BIGINT (number | bigint): Number(row.x); a column that may be NULL: a default", async () => {
+    // Every integer from CSV or JSON is BIGINT: a number, and a bigint only beyond ±2^53 (db/values.ts).
+    const p = makeProject({ files: { "assets/sales.ts": ISSUES_TS, "assets/revenue.ts": REVENUE_TS("row.quantity * row.unit_price") } });
+    withTypescript(p);
+    catalog(p, [built("sales", "ingest", ["id"], [col("id", "BIGINT"), col("quantity", "BIGINT"), col("unit_price", "DOUBLE")])]);
+    const r = await validateTypes(p);
+    expect(r.exit).toBe(2);
+    expect(r.json.data.types).toEqual({ status: "failed", errors: 3 });
+    const [quantityNull, bigint, priceNull] = r.json.problems;
+    expect(quantityNull).toMatchObject({
+      code: "ASSET_INVALID", asset: "revenue", file: "assets/revenue.ts", line: 8,
+      message: "TS18047: 'row.quantity' is possibly 'null'.",
+      hint: "quantity of sales may be NULL (every column but the key may): give it a default, (row.quantity ?? 0), or skip the rows where it is null",
+      fix: { kind: "edit", description: "handle a NULL row.quantity on line 8", file: "assets/revenue.ts", line: 8 },
+      details: { tsc: "TS18047", input: "sales", column: "quantity" },
+    });
+    expect(bigint).toMatchObject({
+      code: "ASSET_INVALID", line: 8,
+      message: "TS2365: Operator '*' cannot be applied to types 'number | bigint' and 'number'.",
+      hint: "a BIGINT column is number | bigint (a bigint only beyond ±2^53): for arithmetic, write Number(row.quantity), exact up to ±2^53",
+      fix: { kind: "edit", description: "convert the BIGINT value with Number(row.quantity) on line 8", file: "assets/revenue.ts", line: 8 },
+      details: { tsc: "TS2365", input: "sales", column: "quantity" },
+    });
+    expect(priceNull).toMatchObject({ message: "TS18047: 'row.unit_price' is possibly 'null'.", details: { column: "unit_price" } });
+
+    // What the hints say to write passes.
+    writeFiles(p.root, { "assets/revenue.ts": REVENUE_TS("Number(row.quantity ?? 0) * (row.unit_price ?? 0)") });
+    const fixed = await validateTypes(p);
+    expect(fixed.json.problems).toEqual([]);
+    expect(fixed.exit).toBe(0);
+  }, 60_000);
+
+  test("a number | bigint anywhere else still gets the Number() hint; other errors keep the generic one", async () => {
+    const p = makeProject({ files: { "assets/sales.ts": ISSUES_TS, "assets/revenue.ts": REVENUE_TS("Math.round(row.id) + ([] as string[]).length.nope") } });
+    withTypescript(p);
+    catalog(p, [built("sales", "ingest", ["id"], [col("id", "BIGINT")])]);
+    const r = await validateTypes(p);
+    expect(r.json.problems.map((x: { message: string; hint: string }) => [x.message.slice(0, 7), x.hint.slice(0, 40)])).toEqual([
+      ["TS2345:", "a BIGINT column is number | bigint (a bi"],
+      ["TS2339:", "fix the type error; the project's own ts"],
+    ]);
+    expect(r.json.problems[0].fix.description).toBe("convert the BIGINT value with Number(row.id) on line 8");
+  }, 60_000);
+});
+
 describe("includesInputTypes: whether tsconfig.json reaches .croft/types", () => {
   test("only a pattern naming .croft does: TypeScript's wildcards skip dot folders", () => {
     expect(includesInputTypes(TSCONFIG())).toBe(true);

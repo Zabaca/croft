@@ -27,11 +27,13 @@
 //    - the unoptimized plan's scans join the AST inputs, and the graph (order, CYCLE) is built again with them.
 // 3. --types: first .croft/types, the input row types of TS transforms (project/types-gen.ts), from the column
 //    cache with each bound SQL asset's output columns as its code is now; then the project's own
-//    node_modules/.bin/tsc --noEmit. A TS transform that reads a column its input does not have (renamed or
-//    removed upstream, even in SQL not yet run) is a missing property of a generated row type, reported as
-//    UNKNOWN_INPUT_COLUMN with the runtime's did-you-mean and edit fix; every other type error is ASSET_INVALID.
-//    No tsc (or no tsconfig.json) is an info problem and a skip; croft never installs anything. A tsconfig.json
-//    whose "include" leaves out .croft/types is an info problem with the edit.
+//    node_modules/.bin/tsc --noEmit --pretty false. A TS transform that reads a column its input does not have
+//    (renamed or removed upstream, even in SQL not yet run) is a missing property of a generated row type,
+//    reported as UNKNOWN_INPUT_COLUMN with the runtime's did-you-mean and edit fix; every other type error is
+//    ASSET_INVALID, worded for the two a generated type causes most: a column that may be NULL, and arithmetic on
+//    a BIGINT (number | bigint: Number(row.x)). No tsc (or no tsconfig.json) is an info problem and a skip; croft
+//    never installs anything. A tsconfig.json whose "include" leaves out .croft/types is an info problem with the
+//    edit. Plain validate names --types as the next step when TS transforms read assets (nextSteps).
 // 4. --hook: what Claude Code's PostToolUse hook runs after an edit (agent/hook.ts, §9 item 7): the edited asset
 //    and what it can break, silent unless there is an error, which goes to stderr with exit 2 (validateHook).
 //
@@ -830,12 +832,84 @@ function tscProblem(d: TscDiagnostic, root: string, inputTypes?: TypesResult): P
       details: { tsc: d.code, input: indexed.asset, types: indexed.file },
     });
   }
+  if (file) {
+    const worded = nullableColumn(d, at, file, inputTypes) ?? bigintValue(d, root, at, file, inputTypes);
+    if (worded) return worded;
+  }
   return problem("ASSET_INVALID", {
     message: `${d.code}: ${d.message}`,
     hint: "fix the type error; the project's own tsc --noEmit reports it",
     ...at,
     ...(file ? { fix: { kind: "edit" as const, description: `fix the type error${d.line !== undefined ? ` on line ${d.line}` : ""}`, file, ...(d.line !== undefined ? { line: d.line } : {}) } } : {}),
     details: { tsc: d.code },
+  });
+}
+
+/** tsc on a value that may be NULL: `'row.amount' is possibly 'null'.` (TS18047; TS18049 adds undefined). */
+const POSSIBLY_NULL = /^'(.+)' is possibly 'null'(?: or 'undefined')?\.$/;
+/** The property an expression ends with: row.amount, row?.amount, row["Unit Price"]. */
+const LAST_PROPERTY = /(?:\??\.([A-Za-z_$][\w$]*)|\[("(?:[^"\\]|\\.)*")\])$/;
+/** A property read in code: row.amount, row?.amount, row["Unit Price"]. */
+const PROPERTY_READ = /[A-Za-z_$][\w$]*(?:\??\.([A-Za-z_$][\w$]*)|\[("(?:[^"\\]|\\.)*")\])/g;
+/** A default of a column's type, for the NULL hint. */
+const DEFAULTS: Record<string, string> = { number: "0", "number | bigint": "0", bigint: "0n", string: "\"\"", boolean: "false" };
+
+const locate = (file: string, line: number | undefined) => ({ file, ...(line !== undefined ? { line } : {}) });
+const onLine = (line: number | undefined) => (line !== undefined ? ` on line ${line}` : "");
+
+/**
+ * A column of a generated row type that may be NULL, used as if it could not be (R51-09): every column but the
+ * key and croft's own may hold NULL, so the type says `| null`. The hint names the column and a default of its
+ * type. Null when the expression does not end with such a column.
+ */
+function nullableColumn(d: TscDiagnostic, at: Pick<Problem, "asset" | "line" | "column">, file: string, types?: TypesResult): Problem | null {
+  const m = POSSIBLY_NULL.exec(d.message.split("\n")[0]!);
+  const p = m ? LAST_PROPERTY.exec(m[1]!) : null;
+  if (!m || !p || !types) return null;
+  const column = p[1] ?? (JSON.parse(p[2]!) as string);
+  const owners = Object.values(types.types).filter((t) => t.columnTypes[column]?.endsWith(" | null"));
+  if (!owners.length) return null;
+  const input = owners.length === 1 ? owners[0]! : null;
+  const expr = m[1]!;
+  const fallback = input ? DEFAULTS[input.columnTypes[column]!.slice(0, -" | null".length)] : undefined;
+  return problem("ASSET_INVALID", {
+    message: `${d.code}: ${d.message}`,
+    hint: `${column}${input ? ` of ${input.asset}` : ""} may be NULL (every column but the key may): give it a default, `
+      + `${fallback ? `(${expr} ?? ${fallback})` : `${expr} ?? <default>`}, or skip the rows where it is null`,
+    ...at,
+    fix: { kind: "edit", description: `handle a NULL ${expr}${onLine(at.line)}`, ...locate(file, at.line) },
+    details: { tsc: d.code, ...(input ? { input: input.asset, types: input.file } : {}), column },
+  });
+}
+
+/**
+ * Arithmetic (or a number parameter) on a BIGINT (R51-09). A BIGINT reaches a TS transform as a number, and as a
+ * bigint only beyond ±2^53 (db/values.ts), so its generated type is `number | bigint`: honest, but `row.qty * 2`
+ * does not compile. The hint says to convert it with Number(), naming the first BIGINT column read from where
+ * tsc points on. Null when tsc's message names no `number | bigint`.
+ */
+function bigintValue(d: TscDiagnostic, root: string, at: Pick<Problem, "asset" | "line" | "column">, file: string, types?: TypesResult): Problem | null {
+  if (!d.message.includes("number | bigint")) return null;
+  const text = at.line !== undefined ? readText(join(root, file)).split("\n")[at.line - 1] ?? "" : "";
+  let found: { expr: string; column: string; owners: GeneratedType[] } | null = null;
+  for (const m of text.slice(Math.max(0, (at.column ?? 1) - 1)).matchAll(PROPERTY_READ)) {
+    const column = m[1] ?? (JSON.parse(m[2]!) as string);
+    const owners = Object.values(types?.types ?? {}).filter((t) => t.columnTypes[column]?.startsWith("number | bigint"));
+    if (owners.length) {
+      found = { expr: m[0], column, owners };
+      break;
+    }
+  }
+  const convert = `Number(${found?.expr ?? "…"})`;
+  return problem("ASSET_INVALID", {
+    message: `${d.code}: ${d.message}`,
+    hint: `a BIGINT column is number | bigint (a bigint only beyond ±2^53): for arithmetic, write ${convert}, exact up to ±2^53`,
+    ...at,
+    fix: { kind: "edit", description: `convert the BIGINT value with ${convert}${onLine(at.line)}`, ...locate(file, at.line) },
+    details: {
+      tsc: d.code,
+      ...(found ? { ...(found.owners.length === 1 ? { input: found.owners[0]!.asset } : {}), column: found.column } : {}),
+    },
   });
 }
 
