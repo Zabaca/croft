@@ -491,6 +491,9 @@ describe("handing the file to a writer", () => {
   test("queries queued during the handoff succeed after the reopen and see the writer's commit", async () => {
     const p = await seeded();
     const { e } = await engine(p);
+    // The worker has the file open before the writer comes: on a loaded machine its spawn can otherwise lose the race,
+    // and the writer takes the file while the engine is still opening.
+    await e.query(q("SELECT 1 AS x"));
     // Held long enough that a loaded machine (the whole suite in parallel) cannot let the writer finish, and the engine
     // reopen, between the writer's "acquired" and this check.
     const w = warehouseWriter(p, "r_hold", 2000);
