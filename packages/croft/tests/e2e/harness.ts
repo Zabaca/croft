@@ -163,6 +163,18 @@ export class Project {
     unlinkSync(join(this.root, rel));
   }
 
+  /**
+   * Replace `from` with `to` in a project file, as an agent's Edit tool does: `from` must occur exactly once (or
+   * pass `all` to replace every occurrence, at least one). Throws otherwise, so a template that changed under a
+   * journey fails at the edit, not three steps later.
+   */
+  edit(rel: string, from: string, to: string, o: { all?: boolean } = {}): void {
+    const text = this.read(rel);
+    const n = text.split(from).length - 1;
+    if (n === 0 || (n > 1 && !o.all)) throw new Error(`${rel}: expected ${o.all ? "at least one" : "exactly one"} ${JSON.stringify(from)}, found ${n}\n${text}`);
+    this.write(rel, o.all ? text.split(from).join(to) : text.replace(from, () => to));
+  }
+
   /** Append NAME=value to .env, as a user would. */
   secret(name: string, value: string): void {
     const p = join(this.root, ".env");
@@ -444,4 +456,85 @@ export async function holdDuckDb(path: string): Promise<FileHolder> {
       spawned.delete(proc);
     },
   };
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Phase 5: the rest of what `bun install` leaves in a project, and the hook's shell
+
+/**
+ * node_modules/.bin/croft → the package's bin, as `bun install` links it. The hook that `croft init --with-hook`
+ * adds runs ./node_modules/.bin/croft, so a journey that runs the hook command needs it.
+ */
+export function linkCroftBin(p: Project): void {
+  const bin = join(p.root, "node_modules", ".bin");
+  mkdirSync(bin, { recursive: true });
+  if (!existsSync(join(bin, "croft"))) symlinkSync(join("..", "@zabaca", "croft", "bin", "croft.mjs"), join(bin, "croft"));
+}
+
+/**
+ * TypeScript and Bun's types in node_modules, with node_modules/.bin/tsc, as `bun install` leaves them for the
+ * devDependencies croft init writes (`croft validate --types` runs that tsc; a journey runs it too).
+ */
+export function linkTypescript(p: Project): void {
+  const nm = join(p.root, "node_modules");
+  mkdirSync(join(nm, "@types"), { recursive: true });
+  mkdirSync(join(nm, ".bin"), { recursive: true });
+  if (!existsSync(join(nm, "typescript"))) symlinkSync(join(PKG, "node_modules", "typescript"), join(nm, "typescript"));
+  if (!existsSync(join(nm, "@types", "bun"))) symlinkSync(join(PKG, "node_modules", "@types", "bun"), join(nm, "@types", "bun"));
+  if (!existsSync(join(nm, ".bin", "tsc"))) symlinkSync(join("..", "typescript", "bin", "tsc"), join(nm, ".bin", "tsc"));
+}
+
+/** The project's own `tsc --noEmit` (node_modules/.bin/tsc, run by this Bun as croft runs it), from its root. */
+export async function projectTsc(p: Project): Promise<{ code: number; out: string }> {
+  const proc = Bun.spawn([process.execPath, join(p.root, "node_modules", ".bin", "tsc"), "--noEmit", "--pretty", "false"], {
+    cwd: p.root, env: baseEnv(), stdin: "ignore", stdout: "pipe", stderr: "pipe",
+  });
+  spawned.add(proc);
+  const [out, err] = await Promise.all([new Response(proc.stdout as ReadableStream).text(), new Response(proc.stderr as ReadableStream).text()]);
+  const code = await proc.exited;
+  spawned.delete(proc);
+  return { code, out: `${out}${err}` };
+}
+
+/**
+ * Run a command as Claude Code runs a hook's command: through `sh -c`, in `cwd` (Claude's current folder), with
+ * the hook's JSON on stdin and CLAUDE_PROJECT_DIR set by the caller. The result's args are ["sh", "-c", command].
+ */
+export async function hookShell(cwd: string, command: string, o: { env?: Record<string, string>; stdin: string }): Promise<CliResult> {
+  const started = performance.now();
+  const proc = Bun.spawn(["/bin/sh", "-c", command], {
+    cwd, env: baseEnv(o.env), stdin: new TextEncoder().encode(o.stdin), stdout: "pipe", stderr: "pipe",
+  });
+  spawned.add(proc);
+  const [stdout, stderr] = await Promise.all([new Response(proc.stdout as ReadableStream).text(), new Response(proc.stderr as ReadableStream).text()]);
+  const code = await proc.exited;
+  spawned.delete(proc);
+  return { args: ["sh", "-c", command], code: proc.signalCode ? null : code, signal: proc.signalCode ?? null, stdout, stderr, ms: performance.now() - started };
+}
+
+/**
+ * The JSON Claude Code writes on a PostToolUse hook's stdin after an Edit, MultiEdit or Write of `file` (absolute),
+ * with `cwd` as Claude's current folder: the fields of code.claude.com/docs/en/hooks (session_id,
+ * transcript_path, cwd, permission_mode, hook_event_name, tool_name, tool_input, tool_response, tool_use_id).
+ */
+export function postToolUse(o: { tool: "Edit" | "Write" | "MultiEdit"; file: string; cwd: string; content?: string }): string {
+  const input = o.tool === "Write"
+    ? { file_path: o.file, content: o.content ?? "" }
+    : o.tool === "MultiEdit"
+      ? { file_path: o.file, edits: [{ old_string: "a", new_string: "b", replace_all: false }] }
+      : { file_path: o.file, old_string: "a", new_string: "b", replace_all: false };
+  const response = o.tool === "Write"
+    ? { type: "update", filePath: o.file, content: o.content ?? "", structuredPatch: [] }
+    : { filePath: o.file, oldString: "a", newString: "b", originalFile: "", structuredPatch: [], userModified: false, replaceAll: false };
+  return JSON.stringify({
+    session_id: "0a1b2c3d-e2e0-4000-8000-000000000029",
+    transcript_path: join(tmpdir(), "croft-e2e-transcript.jsonl"),
+    cwd: o.cwd,
+    permission_mode: "default",
+    hook_event_name: "PostToolUse",
+    tool_name: o.tool,
+    tool_input: input,
+    tool_response: response,
+    tool_use_id: "toolu_01E2eHookJourney0000000",
+  });
 }
