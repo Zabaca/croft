@@ -1,14 +1,21 @@
 // Journey 29: the opt-in Claude Code hook (DESIGN.md §9 item 7, D27), through the real CLI and the real shell.
 //   a. `croft init --claude --with-hook` merges the PostToolUse hook into a .claude/settings.json the user already
 //      has (their permissions, model, other hooks and indentation stay); a second run changes nothing, and init
-//      without --with-hook never touches the file. A new project, and an app's data/ project, get it too.
+//      without --with-hook never touches the file. The hook goes in as one insertion: CRLF, compact arrays and
+//      1.50 stay as written; a file croft cannot change that way ("hooks" written twice) is left byte for byte,
+//      with the snippet to add by hand. A new project, and an app's data/ project, get it too; until
+//      data/ is installed, the app's hook does nothing (exit 0, silent), for app files and data/ assets alike;
+//      once it is, its report names data/assets/x.sql, the path from the app folder where Claude works.
 //   b. The hook command from settings.json runs exactly as Claude Code runs it (`sh -c`, CLAUDE_PROJECT_DIR set,
 //      the PostToolUse JSON on stdin), with node_modules/.bin/croft as `bun install` links it:
 //      - an asset edit with an error: exit 2, stdout empty, stderr names the file, the code and the fix;
 //      - an SQL edit that breaks the asset reading it: exit 2, and stderr says the reader was checked too;
 //      - a TS asset that does not compile, and a second file for one asset name: exit 2; a path through a symlink
 //        (macOS's /var) is the same file;
-//      - a clean edit, and an edit whose only finding is a warning: exit 0, nothing printed;
+//      - a clean edit: exit 0, nothing printed;
+//      - an edit whose only findings are warnings (a secret not set yet; a full-refresh transform that pays for
+//        every row on every rebuild): exit 0, stderr empty, one line of PostToolUse JSON on stdout whose
+//        hookSpecificOutput.additionalContext carries them to Claude without blocking it;
 //      - a file outside assets/ (README, a CSV, croft.json, a script, a file outside the project), even while an
 //        asset is broken: exit 0, nothing printed;
 //      - a lib/ edit that breaks the asset importing it: exit 2 naming that asset; fixed: exit 0, silent;
@@ -23,7 +30,7 @@ import {
 
 afterAll(cleanupAll);
 
-const HOOK_COMMAND = 'cd "$CLAUDE_PROJECT_DIR" && ./node_modules/.bin/croft validate --hook';
+const HOOK_COMMAND = 'cd "$CLAUDE_PROJECT_DIR" && test -x ./node_modules/.bin/croft || exit 0; ./node_modules/.bin/croft validate --hook';
 const CROFT_GROUP = { matcher: "Edit|Write|MultiEdit", hooks: [{ type: "command", command: HOOK_COMMAND, timeout: 120 }] };
 
 /** A user's own settings, written with four-space indentation. */
@@ -73,6 +80,29 @@ describe("a. croft init --with-hook writes the hook into .claude/settings.json",
     expect(refused.problems[0]).toMatchObject({ code: "USAGE_ERROR", fix: { command: "croft init --claude --with-hook" } });
   }, 120_000);
 
+  test("hand-formatted settings (CRLF, compact arrays, 1.50) keep every byte; hooks written twice: left alone, the snippet to add by hand", async () => {
+    const { project: p } = await initProject("byte-for-byte");
+    const before = `{\r\n    "permissions": { "allow": ["Bash(npm test)", "Read(./src/**)"], "deny": ["Read(./.env)"] },\r\n    "env": { "RATIO": 1.50 }\r\n}\r\n`;
+    p.write(".claude/settings.json", before);
+    golden("init", await p.croft(["init", "--claude", "--with-hook", "--json"]));
+    const after = p.read(".claude/settings.json");
+    const cut = before.indexOf("\r\n}\r\n");
+    expect(after.slice(0, cut)).toBe(before.slice(0, cut));
+    expect(after).toEndWith(before.slice(cut));
+    expect(after.replace(/\r\n/g, "")).not.toContain("\n");
+    expect(JSON.parse(after).hooks).toEqual({ PostToolUse: [CROFT_GROUP] });
+
+    const twice = `{\n  "hooks": {},\n  "hooks": {"Stop": []}\n}\n`;
+    p.write(".claude/settings.json", twice);
+    const refused = golden("init", await p.croft(["init", "--claude", "--with-hook", "--json"]), { exit: 2 });
+    expect(refused.ok).toBe(false);
+    expect(p.read(".claude/settings.json")).toBe(twice);
+    expect(refused.data.files).toContainEqual(expect.objectContaining({ path: ".claude/settings.json", action: "skipped" }));
+    expect(refused.problems[0]).toMatchObject({ code: "USAGE_ERROR", fix: { kind: "manual", description: expect.stringContaining(JSON.stringify({ hooks: { PostToolUse: [CROFT_GROUP] } })) } });
+    const human = await p.croft(["init", "--claude", "--with-hook"]);
+    expect(human.stdout + human.stderr).toContain('"hooks" is written twice');
+  }, 120_000);
+
   test("a new project, and an app's data/ project (the app's settings cd into data/)", async () => {
     const base = tempDir();
     const fresh = golden("init", await croftIn(base, ["init", join(base, "fresh"), "--no-install", "--with-hook", "--json"]));
@@ -88,17 +118,26 @@ describe("a. croft init --with-hook writes the hook into .claude/settings.json",
     const dataSettings = JSON.parse(readFileSync(join(app, "data", ".claude", "settings.json"), "utf8"));
     expect(dataSettings).toEqual({ hooks: { PostToolUse: [CROFT_GROUP] } });
     const appCommand = appSettings.hooks.PostToolUse[0].hooks[0].command as string;
-    expect(appCommand).toBe('cd "$CLAUDE_PROJECT_DIR"/data && ./node_modules/.bin/croft validate --hook');
+    expect(appCommand).toBe('cd "$CLAUDE_PROJECT_DIR"/data && test -x ./node_modules/.bin/croft || exit 0; ./node_modules/.bin/croft validate --hook');
+
+    // Until data/ is installed, the app's hook does nothing: no "hook error" after every edit of the app.
+    const data = new Project(join(app, "data"));
+    data.write("assets/broken.sql", "-- key: id\nSELECT id FROM no_such_asset\n");
+    writeFileSync(join(app, "page.ts"), "export const x = 1;\n");
+    for (const file of [join(app, "page.ts"), join(data.root, "assets/broken.sql")]) {
+      const before = await hookShell(app, appCommand, { env: { CLAUDE_PROJECT_DIR: app }, stdin: postToolUse({ tool: "Edit", file, cwd: app }) });
+      expect({ code: before.code, stdout: before.stdout, stderr: before.stderr }, show(before)).toEqual({ code: 0, stdout: "", stderr: "" });
+    }
 
     // The app's hook, run from the app folder (where Claude Code started), checks the data/ project's assets.
-    const data = new Project(join(app, "data"));
     mkdirSync(join(data.root, "node_modules", "@zabaca"), { recursive: true });
     symlinkSync(PKG, join(data.root, "node_modules", "@zabaca", "croft"));
     linkCroftBin(data);
-    data.write("assets/broken.sql", "-- key: id\nSELECT id FROM no_such_asset\n");
     const r = await hookShell(app, appCommand, { env: { CLAUDE_PROJECT_DIR: app }, stdin: postToolUse({ tool: "Write", file: join(data.root, "assets/broken.sql"), cwd: app }) });
     expect(r.code, show(r)).toBe(2);
-    expect(r.stderr).toContain("assets/broken.sql");
+    // Paths are named from the app folder, where Claude works: data/assets/broken.sql.
+    expect(r.stderr).toStartWith("croft validate --hook: 1 error after the edit to data/assets/broken.sql\n");
+    expect(r.stderr).toContain("  data/assets/broken.sql:2");
     expect(r.stdout).toBe("");
   }, 120_000);
 });
@@ -214,7 +253,17 @@ SELECT order_id, region, ${column} FROM example_sales WHERE amount > 100
     }
   }, 60_000);
 
-  test("an edit whose only finding is a warning (a secret not set yet): exit 0, silent", async () => {
+  /** The context a warnings-only edit hands Claude: exit 0, stderr empty, one line of PostToolUse JSON on stdout. */
+  const context = (r: CliResult): string => {
+    expect(r.code, show(r)).toBe(0);
+    expect(r.stderr, show(r)).toBe("");
+    expect(r.stdout.trimEnd().split("\n"), show(r)).toHaveLength(1);
+    const out = JSON.parse(r.stdout);
+    expect(out.hookSpecificOutput.hookEventName).toBe("PostToolUse");
+    return out.hookSpecificOutput.additionalContext as string;
+  };
+
+  test("an edit whose only finding is a warning (a secret not set yet): exit 0, the warning reaches Claude as context", async () => {
     p.write("assets/partners.ts", `import { ingest } from "@zabaca/croft";
 
 export default ingest({
@@ -225,9 +274,34 @@ export default ingest({
   },
 });
 `);
-    silent(await hook("assets/partners.ts", { tool: "Write" }));
+    const text = context(await hook("assets/partners.ts", { tool: "Write" }));
+    expect(text).toStartWith("croft validate --hook: 1 warning after the edit to assets/partners.ts\n");
+    expect(text).toContain("SECRET_MISSING");
+    expect(text).toContain("PARTNER_KEY");
     const v = golden("validate", await p.croft(["validate", "partners", "--json"]));
     expect(v.problems.map((x: { code: string }) => x.code)).toEqual(["SECRET_MISSING"]);
+    p.remove("assets/partners.ts");
+  }, 60_000);
+
+  test("a full-refresh transform that makes requests (pays for every row on every rebuild): TRANSFORM_MAKES_REQUESTS reaches Claude", async () => {
+    p.write(".env", "API_TOKEN=tok-abc-123456\n");
+    p.write("assets/paid_full.ts", `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["example_sales"], key: "order_id", secrets: ["API_TOKEN"],
+  async *rows({ rows, http, secret }) {
+    for await (const r of rows("example_sales")) {
+      const res = await http.post("https://api.example.com/v1/classify", { text: String(r.product) }, { headers: { Authorization: \`Bearer \${secret("API_TOKEN")}\` } });
+      yield { order_id: r.order_id, label: res.json<{ label: string }>().label };
+    }
+  },
+});
+`);
+    const text = context(await hook("assets/paid_full.ts", { tool: "Write" }));
+    expect(text).toStartWith("croft validate --hook: 1 warning after the edit to assets/paid_full.ts\n");
+    expect(text).toContain("TRANSFORM_MAKES_REQUESTS  assets/paid_full.ts:");
+    expect(text).toContain("every rebuild pays for every row again");
+    expect(text).not.toContain("tok-abc-123456");
+    p.remove("assets/paid_full.ts");
   }, 60_000);
 
   test("a lib/ edit: exit 2 naming the asset that imports it while it is broken; exit 0, silent, once fixed", async () => {

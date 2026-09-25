@@ -33,13 +33,14 @@
 //    No tsc (or no tsconfig.json) is an info problem and a skip; croft never installs anything. A tsconfig.json
 //    whose "include" leaves out .croft/types is an info problem with the edit.
 // 4. --hook: what Claude Code's PostToolUse hook runs after an edit (agent/hook.ts, §9 item 7): the edited asset
-//    and what it can break, silent unless there is an error, which goes to stderr with exit 2 (validateHook).
+//    and what it can break. Errors go to stderr with exit 2; warnings only, to Claude as additionalContext (JSON
+//    on stdout, exit 0); croft's own failures exit 1, which never blocks Claude (validateHook, hookHuman).
 //
 // Data: ValidateData (core/types.ts). Every finding is a problem of the envelope, grouped by asset in run order.
 // Human output is the §4.2 layout: "checked N assets in 0.6 s", each problem, then the counts.
 import { existsSync, readFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
-import { HOOK_IO, hookProblems, hookReport, hookSelection, hookTarget, parseHookInput } from "../../agent/hook.ts";
+import { hookContext, hookOutput, hookPaths, hookProblems, hookReport, hookSelection, hookTarget, parseHookInput, readHookStdin, showPaths } from "../../agent/hook.ts";
 import { probeSql } from "../../checks/parse.ts";
 import { type Code, CroftError, CODES, EXIT, isCode, problem } from "../../core/errors.ts";
 import { formatInstant } from "../../core/time.ts";
@@ -824,8 +825,9 @@ function tscProblem(d: TscDiagnostic, root: string, inputTypes?: TypesResult): P
 // ---------------------------------------------------------------------------------------------------------
 // --hook
 
-/** What a --hook run checked, for its human output (the edit, the edited asset's name, what was selected). */
-interface HookRun { target: string; asset: string | null; selected: string[] }
+/** What a --hook run checked, for its human output (the edit, the edited asset's name, what was selected, how to
+ *  name files for Claude), and whether croft itself failed (not a finding about the edit). */
+interface HookRun { target: string; asset: string | null; selected: string[]; show?: (file: string) => string; failed?: boolean }
 const hookRuns = new WeakMap<object, HookRun>();
 
 /**
@@ -833,12 +835,27 @@ const hookRuns = new WeakMap<object, HookRun>();
  * JSON on stdin. An edit that is not an asset file in assets/ or a file in lib/ of this project checks nothing.
  * Otherwise the edited asset is validated, with the assets that read it when it is SQL (a lib/ file: the TS
  * assets that import it), and only their errors and warnings count: exit 2 when there is an error, which shows
- * stderr to Claude; 0 otherwise, with nothing printed. Never the warehouse, never the network.
+ * stderr to Claude; 0 otherwise, with the warnings handed to Claude as context (hookHuman). Files are named from
+ * the folder Claude works in (the input's cwd). Never the warehouse, never the network.
+ *
+ * Exit 2 is only for findings about the edited assets. croft's own failures (a usage error, stdin that is not the
+ * hook's JSON, anything else croft raises that is not a problem in the project) exit 1, which Claude Code shows
+ * the user as a non-blocking hook error: exit 2 would feed them to Claude after every edit it makes.
  */
 async function validateHook(ctx: Ctx): Promise<CommandResult<ValidateData>> {
+  try {
+    return await checkEdit(ctx);
+  } catch (e) {
+    if (!(e instanceof CroftError)) throw e;
+    hookRuns.set(ctx, { target: "the edited file", asset: null, selected: [], ...hookRuns.get(ctx), failed: true });
+    return { data: { order: [], assets: [] }, problems: [e.problem], next: [], exit: EXIT.FAILED };
+  }
+}
+
+async function checkEdit(ctx: Ctx): Promise<CommandResult<ValidateData>> {
   hookUsage(ctx);
   const none: CommandResult<ValidateData> = { data: { order: [], assets: [] }, problems: [], next: [], exit: EXIT.OK };
-  const stdin = await HOOK_IO.readStdin();
+  const stdin = await readHookStdin();
   const root = findRoot(ctx.cwd);
   if (!root) {
     parseHookInput(stdin);                          // stdin that is not hook JSON is still a usage error
@@ -846,7 +863,8 @@ async function validateHook(ctx: Ctx): Promise<CommandResult<ValidateData>> {
   }
   const target = hookTarget(stdin, root);
   if (!target) return none;
-  const run: HookRun = { target, asset: null, selected: [] };
+  // Files are named for Claude from where it works (an app's data/ project: data/assets/x.sql).
+  const run: HookRun = { target, asset: null, selected: [], show: hookPaths(root, parseHookInput(stdin).cwd) };
   hookRuns.set(ctx, run);
   const found = (problems: Problem[]): CommandResult<ValidateData> => ({
     ...none, problems, exit: problems.some((p) => p.severity === "error") ? EXIT.INVALID : EXIT.OK,
@@ -871,7 +889,7 @@ async function validateHook(ctx: Ctx): Promise<CommandResult<ValidateData>> {
     return { ...found(hookProblems(report.problems, new Set(run.selected), target)), data: report.data };
   } catch (e) {
     // A problem Claude can fix in the project (a croft.json that does not load, say) is reported like the
-    // others; anything else fails as croft fails, which Claude Code shows the user and does not block on.
+    // others; anything else is croft's own failure (validateHook: exit 1).
     if (e instanceof CroftError && CODES[e.code].category === "project") return found([e.problem]);
     throw e;
   }
@@ -896,12 +914,28 @@ function hookUsage(ctx: Ctx): void {
   }
 }
 
-/** --hook's human output: nothing unless there is an error; then the report goes to stderr, which is what
- *  Claude Code shows Claude on exit 2, and stdout stays empty. */
+/**
+ * --hook's human output, per Claude Code's PostToolUse contract (agent/hook.ts):
+ * - errors: the report on stderr, which Claude Code shows Claude on exit 2; stdout stays empty;
+ * - warnings only: one line of JSON on stdout whose additionalContext Claude reads next to the edit, exit 0;
+ * - a clean check, or nothing to check: nothing at all;
+ * - croft's own failure (exit 1): its problem block on stderr, whose first line Claude Code shows the user.
+ */
 function hookHuman(result: CommandResult<ValidateData>, ctx: Ctx): undefined {
-  if (!result.problems.some((p) => p.severity === "error")) return undefined;
   const run = hookRuns.get(ctx) ?? { target: "the edited file", asset: null, selected: [] };
-  ctx.render.errRaw(hookReport({ ...run, problems: result.problems, formatted: formatProblems(result.problems, false) }));
+  if (run.failed) {
+    ctx.render.errRaw(formatProblems(result.problems, ctx.render.errColor));
+    return undefined;
+  }
+  if (!result.problems.length) return undefined;
+  const show = run.show ?? ((file: string) => file);
+  const problems = showPaths(result.problems, show);
+  const findings = { ...run, shown: show(run.target), problems };
+  if (problems.some((p) => p.severity === "error")) {
+    ctx.render.errRaw(hookReport({ ...findings, formatted: formatProblems(problems, false) }));
+  } else {
+    ctx.render.outRaw(hookOutput(hookContext({ ...findings, formatted: problems.map((p) => formatProblems([p], false)) })));
+  }
   return undefined;
 }
 

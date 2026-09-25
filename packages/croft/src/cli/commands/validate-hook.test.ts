@@ -1,10 +1,12 @@
 // croft validate --hook (DESIGN.md §9 item 7): the PostToolUse hook's side. Claude Code runs it after each Edit,
-// Write or MultiEdit with the tool call's JSON on stdin; exit 2 shows its stderr to Claude, exit 0 is silent
-// (code.claude.com/docs/en/hooks, "Exit code 2 behavior per event": PostToolUse "Shows stderr to Claude; the
-// tool already ran").
+// Write or MultiEdit with the tool call's JSON on stdin (code.claude.com/docs/en/hooks):
+// - exit 2 shows its stderr to Claude ("Exit code 2 behavior per event": PostToolUse "Shows stderr to Claude;
+//   the tool already ran"): errors in the edited assets;
+// - exit 0 with hookSpecificOutput.additionalContext on stdout hands text to Claude without blocking: warnings;
+// - any other exit is a non-blocking "hook error" notice for the user: croft's own failures (exit 1).
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { HOOK_IO, hookCommand } from "../../agent/hook.ts";
 import { putCatalog } from "../../history/catalog.ts";
 import { cleanup, cli, ISSUES_CATALOG, ISSUES_TS, makeProject, PKG, runsDb, type TestProject, writeFiles } from "./inspect-testkit.ts";
@@ -81,15 +83,75 @@ describe("croft validate --hook: nothing to check", () => {
     expect(whole.exit).toBe(2);                        // broken.sql: the full validate still reports it
   });
 
-  test("warnings alone do not stop Claude: exit 0, silent (--json still carries them)", async () => {
+  test("warnings alone do not stop Claude: exit 0, and they reach Claude as context, one line of JSON on stdout (--json still carries them)", async () => {
     const p = project();
     const r = await hook(p, "assets/github_issues.ts");
-    expect([r.exit, r.stdout, r.stderr]).toEqual([0, "", ""]);
+    expect([r.exit, r.stderr]).toEqual([0, ""]);
+    expect(r.stdout.endsWith("\n")).toBe(true);
+    expect(r.stdout.trimEnd()).not.toContain("\n");
+    const out = JSON.parse(r.stdout);
+    expect(Object.keys(out)).toEqual(["hookSpecificOutput"]);
+    expect(out.hookSpecificOutput.hookEventName).toBe("PostToolUse");
+    const context = (out.hookSpecificOutput.additionalContext as string).split("\n");
+    expect(context[0]).toBe("croft validate --hook: 1 warning after the edit to assets/github_issues.ts");
+    expect(context[1]).toStartWith("warn  SECRET_MISSING  ");
+    expect(context.at(-1)).toBe("A warning does not stop the edit or croft run; it says what the asset will cost or risk as written.");
     const j = await hook(p, "assets/github_issues.ts", { json: true });
     expect(j.exit).toBe(0);
     expect(j.json).toMatchObject({ ok: true, command: "validate", next: [] });
     expect(j.json.problems.map((x: { code: string }) => x.code)).toEqual(["SECRET_MISSING"]);
     expect(j.json.data.assets.map((a: { name: string }) => a.name)).toEqual(["github_issues"]);
+  });
+
+  test("a full-refresh transform that makes requests: TRANSFORM_MAKES_REQUESTS reaches Claude as context, with its fix", async () => {
+    const p = project({
+      "assets/labelled.ts": `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["github_issues"], key: "id",
+  async *rows({ rows, http }) {
+    for await (const r of rows("github_issues")) {
+      const res = await http.post("https://api.example.com/v1/classify", { text: String(r.title) });
+      yield { id: r.id, label: res.json<{ label: string }>().label };
+    }
+  },
+});
+`,
+    });
+    const r = await hook(p, "assets/labelled.ts", { stdin: input(p, "assets/labelled.ts", "Write") });
+    expect([r.exit, r.stderr]).toEqual([0, ""]);
+    const context = JSON.parse(r.stdout).hookSpecificOutput.additionalContext as string;
+    expect(context).toStartWith("croft validate --hook: 1 warning after the edit to assets/labelled.ts\n");
+    expect(context).toContain("warn  TRANSFORM_MAKES_REQUESTS  assets/labelled.ts:");
+    expect(context).toContain("every rebuild pays for every row again");
+    expect(context).not.toContain("\x1b[");
+  });
+
+  test("errors and warnings together: exit 2 with both on stderr, nothing on stdout", async () => {
+    const p = project({
+      "assets/enriched.ts": `import { transform } from "@zabaca/croft";\nexport default transform({ inputs: ["github_issue"], async *rows(ctx) { await ctx.http.get("https://example.com"); yield []; } });\n`,
+    });
+    const r = await hook(p, "assets/enriched.ts");
+    expect(r.exit).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toStartWith("croft validate --hook: 1 error, 1 warning after the edit to assets/enriched.ts\n");
+    expect(r.stderr).toContain("error UNKNOWN_TABLE");
+    expect(r.stderr).toContain("warn  TRANSFORM_MAKES_REQUESTS");
+  });
+
+  test("many warnings: the context stays under Claude Code's 10,000-character cap and says how many were left out", async () => {
+    const files: Record<string, string> = {};
+    const readers: string[] = [];
+    for (let i = 0; i < 60; i++) {
+      readers.push(`reader_${i}`);
+      files[`assets/reader_${i}.ts`] = `import { transform } from "@zabaca/croft";\nexport default transform({ inputs: ["open_issues"], key: "id", async *rows({ rows, http }) { for await (const r of rows("open_issues")) { await http.get("https://example.com/${"x".repeat(80)}"); yield { id: r.id }; } } });\n`;
+    }
+    const p = project(files);
+    const r = await hook(p, "assets/open_issues.sql");
+    expect(r.exit).toBe(0);
+    const context = JSON.parse(r.stdout).hookSpecificOutput.additionalContext as string;
+    expect(context.length).toBeLessThanOrEqual(10_000);
+    expect(context).toStartWith("croft validate --hook: 60 warnings after the edit to assets/open_issues.sql (also checked the assets that read it: ");
+    expect(context).toMatch(/\n\.\.\. and \d+ more warnings; croft validate lists them all\n/);
   });
 });
 
@@ -184,6 +246,62 @@ describe("croft validate --hook: problems go to Claude", () => {
     expect(r.stderr).toContain("error UNKNOWN_COLUMN  assets/open_issues.sql:1:12");
   });
 
+  test("paths are named from the folder Claude works in (the input's cwd): data/assets/x.sql from an app folder", async () => {
+    const p = project();
+    writeFiles(p.root, {
+      "assets/open_issues.sql": `SELECT id, titel, "user"->>'login' AS author FROM github_issues\n`,
+      "assets/enriched.ts": `import { transform } from "@zabaca/croft";\nexport default transform({ inputs: ["github_issue"], async *rows() { yield []; } });\n`,
+    });
+    const at = (cwd: string, file: string) => {
+      const stdin = JSON.parse(input(p, file));
+      return JSON.stringify({ ...stdin, cwd });
+    };
+    // Claude Code started in the folder above the project (an app whose croft project is data/).
+    const app = dirname(p.root);
+    const sub = basename(p.root);
+    const fromApp = await hook(p, "", { stdin: at(app, "assets/open_issues.sql") });
+    expect(fromApp.exit).toBe(2);
+    expect(fromApp.stderr).toStartWith(`croft validate --hook: 1 error after the edit to ${sub}/assets/open_issues.sql (also checked the assets that read it: by_author)\n`);
+    expect(fromApp.stderr).toContain(`error UNKNOWN_COLUMN  ${sub}/assets/open_issues.sql:1:12`);
+    const ts = await hook(p, "", { stdin: at(app, "assets/enriched.ts") });
+    expect(ts.stderr).toContain(`error UNKNOWN_TABLE  ${sub}/assets/enriched.ts:2`);
+    // Claude has moved into assets/: names relative to it.
+    const fromAssets = await hook(p, "", { stdin: at(join(p.root, "assets"), "assets/open_issues.sql") });
+    expect(fromAssets.stderr).toStartWith("croft validate --hook: 1 error after the edit to open_issues.sql (");
+    expect(fromAssets.stderr).toContain("error UNKNOWN_COLUMN  open_issues.sql:1:12");
+    // Claude works outside the project: absolute paths.
+    const elsewhere = join(dirname(app), "elsewhere-for-hook");
+    mkdirSync(elsewhere, { recursive: true });
+    const outside = await hook(p, "", { stdin: at(elsewhere, "assets/open_issues.sql") });
+    expect(outside.stderr).toContain(`error UNKNOWN_COLUMN  ${join(p.root, "assets/open_issues.sql")}:1:12`);
+    // --json keeps the envelope's project-relative paths.
+    const j = await hook(p, "", { stdin: at(app, "assets/open_issues.sql"), json: true });
+    expect(j.json.problems[0]).toMatchObject({ code: "UNKNOWN_COLUMN", file: "assets/open_issues.sql" });
+  });
+
+  test("from an app folder, paths inside a message are named the same way", async () => {
+    const p = project({
+      "lib/fmt.ts": "export const label = (s: string) => s.toUpperCase(;\n",
+      "assets/labelled.ts": `import { transform } from "@zabaca/croft";\nimport { label } from "../lib/fmt.ts";\nexport default transform({ inputs: ["github_issues"], async *rows() { yield { l: label("x") }; } });\n`,
+    });
+    const sub = basename(p.root);
+    const stdin = JSON.stringify({ ...JSON.parse(input(p, "lib/fmt.ts")), cwd: dirname(p.root) });
+    const r = await hook(p, "", { stdin });
+    expect(r.exit).toBe(2);
+    expect(r.stderr).toContain(`after the edit to ${sub}/lib/fmt.ts (checked the assets that import it: labelled)`);
+    expect(r.stderr).toContain(`error ASSET_INVALID  ${sub}/lib/fmt.ts:1:51`);
+    expect(r.stderr).toContain(`${sub}/assets/labelled.ts does not compile`);
+    expect(r.stderr).not.toMatch(/(^|[^/\w])assets\/labelled\.ts/m);
+  });
+
+  test("a warning's path, from an app folder, too", async () => {
+    const p = project();
+    const stdin = JSON.stringify({ ...JSON.parse(input(p, "assets/github_issues.ts")), cwd: dirname(p.root) });
+    const r = await hook(p, "", { stdin });
+    const context = JSON.parse(r.stdout).hookSpecificOutput.additionalContext as string;
+    expect(context).toStartWith(`croft validate --hook: 1 warning after the edit to ${basename(p.root)}/assets/github_issues.ts\n`);
+  });
+
   test("a broken croft.json is reported for an asset edit (Claude can fix it)", async () => {
     const p = project();
     writeFileSync(join(p.root, "croft.json"), `{"database": 3}`);
@@ -195,27 +313,52 @@ describe("croft validate --hook: problems go to Claude", () => {
   });
 });
 
-describe("croft validate --hook: usage", () => {
-  test("typed at a terminal: USAGE_ERROR pointing at croft validate, and stdin is never read", async () => {
+describe("croft validate --hook: usage, and croft's own failures", () => {
+  // Exit 2 is kept for findings about the edited assets: Claude Code feeds it to Claude after the edit. croft's
+  // own failures exit 1, which Claude Code shows the user as a non-blocking hook error.
+  test("typed at a terminal: USAGE_ERROR pointing at croft validate, exit 1, and stdin is never read", async () => {
     const p = project();
     const r = await hook(p, "assets/open_issues.sql", { stdinTTY: true });
-    expect(r.exit).toBe(2);
+    expect(r.exit).toBe(1);
     expect(r.reads).toBe(0);
-    expect(r.stderr).toContain("error USAGE_ERROR");
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toStartWith("error USAGE_ERROR  croft validate --hook is what Claude Code's PostToolUse hook runs");
     expect(r.stderr).toContain("croft validate");
   });
 
-  test("stdin that is not hook JSON, asset names, or --types alongside: USAGE_ERROR", async () => {
+  test("stdin that is not hook JSON, asset names, or --types alongside: USAGE_ERROR, exit 1", async () => {
     const p = project();
     const bad = await hook(p, "", { stdin: "hello", json: true });
-    expect(bad.exit).toBe(2);
+    expect(bad.exit).toBe(1);
+    expect(bad.json).toMatchObject({ ok: false, command: "validate" });
     expect(bad.json.problems[0]).toMatchObject({ code: "USAGE_ERROR", fix: { kind: "command", command: "croft validate" } });
+    const human = await hook(p, "", { stdin: "hello" });
+    expect([human.exit, human.stdout]).toEqual([1, ""]);
+    expect(human.stderr).toStartWith("error USAGE_ERROR  croft validate --hook reads the JSON Claude Code sends");
     const named = await hook(p, "assets/open_issues.sql", { args: ["open_issues"], json: true });
-    expect(named.exit).toBe(2);
+    expect(named.exit).toBe(1);
     expect(named.json.problems[0]).toMatchObject({ code: "USAGE_ERROR", fix: { kind: "command", command: "croft validate open_issues" } });
     const types = await hook(p, "assets/open_issues.sql", { args: ["--types"], json: true });
-    expect(types.exit).toBe(2);
+    expect(types.exit).toBe(1);
     expect(types.json.problems[0]).toMatchObject({ code: "USAGE_ERROR", fix: { kind: "command", command: "croft validate --types" } });
+  });
+
+  test("stdin still open after the time limit (a pipe nobody closes): USAGE_ERROR, exit 1, instead of waiting", async () => {
+    const p = project();
+    let limit = 0;
+    HOOK_IO.readStdin = async (ms: number) => { limit = ms; return null; };
+    const r = await cli(["validate", "--hook"], { cwd: p.root });
+    expect(limit).toBe(HOOK_IO.stdinTimeoutMs);
+    expect([r.exit, r.stdout]).toEqual([1, ""]);
+    expect(r.stderr).toStartWith("error USAGE_ERROR  croft validate --hook reads the JSON Claude Code sends a PostToolUse hook on stdin, and stdin was still open after 5 s");
+    expect(r.stderr).toContain("fix: croft validate");
+  });
+
+  test("outside a croft project, stdin that is not hook JSON is still a usage error, exit 1", async () => {
+    const p = project();
+    const r = await hook(p, "", { stdin: "hello", cwd: dirname(p.root) });
+    expect(r.exit).toBe(1);
+    expect(r.stderr).toContain("USAGE_ERROR");
   });
 });
 
@@ -253,5 +396,24 @@ describe("croft validate --hook: the real hook command", () => {
     expect(good).toEqual({ exit: 0, stdout: "", stderr: "" });
     const other = await sh(hookCommand(), { projectDir: p.root, cwd: PKG, stdin: input(p, "CLAUDE.md") });
     expect(other).toEqual({ exit: 0, stdout: "", stderr: "" });
+  }, 60_000);
+
+  test("stdin a pipe that never closes: the process gives up after 5 s and exits 1 (it does not wait for the pipe)", async () => {
+    const p = project();
+    linkBin(p.root);
+    const started = performance.now();
+    const proc = Bun.spawn([process.execPath, "--no-env-file", join(p.root, "node_modules", ".bin", "croft"), "validate", "--hook"], {
+      cwd: p.root, stdin: "pipe", stdout: "pipe", stderr: "pipe",
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", CROFT_FORBID_OS_JOBS: "1", CROFT_NOTIFY_DRY: "1" },
+    });
+    const killer = setTimeout(() => proc.kill(), 30_000);
+    const [stderr, exit] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    clearTimeout(killer);
+    const seconds = (performance.now() - started) / 1000;
+    proc.stdin.end();
+    expect(exit).toBe(1);
+    expect(stderr).toContain("stdin was still open after 5 s");
+    expect(seconds).toBeGreaterThanOrEqual(4.9);
+    expect(seconds).toBeLessThan(20);
   }, 60_000);
 });

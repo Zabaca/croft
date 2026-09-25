@@ -7,8 +7,8 @@ import type { Problem } from "../core/types.ts";
 import { docs } from "../cli/commands/docs.ts";
 import type { Ctx } from "../cli/command.ts";
 import {
-  HOOK_MATCHER, hookCommand, hookPlaces, hookProblems, hookReport, hookSelection, hookSettings, hookTarget, installHook,
-  mergeHookSettings, parseHookInput, SETTINGS_FILE,
+  HOOK_CONTEXT_MAX, HOOK_IO, HOOK_MATCHER, hookCommand, hookContext, hookOutput, hookPlaces, hookProblems, hookReport, hookSelection,
+  hookPaths, hookSettings, hookTarget, installHook, mergeHookSettings, parseHookInput, readAll, SETTINGS_FILE, showPaths,
 } from "./hook.ts";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "croft-hook-")));
@@ -32,9 +32,44 @@ const edit = (file_path: string, o: { cwd?: string; tool?: string } = {}) => JSO
 
 describe("the hook entry", () => {
   test("the project's pinned croft, started from the project folder (a data/ project from the app folder)", () => {
-    expect(hookCommand()).toBe(`cd "$CLAUDE_PROJECT_DIR" && ./node_modules/.bin/croft validate --hook`);
-    expect(hookCommand("data")).toBe(`cd "$CLAUDE_PROJECT_DIR"/data && ./node_modules/.bin/croft validate --hook`);
-    expect(hookCommand("my data")).toBe(`cd "$CLAUDE_PROJECT_DIR"/'my data' && ./node_modules/.bin/croft validate --hook`);
+    const guard = "test -x ./node_modules/.bin/croft || exit 0; ./node_modules/.bin/croft validate --hook";
+    expect(hookCommand()).toBe(`cd "$CLAUDE_PROJECT_DIR" && ${guard}`);
+    expect(hookCommand("data")).toBe(`cd "$CLAUDE_PROJECT_DIR"/data && ${guard}`);
+    expect(hookCommand("my data")).toBe(`cd "$CLAUDE_PROJECT_DIR"/'my data' && ${guard}`);
+  });
+
+  test("before bun install (no pinned croft), or with the project folder gone, the hook does nothing: exit 0, silent", async () => {
+    const app = fresh();
+    const project = join(app, "data");
+    mkdirSync(project);
+    for (const [dir, sub] of [[project, ""], [app, "data"], [app, "gone"]] as const) {
+      const proc = Bun.spawn(["sh", "-c", hookCommand(sub)], {
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", CLAUDE_PROJECT_DIR: dir }, cwd: fresh(),
+        stdin: new TextEncoder().encode(edit(join(project, "assets/x.sql"))), stdout: "pipe", stderr: "pipe",
+      });
+      const [stdout, exit] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+      expect({ sub, exit, stdout }).toEqual({ sub, exit: 0, stdout: "" });
+    }
+  });
+
+  test("no bun on the PATH Claude Code gives the hook (an app started from the Dock): exit 1, a one-line notice for the user, never 2", async () => {
+    const PATH = "/usr/bin:/bin";
+    if (Bun.which("bun", { PATH }) || Bun.which("node", { PATH })) return;       // a system-wide runtime
+    const project = fresh();
+    const bin = join(project, "node_modules", ".bin");
+    mkdirSync(bin, { recursive: true });
+    symlinkSync(join(import.meta.dir, "..", "..", "bin", "croft.mjs"), join(bin, "croft"));
+    const proc = Bun.spawn(["sh", "-c", hookCommand()], {
+      env: { PATH, CLAUDE_PROJECT_DIR: project }, cwd: project,
+      stdin: new TextEncoder().encode(edit(join(project, "README.md"))), stdout: "pipe", stderr: "pipe",
+    });
+    const [stdout, stderr, exit] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    expect(exit).toBe(1);
+    expect(stdout).toBe("");
+    // Claude Code shows the user the first line of stderr, prefixed with "Failed with non-blocking status code:".
+    const first = stderr.split("\n")[0]!;
+    expect(first).toStartWith("error NEEDS_BUN  croft validate --hook did not run: bun is not on the PATH");
+    expect(stderr).toContain("~/.bun/bin");
   });
 
   test("a PostToolUse group for Edit|Write|MultiEdit with one command handler", () => {
@@ -131,7 +166,8 @@ describe("mergeHookSettings", () => {
     expect(JSON.parse(empty.text)).toEqual(hookSettings());
     const bom = mergeHookSettings(`﻿{"model":"opus"}`);
     if (!bom.ok) throw new Error("refused");
-    expect(JSON.parse(bom.text)).toEqual({ model: "opus", ...hookSettings() });
+    expect(bom.text).toStartWith(`﻿{"model":"opus"`);                  // the mark is kept
+    expect(JSON.parse(bom.text.slice(1))).toEqual({ model: "opus", ...hookSettings() });
   });
 
   test("refused, with the reason, when the file is not settings croft can merge into", () => {
@@ -139,7 +175,87 @@ describe("mergeHookSettings", () => {
     expect(mergeHookSettings(`// comment\n{}`)).toMatchObject({ ok: false, reason: expect.stringContaining("not valid JSON") });
     expect(mergeHookSettings(`[]`)).toMatchObject({ ok: false, reason: expect.stringContaining("not a JSON object") });
     expect(mergeHookSettings(`{"hooks": []}`)).toMatchObject({ ok: false, reason: expect.stringContaining(`"hooks" is not an object`) });
+    expect(mergeHookSettings(`{"hooks": null}`)).toMatchObject({ ok: false, reason: expect.stringContaining(`"hooks" is not an object`) });
     expect(mergeHookSettings(`{"hooks": {"PostToolUse": {}}}`)).toMatchObject({ ok: false, reason: expect.stringContaining(`"hooks.PostToolUse" is not a list`) });
+  });
+
+  // R51-04: the user's settings.json is usually committed and shared, so adding the hook changes nothing else in
+  // it, byte for byte: line endings, indentation, compact arrays, number spelling, escapes, key order.
+  /** `after` is `before` with one run of text inserted: what was inserted, or null when anything else changed. */
+  const insertion = (before: string, after: string): string | null => {
+    let p = 0;
+    while (p < before.length && before[p] === after[p]) p++;
+    const s = before.length - p;
+    return after.length >= before.length && after.slice(after.length - s) === before.slice(p) ? after.slice(p, after.length - s) : null;
+  };
+  const merged = (before: string): string => {
+    const r = mergeHookSettings(before);
+    if (!r.ok) throw new Error(`refused: ${r.reason}`);
+    expect(r.action).toBe("merged");
+    return r.text;
+  };
+
+  test("a hand-formatted file with CRLF, compact arrays and 1.50: only the hook is inserted, in the file's style", () => {
+    const before = `{\r\n    "permissions": { "allow": ["Bash(npm test)", "Read(./src/**)"], "deny": ["Read(./.env)"] },\r\n    "env": { "RATIO": 1.50 }\r\n}\r\n`;
+    const after = merged(before);
+    const added = insertion(before, after);
+    expect(added).not.toBeNull();
+    expect(after.replace(/\r\n/g, "")).not.toContain("\n");                // every line still ends in CRLF
+    expect(after).toContain(`"env": { "RATIO": 1.50 },\r\n    "hooks": {\r\n        "PostToolUse": [\r\n            {\r\n                "matcher": "Edit|Write|MultiEdit",`);
+    expect(after).toEndWith(`            }\r\n        ]\r\n    }\r\n}\r\n`);
+    expect(JSON.parse(after)).toEqual({
+      permissions: { allow: ["Bash(npm test)", "Read(./src/**)"], deny: ["Read(./.env)"] }, env: { RATIO: 1.5 }, ...hookSettings(),
+    });
+  });
+
+  test("big integers, \\u escapes and a key written twice outside hooks stay as written", () => {
+    for (const before of [
+      `{\n  "cleanupPeriodDays": 12345678901234567890\n}\n`,
+      `{\n  "env": {"PATH_SEP": "\\u002F", "X": "\\ud83d\\ude00"}\n}\n`,
+      `{\n  "env": {"A": "1"},\n  "env": {"B": "2"}\n}\n`,
+    ]) {
+      const after = merged(before);
+      expect(insertion(before, after), before).toStartWith(",\n  \"hooks\": {\n    \"PostToolUse\": [");
+    }
+  });
+
+  test("into hooks the file already has: a PostToolUse list gains the group, a hooks object gains PostToolUse", () => {
+    const list = `{\n  "hooks": {\n    "PostToolUse": [\n      {"matcher": "Write", "hooks": [{"type": "command", "command": "prettier --write"}]}\n    ]\n  },\n  "model": "opus"\n}\n`;
+    const a = merged(list);
+    expect(insertion(list, a)).toBe(`,\n      {\n        "matcher": "Edit|Write|MultiEdit",\n        "hooks": [\n          {\n            "type": "command",\n            "command": ${JSON.stringify(hookCommand())},\n            "timeout": 120\n          }\n        ]\n      }`);
+    expect(Object.keys(JSON.parse(a))).toEqual(["hooks", "model"]);
+    const noGroup = `{"hooks": {"PostToolUse": [{"matcher": "Edit"}]}}`;
+    expect(JSON.parse(merged(noGroup)).hooks.PostToolUse).toEqual([{ matcher: "Edit" }, hookSettings().hooks.PostToolUse[0]]);
+    const other = `{\n\t"hooks": {\n\t\t"Stop": []\n\t}\n}`;
+    const b = merged(other);
+    expect(insertion(other, b)).toStartWith(`,\n\t\t"PostToolUse": [\n\t\t\t{\n\t\t\t\t"matcher"`);
+    const empty = `{\n  "hooks": {\n    "PostToolUse": []\n  }\n}\n`;
+    const c = merged(empty);
+    expect(c).toStartWith(`{\n  "hooks": {\n    "PostToolUse": [\n      {\n        "matcher": "Edit|Write|MultiEdit",`);
+    expect(c).toEndWith(`      }\n    ]\n  }\n}\n`);
+    expect(JSON.parse(c)).toEqual(hookSettings());
+  });
+
+  test("a one-line file stays on one line; {} becomes the hook, indented", () => {
+    const one = `{"model":"opus","permissions":{"allow":[]}}`;
+    const a = merged(one);
+    expect(a).not.toContain("\n");
+    expect(insertion(one, a)).toBe(`,"hooks":${JSON.stringify(hookSettings().hooks)}`);
+    const spaced = `{"model": "opus", "hooks": {"PostToolUse": [{"matcher": "Edit"}]}}`;
+    expect(insertion(spaced, merged(spaced))).toBe(`, {"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command", "command": ${JSON.stringify(hookCommand())}, "timeout": 120}]}`);
+    expect(merged(`{"hooks":{}}`)).toBe(`{"hooks":{"PostToolUse":[${JSON.stringify(hookSettings().hooks.PostToolUse[0])}]}}`);
+    expect(merged(`{}\n`)).toBe(`${JSON.stringify(hookSettings(), null, 2)}\n`);
+    expect(merged(`{\r\n}`)).toBe(JSON.stringify(hookSettings(), null, 2).replace(/\n/g, "\r\n"));
+  });
+
+  test("hooks or hooks.PostToolUse written twice: refused, since croft cannot tell which one Claude Code reads", () => {
+    expect(mergeHookSettings(`{"hooks": {}, "hooks": {"Stop": []}}`)).toMatchObject({ ok: false, reason: expect.stringContaining(`"hooks" is written twice`) });
+    expect(mergeHookSettings(`{"hooks": {"PostToolUse": [], "PostToolUse": []}}`)).toMatchObject({ ok: false, reason: expect.stringContaining(`"hooks.PostToolUse" is written twice`) });
+  });
+
+  test("disableAllHooks: the hook is added, and the note says Claude Code will not run it", () => {
+    const r = mergeHookSettings(`{\n  "disableAllHooks": true\n}\n`);
+    expect(r).toMatchObject({ ok: true, action: "merged", note: expect.stringContaining(`"disableAllHooks" is true`) });
   });
 });
 
@@ -185,6 +301,36 @@ describe("installHook", () => {
     expect(p.hint).toContain("croft init --claude --with-hook");
     expect(p.fix!.description).toContain(JSON.stringify(hookSettings()));
   });
+
+  test("a file croft cannot change by one insertion (hooks written twice) is left byte for byte; the fix is the snippet", () => {
+    const root = fresh();
+    mkdirSync(join(root, ".claude"));
+    const text = `{\r\n  "hooks": {},\r\n  "hooks": {"Stop": []}\r\n}\r\n`;
+    writeFileSync(join(root, SETTINGS_FILE), text);
+    const r = installHook(root, root);
+    expect(r.files).toEqual([{ path: SETTINGS_FILE, action: "skipped", note: expect.stringContaining(`"hooks" is written twice`) }]);
+    expect(readFileSync(join(root, SETTINGS_FILE), "utf8")).toBe(text);
+    const p = r.problems[0]!;
+    expect(p.message).toStartWith(`${SETTINGS_FILE}: "hooks" is written twice in it, so croft left it as it was`);
+    expect(p.hint).not.toContain("strict JSON");
+    expect(p.fix).toEqual({ kind: "manual", description: `add this to ${SETTINGS_FILE} by hand, merged into "hooks" and "hooks.PostToolUse" where the file has them: ${JSON.stringify(hookSettings())}` });
+  });
+
+  test("an app's hand-formatted settings (CRLF, compact arrays, 1.50) gain the hook and nothing else changes", () => {
+    const app = fresh();
+    const root = join(app, "data");
+    mkdirSync(join(app, ".claude"), { recursive: true });
+    mkdirSync(root);
+    const text = `{\r\n    "permissions": { "allow": ["Bash(npm test)", "Read(./src/**)"], "deny": ["Read(./.env)"] },\r\n    "env": { "RATIO": 1.50 }\r\n}\r\n`;
+    writeFileSync(join(app, SETTINGS_FILE), text);
+    installHook(root, app);
+    const after = readFileSync(join(app, SETTINGS_FILE), "utf8");
+    const cut = text.indexOf("\r\n}\r\n");
+    expect(after.slice(0, cut)).toBe(text.slice(0, cut));
+    expect(after).toEndWith(text.slice(cut));
+    expect(after.slice(cut)).toStartWith(`,\r\n    "hooks": {\r\n        "PostToolUse": [`);
+    expect(JSON.parse(after).hooks).toEqual(hookSettings("data").hooks);
+  });
 });
 
 describe("hookTarget", () => {
@@ -223,11 +369,58 @@ describe("hookTarget", () => {
     expect(hookTarget(edit(join(link, "assets/new_one.sql")), root)).toBe("assets/new_one.sql");
   });
 
+  test("hookPaths: files named from where Claude works (the input's cwd); showPaths renames a problem's files", () => {
+    const app = fresh();
+    const root = join(app, "data");
+    mkdirSync(join(root, "assets"), { recursive: true });
+    expect(hookPaths(root, root)("assets/x.sql")).toBe("assets/x.sql");
+    expect(hookPaths(root, app)("assets/x.sql")).toBe("data/assets/x.sql");
+    expect(hookPaths(root, join(root, "assets"))("assets/x.sql")).toBe("x.sql");
+    expect(hookPaths(root, join(root, "assets"))("lib/fmt.ts")).toBe("../lib/fmt.ts");
+    expect(hookPaths(root, fresh())("assets/x.sql")).toBe(join(root, "assets", "x.sql"));
+    expect(hookPaths(root, undefined)("assets/x.sql")).toBe("assets/x.sql");
+    expect(hookPaths(root, "relative/cwd")("assets/x.sql")).toBe("assets/x.sql");
+    // A symlinked spelling of the same folders (macOS: /var is /private/var).
+    const link = join(fresh(), "link");
+    symlinkSync(app, link);
+    expect(hookPaths(root, link)("assets/x.sql")).toBe("data/assets/x.sql");
+
+    const p = { severity: "error" as const, code: "UNKNOWN_COLUMN", message: "m", hint: "h", docs: "d", file: "assets/x.sql", line: 2,
+      fix: { kind: "edit" as const, description: "d", file: "assets/y.sql" } };
+    expect(showPaths([p, { ...p, file: undefined, fix: undefined }], hookPaths(root, app))).toEqual([
+      { ...p, file: "data/assets/x.sql", fix: { ...p.fix, file: "data/assets/y.sql" } },
+      { ...p, file: undefined, fix: undefined },
+    ]);
+    // Paths in the first line of a message, the hint and a fix's description; quoted code after it stays.
+    const said = {
+      ...p, message: "assets/b.ts does not compile: Unexpected ; at lib/fmt.ts:1:5.\n  const f = \"assets/x.csv\";",
+      hint: "see lib/fmt.ts, not ../lib/fmt.ts or assets/", fix: { kind: "manual" as const, description: "fix lib/fmt.ts:1:5" },
+    };
+    expect(showPaths([said], hookPaths(root, app))[0]).toMatchObject({
+      message: "data/assets/b.ts does not compile: Unexpected ; at data/lib/fmt.ts:1:5.\n  const f = \"assets/x.csv\";",
+      hint: "see data/lib/fmt.ts, not ../lib/fmt.ts or assets/", fix: { kind: "manual", description: "fix data/lib/fmt.ts:1:5" },
+    });
+  });
+
   test("input without a file path (another tool or event) is nothing to check", () => {
     const root = project();
     expect(hookTarget(JSON.stringify({ hook_event_name: "Stop" }), root)).toBeNull();
     expect(hookTarget(JSON.stringify({ tool_name: "Bash", tool_input: { command: "ls" } }), root)).toBeNull();
     expect(parseHookInput(JSON.stringify({ tool_response: { filePath: "/x/assets/a.sql" } })).file).toBe("/x/assets/a.sql");
+  });
+
+  test("readAll: all of a stream that closes; null, promptly, for one still open at the deadline", async () => {
+    const bytes = new TextEncoder().encode(edit("/p/assets/é.sql"));
+    const split = bytes.indexOf(0xc3) + 1;                                   // inside the two bytes of "é"
+    const closed = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(bytes.slice(0, split)); c.enqueue(bytes.slice(split)); c.close(); } });
+    expect(await readAll(closed, 1000)).toBe(edit("/p/assets/é.sql"));
+    let canceled = false;
+    const open = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(bytes.slice(0, 5)); }, cancel() { canceled = true; } });
+    const t0 = performance.now();
+    expect(await readAll(open, 50)).toBeNull();
+    expect(performance.now() - t0).toBeLessThan(1000);
+    expect(canceled).toBe(true);                                             // the read is given up, so the process can exit
+    expect(HOOK_IO.stdinTimeoutMs).toBe(5000);
   });
 
   test("stdin that is not a hook's JSON is USAGE_ERROR, with a hint and a fix", () => {
@@ -292,6 +485,29 @@ describe("what an edit affects, and what Claude reads", () => {
       .toStartWith("croft validate --hook: 1 error after the edit to lib/money.ts (checked the assets that import it: weekly)\n");
     expect(hookReport({ target: "assets/Bad.sql", asset: null, selected: [], problems: two.slice(0, 1), formatted: "x" }))
       .toStartWith("croft validate --hook: 1 error after the edit to assets/Bad.sql\n");
+  });
+
+  test("hookContext and hookOutput: warnings for Claude as PostToolUse additionalContext, under Claude Code's cap", () => {
+    const warn = (code: string) => p({ severity: "warning", code });
+    const one = hookContext({ target: "assets/paid.ts", asset: "paid", selected: ["paid"], problems: [warn("TRANSFORM_MAKES_REQUESTS")], formatted: ["<w1>"] });
+    expect(one.split("\n")).toEqual([
+      "croft validate --hook: 1 warning after the edit to assets/paid.ts",
+      "<w1>",
+      "A warning does not stop the edit or croft run; it says what the asset will cost or risk as written.",
+    ]);
+    expect(JSON.parse(hookOutput(one))).toEqual({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: one } });
+    expect(hookOutput(one)).not.toContain("\n");
+
+    const many = Array.from({ length: 50 }, (_, i) => warn(`W${i}`));
+    const formatted = many.map((_, i) => `warn  W${i}  ${"x".repeat(400)}`);
+    const text = hookContext({ target: "assets/orders.sql", asset: "orders", selected: ["orders", "daily"], problems: many, formatted });
+    expect(text.length).toBeLessThanOrEqual(HOOK_CONTEXT_MAX);
+    const lines = text.split("\n");
+    expect(lines[0]).toBe("croft validate --hook: 50 warnings after the edit to assets/orders.sql (also checked the assets that read it: daily)");
+    const shown = lines.filter((l) => l.startsWith("warn  ")).length;
+    expect(shown).toBeGreaterThan(10);
+    expect(lines.at(-2)).toBe(`... and ${50 - shown} more warnings; croft validate lists them all`);
+    expect(lines.at(-1)).toBe("Warnings do not stop the edit or croft run; each says what its asset will cost or risk as written.");
   });
 });
 
