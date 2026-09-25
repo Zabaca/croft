@@ -273,6 +273,8 @@ function jsonPage(): string {
     "- Every value found in .env is replaced with [redacted:NAME] in messages. In data (query rows) only declared",
     "  secrets and credential-looking values are replaced, and data then carries redactedValues: true.",
     "- Outside a project, database is \"\" and timezone is this machine's zone.",
+    "- JSON Schemas (draft 2020-12) of every command's envelope ship with croft, in",
+    "  node_modules/@zabaca/croft/schemas/: <command>.schema.json, and envelope.schema.json for any command.",
   ].join("\n");
 }
 

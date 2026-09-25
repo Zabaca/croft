@@ -271,16 +271,19 @@ JOIN (PIVOT refunds ON order_id) AS r ON true`);
 
   describe("SQL_READS_FILES", () => {
     test("a path in FROM, a file function, a list of files, a glob", async () => {
-      for (const [sql, files] of [
-        ["SELECT * FROM 'files/sales.csv'", ["files/sales.csv"]],
-        ["SELECT * FROM read_parquet('files/sales/*.parquet')", ["files/sales/*.parquet"]],
-        ["SELECT * FROM read_csv(['files/a.csv', 'files/b.csv'], header := true)", ["files/a.csv", "files/b.csv"]],
-        ["SELECT count(*) FROM glob('files/*')", ["files/*"]],
-        ["SELECT * FROM read_json(getvariable('x'))", []],
+      for (const [sql, files, ingest] of [
+        ["SELECT * FROM 'files/sales.csv'", ["files/sales.csv"], "sales"],
+        ["SELECT * FROM read_parquet('files/sales/*.parquet')", ["files/sales/*.parquet"], "sales"],
+        ["SELECT * FROM read_csv(['files/a.csv', 'files/b.csv'], header := true)", ["files/a.csv", "files/b.csv"], "a"],
+        ["SELECT count(*) FROM glob('files/*')", ["files/*"], "files"],
+        ["SELECT * FROM read_json(getvariable('x'))", [], "asset"],
       ] as const) {
         const p = only(await load(`-- key: id\n${sql}`), "SQL_READS_FILES");
         expect([sql, p.details?.files]).toEqual([sql, files]);
-        expect(p.fix).toEqual({ kind: "command", description: "read how to make a file ingest, then read its table by name", command: "croft docs ingest" });
+        expect(p.fix).toEqual({
+          kind: "command", description: "write a file ingest for the file, point its file: at it, then read its table by name", command: `croft new file ${ingest}`,
+        });
+        expect(p.hint).toBe(`load the file with a file ingest (croft new file ${ingest} writes one; point its file: at the file), then read its table by name`);
         expect(p.line).toBe(2);
       }
     });

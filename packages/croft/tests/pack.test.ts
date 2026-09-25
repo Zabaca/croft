@@ -66,7 +66,8 @@ test.skipIf(!NPM)("npm pack from a clean checkout ships bin, the schema and the 
   const report = JSON.parse(r.stdout.slice(at)) as { files: { path: string }[] }[];
   const files = report[0]!.files.map((f) => f.path);
 
-  for (const f of ["package.json", "bin/croft.mjs", "croft.schema.json", "dist/read.js", "dist/read.d.ts", "src/index.ts", "src/cli/main.ts"]) {
+  for (const f of ["package.json", "bin/croft.mjs", "croft.schema.json", "dist/read.js", "dist/read.d.ts", "src/index.ts", "src/cli/main.ts",
+    "src/cli/schemas.ts", "schemas/envelope.schema.json", "schemas/run.schema.json", "schemas/status.schema.json"]) {
     expect(files, f).toContain(f);
   }
   // Direct mode is a chunk read.js imports on first use; it ships too.

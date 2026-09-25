@@ -17,6 +17,7 @@
     "eval": "bun evals/run.ts",
     "build": "bun scripts/build-read.ts",
     "build:read": "bun scripts/build-read.ts",
+    "build:schemas": "bun scripts/build-schemas.ts",
     "prepack": "bun scripts/build-read.ts"
   },
   "dependencies": {

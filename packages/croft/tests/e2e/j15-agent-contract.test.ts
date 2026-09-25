@@ -100,7 +100,7 @@ describe("the agent contract", () => {
     p.remove("assets/example_sales.ts");
     const empty = await p.json(["run"]);
     expect(empty.code, show(empty)).toBe(0);
-    expect(empty.json.next).toEqual([{ command: "croft docs ingest", reason: "assets/ has no assets yet; start from a template" }]);
+    expect(empty.json.next).toEqual([{ command: "croft new --list", reason: "assets/ has no assets yet; start from a template" }]);
     expect((await p.json(["docs", "ingest"])).code).toBe(0);
   }, 60_000);
 });

@@ -321,7 +321,7 @@ export const run: CommandImpl<RunData | DryRunData> = {
       });
       if (confirmToken !== undefined) settleConfirmation(ctx, confirmToken, out);
       // Nothing due is not an empty project: the template hint of an empty run does not apply.
-      if (due && out.data.steps.length === 0) out.next = out.next.filter((n) => n.command !== "croft docs ingest");
+      if (due && out.data.steps.length === 0) out.next = out.next.filter((n) => n.command !== "croft new --list");
       return toResult(out);
     } finally {
       process.off("SIGINT", onSignal);

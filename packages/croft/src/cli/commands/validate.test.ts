@@ -439,7 +439,7 @@ describe("croft validate (the command)", () => {
     const r = await cli(["validate", "--json"], { cwd: p.root });
     expect(r.exit).toBe(0);
     expect(r.json.data).toEqual({ order: [], assets: [] });
-    expect(r.json.next).toEqual([{ command: "croft docs ingest", reason: "assets/ has no assets yet; start from a template" }]);
+    expect(r.json.next).toEqual([{ command: "croft new --list", reason: "assets/ has no assets yet; start from a template" }]);
   });
 
   test("human output: checked N assets, each problem with its fix or next step, then the counts (§4.2)", async () => {

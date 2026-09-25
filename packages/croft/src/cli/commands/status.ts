@@ -859,7 +859,7 @@ export function formatStatus(d: StatusData, now: Date, o: { tz?: string; problem
   const stale = o.problems?.find((p) => p.code === "SCHEDULER_STALE");
   const tail = [...(stale ? logTailLines(stale) : []), ...readCopyLines(d, now, tz, o)];
   if (d.assets.length === 0) {
-    return ["No assets yet: add one to assets/ (croft docs ingest has templates), then croft run <asset>.", schedulingLine(d, now, tz), ...tail].join("\n");
+    return ["No assets yet: add one to assets/ (croft new --list has templates), then croft run <asset>.", schedulingLine(d, now, tz), ...tail].join("\n");
   }
   const renamed = renamedRows(o.problems);
   const config = configRows(o.problems);

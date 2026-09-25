@@ -573,7 +573,7 @@ export function selectAssets(names: readonly string[], selectors: readonly strin
         if (broken[0]) throw discoveryError(broken[0]);
         throw new CroftError("USAGE_ERROR", {
           message: `no asset matches ${JSON.stringify(sel)}`,
-          hint: names.length ? `assets are named after their files in assets/: ${names.slice(0, 20).join(", ")}` : "assets/ has no assets yet; croft docs ingest shows templates",
+          hint: names.length ? `assets are named after their files in assets/: ${names.slice(0, 20).join(", ")}` : "assets/ has no assets yet; croft new --list shows templates",
           details: { selector: sel },
         });
       }
@@ -587,7 +587,7 @@ export function selectAssets(names: readonly string[], selectors: readonly strin
       const command = o.retry ? o.retry(fixed) : ["croft run", ...selectorWords(fixed)].join(" ");
       throw new CroftError("USAGE_ERROR", {
         message: `there is no asset named ${JSON.stringify(sel)}`,
-        hint: guess ? `did you mean ${guess}?` : names.length ? `assets are named after their files in assets/: ${names.slice(0, 20).join(", ")}` : "assets/ has no assets yet; croft docs ingest shows templates",
+        hint: guess ? `did you mean ${guess}?` : names.length ? `assets are named after their files in assets/: ${names.slice(0, 20).join(", ")}` : "assets/ has no assets yet; croft new --list shows templates",
         ...(guess ? { fix: { kind: "command" as const, description: `the same command with ${guess}`, command } } : {}),
         details: { selector: sel, ...(guess ? { suggestion: guess } : {}) },
       });

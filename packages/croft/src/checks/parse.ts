@@ -164,7 +164,7 @@ export async function vetCheck(serialize: (sql: string) => Promise<string>, asse
     if (u.kind === "relation") {
       // A path in FROM, or a table macro's table given as a path: DuckDB reads the file (a replacement scan).
       if (looksLikePath(u.name)) {
-        return bad(`reads the file ${u.name}; a check reads tables only`, "load the file with a file ingest (croft docs ingest), then name its table");
+        return bad(`reads the file ${u.name}; a check reads tables only`, "load the file with a file ingest (croft new file <name>), then name its table");
       }
       // croft's own state, another catalog, information_schema: nothing croft tracks, so no ordering either.
       if (u.catalog !== "" || (u.schema !== "" && asciiLower(u.schema) !== "main")) {

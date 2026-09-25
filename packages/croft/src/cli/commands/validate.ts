@@ -148,7 +148,7 @@ export function nextSteps(r: ValidateReport): Next[] {
   const fixable = r.problems.some((p) => p.severity === "error" || (p.severity === "warning" && !(p.fix && "requiresHuman" in p.fix && p.fix.requiresHuman)));
   // A check with --types is re-checked with it: only tsc confirms a type error's fix.
   if (fixable) return [{ command: r.data.types ? "croft validate --types" : "croft validate", reason: "re-check after the edit" }];
-  if (r.data.order.length === 0) return [{ command: "croft docs ingest", reason: "assets/ has no assets yet; start from a template" }];
+  if (r.data.order.length === 0) return [{ command: "croft new --list", reason: "assets/ has no assets yet; start from a template" }];
   const changed = r.data.assets.filter((a) => a.codeChanged).map((a) => a.name).slice(0, PREVIEW_NEXT);
   if (changed.length) return [{ command: `croft preview ${changed.join(" ")}`, reason: "see what the changed code builds before running it" }];
   return [];

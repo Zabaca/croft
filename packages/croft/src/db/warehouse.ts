@@ -171,7 +171,9 @@ export class LeaseSql implements Sql {
   }
 }
 
-interface Described { holder: LockHolder; croft: boolean }
+/** `known`: whether the holder was identified at all. A process whose command line could not be read (ps failing on
+ *  a loaded machine) is not known to be foreign, so the write intent is never withdrawn on that guess. */
+interface Described { holder: LockHolder; croft: boolean; known: boolean }
 
 /** `p`, or a rejection as soon as `signal` aborts (p keeps running; its outcome is then ignored). */
 function untilAborted<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -426,7 +428,7 @@ export class DuckWarehouse implements Warehouse {
           this.dropIntent();
           throw e;
         }
-        const { holder, croft } = await this.describeCached(conflict, seen);
+        const { holder, croft, known } = await this.describeCached(conflict, seen);
         this.waitingOn = holder;
         const now = Date.now();
         if (this.intentHeld) {
@@ -434,7 +436,7 @@ export class DuckWarehouse implements Warehouse {
             foreignPid = null;
             if (withdrawnAt !== null) intents.resume(this.stateDir);
             withdrawnAt = null;
-          } else {
+          } else if (known) {
             if (foreignPid !== holder.pid) {
               foreignPid = holder.pid;
               foreignSince = now;
@@ -523,14 +525,15 @@ export class DuckWarehouse implements Warehouse {
 
   private async describe(c: LockConflict): Promise<Described> {
     const pid = c.pid;
-    if (pid === null) return { holder: { pid: null, program: c.program }, croft: false };
+    if (pid === null) return { holder: { pid: null, program: c.program }, croft: false, known: true };
     const intent = intents.liveIntents(this.stateDir).find((i) => i.pid === pid);
     const base: LockHolder = intent
       ? { pid, program: "croft", runId: intent.runId ?? undefined, action: "write", since: intent.since }
       : { pid, program: c.program };
     let croft = Boolean(intent);
+    const cmd = croft ? "" : commandLine(pid);
     // croft serve holds the file in its query worker, a child process (serve/worker.ts), not under its own pid.
-    if (!croft && (servePid(this.stateDir) === pid || isServeWorker(pid))) {
+    if (!croft && (servePid(this.stateDir) === pid || isServeWorkerCommand(cmd))) {
       base.program = "croft's read server";
       croft = true;
     }
@@ -539,11 +542,11 @@ export class DuckWarehouse implements Warehouse {
       Object.assign(base, extra);
       croft = true;
     }
-    if (!croft && isCroftCommand(pid)) {
+    if (!croft && isCroftCommandLine(cmd)) {
       base.program = "croft";
       croft = true;
     }
-    return { holder: base, croft };
+    return { holder: base, croft, known: croft || cmd !== "" };
   }
 
   private busyError(holder: LockHolder, croft: boolean, waitedMs: number, kind: "read" | "write"): CroftError {
@@ -585,12 +588,20 @@ function servePid(stateDir: string): number | null {
 
 /** Whether a PID runs croft: the bin (`croft …`), the package (`@zabaca/croft`) or its source tree. */
 export function isCroftCommand(pid: number): boolean {
-  return /(^|[\/\s])croft(\s|$)|@zabaca\/croft|\/croft\/src\//.test(commandLine(pid));
+  return isCroftCommandLine(commandLine(pid));
+}
+
+function isCroftCommandLine(cmd: string): boolean {
+  return /(^|[\/\s])croft(\s|$)|@zabaca\/croft|\/croft\/src\//.test(cmd);
 }
 
 /** Whether a PID is croft serve's query worker (serve/worker.ts), which holds the warehouse for the server. */
 export function isServeWorker(pid: number): boolean {
-  return /[\/\\]serve[\/\\]worker\.ts(\s|$)/.test(commandLine(pid));
+  return isServeWorkerCommand(commandLine(pid));
+}
+
+function isServeWorkerCommand(cmd: string): boolean {
+  return /[\/\\]serve[\/\\]worker\.ts(\s|$)/.test(cmd);
 }
 
 /** A process's command line: /proc on Linux (minimal containers ship no `ps`), `ps` elsewhere. */

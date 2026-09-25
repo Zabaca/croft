@@ -294,7 +294,7 @@ function notBuiltYet(e: unknown, project: Project, configs: readonly AssetConfig
     message: `no table named ${table}: ${why} yet, so there are no tables`,
     hint: guess ? `did you mean ${guess}? build it first: croft run ${guess}`
       : names.length ? `the assets are ${names.join(", ")}; build one with croft run <asset>`
-      : "files under files/ can be queried already; croft docs ingest shows how to make an asset",
+      : "files under files/ can be queried already; croft new --list shows how to make an asset",
     ...(guess ? { fix: { kind: "command" as const, description: `build ${guess}`, command: `croft run ${guess}` } } : {}),
     details: { ...e.problem.details, table, ...(guess ? { suggestion: guess } : {}) },
   });

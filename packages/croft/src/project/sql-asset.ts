@@ -24,7 +24,7 @@ import {
   asciiLower, type AstNode, catalogPrefixes, collect, finiteJson, looksLikePath, relationNames, stringOf, volatileUses, walk,
 } from "../sql/ast.ts";
 import { assertOneSelect, lineColumn, type SelectAst, TABLE_FUNCTIONS } from "../sql/gate.ts";
-import type { DiscoveredAsset } from "./discover.ts";
+import { type DiscoveredAsset, suggestName } from "./discover.ts";
 import { didYouMean } from "./suggest.ts";
 
 /** The header: the run of `-- name: value` comment lines at the top of the file (§3c). */
@@ -578,17 +578,27 @@ function literalStrings(n: AstNode | undefined): string[] {
 
 function readsFilesProblem(f: FileRead, asset: string, assetNames: readonly string[], at: Locator): Problem {
   const base = f.paths.map((p) => p.split(/[\\/]/).pop()!.replace(/\..*$/, "").toLowerCase()).find((b) => assetNames.includes(b));
+  const ingest = `croft new file ${fileIngestName(f.paths)}`;
   return problem("SQL_READS_FILES", {
     message: `${asset} reads ${f.shown} directly; croft cannot tell when a file changed, so the table would go stale`,
     hint: base
       ? `read the table instead: FROM ${base}`
-      : "load the file with a file ingest (croft docs ingest shows how), then read its table by name",
+      : `load the file with a file ingest (${ingest} writes one; point its file: at the file), then read its table by name`,
     ...at.at(f.at),
     fix: base
       ? { kind: "edit", description: `read the table ${base} instead of ${f.shown}`, file: at.file, ...lineOf(at.at(f.at)) }
-      : { kind: "command", description: "read how to make a file ingest, then read its table by name", command: "croft docs ingest" },
+      : { kind: "command", description: "write a file ingest for the file, point its file: at it, then read its table by name", command: ingest },
     details: { files: f.paths },
   });
+}
+
+/** A name for the file ingest of `paths`: the first file's name, or its folder's for a glob ("files/sales/*.csv" →
+ *  sales), made a valid asset name. */
+function fileIngestName(paths: readonly string[]): string {
+  const parts = (paths[0] ?? "").split(/[\\/]/).filter(Boolean);
+  let last = parts.pop() ?? "";
+  if (/[*?[{]/.test(last)) last = parts.pop() ?? "";
+  return suggestName(last.replace(/\..*$/, ""));
 }
 
 /** The DESCRIBE, SUMMARIZE or SHOW in the statement (a SHOW_REF node, which has no position), or null. */

@@ -506,7 +506,7 @@ function nextSteps(steps: StepResult[], problems: Problem[], deferred: ReadonlyM
   }
   const ok = steps.find((s) => s.status === "ok" && s.rows.total > 0);
   if (ok && next.length === 0) next.push({ command: `croft query "from ${ok.asset} limit 5"`, reason: `look at ${ok.asset}` });
-  if (steps.length === 0 && problems.length === 0) next.push({ command: "croft docs ingest", reason: "assets/ has no assets yet; start from a template" });
+  if (steps.length === 0 && problems.length === 0) next.push({ command: "croft new --list", reason: "assets/ has no assets yet; start from a template" });
   return next;
 }
 
