@@ -5,6 +5,7 @@ import { closeAllWarehouses } from "../../db/warehouse.ts";
 import { type CatalogAsset, getCatalog, putCatalog } from "../../history/catalog.ts";
 import { listLeases, tryAcquire } from "../../history/leases.ts";
 import { cliEnv, cli as spawnCli } from "../../run/testkit.ts";
+import { deletedByCroft } from "../../safety/delete.ts";
 import { listTrash, versionNote } from "../../safety/trash.ts";
 import { deleteCommand, MAINTAIN_WAITS, prompter } from "./delete.ts";
 import { cleanup, cli, DEAD, makeProject, runsDb, seed, STATE, type TestProject, writeFiles } from "./inspect-testkit.ts";
@@ -261,6 +262,12 @@ describe("croft delete: the scheduler, readers and tokens (R41-06, R41-11)", () 
     db = runsDb(p.stateDir);
     try {
       expect(db.approvedCode("orders")).toBeNull();
+      expect(deletedByCroft(db, "orders")).toBe(true);
+      // A scheduled run that skipped it (held) does not make it look built.
+      const run = db.createRun({ trigger: "schedule", human: false, argv: ["run", "--due"], timeZone: "UTC" });
+      db.startStep({ runId: run.id, asset: "orders", attempt: 0, reason: "fired at 12:00" });
+      db.finishStep(run.id, "orders", 0, { status: "skipped", reason: "held" });
+      expect(deletedByCroft(db, "orders")).toBe(true);
       const [v] = listTrash(p.stateDir, "orders");
       expect(versionNote(v!.path, "approvedCodeHash")).toBe("hash-1");
     } finally {
@@ -271,6 +278,7 @@ describe("croft delete: the scheduler, readers and tokens (R41-06, R41-11)", () 
     db = runsDb(p.stateDir);
     try {
       expect(db.approvedCode("orders")).toBe("hash-1");
+      expect(deletedByCroft(db, "orders")).toBe(false);
     } finally {
       db.close();
     }
