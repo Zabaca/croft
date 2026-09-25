@@ -225,6 +225,17 @@ describe("croft validate --hook: usage, and croft's own failures", () => {
     expect(types.json.problems[0]).toMatchObject({ code: "USAGE_ERROR", fix: { kind: "command", command: "croft validate --types" } });
   });
 
+  test("stdin still open after the time limit (a pipe nobody closes): USAGE_ERROR, exit 1, instead of waiting", async () => {
+    const p = project();
+    let limit = 0;
+    HOOK_IO.readStdin = async (ms: number) => { limit = ms; return null; };
+    const r = await cli(["validate", "--hook"], { cwd: p.root });
+    expect(limit).toBe(HOOK_IO.stdinTimeoutMs);
+    expect([r.exit, r.stdout]).toEqual([1, ""]);
+    expect(r.stderr).toStartWith("error USAGE_ERROR  croft validate --hook reads the JSON Claude Code sends a PostToolUse hook on stdin, and stdin was still open after 5 s");
+    expect(r.stderr).toContain("fix: croft validate");
+  });
+
   test("outside a croft project, stdin that is not hook JSON is still a usage error, exit 1", async () => {
     const p = project();
     const r = await hook(p, "", { stdin: "hello", cwd: dirname(p.root) });
@@ -267,5 +278,24 @@ describe("croft validate --hook: the real hook command", () => {
     expect(good).toEqual({ exit: 0, stdout: "", stderr: "" });
     const other = await sh(hookCommand(), { projectDir: p.root, cwd: PKG, stdin: input(p, "CLAUDE.md") });
     expect(other).toEqual({ exit: 0, stdout: "", stderr: "" });
+  }, 60_000);
+
+  test("stdin a pipe that never closes: the process gives up after 5 s and exits 1 (it does not wait for the pipe)", async () => {
+    const p = project();
+    linkBin(p.root);
+    const started = performance.now();
+    const proc = Bun.spawn([process.execPath, "--no-env-file", join(p.root, "node_modules", ".bin", "croft"), "validate", "--hook"], {
+      cwd: p.root, stdin: "pipe", stdout: "pipe", stderr: "pipe",
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", CROFT_FORBID_OS_JOBS: "1", CROFT_NOTIFY_DRY: "1" },
+    });
+    const killer = setTimeout(() => proc.kill(), 30_000);
+    const [stderr, exit] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    clearTimeout(killer);
+    const seconds = (performance.now() - started) / 1000;
+    proc.stdin.end();
+    expect(exit).toBe(1);
+    expect(stderr).toContain("stdin was still open after 5 s");
+    expect(seconds).toBeGreaterThanOrEqual(4.9);
+    expect(seconds).toBeLessThan(20);
   }, 60_000);
 });

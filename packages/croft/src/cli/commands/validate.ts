@@ -39,7 +39,7 @@
 // Human output is the §4.2 layout: "checked N assets in 0.6 s", each problem, then the counts.
 import { existsSync, readFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
-import { HOOK_IO, hookProblems, hookReport, hookSelection, hookTarget, parseHookInput } from "../../agent/hook.ts";
+import { hookProblems, hookReport, hookSelection, hookTarget, parseHookInput, readHookStdin } from "../../agent/hook.ts";
 import { probeSql } from "../../checks/parse.ts";
 import { type Code, CroftError, CODES, EXIT, isCode, problem } from "../../core/errors.ts";
 import { formatInstant } from "../../core/time.ts";
@@ -853,7 +853,7 @@ async function validateHook(ctx: Ctx): Promise<CommandResult<ValidateData>> {
 async function checkEdit(ctx: Ctx): Promise<CommandResult<ValidateData>> {
   hookUsage(ctx);
   const none: CommandResult<ValidateData> = { data: { order: [], assets: [] }, problems: [], next: [], exit: EXIT.OK };
-  const stdin = await HOOK_IO.readStdin();
+  const stdin = await readHookStdin();
   const root = findRoot(ctx.cwd);
   if (!root) {
     parseHookInput(stdin);                          // stdin that is not hook JSON is still a usage error

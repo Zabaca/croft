@@ -7,8 +7,8 @@ import type { Problem } from "../core/types.ts";
 import { docs } from "../cli/commands/docs.ts";
 import type { Ctx } from "../cli/command.ts";
 import {
-  HOOK_MATCHER, hookCommand, hookPlaces, hookProblems, hookReport, hookSelection, hookSettings, hookTarget, installHook,
-  mergeHookSettings, parseHookInput, SETTINGS_FILE,
+  HOOK_IO, HOOK_MATCHER, hookCommand, hookPlaces, hookProblems, hookReport, hookSelection, hookSettings, hookTarget, installHook,
+  mergeHookSettings, parseHookInput, readAll, SETTINGS_FILE,
 } from "./hook.ts";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "croft-hook-")));
@@ -263,6 +263,20 @@ describe("hookTarget", () => {
     expect(hookTarget(JSON.stringify({ hook_event_name: "Stop" }), root)).toBeNull();
     expect(hookTarget(JSON.stringify({ tool_name: "Bash", tool_input: { command: "ls" } }), root)).toBeNull();
     expect(parseHookInput(JSON.stringify({ tool_response: { filePath: "/x/assets/a.sql" } })).file).toBe("/x/assets/a.sql");
+  });
+
+  test("readAll: all of a stream that closes; null, promptly, for one still open at the deadline", async () => {
+    const bytes = new TextEncoder().encode(edit("/p/assets/é.sql"));
+    const split = bytes.indexOf(0xc3) + 1;                                   // inside the two bytes of "é"
+    const closed = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(bytes.slice(0, split)); c.enqueue(bytes.slice(split)); c.close(); } });
+    expect(await readAll(closed, 1000)).toBe(edit("/p/assets/é.sql"));
+    let canceled = false;
+    const open = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(bytes.slice(0, 5)); }, cancel() { canceled = true; } });
+    const t0 = performance.now();
+    expect(await readAll(open, 50)).toBeNull();
+    expect(performance.now() - t0).toBeLessThan(1000);
+    expect(canceled).toBe(true);                                             // the read is given up, so the process can exit
+    expect(HOOK_IO.stdinTimeoutMs).toBe(5000);
   });
 
   test("stdin that is not a hook's JSON is USAGE_ERROR, with a hint and a fix", () => {

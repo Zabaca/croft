@@ -43,9 +43,53 @@ export interface HookGroup { matcher: string; hooks: HookHandler[] }
 
 /** How validate --hook reads stdin; tests replace it. */
 export const HOOK_IO = {
-  /** All of stdin, as text. */
-  readStdin: async (): Promise<string> => await Bun.stdin.text(),
+  /** How long validate --hook waits for stdin to close. Claude Code writes the JSON at once and closes it; a pipe
+   *  nobody closes (a shell or a wrapper whose stdin is a pipe) would otherwise hold the hook until its timeout. */
+  stdinTimeoutMs: 5_000,
+  /** All of stdin as text, or null when it is still open after `ms`. */
+  readStdin: (ms: number): Promise<string | null> => readAll(Bun.stdin.stream(), ms),
 };
+
+/**
+ * All of a stream as UTF-8 text, or null when it has not ended after `ms`; then the read is canceled, since a
+ * pending read of stdin keeps Bun running until the pipe closes [V: Bun.stdin.text() raced against a timer
+ * held a `(sleep 4) |` process for 4 s; a canceled reader let it exit at the deadline].
+ */
+export async function readAll(stream: ReadableStream<Uint8Array>, ms: number): Promise<string | null> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<null>((done) => { timer = setTimeout(() => done(null), ms); });
+  const all = (async () => {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return Buffer.concat(chunks).toString("utf8");
+      chunks.push(value);
+    }
+  })();
+  try {
+    const text = await Promise.race([all, deadline]);
+    if (text === null) {
+      all.catch(() => {});                              // the canceled read rejects or ends; nothing waits on it
+      await reader.cancel().catch(() => {});
+    }
+    return text;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The hook's stdin (HOOK_IO), or USAGE_ERROR when it is still open after the time limit. */
+export async function readHookStdin(): Promise<string> {
+  const text = await HOOK_IO.readStdin(HOOK_IO.stdinTimeoutMs);
+  if (text !== null) return text;
+  throw new CroftError("USAGE_ERROR", {
+    message: `croft validate --hook reads the JSON Claude Code sends a PostToolUse hook on stdin, and stdin was still open after ${HOOK_IO.stdinTimeoutMs / 1000} s`,
+    hint: "Claude Code writes the hook's JSON and closes stdin at once; to check the project yourself, run croft validate",
+    fix: { kind: "command", description: "validate the whole project", command: "croft validate" },
+    details: { timeoutMs: HOOK_IO.stdinTimeoutMs },
+  });
+}
 
 /** Quote a path segment for sh (main.ts has the same rule; importing it here would load the CLI). */
 function shellQuote(arg: string): string {

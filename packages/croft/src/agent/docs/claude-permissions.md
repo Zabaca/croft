@@ -59,7 +59,8 @@ checks the edit at once, so a broken asset is caught before the next step rather
   }
 
 What croft validate --hook does:
-- It reads the edited file from the JSON Claude Code sends on stdin (tool_input.file_path).
+- It reads the edited file from the JSON Claude Code sends on stdin (tool_input.file_path). Claude Code
+  writes it and closes stdin at once; stdin still open after 5 seconds is a usage error.
 - An edit that is not an asset in assets/ or a file in lib/ checks nothing: exit code 0, no output.
 - Otherwise it validates that asset, plus the assets that read it when it is SQL (a renamed column breaks
   them), or, for a file in lib/, the TS assets that import it. It never opens the warehouse or the network.
