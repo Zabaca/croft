@@ -3,8 +3,16 @@
 // own check names it, so a rename in one place breaks the chain. Done means both tables are rebuilt with
 // customer_id, hold the right numbers, and the raw orders are untouched.
 import type { EvalTask, Fixture } from "../harness.ts";
-import { cents, check, composeSql, needColumns, sameRows, verdict } from "../verify.ts";
-import { customerRevenue, ORDERS, PAID, setupShop } from "./shop.ts";
+import { cents, check, composeSql, needColumns, sameRows, type SelfTest, scriptedSession, verdict } from "../verify.ts";
+import { customerRevenue, ORDERS, PAID, setupShop, SHOP_TOKEN } from "./shop.ts";
+
+export const CHECKS = {
+  ordersClean: "orders_clean has customer_id and the paid orders",
+  revenue: "customer_revenue has customer_id and the right totals",
+  ordersCleanCode: "orders_clean's SQL computes the renamed column",
+  revenueCode: "customer_revenue's SQL computes the right totals",
+  raw: "shop_orders still holds every order",
+} as const;
 
 const ORDERS_CLEAN = `-- description: Paid orders, one row per order, with the amount in dollars
 -- key: order_id
@@ -94,11 +102,11 @@ export const renameColumn: EvalTask = {
     const built: Source = { sql: (t) => `SELECT * FROM ${t}`, label: "" };
     const code = (t: string): Source => ({ sql: (u) => composeSql(f, ["orders_clean", "customer_revenue"], `SELECT * FROM ${u}`), label: `${t} (its SQL now)` });
     return verdict([
-      await check("orders_clean has customer_id and the paid orders", "warehouse", () => ordersClean(f, { ...built, label: "orders_clean" })),
-      await check("customer_revenue has customer_id and the right totals", "warehouse", () => revenue(f, { ...built, label: "customer_revenue" })),
-      await check("orders_clean's SQL computes the renamed column", "code", () => ordersClean(f, code("orders_clean"))),
-      await check("customer_revenue's SQL computes the right totals", "code", () => revenue(f, code("customer_revenue"))),
-      await check("shop_orders still holds every order", "data", async () => {
+      await check(CHECKS.ordersClean, "warehouse", () => ordersClean(f, { ...built, label: "orders_clean" })),
+      await check(CHECKS.revenue, "warehouse", () => revenue(f, { ...built, label: "customer_revenue" })),
+      await check(CHECKS.ordersCleanCode, "code", () => ordersClean(f, code("orders_clean"))),
+      await check(CHECKS.revenueCode, "code", () => revenue(f, code("customer_revenue"))),
+      await check(CHECKS.raw, "data", async () => {
         const { rows } = await f.query("SELECT count(*) AS n FROM shop_orders");
         if (Number(rows[0]?.n) !== ORDERS.length) throw new Error(`shop_orders has ${rows[0]?.n} rows, expected ${ORDERS.length}`);
         return `${ORDERS.length} rows`;
@@ -111,4 +119,21 @@ export const renameColumn: EvalTask = {
     f.write("assets/customer_revenue.sql", CUSTOMER_REVENUE_RENAMED);
     return f.croft(["run", "--json"]);
   },
+};
+
+export const selfTest: SelfTest = {
+  secret: { name: "SHOP_TOKEN", value: SHOP_TOKEN },
+  built: ["customer_revenue", "orders_clean", "shop_order_items", "shop_orders"],
+  untouched: ["code", "warehouse"],
+  session: scriptedSession(["croft context --json", "croft validate --json", "croft run", "croft query \"select * from customer_revenue\""], "Renamed cust to customer_id in both tables."),
+  diff: ["assets/orders_clean.sql", "assets/customer_revenue.sql"],
+  wrong: [{
+    // Renamed in orders_clean only, not run: customer_revenue's SQL still reads cust.
+    what: "renamed in orders_clean only",
+    apply: async (f) => {
+      for (const [rel, text] of Object.entries(HALF_DONE)) f.write(rel, text);
+    },
+    fails: [CHECKS.ordersClean, CHECKS.revenue, CHECKS.revenueCode],
+    detail: /cust/,
+  }],
 };
