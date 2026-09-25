@@ -1,8 +1,8 @@
 # Claude Code permissions
 
-croft init writes CLAUDE.md and .claude/skills/croft/SKILL.md, and nothing else under .claude/. It never
-writes .claude/settings.json: permission rules change what Claude Code may do without asking, so they stay
-your decision.
+croft init writes CLAUDE.md and .claude/skills/croft/SKILL.md, and nothing else under .claude/. It writes
+.claude/settings.json only when you ask for the validate hook (croft init --claude --with-hook, below):
+permission rules and hooks change what Claude Code may do without asking, so they stay your decision.
 
 Every destructive croft action ends in one command, croft confirm <token>:
 - croft run --rebuild of an ingest or of an incremental transform;
@@ -34,3 +34,44 @@ What the rules do:
 
 Add the rules by hand, or ask Claude Code to add them after you have read them. Run croft docs secrets for how
 croft handles .env.
+
+## The validate hook (opt-in)
+
+croft init --claude --with-hook (or croft init --with-hook for a new project) adds a PostToolUse hook to
+.claude/settings.json. After every Edit, Write or MultiEdit, Claude Code runs croft validate --hook, which
+checks the edit at once, so a broken asset is caught before the next step rather than at croft run:
+
+  {
+    "hooks": {
+      "PostToolUse": [
+        {
+          "matcher": "Edit|Write|MultiEdit",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "cd \"$CLAUDE_PROJECT_DIR\" && ./node_modules/.bin/croft validate --hook",
+              "timeout": 120
+            }
+          ]
+        }
+      ]
+    }
+  }
+
+What croft validate --hook does:
+- It reads the edited file from the JSON Claude Code sends on stdin (tool_input.file_path).
+- An edit that is not an asset in assets/ or a file in lib/ checks nothing: exit code 0, no output.
+- Otherwise it validates that asset, plus the assets that read it when it is SQL (a renamed column breaks
+  them), or, for a file in lib/, the TS assets that import it. It never opens the warehouse or the network.
+- With an error, it prints the problems on stderr and exits with exit code 2, which Claude Code shows to
+  Claude after the edit (the edit itself is already made). Warnings and a clean check print nothing.
+
+The command, cd "$CLAUDE_PROJECT_DIR" && ./node_modules/.bin/croft validate --hook, runs the project's own
+croft (node_modules/.bin/croft, from bun install) from the folder Claude Code started in
+($CLAUDE_PROJECT_DIR), wherever Claude has moved since. For a project in data/ inside an app, the app's settings say
+cd "$CLAUDE_PROJECT_DIR"/data instead, and data/.claude/settings.json gets the plain form for sessions started
+in data/. croft merges the hook into settings you already have and keeps everything else in them; running it
+again adds nothing twice. Before bun install has run, the hook cannot start: Claude Code shows you a
+non-blocking hook error and carries on.
+
+To remove the hook, delete its entry from hooks.PostToolUse in .claude/settings.json.

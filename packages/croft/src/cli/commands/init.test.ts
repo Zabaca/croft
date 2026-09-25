@@ -2,10 +2,11 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { hookSettings, SETTINGS_FILE } from "../../agent/hook.ts";
 import { CROFT_VERSION, SKILL_PATH, skillMd } from "../../agent/templates.ts";
 import type { InitResult } from "../../project/init.ts";
 import { main, type MainIO } from "../main.ts";
-import { describe as describeInit, nextSteps } from "./init.ts";
+import { describe as describeInit, HOOK_LINE, nextSteps } from "./init.ts";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "croft-initcmd-")));
 afterAll(() => rmSync(base, { recursive: true, force: true }));
@@ -125,6 +126,97 @@ describe("croft init (command)", () => {
     const r = await croft(["init", "--no-instal", "--json"], { cwd: fresh() });
     expect(r.exit).toBe(2);
     expect(r.env.problems[0].hint).toBe("did you mean --no-install?");
+  });
+});
+
+describe("croft init --with-hook (DESIGN.md §9 item 7)", () => {
+  const settings = (dir: string) => JSON.parse(readFileSync(join(dir, SETTINGS_FILE), "utf8"));
+
+  test("plain init never writes .claude/settings.json (D27)", async () => {
+    const cwd = fresh();
+    await croft(["init", "p", "--no-install"], { cwd });
+    expect(existsSync(join(cwd, "p", SETTINGS_FILE))).toBe(false);
+    await croft(["init", "--claude"], { cwd: join(cwd, "p") });
+    expect(existsSync(join(cwd, "p", SETTINGS_FILE))).toBe(false);
+  });
+
+  test("a new project: .claude/settings.json holds the PostToolUse hook, and the output says so", async () => {
+    const cwd = fresh();
+    const r = await croft(["init", "p", "--no-install", "--with-hook", "--json"], { cwd });
+    expect(r.exit).toBe(0);
+    expect(r.env.problems).toEqual([]);
+    expect(r.env.data.files).toContainEqual({ path: SETTINGS_FILE, action: "created", note: expect.stringContaining("croft validate --hook") });
+    expect(settings(join(cwd, "p"))).toEqual(hookSettings());
+
+    const human = await croft(["init", "q", "--no-install", "--with-hook"], { cwd });
+    expect(human.exit).toBe(0);
+    expect(human.stdout).toContain(HOOK_LINE);
+  });
+
+  test("--claude --with-hook merges into the user's settings, and a second run changes nothing", async () => {
+    const cwd = fresh();
+    await croft(["init", "p", "--no-install"], { cwd });
+    const root = join(cwd, "p");
+    mkdirSync(join(root, ".claude"), { recursive: true });
+    writeFileSync(join(root, SETTINGS_FILE), `{\n  "permissions": {\n    "ask": ["Bash(croft confirm:*)"]\n  }\n}\n`);
+    const first = await croft(["init", "--claude", "--with-hook"], { cwd: root });
+    expect(first.exit).toBe(0);
+    expect(first.stdout).toContain(`  ${SETTINGS_FILE}  merged (`);
+    expect(first.stdout).toContain(HOOK_LINE);
+    expect(settings(root)).toEqual({ permissions: { ask: ["Bash(croft confirm:*)"] }, ...hookSettings() });
+
+    const before = readFileSync(join(root, SETTINGS_FILE), "utf8");
+    const second = await croft(["init", "--claude", "--with-hook", "--json"], { cwd: root });
+    expect(second.exit).toBe(0);
+    expect(second.env.data.files).toContainEqual({ path: SETTINGS_FILE, action: "unchanged", note: expect.any(String) });
+    expect(readFileSync(join(root, SETTINGS_FILE), "utf8")).toBe(before);
+  });
+
+  test("a project inside an app: the app's settings run data/'s croft; data/ gets its own for sessions started there", async () => {
+    const app = fresh();
+    writeFileSync(join(app, "package.json"), "{}");
+    mkdirSync(join(app, ".claude"));
+    writeFileSync(join(app, SETTINGS_FILE), `{"model": "opus"}`);
+    const r = await croft(["init", "--no-install", "--with-hook"], { cwd: app });
+    expect(r.exit).toBe(0);
+    expect(r.stdout).toContain(`  ${SETTINGS_FILE}: merged (`);
+    expect(r.stdout).toContain(HOOK_LINE);
+    expect(settings(app)).toEqual({ model: "opus", ...hookSettings("data") });
+    expect(settings(join(app, "data"))).toEqual(hookSettings());
+
+    const again = await croft(["init", "--claude", "--with-hook", "--json"], { cwd: app });
+    expect(again.env.data.files.filter((f: { path: string }) => f.path.endsWith(SETTINGS_FILE)))
+      .toEqual([
+        { path: `data/${SETTINGS_FILE}`, action: "unchanged", note: expect.any(String) },
+        { path: SETTINGS_FILE, action: "unchanged", note: expect.any(String) },
+      ]);
+    expect(settings(app).hooks.PostToolUse).toHaveLength(1);
+  });
+
+  test("settings.json that is not valid JSON: the project is created, the file untouched, USAGE_ERROR says what to do", async () => {
+    const cwd = fresh();
+    const target = join(cwd, "p");
+    mkdirSync(join(target, ".claude"), { recursive: true });
+    writeFileSync(join(target, SETTINGS_FILE), `{"model": "opus",}`);
+    const r = await croft(["init", "p", "--no-install", "--with-hook", "--json"], { cwd });
+    expect(r.exit).toBe(2);
+    expect(existsSync(join(target, "croft.json"))).toBe(true);
+    expect(readFileSync(join(target, SETTINGS_FILE), "utf8")).toBe(`{"model": "opus",}`);
+    expect(r.env.problems).toEqual([expect.objectContaining({
+      code: "USAGE_ERROR", file: SETTINGS_FILE, fix: expect.objectContaining({ kind: "manual" }),
+    })]);
+    expect(r.env.problems[0].hint).toContain("croft init --claude --with-hook");
+    expect(r.env.data.files).toContainEqual({ path: SETTINGS_FILE, action: "skipped", note: expect.stringContaining("not valid JSON") });
+  });
+
+  test("--with-hook on an existing project: the fix is croft init --claude --with-hook", async () => {
+    const cwd = fresh();
+    await croft(["init", "p", "--no-install"], { cwd });
+    const r = await croft(["init", "p", "--with-hook", "--json"], { cwd });
+    expect(r.exit).toBe(2);
+    expect(r.env.problems[0]).toMatchObject({ code: "USAGE_ERROR", fix: { kind: "command", command: "croft init p --claude --with-hook" } });
+    expect(r.env.problems[0].hint).toContain("croft init p --claude --with-hook");
+    expect(existsSync(join(cwd, "p", SETTINGS_FILE))).toBe(false);
   });
 });
 

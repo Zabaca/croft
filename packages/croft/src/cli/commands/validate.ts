@@ -27,11 +27,14 @@
 //    - the unoptimized plan's scans join the AST inputs, and the graph (order, CYCLE) is built again with them.
 // 3. --types: the project's own node_modules/.bin/tsc --noEmit. No tsc (or no tsconfig.json) is an info
 //    problem and a skip; croft never installs anything.
+// 4. --hook: what Claude Code's PostToolUse hook runs after an edit (agent/hook.ts, §9 item 7): the edited asset
+//    and what it can break, silent unless there is an error, which goes to stderr with exit 2 (validateHook).
 //
 // Data: ValidateData (core/types.ts). Every finding is a problem of the envelope, grouped by asset in run order.
 // Human output is the §4.2 layout: "checked N assets in 0.6 s", each problem, then the counts.
 import { existsSync, readFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
+import { HOOK_IO, hookProblems, hookReport, hookSelection, hookTarget, parseHookInput } from "../../agent/hook.ts";
 import { probeSql } from "../../checks/parse.ts";
 import { type Code, CroftError, CODES, EXIT, isCode, problem } from "../../core/errors.ts";
 import { formatInstant } from "../../core/time.ts";
@@ -40,16 +43,17 @@ import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
 import { RUNS_DB_FILE, RunsDb } from "../../history/runs-db.ts";
 import { quoteIdent } from "../../load/evolve.ts";
 import { missingSecret, type ProjectEnv } from "../../project/env.ts";
+import { discoverAssets } from "../../project/discover.ts";
 import { buildGraph, type Graph } from "../../project/graph.ts";
-import { type ResolvedAsset, resolveProject, selectorWords } from "../../project/resolve.ts";
-import type { Project } from "../../project/root.ts";
+import { type ResolvedAsset, type ResolvedProject, resolveProject, selectorWords } from "../../project/resolve.ts";
+import { findRoot, type Project } from "../../project/root.ts";
 import type { LoadedSqlAsset } from "../../project/sql-asset.ts";
 import { didYouMean } from "../../project/suggest.ts";
 import { pendingBehavior, resolvedSide } from "../../run/plan.ts";
 import { previewDirectory } from "../../run/preview.ts";
 import { nextFires } from "../../schedule/types.ts";
 import { ShadowCatalog, type ShadowColumn } from "../../sql/bind.ts";
-import type { CommandImpl, Next } from "../command.ts";
+import type { CommandImpl, CommandResult, Ctx, Next } from "../command.ts";
 import { formatDuration, formatProblems, problemSummary } from "../render.ts";
 
 /** How long the project's tsc may take before --types gives up. */
@@ -75,6 +79,9 @@ export interface ValidateInput {
   processEnv?: Readonly<Record<string, string | undefined>>;
   /** The current time, for each schedule's next fire times (default: the clock). */
   now?: Date;
+  /** The assets to check, picked once the project is resolved (--hook: an edit and the assets it can break,
+   *  agent/hook.ts hookSelection). Default: what the selectors pick. */
+  select?: (resolved: ResolvedProject) => readonly string[];
 }
 
 export interface ValidateReport {
@@ -86,6 +93,7 @@ export interface ValidateReport {
 /** croft validate. Its spec (usage, options) is in commands/index.ts. */
 export const validate: CommandImpl<ValidateData> = {
   async run(ctx) {
+    if (ctx.values.hook === true) return validateHook(ctx);
     const project = ctx.project;
     const report = await validateProject({
       project, env: ctx.env, selectors: ctx.positionals, types: ctx.values.types === true, processEnv: ctx.processEnv,
@@ -98,6 +106,7 @@ export const validate: CommandImpl<ValidateData> = {
   },
 
   human(result, ctx) {
+    if (ctx.values?.hook === true) return hookHuman(result, ctx);
     const d = result.data;
     const n = d.assets.length;
     const lines = [`checked ${n} asset${n === 1 ? "" : "s"} in ${formatDuration(performance.now() - ctx.startedAt)}`];
@@ -160,9 +169,9 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
     ...(i.importTimeoutMs !== undefined ? { importTimeoutMs: i.importTimeoutMs } : {}),
   });
   const byName = new Map(resolved.assets.map((a) => [a.name, a]));
-  const selected = new Set(resolved.selected);
+  const selected = new Set(i.select ? i.select(resolved) : resolved.selected);
   // What the bind needs: the selection and everything it reads (their output columns are its inputs).
-  const scope = new Set([...resolved.selected, ...resolved.graph.upstream(resolved.selected)]);
+  const scope = new Set([...selected, ...resolved.graph.upstream([...selected])]);
   // Declared secrets set in the shell are redacted from the output like .env values.
   i.env.declare(resolved.assets.flatMap((a) => a.ts?.spec?.secrets ?? []));
 
@@ -714,4 +723,88 @@ function tscProblem(d: TscDiagnostic): Problem {
     ...(file ? { fix: { kind: "edit" as const, description: `fix the type error${d.line !== undefined ? ` on line ${d.line}` : ""}`, file, ...(d.line !== undefined ? { line: d.line } : {}) } } : {}),
     details: { tsc: d.code },
   });
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// --hook
+
+/** What a --hook run checked, for its human output (the edit, the edited asset's name, what was selected). */
+interface HookRun { target: string; asset: string | null; selected: string[] }
+const hookRuns = new WeakMap<object, HookRun>();
+
+/**
+ * croft validate --hook (DESIGN.md §9 item 7; agent/hook.ts): the edit Claude Code just made, from its PostToolUse
+ * JSON on stdin. An edit that is not an asset file in assets/ or a file in lib/ of this project checks nothing.
+ * Otherwise the edited asset is validated, with the assets that read it when it is SQL (a lib/ file: the TS
+ * assets that import it), and only their errors and warnings count: exit 2 when there is an error, which shows
+ * stderr to Claude; 0 otherwise, with nothing printed. Never the warehouse, never the network.
+ */
+async function validateHook(ctx: Ctx): Promise<CommandResult<ValidateData>> {
+  hookUsage(ctx);
+  const none: CommandResult<ValidateData> = { data: { order: [], assets: [] }, problems: [], next: [], exit: EXIT.OK };
+  const stdin = await HOOK_IO.readStdin();
+  const root = findRoot(ctx.cwd);
+  if (!root) {
+    parseHookInput(stdin);                          // stdin that is not hook JSON is still a usage error
+    return none;
+  }
+  const target = hookTarget(stdin, root);
+  if (!target) return none;
+  const run: HookRun = { target, asset: null, selected: [] };
+  hookRuns.set(ctx, run);
+  const found = (problems: Problem[]): CommandResult<ValidateData> => ({
+    ...none, problems, exit: problems.some((p) => p.severity === "error") ? EXIT.INVALID : EXIT.OK,
+  });
+  try {
+    const project = ctx.project;
+    if (target.startsWith("assets/")) {
+      // A file discovery refuses (its name, or a twin with the same name) is its own problem; one it skips is
+      // no asset.
+      const discovery = await discoverAssets(project.root);
+      const refused = discovery.problems.filter((p) => p.file === target || (Array.isArray(p.details?.files) && p.details.files.includes(target)));
+      if (refused.length) return found(refused);
+      run.asset = discovery.assets.find((a) => a.file === target)?.name ?? null;
+      if (!run.asset) return none;
+    }
+    const report = await validateProject({
+      project, env: ctx.env, processEnv: ctx.processEnv, now: ctx.now(),
+      ...(run.asset ? { selectors: [run.asset] } : {}),
+      select: (resolved) => hookSelection(resolved, target),
+    });
+    run.selected = report.data.assets.map((a) => a.name);
+    return { ...found(hookProblems(report.problems, new Set(run.selected), target)), data: report.data };
+  } catch (e) {
+    // A problem Claude can fix in the project (a croft.json that does not load, say) is reported like the
+    // others; anything else fails as croft fails, which Claude Code shows the user and does not block on.
+    if (e instanceof CroftError && CODES[e.code].category === "project") return found([e.problem]);
+    throw e;
+  }
+}
+
+/** --hook takes its file from stdin: asset names, --types and a terminal on stdin are usage errors. */
+function hookUsage(ctx: Ctx): void {
+  const usage = (message: string, hint: string, command: string) =>
+    new CroftError("USAGE_ERROR", { message, hint, fix: { kind: "command", description: "check it yourself", command } });
+  if (ctx.positionals.length) {
+    const command = ["croft validate", ...selectorWords(ctx.positionals)].join(" ");
+    throw usage("croft validate --hook takes the edited file from the hook's JSON on stdin, not asset names",
+      `to check them yourself, run ${command}`, command);
+  }
+  if (ctx.values.types === true) {
+    throw usage("croft validate --hook checks one edit and stays fast, so it does not run tsc",
+      "run croft validate --types on its own", "croft validate --types");
+  }
+  if (ctx.isTTY.stdin) {
+    throw usage("croft validate --hook is what Claude Code's PostToolUse hook runs: it reads the hook's JSON on stdin, and stdin is a terminal",
+      "to check the project yourself, run croft validate; croft init --claude --with-hook adds the hook", "croft validate");
+  }
+}
+
+/** --hook's human output: nothing unless there is an error; then the report goes to stderr, which is what
+ *  Claude Code shows Claude on exit 2, and stdout stays empty. */
+function hookHuman(result: CommandResult<ValidateData>, ctx: Ctx): undefined {
+  if (!result.problems.some((p) => p.severity === "error")) return undefined;
+  const run = hookRuns.get(ctx) ?? { target: "the edited file", asset: null, selected: [] };
+  ctx.render.errRaw(hookReport({ ...run, problems: result.problems, formatted: formatProblems(result.problems, false) }));
+  return undefined;
 }
