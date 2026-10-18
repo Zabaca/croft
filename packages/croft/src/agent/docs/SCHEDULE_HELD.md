@@ -3,7 +3,9 @@
 The scheduler only runs code a person has run. An asset is held when it is new, or when its code changed since
 it was last run by hand: its file, the lib/ code it imports, or its packages. The tick skips it and it stays
 due; croft status, croft context and croft schedule status show it as held, with how long ago it was edited.
-A file that no longer loads is held too, until it is fixed and run.
+A file that no longer loads is held too, until it is fixed and run. When croft.json names a secretsFrom command
+(croft docs secrets) that is new or changed since a person last ran an asset that reads secrets, every asset that
+reads secrets is held, since its run would run that command; a run by hand of any one of them releases them all.
 
 What to do: check the change, then run it by hand once.
 

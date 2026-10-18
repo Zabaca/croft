@@ -38,6 +38,7 @@ import type { StepRecord } from "../../history/runs-db.ts";
 import { RESERVED } from "../../load/contract.ts";
 import { quoteIdent } from "../../load/evolve.ts";
 import { discoverAssets, type DiscoveredAsset, NAME_PATTERN } from "../../project/discover.ts";
+import { staticSecrets } from "../../project/env.ts";
 import { type ResolvedAsset, type ResolvedProject, sniffKind } from "../../project/resolve.ts";
 import type { Project } from "../../project/root.ts";
 import { parseSqlHeader } from "../../project/sql-asset.ts";
@@ -74,17 +75,8 @@ export interface AssetConfig {
   problems: Problem[];
 }
 
-/** Secret names a TS file declares, read from its text: `secrets: ["A", 'B']` lists and `secret("C")` calls.
- *  The fallback for a file that does not import, so its secrets are still known (and redacted). */
-export function staticSecrets(source: string): string[] {
-  const names = new Set<string>();
-  const literal = /(["'`])([A-Za-z_][\w.-]*)\1/g;
-  for (const m of source.matchAll(/\bsecrets\s*:\s*\[([^\]]*)\]/g)) {
-    for (const l of m[1]!.matchAll(literal)) names.add(l[2]!);
-  }
-  for (const m of source.matchAll(/\bsecret\s*\(\s*(["'`])([A-Za-z_][\w.-]*)\1\s*\)/g)) names.add(m[2]!);
-  return [...names].sort();
-}
+// staticSecrets lives with the secrets (project/env.ts), so the scheduler reads it without this module's imports.
+export { staticSecrets };
 
 function emptyConfig(a: Pick<DiscoveredAsset, "name" | "file" | "path">, kind: AssetKind | null): AssetConfig {
   return {

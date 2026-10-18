@@ -51,6 +51,55 @@ describe("croft secrets (list)", () => {
     expect(r.exit).toBe(0);
   });
 
+  describe("with croft.json's secretsFrom (D108)", () => {
+    const withCommand = (code: string) => JSON.stringify({
+      database: "warehouse.duckdb", timezone: "America/Los_Angeles",
+      secretsFrom: { command: [process.execPath, "-e", `require("node:fs").appendFileSync("ran.txt", "x"); ${code}`] },
+    });
+    const ran = (root: string) => (existsSync(join(root, "ran.txt")) ? readFileSync(join(root, "ran.txt"), "utf8").length : 0);
+
+    test("a name the shell and .env lack runs the command once; its names are set from it, never printed", async () => {
+      const p = makeProject({ files: { ...FILES, ".env": "GITHUB_TOKEN=ghp_abcdefghijkl\n", "croft.json": withCommand(`console.log("STRIPE_KEY=sk_from_store_77")`) } });
+      const r = await cli(["secrets", "--json"], { cwd: p.root });
+      expect(r.exit).toBe(0);
+      expect(r.json.data).toEqual([
+        { name: "GITHUB_TOKEN", status: "set", source: ".env", usedBy: ["github_issues"] },
+        { name: "STRIPE_KEY", status: "set", source: "command", usedBy: ["stripe_charges"] },
+      ]);
+      expect(r.stdout).not.toContain("sk_from_store_77");
+      expect(ran(p.root)).toBe(1);
+      const human = await cli(["secrets"], { cwd: p.root });
+      expect(human.stdout).toContain("STRIPE_KEY     set (secretsFrom command)   used by stripe_charges");
+      expect(human.stdout).toMatch(/\nsecretsFrom \(croft\.json\): \S+ -e .* \(it ran\)\n?$/);
+    });
+
+    test("when the shell and .env set every name, the command does not run", async () => {
+      const p = makeProject({ files: { ...FILES, ".env": "GITHUB_TOKEN=ghp_abcdefghijkl\n", "croft.json": withCommand(`console.log("X=1")`) } });
+      const r = await cli(["secrets"], { cwd: p.root, env: { STRIPE_KEY: "sk_from_shell_1" } });
+      expect(r.exit).toBe(0);
+      expect(r.stdout).toContain("(not run: the environment and .env set every name)");
+      expect(ran(p.root)).toBe(0);
+    });
+
+    test("a name the command does not print is missing; a failing command is SECRETS_COMMAND_FAILED (exit 2) and its names unchecked", async () => {
+      const p = makeProject({ files: { ...FILES, "croft.json": withCommand(`console.log("STRIPE_KEY=sk_from_store_77")`) } });
+      const r = await cli(["secrets"], { cwd: p.root });
+      expect(r.stdout).toContain("GITHUB_TOKEN   missing                     used by github_issues → add GITHUB_TOKEN=... to .env or to the secretsFrom store");
+
+      const q = makeProject({ files: { ...FILES, ".env": "GITHUB_TOKEN=ghp_abcdefghijkl\n", "croft.json": withCommand(`console.error("cannot decrypt with ghp_abcdefghijkl"); process.exit(1)`) } });
+      const f = await cli(["secrets", "--json"], { cwd: q.root });
+      expect(f.exit).toBe(2);
+      expect(f.json.ok).toBe(false);
+      expect(f.json.data).toEqual([
+        { name: "GITHUB_TOKEN", status: "set", source: ".env", usedBy: ["github_issues"] },
+        { name: "STRIPE_KEY", status: "unchecked", source: "command", usedBy: ["stripe_charges"] },
+      ]);
+      const problem = f.json.problems.find((x: { code: string }) => x.code === "SECRETS_COMMAND_FAILED");
+      expect(problem.message).toEndWith("exited with status 1:\ncannot decrypt with [redacted:GITHUB_TOKEN]");
+      expect(f.stdout).not.toContain("ghp_abcdefghijkl");
+    });
+  });
+
   test("no declared secrets", async () => {
     const p = makeProject();
     expect((await cli(["secrets", "--json"], { cwd: p.root })).json.data).toEqual([]);

@@ -670,6 +670,36 @@ export default ingest({ secrets: names, key: "id", async *rows() { await Bun.wri
       expect(data.checks.filter((c) => c.id === "secrets")).toHaveLength(1);
     });
 
+    test("croft.json's secretsFrom (D108): never run; its names are not missing; a program no PATH finds is a warning", async () => {
+      const root = await withSecrets();
+      const config = JSON.parse(readFileSync(join(root, "croft.json"), "utf8"));
+      const withCommand = (command: string[]) => writeFileSync(join(root, "croft.json"), JSON.stringify({ ...config, secretsFrom: { command } }));
+      withCommand([process.execPath, "-e", "require('node:fs').writeFileSync('ran-command', 'x')"]);
+      writeFileSync(join(root, ".env"), "STRIPE_KEY=sk_test_123\n");
+      const ok = await runDoctor(root, deps());
+      expect(existsSync(join(root, "ran-command"))).toBe(false);
+      expect(ok.problems.filter((p) => p.code === "SECRET_MISSING" || p.code === "SECRETS_COMMAND_FAILED")).toEqual([]);
+      expect(ok.data.checks.filter((c) => c.id === "secrets" || c.id === "secrets-from").map((c) => [c.status, c.text])).toEqual([
+        ["info", `secretsFrom: ${process.execPath} -e "require('node:fs').writeFileSync('ran-command', 'x')" (${process.execPath}), not run by doctor; GH_TOKEN can only come from it (croft secrets runs it to check)`],
+        ["ok", "secrets: STRIPE_KEY set"],
+      ]);
+
+      withCommand(["no-such-secrets-tool", "-d", "secrets.enc.yaml"]);
+      const missing = await runDoctor(root, deps({ env: { PATH: "/usr/bin:/bin" } }));
+      const p = missing.problems.find((x) => x.code === "SECRETS_COMMAND_FAILED")!;
+      expect(p).toMatchObject({ severity: "warning", file: "croft.json", fix: { kind: "manual", requiresHuman: true } });
+      expect(p.message).toBe("secretsFrom: no-such-secrets-tool is not on PATH, so no-such-secrets-tool -d secrets.enc.yaml cannot run; GH_TOKEN can only come from it (croft secrets runs it to check)");
+
+      // Found on this shell's PATH, but not on the one scheduled runs get.
+      const bin = join(root, "mybin");
+      mkdirSync(bin);
+      writeFileSync(join(bin, "store-tool"), "#!/bin/sh\necho K=v\n", { mode: 0o755 });
+      withCommand(["store-tool"]);
+      const scheduler = await runDoctor(root, deps({ env: { PATH: `${bin}:/usr/bin:/bin` } }));
+      expect(scheduler.problems.find((x) => x.code === "SECRETS_COMMAND_FAILED")!.message)
+        .toStartWith(`secretsFrom: store-tool is found here (${join(bin, "store-tool")}) but not on the PATH scheduled runs get (`);
+    });
+
     test("not checked when the DuckDB binding does not load (finding the assets needs it)", async () => {
       const root = await withSecrets();
       const { data, problems } = await runDoctor(root, deps({ probeDuckdb: () => ({ ok: false, code: "ERR_DLOPEN_FAILED", message: "dlopen failed" }) }));

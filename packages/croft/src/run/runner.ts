@@ -83,12 +83,12 @@ import type { CheckHookResult, WriteBatchInput } from "../load/write.ts";
 import { outsideCapture, setOutputRedactor } from "../core/output.ts";
 import { formatInstant, now as clockNow } from "../core/time.ts";
 import { refreshReadCopy } from "../db/readcopy.ts";
-import { scheduleHeld } from "../schedule/due.ts";
+import { scheduleHeld, secretsCommandHeld, secretsCommandUnapproved } from "../schedule/due.ts";
 import { notifyScheduledFailure, type ScheduledFailure } from "../schedule/notify.ts";
 import { discoverAssets } from "../project/discover.ts";
 import { tsFingerprint } from "../project/ts-asset.ts";
 import { generateInputTypes } from "../project/types-gen.ts";
-import { ProjectEnv } from "../project/env.ts";
+import { ProjectEnv, secretsCommandHash } from "../project/env.ts";
 import { loadProject, type Project } from "../project/root.ts";
 import {
   croftError, type FreshStart, fromSince, isRetryable, type ProgressSnapshot, runIngest, savedCursors, SHRINK_ACTION, shrinkCommand, StepProgress,
@@ -875,6 +875,10 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
           runs.finishStep(runId, asset, attempt, { status: out.result.status, reason: out.result.reason, rows: out.result.rows });
           const ran = out.result.status === "ok" || out.result.status === "unchanged";
           if (ran && (o.human ?? true) && codeHash) runs.approveCode(asset, codeHash);
+          // A person ran an asset that reads secrets under croft.json's secretsFrom command: the scheduler may run it (D108).
+          if (ran && (o.human ?? true) && step.spec?.secrets.length && project.config.secretsFrom) {
+            runs.approveSecretsCommand(secretsCommandHash(project.config.secretsFrom));
+          }
           events.emit({ type: "step", runId, asset, attempt, status: out.result.status, result: out.result });
           return { ok: true as const, out };
         } catch (e) {
@@ -1150,10 +1154,12 @@ function codeHashOf(step: PlannedStep): string | undefined {
  * file (up to 30 min), and before earlier steps and retries. Held now:
  * - scheduling paused or off since;
  * - code that is not the code a person last ran (SCHEDULE_HELD): the code the plan loaded, and for a TS asset its
- *   files as they are now, since code rows() imports as it runs is read then.
+ *   files as they are now, since code rows() imports as it runs is read then;
+ * - an asset that declares secrets while croft.json's secretsFrom command is not one a person has run (SCHEDULE_HELD,
+ *   D108): its secret() calls would run that command.
  * null: the step may start.
  */
-export async function holdAtStart(step: PlannedStep, runs: RunsDb, project: Pick<Project, "root" | "timezone">, now: Date): Promise<{ why: string; problem?: Problem } | null> {
+export async function holdAtStart(step: PlannedStep, runs: RunsDb, project: Pick<Project, "root" | "timezone" | "config">, now: Date): Promise<{ why: string; problem?: Problem } | null> {
   const scheduling = runs.getScheduling();
   if (scheduling.state === "paused") return { why: HOLD_WORDS.paused };
   if (scheduling.state === "off") return { why: "held: scheduling is off" };
@@ -1163,7 +1169,11 @@ export async function holdAtStart(step: PlannedStep, runs: RunsDb, project: Pick
     : await tsFingerprint(step.path, { root: project.root, timezone: project.timezone }).catch(() => undefined);
   // croft delete removed its table since the plan: held whatever the approval (a build from scratch needs a person).
   const deleted = deletedByCroft(runs, step.asset);
-  if (!deleted && approved !== null && planned === approved && current === approved) return null;
+  if (!deleted && approved !== null && planned === approved && current === approved) {
+    if (!(step.spec?.secrets.length && secretsCommandUnapproved(project, runs))) return null;
+    const h = secretsCommandHeld({ asset: step.asset, file: step.file, secretsFrom: project.config.secretsFrom! });
+    return { why: `held (SCHEDULE_HELD): ${h.reason}`, problem: h.problem };
+  }
   let editedAt: number | null = null;
   try {
     editedAt = statSync(step.path).mtimeMs;

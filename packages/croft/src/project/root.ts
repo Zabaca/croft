@@ -17,6 +17,8 @@ export interface NotifyConfig { desktop: boolean; webhook: string | null }
 export interface ServeConfig {
   port: number; host: string; queryTimeoutMs: number; maxConcurrent: number; maxBytes: number; maxRows: number; allowOrigins: string[];
 }
+/** Where secrets come from besides the shell and .env (§9.8 "Secrets", D108): a command whose output is dotenv. */
+export interface SecretsFrom { command: string[] }
 export interface CroftConfig {
   database: string;                  // as written: relative to the root, or absolute after relocation
   timezone: string;
@@ -25,6 +27,7 @@ export interface CroftConfig {
   concurrency: number;               // parallel extractions in one run
   serve: ServeConfig;
   stateDir: string | null;           // set when .croft/ was relocated off a synced folder
+  secretsFrom: SecretsFrom | null;   // run only when a secret is needed and not set in the shell or .env
 }
 
 export const DEFAULTS = {
@@ -51,11 +54,13 @@ export const CONFIG_KEYS: { key: string; type: string; default: string; descript
   { key: "serve.maxRows", type: "integer", default: String(DEFAULTS.serve.maxRows), description: "most rows one answer carries, whatever limit asks; more fail with QUERY_TOO_MANY_ROWS" },
   { key: "serve.allowOrigins", type: "string[]", default: "[]", description: "browser origins allowed to call the read server, e.g. \"http://localhost:3000\"" },
   { key: "stateDir", type: "string", default: "\".croft\"", description: "state folder; croft sets it when it moves state off a synced folder" },
+  { key: "secretsFrom.command", type: "string[]", default: "null", description: "a command, run from the project folder without a shell, that prints the secrets the shell and .env lack as KEY=value lines, e.g. [\"sops\", \"-d\", \"--output-type\", \"dotenv\", \"secrets.enc.yaml\"] (croft docs secrets)" },
 ];
 
-const TOP_KEYS = ["$schema", "database", "timezone", "readCopy", "notify", "concurrency", "serve", "stateDir"];
+const TOP_KEYS = ["$schema", "database", "timezone", "readCopy", "notify", "concurrency", "serve", "stateDir", "secretsFrom"];
 const NOTIFY_KEYS = ["desktop", "webhook"];
 const SERVE_KEYS = ["port", "host", "queryTimeoutMs", "maxConcurrent", "maxBytes", "maxRows", "allowOrigins"];
+const SECRETS_FROM_KEYS = ["command"];
 
 export interface ConfigIssue {
   path: string;                      // "" for the whole file, "serve.port", "serve.allowOrigins[0]"
@@ -221,12 +226,38 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined, p
   let stateDir: string | null = null;
   if (raw.stateDir !== undefined && raw.stateDir !== null) stateDir = str(raw, "stateDir", "stateDir", "") || null;
 
+  // secretsFrom (D108): an argv, never a shell line, so nothing in it is expanded or split.
+  let secretsFrom: SecretsFrom | null = null;
+  if (raw.secretsFrom !== undefined && raw.secretsFrom !== null) {
+    const f = obj("secretsFrom", "secretsFrom");
+    unknownKeys(f, SECRETS_FROM_KEYS, "secretsFrom");
+    const example = '["sops", "-d", "--output-type", "dotenv", "secrets.enc.yaml"]';
+    const c = f.command;
+    if (isPlainObject(raw.secretsFrom) && c === undefined) {
+      add("secretsFrom", `"secretsFrom" needs "command": the program and its arguments as a list`, `set "secretsFrom" to {"command": ${example}}, or remove it`);
+    } else if (c !== undefined) {
+      if (!Array.isArray(c) || c.length === 0) {
+        const fix = typeof c === "string" && c.trim() !== "" ? `write it as a list, one argument per string: ${JSON.stringify(c.trim().split(/\s+/))}` : `write it as a list like ${example}`;
+        add("secretsFrom.command", `"secretsFrom.command" must be a non-empty list of strings (the program, then its arguments; no shell runs it); found ${show(c)}`, fix);
+      } else {
+        const bad = c.findIndex((x: unknown) => typeof x !== "string" || (x as string) === "");
+        if (bad !== -1) add(joinPath("secretsFrom.command", bad), `"${joinPath("secretsFrom.command", bad)}" must be a non-empty string; found ${show(c[bad])}`, "give every argument as a string in double quotes");
+        // A whole command line in one string would run as a program of that name.
+        else if (c.length === 1 && /\s/.test(c[0] as string)) {
+          const split = JSON.stringify((c[0] as string).trim().split(/\s+/));
+          add("secretsFrom.command", `"secretsFrom.command" is one string with spaces, which would run as a program of that name: no shell splits it`,
+            `write each argument as its own string: ${split}`);
+        } else secretsFrom = { command: [...c as string[]] };
+      }
+    }
+  }
+
   if (place && !issues.length) {
     for (const i of locationIssues(database, stateDir, place)) add(i.path, i.message, i.hint);
   }
 
   if (issues.length) return { ok: false, issues };
-  return { ok: true, config: { database, timezone, readCopy, notify: { desktop, webhook }, concurrency, serve, stateDir } };
+  return { ok: true, config: { database, timezone, readCopy, notify: { desktop, webhook }, concurrency, serve, stateDir, secretsFrom } };
 }
 
 /**
