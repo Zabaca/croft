@@ -160,7 +160,7 @@ export interface PlannedStep {
 export interface DuePlanning {
   /** Why the scheduler must not run this step now (SCHEDULE_HELD, LARGE_REPROCESS, paused, leased), or null.
    *  `reason` becomes the step's reason; `problem` (a warning) goes with the skipped step. */
-  hold(step: { asset: string; file: string; kind: StepKind; codeHash?: string; ok: boolean }): { hold: Hold; reason: string; problem?: Problem } | null;
+  hold(step: { asset: string; file: string; kind: StepKind; codeHash?: string; ok: boolean; secrets?: readonly string[] }): { hold: Hold; reason: string; problem?: Problem } | null;
   /** The fire a due ingest handles (its schedule as written), or null. */
   fire(step: { asset: string; schedule?: string }): string | null;
   /** What the scheduled run may import (§6): a TS asset only when the code hash of its bundle (computed without
@@ -625,7 +625,10 @@ function applyDue(step: PlannedStep, due: DuePlanning): void {
     step.reason = "up to date: nothing it reads changed since the scheduler found it due";
     return;
   }
-  const h = due.hold({ asset: step.asset, file: step.file, kind: step.kind, ...(step.codeHash ? { codeHash: step.codeHash } : {}), ok: loadErrors(step).length === 0 });
+  const h = due.hold({
+    asset: step.asset, file: step.file, kind: step.kind, ...(step.codeHash ? { codeHash: step.codeHash } : {}), ok: loadErrors(step).length === 0,
+    ...(step.spec ? { secrets: step.spec.secrets } : {}),
+  });
   if (h) {
     step.hold = h.hold;
     step.reason = h.reason;

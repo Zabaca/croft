@@ -11,7 +11,8 @@ import { tryAcquire } from "../history/leases.ts";
 import { RunsDb } from "../history/runs-db.ts";
 import { loadProject } from "../project/root.ts";
 import { duePlan } from "../cli/commands/run.ts";
-import { dueWork, FACTS_SETTING } from "../schedule/due.ts";
+import { secretsCommandHash } from "../project/env.ts";
+import { dueWork, FACTS_SETTING, scheduleView } from "../schedule/due.ts";
 import type { ScheduledFailure } from "../schedule/notify.ts";
 import { planRun } from "./plan.ts";
 import { type RunnerOptions, SCHEDULED_LOCK_WAIT_MS } from "./runner.ts";
@@ -451,6 +452,81 @@ describe("croft run --due on the command line", () => {
     expect(db.scheduleState("issues")?.lastFireAt).toBe(fire.toISOString());
     db.close();
   }, 60_000);
+
+  describe("croft.json's secretsFrom command (D108)", () => {
+    const KEYED = `import { ingest } from "@zabaca/croft";
+export default ingest({${HOURLY}
+  secrets: ["API_KEY"],
+  async *rows({ secret }) { yield [{ id: 1, key_length: secret("API_KEY").length }]; },
+});
+`;
+    const PLAIN = `import { ingest } from "@zabaca/croft";
+export default ingest({${HOURLY}
+  async *rows() { yield [{ id: 1 }]; },
+});
+`;
+    /** croft.json with a secretsFrom command that prints API_KEY (`print`) and counts its runs in ran.txt. */
+    const config = (print: string) => ({
+      secretsFrom: { command: [process.execPath, "-e", `require("node:fs").appendFileSync("ran.txt", "x"); console.log(${JSON.stringify(print)})`] },
+    });
+    const ran = (root: string) => (existsSync(join(root, "ran.txt")) ? readFileSync(join(root, "ran.txt"), "utf8").length : 0);
+
+    test("a step reads its secret from the command; a failing command fails only the steps that need it", async () => {
+      const root = makeProject({ "assets/keyed.ts": KEYED, "assets/plain.ts": PLAIN }, { timezone: "UTC", config: config("API_KEY=key-from-store-1") });
+      const out = await runIn(root, ["keyed", "plain"]);
+      expect(out.data.steps.map((s) => [s.asset, s.status])).toEqual([["keyed", "ok"], ["plain", "ok"]]);
+      expect(ran(root)).toBe(1);
+
+      writeFileSync(join(root, "croft.json"), JSON.stringify({ database: "warehouse.duckdb", timezone: "UTC",
+        secretsFrom: { command: [process.execPath, "-e", "console.error('no key could decrypt key-from-store-1'); process.exit(2)"] } }));
+      const failed = await runIn(root, ["keyed", "plain"]);
+      expect(failed.data.steps.map((s) => [s.asset, s.status])).toEqual([["keyed", "failed"], ["plain", "ok"]]);
+      const p = failed.problems.find((x) => x.code === "SECRETS_COMMAND_FAILED")!;
+      expect(p).toMatchObject({ severity: "error", asset: "keyed", fix: { kind: "manual", requiresHuman: true } });
+      expect(p.message).toEndWith("exited with status 2:\nno key could decrypt key-from-store-1");
+    });
+
+    test("the scheduler holds what reads secrets until a person has run an asset under the command; a changed command holds again", async () => {
+      const root = makeProject({ "assets/keyed.ts": KEYED, "assets/plain.ts": PLAIN }, { timezone: "UTC", config: config("API_KEY=key-from-store-1") });
+      expect((await runIn(root, ["keyed", "plain"])).data.status).toBe("succeeded");
+      on(root);
+      const first = await runDue(root, ["keyed", "plain"], nextFire().now);
+      expect(first.data.steps.map((s) => [s.asset, s.status])).toEqual([["keyed", "ok"], ["plain", "ok"]]);
+      expect(ran(root)).toBe(2);
+
+      // Edited: the asset that reads secrets is held, the other runs, and the new command never runs.
+      writeFileSync(join(root, "croft.json"), JSON.stringify({ database: "warehouse.duckdb", timezone: "UTC", ...config("API_KEY=key-from-store-2") }));
+      const now = new Date(nextFire().now.getTime() + 3_600_000);
+      const views = await scheduleView({ root, now });
+      expect(views.find((v) => v.asset === "keyed")!.held).toEqual({
+        code: "SCHEDULE_HELD", reason: "croft.json's secretsFrom command is new or changed, not run by hand yet; croft run keyed releases it",
+      });
+      expect(views.find((v) => v.asset === "plain")!.held).toBeNull();
+      const held = await runDue(root, ["keyed", "plain"], now);
+      expect(held.data.steps.map((s) => [s.asset, s.status])).toEqual([["keyed", "skipped"], ["plain", "ok"]]);
+      expect(held.data.steps[0]!.skippedBecause).toBe("held (SCHEDULE_HELD): croft.json's secretsFrom command is new or changed, not run by hand yet; croft run keyed releases it");
+      expect(held.problems.find((p) => p.code === "SCHEDULE_HELD")).toMatchObject({ severity: "warning", asset: "keyed", fix: { command: "croft run keyed" } });
+      expect(held.exit).toBe(0);
+      expect(ran(root)).toBe(2);
+
+      // A plan without the scheduler's holds: the step's start still checks the command (holdAtStart).
+      const plan = await planRun({ root, timezone: "UTC", selectors: ["keyed"] });
+      const atStart = await runIn(root, ["keyed"], { plan, trigger: "schedule", human: false, argv: ["run", "--due", "keyed"] });
+      expect(atStart.data.steps[0]).toMatchObject({ status: "skipped" });
+      expect(atStart.data.steps[0]!.skippedBecause).toBe("held (SCHEDULE_HELD): croft.json's secretsFrom command is new or changed, not run by hand yet; croft run keyed releases it");
+      expect(ran(root)).toBe(2);
+      // A run that is not a person's approves nothing.
+      expect((await runIn(root, ["keyed"], { plan, human: false })).data.steps[0]!.status).toBe("ok");
+      const db = runsDb(root);
+      expect(db.approvedSecretsCommand()).not.toBe(secretsCommandHash(loadProject({ root }).config.secretsFrom!));
+      db.close();
+
+      // A run by hand releases it.
+      expect((await runIn(root, ["keyed"])).data.steps[0]).toMatchObject({ status: "ok" });
+      const later = await runDue(root, ["keyed"], new Date(now.getTime() + 3_600_000));
+      expect(later.data.steps[0]).toMatchObject({ asset: "keyed", status: "ok" });
+    });
+  });
 
   test("an asset whose file is gone since the tick is left out; nothing due is not an empty project", async () => {
     const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones", HOURLY) });

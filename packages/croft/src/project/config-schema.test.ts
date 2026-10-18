@@ -9,14 +9,14 @@ import { CONFIG_KEYS, DEFAULTS, validateConfig } from "./root.ts";
 
 type Schema = {
   type?: string | string[]; properties?: Record<string, Schema>; additionalProperties?: boolean; required?: string[];
-  minimum?: number; maximum?: number; minLength?: number; pattern?: string; items?: Schema; default?: unknown;
+  minimum?: number; maximum?: number; minLength?: number; minItems?: number; pattern?: string; items?: Schema; default?: unknown;
   description?: string; $schema?: string; $id?: string; title?: string;
 };
 
 const SCHEMA_PATH = fileURLToPath(new URL("../../croft.schema.json", import.meta.url));
 const schema = JSON.parse(readFileSync(SCHEMA_PATH, "utf8")) as Schema;
 
-const SUPPORTED = new Set(["type", "properties", "additionalProperties", "required", "minimum", "maximum", "minLength", "pattern",
+const SUPPORTED = new Set(["type", "properties", "additionalProperties", "required", "minimum", "maximum", "minLength", "minItems", "pattern",
   "items", "default", "description", "$schema", "$id", "title", "markdownDescription"]);
 
 function typeOf(v: unknown): string[] {
@@ -41,6 +41,7 @@ function valid(s: Schema, v: unknown): boolean {
     if (s.minLength !== undefined && [...v].length < s.minLength) return false;
     if (s.pattern !== undefined && !new RegExp(s.pattern, "u").test(v)) return false;
   }
+  if (Array.isArray(v) && s.minItems !== undefined && v.length < s.minItems) return false;
   if (Array.isArray(v) && s.items) return v.every((x) => valid(s.items!, x));
   if (v && typeof v === "object" && !Array.isArray(v)) {
     const o = v as Record<string, unknown>;
@@ -65,6 +66,8 @@ const VALID: unknown[] = [
   { ...tz, serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 100, maxConcurrent: 64, maxBytes: 1024, maxRows: 1, allowOrigins: ["http://localhost:3000", "https://app.example.com"] } },
   { ...tz, serve: { port: 1, host: "0.0.0.0", queryTimeoutMs: 3_600_000, maxConcurrent: 1, maxBytes: Number.MAX_SAFE_INTEGER, maxRows: 10_000_000, allowOrigins: [] } },
   { ...tz, serve: { port: 65535 }, notify: {}, stateDir: null },
+  { ...tz, secretsFrom: { command: ["sops", "-d", "--output-type", "dotenv", "secrets.enc.yaml"] } },
+  { ...tz, secretsFrom: { command: ["/opt/homebrew/bin/sops"] } }, { ...tz, secretsFrom: null },
 ];
 const INVALID: unknown[] = [
   [], "croft", null, 42,
@@ -94,6 +97,9 @@ const INVALID: unknown[] = [
   { ...tz, serve: { allowOrigins: ["localhost:3000"] } },
   { ...tz, serve: { tls: true } },
   { ...tz, stateDir: "" }, { ...tz, stateDir: 5 },
+  { ...tz, secretsFrom: "sops -d secrets.yaml" }, { ...tz, secretsFrom: {} }, { ...tz, secretsFrom: { command: [] } },
+  { ...tz, secretsFrom: { command: "sops" } }, { ...tz, secretsFrom: { command: ["sops", ""] } }, { ...tz, secretsFrom: { command: ["sops", 1] } },
+  { ...tz, secretsFrom: { command: ["sops"], format: "json" } },
 ];
 
 /** Meaning the schema cannot express; croft reports these (croft validate, doctor) and editors do not. */
@@ -103,6 +109,7 @@ const SCHEMA_ACCEPTS_VALIDATOR_REJECTS: unknown[] = [
   { timezone: "america/los_angeles" },                                // not the canonical spelling
   { ...tz, serve: { allowOrigins: ["http://LOCALHOST:3000"] } },      // origins must be written normalized
   { ...tz, serve: { allowOrigins: ["http://localhost:80"] } },
+  { ...tz, secretsFrom: { command: ["sops -d secrets.yaml"] } },        // a command line in one string: no shell splits it
 ];
 
 describe("croft.schema.json", () => {

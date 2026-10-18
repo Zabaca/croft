@@ -64,7 +64,7 @@ import { putCatalog } from "../history/catalog.ts";
 import { LogWriter } from "../history/logs.ts";
 import { newRunId, RunsDb } from "../history/runs-db.ts";
 import { isReservedColumn, normalizeType, quoteIdent, quoteLiteral } from "../load/evolve.ts";
-import type { ProjectEnv } from "../project/env.ts";
+import { type ProjectEnv, secretsCommandHash } from "../project/env.ts";
 import type { Project } from "../project/root.ts";
 import { generateInputTypes } from "../project/types-gen.ts";
 import { isoMicros, wouldShrink } from "../safety/guards.ts";
@@ -779,9 +779,13 @@ class Engine {
   private approve(entries: readonly Entry[]): void {
     const hashed = entries.map((e) => [e.step.asset, e.step.codeHash ?? e.step.sql?.codeHash] as const).filter((x): x is readonly [string, string] => !!x[1]);
     if (hashed.length === 0) return;
+    // An asset that reads secrets, built under croft.json's secretsFrom command, approves that command too (D108).
+    const from = this.project.config.secretsFrom;
+    const command = from && entries.some((e) => e.step.spec?.secrets.length) ? secretsCommandHash(from) : null;
     const db = RunsDb.open(this.project.paths.stateDir);
     try {
       for (const [asset, hash] of hashed) db.approveCode(asset, hash);
+      if (command) db.approveSecretsCommand(command);
     } finally {
       db.close();
     }

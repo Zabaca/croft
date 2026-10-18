@@ -11,6 +11,8 @@ import type { LockHolder, Problem } from "../core/types.ts";
 import type { SchedulingSetting } from "../schedule/os.ts";
 
 export const RUNS_DB_FILE = "runs.sqlite";
+/** The settings row holding the hash of the secretsFrom command a person last ran an asset with (D108). */
+export const SECRETS_COMMAND_SETTING = "secrets.approvedCommand";
 export const BUSY_TIMEOUT_MS = 5000;
 
 // The v1 schema, exactly as in DESIGN.md §5. Later versions append a migration; never edit one
@@ -533,6 +535,18 @@ export class RunsDb {
     const row = this.sqlite.query("SELECT approved_code_hash FROM schedule_state WHERE asset = ?").get(asset) as
       { approved_code_hash: string | null } | null;
     return row?.approved_code_hash ?? null;
+  }
+
+  /** Record croft.json's secretsFrom command (project/env.ts secretsCommandHash) as one a person has run with: a
+   *  human-initiated run or preview of an asset that declares secrets succeeded under it (D108). */
+  approveSecretsCommand(hash: string): void {
+    this.setSetting(SECRETS_COMMAND_SETTING, hash);
+  }
+
+  /** The secretsFrom command a person last ran an asset with, as its hash, or null. */
+  approvedSecretsCommand(): string | null {
+    const v = this.getSetting<unknown>(SECRETS_COMMAND_SETTING);
+    return typeof v === "string" ? v : null;
   }
 
   // ---- schedule_state and the tick row (§8) ----

@@ -17,7 +17,8 @@
 // - SCHEDULE_HELD: the code is not the code a human last ran (approved_code_hash), new assets included. A hash
 //   that differs only because croft.json's timezone changed says so, rather than "code edited". An asset whose
 //   table croft delete removed (safety/trash.ts deletedByCroft) is held whatever its approval, until a person
-//   restores it or runs it: a scheduled run would build it again from scratch (refetch, re-bill);
+//   restores it or runs it: a scheduled run would build it again from scratch (refetch, re-bill). So is an asset
+//   that reads secrets while croft.json's secretsFrom command is not the one a person last ran one with (D108);
 // - LARGE_REPROCESS: a scheduled run met the cost guard, and no person has run the transform since;
 // - leased: another run holds it, or a run a tick started has not taken its leases yet (overlaps skip);
 // - backoff, one of:
@@ -60,8 +61,9 @@ import { zonedParts } from "../core/time.ts";
 import type { AssetKind, Hold, Incremental, Problem, Reason } from "../core/types.ts";
 import type { CatalogAsset } from "../history/catalog.ts";
 import { RUNS_DB_FILE, RunsDb, type ScheduleStateRow, type StepRecord } from "../history/runs-db.ts";
+import { commandText, secretsCommandHash, staticSecrets } from "../project/env.ts";
 import type { ResolvedAsset } from "../project/resolve.ts";
-import { loadProject, type Project } from "../project/root.ts";
+import { loadProject, type Project, type SecretsFrom } from "../project/root.ts";
 import { deletedByCroft } from "../safety/trash.ts";
 import type { DuePlanning, StepKind } from "../run/plan.ts";
 import { staleReasons } from "../run/staleness.ts";
@@ -868,6 +870,28 @@ export function scheduleHeld(o: {
   return { reason, problem: { ...p, severity: "warning" } };
 }
 
+/** Whether croft.json names a secretsFrom command that is not the one a person last ran an asset with (D108): the
+ *  scheduler then holds every asset that reads secrets, since a run of one would run a command nobody has run. */
+export function secretsCommandUnapproved(project: Pick<Project, "config">, runs: Pick<RunsDb, "approvedSecretsCommand"> | null): boolean {
+  const from = project.config.secretsFrom;
+  return from !== null && (runs?.approvedSecretsCommand() ?? null) !== secretsCommandHash(from);
+}
+
+/** SCHEDULE_HELD (§6, D108) for an asset that reads secrets while secretsCommandUnapproved: the reason is what status
+ *  shows. */
+export function secretsCommandHeld(o: { asset: string; file: string; secretsFrom: SecretsFrom }): { reason: string; problem: Problem } {
+  const run = `croft run ${o.asset}`;
+  const p = problem("SCHEDULE_HELD", {
+    asset: o.asset, file: o.file,
+    message: `${o.asset} is held from the scheduler: it reads secrets, and croft.json's secretsFrom command (${commandText(o.secretsFrom.command)}) is not one a person has run an asset with`,
+    hint: `the scheduler only runs what a person has run; check the command, then ${run} (a run from a terminal or Claude Code) releases every asset that reads secrets`,
+    effect: "scheduled runs skip it, and it stays due",
+    fix: { kind: "command", description: `run ${o.asset} by hand once`, command: run },
+    details: { secretsFrom: o.secretsFrom.command },
+  });
+  return { reason: `croft.json's secretsFrom command is new or changed, not run by hand yet; ${run} releases it`, problem: { ...p, severity: "warning" } };
+}
+
 function editedAt(root: string, file: string): number | null {
   try {
     return statSync(join(root, file)).mtimeMs;
@@ -964,6 +988,18 @@ export async function dueWork(i: DueInput): Promise<DueWork> {
     return found;
   };
 
+  // A secretsFrom command no person has run holds the assets that read secrets (D108). Which ones is read from each
+  // TS file's text, without importing it, and only while the command is unapproved: otherwise no file is read.
+  const commandUnapproved = secretsCommandUnapproved(project, runs);
+  const readsSecrets = (f: AssetFacts): boolean => {
+    if (f.kind === "sql") return false;
+    try {
+      return staticSecrets(readFileSync(join(project.root, f.file), "utf8")).length > 0;
+    } catch {
+      return false;
+    }
+  };
+
   const views: AssetScheduleView[] = [];
   const histories = new Map<string, History>();
   const due = new Map<string, string>();          // primary due assets → why
@@ -1018,6 +1054,7 @@ export async function dueWork(i: DueInput): Promise<DueWork> {
       project, now, scheduling, approved: h.state?.approvedCodeHash ?? null, leasedBy: leased.get(f.asset) ?? null,
       startingRun: starting.get(f.asset) ?? null, failedStart: failedStartOf(f.asset, h.lastOk), primaryDue: due.has(f.asset),
       inputs: transform ? inputsOf(f) : [], entry, deleted: runs ? deletedByCroft(runs, f.asset) : false,
+      secretsHeld: commandUnapproved && readsSecrets(f),
     });
     if (hold) holds.set(f.asset, hold);
     view.held = hold;
@@ -1111,6 +1148,8 @@ interface HoldContext {
   entry: (name: string) => CatalogAsset | null;
   /** croft delete removed its table (deletedByCroft). */
   deleted: boolean;
+  /** The asset reads secrets while croft.json's secretsFrom command is not approved (secretsCommandUnapproved). */
+  secretsHeld: boolean;
 }
 
 /** The first hold that applies (see the top of this file), or null. Waiting for an input comes after (dueWork). */
@@ -1126,6 +1165,9 @@ function holdOf(f: AssetFacts, h: History, c: HoldContext): { code: HoldCode; re
       asset: f.asset, file: f.file, approved: c.approved, editedAt: editedAt(c.project.root, f.file), loads: f.ok && f.codeHash !== null, now: c.now,
       timeZoneChanged: f.timeZoneChanged ?? null, deleted: c.deleted,
     }).reason };
+  }
+  if (c.secretsHeld) {
+    return { code: "SCHEDULE_HELD", reason: secretsCommandHeld({ asset: f.asset, file: f.file, secretsFrom: c.project.config.secretsFrom! }).reason };
   }
   if (h.reprocess) {
     return { code: "LARGE_REPROCESS", reason: `the cost guard needs a person: croft run ${f.asset} shows how many rows it would process and asks first` };
@@ -1283,8 +1325,9 @@ export function duePlanning(o: { project: Project; runs: RunsDb; now: Date; fire
   const times = o.times ?? defaultFires;
   const scheduling = runs.getScheduling();
   const facts = runs.getSetting<Record<string, AssetFacts>>(FACTS_SETTING) ?? {};
+  const commandUnapproved = secretsCommandUnapproved(project, runs);
   return {
-    hold(step: { asset: string; file: string; kind: StepKind; codeHash?: string; ok: boolean }) {
+    hold(step: { asset: string; file: string; kind: StepKind; codeHash?: string; ok: boolean; secrets?: readonly string[] }) {
       if (scheduling.state === "paused") {
         return { hold: "paused" as Hold, reason: "held: scheduling is paused" };
       }
@@ -1299,6 +1342,10 @@ export function duePlanning(o: { project: Project; runs: RunsDb; now: Date; fire
           asset: step.asset, file: step.file, approved, editedAt: editedAt(project.root, step.file), loads: step.ok && step.codeHash !== undefined, now,
           timeZoneChanged: zone, deleted,
         });
+        return { hold: "code_not_run_by_hand" as Hold, reason: `held: ${h.reason}`, problem: h.problem };
+      }
+      if (commandUnapproved && (step.secrets?.length ?? 0) > 0) {
+        const h = secretsCommandHeld({ asset: step.asset, file: step.file, secretsFrom: project.config.secretsFrom! });
         return { hold: "code_not_run_by_hand" as Hold, reason: `held: ${h.reason}`, problem: h.problem };
       }
       if (step.kind === "transform") {

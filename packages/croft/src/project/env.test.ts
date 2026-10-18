@@ -1,10 +1,12 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { formatWithOptions, inspect } from "node:util";
 import { CroftError } from "../core/errors.ts";
-import { ProjectEnv, parseDotenv } from "./env.ts";
+import { CONFIRM_GRANT_ENV } from "../safety/confirm.ts";
+import { TOKEN_ENV } from "../serve/auth.ts";
+import { commandText, ProjectEnv, parseDotenv } from "./env.ts";
 
 const base = mkdtempSync(join(tmpdir(), "croft-env-"));
 afterAll(() => rmSync(base, { recursive: true, force: true }));
@@ -401,5 +403,153 @@ describe("redact: escaped and encoded renderings", () => {
     const out = odd.redact(text);
     expect(out).toBe(`${filler} {"k":"[redacted:GH_APP_KEY]"} ${filler} "[redacted:AWS_SECRET]" [redacted:PUNCT] ${filler}`);
     expect(odd.redact(`${filler}${Buffer.from(`user:${AWS}`).toString("base64")}`)).toContain("[redacted:AWS_SECRET]");
+  });
+});
+
+describe("secretsFrom: a command that prints secrets (D108)", () => {
+  function projectWith(files: Record<string, string>): string {
+    const dir = mkdtempSync(join(base, "cmd-"));
+    for (const [name, text] of Object.entries(files)) writeFileSync(join(dir, name), text);
+    return dir;
+  }
+  /** Bun running `code`, which also appends to ran.txt in the project folder, so a test counts the runs. */
+  const bun = (code: string) => [process.execPath, "-e", `require("node:fs").appendFileSync("ran.txt", "x"); ${code}`];
+  const runs = (root: string) => { try { return readFileSync(join(root, "ran.txt"), "utf8").length; } catch { return 0; } };
+  const PRINT = bun(`console.log("STRIPE_KEY=sk_from_store_123\\nGITHUB_TOKEN=ghp_from_store_456\\n# a comment\\nOPENAI_KEY='sk-quoted value'")`);
+
+  test("the shell, then .env, then the command: it runs only for a name neither has, once per ProjectEnv", () => {
+    const root = projectWith({});
+    const env = new ProjectEnv({ root, fileValues: new Map([["GITHUB_TOKEN", "ghp_file"]]), shell: { OPENAI_KEY: "sk-shell" }, secretsFrom: { command: PRINT } });
+    expect(env.secret("GITHUB_TOKEN", ["GITHUB_TOKEN"])).toBe("ghp_file");
+    expect(env.secret("OPENAI_KEY", ["OPENAI_KEY"])).toBe("sk-shell");
+    expect(env.lookup("STRIPE_KEY")).toBeNull();          // lookup never runs it
+    expect(runs(root)).toBe(0);
+    expect(env.commandRan).toBe(false);
+    expect(env.secret("STRIPE_KEY", ["STRIPE_KEY"])).toBe("sk_from_store_123");
+    expect(env.resolve("GITHUB_TOKEN")).toEqual({ value: "ghp_file", source: ".env" });
+    expect(env.lookup("STRIPE_KEY")).toEqual({ value: "sk_from_store_123", source: "command" });
+    expect(() => env.secret("NOT_IN_STORE", ["NOT_IN_STORE"])).toThrow(CroftError);
+    expect(runs(root)).toBe(1);
+  });
+
+  test("a name the command does not print is SECRET_MISSING naming the command", () => {
+    const root = projectWith({});
+    const env = new ProjectEnv({ root, secretsFrom: { command: PRINT } });
+    let err: unknown;
+    try { env.secret("NOPE", ["NOPE"], "orders"); } catch (e) { err = e; }
+    expect((err as CroftError).problem).toMatchObject({
+      code: "SECRET_MISSING", asset: "orders",
+      message: `secret NOPE is not set (used by orders): not in the environment, not in .env, and not printed by the secretsFrom command (${commandText(PRINT)})`,
+      hint: "add NOPE to the store the secretsFrom command reads, or NOPE=... to .env (or run `croft secrets set NOPE` in your terminal)",
+      fix: { kind: "manual", requiresHuman: true },
+    });
+  });
+
+  test("its values are redacted like .env values, in free text and (credential-looking or declared) in data", () => {
+    const root = projectWith({});
+    const env = new ProjectEnv({ root, secretsFrom: { command: bun(`console.log("STRIPE_KEY=sk_from_store_123\\nPLAIN=production")`) } });
+    expect(env.redact("key sk_from_store_123")).toBe("key sk_from_store_123");   // not run yet: croft holds nothing
+    env.secret("STRIPE_KEY", ["STRIPE_KEY"]);
+    expect(env.redact("key sk_from_store_123, env production")).toBe("key [redacted:STRIPE_KEY], env [redacted:PLAIN]");
+    expect(env.redactData("key sk_from_store_123, env production")).toBe("key [redacted:STRIPE_KEY], env production");
+    env.declare(["PLAIN"]);
+    expect(env.redactData("env production")).toBe("env [redacted:PLAIN]");
+  });
+
+  test("a failure is SECRETS_COMMAND_FAILED with its stderr redacted, remembered, and raised for every name it would supply", () => {
+    const root = projectWith({});
+    const env = new ProjectEnv({
+      root, fileValues: new Map([["DB_PASS", "hunter2-file"]]),
+      secretsFrom: { command: bun(`console.log("HALF=half-printed-secret"); console.error("no key for hunter2-file\\nhalf-printed-secret\\nFailed to get the data key"); process.exit(3)`) },
+    });
+    let err: unknown;
+    try { env.secret("STRIPE_KEY", ["STRIPE_KEY"], "orders"); } catch (e) { err = e; }
+    const p = (err as CroftError).problem;
+    expect(p).toMatchObject({
+      code: "SECRETS_COMMAND_FAILED", severity: "error", asset: "orders", file: "croft.json", docs: "croft docs SECRETS_COMMAND_FAILED",
+      fix: { kind: "manual", requiresHuman: true }, details: { reason: "exit", status: 3, name: "STRIPE_KEY" },
+    });
+    expect(p.message).toStartWith("the secretsFrom command in croft.json (");
+    expect(p.message).toEndWith(") exited with status 3:\nno key for [redacted:DB_PASS]\n[redacted:HALF]\nFailed to get the data key");
+    expect(p.hint).toContain("an agent must not");
+    // Remembered: not run again, and raised for the next name too; what it printed is still redacted.
+    expect(() => env.secret("OTHER", ["OTHER"])).toThrow("exited with status 3");
+    expect(runs(root)).toBe(1);
+    expect(env.commandFailure()?.code).toBe("SECRETS_COMMAND_FAILED");
+    expect(env.lookup("HALF")).toBeNull();
+    expect(env.redact("half-printed-secret")).toBe("[redacted:HALF]");
+    // A name the shell or .env has still works.
+    expect(env.secret("DB_PASS", ["DB_PASS"])).toBe("hunter2-file");
+  });
+
+  test("not on PATH, not executable, too slow, or not dotenv: each says why, with a hint", () => {
+    const root = projectWith({ "plain.txt": "x" });
+    const fail = (command: string[], shell: Record<string, string> = {}, timeoutMs?: number) => {
+      const env = new ProjectEnv({ root, shell, secretsFrom: { command }, ...(timeoutMs ? { commandTimeoutMs: timeoutMs } : {}) });
+      try { env.secret("K", ["K"]); } catch (e) { return (e as CroftError).problem; }
+      throw new Error("expected a failure");
+    };
+    const missing = fail(["no-such-secrets-tool", "-d"], { PATH: "/usr/bin:/bin" });
+    expect(missing.message).toEndWith("could not start: no-such-secrets-tool is not on PATH (/usr/bin:/bin)");
+    expect(missing.hint).toContain("write its absolute path as the first element of secretsFrom.command");
+    expect(missing.hint).toContain("scheduled runs search only Bun's folder");
+    expect(fail(["./bin/nothing"]).message).toEndWith(`could not start: ${join(root, "bin/nothing")} does not exist`);
+    expect(fail(["./plain.txt"]).message).toEndWith(`could not start: ${join(root, "plain.txt")} is not executable`);
+    const slow = fail([process.execPath, "-e", "await Bun.sleep(5000)"], {}, 1000);
+    expect(slow.message).toEndWith("did not finish within 1 s and was stopped");
+    expect(slow.hint).toContain("cannot finish here: croft runs it with no terminal and no input");
+    const yaml = fail(bun(`console.log("stripe:\\n    key: ENC[AES256_GCM,data:abc]")`));
+    expect(yaml.message).toContain("printed 2 lines, none of them KEY=value");
+    expect(yaml.hint).toContain("--output-type dotenv");
+  });
+
+  test("it runs from the project folder with exactly croft's environment, minus croft's own credentials and .env", () => {
+    const root = projectWith({});
+    const shell = { PATH: "/usr/bin:/bin", HOME: "/home/x", CROFT_CONFIRM_GRANT: "grant-1", CROFT_SERVE_TOKEN: "token-1" };
+    const report = "console.log('SEEN=' + Buffer.from(JSON.stringify({ cwd: process.cwd(), keys: Object.keys(process.env).sort() })).toString('hex'))";
+    const env = new ProjectEnv({ root, fileValues: new Map([["FROM_FILE", "file-value-1"]]), shell, secretsFrom: { command: bun(report) } });
+    const seen = JSON.parse(Buffer.from(env.secret("SEEN", ["SEEN"]), "hex").toString("utf8")) as { cwd: string; keys: string[] };
+    expect(realpathSync(seen.cwd)).toBe(realpathSync(root));
+    expect(seen.keys.filter((k) => !["PWD", "SHLVL", "_", "OLDPWD"].includes(k))).toEqual(["HOME", "PATH"]);
+    expect([CONFIRM_GRANT_ENV, TOKEN_ENV].sort()).toEqual(["CROFT_CONFIRM_GRANT", "CROFT_SERVE_TOKEN"]);
+  });
+
+  test("listSecrets: unchecked without run (validate, doctor); with run (croft secrets) set from the command, or missing", () => {
+    const root = projectWith({});
+    const env = new ProjectEnv({ root, fileValues: new Map([["GITHUB_TOKEN", "ghp_file"]]), secretsFrom: { command: PRINT } });
+    const declared = { a: ["GITHUB_TOKEN", "STRIPE_KEY"], b: ["NOPE"] };
+    expect(env.listSecrets(declared)).toEqual([
+      { name: "GITHUB_TOKEN", status: "set", source: ".env", usedBy: ["a"] },
+      { name: "NOPE", status: "unchecked", source: "command", usedBy: ["b"] },
+      { name: "STRIPE_KEY", status: "unchecked", source: "command", usedBy: ["a"] },
+    ]);
+    expect(runs(root)).toBe(0);
+    expect(env.listSecrets(declared, { run: true })).toEqual([
+      { name: "GITHUB_TOKEN", status: "set", source: ".env", usedBy: ["a"] },
+      { name: "NOPE", status: "missing", source: null, usedBy: ["b"] },
+      { name: "STRIPE_KEY", status: "set", source: "command", usedBy: ["a"] },
+    ]);
+    // The shell and .env cover every name: the command never runs.
+    const covered = new ProjectEnv({ root, fileValues: new Map([["GITHUB_TOKEN", "ghp_file"]]), secretsFrom: { command: PRINT } });
+    covered.listSecrets({ a: ["GITHUB_TOKEN"] }, { run: true });
+    expect(runs(root)).toBe(1);
+    // A failed command leaves the names it would supply unchecked.
+    const failing = new ProjectEnv({ root, secretsFrom: { command: [process.execPath, "-e", "process.exit(1)"] } });
+    expect(failing.listSecrets({ a: ["STRIPE_KEY"] }, { run: true })).toEqual([{ name: "STRIPE_KEY", status: "unchecked", source: "command", usedBy: ["a"] }]);
+    expect(failing.commandFailure()?.code).toBe("SECRETS_COMMAND_FAILED");
+  });
+
+  test("load() takes secretsFrom from croft.json, and none when croft.json does not load", () => {
+    const command = ["sops", "-d", "--output-type", "dotenv", "secrets.enc.yaml"];
+    const root = projectWith({ "croft.json": JSON.stringify({ timezone: "UTC", secretsFrom: { command } }) });
+    expect(ProjectEnv.load(root, {}).secretsFrom).toEqual({ command });
+    expect(JSON.stringify(ProjectEnv.load(root, {}))).toContain('"secretsFrom":{"command":["sops"');
+    const broken = projectWith({ "croft.json": JSON.stringify({ secretsFrom: { command } }) });   // no timezone
+    expect(ProjectEnv.load(broken, {}).secretsFrom).toBeNull();
+    expect(ProjectEnv.load(projectWith({}), {}).secretsFrom).toBeNull();
+  });
+
+  test("commandText quotes what has spaces or quotes", () => {
+    expect(commandText(["sops", "-d", "--output-type", "dotenv", "my secrets.yaml", "a\"b"])).toBe('sops -d --output-type dotenv "my secrets.yaml" "a\\"b"');
   });
 });

@@ -43,7 +43,7 @@ When an ingest runs on its own, in plain words: `"every hour"`, `"weekdays at 9a
 
 ## 7. Secret
 
-A value in `.env` that an asset asks for by name: `secrets: ["STRIPE_KEY"]`, then `secret("STRIPE_KEY")`. croft reads `.env` itself and replaces every value from it with `[redacted:NAME]` in its output. See [Secrets](/docs/guides/secrets/).
+A value in `.env` that an asset asks for by name: `secrets: ["STRIPE_KEY"]`, then `secret("STRIPE_KEY")`. croft reads `.env` itself and replaces every value from it with `[redacted:NAME]` in its output. A project that keeps its secrets in an encrypted store can name, in `croft.json`, a command that prints them instead (`secretsFrom`). See [Secrets](/docs/guides/secrets/).
 
 ## How each run writes, inferred
 

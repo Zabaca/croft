@@ -96,6 +96,7 @@ export const CODES = {
   PROJECT_NOT_WRITABLE: { category: "environment", severity: "error", exit: 2 },
   DB_UNREADABLE: { category: "environment", severity: "error", exit: 2 },
   INSTALL_FAILED: { category: "environment", severity: "error", exit: 2 },
+  SECRETS_COMMAND_FAILED: { category: "environment", severity: "error", exit: 2 },
   ENV_FILE_IGNORED: { category: "warning", severity: "warning", exit: 0 },
   TABLE_MODIFIED_OUTSIDE_CROFT: { category: "warning", severity: "warning", exit: 0 },
   VOLATILE_SQL: { category: "warning", severity: "warning", exit: 0 },

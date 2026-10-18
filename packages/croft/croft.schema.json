@@ -112,6 +112,23 @@
       "description": "state folder; croft sets it when it moves state off a synced folder",
       "type": ["string", "null"],
       "pattern": "\\S"
+    },
+    "secretsFrom": {
+      "description": "where secrets come from besides the shell and .env (croft docs secrets)",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "command": {
+          "description": "a command, run from the project folder without a shell, that prints the secrets the shell and .env lack as KEY=value lines, e.g. [\"sops\", \"-d\", \"--output-type\", \"dotenv\", \"secrets.enc.yaml\"] (croft docs secrets)",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
     }
   }
 }

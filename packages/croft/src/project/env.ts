@@ -2,10 +2,20 @@
 // it depends on the working directory and silently prefers .env.local. croft parses .env itself,
 // the shell environment wins over it, only declared names reach asset code, and every .env value
 // is redacted from messages and logs. Command data (query rows) is redacted more narrowly: see redactsInData.
+//
+// croft.json's secretsFrom (D108) names a command whose output, read as .env text, supplies what the shell and .env
+// lack: an encrypted store (`sops -d --output-type dotenv secrets.enc.yaml`) without a wrapper script around every
+// croft command. It runs only when a secret is asked for (ctx.secret(), croft secrets) and neither the shell nor .env
+// has it, at most once per ProjectEnv (one per process), with no shell, no input, an explicit environment and a
+// deadline. Its values stay in memory and are redacted like .env values; a failure is SECRETS_COMMAND_FAILED,
+// remembered, with the command's stderr redacted.
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { CroftError, problem } from "../core/errors.ts";
 import type { Problem } from "../core/types.ts";
+import { CONFIG_FILE, parseConfig, type SecretsFrom } from "./root.ts";
 
 export interface DotenvIssue { line: number; message: string }
 export interface DotenvParse { values: Map<string, string>; issues: DotenvIssue[] }
@@ -92,8 +102,22 @@ function countNewlines(s: string, from: number, to: number): number {
   return count;
 }
 
-export type SecretSource = ".env" | "env";
-export interface SecretStatus { name: string; status: "set" | "missing"; source: SecretSource | null; usedBy: string[] }
+export type SecretSource = ".env" | "env" | "command";
+/** "unchecked": in neither the shell nor .env, and only the secretsFrom command, not run (or failed), could say
+ *  (source "command"). */
+export interface SecretStatus { name: string; status: "set" | "missing" | "unchecked"; source: SecretSource | null; usedBy: string[] }
+
+/** How long the secretsFrom command may take: long enough for an unlock a person answers in another window, short
+ *  enough that a run waiting on a prompt nobody sees fails instead of hanging. */
+export const SECRETS_COMMAND_TIMEOUT_MS = 60_000;
+/** The most output the command may print (stdout or stderr). */
+const SECRETS_COMMAND_MAX_BYTES = 16 * 1024 * 1024;
+/** croft's own credentials, never handed to the command: the confirmation grant (safety/confirm.ts
+ *  CONFIRM_GRANT_ENV) and the serve token (serve/auth.ts TOKEN_ENV). */
+const NOT_PASSED = new Set(["CROFT_CONFIRM_GRANT", "CROFT_SERVE_TOKEN"]);
+/** How much of the command's stderr a failure quotes: its end, where tools say what went wrong. */
+const STDERR_LINES = 20;
+const STDERR_CHARS = 2000;
 
 // Template names that document variables rather than hold them; warning about them would be noise.
 const TEMPLATES = new Set([".env.example", ".env.sample", ".env.template", ".env.dist"]);
@@ -110,33 +134,58 @@ export function redactsInData(value: string, declared: boolean): boolean {
   return value.length >= MIN_DATA_REDACT && !/^\p{L}+$/u.test(value) && !/^\d+$/.test(value);
 }
 
+/** Secret names a TS file declares, read from its text: `secrets: ["A", 'B']` lists and `secret("C")` calls.
+ *  The fallback for a file that does not import, so its secrets are still known (and redacted), and what the
+ *  scheduler reads, without importing, to hold assets that read secrets (D108). */
+export function staticSecrets(source: string): string[] {
+  const names = new Set<string>();
+  const literal = /(["'`])([A-Za-z_][\w.-]*)\1/g;
+  for (const m of source.matchAll(/\bsecrets\s*:\s*\[([^\]]*)\]/g)) {
+    for (const l of m[1]!.matchAll(literal)) names.add(l[2]!);
+  }
+  for (const m of source.matchAll(/\bsecret\s*\(\s*(["'`])([A-Za-z_][\w.-]*)\1\s*\)/g)) names.add(m[2]!);
+  return [...names].sort();
+}
+
 /** A compiled redaction (Redaction, below). */
 type Pattern = Redaction;
 
-/** The project's secrets: <root>/.env overlaid by the shell environment. Values are held in private
- *  fields so logging or serializing this object never prints them. */
+/** The project's secrets: <root>/.env overlaid by the shell environment, and what croft.json's secretsFrom command
+ *  prints for names neither has. Values are held in private fields so logging or serializing this object never
+ *  prints them. */
 export class ProjectEnv {
   readonly root: string | null;
   readonly ignoredFiles: string[];
   readonly issues: DotenvIssue[];
+  /** croft.json's secretsFrom, or null. */
+  readonly secretsFrom: SecretsFrom | null;
   readonly #file: Map<string, string>;
   readonly #shell: Record<string, string | undefined>;
   readonly #extra = new Map<string, string>();           // shell values handed out by secret()
   readonly #declared = new Set<string>();                // names assets list in `secrets`
+  readonly #commandTimeoutMs: number;
+  /** What the secretsFrom command printed: the values once it succeeded; after a failure, whatever its output held,
+   *  kept only so redaction hides it. */
+  readonly #command = new Map<string, string>();
+  /** Whether the command ran: null not yet, "ok", or its failure (thrown again for every name it would supply). */
+  #commandRun: "ok" | CroftError | null = null;
   #pattern: Pattern | null = null;
   #dataPattern: Pattern | null | undefined;
 
   constructor(opts: { root: string | null; fileValues?: Map<string, string>; shell?: Record<string, string | undefined>;
-    ignoredFiles?: string[]; issues?: DotenvIssue[] }) {
+    ignoredFiles?: string[]; issues?: DotenvIssue[]; secretsFrom?: SecretsFrom | null; commandTimeoutMs?: number }) {
     this.root = opts.root;
     this.#file = opts.fileValues ?? new Map();
     this.#shell = opts.shell ?? {};
     this.ignoredFiles = opts.ignoredFiles ?? [];
     this.issues = opts.issues ?? [];
+    this.secretsFrom = opts.secretsFrom ?? null;
+    this.#commandTimeoutMs = opts.commandTimeoutMs ?? SECRETS_COMMAND_TIMEOUT_MS;
   }
 
-  /** Read <root>/.env (a missing file is fine) and note .env.local and .env.* files croft ignores. */
-  static load(root: string | null, shell: Record<string, string | undefined> = process.env): ProjectEnv {
+  /** Read <root>/.env (a missing file is fine), note .env.local and .env.* files croft ignores, and take
+   *  croft.json's secretsFrom (none when croft.json does not load: every command that runs assets refuses then). */
+  static load(root: string | null, shell: Record<string, string | undefined> = process.env, o: { commandTimeoutMs?: number } = {}): ProjectEnv {
     if (!root) return new ProjectEnv({ root: null, shell });
     let text = "";
     try {
@@ -149,17 +198,46 @@ export class ProjectEnv {
     try {
       ignoredFiles = readdirSync(root).filter((f) => f.startsWith(".env.") && !TEMPLATES.has(f)).sort();
     } catch { /* unreadable root: nothing to report */ }
-    return new ProjectEnv({ root, fileValues: values, shell, ignoredFiles, issues });
+    return new ProjectEnv({ root, fileValues: values, shell, ignoredFiles, issues, secretsFrom: secretsFromOf(root), ...o });
   }
 
-  /** A value and where it came from. A non-empty shell variable wins over .env; an empty one does
-   *  not, because CI systems export missing secrets as "". */
+  /** A value and where it came from, without running anything. A non-empty shell variable wins over .env; an empty
+   *  one does not, because CI systems export missing secrets as "". The secretsFrom command's values come last, and
+   *  only once it has run (resolve() runs it). */
   lookup(name: string): { value: string; source: SecretSource } | null {
     const shell = this.#shell[name];
     if (shell !== undefined && shell !== "") return { value: shell, source: "env" };
     const file = this.#file.get(name);
     if (file !== undefined && file !== "") return { value: file, source: ".env" };
+    const command = this.#commandRun === "ok" ? this.#command.get(name) : undefined;
+    if (command !== undefined && command !== "") return { value: command, source: "command" };
     return null;
+  }
+
+  /** lookup(), running the secretsFrom command first when the shell and .env lack the name and it has not run in
+   *  this process. Throws its SECRETS_COMMAND_FAILED (with `asset`) when it failed, now or earlier. */
+  resolve(name: string, asset?: string): { value: string; source: SecretSource } | null {
+    const found = this.lookup(name);
+    if (found || !this.secretsFrom) return found;
+    if (this.#commandRun === null) this.#runCommand();
+    if (this.#commandRun instanceof CroftError) {
+      const p = this.#commandRun.problem;
+      throw new CroftError("SECRETS_COMMAND_FAILED", {
+        message: p.message, hint: p.hint, ...(asset ? { asset } : {}), ...(p.file ? { file: p.file } : {}),
+        ...(p.fix ? { fix: p.fix } : {}), ...(p.details ? { details: { ...p.details, name } } : {}),
+      });
+    }
+    return this.lookup(name);
+  }
+
+  /** The secretsFrom command's failure in this process, or null (it succeeded, or has not run). */
+  commandFailure(): CroftError | null {
+    return this.#commandRun instanceof CroftError ? this.#commandRun : null;
+  }
+
+  /** Whether the secretsFrom command has run in this process (successfully or not). */
+  get commandRan(): boolean {
+    return this.#commandRun !== null;
   }
 
   /** ctx.secret(): only names the asset declared in `secrets`; throws SECRET_MISSING otherwise. */
@@ -175,14 +253,16 @@ export class ProjectEnv {
       });
     }
     this.declare(declared);
-    const found = this.lookup(name);
-    if (!found) throw missingSecret(name, asset);
+    const found = this.resolve(name, asset);
+    if (!found) throw missingSecret(name, asset, this.secretsFrom);
     if (found.source === "env") this.#remember(name, found.value);
     return found.value;
   }
 
-  /** `croft secrets --json`: every declared name, whether it is set, where from, and who uses it. */
-  listSecrets(declaredByAsset: Record<string, readonly string[]>): SecretStatus[] {
+  /** `croft secrets --json`: every declared name, whether it is set, where from, and who uses it. With `run`
+   *  (croft secrets), the secretsFrom command runs when a name is in neither the shell nor .env; without it
+   *  (validate, doctor, which run on every edit) such a name is "unchecked", as it is when the command failed. */
+  listSecrets(declaredByAsset: Record<string, readonly string[]>, o: { run?: boolean } = {}): SecretStatus[] {
     const usedBy = new Map<string, Set<string>>();
     for (const [asset, names] of Object.entries(declaredByAsset)) {
       for (const name of names) {
@@ -191,8 +271,17 @@ export class ProjectEnv {
       }
     }
     return [...usedBy.keys()].sort().map((name) => {
-      const found = this.lookup(name);
-      return { name, status: found ? "set" : "missing", source: found?.source ?? null, usedBy: [...usedBy.get(name)!].sort() };
+      let found = this.lookup(name);
+      if (!found && o.run) {
+        try {
+          found = this.resolve(name);
+        } catch {
+          // commandFailure() has it; the name stays unchecked.
+        }
+      }
+      const users = [...usedBy.get(name)!].sort();
+      if (!found && this.secretsFrom && this.#commandRun !== "ok") return { name, status: "unchecked", source: "command", usedBy: users };
+      return { name, status: found ? "set" : "missing", source: found?.source ?? null, usedBy: users };
     });
   }
 
@@ -207,9 +296,9 @@ export class ProjectEnv {
   }
 
   /** Mark names as declared secrets (an asset's `secrets` list): redactData() then always hides their values,
-   *  whether they come from .env or the shell (a shell value is registered as secret() would, without being
-   *  handed out). secret() declares the calling asset's list; commands that show data should declare the
-   *  project's. */
+   *  whether they come from .env, the shell (a shell value is registered as secret() would, without being
+   *  handed out) or the secretsFrom command (once it has run; declaring never runs it). secret() declares the
+   *  calling asset's list; commands that show data should declare the project's. */
   declare(names: Iterable<string>): void {
     for (const name of names) {
       if (this.#declared.has(name)) continue;
@@ -220,19 +309,20 @@ export class ProjectEnv {
     }
   }
 
-  /** Replace every .env value (and every shell value handed out by secret()) of 4+ characters, in any of
-   *  its renderings (escaped, URL-encoded, base64, a line of a multi-line value: see below), with
-   *  [redacted:NAME]. Longer values are replaced first so overlapping values stay hidden.
-   *  For free text: messages, hints, logs. */
+  /** Replace every .env value (every value the secretsFrom command printed, and every shell value handed out by
+   *  secret()) of 4+ characters, in any of its renderings (escaped, URL-encoded, base64, a line of a multi-line
+   *  value: see below), with [redacted:NAME]. Longer values are replaced first so overlapping values stay hidden.
+   *  For free text: messages, hints, logs. A command that has not run in this process has given croft nothing to
+   *  hide, and redaction never runs it. */
   redact(text: string): string {
     return replaceWith(this.#compile(), text);
   }
 
-  /** Redaction for command data (query rows, samples): see redactsInData. Shell values handed out by
-   *  secret() count as declared. */
+  /** Redaction for command data (query rows, samples): see redactsInData. The command's values count as .env
+   *  values; shell values handed out by secret() count as declared. */
   redactData(text: string): string {
     if (this.#dataPattern === undefined) {
-      const entries = [...this.#file].filter(([name, value]) => redactsInData(value, this.#declared.has(name)));
+      const entries = [...this.#file, ...this.#command].filter(([name, value]) => redactsInData(value, this.#declared.has(name)));
       for (const [name, value] of this.#extra) if (redactsInData(value, true)) entries.push([name, value]);
       this.#dataPattern = buildPattern(entries);
     }
@@ -253,8 +343,8 @@ export class ProjectEnv {
     return walk(value) as T;
   }
 
-  toJSON(): { root: string | null; names: string[]; ignoredFiles: string[] } {
-    return { root: this.root, names: [...this.#file.keys()].sort(), ignoredFiles: this.ignoredFiles };
+  toJSON(): { root: string | null; names: string[]; ignoredFiles: string[]; secretsFrom: SecretsFrom | null } {
+    return { root: this.root, names: [...this.#file.keys()].sort(), ignoredFiles: this.ignoredFiles, secretsFrom: this.secretsFrom };
   }
 
   #remember(name: string, value: string): void {
@@ -265,9 +355,122 @@ export class ProjectEnv {
   }
 
   #compile(): Pattern | null {
-    this.#pattern ??= buildPattern([...this.#file, ...this.#extra].filter(([, value]) => value.length >= MIN_REDACT));
+    this.#pattern ??= buildPattern([...this.#file, ...this.#command, ...this.#extra].filter(([, value]) => value.length >= MIN_REDACT));
     return this.#pattern;
   }
+
+  /** Run the secretsFrom command once (see the top of this file). Its values are redacted from here on, whatever
+   *  the outcome, before its stderr is quoted. */
+  #runCommand(): void {
+    const argv = this.secretsFrom!.command;
+    const out = runSecretsCommand(argv, { cwd: this.root ?? process.cwd(), env: this.#shell, timeoutMs: this.#commandTimeoutMs });
+    for (const [name, value] of out.values) this.#command.set(name, value);
+    this.#pattern = null;
+    this.#dataPattern = undefined;
+    if (out.failure) {
+      const f = out.failure;
+      const stderr = this.redact(out.stderr);
+      this.#commandRun = new CroftError("SECRETS_COMMAND_FAILED", {
+        message: `the secretsFrom command in croft.json (${commandText(argv)}) ${f.what}${stderr ? `:\n${stderr}` : ""}`,
+        hint: f.hint,
+        file: CONFIG_FILE,
+        fix: {
+          kind: "manual", requiresHuman: true,
+          description: "ask the user to run the secretsFrom command in their own terminal, from the project folder, and fix it or what it needs",
+        },
+        details: { command: [...argv], ...f.details, stderr },
+      });
+      return;
+    }
+    this.#commandRun = "ok";
+  }
+}
+
+/** croft.json's secretsFrom, or null when it names none or croft.json does not load. */
+function secretsFromOf(root: string): SecretsFrom | null {
+  try {
+    const r = parseConfig(readFileSync(join(root, CONFIG_FILE), "utf8"));
+    return r.ok ? r.config.secretsFrom : null;
+  } catch {
+    return null;
+  }
+}
+
+/** What the scheduler's approval of the secretsFrom command records (§6, D108): the command, not its output. */
+export function secretsCommandHash(from: SecretsFrom): string {
+  return createHash("sha256").update(JSON.stringify(from.command)).digest("hex").slice(0, 16);
+}
+
+/** A command as one line for messages: arguments with spaces or quotes in JSON quotes. */
+export function commandText(argv: readonly string[]): string {
+  return argv.map((a) => (/^[\w@%+=:,./~-]+$/.test(a) ? a : JSON.stringify(a))).join(" ");
+}
+
+/** What running the secretsFrom command gave: the KEY=value pairs its stdout held (also after a failure, so they
+ *  can be redacted), its stderr's end, and why it failed, if it did. */
+export interface SecretsCommandOutput {
+  values: Map<string, string>;
+  stderr: string;
+  failure: { what: string; hint: string; details: Record<string, unknown> } | null;
+}
+
+/** Run `argv` with no shell and no input, from `cwd`, with exactly `env` (croft's own credentials taken out), for at
+ *  most `timeoutMs`. A bare program name is looked up on env.PATH, as the scheduler's runs see it, rather than on
+ *  croft's own; a relative path is taken from `cwd`. stdout is read as .env text. */
+export function runSecretsCommand(argv: readonly string[], o: { cwd: string; env: Record<string, string | undefined>; timeoutMs: number }): SecretsCommandOutput {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(o.env)) if (v !== undefined && !NOT_PASSED.has(k)) env[k] = v;
+  const program = argv[0]!;
+  const unattended = "croft runs it with no terminal and no input, as runs from Claude Code and the scheduler do";
+  const fail = (what: string, hint: string, details: Record<string, unknown> = {}, stdout = "", stderr = ""): SecretsCommandOutput =>
+    ({ values: parseDotenv(stdout).values, stderr: tail(stderr), failure: { what, hint, details } });
+
+  const path = program.includes("/") ? resolve(o.cwd, program) : Bun.which(program, { PATH: env.PATH ?? "" });
+  if (!path) {
+    return fail(`could not start: ${program} is not on PATH (${env.PATH || "empty"})`,
+      `install ${program}, or write its absolute path as the first element of secretsFrom.command (\`command -v ${program}\` in a terminal prints it); scheduled runs search only Bun's folder, /opt/homebrew/bin (macOS), /usr/local/bin and the system folders`,
+      { reason: "not_found", path: env.PATH ?? null });
+  }
+  const r = spawnSync(path, argv.slice(1), {
+    cwd: o.cwd, env, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", timeout: o.timeoutMs, maxBuffer: SECRETS_COMMAND_MAX_BYTES, windowsHide: true,
+  });
+  const stdout = typeof r.stdout === "string" ? r.stdout : "";
+  const stderr = typeof r.stderr === "string" ? r.stderr : "";
+  const code = (r.error as NodeJS.ErrnoException | undefined)?.code;
+  if (code === "ENOENT") {
+    return fail(`could not start: ${path} does not exist`, "fix the program's path in secretsFrom.command (a relative path starts at the project folder)", { reason: "not_found" });
+  }
+  if (code === "EACCES") {
+    return fail(`could not start: ${path} is not executable`, `make ${path} executable (chmod +x), or name the program that runs it first`, { reason: "not_executable" });
+  }
+  if (code === "ETIMEDOUT") {
+    return fail(`did not finish within ${Math.round(o.timeoutMs / 1000)} s and was stopped`,
+      `a command that waits for a password, a touch or a confirmation cannot finish here: ${unattended}. Make it work unattended (sops with an age key file, a service account token), or put the secrets in .env`,
+      { reason: "timeout", timeoutMs: o.timeoutMs }, stdout, stderr);
+  }
+  if (code === "ENOBUFS") {
+    return fail(`printed more than ${SECRETS_COMMAND_MAX_BYTES / 1024 / 1024} MiB and was stopped`, "make it print only the KEY=value lines of the secrets",
+      { reason: "too_much_output" }, stdout, stderr);
+  }
+  if (r.error) return fail(`could not start: ${r.error.message}`, "run it in a terminal from the project folder to see why", { reason: "spawn_failed" }, stdout, stderr);
+  if (r.status !== 0) {
+    const how = r.signal ? `was stopped by ${r.signal}` : `exited with status ${r.status}`;
+    return fail(how, `the user can run it in their own terminal from the project folder to see why (an agent must not: what it prints is the secrets); ${unattended}, and a scheduled run passes it only HOME, PATH, LANG and a few more variables (croft docs secrets)`,
+      { reason: "exit", status: r.status, signal: r.signal ?? null }, stdout, stderr);
+  }
+  const parsed = parseDotenv(stdout);
+  if (parsed.values.size === 0 && stdout.trim() !== "") {
+    return fail(`printed ${parsed.issues.length} line${parsed.issues.length === 1 ? "" : "s"}, none of them KEY=value`,
+      "croft reads the command's output as .env text, one KEY=value per line: make it print that (sops: -d --output-type dotenv)",
+      { reason: "not_dotenv" }, stdout, stderr);
+  }
+  return { values: parsed.values, stderr: "", failure: null };
+}
+
+/** The end of a command's stderr: its last lines, at most STDERR_CHARS. */
+function tail(stderr: string): string {
+  const lines = stderr.replace(/\r\n?/g, "\n").trimEnd().split("\n").slice(-STDERR_LINES).join("\n");
+  return lines.length > STDERR_CHARS ? `…${lines.slice(-STDERR_CHARS)}` : lines;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -467,7 +670,18 @@ function replaceWith(pattern: Pattern | null, text: string): string {
   return pattern ? pattern.apply(text) : text;
 }
 
-export function missingSecret(name: string, asset?: string): CroftError {
+/** SECRET_MISSING for a declared name nothing sets. With a secretsFrom command, it ran and did not print the name. */
+export function missingSecret(name: string, asset?: string, secretsFrom?: SecretsFrom | null): CroftError {
+  if (secretsFrom) {
+    const command = commandText(secretsFrom.command);
+    return new CroftError("SECRET_MISSING", {
+      message: `secret ${name} is not set${asset ? ` (used by ${asset})` : ""}: not in the environment, not in .env, and not printed by the secretsFrom command (${command})`,
+      hint: `add ${name} to the store the secretsFrom command reads, or ${name}=... to .env (or run \`croft secrets set ${name}\` in your terminal)`,
+      ...(asset ? { asset } : {}),
+      fix: { kind: "manual", description: `ask the user to add ${name} to the secrets the secretsFrom command prints, or ${name}=... to .env`, requiresHuman: true },
+      details: { name, command: [...secretsFrom.command] },
+    });
+  }
   return new CroftError("SECRET_MISSING", {
     message: `secret ${name} is not set${asset ? ` (used by ${asset})` : ""}`,
     hint: `add ${name}=... to .env (or run \`croft secrets set ${name}\` in your terminal)`,
