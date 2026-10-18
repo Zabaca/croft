@@ -470,16 +470,22 @@ function shellArg(s: string): string {
 
 const ID_LIKE = /(^|_)id$|^id_|^number$|year$/i;
 
-/** A cell for the human table: integers get thousands separators, except in id-like columns. */
-function humanCell(v: unknown, column: string): unknown {
-  if (typeof v === "number" && Number.isInteger(v) && Math.abs(v) >= 1000 && !ID_LIKE.test(column)) return formatCount(v);
+/** Integer column types: their values are counts and get thousands separators. */
+const INTEGER_TYPE = /^U?(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT)$/i;
+
+/** A cell for the human table: values of integer columns get thousands separators, except in id-like columns.
+ *  The column's type decides, not the value: a DOUBLE or DECIMAL that happens to be whole (1333.0) is printed like
+ *  the rest of its column (2637.5), never as 1,333. */
+function humanCell(v: unknown, column: ColumnInfo | undefined): unknown {
+  if (typeof v === "number" && Number.isInteger(v) && Math.abs(v) >= 1000 && column && INTEGER_TYPE.test(column.type)
+    && !ID_LIKE.test(column.name)) return formatCount(v);
   return v;
 }
 
 export function formatQuery(d: QueryData, elapsedMs: number): string {
   const header = d.columns.map((c) => c.name);
   const keys = d.rows.length ? Object.keys(d.rows[0]!) : header;
-  const t = table(header, d.rows.map((r) => keys.map((k, i) => humanCell(r[k], header[i] ?? k))), {
+  const t = table(header, d.rows.map((r) => keys.map((k, i) => humanCell(r[k], d.columns[i]))), {
     limit: Infinity, total: d.rowCount, maxWidth: Infinity, moreRows: "--limit N",
   });
   const lines = [t.text];

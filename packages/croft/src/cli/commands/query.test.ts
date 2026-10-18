@@ -62,6 +62,12 @@ describe("croft query: the JSON contract", () => {
     const r = await cli(["query", "select 17352 AS n, 2291 AS id"], { cwd: p.root });
     expect(r.stdout.split("\n")[1]).toBe("17,352   2291");
   });
+
+  test("a fractional column is never grouped, whether or not a value happens to be whole", async () => {
+    const p = await issues();
+    const r = await cli(["query", "select region, revenue from (values ('East', 2637.5::DOUBLE), ('West', 1333::DOUBLE), ('North', 1200.00::DECIMAL(9,2))) t(region, revenue)"], { cwd: p.root });
+    expect(r.stdout.split("\n").slice(1, 4).map((l) => l.trim().split(/\s+/)[1])).toEqual(["2637.5", "1333", "1200"]);
+  });
 });
 
 describe("croft query: truncation", () => {
