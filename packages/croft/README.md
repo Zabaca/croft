@@ -89,7 +89,7 @@ Claude Code, or any coding agent, can run a croft project from a cold start:
 
 ## Your data stays safe
 
-Some data can't be fetched again, so croft never throws it away on its own. Every write is all-or-nothing, and a failed check keeps the old data. Anything replaced or deleted goes to a trash first, and `croft restore` brings it back. A crash, even `kill -9`, never leaves half a write.
+Some data can't be fetched again, so croft never throws it away on its own. Every write is all-or-nothing, and a failed check keeps the old data. Anything replaced or deleted goes to a trash first, and `croft restore` brings it back. A crash, even `kill -9`, never leaves half a write. `croft backup` copies the warehouse, its history and the trash to another folder, even while croft is using them.
 
 ## Links
 

@@ -558,8 +558,9 @@ async function refreshOnce(project: Project, o: ReadCopyOptions, round: number):
   }
 }
 
-/** After CHECKPOINT the WAL is gone or empty; otherwise the copy would miss what it holds. A stat, never an open. */
-function assertWalFolded(database: string): void {
+/** After CHECKPOINT the WAL is gone or empty; otherwise the copy would miss what it holds. A stat, never an open.
+ *  Project backups check the same (db/backup.ts). */
+export function assertWalFolded(database: string): void {
   let size = 0;
   try {
     size = statSync(`${database}.wal`).size;

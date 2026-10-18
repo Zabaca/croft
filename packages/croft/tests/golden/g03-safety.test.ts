@@ -1,6 +1,7 @@
 // Golden: the commands that change or remove data (DESIGN.md §4.3, §6), each --json envelope validated against its
 // schema: delete (rows and a whole table) and restore, each asking for a token off a TTY, confirm carrying the token
-// out (and refusing a spent one), a shrink and a rebuild confirmed through croft run, and rename.
+// out (and refusing a spent one), a shrink and a rebuild confirmed through croft run, and rename; and backup, the
+// copy that keeps what they could lose (D109).
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { cleanupAll, initProject, type Project, schedulerEnv } from "../e2e/harness.ts";
 import { golden } from "./kit.ts";
@@ -78,4 +79,13 @@ test("rename, and a rename onto a name that is taken", async () => {
   expect(r).toMatchObject({ from: "sales_by_region", to: "region_sales" });
   golden("rename", await p.croft(["rename", "region_sales", "example_sales", "--json"], { env }), { failed: true, exit: 2 });
   golden("describe", await p.croft(["describe", "region_sales", "--json"], { env }));
+}, 120_000);
+
+test("backup: a new folder each time, with the trash; a folder inside the state folder is refused", async () => {
+  const first = golden("backup", await p.croft(["backup", "--json"], { env })).data;
+  expect(first).toMatchObject({ warehouse: { file: "warehouse.duckdb" }, runs: { file: "runs.sqlite" }, sameDisk: true });
+  expect(first.trash.versions).toBeGreaterThan(0);
+  const away = golden("backup", await p.croft(["backup", "kept", "--json"], { env })).data;
+  expect(away.path).not.toBe(first.path);
+  golden("backup", await p.croft(["backup", ".croft/trash", "--json"], { env }), { failed: true, exit: 2 });
 }, 120_000);

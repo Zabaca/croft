@@ -10,6 +10,7 @@
 //
 // Slow suite (real processes, ~20 s): it runs in the whole `bun test`. CROFT_CI=1 adds SLACK to every budget.
 import { afterAll, describe, expect, test } from "bun:test";
+import { DuckDBInstance } from "@duckdb/node-api";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { connect, type Socket } from "node:net";
 import { join } from "node:path";
@@ -296,5 +297,32 @@ describe("croft serve with writers (slow: real processes)", () => {
     expect(r.code, show(r)).toBe(0);
     expect(r.json!.data.steps[0]).toMatchObject({ status: "ok", rows: { added: 1, total: 121 } });
     expect(await rowsVia(s, COUNT)).toEqual([{ n: 121 }]);
+  }, 60_000);
+
+  test("croft backup under steady load: serve steps aside for the checkpoint and the clone, every query is answered, and the copy has every row (D109)", async () => {
+    const { p, s } = await served();
+    addSale(p, 6001);
+    const run = await p.json(["run", "example_sales", "--only", "--follow", "60s"]);
+    expect(run.code, show(run)).toBe(0);
+    const steady = load(s, 4);
+    await until(() => (steady.statuses[200] ?? 0) > 20);
+    const r = await p.json(["backup"]);
+    expect(r.code, show(r)).toBe(0);
+    expect(r.json!.data).toMatchObject({ sameDisk: true, warehouse: { file: "warehouse.duckdb" } });
+    expect(r.json!.data.heldMs).toBeLessThan(2000);
+    await until(async () => (await s.engine()).state === "open", 5000, 20);
+    await steady.stop();
+    expect(steady.failures, JSON.stringify(steady.failures.slice(0, 3))).toEqual([]);
+    // The copy opens on its own and holds what the warehouse held, the run's row included.
+    const copy = await DuckDBInstance.create(join(r.json!.data.path, "warehouse.duckdb"), { access_mode: "READ_ONLY" });
+    const c = await copy.connect();
+    try {
+      expect(Number((await c.runAndReadAll(COUNT)).getRowObjectsJS()[0]!.n)).toBe(121);
+    } finally {
+      c.disconnectSync();
+      copy.closeSync();
+    }
+    expect(await rowsVia(s, COUNT)).toEqual([{ n: 121 }]);
+    expect(s.stderr()).toBe("");
   }, 60_000);
 });
