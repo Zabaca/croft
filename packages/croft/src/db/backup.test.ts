@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { RunsDb } from "../history/runs-db.ts";
 import { cleanup as cleanupChildren, spawnHolder, spawnIdle, writeIntent } from "../read/testkit.ts";
+import type { SchedulingSetting } from "../schedule/os.ts";
 import {
   BACKUP_MANIFEST, type BackupManifest, BACKUPS_DIR, BACKUPS_KEPT, backupBeforeUpgrade, backupProject, backupsDir, compareEngineVersions,
   ENGINE_SETTING, type EngineRecord, listBackups, listProjectBackups, recordedEngine,
@@ -389,7 +390,7 @@ describe("backupProject", () => {
     expect(await count(join(b.path, "trash", "orders", "20260920T100000.000Z.duckdb"))).toBe(4);
     const copy = RunsDb.open(b.path);
     try {
-      expect(copy.getSetting("scheduling")).toEqual({ state: "on", via: "os-job" });
+      expect(copy.getSetting<SchedulingSetting>("scheduling")).toEqual({ state: "on", via: "os-job" });
     } finally {
       copy.close();
     }
