@@ -140,9 +140,11 @@ and rows("x"), newRows("x") and query<"x">(sql) hand over that type, so croft va
 tsc) reports code that reads a column the input does not have, such as one renamed upstream; before that, every
 column is unknown. Read without a type argument: newRows<Issue>("x") replaces the generated type, so only the run
 finds the rename (newRows<Row>("x") is for column names computed at run time). The types say what arrives: every
-column but the key may be null, so give it a default (row.amount ?? 0); a BIGINT is number | bigint, a bigint
-only beyond ±2^53, so write Number(row.quantity) before arithmetic; a JSON column is unknown until the code says
-its shape (row.meta as { plan?: string } | null).
+column may be null but the key and those a blocking not_null check of the input covers, so give it a default
+(row.amount ?? 0), or, when NULL is wrong there, add not_null(amount) to the input's checks: the type narrows
+after the run that passes it (a warning's never does). A BIGINT is number | bigint, a bigint only beyond ±2^53,
+so write Number(row.quantity) before arithmetic; a JSON column is unknown until the code says its shape
+(row.meta as { plan?: string } | null).
 
 Rows are guarded: reading a column the input does not have throws UNKNOWN_INPUT_COLUMN with a did-you-mean,
 instead of storing NULL. Copy a row with { ...row } (structuredClone does not work on it); croft's _loaded_at

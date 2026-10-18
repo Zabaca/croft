@@ -20,7 +20,10 @@ ingests included.
 - A key implies unique(key) and not_null(key); there is no need to write them.
 - NULL passes a rule: `amount >= 0` lets a NULL amount through. Add not_null(amount) when NULL is wrong too.
 - One check is one condition. Join conditions with AND, or write two checks.
-- A new or edited check looks at the whole table the first time it runs, not only the new rows.
+- A new or edited check looks at the whole table the first time it runs, not only the new rows. So does a
+  warning made a blocking check: the rows it only warned about are checked too.
+- A blocking not_null(a) that the last run passed drops `| null` from a in the generated row types
+  (.croft/types) that TS transforms and apps read (croft docs transforms). A warning's never does.
 - A rule may read other tables in a subquery: `customer_id IN (SELECT id FROM customers)`. croft builds the
   tables it names before this asset.
 - A check may not read files, call table functions that read files or run SQL text, use parameters ($1, ?) or

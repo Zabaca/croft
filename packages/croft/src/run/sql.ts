@@ -299,7 +299,7 @@ async function warnings(i: StepInput, r: WriteResult): Promise<CheckHookResult> 
   try {
     // The check sources of the asset's last ok step (this step's result is recorded after the run): a warning
     // not among them is new or edited, and looks at the whole table this time (§3f).
-    const previous = i.runs.lastCheckSources(asset);
+    const previous = i.runs.lastCheckSources(asset, { runId: i.runId });
     return await i.warehouse.read(async (db) =>
       runWarnings(db, { asset, table: tableRef(await currentDatabase(db), asset), loadedAt: r.loadedAt, rows: r.rows }, list, { file: i.step.file, previous }),
     { purpose: `check the warnings of ${asset}`, signal: i.signal });

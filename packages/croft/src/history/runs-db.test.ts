@@ -263,6 +263,53 @@ describe("steps", () => {
     expect(db.lastCheckSources("orders")).toBeNull();
   });
 
+  // D107: one finished run of `asset`, its step ending `status` with these results; the catalog's lastRunId names
+  // it when `wrote`.
+  const finished = (asset: string, status: StepResult["status"], checks: StepResult["checks"], o: { wrote?: boolean } = {}) => {
+    clock += 1000;
+    const r = db.createRun({ trigger: "manual", human: true, argv: [] });
+    db.startStep({ runId: r.id, asset, attempt: 1, reason: "requested" });
+    db.finishStep(r.id, asset, 1, { status });
+    db.finishRun(r.id, status === "ok" ? "succeeded" : "failed", { data: { runId: r.id, steps: [{ asset, status, checks }] } });
+    if (o.wrote) db.catalogPut(asset, { asset, lastRunId: r.id }, "run");
+    return r.id;
+  };
+
+  test("lastCheckSources with blocking: a warning made blocking is new; an older croft's unmarked results count as blocking", () => {
+    finished("orders", "ok", [
+      { check: "not_null(id)", ok: true, blocking: true, failing: 0 },
+      { check: "not_null(author)", ok: false, blocking: false, failing: 2 },
+      { check: "amount >= 0", ok: true, failing: 0 },
+    ], { wrote: true });
+    expect(db.lastCheckSources("orders")).toEqual(["not_null(id)", "not_null(author)", "amount >= 0"]);
+    expect(db.lastCheckSources("orders", { blocking: true })).toEqual(["not_null(id)", "amount >= 0"]);
+    expect(db.lastStepChecks("orders")).toEqual([
+      { check: "not_null(id)", ok: true, blocking: true, failing: 0 },
+      { check: "not_null(author)", ok: false, blocking: false, failing: 2 },
+      { check: "amount >= 0", ok: true, failing: 0 },
+    ]);
+  });
+
+  test("lastStepChecks: unknown while a later run that did not end ok has written the table (lastRunId)", () => {
+    const ok = finished("issues", "ok", [{ check: "not_null(label)", ok: true, blocking: true, failing: 0 }], { wrote: true });
+    expect(db.lastStepChecks("issues")).toEqual([{ check: "not_null(label)", ok: true, blocking: true, failing: 0 }]);
+    // A failed step that wrote nothing (its write rolled back) leaves lastRunId alone.
+    finished("issues", "failed", []);
+    expect(db.lastCheckSources("issues")).toEqual(["not_null(label)"]);
+    // A failed chunked transform: its chunks committed, so the mirror names its run.
+    const failed = finished("issues", "failed", [], { wrote: true });
+    expect(db.lastStepChecks("issues")).toBeNull();
+    expect(db.lastCheckSources("issues", { blocking: true })).toBeNull();
+    // The run asking does not count its own writes: they passed its own checks.
+    expect(db.lastCheckSources("issues", { runId: failed })).toEqual(["not_null(label)"]);
+    // A lastRunId older than the ok step, or one this file has no run for, does not hide it.
+    db.catalogPut("issues", { asset: "issues", lastRunId: "r_0101_0000_gone" }, "run");
+    expect(db.lastCheckSources("issues")).toEqual(["not_null(label)"]);
+    db.catalogPut("issues", { asset: "issues", lastRunId: ok }, "run");
+    finished("issues", "ok", [], { wrote: true });
+    expect(db.lastStepChecks("issues")).toEqual([]);
+  });
+
   test("danglingSteps lists the unchecked steps of ended runs only", () => {
     const live = db.createRun({ trigger: "manual", human: true, argv: [] });
     db.startStep({ runId: live.id, asset: "a", attempt: 1, reason: "requested" });

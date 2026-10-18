@@ -695,7 +695,7 @@ class Engine {
     const blocking = list.filter((c) => c.blocking);
     if (blocking.length) {
       try {
-        const r = await checksHook(blocking, { file: step.file, previous })(db, { ...ctx, batch: "" });
+        const r = await checksHook(blocking, { file: step.file, previous: this.previousChecks(asset, { blocking: true }) })(db, { ...ctx, batch: "" });
         if (r && !Array.isArray(r)) results.push(...r.results);
       } catch (e) {
         const err = croftError(e);
@@ -712,13 +712,14 @@ class Engine {
   }
 
   /** The check sources of the asset's last ok step in the live runs.sqlite (a new or edited check covers the whole
-   *  table), or null when it never ran. runs.sqlite is only read; it is not created. */
-  private previousChecks(asset: string): string[] | null {
+   *  table), or null when it never ran. runs.sqlite is only read; it is not created. `blocking`: only the
+   *  blocking checks' (D107). */
+  private previousChecks(asset: string, o: { blocking?: boolean } = {}): string[] | null {
     const stateDir = this.project.paths.stateDir;
     if (!existsSync(join(stateDir, "runs.sqlite"))) return null;
     const db = RunsDb.open(stateDir);
     try {
-      return db.lastCheckSources(asset);
+      return db.lastCheckSources(asset, o);
     } finally {
       db.close();
     }

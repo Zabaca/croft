@@ -566,6 +566,9 @@
               "ok": {
                 "type": "boolean"
               },
+              "blocking": {
+                "type": "boolean"
+              },
               "failing": {
                 "type": "number"
               },
