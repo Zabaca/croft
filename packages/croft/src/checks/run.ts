@@ -7,6 +7,10 @@
 // CHECK_FAILED details are {check, failing, sample}: 20 sample rows collected, 3 rendered. A sample shows a
 // TIMESTAMPTZ with the project offset, as `croft query` does (instantsInZone).
 //
+// Every result says whether its check is blocking (StepResult.checks[].blocking, false for a warning): the next
+// run's blocking checks count only blocking ones as run before, and generated types narrow a column only for a
+// blocking not_null (history/runs-db.ts lastStepChecks, D107).
+//
 // Also in the details: `checked` (the rows in scope) and `scope` ("batch" or "table"); a blocking failure adds
 // `results`, every blocking check's result, since the hook throws instead of returning them. Every blocking
 // check runs, so one failure does not hide the next; the message names the first with its samples and lists the
@@ -39,8 +43,9 @@ import { checkColumns, minRowsOf, tokenize, vetCheck } from "./parse.ts";
 export interface ChecksHookOptions {
   /** Root-relative, for CHECK_FAILED's location and fix. */
   file: string;
-  /** Sources of the checks the asset's last successful write ran. A check not among them is new or edited, and
-   *  covers the whole table this time. Omitted or null: every check covers the whole table. */
+  /** Sources of the blocking checks the asset's last successful write ran (RunsDb.lastCheckSources with blocking:
+   *  a warning made blocking is new). A check not among them is new or edited, and covers the whole table this
+   *  time. Omitted or null: every check covers the whole table. */
   previous?: readonly string[] | null;
 }
 
@@ -49,7 +54,7 @@ export const SAMPLE_ROWS = 20;
 /** Sample rows rendered in a CHECK_FAILED message. */
 export const RENDERED_ROWS = 3;
 
-type CheckResult = { check: string; ok: boolean; failing?: number; sample?: Row[] };
+type CheckResult = { check: string; ok: boolean; blocking: boolean; failing?: number; sample?: Row[] };
 
 /** One check's outcome: its result, how many rows it looked at, and what a message needs. */
 interface Outcome {
@@ -129,7 +134,7 @@ export async function runWarnings(sql: Sql, ctx: WarningContext, checks: readonl
     } catch (e) {
       if (!(e instanceof CroftError) || e.code !== "CHECK_INVALID") throw e;
       out.problems.push({ ...e.problem, severity: "warning" });
-      out.results.push({ check: c.source, ok: false });
+      out.results.push({ check: c.source, ok: false, blocking: false });
       continue;
     }
     out.results.push(x.result);
@@ -172,14 +177,14 @@ async function scopeCounts(sql: Sql, table: string, loadedAt: string): Promise<C
 async function evaluate(sql: Sql, t: Target, c: Check, whole: boolean, counts: Counts): Promise<Outcome> {
   const checked = whole ? counts.total : counts.batch;
   const widened = whole && c.scope === "batch" && counts.total > counts.batch;
-  const ok = (extra: Partial<Outcome> = {}): Outcome => ({ check: c, result: { check: c.source, ok: true, failing: 0 }, checked, whole, widened, ...extra });
+  const ok = (extra: Partial<Outcome> = {}): Outcome => ({ check: c, result: { check: c.source, ok: true, blocking: c.blocking, failing: 0 }, checked, whole, widened, ...extra });
   const scope = whole ? "" : `${STAMP} = ${stampLiteral(t.loadedAt)} AND `;
   try {
     if (c.kind === "min_rows") {
       const n = minRowsOf(c);
       if (n === null) throw invalid(t, c, "needs a whole number of rows");
       if (counts.total >= n) return ok({ groups: counts.total });
-      return { check: c, result: { check: c.source, ok: false, failing: n - counts.total, sample: [] }, checked: counts.total, whole: true, groups: counts.total };
+      return { check: c, result: { check: c.source, ok: false, blocking: c.blocking, failing: n - counts.total, sample: [] }, checked: counts.total, whole: true, groups: counts.total };
     }
     if (checked === 0) return ok();
     if (c.kind === "unique") {
@@ -193,7 +198,7 @@ async function evaluate(sql: Sql, t: Target, c: Check, whole: boolean, counts: C
       if (failing === 0) return ok();
       const sample = await sampleRows(sql,
         `SELECT * EXCLUDE (${STAMP}) FROM ${t.table} WHERE ${set} QUALIFY count(*) OVER (PARTITION BY ${list}) > 1 ORDER BY ${list} LIMIT ${SAMPLE_ROWS}`);
-      return { check: c, result: { check: c.source, ok: false, failing, sample }, checked: counts.total, whole: true, groups: num(r?.groups) };
+      return { check: c, result: { check: c.source, ok: false, blocking: c.blocking, failing, sample }, checked: counts.total, whole: true, groups: num(r?.groups) };
     }
     let fails: string;
     if (c.kind === "not_null") {
@@ -212,7 +217,7 @@ async function evaluate(sql: Sql, t: Target, c: Check, whole: boolean, counts: C
     const failing = num(r?.n);
     if (failing === 0) return ok();
     const sample = await sampleRows(sql, `SELECT * EXCLUDE (${STAMP}) FROM ${t.table} WHERE ${scope}${fails} LIMIT ${SAMPLE_ROWS}`);
-    return { check: c, result: { check: c.source, ok: false, failing, sample }, checked, whole, widened };
+    return { check: c, result: { check: c.source, ok: false, blocking: c.blocking, failing, sample }, checked, whole, widened };
   } catch (e) {
     throw asCheckError(e, t, c);
   }

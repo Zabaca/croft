@@ -4,7 +4,8 @@ croft writes runs, logs, the trash and backups under .croft/ (or the "stateDir" 
 to it, and a new project's files when croft init creates one. PROJECT_NOT_WRITABLE means a write there failed with a
 permission error, a read-only disk, or a full disk (details.error: EACCES, EPERM, EROFS, ENOSPC, EDQUOT).
 croft doctor probes the folder, croft init reports the path it could not write, and a backup before a DuckDB
-upgrade reports the backups folder.
+upgrade reports the backups folder. croft backup reports the folder it was making the backup in, which may be
+outside the project (details.backups); it leaves no partial backup.
 
 What was written before the failure stays; the command did not finish.
 

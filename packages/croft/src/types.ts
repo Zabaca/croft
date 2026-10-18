@@ -4,7 +4,7 @@ export type ColumnType = "BOOLEAN" | "BIGINT" | "HUGEINT" | "DOUBLE" | "VARCHAR"
   | "TIMESTAMPTZ" | "JSON" | `DECIMAL(${number},${number})` | (string & {});
 export type ColumnPin = ColumnType | { type: ColumnType; format?: string };   // format: strptime pattern
 export type RowSource = AsyncIterable<Row | Row[]> | Iterable<Row | Row[]> | Promise<Row[]>;
-export type FileFormat = "csv" | "tsv" | "json" | "ndjson" | "parquet";
+export type FileFormat = "csv" | "tsv" | "json" | "ndjson" | "parquet" | "yaml";
 
 export interface Common {
   description?: string;
@@ -41,9 +41,15 @@ export interface FileIngest extends IngestBase {
 }
 export interface TransformConfig extends Common {
   inputs: string[];                          // assets this code reads
-  incremental?: boolean;                     // newRows() + merge instead of replace; chunked commits (§3e)
+  incremental?: boolean | KeyOnce;           // newRows() + merge instead of replace; chunked commits (§3e)
   confirmAbove?: number;                     // cost guard threshold, default 1000 input rows (§5)
   rows(ctx: TransformContext): RowSource;
+}
+/** incremental: { once: "key" } (§3e, D106): newRows() skips an input row whose output key the table already holds,
+ *  so the code runs (and pays) once per key; edits to other columns of the input row never send it again. */
+export interface KeyOnce {
+  once: "key";
+  from?: Record<string, string>;             // output key column → the input column it is read from (default: same name)
 }
 
 export interface BaseContext {
@@ -90,14 +96,21 @@ export interface HttpInit {
   headers?: Record<string, string>;
   query?: Record<string, string | number | boolean | null | undefined>;   // null/undefined omitted
   retries?: number; timeoutMs?: number;
+  // Statuses of 400 and above the code handles itself, returned as a response instead of thrown: { okStatus: [404] }
+  // for "does this exist". Never retried. An unlisted 429 or 5xx is still retried and thrown (D103).
+  okStatus?: number[];
 }
 export interface HttpResponse {
   status: number; url: string; headers: Headers; text: string;
   json<T = unknown>(): T;                    // lossless: unsafe integers → bigint
   next?: string;                             // rel="next" from the Link header
 }
+/** getBytes(): the body as raw bytes; `text` decodes them as UTF-8 only when read. */
+export interface HttpBytesResponse extends HttpResponse { bytes: Uint8Array }
 export interface Http {
   get(url: string, init?: HttpInit): Promise<HttpResponse>;
   post(url: string, body: unknown, init?: HttpInit): Promise<HttpResponse>;
+  head(url: string, init?: HttpInit): Promise<HttpResponse>;              // status and headers; text is ""
+  getBytes(url: string, init?: HttpInit): Promise<HttpBytesResponse>;     // PDFs, images, gzip: bytes, not text
 }
 export interface AssetDefinition { readonly __croft: "ingest" | "transform"; readonly config: RowsIngest | FileIngest | TransformConfig }

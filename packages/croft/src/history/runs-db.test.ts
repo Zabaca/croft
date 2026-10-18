@@ -34,6 +34,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   confirmations: ["token", "command", "impact", "impact_hash", "created_at", "expires_at", "used_at"],
   catalog: ["asset", "json", "source", "refreshed_at"],
   settings: ["key", "value"],
+  http_requests: ["host", "at", "run_id", "asset"],
 };
 
 describe("schema", () => {
@@ -226,6 +227,30 @@ describe("steps", () => {
     expect(db.latestStep("nothing")).toBeNull();
   });
 
+  test("latestSteps: latestStep of every asset", () => {
+    const r1 = db.createRun({ trigger: "manual", human: true, argv: [] });
+    db.startStep({ runId: r1.id, asset: "orders", attempt: 1, reason: "requested" });
+    db.finishStep(r1.id, "orders", 1, { status: "failed" });
+    clock += 1000;
+    db.startStep({ runId: r1.id, asset: "orders", attempt: 2, reason: "requested" });
+    db.startStep({ runId: r1.id, asset: "zones", attempt: 1, reason: "requested" });
+    expect(db.latestSteps().map((s) => [s.asset, s.attempt])).toEqual([["orders", 2], ["zones", 1]]);
+  });
+
+  test("http_requests: requests to a host after a time, oldest first; a host's rows past `forget` are dropped as it records", () => {
+    const who = { runId: "r_0922_1700_abcd", asset: "orders" };
+    db.recordRequest("api.example.com", who, "2026-09-21T17:00:00.000Z");
+    clock += 60_000;
+    db.recordRequest("api.example.com", who, "2026-09-21T17:01:00.000Z");
+    db.recordRequest("other.example.com", who, "2026-09-21T17:01:00.000Z");
+    expect(db.requestTimes("api.example.com", "2026-09-22T16:00:00.000Z")).toEqual(["2026-09-22T17:00:00.000Z", "2026-09-22T17:01:00.000Z"]);
+    expect(db.requestTimes("api.example.com", "2026-09-22T17:00:00.000Z")).toEqual(["2026-09-22T17:01:00.000Z"]);
+    clock += 86_400_000;
+    db.recordRequest("api.example.com", who, "2026-09-22T17:00:30.000Z");
+    expect(db.requestTimes("api.example.com", "1970-01-01T00:00:00.000Z")).toEqual(["2026-09-22T17:01:00.000Z", "2026-09-23T17:01:00.000Z"]);
+    expect(db.requestTimes("other.example.com", "1970-01-01T00:00:00.000Z")).toHaveLength(1);
+  });
+
   test("lastCheckSources: the checks the asset's last ok step ran, from its run's summary; null when unknown", () => {
     const result = (asset: string, status: StepResult["status"], checks: string[]): Partial<StepResult> =>
       ({ asset, status, checks: checks.map((check) => ({ check, ok: true, failing: 0 })) });
@@ -261,6 +286,53 @@ describe("steps", () => {
     db.finishStep(r4.id, "orders", 1, { status: "ok", reason: "requested (recovered)" });
     db.markCrashed(r4.id);
     expect(db.lastCheckSources("orders")).toBeNull();
+  });
+
+  // D107: one finished run of `asset`, its step ending `status` with these results; the catalog's lastRunId names
+  // it when `wrote`.
+  const finished = (asset: string, status: StepResult["status"], checks: StepResult["checks"], o: { wrote?: boolean } = {}) => {
+    clock += 1000;
+    const r = db.createRun({ trigger: "manual", human: true, argv: [] });
+    db.startStep({ runId: r.id, asset, attempt: 1, reason: "requested" });
+    db.finishStep(r.id, asset, 1, { status });
+    db.finishRun(r.id, status === "ok" ? "succeeded" : "failed", { data: { runId: r.id, steps: [{ asset, status, checks }] } });
+    if (o.wrote) db.catalogPut(asset, { asset, lastRunId: r.id }, "run");
+    return r.id;
+  };
+
+  test("lastCheckSources with blocking: a warning made blocking is new; an older croft's unmarked results count as blocking", () => {
+    finished("orders", "ok", [
+      { check: "not_null(id)", ok: true, blocking: true, failing: 0 },
+      { check: "not_null(author)", ok: false, blocking: false, failing: 2 },
+      { check: "amount >= 0", ok: true, failing: 0 },
+    ], { wrote: true });
+    expect(db.lastCheckSources("orders")).toEqual(["not_null(id)", "not_null(author)", "amount >= 0"]);
+    expect(db.lastCheckSources("orders", { blocking: true })).toEqual(["not_null(id)", "amount >= 0"]);
+    expect(db.lastStepChecks("orders")).toEqual([
+      { check: "not_null(id)", ok: true, blocking: true, failing: 0 },
+      { check: "not_null(author)", ok: false, blocking: false, failing: 2 },
+      { check: "amount >= 0", ok: true, failing: 0 },
+    ]);
+  });
+
+  test("lastStepChecks: unknown while a later run that did not end ok has written the table (lastRunId)", () => {
+    const ok = finished("issues", "ok", [{ check: "not_null(label)", ok: true, blocking: true, failing: 0 }], { wrote: true });
+    expect(db.lastStepChecks("issues")).toEqual([{ check: "not_null(label)", ok: true, blocking: true, failing: 0 }]);
+    // A failed step that wrote nothing (its write rolled back) leaves lastRunId alone.
+    finished("issues", "failed", []);
+    expect(db.lastCheckSources("issues")).toEqual(["not_null(label)"]);
+    // A failed chunked transform: its chunks committed, so the mirror names its run.
+    const failed = finished("issues", "failed", [], { wrote: true });
+    expect(db.lastStepChecks("issues")).toBeNull();
+    expect(db.lastCheckSources("issues", { blocking: true })).toBeNull();
+    // The run asking does not count its own writes: they passed its own checks.
+    expect(db.lastCheckSources("issues", { runId: failed })).toEqual(["not_null(label)"]);
+    // A lastRunId older than the ok step, or one this file has no run for, does not hide it.
+    db.catalogPut("issues", { asset: "issues", lastRunId: "r_0101_0000_gone" }, "run");
+    expect(db.lastCheckSources("issues")).toEqual(["not_null(label)"]);
+    db.catalogPut("issues", { asset: "issues", lastRunId: ok }, "run");
+    finished("issues", "ok", [], { wrote: true });
+    expect(db.lastStepChecks("issues")).toEqual([]);
   });
 
   test("danglingSteps lists the unchecked steps of ended runs only", () => {

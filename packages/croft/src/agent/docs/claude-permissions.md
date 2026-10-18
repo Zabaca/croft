@@ -24,7 +24,8 @@ Suggested rules, for .claude/settings.json (shared with your team) or .claude/se
   }
 
 If the croft project lives in data/ inside an app, use "Read(./data/.env)" and "Read(./data/.env.*)" in the
-app's settings as well.
+app's settings as well. If croft.json names a secretsFrom command (croft docs secrets), deny the agent that
+command too, since what it prints is the secrets: for sops, "Bash(sops -d:*)" and "Bash(sops decrypt:*)".
 
 What the rules do:
 - "ask": ["Bash(croft confirm:*)"]: Claude Code asks you before it runs croft confirm, whatever the token.

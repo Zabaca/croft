@@ -220,6 +220,71 @@ export default ingest({ async *rows() { yield [{ id: 1 }]; throw new TypeError("
     }
   });
 
+  // D105: a run by hand inside a wait the server stated would spend a request on the same 429.
+  test("a run by hand inside the server's wait is held with HTTP_WAIT: no request, exit 0, and its readers go ahead", async () => {
+    api.state.limited = 5;
+    api.state.retryAfter = "3600";
+    try {
+      const root = makeProject({
+        "assets/limited.ts": simpleGet(api.url, "/limited"),
+        "assets/limited_ids.sql": "select id from limited",
+      });
+      api.state.limited = 0;
+      expect((await runIn(root, ["limited"])).exit).toBe(0);
+      api.state.limited = 5;
+      const failed = await runIn(root, ["limited"], { only: true });
+      expect(failed.data.steps[0]!.error?.code).toBe("HTTP_ERROR");
+      const sent = api.state.log.length;
+      const out = await runIn(root, ["limited"]);
+      expect(api.state.log.length).toBe(sent);
+      expect(out.exit).toBe(0);
+      const [held, reader] = out.data.steps;
+      expect(held).toMatchObject({ asset: "limited", status: "skipped" });
+      expect(held!.skippedBecause).toMatch(/^held \(HTTP_WAIT\): the API answered 429 in run r_\S+ and asked to wait until /);
+      // The reader is not skipped for its input: it is up to date, since the held ingest wrote nothing.
+      expect(reader).toMatchObject({ asset: "limited_ids", status: "skipped" });
+      expect(reader!.skippedBecause).toStartWith("up to date");
+      const w = out.problems.find((p) => p.code === "HTTP_WAIT")!;
+      expect(w).toMatchObject({ severity: "warning", asset: "limited", details: { code: "HTTP_ERROR", status: 429, runId: failed.data.runId } });
+      expect(Math.abs(Date.parse(String(w.details!.until)) - Date.parse(failed.data.steps[0]!.nextRetryAt!))).toBeLessThan(10_000);
+    } finally {
+      api.state.retryAfter = "1";
+      api.state.limited = 0;
+    }
+  });
+
+  // D104: croft.json's http.budgets, counted across runs in runs.sqlite.
+  test("a spent request budget ends the step with HTTP_BUDGET_SPENT and nextRetryAt; the next run is held until it frees", async () => {
+    api.state.items = Array.from({ length: 6 }, (_, i) => ({ id: i + 1 }));
+    const host = new URL(api.url).host;
+    const root = makeProject({ "assets/items.ts": linkItems(api.url) }, { config: { http: { budgets: { [host]: { perHour: 2 } } } } });
+    const out = await runIn(root, ["items"]);
+    expect(out.exit).toBe(1);
+    expect(api.state.log.filter((l) => l.path === "/items")).toHaveLength(2);
+    const s = out.data.steps[0]!;
+    expect(s).toMatchObject({ status: "failed", attempt: 1 });
+    expect(s.error).toMatchObject({ code: "HTTP_BUDGET_SPENT", retryable: true, details: { host, window: "hour", limit: 2, used: 2, requestIndex: 3 } });
+    expect(Math.abs(Date.parse(s.nextRetryAt!) - (Date.now() + 3_600_000))).toBeLessThan(10_000);
+    expect(out.next).toContainEqual({ command: "croft run items", reason: `its request budget frees at ${s.nextRetryAt}; run it again after that` });
+    const db = runsDb(root);
+    try {
+      expect(db.requestTimes(host, "1970-01-01T00:00:00Z")).toHaveLength(2);
+    } finally {
+      db.close();
+    }
+
+    const again = await runIn(root, ["items"]);
+    expect(api.state.log.filter((l) => l.path === "/items")).toHaveLength(2);
+    expect(again.data.steps[0]).toMatchObject({ status: "skipped" });
+    expect(again.problems.find((p) => p.code === "HTTP_WAIT")).toMatchObject({ details: { code: "HTTP_BUDGET_SPENT", host } });
+
+    // A budget raised in croft.json ends the wait: it is asked again, not read from the failure.
+    writeFileSync(join(root, "croft.json"), JSON.stringify({ database: "warehouse.duckdb", timezone: "America/Los_Angeles", http: { budgets: { [host]: { perHour: 10 } } } }));
+    const raised = await runIn(root, ["items"]);
+    expect(raised.data.steps[0]).toMatchObject({ status: "ok", rows: { total: 6 } });
+    expect(api.state.log.filter((l) => l.path === "/items")).toHaveLength(5);
+  });
+
   test("retries: 0 in the asset means one attempt only", async () => {
     api.state.failures = 10;
     const root = makeProject({ "assets/flaky.ts": simpleGet(api.url, "/flaky", "\n  retries: 0,") });
@@ -1208,6 +1273,35 @@ export default ingest({
     const log2 = readFileSync(logPath(join(root, ".croft"), second.data.runId, "known"), "utf8");
     expect(log2).toContain(`seen [[1,"170141183460469231731687303715884105727"],[2,"5"]]`);
     expect(await rows(root, "select id, known from known order by id")).toEqual([{ id: 1n, known: true }, { id: 2n, known: true }]);
+  });
+
+  test("ingest.md's recipe: a merge ingest skips what earlier runs saved and does a batch of the rest per run", async () => {
+    const root = makeProject({
+      "assets/lookups.ts": `import { ingest } from "@zabaca/croft";
+
+const ids = ["a", "b", "c", "d", "e"];
+
+export default ingest({
+  key: "id",
+  write: "merge",
+  async *rows({ query, log }) {
+    const saved = await query<{ id: string }>("select id from lookups").catch(() => []);
+    const done = new Set(saved.map((r) => r.id));
+    const todo = ids.filter((id) => !done.has(id)).slice(0, 2);
+    log("looked up", todo.join(","));
+    for (const id of todo) yield { id, n: id.charCodeAt(0) };
+  },
+});
+` });
+    // Each run saves its batch; the next one skips it, and once everything is saved a run yields nothing.
+    const logged: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const out = await runIn(root, ["lookups"]);
+      expect(out.exit).toBe(0);
+      logged.push(readFileSync(logPath(join(root, ".croft"), out.data.runId, "lookups"), "utf8").match(/looked up (\S*)/)?.[1] ?? "");
+    }
+    expect(logged).toEqual(["a,b", "c,d", "e", ""]);
+    expect(await rows(root, "select id from lookups order by id")).toEqual(["a", "b", "c", "d", "e"].map((id) => ({ id })));
   });
 
   test("ctx.query is one sandboxed SELECT: writes, other files and the state folder are refused", async () => {

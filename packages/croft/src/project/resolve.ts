@@ -638,7 +638,10 @@ export function behaviorWords(write: WriteMode, key: readonly string[], incremen
   } else if (incremental.kind === "files") {
     what = "loads new and changed files only; rows of deleted files are kept";
   } else if (incremental.kind === "new-rows") {
-    what = "processes new and changed input rows once";
+    // D106: under { once: "key" } a changed input row of a key the table holds is not processed again.
+    what = incremental.once
+      ? "processes each key once; a changed input row of a key it holds is not processed again"
+      : "processes new and changed input rows once";
   } else what = "";
   if (write === "merge") return `updates rows by ${keyText}${what ? `; ${what}` : ""}`;
   if (write === "append") return `adds the new rows${what ? `; ${what}` : ""}`;

@@ -43,7 +43,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
 import { hookContext, hookOutput, hookPaths, hookProblems, hookReport, hookSelection, hookTarget, parseHookInput, readHookStdin, showPaths } from "../../agent/hook.ts";
-import { probeSql } from "../../checks/parse.ts";
+import { checkColumns, displayIdent, probeSql } from "../../checks/parse.ts";
 import { type Code, CroftError, CODES, EXIT, isCode, problem } from "../../core/errors.ts";
 import { formatInstant } from "../../core/time.ts";
 import type { Check, Fix, Problem, ValidateAsset, ValidateData } from "../../core/types.ts";
@@ -244,10 +244,12 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
   const data: ValidateData = { order: graph.order.slice(), assets };
   if (i.types) {
     // The input row types first, with each bound SQL asset's output as its code is now, so tsc checks the TS
-    // transforms against the code that the next run will build.
+    // transforms against the code that the next run will build. Its blocking not_null checks narrow a column
+    // where the last run vouches for it too (D107).
     const generated = writeInputTypes(i.project, [...bound.outputs].flatMap(([name, columns]) => {
       const a = byName.get(name);
-      return a ? [{ asset: name, from: "code" as const, file: a.file, key: a.key, columns }] : [];
+      const notNull = a?.checks.filter((c) => c.blocking && c.kind === "not_null").flatMap((c) => checkColumns(c) ?? []) ?? [];
+      return a ? [{ asset: name, from: "code" as const, file: a.file, key: a.key, columns, notNull }] : [];
     }));
     problems.push(...generated.problems);
     const t = await typecheck(root, i.processEnv ?? {}, generated.types ? { inputTypes: generated.types } : {});
@@ -876,8 +878,9 @@ function propertyName(plain: string | undefined, quoted: string | undefined): st
 
 /**
  * A column of a generated row type that may be NULL, used as if it could not be (R51-09): every column but the
- * key and croft's own may hold NULL, so the type says `| null`. The hint names the column and a default of its
- * type. Null when the expression does not end with such a column.
+ * key, croft's own and those a blocking not_null check vouches for (D107) may hold NULL, so the type says
+ * `| null`. The hint names the column and a default of its type, and for one input the not_null check that would
+ * narrow it once a run passes it. Null when the expression does not end with such a column.
  */
 function nullableColumn(d: TscDiagnostic, root: string, at: Pick<Problem, "asset" | "line" | "column">, file: string, types?: TypesResult): Problem | null {
   if (!types) return null;
@@ -899,8 +902,11 @@ function nullableColumn(d: TscDiagnostic, root: string, at: Pick<Problem, "asset
   const fallback = Object.hasOwn(DEFAULTS, base) ? DEFAULTS[base] : undefined;
   return problem("ASSET_INVALID", {
     message: `${d.code}: ${d.message}`,
-    hint: `${column}${input ? ` of ${input.asset}` : ""} may be NULL (every column but the key may): give it a default, `
-      + `${fallback ? `(${expr} ?? ${fallback})` : `${expr} ?? <default>`}, or skip the rows where it is null`,
+    hint: `${column}${input ? ` of ${input.asset}` : ""} may be NULL (every column but the key and those a blocking not_null check covers may): `
+      + `give it a default, ${fallback ? `(${expr} ?? ${fallback})` : `${expr} ?? <default>`}, `
+      + (input
+        ? `skip the rows where it is null, or, when NULL is wrong there, check not_null(${displayIdent(column)}) in ${input.asset} (the type follows once a run passes it)`
+        : "or skip the rows where it is null"),
     ...at,
     fix: { kind: "edit", description: `handle a NULL ${expr}${onLine(at.line)}`, ...locate(file, at.line) },
     details: { tsc: d.code, ...(input ? { input: input.asset, types: input.file } : {}), column },

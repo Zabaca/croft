@@ -11,9 +11,16 @@
 //   first 500 bytes of the body. Every URL, body and message that leaves this module is redacted.
 // - res.next comes from the Link header; res.json() is lossless (unsafe integers become bigint, and a number
 //   beyond DOUBLE such as 1e400 becomes JSON.rawJSON of its text instead of Infinity).
-// - getBytes() (croft's own, for file downloads) keeps the body as raw bytes; everything above applies.
+// - okStatus lists statuses of 400 and above the code handles itself: answered with one, the request returns its
+//   response, unretried, instead of throwing (D103). An unlisted 429 or 5xx is retried and thrown as before.
+// - head() sends HEAD (status and headers, text ""); getBytes() keeps the body as raw bytes, for PDFs, images and
+//   file downloads (D103). Everything above applies to both.
+// - With a budget (http/budget.ts, croft.json http.budgets, D104), every attempt to a budgeted host first takes a
+//   request from it. A spent budget is waited out like a Retry-After when it frees within maxRetryAfterMs;
+//   otherwise the request is not sent and fails with HTTP_BUDGET_SPENT, carrying retryAfterMs and freeAt.
 import { CroftError } from "../core/errors.ts";
-import type { Http, HttpInit, HttpResponse } from "../types.ts";
+import type { Http, HttpBytesResponse, HttpInit, HttpResponse } from "../types.ts";
+import type { BudgetSpent, RequestBudget } from "./budget.ts";
 
 export interface HttpOptions {
   /** The run's signal: Ctrl-C/SIGTERM, the step's no-progress timeout, the preview row cap. */
@@ -31,18 +38,19 @@ export interface HttpOptions {
   /** The longest Retry-After croft sleeps through inside a run (default 5 min, half the default
    *  no-progress timeout). Longer waits fail at once with retryAfterMs so the run can be retried later. */
   maxRetryAfterMs?: number;
+  /** The project's per-host request budgets (croft.json http.budgets), over the live runs.sqlite. */
+  budget?: RequestBudget;
 }
 
 /** A response whose body was kept as raw bytes (getBytes). `text` decodes them as UTF-8 on first use. */
-export type BytesResponse = HttpResponse & { bytes: Uint8Array };
+export type BytesResponse = HttpBytesResponse;
 
-/** Http plus counters the runner reports (StepResult.requests, run progress). */
+/** Http plus counters the runner reports (StepResult.requests, run progress). getBytes() is also how file ingests
+ *  download: HttpResponse.text is UTF-8, which would corrupt Parquet, gzip and latin-1 files. It has the same
+ *  retries, Retry-After, timeout, signal, redaction and HTTP_ERROR as get(); a 304 (the answer to a conditional
+ *  request) is a success with an empty body. */
 export interface HttpClient extends Http {
-  /** GET that keeps the body as raw bytes, for file downloads: HttpResponse.text is UTF-8, which would
-   *  corrupt Parquet, gzip and latin-1 files. Same retries, Retry-After, timeout, signal, redaction and
-   *  HTTP_ERROR as get(); a 304 (the answer to a conditional request) is a success with an empty body. */
-  getBytes(url: string, init?: HttpInit): Promise<BytesResponse>;
-  /** Logical requests made: one per get()/post()/getBytes() call, whatever its retries. */
+  /** Logical requests made: one per get()/post()/head()/getBytes() call, whatever its retries. */
   readonly requests: number;
   /** HTTP attempts sent, retries included. */
   readonly attempts: number;
@@ -67,9 +75,9 @@ export function createHttp(opts: HttpOptions): HttpClient {
   let requests = 0;
   let attempts = 0;
 
-  async function request(method: "GET" | "POST", url: string, body: unknown, init: HttpInit, raw: true): Promise<BytesResponse>;
-  async function request(method: "GET" | "POST", url: string, body: unknown, init?: HttpInit): Promise<HttpResponse>;
-  async function request(method: "GET" | "POST", url: string, body: unknown, init: HttpInit = {}, raw = false): Promise<HttpResponse> {
+  async function request(method: Method, url: string, body: unknown, init: HttpInit, raw: true): Promise<BytesResponse>;
+  async function request(method: Method, url: string, body: unknown, init?: HttpInit): Promise<HttpResponse>;
+  async function request(method: Method, url: string, body: unknown, init: HttpInit = {}, raw = false): Promise<HttpResponse> {
     const requestIndex = ++requests;
     const signal = opts.signal;
     if (signal.aborted) throw abortReason(signal);
@@ -87,9 +95,16 @@ export function createHttp(opts: HttpOptions): HttpClient {
     const retryBaseMs = opts.retryBaseMs ?? HTTP_DEFAULTS.retryBaseMs;
     const maxRetryAfterMs = opts.maxRetryAfterMs ?? HTTP_DEFAULTS.maxRetryAfterMs;
     const shown = redact(displayUrl(target));
+    const expected = new Set((init.okStatus ?? []).filter((s) => Number.isInteger(s)));
 
     for (let attempt = 1; ; attempt++) {
       if (signal.aborted) throw abortReason(signal);
+      // The budget is taken per attempt, before it is sent: a retry is a request the API counts too.
+      for (let spent = opts.budget?.take(target) ?? null; spent; spent = opts.budget!.take(target)) {
+        if (spent.waitMs > maxRetryAfterMs) throw budgetError(spent, { method, shown, attempts: attempt - 1, requestIndex, redact, maxRetryAfterMs });
+        log(redact(`${method} ${shown}: ${budgetWords(spent)}; waiting ${seconds(spent.waitMs)} for it`));
+        await sleep(Math.max(spent.waitMs, 1), signal);
+      }
       attempts++;
       const timeout = AbortSignal.timeout(timeoutMs);
       let failure: Failure;
@@ -98,8 +113,9 @@ export function createHttp(opts: HttpOptions): HttpClient {
           method, headers, body: payload as BodyInit | undefined, redirect: "follow",
           signal: AbortSignal.any([signal, timeout]),
         });
-        // Redirects are followed; a 304 only answers a conditional request the code made itself.
-        if (res.status < 400) {
+        // Redirects are followed; a 304 only answers a conditional request the code made itself. A status the code
+        // listed in okStatus is its own answer to handle (a 404 for "not there"), never retried.
+        if (res.status < 400 || expected.has(res.status)) {
           const content = raw ? new Uint8Array(await res.arrayBuffer()) : await res.text();
           return response(res, content, target, { method, shown, attempts: attempt, requestIndex, redact });
         }
@@ -130,11 +146,14 @@ export function createHttp(opts: HttpOptions): HttpClient {
   return {
     get: (url, init) => request("GET", url, undefined, init),
     post: (url, body, init) => request("POST", url, body, init),
+    head: (url, init) => request("HEAD", url, undefined, init),
     getBytes: (url, init) => request("GET", url, undefined, init ?? {}, true),
     get requests() { return requests; },
     get attempts() { return attempts; },
   };
 }
+
+type Method = "GET" | "POST" | "HEAD";
 
 interface Attempted {
   method: string;
@@ -208,6 +227,24 @@ function failureError(f: Failure, a: Attempted & { retryable: boolean; tooLong: 
     details: { ...base, status: f.status, retryAfterMs: f.retryAfterMs, reason: "status", body },
     retryable: a.retryable,
   });
+}
+
+/** A budget with no room until later than ctx.http waits inside a run: the request was not sent (D104). */
+function budgetError(s: BudgetSpent, a: Attempted & { maxRetryAfterMs: number }): CroftError {
+  return new CroftError("HTTP_BUDGET_SPENT", {
+    message: `${a.method} ${a.shown} was not sent: ${budgetWords(s)} until ${s.freeAt}, longer than croft waits inside a run (${seconds(a.maxRetryAfterMs)})`,
+    hint: `run it again after ${s.freeAt}; if the API allows more, raise http.budgets.${s.host} in croft.json`,
+    effect: "this request was not sent, so it cost nothing against the API's quota",
+    details: {
+      method: a.method, url: a.shown, host: s.host, window: s.window, limit: s.limit, used: s.used, freeAt: s.freeAt,
+      retryAfterMs: Math.max(1, s.waitMs), attempts: a.attempts, requestIndex: a.requestIndex,
+    },
+    retryable: true,
+  });
+}
+
+function budgetWords(s: BudgetSpent): string {
+  return `the request budget for ${s.host} is spent (${s.used} of ${s.limit} per ${s.window})`;
 }
 
 function statusHint(status: number): string {

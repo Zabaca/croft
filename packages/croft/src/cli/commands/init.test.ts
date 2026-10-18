@@ -223,7 +223,7 @@ describe("croft init --with-hook (DESIGN.md §9 item 7)", () => {
 
 describe("init output helpers", () => {
   const result = (o: Partial<InitResult>): InitResult => ({
-    mode: "new", base: "/w/p", root: "/w/p", version: "0.1.0", timezone: "UTC", files: [], relocation: null, tsconfig: null,
+    mode: "new", base: "/w/p", root: "/w/p", version: "0.1.0", timezone: "UTC", files: [], relocation: null, workspace: null, tsconfig: null,
     appSteps: [], install: { ran: true, ok: true, command: "bun install", ms: 2100 }, example: { ran: false, reason: "x" }, ...o,
   });
 
@@ -251,5 +251,13 @@ describe("init output helpers", () => {
     ]);
     const failed = describeInit(result({ install: { ran: true, ok: false, command: "bun install", ms: 900, output: "error: offline" } }), "/w");
     expect(failed).toContain("bun install failed after 900 ms; the project is created but cannot run yet:\n    error: offline");
+  });
+
+  test("a project a workspace takes in: the package.json, its pattern and the exclusion to add", () => {
+    const text = describeInit(result({ root: "/w/packages/p", workspace: { file: "/w/package.json", pattern: "packages/*", exclude: "!packages/p" } }), "/w");
+    expect(text.split("\n").slice(1, 3)).toEqual([
+      'package.json takes this project into its workspaces ("packages/*"), but a croft project',
+      'installs its own pinned croft: add "!packages/p" to that "workspaces" list, then run bun install in packages/p/.',
+    ]);
   });
 });

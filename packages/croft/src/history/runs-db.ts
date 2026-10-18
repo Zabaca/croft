@@ -7,10 +7,12 @@ import { join } from "node:path";
 import { randomInt } from "node:crypto";
 import { CroftError, problem } from "../core/errors.ts";
 import { currentIdentity, type ProcessIdentity } from "../core/proc.ts";
-import type { LockHolder, Problem } from "../core/types.ts";
+import type { LockHolder, Problem, StepResult } from "../core/types.ts";
 import type { SchedulingSetting } from "../schedule/os.ts";
 
 export const RUNS_DB_FILE = "runs.sqlite";
+/** The settings row holding the hash of the secretsFrom command a person last ran an asset with (D108). */
+export const SECRETS_COMMAND_SETTING = "secrets.approvedCommand";
 export const BUSY_TIMEOUT_MS = 5000;
 
 // The v1 schema, exactly as in DESIGN.md §5. Later versions append a migration; never edit one
@@ -37,6 +39,9 @@ const MIGRATIONS: readonly string[] = [
    CREATE INDEX IF NOT EXISTS runs_by_status ON runs (status);`,
   // 2 (phase 3): per-project settings, such as scheduling on/off/paused.
   `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);`,
+  // 3: requests sent to a host with a budget in croft.json (http.budgets, D104), one row per attempt, kept a day.
+  `CREATE TABLE IF NOT EXISTS http_requests (host TEXT, at TEXT, run_id TEXT, asset TEXT);
+   CREATE INDEX IF NOT EXISTS http_requests_by_host ON http_requests (host, at);`,
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 
@@ -443,23 +448,55 @@ export class RunsDb {
     return row ? toStep(row) : null;
   }
 
+  /** latestStep of every asset with a step, by asset name. */
+  latestSteps(): StepRecord[] {
+    const rows = this.sqlite
+      .query(`SELECT s.* FROM steps s JOIN (SELECT asset, max(started_at) AS at FROM steps GROUP BY asset) m
+              ON m.asset = s.asset AND m.at = s.started_at ORDER BY s.asset, s.attempt DESC`)
+      .all() as StepRow[];
+    const out = new Map<string, StepRecord>();
+    for (const r of rows) if (!out.has(r.asset)) out.set(r.asset, toStep(r));
+    return [...out.values()];
+  }
+
   /**
-   * The sources of the checks and warnings the asset's last successful write ran: StepResult.checks of its
-   * latest `ok` step, from that run's stored summary (checks/run.ts ChecksHookOptions.previous). A check not
-   * among them is new or edited and covers the whole table once. null when unknown: no ok step, or its run left
-   * no summary (it crashed, or is still going); every check then covers the whole table, which is always safe.
+   * StepResult.checks of the asset's latest `ok` step, from that run's stored summary: what every row of its table
+   * passed (§3f: a new or edited check covers the whole table once, then each write's rows). null when unknown:
+   * no ok step; its run left no summary (it crashed, or is still going); or a later run whose step did not end ok
+   * has written the table since (the catalog mirror's lastRunId: an incremental TS transform's chunks commit before
+   * its step fails, and reconcile names a crashed step that committed). A lastRunId this file holds no run for
+   * counts as older. Restore and delete record an ok step with no checks, so after them nothing is vouched for.
+   * @param o.runId the run asking: what it wrote itself passed its own checks, so its writes do not count.
    */
-  lastCheckSources(asset: string): string[] | null {
+  lastStepChecks(asset: string, o: { runId?: string } = {}): StepResult["checks"] | null {
     const row = this.sqlite
-      .query(`SELECT r.summary AS summary FROM steps s JOIN runs r ON r.id = s.run_id
+      .query(`SELECT s.run_id AS run_id, r.started_at AS started_at, r.summary AS summary FROM steps s JOIN runs r ON r.id = s.run_id
               WHERE s.asset = ? AND s.status = 'ok' ORDER BY s.started_at DESC, s.attempt DESC LIMIT 1`)
-      .get(asset) as { summary: string | null } | null;
+      .get(asset) as { run_id: string; started_at: string | null; summary: string | null } | null;
     if (!row) return null;
+    const wrote = this.catalogGet<{ lastRunId?: unknown } | null>(asset)?.value?.lastRunId;
+    if (typeof wrote === "string" && wrote !== row.run_id && wrote !== o.runId) {
+      const later = this.getRun(wrote);
+      if (later && later.startedAt >= (row.started_at ?? "")) return null;
+    }
     const steps = (parseJson(row.summary) as { data?: { steps?: unknown } } | null)?.data?.steps;
     if (!Array.isArray(steps)) return null;
     const step = steps.find((s) => (s as { asset?: unknown } | null)?.asset === asset) as { status?: unknown; checks?: unknown } | undefined;
     if (!step || step.status !== "ok" || !Array.isArray(step.checks)) return null;
-    return step.checks.flatMap((c) => (typeof (c as { check?: unknown } | null)?.check === "string" ? [(c as { check: string }).check] : []));
+    return step.checks.filter((c): c is StepResult["checks"][number] => typeof (c as { check?: unknown } | null)?.check === "string");
+  }
+
+  /**
+   * The sources of the checks and warnings the asset's last successful write ran (lastStepChecks; checks/run.ts
+   * ChecksHookOptions.previous). A check not among them is new or edited and covers the whole table once. null
+   * when unknown; every check then covers the whole table, which is always safe.
+   * @param o.blocking only the blocking checks', for the blocking checks: a warning's rows were never refused, so a
+   * warning made blocking is new (a result an older croft recorded, with no `blocking`, counts as blocking).
+   * @param o.runId as lastStepChecks.
+   */
+  lastCheckSources(asset: string, o: { blocking?: boolean; runId?: string } = {}): string[] | null {
+    const checks = this.lastStepChecks(asset, o.runId === undefined ? {} : { runId: o.runId });
+    return checks && checks.filter((c) => !o.blocking || c.blocking !== false).map((c) => c.check);
   }
 
   /** Steps of ended runs that reconcile has left to check against the warehouse: those markCrashed or
@@ -533,6 +570,18 @@ export class RunsDb {
     const row = this.sqlite.query("SELECT approved_code_hash FROM schedule_state WHERE asset = ?").get(asset) as
       { approved_code_hash: string | null } | null;
     return row?.approved_code_hash ?? null;
+  }
+
+  /** Record croft.json's secretsFrom command (project/env.ts secretsCommandHash) as one a person has run with: a
+   *  human-initiated run or preview of an asset that declares secrets succeeded under it (D108). */
+  approveSecretsCommand(hash: string): void {
+    this.setSetting(SECRETS_COMMAND_SETTING, hash);
+  }
+
+  /** The secretsFrom command a person last ran an asset with, as its hash, or null. */
+  approvedSecretsCommand(): string | null {
+    const v = this.getSetting<unknown>(SECRETS_COMMAND_SETTING);
+    return typeof v === "string" ? v : null;
   }
 
   // ---- schedule_state and the tick row (§8) ----
@@ -626,6 +675,20 @@ export class RunsDb {
 
   setScheduling(s: SchedulingSetting): void {
     this.setSetting("scheduling", s);
+  }
+
+  // ---- requests to hosts with a budget (http/budget.ts, D104) ----
+
+  /** When the requests to `host` recorded after `after` (ISO-8601 UTC, exclusive) were sent, oldest first. */
+  requestTimes(host: string, after: string): string[] {
+    return (this.sqlite.query("SELECT at FROM http_requests WHERE host = ? AND at > ? ORDER BY at")
+      .all(host, after) as { at: string }[]).map((r) => r.at);
+  }
+
+  /** Records one request sent to `host` now; requests to it older than `forget` are dropped. */
+  recordRequest(host: string, who: { runId: string; asset: string }, forget: string): void {
+    this.sqlite.query("DELETE FROM http_requests WHERE host = ? AND at <= ?").run(host, forget);
+    this.sqlite.query("INSERT INTO http_requests (host, at, run_id, asset) VALUES (?, ?, ?, ?)").run(host, this.nowIso(), who.runId, who.asset);
   }
 
   // ---- catalog mirror of _croft.* (DuckDB wins on disagreement) ----

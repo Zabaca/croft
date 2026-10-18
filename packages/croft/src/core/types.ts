@@ -8,14 +8,17 @@ export type Incremental =
   | { kind: "none" }
   | { kind: "cursor"; field: string; unit?: "s" | "ms"; lookbackMs: number }
   | { kind: "files" }
-  | { kind: "new-rows"; inputs: string[] };                  // TS newRows()
+  | { kind: "new-rows"; inputs: string[]; once?: OnceColumn[] };   // TS newRows(); once: { once: "key" } (D106)
+/** incremental: { once: "key" } as resolved (§3e, D106): each output key column, and the input column newRows()
+ *  reads it from to tell whether the table already holds the key. */
+export interface OnceColumn { key: string; from: string }
 export interface Check { source: string; kind: "unique" | "not_null" | "min_rows" | "rule";
   blocking: boolean; scope: "batch" | "table"; sql: string; reads: string[] }
 // ResolvedAsset (§10) is project/resolve.ts's: it carries the loaded TS and SQL modules, whose types core/ does
 // not import (src/read.ts's declarations are type-checked against this file without them).
 export type Reason = "requested" | "schedule_due" | "never_built" | "code_changed" | "input_changed"
   | "input_replaced" | "rebuild" | "backfill";
-export type Hold = "code_not_run_by_hand" | "large_reprocess" | "paused" | "leased";
+export type Hold = "code_not_run_by_hand" | "large_reprocess" | "paused" | "leased" | "retry_after";
 export interface PlanStep { asset: string; action: "fetch" | "rebuild" | "update" | "skip";
   reasons: Reason[]; hold?: Hold; window?: { sinceValue: string | number; sinceType: CursorType };
   confirmation?: Impact }
@@ -37,7 +40,10 @@ export interface StepResult {
   rows: { in: number; added: number; updated: number; unchanged: number; deleted: number; total: number };
   schemaChanges: SchemaChange[]; cursor?: { before?: string; after?: string; sinceUsed?: string };
   inputs?: { input: string; seenBefore: string | null; seenAfter: string; rows: number }[];
-  requests?: number; checks: { check: string; ok: boolean; failing?: number; sample?: Row[] }[];
+  requests?: number;
+  /** Every check and warning the step ran. `blocking` is false for a warning (§3f); a step an older croft recorded
+   *  has none (RunsDb.lastStepChecks, D107). */
+  checks: { check: string; ok: boolean; blocking?: boolean; failing?: number; sample?: Row[] }[];
   trashed?: { path: string; rows: number }; logsCommand: string; durationMs: number; error?: Problem;
   /** Present when this step created the table ("new table, 31 columns (7 JSON)", §4.2): its columns
    *  without croft's _loaded_at, and how many of them are JSON. */

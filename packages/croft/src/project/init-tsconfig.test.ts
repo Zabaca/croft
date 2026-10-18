@@ -17,7 +17,7 @@ const SKIPPED = ["data/assets", "data/lib"];
 function edited(text: string) {
   const plan = planExclude(text);
   expect(plan.status).toBe("needed");
-  return { plan, after: plan.after!, value: toValue(parseJsonc(plan.after!)) as { exclude?: string[]; include?: string[] } };
+  return { plan, after: plan.after!, value: toValue(parseJsonc(plan.after!)) as Record<string, unknown> & { exclude?: string[]; include?: string[] } };
 }
 
 describe("planExclude: skip the project's Bun-only folders, include its row types", () => {

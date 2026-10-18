@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import type { Sql } from "../core/types.ts";
 import { openMemory } from "../db/connect.ts";
@@ -12,7 +12,7 @@ import type { FileIngest, Http, HttpInit, HttpResponse } from "../types.ts";
 import { ident } from "./classify.ts";
 import {
   buildFileBatch, type ByteHttp, extractFiles, type ExtractFilesInput, type FileBatch, type FileExtract, fileId, formatFromContentType, formatFromName,
-  parquetColumn, readKnownFiles, recordFiles,
+  parquetColumn, readKnownFiles, recordFiles, unreadableHint,
 } from "./files.ts";
 import { type KnownColumn, normalizePins } from "./types.ts";
 import { type WriteResult, writeBatch } from "./write.ts";
@@ -24,10 +24,12 @@ afterAll(async () => {
   await closeAllWarehouses();
 });
 
-const noHttp: Http = {
+// No getBytes: a download takes extractFiles' own fetch, as it does for any client without one.
+const noHttp = {
   get: () => Promise.reject(new Error("no network in this test")),
   post: () => Promise.reject(new Error("no network in this test")),
-};
+  head: () => Promise.reject(new Error("no network in this test")),
+} as Omit<Http, "getBytes"> as Http;
 
 let runSeq = 0;
 
@@ -129,11 +131,15 @@ describe("formats and names", () => {
     expect(formatFromName("x.ndjson")).toBe("ndjson");
     expect(formatFromName("x.json.gz")).toBe("json");
     expect(formatFromName("x.parquet")).toBe("parquet");
+    expect(formatFromName("x.yaml")).toBe("yaml");
+    expect(formatFromName("x.YML")).toBe("yaml");
     expect(formatFromName("x.xlsx")).toBeUndefined();
     expect(formatFromContentType("text/csv; charset=utf-8")).toBe("csv");
     expect(formatFromContentType("application/json")).toBe("json");
     expect(formatFromContentType("application/x-ndjson")).toBe("ndjson");
     expect(formatFromContentType("application/vnd.apache.parquet")).toBe("parquet");
+    expect(formatFromContentType("application/yaml")).toBe("yaml");
+    expect(formatFromContentType("text/x-yaml")).toBe("yaml");
     expect(formatFromContentType("text/html")).toBeUndefined();
   });
 
@@ -219,6 +225,30 @@ describe("DuckDB and Bun behaviors this module relies on", () => {
     expect(String(strict)).toContain("Line: 4");
   });
 
+  test("lines ending in both CRLF and LF defeat the sniffer and a declared dialect; a CRLF file with LF inside a quoted cell reads", async () => {
+    const { dir, sql } = await memory();
+    const crlf = ["id,keyword,volume", ...Array.from({ length: 105 }, (_, i) => `${i + 1},kw ${i + 1},${(i + 1) * 10}`)].join("\r\n") + "\r\n";
+    writeFileSync(join(dir, "mixed.csv"), `${crlf}106,kw 106,1060\n`);
+    const sniffed = await sql.all(`SELECT * FROM sniff_csv('${dir}/mixed.csv')`).catch((e: Error) => e);
+    expect(String(sniffed)).toContain("detect the CSV parsing dialect");
+    const declared = await sql.all(`SELECT * FROM read_csv('${dir}/mixed.csv', all_varchar = true, header = true, delim = ',', quote = '"', escape = '"')`).catch((e: Error) => e);
+    expect(String(declared)).toContain("detect the CSV parsing dialect");
+    writeFileSync(join(dir, "mixed-lf.csv"), `${crlf.replaceAll("\r\n", "\n")}106,kw 106,1060\n`);
+    expect(await sql.all(`SELECT count(*)::INTEGER AS n FROM read_csv('${dir}/mixed-lf.csv', all_varchar = true)`)).toEqual([{ n: 106 }]);
+    writeFileSync(join(dir, "excel.csv"), `${crlf}106,"two\nlines",1060\r\n`);
+    expect(await sql.all(`SELECT keyword FROM read_csv('${dir}/excel.csv', all_varchar = true) WHERE id = '106'`)).toEqual([{ keyword: "two\nlines" }]);
+  });
+
+  test("Bun.YAML.parse: YAML 1.2 core types, a document stream as a list, big integers as lossy numbers", () => {
+    expect(Bun.YAML.parse("- a: 1\n  b: x\n- a: 2\n")).toEqual([{ a: 1, b: "x" }, { a: 2 }]);
+    expect(Bun.YAML.parse("---\na: 1\n---\na: 2\n")).toEqual([{ a: 1 }, { a: 2 }]);
+    expect(Bun.YAML.parse("a: 1\n---\n")).toEqual([{ a: 1 }, null]);
+    expect(Bun.YAML.parse("# nothing\n")).toBeNull();
+    expect(Bun.YAML.parse("d: 2026-01-02\nt: 2026-01-02T10:00:00Z\ny: yes\nz: 007\nn: ~\n")).toEqual({ d: "2026-01-02", t: "2026-01-02T10:00:00Z", y: "yes", z: 7, n: null });
+    expect((Bun.YAML.parse("id: 9007199254740993\n") as { id: number }).id).toBe(9007199254740992);
+    expect(() => Bun.YAML.parse("a: [1, 2\n")).toThrow("YAML Parse error");
+  });
+
   test("rows a transaction inserts get transaction-local rowids, contiguous in insertion order", async () => {
     const { conn, sql } = await memory();
     await conn.run("BEGIN TRANSACTION");
@@ -297,6 +327,31 @@ describe("extractFiles", () => {
 
     const rebuilt = await extract(p, cfg, { known, rebuild: true });
     expect(rebuilt.files.filter((f) => f.status !== "gone").map((f) => f.status)).toEqual(["changed", "new"]);
+  });
+
+  test("files outside the project: a ../ glob resolves from the project root, and the identity is the absolute path", async () => {
+    const p = project({ asset: "outside" });
+    const out = `${p.root}-outside`;
+    mkdirSync(join(out, "sub"), { recursive: true });
+    cleanups.push(() => rmSync(out, { recursive: true, force: true }));
+    writeFileSync(join(out, "a.json"), '[{"id":1,"v":"a"}]');
+    writeFileSync(join(out, "b.json"), '[{"id":2,"v":"b"}]');
+    const spec = `../${basename(out)}/*.json`;
+    const cfg = { file: spec, incremental: true, key: "id" };
+    const first = await run(p, cfg);
+    expect(first.extract.files.map((f) => [f.path, f.status])).toEqual([[join(out, "a.json"), "new"], [join(out, "b.json"), "new"]]);
+    expect(first.extract.files.every((f) => f.local!.startsWith(join(p.stateDir, "staging")))).toBe(true);
+    expect(await q(p, `SELECT id, v, _file FROM outside ORDER BY id`)).toEqual([
+      { id: 1, v: "a", _file: join(out, "a.json") }, { id: 2, v: "b", _file: join(out, "b.json") },
+    ]);
+    // Tracked like any file: unchanged is skipped, a changed one is reloaded, and so is a literal ../ path.
+    expect((await run(p, cfg)).extract.unchanged).toBe(true);
+    writeFileSync(join(out, "b.json"), '[{"id":2,"v":"B"}]');
+    const third = await run(p, cfg);
+    expect(third.extract.files.map((f) => f.status)).toEqual(["unchanged", "changed"]);
+    expect(await q(p, `SELECT v FROM outside ORDER BY id`)).toEqual([{ v: "a" }, { v: "B" }]);
+    const literal = await extract(p, { file: `../${basename(out)}/a.json` });
+    expect(literal.files.map((f) => [f.path, f.status])).toEqual([[join(out, "a.json"), "unchanged"], [join(out, "b.json"), "gone"]]);
   });
 
   test("a non-incremental ingest loads every file when anything changed, and nothing when nothing did", async () => {
@@ -521,6 +576,47 @@ describe("CSV", () => {
     }
     p.put("files/bad.csv", "id,name,note\n1,a,x\n2,b\n");
     expect((await failure(run(p, { file: "files/bad.csv" }))).message).toContain("Line: 3");
+  });
+
+  test("lines ending in both CRLF and LF load: the read copy has LF outside quotes, the recorded file is the file's own", async () => {
+    const p = project({ asset: "kw" });
+    const crlf = ["id,keyword,volume,note", ...Array.from({ length: 105 }, (_, i) => `${i + 1},kw ${i + 1},${(i + 1) * 10},"a\r\nb"`)].join("\r\n") + "\r\n";
+    const body = `${crlf}106,a longer keyword phrase,999999,"x\ny"\n`;
+    p.put("files/kw.csv", body);
+    const logs: string[] = [];
+    const cfg = { file: "files/kw.csv", incremental: true, key: "id" };
+    const r = await run(p, cfg, { log: (...a) => logs.push(a.join(" ")) });
+    expect(r.result!.rows).toMatchObject({ in: 106, added: 106, total: 106 });
+    expect(logs).toContain("files/kw.csv: 106 lines end in CRLF and 1 in LF; read with LF line endings");
+    // Line breaks inside quoted cells are values, kept byte for byte.
+    expect(await q(p, `SELECT id, volume, note FROM kw WHERE id IN (1, 106) ORDER BY id`)).toEqual([
+      { id: 1, volume: 10, note: "a\r\nb" }, { id: 106, volume: 999999, note: "x\ny" },
+    ]);
+    const f = r.extract.files[0]!;
+    expect(f.local!.endsWith("-lf.csv")).toBe(true);
+    expect(f.sha256).toBe(new Bun.CryptoHasher("sha256").update(body).digest("hex"));
+    expect(f.size).toBe(Buffer.byteLength(body));
+    expect((await run(p, cfg)).extract.unchanged).toBe(true);
+
+    // One kind of line ending (a bare LF only inside quotes) is left alone; so is a gzip file's mix, read unzipped.
+    const excel = project({ asset: "excel" });
+    excel.put("files/excel.csv", "id,note\r\n1,\"two\nlines\"\r\n2,x\r\n");
+    const e = await run(excel, { file: "files/excel.csv" });
+    expect(e.extract.files[0]!.local!.endsWith("-lf.csv")).toBe(false);
+    expect(await q(excel, `SELECT note FROM excel ORDER BY id`)).toEqual([{ note: "two\nlines" }, { note: "x" }]);
+    const gz = project({ asset: "gz" });
+    gz.put("files/gz.csv.gz", Bun.gzipSync(new TextEncoder().encode(body)));
+    const g = await run(gz, { file: "files/gz.csv.gz", key: "id" });
+    expect(g.extract.files[0]!.csv!.gzip).toBe(false);
+    expect(await q(gz, `SELECT count(*)::INTEGER AS n FROM gz`)).toEqual([{ n: 106 }]);
+  });
+
+  test("FILE_UNREADABLE's hint claims a ragged line only when a strict read found one", () => {
+    expect(unreadableHint("CSV Error on Line: 4\nExpected Number of Columns: 3 Found: 4")).toContain("does not have the same columns as its header");
+    const dialect = unreadableHint("Error when sniffing file \"x.csv\".\nIt was not possible to automatically detect the CSV parsing dialect");
+    expect(dialect).not.toContain("same columns");
+    expect(dialect).toContain("a quote that is never closed");
+    expect(unreadableHint("Invalid Input Error: line 3 column 2: bad")).toBe("check that the file is complete and in the declared format");
   });
 
   test("money, day-first and month-first dates, ambiguous dates by time zone, mixed orders", async () => {
@@ -1047,6 +1143,7 @@ describe("URLs", () => {
     const http: Http & ByteHttp = {
       get: () => Promise.reject(new Error("get() must not be used for downloads")),
       post: () => Promise.reject(new Error("unused")),
+      head: () => Promise.reject(new Error("unused")),
       async getBytes(url: string, init?: HttpInit): Promise<HttpResponse & { bytes: Uint8Array }> {
         calls.push(`${url} ${JSON.stringify(init?.headers ?? {})}`);
         const bytes = new TextEncoder().encode("id\n1\n");
@@ -1182,7 +1279,7 @@ describe("Parquet", () => {
 
 // ---------------------------------------------------------------------------------------------------------
 
-describe("JSON and NDJSON", () => {
+describe("JSON, NDJSON and YAML", () => {
   test("a JSON array goes through the API pipeline: exact big integers, JSON columns, zoned timestamps", async () => {
     const p = project({ asset: "orders" });
     p.put("files/orders.json", { fixture: "orders.json" });
@@ -1234,6 +1331,38 @@ describe("JSON and NDJSON", () => {
     p.put("files/lines.json", '{"a": 3}');
     await run(p, { file: "files/lines.json" });
     expect(await q(p, `SELECT a FROM j`)).toEqual([{ a: 3 }]);
+  });
+
+  test("YAML maps to rows as JSON does: a list, one mapping, or one mapping per document; values follow the JSON rules", async () => {
+    const p = project({ asset: "specs" });
+    p.put("files/specs/a.yaml", "- id: 1\n  name: first\n  starts: 2026-01-02\n  limits: {weekly: 40}\n- id: 2\n  name: second\n  starts: 2026-02-03\n");
+    p.put("files/specs/b.yml", "id: 3\nname: third\n");
+    p.put("files/specs/c.yaml", "---\nid: 4\nname: fourth\n---\nid: 5\nname: fifth\n---\n");
+    p.put("files/specs/d.yaml", "# nothing here yet\n");
+    const r = await run(p, { file: "files/specs/*", incremental: true, key: "id" });
+    expect(r.extract.format).toBe("yaml");
+    expect(r.extract.staged).toBe(true);
+    expect(await types(p)).toMatchObject({ id: "BIGINT", name: "VARCHAR", starts: "DATE", limits: "JSON", _file: "VARCHAR" });
+    expect(await q(p, `SELECT id, name, starts::VARCHAR AS starts, limits::VARCHAR AS limits, _file FROM specs ORDER BY id`)).toEqual([
+      { id: 1, name: "first", starts: "2026-01-02", limits: '{"weekly":40}', _file: "files/specs/a.yaml" },
+      { id: 2, name: "second", starts: "2026-02-03", limits: null, _file: "files/specs/a.yaml" },
+      { id: 3, name: "third", starts: null, limits: null, _file: "files/specs/b.yml" },
+      { id: 4, name: "fourth", starts: null, limits: null, _file: "files/specs/c.yaml" },
+      { id: 5, name: "fifth", starts: null, limits: null, _file: "files/specs/c.yaml" },
+    ]);
+    // A list item that is not a mapping, YAML that does not parse, and a big integer YAML cannot keep.
+    p.put("files/specs/e.yaml", "- id: 6\n- just text\n");
+    const notRow = await failure(extract(p, { file: "files/specs/*", incremental: true, key: "id" }));
+    expect(notRow.code).toBe("ROW_NOT_OBJECT");
+    expect(notRow.problem.hint).toContain("a YAML file holds one mapping per row");
+    p.put("files/specs/e.yaml", "- id: [6\n");
+    const bad = await failure(extract(p, { file: "files/specs/*", incremental: true, key: "id" }));
+    expect(bad.code).toBe("FILE_UNREADABLE");
+    expect(bad.message).toContain("files/specs/e.yaml is not valid YAML");
+    p.put("files/specs/e.yaml", "id: 12345678901234567890\nname: big\n");
+    const big = await run(p, { file: "files/specs/*", incremental: true, key: "id" });
+    const unsafe = big.batch!.warnings.find((w) => w.code === "UNSAFE_INTEGER");
+    expect(unsafe?.hint).toContain("quote such values in the YAML file");
   });
 });
 

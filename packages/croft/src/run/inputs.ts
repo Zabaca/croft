@@ -3,7 +3,10 @@
 //
 //   ctx.rows(x)      every row of input x, from <staging>/<asset>/in/<x>/all.parquet
 //   ctx.newRows(x)   the rows after the transform's composite position in x, from new.parquet (an incremental
-//                    transform; a full-refresh one keeps no position, so newRows() is rows() there)
+//                    transform; a full-refresh one keeps no position, so newRows() is rows() there). Under
+//                    incremental: { once: "key" } (D106) only those whose output key the table does not hold, one
+//                    per key. A position moves past a row left out only with a later row handed over; one left
+//                    out after the last stays after the position, left out again while the table holds its key
 //   ctx.query(sql)   one SELECT over the declared inputs, each a view over its all.parquet
 //
 // Each snapshot is taken on first use, under one short read lease (run/snapshot.ts), and read through a private
@@ -54,7 +57,7 @@ import { mapQueryError } from "../read/select.ts";
 import { relationNames } from "../sql/ast.ts";
 import { assertOneSelect } from "../sql/gate.ts";
 import { croftError } from "./ingest.ts";
-import { type InputFacts, type InputSnapshot, type SeenPosition, snapshotColumnsSql, snapshotInput } from "./snapshot.ts";
+import { type InputFacts, type InputSnapshot, onceMissing, type OnceFilter, type SeenPosition, snapshotColumnsSql, snapshotInput } from "./snapshot.ts";
 
 /** Properties that code outside the asset reads off any object it is handed (await, JSON.stringify, test
  *  matchers, React): they are never columns, and a guarded row answers undefined for them instead of throwing. */
@@ -93,6 +96,9 @@ export interface TransformInputsOptions {
   /** Incremental transforms read newRows() after their positions and track them; a full-refresh transform
    *  keeps no position, so its newRows() is rows(). */
   incremental: boolean;
+  /** incremental: { once: "key" } (D106): newRows() hands over only the rows whose output key the transform's
+   *  table does not hold yet, one per key (run/snapshot.ts OnceFilter). */
+  once?: OnceFilter;
   /** croft preview's cap: at most this many rows of each input. */
   limit?: number;
   /** Called for every input row handed to the code (the no-progress watchdog counts it). */
@@ -183,6 +189,7 @@ export class TransformInputs {
     if (!this.o.incremental) return { [Symbol.asyncIterator]: () => this.fullIterator(name) };
     const facts = this.o.facts.get(name);
     if (facts && facts.key.length === 0) throw this.needsKey(name);
+    if (facts && this.o.once && onceMissing(facts.columns, this.o.once.columns).length > 0) throw this.onceUnmapped(name, facts.columns);
     return { [Symbol.asyncIterator]: () => this.newIterator(name) };
   }
 
@@ -322,7 +329,8 @@ export class TransformInputs {
       if (this.#closed) throw this.afterStep(name);
       const snap = await snapshotInput(this.o.warehouse, {
         input: name, dir: join(this.o.stageDir, "in", name), kind, after: kind === "new" ? this.o.saved.get(name) ?? null : null,
-        ...(this.o.limit !== undefined ? { limit: this.o.limit } : {}), signal: this.o.signal,
+        ...(this.o.limit !== undefined ? { limit: this.o.limit } : {}), ...(kind === "new" && this.o.once ? { once: this.o.once } : {}),
+        signal: this.o.signal,
       });
       if (!snap) throw this.notBuilt(name);
       if (kind === "all") use.allSnapshot = snap;
@@ -643,6 +651,29 @@ export class TransformInputs {
           : `add ${JSON.stringify(name)} to inputs in ${this.o.file}, so croft builds it first and knows the dependency`,
       ...(self ? {} : { fix: { kind: "edit" as const, description: `add ${JSON.stringify(name)} to inputs: [${[...this.o.inputs, name].map((n) => JSON.stringify(n)).join(", ")}]`, file: this.o.file } }),
       details: { input: name, via, inputs: [...this.o.inputs], ...(guess ? { suggestion: guess } : {}) },
+    });
+  }
+
+  /** UNKNOWN_INPUT_COLUMN for a once-per-key transform whose output key cannot be read from an input's rows: a key
+   *  column with no input column of its name and no `from` that names one (D106). No row of the input is handed
+   *  over. The fix names, for each key column, the input column it would be read from (a did-you-mean). */
+  private onceUnmapped(name: string, columns: readonly RealColumn[]): CroftError {
+    const once = this.o.once!.columns;
+    const missing = onceMissing(columns, once);
+    const names = columns.map((c) => c.name).filter((c) => !HIDDEN.has(c));
+    const prop = (k: string) => (/^[A-Za-z_$][\w$]*$/.test(k) ? k : JSON.stringify(k));
+    const from = once.map((o) => {
+      const guess = missing.includes(o) ? didYouMean(o.from, names) ?? `<column of ${name}>` : o.from;
+      return `${prop(o.key)}: ${JSON.stringify(guess)}`;
+    }).join(", ");
+    const edit = `incremental: { once: "key", from: { ${from} } }`;
+    return new CroftError("UNKNOWN_INPUT_COLUMN", {
+      asset: this.o.asset, file: this.o.file,
+      message: `${name} has no column ${missing.map((m) => JSON.stringify(m.from)).join(", ")}, which incremental: { once: "key" } reads the key of ${this.o.asset} from`,
+      hint: `name the column of ${name} each key column is read from: ${edit}`,
+      fix: { kind: "edit", description: edit, file: this.o.file },
+      effect: `no row of ${name} was processed`,
+      details: { input: name, column: missing[0]!.from, columns: names, once: once.map((o) => ({ ...o })) },
     });
   }
 

@@ -222,6 +222,14 @@ const restore = lazyCommand({
   maxPositionals: 1,
 }, async () => (await import("./restore.ts")).restore);
 
+const backup = lazyCommand({
+  name: "backup",
+  summary: "copy the warehouse, run history and trash, as one consistent moment, to a new folder (works while croft serve runs)",
+  usage: "croft backup [<dir>]",
+  options: {},
+  maxPositionals: 1,
+}, async () => (await import("./backup.ts")).backup);
+
 const newCmd = lazyCommand({
   name: "new",
   summary: "write a commented, working template for a new asset; --list shows the kinds",
@@ -235,5 +243,5 @@ const newCmd = lazyCommand({
 
 export const COMMANDS: readonly Command[] = [
   docs, help, version, init, doctor, validate, preview, run, wait, status, query, describe, context, logs, secrets, confirm,
-  schedule, serve, tick, rename, del, restore, newCmd,
+  schedule, serve, tick, rename, del, restore, backup, newCmd,
 ];

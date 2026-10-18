@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { problem } from "../core/errors.ts";
 import { type CatalogAsset, type CatalogColumn, putCatalog } from "../history/catalog.ts";
 import { tryAcquire } from "../history/leases.ts";
 import { RunsDb } from "../history/runs-db.ts";
@@ -487,6 +488,21 @@ export default transform({
     });
     const zones = stepsOf((await run({ selectors: ["zones"] })).data).zones;
     expect(zones).toMatchObject({ hold: "leased", reason: "replace; run r_0922_1150_live holds it now, so the run would wait for it" });
+  });
+
+  test("an asset inside the server's wait (D105): held with HTTP_WAIT, as the run holds it; after the wait it fetches", async () => {
+    const { run } = setup(FILES, CATALOG, (db) => {
+      const r = db.createRun({ trigger: "manual", human: true, argv: ["run", "zones"] });
+      db.startStep({ runId: r.id, asset: "zones", attempt: 1, reason: "requested" });
+      db.finishStep(r.id, "zones", 1, { status: "failed", error: problem("HTTP_ERROR", { message: "429", hint: "later", retryable: true, details: { status: 429, retryAfterMs: 2 * 3_600_000 } }) });
+    });
+    const out = await run({ selectors: ["zones"] });
+    expect(stepsOf(out.data).zones).toMatchObject({ action: "skip", hold: "retry_after" });
+    expect(stepsOf(out.data).zones!.skippedBecause).toMatch(/^held: the API answered 429 in run r_\S+ and asked to wait until /);
+    expect(out.problems.find((p) => p.code === "HTTP_WAIT")).toMatchObject({ severity: "warning", details: { until: "2026-09-22T20:00:00.000Z" } });
+    const later = await run({ selectors: ["zones"], now: new Date("2026-09-22T20:00:01.000Z") });
+    expect(stepsOf(later.data).zones).toMatchObject({ action: "fetch" });
+    expect(later.problems.some((p) => p.code === "HTTP_WAIT")).toBe(false);
   });
 
   test("without runs.sqlite everything is never built, and nothing is created", async () => {

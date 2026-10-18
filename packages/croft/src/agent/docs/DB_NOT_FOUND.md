@@ -20,7 +20,8 @@ What to do:
 - Deleted with croft delete: croft restore <asset> brings the table back from the trash.
 - Built, then dropped outside croft: croft doctor compares every table with what croft last wrote; ask the user
   before rebuilding it.
-- Built before and now missing: ask the user where the file went, and put it back or point "database" at it.
+- Built before and now missing: ask the user where the file went, and put it back or point "database" at it. A
+  croft backup folder holds a copy: croft docs backup says how to put it back.
   Running an asset instead starts an empty warehouse and fetches everything again from the sources, which can
   cost time and API calls: only do that after the user agrees.
 - No preview: croft preview <asset> first, then croft query --preview "from <asset>".

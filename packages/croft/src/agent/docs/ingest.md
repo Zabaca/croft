@@ -160,9 +160,9 @@ export default ingest({
 
 ## Files: a folder of exports, or a URL
 
-Paths are relative to the project folder; put input files under files/. Formats come from the extension
-(.csv, .tsv, .json, .ndjson/.jsonl, .parquet), or from format:. croft new file <name> writes the first example
-and makes its folder, files/<name>/.
+Paths are relative to the project folder, wherever croft was started; put the project's input files under files/
+(files elsewhere work too, below). Formats come from the extension (.csv, .tsv, .json, .ndjson/.jsonl, .parquet,
+.yaml/.yml), or from format:. croft new file <name> writes the first example and makes its folder, files/<name>/.
 
 ```ts
 // assets/sales.ts: every CSV dropped into files/sales/ is loaded once; changed files are reloaded
@@ -190,17 +190,40 @@ export default ingest({
 });
 ```
 
+- Files outside the project are read the same way: file: "../shared/specs/*.json" (relative to the project
+  folder) or an absolute path. Each is copied into the state folder before it is loaded and tracked like any other
+  file, so incremental: true loads only new and changed ones. Their _file is the absolute path, so moving that
+  folder makes them new files. croft query reads only files/: look at them through the asset's table.
+- A YAML file is read like a JSON file: a list is one row per item, a mapping is one row, and a file of several
+  documents (---) is one row per document. YAML's own rules type the values, as in any YAML reader: an unquoted
+  007 is the number 7, and an integer beyond 2^53 loses digits (UNSAFE_INTEGER). Quote values that must stay text.
+- CSV lines may end in CRLF or LF, both in one file (a row appended by another tool): croft reads such a file with
+  one kind of line ending and changes no value, so appending rows to an export is fine.
+
 ## What rows() gets
 
 - since: the saved cursor (minus lookback) in its own JSON type, undefined on the first run, or the value of
   croft run <name> --from <when> (a date, an ISO time or -90d; merge ingests only).
-- http.get(url, {headers, query, retries, timeoutMs}) and http.post(url, body, {...}): retries network errors,
-  429 and 5xx, honors Retry-After, and throws HTTP_ERROR for 400 and above. null and undefined query values are
-  dropped, so since can be passed as is. res.json() keeps big integers exact; res.text; res.next.
+- http.get(url, {headers, query, retries, timeoutMs, okStatus}) and http.post(url, body, {...}): retries network
+  errors, 429 and 5xx, honors Retry-After, and throws HTTP_ERROR for 400 and above. null and undefined query values
+  are dropped, so since can be passed as is. res.json() keeps big integers exact; res.text; res.next.
+  - okStatus: [404] returns those statuses as a response (res.status) instead of throwing, for "does this
+    exist". An unlisted 429 or 5xx is still retried and thrown; never .catch(() => null) a request.
+  - http.head(url) gets the status and headers only. http.getBytes(url) keeps the body as res.bytes (a
+    Uint8Array) for PDFs, images and gzip, which res.text would corrupt; res.bytes.byteLength is its size.
+  - Conditional requests: send headers {"If-None-Match": etag} or {"If-Modified-Since": date}; an unchanged
+    resource answers 304, a response with an empty body, not an error.
+  - croft.json "http": {"budgets": {"api.example.com": {"perHour": 50, "perDay": 125}}} caps the requests to a
+    host across runs and previews (perMinute, perHour, perDay); a spent budget sends nothing and stops the step
+    with HTTP_BUDGET_SPENT until it frees (croft docs HTTP_BUDGET_SPENT).
 - secret("NAME"): only names listed in secrets: [...]; a missing value is SECRET_MISSING.
 - log(...): goes to the step's log (croft logs <name>), redacted.
 - query(sql): one SELECT over this asset's own table, e.g. which ids it already has.
 - signal: aborted on timeout or Ctrl-C.
+
+Asset code runs in the project folder: croft changes into it before it runs a command, and scheduled and
+background runs start there. So a relative path in code, in assets/ or lib/ alike
+(readFileSync("files/rules.json")), reads the project's file.
 
 Other options: schedule (when it runs on its own: "every hour", "daily at 06:00", "weekdays at 9am", "monthly" or a
 cron; croft docs scheduling), columns (type pins, e.g. { amount: "DECIMAL(18,2)" }), write ("replace", "append" or "merge"),
@@ -224,3 +247,38 @@ A long first load of a cursor ingest is saved in parts, every 50,000 rows or 5 m
 arrives in ascending order (the step's reason says "saved in N commits"). A failure or a kill late in the load then
 continues from the last part saved instead of from the start. A newest-first source is saved in one commit at the
 end. With a lookback, a run that gets no rows although the window held rows last time warns EMPTY_EXTRACT.
+
+A rows() ingest without a cursor is saved in one commit too: a run that stops partway saves nothing, and the next
+run starts again from its first request. When every request costs (a lookup per name, a search per query), split
+the work across runs: merge by key, read with query() what earlier runs saved, and do a batch of the rest.
+
+```ts
+// assets/company_records.ts: one paid lookup per company, at most 200 per run
+import { ingest } from "@zabaca/croft";
+
+const companyIds: string[] = ["C-1001", "C-1002", "C-1003"];     // or import the list from lib/
+
+export default ingest({
+  description: "The registry record of every company in companyIds",
+  schedule: "every hour",       // works through the list on its own, a batch an hour
+  secrets: ["REGISTRY_KEY"],
+  key: "company_id",
+  write: "merge",               // rows earlier runs saved stay; each run adds its batch
+
+  async *rows({ http, secret, query }) {
+    // What earlier runs saved. On the first run there is no table yet and query() throws, hence the catch;
+    // it would hide a mistake in this SQL too, so keep it a plain select of the key.
+    const saved = await query<{ company_id: string }>("select company_id from company_records").catch(() => []);
+    const done = new Set(saved.map((r) => r.company_id));
+    for (const id of companyIds.filter((c) => !done.has(c)).slice(0, 200)) {
+      const res = await http.get(`https://api.example.com/v1/companies/${id}`, {
+        headers: { Authorization: `Bearer ${secret("REGISTRY_KEY")}` },
+      });
+      yield { ...res.json<Record<string, unknown>>(), company_id: id };
+    }
+  },
+});
+```
+
+Each run that succeeds saves its batch, and a failed run loses only its own. Once every id is saved, a run makes
+no request.

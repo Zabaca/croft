@@ -3,7 +3,10 @@
 // `croft secrets` lists every secret the assets declare (their `secrets` lists, read by importing each asset
 // as validate does), whether it is set, where the value comes from (.env, or the shell environment, which
 // wins), and which assets use it. It never prints a value: an agent confirms a secret exists without reading
-// it. `--json` data is [{name, status: "set"|"missing", source: ".env"|"env"|null, usedBy}].
+// it. `--json` data is [{name, status: "set"|"missing"|"unchecked", source: ".env"|"env"|"command"|null, usedBy}].
+// With croft.json's secretsFrom (D108), a name the shell and .env lack makes it run that command once, and the
+// name is set from the command, missing from it, or unchecked when the command failed (its SECRETS_COMMAND_FAILED
+// is in problems, so the exit is 2). A list the shell and .env cover never runs it.
 //
 // `croft secrets set NAME` writes NAME to <project>/.env with mode 0600, keeping every other line (comments,
 // order, other keys) as it was. The value comes from a hidden prompt on a TTY, or from stdin with --stdin
@@ -13,7 +16,7 @@ import { chmodSync, existsSync, lstatSync, readFileSync, realpathSync, renameSyn
 import { dirname, join } from "node:path";
 import { CroftError, problem } from "../../core/errors.ts";
 import type { Problem } from "../../core/types.ts";
-import { parseDotenv, type SecretStatus } from "../../project/env.ts";
+import { commandText, parseDotenv, type SecretStatus } from "../../project/env.ts";
 import { discoverAssets } from "../../project/discover.ts";
 import type { CommandImpl, Ctx } from "../command.ts";
 import { table } from "../render.ts";
@@ -241,8 +244,10 @@ export const secrets: CommandImpl<SecretsData> = {
     const declared = secretsByAsset(configs);
 
     if (sub === undefined) {
-      const list = ctx.env.listSecrets(declared);
-      return { data: list, problems: envProblems(ctx), next: [] };
+      // The secretsFrom command runs only for a name the shell and .env lack (D108).
+      const list = ctx.env.listSecrets(declared, { run: true });
+      const failed = ctx.env.commandFailure();
+      return { data: list, problems: [...envProblems(ctx), ...(failed ? [failed.problem] : [])], next: [] };
     }
 
     if (name === undefined || extra.length > 0 || !NAME.test(name)) {
@@ -263,7 +268,7 @@ export const secrets: CommandImpl<SecretsData> = {
     };
     return { data, problems: [], next: [] };
   },
-  human(result) {
+  human(result, ctx) {
     const d = result.data;
     if (!Array.isArray(d)) {
       const notes: string[] = [];
@@ -273,11 +278,17 @@ export const secrets: CommandImpl<SecretsData> = {
       return notes.join("\n");
     }
     if (d.length === 0) return "No asset declares a secret. Declare one with secrets: [\"NAME\"] in the asset.";
+    const from = ctx.env.secretsFrom;
+    const where = { env: "environment", ".env": ".env", command: "secretsFrom command" } as const;
     const rows = d.map((s) => [
       s.name,
-      s.status === "set" ? `set (${s.source === "env" ? "environment" : ".env"})` : "missing",
-      `used by ${s.usedBy.join(", ")}${s.status === "missing" ? ` → add ${s.name}=... to .env` : ""}`,
+      s.status === "set" ? `set (${where[s.source ?? ".env"]})` : s.status === "unchecked" ? "unchecked" : "missing",
+      `used by ${s.usedBy.join(", ")}${s.status === "missing" ? ` → add ${s.name}=... to .env${from ? " or to the secretsFrom store" : ""}` : ""}`,
     ]);
-    return table(["NAME", "STATUS", "USED BY"], rows, { limit: Infinity, maxWidth: 200 }).text.split("\n").slice(1).join("\n");
+    const text = table(["NAME", "STATUS", "USED BY"], rows, { limit: Infinity, maxWidth: 200 }).text.split("\n").slice(1).join("\n");
+    if (!from) return text;
+    // Where the rest comes from, and whether it ran: it runs only for a name the shell and .env lack.
+    const ran = ctx.env.commandFailure() ? "it failed (below)" : ctx.env.commandRan ? "it ran" : "not run: the environment and .env set every name";
+    return `${text}\n\nsecretsFrom (croft.json): ${commandText(from.command)} (${ran})`;
   },
 };

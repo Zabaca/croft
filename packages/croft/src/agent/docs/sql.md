@@ -115,6 +115,11 @@ GROUP BY region
 - Columns named like SQL keywords must be quoted: "order", "group" (QUOTE_IDENTIFIER).
 - Nested fields are JSON columns: col->>'field', col->>'$[*].name', json_each(col). croft describe <input> lists
   the keys.
+- Put ->> and -> in parentheses whenever anything else is in the expression. DuckDB takes everything to their
+  left as the JSON they read: they bind more loosely than AND, OR, NOT, = and ||. So
+  `state = 'open' AND user->>'login' = 'x'` runs as `((state = 'open' AND user)->>'login') = 'x'` and fails with
+  "Conversion Error: Failed to cast value ...: {...}". Write `state = 'open' AND (user->>'login') = 'x'`, or
+  json_extract_string(user, 'login'). The same goes for the value of json_each: `(e.value->>'name') = 'bug'`.
 - TIMESTAMPTZ values cast to DATE in croft.json's timezone; epoch seconds become a timestamp with
   to_timestamp(created).
 

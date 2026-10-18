@@ -26,10 +26,11 @@ App code reads with the same function in both modes:
 
 Rows are typed by table name: query<"daily_revenue">(sql) returns daily_revenue's rows as this function hands
 them over (.croft/types/daily_revenue.d.ts, DailyRevenueReadRow), once croft has written its type after a run or
-preview, and plain rows until then. The app's tsconfig.json must include the project's .croft/types. For an app
-with the project in data/, croft init proposes the edit: "data/.croft/types/**/*.d.ts" in "include", and
-"data/assets" and "data/lib" in "exclude" (excluding all of data would drop the types too). A join or an aggregate
-has no table type: query<{ day: string }>(sql).
+preview, and plain rows until then. Every column may be null there but the key and those a blocking not_null
+check of the table covers once a run has passed it. The app's tsconfig.json must include the project's
+.croft/types. For an app with the project in data/, croft init proposes the edit: "data/.croft/types/**/*.d.ts"
+in "include", and "data/assets" and "data/lib" in "exclude" (excluding all of data would drop the types too). A
+join or an aggregate has no table type: query<{ day: string }>(sql).
 
 In the project (or an app whose croft project is data/), it finds the running server and its token in
 .croft/serve.json; with no server running it opens the file briefly per query. An app elsewhere (Vercel, Fly)

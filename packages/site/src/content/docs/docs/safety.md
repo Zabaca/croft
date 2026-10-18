@@ -56,3 +56,14 @@ A restore puts the current table in the trash first, so a restore can itself be 
 `.croft/` holds the trash and the backups croft makes before a DuckDB upgrade, so it is not a cache. Never delete it, and never run `git clean -X` in a croft project.
 
 See [The trash](/docs/guides/trash/) for the details.
+
+## Backups
+
+The trash undoes a croft command; a backup survives losing the folder or the disk. `croft backup` copies the warehouse, the run history and the trash, as one consistent moment, to a new folder:
+
+```sh
+croft backup                     # a new folder in .croft/backups/
+croft backup /Volumes/Backup     # or inside a folder on another disk
+```
+
+It takes the file the way a croft writer does, so it is safe while `croft serve` runs or a run is going: serve steps aside for the moment a checkpoint and a copy-on-write clone take. Never copy `warehouse.duckdb` by hand; a copy taken mid-write, or with commits still in its WAL, can miss rows. croft never overwrites or deletes a backup. Putting one back is a few manual steps, described in [Backups](/docs/guides/backup/).

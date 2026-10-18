@@ -31,11 +31,11 @@
 //   ASSET_RENAMED with `croft rename <old> <new>` as its fix and in next, since neither name runs until it finishes.
 import { accessSync, constants as fsConstants, existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, join, relative, resolve as resolvePath, sep } from "node:path";
 import { CroftError, problem } from "../../core/errors.ts";
 import { now, offsetSeconds } from "../../core/time.ts";
 import type { LockHolder, Problem } from "../../core/types.ts";
-import { BACKUPS_KEPT, backupsDir, compareEngineVersions, type EngineRecord, listBackups, recordedEngine } from "../../db/backup.ts";
+import { BACKUPS_KEPT, backupsDir, compareEngineVersions, type EngineRecord, listBackups, listProjectBackups, recordedEngine } from "../../db/backup.ts";
 import { filesystemKind, folderKind, type FsKind } from "../../db/fs-kind.ts";
 import { isHolderAlive, liveIntents } from "../../db/intent.ts";
 import { readCopyStatus, readCopySummary } from "../../db/readcopy.ts";
@@ -43,10 +43,11 @@ import { CLAUDE_MD, claudeBlock, findBlock, SKILL_PATH, skillStamp } from "../..
 import { type DriftEntry, driftTexts, recentDrift } from "../../history/drift.ts";
 import { listLeases } from "../../history/leases.ts";
 import { RUNS_DB_FILE, RunsDb } from "../../history/runs-db.ts";
-import { ProjectEnv } from "../../project/env.ts";
+import { commandText, ProjectEnv } from "../../project/env.ts";
 import { appRootOf, relocationPlan } from "../../project/init.ts";
-import { configProblems, findRoot, loadProject, syncedLocation, type ConfigIssue, type Project } from "../../project/root.ts";
+import { configProblems, findRoot, loadProject, syncedLocation, type ConfigIssue, type Project, type SecretsFrom } from "../../project/root.ts";
 import { croftHome, type CroftHome } from "../../schedule/home.ts";
+import { jobPath } from "../../schedule/register.ts";
 import { type OsRunner, realRunner } from "../../schedule/os.ts";
 import type { CommandImpl } from "../command.ts";
 import { LAUNCH_ENV, SELF_ROOT } from "../launcher.ts";
@@ -967,8 +968,9 @@ function checkDrift(r: Report, d: DoctorDeps, project: Project): void {
 
 /**
  * Pre-upgrade backups (§6 "Before an engine upgrade", db/backup.ts): how many, their size and the newest, in
- * .croft/backups/. When the DuckDB this croft loads is newer than the engine runs.sqlite recorded, the next command
- * that writes backs the warehouse up first, and the line says so (info). No line with neither. Reads only.
+ * .croft/backups/, and the croft backup folders there (D109; ones made elsewhere are not known). When the DuckDB this
+ * croft loads is newer than the engine runs.sqlite recorded, the next command that writes backs the warehouse up
+ * first, and the line says so (info). No line with none of them. Reads only.
  */
 function checkBackups(r: Report, d: DoctorDeps, project: Project, probe: DuckdbProbe): void {
   let at: Date;
@@ -981,9 +983,10 @@ function checkBackups(r: Report, d: DoctorDeps, project: Project, probe: DuckdbP
   } catch { /* runs.sqlite cannot be read: nothing pending that doctor can tell */ }
   const running = probe.ok ? probe.version : null;
   const pending = running !== null && rec !== null && existsSync(project.paths.database) && compareEngineVersions(running, rec.version) > 0;
-  if (list.length === 0 && !pending) return;
-  const bare = (v: string) => v.replace(/^v(?=\d)/, "");
   const dir = backupsDir(stateDir);
+  const made = listProjectBackups(dir);
+  if (list.length === 0 && made.length === 0 && !pending) return;
+  const bare = (v: string) => v.replace(/^v(?=\d)/, "");
   const shownDir = `${inside(project.root, dir) ? relative(project.root, dir) : dir}/`;
   const parts: string[] = [];
   if (list.length) {
@@ -991,13 +994,17 @@ function checkBackups(r: Report, d: DoctorDeps, project: Project, probe: DuckdbP
     const newest = list[0]!;
     const count = list.length === 1 ? "1 before a DuckDB upgrade" : `${formatCount(list.length)} before DuckDB upgrades`;
     parts.push(`backups: ${count}, ${formatBytes(bytes)} in ${shownDir} (newest ${agoText(newest.at, at)}: ${newest.from} → ${newest.to}; the ${BACKUPS_KEPT} newest are kept)`);
-  } else {
-    parts.push("backups: none yet");
   }
+  if (made.length) {
+    const bytes = made.reduce((sum, b) => sum + b.bytes, 0);
+    const what = `${formatCount(made.length)} by croft backup, ${formatBytes(bytes)}${list.length ? "" : ` in ${shownDir}`} (newest ${agoText(made[0]!.createdAt, at)})`;
+    parts.push(list.length ? what : `backups: ${what}`);
+  }
+  if (!list.length && !made.length) parts.push("backups: none yet");
   if (pending) parts.push(`the next croft command that writes backs the warehouse up first (DuckDB ${bare(rec!.version)} → ${bare(running!)})`);
   r.add("project", "backups", pending ? "info" : "ok", parts.join(" · "), undefined, {
     backups: list.map((b) => ({ path: b.path, at: b.at, from: b.from, to: b.to, bytes: b.bytes, wal: b.wal !== null })),
-    recorded: rec?.version ?? null, running, pending,
+    projectBackups: made, recorded: rec?.version ?? null, running, pending,
   });
 }
 
@@ -1052,6 +1059,7 @@ async function checkSecrets(r: Report, d: DoctorDeps, project: Project, bindingO
     return;                          // .env cannot be read: checkEnvFiles already says so
   }
   const list = env.listSecrets(declared);
+  if (env.secretsFrom) checkSecretsCommand(r, d, project, env.secretsFrom, list.filter((s) => s.status === "unchecked").map((s) => s.name));
   if (list.length === 0) return;
   const missing = list.filter((s) => s.status === "missing");
   for (const s of missing) {
@@ -1065,7 +1073,41 @@ async function checkSecrets(r: Report, d: DoctorDeps, project: Project, bindingO
     p.severity = "warning";
     r.add("project", "secrets", "warn", `${s.name} (used by ${s.usedBy.join(", ")})`, p, { name: s.name, usedBy: s.usedBy });
   }
-  if (missing.length === 0) r.add("project", "secrets", "ok", `secrets: ${list.map((s) => s.name).join(", ")} set`);
+  const set = list.filter((s) => s.status === "set");
+  if (missing.length === 0 && set.length > 0) r.add("project", "secrets", "ok", `secrets: ${set.map((s) => s.name).join(", ")} set`);
+}
+
+/**
+ * croft.json's secretsFrom (D108), without running it (doctor never reads a secret): the names only it can supply,
+ * and whether its program is found, on this PATH and on the one scheduled runs get (register.ts jobPath: Bun's
+ * folder, /opt/homebrew/bin on macOS, /usr/local/bin and the system folders). A program found on neither is
+ * SECRETS_COMMAND_FAILED as a warning, since a run that needs it would fail; one only this shell finds is the same
+ * warning about scheduled runs, with the absolute path as the fix.
+ */
+function checkSecretsCommand(r: Report, d: DoctorDeps, project: Project, from: SecretsFrom, unchecked: string[]): void {
+  const program = from.command[0]!;
+  const shown = commandText(from.command);
+  const scheduled = jobPath(dirname(process.execPath), d.platform);
+  const here = program.includes("/") ? (existsSync(resolvePath(project.root, program)) ? resolvePath(project.root, program) : null)
+    : Bun.which(program, { PATH: d.env.PATH ?? "" });
+  const forScheduler = program.includes("/") ? here : Bun.which(program, { PATH: scheduled });
+  const names = unchecked.length ? `; ${unchecked.join(", ")} can only come from it (croft secrets runs it to check)` : "";
+  const warn = (message: string, hint: string, description: string) => {
+    const p = problem("SECRETS_COMMAND_FAILED", {
+      message, hint, file: "croft.json", fix: { kind: "manual", description, requiresHuman: true }, details: { command: from.command },
+    });
+    r.add("project", "secrets-from", "warn", message, { ...p, severity: "warning" }, { command: from.command, found: here, unchecked });
+  };
+  if (!here) {
+    warn(`secretsFrom: ${program} is not on PATH, so ${shown} cannot run${names}`,
+      `install ${program}, or write its absolute path as the first element of secretsFrom.command in croft.json`,
+      `ask the user to install ${program} or give its absolute path in croft.json's secretsFrom.command`);
+  } else if (!forScheduler) {
+    warn(`secretsFrom: ${program} is found here (${here}) but not on the PATH scheduled runs get (${scheduled})`,
+      `write "${here}" as the first element of secretsFrom.command in croft.json`, `use "${here}" in croft.json's secretsFrom.command`);
+  } else {
+    r.add("project", "secrets-from", "info", `secretsFrom: ${shown} (${here}), not run by doctor${names}`, undefined, { command: from.command, found: here, unchecked });
+  }
 }
 
 /** CLAUDE.md's managed block and SKILL.md's version stamp against this croft (CLAUDE_FILES_OUTDATED). */

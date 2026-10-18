@@ -30,6 +30,10 @@
 // every input row again (action rebuild), and an SQL or full-refresh TS transform is recomputed as always. What the
 // run takes besides them (downstream, --upstream) runs as in any run. The runner trashes and asks (run/rebuild.ts).
 //
+// A known wait (§8 "Retries", D105): in a run by hand, an asset whose latest step the API told to wait (a long
+// Retry-After not over yet) or whose host's request budget is still spent is held (PlanInput.waits), with HTTP_WAIT:
+// running it now would only spend a request on the same answer. --due has the scheduler's own hold for it.
+//
 // --due in a scheduled run (§6 "The scheduler only runs code a human has run"): with DuePlanning.imports, a TS
 // asset whose code is not the code a human last ran is not imported at all (project/resolve.ts importApproved): its
 // step is planned from what the scheduler knows of it (PlannedStep.notImported) and held.
@@ -90,7 +94,7 @@ export interface PlannedStep {
   action: "fetch" | "rebuild" | "update" | "skip";
   reasons: Reason[];
   /** Why the scheduler (or the cost guard) holds the step back; a held step does not run. A manual run holds
-   *  nothing: it asks for confirmation instead (the planner never sets it before phase 3). */
+   *  only an asset inside a known wait (retry_after, D105); for the rest it asks for confirmation instead. */
   hold?: Hold;
   /** Why the step runs, or why it is skipped, in words: "requested", "requested; SQL changed (assets/x.sql)",
    *  "input github_issues may have new rows". Run output shows it under the step when it is not "requested". */
@@ -160,7 +164,7 @@ export interface PlannedStep {
 export interface DuePlanning {
   /** Why the scheduler must not run this step now (SCHEDULE_HELD, LARGE_REPROCESS, paused, leased), or null.
    *  `reason` becomes the step's reason; `problem` (a warning) goes with the skipped step. */
-  hold(step: { asset: string; file: string; kind: StepKind; codeHash?: string; ok: boolean }): { hold: Hold; reason: string; problem?: Problem } | null;
+  hold(step: { asset: string; file: string; kind: StepKind; codeHash?: string; ok: boolean; secrets?: readonly string[] }): { hold: Hold; reason: string; problem?: Problem } | null;
   /** The fire a due ingest handles (its schedule as written), or null. */
   fire(step: { asset: string; schedule?: string }): string | null;
   /** What the scheduled run may import (§6): a TS asset only when the code hash of its bundle (computed without
@@ -218,6 +222,9 @@ export interface PlanInput {
    *  ingest is taken as schedule_due, a transform only for its staleness (one that is up to date by now is
    *  skipped), and every step, downstream included, gets the scheduler's holds. */
   due?: DuePlanning;
+  /** A run by hand (not --due): the step of an asset whose next request must wait (schedule/due.ts knownWaits and
+   *  waitHeld, D105) is held with that reason and an HTTP_WAIT warning, and runs nothing. */
+  waits?: (asset: string, file: string) => { reason: string; problem: Problem } | null;
 }
 
 /** TS assets get 2 retries after a retryable error (§8 "Retries"). */
@@ -236,12 +243,15 @@ export function rebuildCommand(asset: string, o: { allowShrink?: boolean } = {})
 /**
  * The incremental TS transforms that read `ingest` with newRows() and whose code makes requests (the cost guard's
  * transforms), among `readers`. A --rebuild of the ingest gives every row a new _loaded_at, so each of them would
- * process every row again and pay for it: the rebuild's confirmation counts them (run/rebuild.ts). Sorted.
+ * process every row again and pay for it: the rebuild's confirmation counts them (run/rebuild.ts). Not one with
+ * incremental: { once: "key" } (D106): it pays only for keys its table does not hold, which a refetch does not add
+ * by restamping rows, and its own cost guard counts and asks for those. Sorted.
  */
 export function paidReadersOf(ingest: string, readers: readonly string[], byName: ReadonlyMap<string, Pick<ResolvedAsset, "kind" | "ts" | "incremental" | "usesHttp">>): string[] {
   return readers.filter((r) => {
     const a = byName.get(r);
     if (!a || stepKindOf(a) !== "transform" || a.incremental.kind !== "new-rows" || a.usesHttp !== true) return false;
+    if (a.incremental.once) return false;
     const reads = a.ts?.readsNewRows;
     return !reads || reads.includes(ingest);
   }).sort();
@@ -599,6 +609,14 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
       }
     }
     if (i.due) applyDue(step, i.due);
+    else if (i.waits && step.action !== "skip") {
+      const w = i.waits(step.asset, step.file);
+      if (w) {
+        step.hold = "retry_after";
+        step.reason = `held: ${w.reason}`;
+        step.problems.push(w.problem);
+      }
+    }
     if (step.kind === "file" && step.action !== "skip" && a.ts?.definition) {
       for (const d of fileDirsOf(i.root, a.ts.definition.config as FileIngest)) fileDirs.add(d);
     }
@@ -625,7 +643,10 @@ function applyDue(step: PlannedStep, due: DuePlanning): void {
     step.reason = "up to date: nothing it reads changed since the scheduler found it due";
     return;
   }
-  const h = due.hold({ asset: step.asset, file: step.file, kind: step.kind, ...(step.codeHash ? { codeHash: step.codeHash } : {}), ok: loadErrors(step).length === 0 });
+  const h = due.hold({
+    asset: step.asset, file: step.file, kind: step.kind, ...(step.codeHash ? { codeHash: step.codeHash } : {}), ok: loadErrors(step).length === 0,
+    ...(step.spec ? { secrets: step.spec.secrets } : {}),
+  });
   if (h) {
     step.hold = h.hold;
     step.reason = h.reason;

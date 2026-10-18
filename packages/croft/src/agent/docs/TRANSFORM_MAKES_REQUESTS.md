@@ -16,7 +16,9 @@ What to do: make it incremental, so each input row is processed once:
       }
     },
 
-Every input read with newRows() needs a key (INPUT_NEEDS_KEY). croft docs transforms has the whole template.
+Every input read with newRows() needs a key (INPUT_NEEDS_KEY). An input row that changed is sent again; to pay
+once per key whatever changes upstream, write incremental: { once: "key" } instead. croft docs transforms has
+the whole template.
 
 The detection reads the bundled code, so an unrelated variable named http counts too: rename it if the
 transform makes no requests.

@@ -9,10 +9,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { RunsDb } from "../history/runs-db.ts";
-import { cleanup as cleanupChildren, spawnIdle, writeIntent } from "../read/testkit.ts";
+import { cleanup as cleanupChildren, spawnHolder, spawnIdle, writeIntent } from "../read/testkit.ts";
+import type { SchedulingSetting } from "../schedule/os.ts";
 import {
-  BACKUPS_DIR, BACKUPS_KEPT, backupBeforeUpgrade, backupsDir, compareEngineVersions, ENGINE_SETTING, type EngineRecord, listBackups, recordedEngine,
+  BACKUP_MANIFEST, type BackupManifest, BACKUPS_DIR, BACKUPS_KEPT, backupBeforeUpgrade, backupProject, backupsDir, compareEngineVersions,
+  ENGINE_SETTING, type EngineRecord, listBackups, listProjectBackups, recordedEngine,
 } from "./backup.ts";
+import { listIntents } from "./intent.ts";
 import { closeAllWarehouses, openWarehouse } from "./warehouse.ts";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "croft-backup-")));
@@ -347,3 +350,159 @@ describe("the warehouse's first read-write open", () => {
     expect(files(join(p.stateDir, BACKUPS_DIR))).toEqual([]);
   });
 });
+
+// Project backups (croft backup, D109, §6 "Backups of the project's data"): the warehouse checkpointed and cloned
+// under a write lease, runs.sqlite through VACUUM INTO and the trash cloned whole, into a new folder that takes its
+// name only once it is complete and never replaces another.
+describe("backupProject", () => {
+  const TZ = "America/Los_Angeles";
+  const clock = () => AT;
+  const projectOf = (p: { root: string; stateDir: string; database: string }) => ({
+    root: p.root, timezone: TZ, paths: { database: p.database, stateDir: p.stateDir } as never,
+  });
+  /** A trash version as safety/trash.ts leaves one: <state>/trash/<asset>/<time>.duckdb and its sidecar. */
+  async function trashVersion(stateDir: string, asset: string, rows: number): Promise<void> {
+    const dir = join(stateDir, "trash", asset);
+    mkdirSync(dir, { recursive: true });
+    await seed(join(dir, "20260920T100000.000Z.duckdb"), rows, false);
+    writeFileSync(join(dir, "20260920T100000.000Z.json"), JSON.stringify({ asset, rows }));
+  }
+  const partials = (dir: string) => files(dir).filter((f) => f.startsWith(".croft-partial-"));
+
+  test("holds every commit, the WAL's included, with runs.sqlite and the trash, in a new folder in .croft/backups", async () => {
+    const p = await project({ rows: 1_500, wal: true });
+    const runs = RunsDb.open(p.stateDir);
+    runs.setSetting("scheduling", { state: "on", via: "os-job" });
+    runs.close();
+    await trashVersion(p.stateDir, "orders", 4);
+    const b = await backupProject(projectOf(p), { now: clock, isTTY: false });
+    const name = `${p.root.slice(p.root.lastIndexOf("/") + 1)}-20260924T140203Z`;
+    expect(b.path).toBe(join(backupsDir(p.stateDir), name));
+    expect(b).toMatchObject({
+      createdAt: "2026-09-24T07:02:03.456-07:00", sameDisk: true,
+      warehouse: { file: "warehouse.duckdb", method: expect.stringMatching(/^(clone|reflink|copy)$/) },
+      runs: { file: "runs.sqlite" }, trash: { dir: "trash", versions: 1 },
+    });
+    expect(b.bytes).toBe(b.warehouse.bytes + b.runs!.bytes + b.trash!.bytes);
+    // The checkpoint folded the WAL first: the copy has every committed row, and no WAL of its own.
+    expect(await count(join(b.path, "warehouse.duckdb"))).toBe(1_500);
+    expect(existsSync(join(b.path, "warehouse.duckdb.wal"))).toBe(false);
+    expect(await count(join(b.path, "trash", "orders", "20260920T100000.000Z.duckdb"))).toBe(4);
+    const copy = RunsDb.open(b.path);
+    try {
+      expect(copy.getSetting<SchedulingSetting>("scheduling")).toEqual({ state: "on", via: "os-job" });
+    } finally {
+      copy.close();
+    }
+    const m = JSON.parse(readFileSync(join(b.path, BACKUP_MANIFEST), "utf8")) as BackupManifest;
+    expect(m).toMatchObject({
+      croftBackup: 1, createdAt: AT.toISOString(), duckdb: expect.stringMatching(/^v\d/),
+      project: { root: p.root, database: p.database, stateDir: p.stateDir, timezone: TZ },
+    });
+    expect(m.files.map((f) => f.path)).toEqual(["runs.sqlite", "trash/orders/20260920T100000.000Z.duckdb", "trash/orders/20260920T100000.000Z.json", "warehouse.duckdb"]);
+    expect(m.restore).toContain("croft docs backup");
+    expect(partials(backupsDir(p.stateDir))).toEqual([]);
+    expect(listProjectBackups(backupsDir(p.stateDir))).toEqual([{ path: b.path, createdAt: AT.toISOString(), bytes: b.bytes }]);
+    // A pre-upgrade backup's listing and retention never see a project backup.
+    expect(listBackups(p.stateDir)).toEqual([]);
+    // The write intent is gone once the backup returns, as every writer's is.
+    expect(listIntents(p.stateDir)).toEqual([]);
+  });
+
+  test("never replaces a backup: a second one in the same second is <name>-2, and the first is untouched", async () => {
+    const p = await project({ rows: 3 });
+    const first = await backupProject(projectOf(p), { now: clock, isTTY: false });
+    await seedMore(p.database, 2);
+    const second = await backupProject(projectOf(p), { now: clock, isTTY: false });
+    expect(second.path).toBe(`${first.path}-2`);
+    expect(await count(join(first.path, "warehouse.duckdb"))).toBe(3);
+    expect(await count(join(second.path, "warehouse.duckdb"))).toBe(5);
+    expect(second.trash).toBeNull();
+  });
+
+  test("a folder elsewhere is created; on another filesystem the copies are staged in .croft/backups and moved across", async () => {
+    const p = await project({ rows: 6 });
+    const away = join(base, `away-${n++}`, "nested");
+    const seen: string[] = [];
+    const b = await backupProject(projectOf(p), {
+      dir: away, now: clock, isTTY: false,
+      deviceOf: (d) => (d.startsWith(join(away, "..")) ? 2 : 1),
+      leased: ({ staging }) => void seen.push(staging),
+    });
+    expect(seen[0]!.startsWith(join(backupsDir(p.stateDir), ".croft-partial-"))).toBe(true);
+    expect(b.path.startsWith(away + "/")).toBe(true);
+    expect(b.sameDisk).toBe(false);
+    expect(await count(join(b.path, "warehouse.duckdb"))).toBe(6);
+    expect(partials(backupsDir(p.stateDir))).toEqual([]);
+    expect(partials(away)).toEqual([]);
+    expect(files(away)).toEqual([b.path.slice(away.length + 1)]);
+  });
+
+  test("refuses a folder inside the state folder other than its backups/, and a file, writing nothing", async () => {
+    const p = await project({ rows: 1 });
+    for (const dir of [join(p.stateDir, "trash"), p.stateDir, join(p.stateDir, "logs", "x")]) {
+      const e = await backupProject(projectOf(p), { dir, now: clock, isTTY: false }).then(() => null, (x: unknown) => x);
+      expect((e as CroftError).problem).toMatchObject({ code: "USAGE_ERROR", effect: "nothing was written" });
+    }
+    writeFileSync(join(p.root, "a-file"), "");
+    const e = await backupProject(projectOf(p), { dir: join(p.root, "a-file"), now: clock, isTTY: false }).then(() => null, (x: unknown) => x);
+    expect((e as CroftError).code).toBe("USAGE_ERROR");
+    expect(files(p.stateDir)).toEqual([]);
+  });
+
+  test("without a warehouse it is DB_NOT_FOUND, and nothing is created", async () => {
+    const p = await project();
+    const e = await backupProject(projectOf(p), { now: clock, isTTY: false }).then(() => null, (x: unknown) => x);
+    expect((e as CroftError).problem).toMatchObject({ code: "DB_NOT_FOUND", fix: { command: "croft status" } });
+    expect(files(p.stateDir)).toEqual([]);
+  });
+
+  test("a copy that fails is PROJECT_NOT_WRITABLE and leaves no partial folder; the warehouse is as it was", async () => {
+    const p = await project({ rows: 4 });
+    const e = await backupProject(projectOf(p), { now: clock, isTTY: false, cp: [join(p.root, "no-cp-here")] }).then(() => null, (x: unknown) => x);
+    expect((e as CroftError).problem).toMatchObject({
+      code: "PROJECT_NOT_WRITABLE", fix: { kind: "manual", requiresHuman: true }, details: { backups: backupsDir(p.stateDir) },
+    });
+    expect(files(backupsDir(p.stateDir))).toEqual([]);
+    expect(listIntents(p.stateDir)).toEqual([]);
+    expect(await count(p.database)).toBe(4);
+  });
+
+  test("it takes the file as a writer does: it waits for the holder, then copies what the holder committed", async () => {
+    const p = await project({ rows: 2 });
+    const holder = spawnHolder(p.database, 400, "INSERT INTO t VALUES (100), (101), (102)");
+    await holder.waitFor("held");
+    const started = Date.now();
+    let leasedAt = 0;
+    const b = await backupProject(projectOf(p), {
+      now: clock, isTTY: false,
+      leased: () => {
+        leasedAt = Date.now();
+        // Under the lease this process's write intent is announced, so croft serve stays closed meanwhile.
+        expect(listIntents(p.stateDir).map((i) => i.pid)).toEqual([process.pid]);
+      },
+    });
+    expect(leasedAt - started).toBeGreaterThanOrEqual(250);
+    expect(await count(join(b.path, "warehouse.duckdb"))).toBe(5);
+  });
+
+  test("a partial backup that a killed process left is removed; another process's live one is not", async () => {
+    const p = await project({ rows: 1 });
+    const live = spawnIdle();
+    await live.waitFor("up");
+    mkdirSync(join(backupsDir(p.stateDir), ".croft-partial-999999-old", "trash"), { recursive: true });
+    mkdirSync(join(backupsDir(p.stateDir), `.croft-partial-${live.pid}-busy`), { recursive: true });
+    await backupProject(projectOf(p), { now: clock, isTTY: false });
+    expect(partials(backupsDir(p.stateDir))).toEqual([`.croft-partial-${live.pid}-busy`]);
+  });
+});
+
+/** Add `rows` rows to t, through a private instance (closed again). */
+async function seedMore(database: string, rows: number): Promise<void> {
+  await closeAllWarehouses();
+  const db = await DuckDBInstance.create(database);
+  const c = await db.connect();
+  await c.run(`INSERT INTO t SELECT range + 1000 FROM range(${rows})`);
+  c.disconnectSync();
+  db.closeSync();
+}

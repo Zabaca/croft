@@ -29,11 +29,13 @@ croft status                # failed, stale, held, never run, edited since its l
 - Avoid now()/current_date in assets (values freeze until the next rebuild); compute ages at query time.
 - Set `key` whenever records have an id. Incremental API ingests need a key.
 - TS transforms that call an API or LLM per row: keep `incremental: true` + `newRows()` (the template default).
+  A changed input row is sent, and paid for, again; to pay once per key, write `incremental: { once: "key" }`.
   Preview them with `--rows 20`: by default a preview hands them up to 1,000 input rows, each a paid call.
 - TS transforms read `newRows("x")` with no type argument: rows get x's column types, and `croft validate --types`
   catches a column renamed upstream. A BIGINT is `number | bigint`: `Number(row.x)` before arithmetic.
 - Use `ctx.http` and `res.json()` (lossless numbers), never raw fetch + JSON.parse for API data.
 - Nested fields are JSON: `col->>'field'`, `col->>'$[*].name'`, `json_each(col)`. `croft describe` lists keys.
+  Parenthesise them beside AND, OR, NOT or =: `a AND (col->>'k') = 'v'` (without, DuckDB reads `a AND col` as the JSON).
 - Columns named like SQL keywords must be quoted: `"order"`.
 - Apps read with `import { query } from "@zabaca/croft/read"`; `query<"x">(sql)` types the rows as table x's (croft docs serve). It talks to `croft serve` when one is running (found via CROFT_URL or .croft/serve.json), otherwise opens the file briefly. Never open the .duckdb files directly.
 - `croft serve` runs until stopped: ask the user to start it in their own terminal instead of running it in your shell.
@@ -45,6 +47,10 @@ croft status                # failed, stale, held, never run, edited since its l
   (`croft new api x --pagination cursor`).
 - Records that change after creation (payments, refunds, orders, tickets) need an updated-since field or a
   lookback: incremental: { field: "created", unit: "s", lookback: "30 days" }. Epoch cursors need `unit`.
+- A status the code expects (a 404 for "not there"): `http.get(url, { okStatus: [404] })`, never
+  `.catch(() => null)`, which also hides 429s and outages. Bytes (PDFs, images): `http.getBytes(url)`.
+- An API with a stated quota (so many requests an hour or a day): ask the user to put it in croft.json
+  `"http": {"budgets": {"<host>": {"perHour": 50}}}`. HTTP_WAIT or HTTP_BUDGET_SPENT: wait until the time it gives.
 
 ## Ask the user first (show the printed impact; wait for an explicit yes in this conversation)
 - `croft confirm <token>` (every destructive action ends here: rebuild of an ingest or incremental TS transform,
@@ -74,10 +80,13 @@ croft status                # failed, stale, held, never run, edited since its l
   check with `croft secrets --json`. Never read .env.
 - Warehouse file missing (DB_NOT_FOUND in status): ask the user where it went before running anything; a run
   builds a new, empty one and refetches from the sources.
+- Backup: croft backup (into .croft/backups/), or croft backup <folder> on another disk; safe while croft serve
+  runs. Never copy warehouse*.duckdb by hand. Putting a backup back replaces data: ask the user (croft docs backup).
 
 ## Output
 - JSON timestamps carry the project offset; ::DATE uses the croft.json timezone.
 - `query` rows are capped: check data.truncatedRows before concluding anything; aggregate in SQL.
+- `query` cuts values at 80 characters, with `--json` too (data.truncatedValues counts them); add `--full-values`.
 
 ## Long work
 - Off a TTY, `croft run` returns after ~100 s with exit 6 and keeps running: `croft wait <runId> --timeout 100s`.

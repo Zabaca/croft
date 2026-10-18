@@ -30,7 +30,7 @@
 // configs without failing on one broken file, the read-only warehouse, and value capping with redaction.
 import { readFileSync } from "node:fs";
 import { CroftError, problem } from "../../core/errors.ts";
-import type { AssetKind, CursorType, Incremental, LockHolder, Problem, WriteMode } from "../../core/types.ts";
+import type { AssetKind, CursorType, Incremental, LockHolder, OnceColumn, Problem, WriteMode } from "../../core/types.ts";
 import { hasState } from "../../db/state.ts";
 import { type DuckWarehouse, type LeaseSql, openWarehouse } from "../../db/warehouse.ts";
 import { type CatalogAsset, readInputsSeen } from "../../history/catalog.ts";
@@ -38,6 +38,7 @@ import type { StepRecord } from "../../history/runs-db.ts";
 import { RESERVED } from "../../load/contract.ts";
 import { quoteIdent } from "../../load/evolve.ts";
 import { discoverAssets, type DiscoveredAsset, NAME_PATTERN } from "../../project/discover.ts";
+import { staticSecrets } from "../../project/env.ts";
 import { type ResolvedAsset, type ResolvedProject, sniffKind } from "../../project/resolve.ts";
 import type { Project } from "../../project/root.ts";
 import { parseSqlHeader } from "../../project/sql-asset.ts";
@@ -74,17 +75,8 @@ export interface AssetConfig {
   problems: Problem[];
 }
 
-/** Secret names a TS file declares, read from its text: `secrets: ["A", 'B']` lists and `secret("C")` calls.
- *  The fallback for a file that does not import, so its secrets are still known (and redacted). */
-export function staticSecrets(source: string): string[] {
-  const names = new Set<string>();
-  const literal = /(["'`])([A-Za-z_][\w.-]*)\1/g;
-  for (const m of source.matchAll(/\bsecrets\s*:\s*\[([^\]]*)\]/g)) {
-    for (const l of m[1]!.matchAll(literal)) names.add(l[2]!);
-  }
-  for (const m of source.matchAll(/\bsecret\s*\(\s*(["'`])([A-Za-z_][\w.-]*)\1\s*\)/g)) names.add(m[2]!);
-  return [...names].sort();
-}
+// staticSecrets lives with the secrets (project/env.ts), so the scheduler reads it without this module's imports.
+export { staticSecrets };
 
 function emptyConfig(a: Pick<DiscoveredAsset, "name" | "file" | "path">, kind: AssetKind | null): AssetConfig {
   return {
@@ -265,7 +257,7 @@ export function behaviorOf(c: AssetConfig | null, cat: CatalogAsset | null): Beh
     const since = `fetches rows with ${field} after the saved position${lookback ? `, re-reading the last ${lookback}` : ""}`;
     words = `${write === "merge" ? `updates rows by ${by}` : "appends new rows"}; ${since}${unit}`;
   } else if (inc.kind === "files") words = `loads only new and changed files; ${write === "merge" ? `updates rows by ${by}` : "appends their rows"}`;
-  else if (inc.kind === "new-rows") words = `processes only new input rows; ${write === "merge" ? `updates rows by ${by}` : "appends the results"}`;
+  else if (inc.kind === "new-rows") words = `processes ${inc.once ? "each key once" : "only new input rows"}; ${write === "merge" ? `updates rows by ${by}` : "appends the results"}`;
   else if (kind === "ts") words = `recomputed in full when an input changes; rows matched by ${by}`;
   else if (write === "append") words = "appends every row it fetches";
   else if (write === "merge") words = `updates rows by ${by}; fetches everything each run`;
@@ -418,6 +410,13 @@ export function lookupsOf(r: ResolvedAsset | null | undefined): string[] {
   return spec.inputs.filter((i) => !reads.includes(i));
 }
 
+/** incremental: { once: "key" } of a TS transform (D106): its key columns and the input columns they are read
+ *  from. undefined for any other asset. */
+export function onceColumnsOf(r: ResolvedAsset | null | undefined): readonly OnceColumn[] | undefined {
+  const inc = r?.ts?.spec?.incremental;
+  return inc?.kind === "new-rows" ? inc.once : undefined;
+}
+
 /** A lookup as inputsSeen shows it: read in full each run, nothing pending (its position, if older code saved
  *  one with newRows(), is kept as the state has it). */
 function lookupSeen(s: Pick<SeenInput, "seenLoadedAt" | "inputLastLoadedAt"> | null): SeenInput {
@@ -428,11 +427,12 @@ function lookupSeen(s: Pick<SeenInput, "seenLoadedAt" | "inputLastLoadedAt"> | n
  * What `asset` has seen of each input (its _croft.inputs rows, and each of `declared` it has no row for yet):
  * the position, the version it last read in full, and how many input rows come after the position. The count
  * is newRows()'s (run/snapshot.ts countAfter): later stamps, and at the position's own stamp the rows whose key
- * comes after the position's key. `lookups` (lookupsOf) are read in full each run and count nothing. Call inside
- * a read lease.
+ * comes after the position's key. `lookups` (lookupsOf) are read in full each run and count nothing. `once`
+ * (onceColumnsOf): a once-per-key transform counts only the rows newRows() would hand over, leaving out those whose
+ * key its table holds (D106). Call inside a read lease.
  */
 export async function inputsSeenOf(db: LeaseSql, asset: string, declared: readonly string[],
-  o: { lookups?: readonly string[] } = {}): Promise<Record<string, SeenInput>> {
+  o: { lookups?: readonly string[]; once?: readonly OnceColumn[] } = {}): Promise<Record<string, SeenInput>> {
   const seen = await readInputsSeen(db, asset);
   const lookups = new Set(o.lookups ?? []);
   const out: Record<string, SeenInput> = {};
@@ -447,7 +447,7 @@ export async function inputsSeenOf(db: LeaseSql, asset: string, declared: readon
     let pendingRows: number | null = null;
     if (facts?.columns.some((c) => c.name === RESERVED.loadedAt)) {
       const position = s?.seenLoadedAt ? { stamp: s.seenLoadedAt, key: Array.isArray(s.seenKey) ? s.seenKey.map(String) : null } : null;
-      pendingRows = await countAfter(db, input, facts, position);
+      pendingRows = await countAfter(db, input, facts, position, o.once ? { asset, columns: o.once } : undefined);
     }
     out[input] = { seenLoadedAt: s?.seenLoadedAt ?? null, inputLastLoadedAt: s?.inputLastLoadedAt ?? null, pendingRows };
   }
@@ -457,7 +457,7 @@ export async function inputsSeenOf(db: LeaseSql, asset: string, declared: readon
 /** What the warehouse knows about one asset. Call inside a read lease. `inputs`: the inputs its definition
  *  declares, listed in inputsSeen even before it has read them; `lookups`: those read in full each run (lookupsOf). */
 export async function readWarehouseAsset(db: LeaseSql, asset: string,
-  o: { samples: number; keys?: boolean; inputs?: readonly string[]; lookups?: readonly string[] } = { samples: 3 }): Promise<WarehouseAsset> {
+  o: { samples: number; keys?: boolean; inputs?: readonly string[]; lookups?: readonly string[]; once?: readonly OnceColumn[] } = { samples: 3 }): Promise<WarehouseAsset> {
   const out: WarehouseAsset = { state: null, tableExists: false, rows: null, columns: [], inputsSeen: {}, recentWrites: [], samples: [] };
   const withState = await hasState(db);
   if (withState) {
@@ -505,7 +505,7 @@ export async function readWarehouseAsset(db: LeaseSql, asset: string,
     }
   }
   if (withState) {
-    out.inputsSeen = await inputsSeenOf(db, asset, o.inputs ?? [], o.lookups ? { lookups: o.lookups } : {});
+    out.inputsSeen = await inputsSeenOf(db, asset, o.inputs ?? [], { ...(o.lookups ? { lookups: o.lookups } : {}), ...(o.once ? { once: o.once } : {}) });
     out.recentWrites = (await rowsOf(db,
       `SELECT run_id, loaded_at, mode, rows_in, added, updated, unchanged, deleted, cursor_before, cursor_after, schema_changes
        FROM _croft.writes WHERE asset = $1 ORDER BY loaded_at DESC LIMIT 5`, [asset])).map((w) => ({
@@ -700,7 +700,8 @@ export const describe: CommandImpl<DescribeData> = {
     let source: DescribeData["source"] = "none";
     const next: { command: string; reason: string }[] = [];
     try {
-      wh = await readOnlyWarehouse(ctx, project).read((db) => readWarehouseAsset(db, name, { samples: 3, inputs, lookups: [...lookups] }),
+      const once = onceColumnsOf(resolved?.assets.find((a) => a.name === name));
+      wh = await readOnlyWarehouse(ctx, project).read((db) => readWarehouseAsset(db, name, { samples: 3, inputs, lookups: [...lookups], ...(once ? { once } : {}) }),
         { purpose: `describe ${name}`, waitMs: DESCRIBE_TIMING.busyWaitMs });
       source = "warehouse";
     } catch (e) {

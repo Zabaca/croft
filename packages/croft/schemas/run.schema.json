@@ -244,7 +244,8 @@
             "code_not_run_by_hand",
             "large_reprocess",
             "leased",
-            "paused"
+            "paused",
+            "retry_after"
           ]
         },
         "skippedBecause": {
@@ -747,6 +748,9 @@
                 "type": "string"
               },
               "ok": {
+                "type": "boolean"
+              },
+              "blocking": {
                 "type": "boolean"
               },
               "failing": {

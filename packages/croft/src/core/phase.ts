@@ -36,7 +36,7 @@ export const COMMAND_PHASE = {
   validate: 2, preview: 2,
   schedule: 3, serve: 3, tick: 3,
   rename: 4, delete: 4, restore: 4,
-  new: 5,
+  new: 5, backup: 5,
 } as const;
 
 export type CommandName = keyof typeof COMMAND_PHASE;

@@ -32,6 +32,7 @@ export const GUIDES: [topic: string, label: string][] = [
   ["read-copy", "GUIs and notebooks"],
   ["rename", "Renaming an asset"],
   ["trash", "The trash"],
+  ["backup", "Backups"],
   ["claude-permissions", "Claude Code permissions"],
 ];
 

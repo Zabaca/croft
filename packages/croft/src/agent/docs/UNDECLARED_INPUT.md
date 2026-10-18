@@ -9,4 +9,6 @@ What to do:
 - A misspelled name: the hint names the input it is closest to.
 - The transform's own table: a transform computes its table from its inputs and never reads it. For work that
   builds on what was done before, make it incremental (incremental: true, newRows()): rows it has already
-  processed are not handed over again.
+  processed are not handed over again. To skip the input rows whose result the table already holds (paid work
+  once per key, even when the input row changes), write incremental: { once: "key" } (croft docs transforms):
+  croft checks the table for the code.

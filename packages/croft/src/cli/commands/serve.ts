@@ -89,7 +89,11 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
 
   const running = liveServer(stateDir);
   if (running && running.pid !== process.pid) throw alreadyServing(running);
-  const token = resolveToken((name) => ctx.env.lookup(name));
+  // The token comes from the shell or .env only: serve never runs the secretsFrom command (D108).
+  const token = resolveToken((name) => {
+    const found = ctx.env.lookup(name);
+    return found && found.source !== "command" ? { value: found.value, source: found.source } : null;
+  });
   const scheduling = readScheduling(stateDir, ctx);
 
   // Signals are caught from here on, so a Ctrl-C while starting still cleans up.

@@ -37,6 +37,25 @@ describe("after a run", () => {
     expect(text).toContain("  /** BIGINT, the key */\n  id: number | bigint;\n  /** DOUBLE */\n  total: number | null;\n");
   });
 
+  test("a blocking not_null the run passed narrows its columns; a warning's do not (D107)", async () => {
+    const root = makeProject({ "assets/orders.ts": `import { ingest } from "@zabaca/croft";
+export default ingest({
+  key: "id",
+  checks: ["not_null(total)"],
+  warnings: ["not_null(note)"],
+  async *rows() { yield [{ id: 1, total: 9.5, note: "a" }, { id: 2, total: 12, note: "b" }]; },
+});
+` });
+    const out = await runIn(root, [], { hooks: { refreshReadCopy: async () => {} } });
+    expect(out.exit).toBe(0);
+    expect(out.data.steps[0]!.checks).toEqual([
+      { check: "unique(id)", ok: true, blocking: true, failing: 0 }, { check: "not_null(id)", ok: true, blocking: true, failing: 0 },
+      { check: "not_null(total)", ok: true, blocking: true, failing: 0 }, { check: "not_null(note)", ok: true, blocking: false, failing: 0 },
+    ]);
+    const text = readFileSync(join(root, ".croft", "types", "orders.d.ts"), "utf8");
+    expect(text).toContain("  /** DOUBLE, never NULL: a blocking not_null check */\n  total: number;\n  /** VARCHAR */\n  note: string | null;\n");
+  });
+
   test("a run with a failed step regenerates too: a failed incremental transform may have committed chunks", async () => {
     const root = makeProject({ "assets/broken.ts": `import { ingest } from "@zabaca/croft";\nexport default ingest({ key: "id", async *rows() { throw new Error("down"); } });\n`,
       "assets/after.sql": "SELECT id FROM broken\n" });

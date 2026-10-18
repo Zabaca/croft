@@ -17,7 +17,8 @@
 // - SCHEDULE_HELD: the code is not the code a human last ran (approved_code_hash), new assets included. A hash
 //   that differs only because croft.json's timezone changed says so, rather than "code edited". An asset whose
 //   table croft delete removed (safety/trash.ts deletedByCroft) is held whatever its approval, until a person
-//   restores it or runs it: a scheduled run would build it again from scratch (refetch, re-bill);
+//   restores it or runs it: a scheduled run would build it again from scratch (refetch, re-bill). So is an asset
+//   that reads secrets while croft.json's secretsFrom command is not the one a person last ran one with (D108);
 // - LARGE_REPROCESS: a scheduled run met the cost guard, and no person has run the transform since;
 // - leased: another run holds it, or a run a tick started has not taken its leases yet (overlaps skip);
 // - backoff, one of:
@@ -28,6 +29,9 @@
 //     ASSET_INVALID: not retryable) waits for a change to its code or inputs; a retryable one (after its own
 //     retries), a crash or an interruption waits RETRY_BACKOFF_MS, or the server's longer Retry-After. Never every
 //     minute. An ingest needs none of this: it is due again only at its next fire;
+//   - an ingest whose fire comes inside a known wait (knownWait, D105): its latest step failed with a server's
+//     Retry-After that has not passed, or with HTTP_BUDGET_SPENT while its host's budget is still spent. It stays
+//     due and runs once the wait is over;
 //   - a transform whose last step was skipped for an input that is still held (any of the above, SCHEDULE_HELD
 //     included, or failed and backed off) and has not changed since: a run would only skip it again. It waits for
 //     that input, and is due again once the input changes or is released.
@@ -60,8 +64,10 @@ import { zonedParts } from "../core/time.ts";
 import type { AssetKind, Hold, Incremental, Problem, Reason } from "../core/types.ts";
 import type { CatalogAsset } from "../history/catalog.ts";
 import { RUNS_DB_FILE, RunsDb, type ScheduleStateRow, type StepRecord } from "../history/runs-db.ts";
+import { budgetState } from "../http/budget.ts";
+import { commandText, secretsCommandHash, staticSecrets } from "../project/env.ts";
 import type { ResolvedAsset } from "../project/resolve.ts";
-import { loadProject, type Project } from "../project/root.ts";
+import { type HostBudget, loadProject, type Project, type SecretsFrom } from "../project/root.ts";
 import { deletedByCroft } from "../safety/trash.ts";
 import type { DuePlanning, StepKind } from "../run/plan.ts";
 import { staleReasons } from "../run/staleness.ts";
@@ -819,6 +825,93 @@ export function clockWords(at: Date, timezone: string, now: Date): string {
   return p.year === n.year && p.month === n.month && p.day === n.day ? clock : `${MONTHS[p.month - 1]} ${p.day} ${clock}`;
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// Known waits (D105): an asset whose next request the API, or the project's request budget, has said must wait
+
+/** "Not before `until`" for an asset's next request: its latest step failed with a server's Retry-After
+ *  (HTTP_ERROR details.retryAfterMs, from when the step ended), or with HTTP_BUDGET_SPENT while its host's budget is
+ *  still spent now (asked again, so a budget raised in croft.json, or one freed since, ends the wait). */
+export interface KnownWait {
+  until: string;
+  code: "HTTP_ERROR" | "HTTP_BUDGET_SPENT";
+  runId: string;
+  /** HTTP_ERROR: the status that asked to wait (429, 503). */
+  status: number | null;
+  /** HTTP_BUDGET_SPENT: the host whose budget is spent. */
+  host: string | null;
+}
+
+/** The wait the step left, or null: none, or over by `now`. Only a failed step leaves one. */
+export function knownWait(step: StepRecord | null, o: { runs: RunsDb; budgets: Readonly<Record<string, HostBudget>>; now: Date }): KnownWait | null {
+  const e = step?.status === "failed" ? step.error : null;
+  if (!step || !e) return null;
+  if (e.code === "HTTP_ERROR") {
+    const asked = Number(e.details?.retryAfterMs);
+    if (!Number.isFinite(asked) || asked <= 0) return null;
+    const until = Date.parse(step.finishedAt ?? step.startedAt) + asked;
+    if (!(until > o.now.getTime())) return null;
+    const status = Number(e.details?.status);
+    return { until: new Date(until).toISOString(), code: "HTTP_ERROR", runId: step.runId, status: Number.isFinite(status) ? status : null, host: null };
+  }
+  if (e.code === "HTTP_BUDGET_SPENT") {
+    const host = typeof e.details?.host === "string" ? e.details.host : null;
+    const budget = host !== null && Object.hasOwn(o.budgets, host) ? o.budgets[host]! : null;
+    const spent = budget ? budgetState(o.runs, host!, budget) : null;
+    if (!spent) return null;
+    return { until: spent.freeAt, code: "HTTP_BUDGET_SPENT", runId: step.runId, status: null, host };
+  }
+  return null;
+}
+
+/** Every asset's known wait, from the latest step of each in runs.sqlite: a run by hand holds these (D105). */
+export function knownWaits(runs: RunsDb, budgets: Readonly<Record<string, HostBudget>>, now: Date): Map<string, KnownWait> {
+  const out = new Map<string, KnownWait>();
+  for (const s of runs.latestSteps()) {
+    const w = knownWait(s, { runs, budgets, now });
+    if (w) out.set(s.asset, w);
+  }
+  return out;
+}
+
+/** run/plan.ts PlanInput.waits for a run by hand, read from runs.sqlite once (D105). */
+export function planWaits(runs: RunsDb, project: Pick<Project, "timezone" | "config">, now: Date): (asset: string, file: string) => { reason: string; problem: Problem } | null {
+  const waits = knownWaits(runs, project.config.http.budgets, now);
+  return (asset, file) => {
+    const w = waits.get(asset);
+    return w ? waitHeld(asset, file, w, project.timezone, now) : null;
+  };
+}
+
+/** planWaits from the project's runs.sqlite, which is never created here (a project that never ran has none). */
+export function readPlanWaits(project: Pick<Project, "timezone" | "config" | "paths">, now: Date): ReturnType<typeof planWaits> {
+  if (!existsSync(join(project.paths.stateDir, RUNS_DB_FILE))) return () => null;
+  const runs = RunsDb.open(project.paths.stateDir, { now: () => now });
+  try {
+    return planWaits(runs, project, now);
+  } finally {
+    runs.close();
+  }
+}
+
+/** HTTP_WAIT: the step is held, not run, until the wait is over. `reason` is the held step's, after "held: ". */
+export function waitHeld(asset: string, file: string, w: KnownWait, timezone: string, now: Date): { reason: string; problem: Problem } {
+  const at = clockWords(new Date(w.until), timezone, now);
+  const asked = w.code === "HTTP_BUDGET_SPENT"
+    ? `the request budget for ${w.host} in croft.json is spent until ${at}`
+    : `the API answered ${w.status ?? "with an error"} in run ${w.runId} and asked to wait until ${at}`;
+  const p = problem("HTTP_WAIT", {
+    asset, file,
+    message: `${asset} is held: ${asked}; running it now would only spend a request on the same answer`,
+    hint: w.code === "HTTP_BUDGET_SPENT"
+      ? `run it after ${at} (croft run ${asset}); if the API allows more, raise http.budgets.${w.host} in croft.json`
+      : `run it after ${at}: croft run ${asset}`,
+    effect: "the step did not run; its table and saved position are as they were",
+    fix: { kind: "manual", description: `wait until ${at}, then croft run ${asset}` },
+    details: { until: w.until, code: w.code, runId: w.runId, status: w.status, host: w.host },
+  });
+  return { reason: `${asked}; croft run ${asset} after that`, problem: { ...p, severity: "warning" } };
+}
+
 /** SCHEDULE_HELD (§6): the asset's code is not the code a human last ran. The reason is what status shows. A hash
  *  that moved only with croft.json's timezone is said as such (§8), not as an edit. */
 export function scheduleHeld(o: {
@@ -866,6 +959,28 @@ export function scheduleHeld(o: {
   });
   // A hold is the scheduler's news, not a failure of the run that skips the asset.
   return { reason, problem: { ...p, severity: "warning" } };
+}
+
+/** Whether croft.json names a secretsFrom command that is not the one a person last ran an asset with (D108): the
+ *  scheduler then holds every asset that reads secrets, since a run of one would run a command nobody has run. */
+export function secretsCommandUnapproved(project: Pick<Project, "config">, runs: Pick<RunsDb, "approvedSecretsCommand"> | null): boolean {
+  const from = project.config.secretsFrom;
+  return from !== null && (runs?.approvedSecretsCommand() ?? null) !== secretsCommandHash(from);
+}
+
+/** SCHEDULE_HELD (§6, D108) for an asset that reads secrets while secretsCommandUnapproved: the reason is what status
+ *  shows. */
+export function secretsCommandHeld(o: { asset: string; file: string; secretsFrom: SecretsFrom }): { reason: string; problem: Problem } {
+  const run = `croft run ${o.asset}`;
+  const p = problem("SCHEDULE_HELD", {
+    asset: o.asset, file: o.file,
+    message: `${o.asset} is held from the scheduler: it reads secrets, and croft.json's secretsFrom command (${commandText(o.secretsFrom.command)}) is not one a person has run an asset with`,
+    hint: `the scheduler only runs what a person has run; check the command, then ${run} (a run from a terminal or Claude Code) releases every asset that reads secrets`,
+    effect: "scheduled runs skip it, and it stays due",
+    fix: { kind: "command", description: `run ${o.asset} by hand once`, command: run },
+    details: { secretsFrom: o.secretsFrom.command },
+  });
+  return { reason: `croft.json's secretsFrom command is new or changed, not run by hand yet; ${run} releases it`, problem: { ...p, severity: "warning" } };
 }
 
 function editedAt(root: string, file: string): number | null {
@@ -964,6 +1079,18 @@ export async function dueWork(i: DueInput): Promise<DueWork> {
     return found;
   };
 
+  // A secretsFrom command no person has run holds the assets that read secrets (D108). Which ones is read from each
+  // TS file's text, without importing it, and only while the command is unapproved: otherwise no file is read.
+  const commandUnapproved = secretsCommandUnapproved(project, runs);
+  const readsSecrets = (f: AssetFacts): boolean => {
+    if (f.kind === "sql") return false;
+    try {
+      return staticSecrets(readFileSync(join(project.root, f.file), "utf8")).length > 0;
+    } catch {
+      return false;
+    }
+  };
+
   const views: AssetScheduleView[] = [];
   const histories = new Map<string, History>();
   const due = new Map<string, string>();          // primary due assets → why
@@ -1018,6 +1145,8 @@ export async function dueWork(i: DueInput): Promise<DueWork> {
       project, now, scheduling, approved: h.state?.approvedCodeHash ?? null, leasedBy: leased.get(f.asset) ?? null,
       startingRun: starting.get(f.asset) ?? null, failedStart: failedStartOf(f.asset, h.lastOk), primaryDue: due.has(f.asset),
       inputs: transform ? inputsOf(f) : [], entry, deleted: runs ? deletedByCroft(runs, f.asset) : false,
+      secretsHeld: commandUnapproved && readsSecrets(f),
+      wait: runs && !transform ? knownWait(h.latest, { runs, budgets: project.config.http.budgets, now }) : null,
     });
     if (hold) holds.set(f.asset, hold);
     view.held = hold;
@@ -1111,6 +1240,10 @@ interface HoldContext {
   entry: (name: string) => CatalogAsset | null;
   /** croft delete removed its table (deletedByCroft). */
   deleted: boolean;
+  /** The asset reads secrets while croft.json's secretsFrom command is not approved (secretsCommandUnapproved). */
+  secretsHeld: boolean;
+  /** An ingest's known wait (knownWait), or null. */
+  wait: KnownWait | null;
 }
 
 /** The first hold that applies (see the top of this file), or null. Waiting for an input comes after (dueWork). */
@@ -1127,6 +1260,9 @@ function holdOf(f: AssetFacts, h: History, c: HoldContext): { code: HoldCode; re
       timeZoneChanged: f.timeZoneChanged ?? null, deleted: c.deleted,
     }).reason };
   }
+  if (c.secretsHeld) {
+    return { code: "SCHEDULE_HELD", reason: secretsCommandHeld({ asset: f.asset, file: f.file, secretsFrom: c.project.config.secretsFrom! }).reason };
+  }
   if (h.reprocess) {
     return { code: "LARGE_REPROCESS", reason: `the cost guard needs a person: croft run ${f.asset} shows how many rows it would process and asks first` };
   }
@@ -1135,6 +1271,12 @@ function holdOf(f: AssetFacts, h: History, c: HoldContext): { code: HoldCode; re
   if (c.failedStart && (c.primaryDue || f.kind !== "ingest")) {
     const until = clockWords(new Date(Date.parse(c.failedStart.at) + RETRY_BACKOFF_MS), c.project.timezone, c.now);
     return { code: "backoff", reason: `the scheduled run ${c.failedStart.runId} did not start it (${c.failedStart.reason}); tries again after ${until}` };
+  }
+  // An ingest is due again only at its next fire, whatever failed; one whose fire comes inside a wait the API (or
+  // the request budget) set waits it out, still due, rather than spend a request on the same answer (D105).
+  if (c.primaryDue && f.kind === "ingest" && c.wait) {
+    const words = c.wait.code === "HTTP_BUDGET_SPENT" ? `the request budget for ${c.wait.host} is spent` : `the API asked to wait (${c.wait.status ?? "HTTP_ERROR"})`;
+    return { code: "backoff", reason: `${words}; tries again after ${clockWords(new Date(c.wait.until), c.project.timezone, c.now)}` };
   }
   if (!c.primaryDue || f.kind === "ingest") return null;
   return backoff(f, h, c);
@@ -1283,8 +1425,9 @@ export function duePlanning(o: { project: Project; runs: RunsDb; now: Date; fire
   const times = o.times ?? defaultFires;
   const scheduling = runs.getScheduling();
   const facts = runs.getSetting<Record<string, AssetFacts>>(FACTS_SETTING) ?? {};
+  const commandUnapproved = secretsCommandUnapproved(project, runs);
   return {
-    hold(step: { asset: string; file: string; kind: StepKind; codeHash?: string; ok: boolean }) {
+    hold(step: { asset: string; file: string; kind: StepKind; codeHash?: string; ok: boolean; secrets?: readonly string[] }) {
       if (scheduling.state === "paused") {
         return { hold: "paused" as Hold, reason: "held: scheduling is paused" };
       }
@@ -1301,6 +1444,10 @@ export function duePlanning(o: { project: Project; runs: RunsDb; now: Date; fire
         });
         return { hold: "code_not_run_by_hand" as Hold, reason: `held: ${h.reason}`, problem: h.problem };
       }
+      if (commandUnapproved && (step.secrets?.length ?? 0) > 0) {
+        const h = secretsCommandHeld({ asset: step.asset, file: step.file, secretsFrom: project.config.secretsFrom! });
+        return { hold: "code_not_run_by_hand" as Hold, reason: `held: ${h.reason}`, problem: h.problem };
+      }
       if (step.kind === "transform") {
         const r = historyOf(runs, step.asset).reprocess;
         if (r) {
@@ -1308,6 +1455,14 @@ export function duePlanning(o: { project: Project; runs: RunsDb; now: Date; fire
             hold: "large_reprocess" as Hold, reason: "held: the cost guard needs a person (LARGE_REPROCESS)",
             problem: { ...r, severity: "warning" as const, asset: step.asset },
           };
+        }
+      }
+      // An ingest inside a wait the API or the request budget set (D105): held, still due, as the tick's view says.
+      if (step.kind === "rows" || step.kind === "file") {
+        const w = knownWait(runs.latestStep(step.asset), { runs, budgets: project.config.http.budgets, now });
+        if (w) {
+          const h = waitHeld(step.asset, step.file, w, project.timezone, now);
+          return { hold: "retry_after" as Hold, reason: `held: ${h.reason}`, problem: h.problem };
         }
       }
       const lease = runs.sqlite.query("SELECT run_id, pid, proc_start, boot_id FROM leases WHERE asset = ?").get(step.asset) as

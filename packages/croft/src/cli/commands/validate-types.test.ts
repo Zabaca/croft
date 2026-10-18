@@ -266,7 +266,8 @@ export default transform({
     expect(quantityNull).toMatchObject({
       code: "ASSET_INVALID", asset: "revenue", file: "assets/revenue.ts", line: 8,
       message: "TS18047: 'row.quantity' is possibly 'null'.",
-      hint: "quantity of sales may be NULL (every column but the key may): give it a default, (row.quantity ?? 0), or skip the rows where it is null",
+      hint: "quantity of sales may be NULL (every column but the key and those a blocking not_null check covers may): give it a default, (row.quantity ?? 0), skip the rows where it is null, "
+        + "or, when NULL is wrong there, check not_null(quantity) in sales (the type follows once a run passes it)",
       fix: { kind: "edit", description: "handle a NULL row.quantity on line 8", file: "assets/revenue.ts", line: 8 },
       details: { tsc: "TS18047", input: "sales", column: "quantity" },
     });
@@ -304,9 +305,31 @@ export default transform({
     catalog(p, [built("sales", "ingest", ["id"], [col("id", "BIGINT"), col("Unit Price", "DOUBLE"), col("region", "VARCHAR")])]);
     const r = await validateTypes(p);
     expect(r.json.problems.map((x: { hint: string }) => x.hint)).toEqual([
-      "Unit Price of sales may be NULL (every column but the key may): give it a default, (row[\"Unit Price\"] ?? 0), or skip the rows where it is null",
-      "region of sales may be NULL (every column but the key may): give it a default, (row.region ?? \"\"), or skip the rows where it is null",
+      "Unit Price of sales may be NULL (every column but the key and those a blocking not_null check covers may): give it a default, (row[\"Unit Price\"] ?? 0), skip the rows where it is null, "
+        + "or, when NULL is wrong there, check not_null(\"Unit Price\") in sales (the type follows once a run passes it)",
+      "region of sales may be NULL (every column but the key and those a blocking not_null check covers may): give it a default, (row.region ?? \"\"), skip the rows where it is null, "
+        + "or, when NULL is wrong there, check not_null(region) in sales (the type follows once a run passes it)",
     ]);
+  }, 60_000);
+
+  test("a column the last run's blocking not_null vouches for is never NULL: no hint, no error (D107)", async () => {
+    const p = makeProject({ files: { "assets/sales.ts": ISSUES_TS, "assets/revenue.ts": REVENUE_TS("row[\"Unit Price\"] * 2 + row.region.length") } });
+    withTypescript(p);
+    catalog(p, [built("sales", "ingest", ["id"], [col("id", "BIGINT"), col("Unit Price", "DOUBLE"), col("region", "VARCHAR")])]);
+    const db = runsDb(p.stateDir);
+    try {
+      const run = db.createRun({ trigger: "manual", human: true, argv: [] });
+      db.startStep({ runId: run.id, asset: "sales", attempt: 1, reason: "requested" });
+      db.finishStep(run.id, "sales", 1, { status: "ok" });
+      const checks = [{ check: "not_null(region)", ok: true, blocking: true, failing: 0 }, { check: "not_null(\"Unit Price\")", ok: true, blocking: false, failing: 0 }];
+      db.finishRun(run.id, "succeeded", { data: { runId: run.id, steps: [{ asset: "sales", status: "ok", checks }] } });
+    } finally {
+      db.close();
+    }
+    const r = await validateTypes(p);
+    // region narrowed; Unit Price's not_null is a warning, which refuses no row.
+    expect(r.json.problems.map((x: { details: { column?: string } }) => x.details.column)).toEqual(["Unit Price"]);
+    expect(readFileSync(join(p.root, ".croft", "types", "sales.d.ts"), "utf8")).toContain("  /** VARCHAR, never NULL: a blocking not_null check */\n  region: string;\n");
   }, 60_000);
 });
 

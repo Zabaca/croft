@@ -31,11 +31,25 @@
 //   ±2^53); HUGEINT and every DECIMAL → string; the rest as above. A DOUBLE that is NaN or ±Infinity arrives as
 //   its text in json mode; the types say number, since a warehouse rarely holds one and number | string on every
 //   DOUBLE would make the common case unusable.
-// Every column may be NULL but the key (KEY_NULL and the key's implied not_null refuse NULL keys) and croft's
-// _loaded_at and _file. A pending column (NULL in every row so far) is unknown: its type is not settled.
+// Every column may be NULL but the key (KEY_NULL and the key's implied not_null refuse NULL keys), croft's
+// _loaded_at and _file, and the columns a blocking not_null check vouches for (D107). A pending column (NULL in
+// every row so far) is unknown: its type is not settled.
+//
+// Vouched for (notNull) means every row of the table as last built passed the check, which the record of the step
+// that built it says (history/runs-db.ts lastStepChecks): a blocking not_null among that ok step's results. It
+// holds for every write mode, appends and merges included, because a check covers each write's rows and a new or
+// edited one the whole table once (§3f), so a row saved before the check was added was checked when it was. Never
+// from a warning (its rows are not refused), nor from the code alone: a check added since the last run has not
+// looked at the table yet, so the column narrows after the run it passes. Nothing is vouched for after a restore or
+// delete (their steps run no checks), while a run that did not end ok has written the table since (a chunked TS
+// transform's committed chunks), for a step an older croft recorded (no `blocking` on its results), or for an
+// asset only previewed (the preview records no steps). validate --types' code columns narrow where the record and
+// the code both say so, so the types hold for the table now and for the build the code will make.
 // STRUCT field names are not claimed: the column cache upper-cases them (load/evolve.ts normalizeType).
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { checkColumns, parseChecks } from "../checks/parse.ts";
+import type { StepResult } from "../core/types.ts";
 import { allCatalog, type CatalogAsset } from "../history/catalog.ts";
 import { RUNS_DB_FILE, RunsDb } from "../history/runs-db.ts";
 import { RESERVED } from "../load/contract.ts";
@@ -63,6 +77,9 @@ export interface TypeSource {
   columns: readonly TypedColumn[];
   /** Key columns: never NULL. */
   key: readonly string[];
+  /** Columns no row holds NULL in (D107): from the cache, vouched for by the last ok step's blocking not_null checks
+   *  (vouchedNotNull); from code, the columns its blocking not_null checks name, kept only where the cache vouches. */
+  notNull?: readonly string[];
   /** Where the columns come from (see the top of this file). */
   from: "run" | "preview" | "code";
   /** The asset file, for "code". */
@@ -229,9 +246,10 @@ function commentLines(text: string): string[] {
 }
 
 /** A column's TypeScript type, and the comment above it. */
-function columnType(c: TypedColumn, key: readonly string[], mode: TypeMode = "ts"): { ts: string; note: string } {
+function columnType(c: TypedColumn, s: Pick<TypeSource, "key" | "notNull">, mode: TypeMode = "ts"): { ts: string; note: string } {
   const type = c.type.trim() || "unknown";
-  const isKey = key.some((k) => sameName(k, c.name));
+  const isKey = s.key.some((k) => sameName(k, c.name));
+  const vouched = !isKey && (s.notNull ?? []).some((k) => sameName(k, c.name));
   const own = sameName(c.name, RESERVED.loadedAt) ? "when croft loaded the row" : sameName(c.name, RESERVED.file) ? "the file the row came from" : null;
   let ts: string;
   let note: string;
@@ -240,18 +258,20 @@ function columnType(c: TypedColumn, key: readonly string[], mode: TypeMode = "ts
     note = `${type}, NULL in every row so far: its type is not settled`;
   } else {
     const base = tsType(type, mode);
-    ts = isKey || own ? base : orNull(base);
+    // A JSON column stays unknown: a not_null check refuses SQL NULL, not a JSON null inside it.
+    const checked = vouched && base !== "unknown";
+    ts = isKey || own || checked ? base : orNull(base);
     // A transform's rows are guarded proxies that leave croft's columns out of a spread; an app's are plain objects.
     note = own ? (mode === "ts" ? `${type}: ${own}; readable, but left out of { ...row }` : `${type}: ${own}`)
       : isKey ? `${type}, the key`
-        : c.jsonKeys?.length ? `${type} (keys seen: ${c.jsonKeys.join(", ")})` : type;
+        : `${c.jsonKeys?.length ? `${type} (keys seen: ${c.jsonKeys.join(", ")})` : type}${checked ? ", never NULL: a blocking not_null check" : ""}`;
   }
   return { ts, note };
 }
 
-function columnLine(c: TypedColumn, key: readonly string[], mode: TypeMode): string[] {
+function columnLine(c: TypedColumn, s: TypeSource, mode: TypeMode): string[] {
   const name = IDENTIFIER.test(c.name) ? c.name : JSON.stringify(c.name);
-  const { ts, note } = columnType(c, key, mode);
+  const { ts, note } = columnType(c, s, mode);
   return [`  /** ${commentSafe(note)} */`, `  ${name}: ${ts};`];
 }
 
@@ -262,7 +282,7 @@ function withLoadedAt(s: TypeSource): readonly TypedColumn[] {
 }
 
 function rowType(s: TypeSource, typeName: string, columns: readonly TypedColumn[], mode: TypeMode = "ts"): string {
-  return [`export type ${typeName} = {`, ...columns.flatMap((c) => columnLine(c, s.key, mode)), "};"].join("\n");
+  return [`export type ${typeName} = {`, ...columns.flatMap((c) => columnLine(c, s, mode)), "};"].join("\n");
 }
 
 /** The ReadRow type with its comment: the same columns as @zabaca/croft/read returns them. */
@@ -299,7 +319,7 @@ export function renderTypes(sources: readonly TypeSource[]): { files: Map<string
     const inIndex = `${s.asset}.d.ts` === TYPES_INDEX;
     types[typeName] = {
       asset: s.asset, file: `${TYPES_DIR}/${s.asset}.d.ts`, columns: columns.map((c) => c.name),
-      columnTypes: Object.fromEntries(columns.map((c) => [c.name, columnType(c, s.key).ts])),
+      columnTypes: Object.fromEntries(columns.map((c) => [c.name, columnType(c, s).ts])),
     };
     const q = JSON.stringify(s.asset);
     const header = commentLines(`${s.asset}: its rows as TS transforms read them: ctx.rows(${q}), ctx.newRows(${q}) and ctx.query<${q}>(sql). ${origin(s)}`);
@@ -343,11 +363,31 @@ export function renderTypes(sources: readonly TypeSource[]): { files: Map<string
 // ---------------------------------------------------------------------------------------------------------
 // The column cache and the folder
 
-function catalogOf(stateDir: string): CatalogAsset[] {
+/**
+ * The columns the blocking not_null checks among a step's results cover (RunsDb.lastStepChecks: every row of the
+ * table passed them), as the checks name them. A warning's never count, nor a failed one, nor a result an older
+ * croft recorded without `blocking`.
+ */
+export function vouchedNotNull(asset: string, results: StepResult["checks"] | null): string[] {
+  const out = new Set<string>();
+  for (const r of results ?? []) {
+    if (r.blocking !== true || !r.ok) continue;
+    const { checks } = parseChecks({ asset, file: "", key: [], checks: [r.check], warnings: [] });
+    for (const c of checks) if (c.kind === "not_null") for (const col of checkColumns(c) ?? []) out.add(col);
+  }
+  return [...out];
+}
+
+/** The catalog mirror's entries as type sources. A live one's notNull comes from the record of the step that
+ *  built it; the preview's runs.sqlite records no steps, so a previewed asset has none. */
+function catalogOf(stateDir: string, from: TypeSource["from"]): TypeSource[] {
   if (!existsSync(join(stateDir, RUNS_DB_FILE))) return [];
   const db = RunsDb.open(stateDir);
   try {
-    return allCatalog(db);
+    return allCatalog(db).map((c) => {
+      const notNull = from === "run" ? vouchedNotNull(c.asset, db.lastStepChecks(c.asset)) : [];
+      return { ...fromCatalog(c, from), ...(notNull.length ? { notNull } : {}) };
+    });
   } finally {
     db.close();
   }
@@ -361,10 +401,10 @@ const fromCatalog = (c: CatalogAsset, from: TypeSource["from"]): TypeSource => (
 /** The column cache as validate's bind check reads it: the live catalog mirror, then each asset never built
  *  that a preview built (a live entry wins). Creates nothing. */
 export function typeSources(stateDir: string): TypeSource[] {
-  const live = catalogOf(stateDir);
+  const live = catalogOf(stateDir, "run");
   const known = new Set(live.map((c) => c.asset));
-  const previewed = catalogOf(join(stateDir, PREVIEW_DIR)).filter((c) => !known.has(c.asset));
-  return [...live.map((c) => fromCatalog(c, "run")), ...previewed.map((c) => fromCatalog(c, "preview"))];
+  const previewed = catalogOf(join(stateDir, PREVIEW_DIR), "preview").filter((c) => !known.has(c.asset));
+  return [...live, ...previewed];
 }
 
 function stateDirOf(root: string): string {
@@ -392,9 +432,14 @@ export function generateInputTypes(root: string, o: TypesOptions = {}): TypesRes
   const stateDir = o.stateDir ?? stateDirOf(root);
   const cached = new Map(typeSources(stateDir).map((s) => [s.asset, s]));
   // Code columns replace the cache's, keeping what only a run saw: the keys inside a JSON column of the same name.
+  // A column the code's not_null names narrows only where the cache vouches for it too (D107): the table now has
+  // no NULL there, and the next build cannot commit one.
   const code = new Map((o.code ?? []).map((s) => {
-    const was = cached.get(s.asset)?.columns ?? [];
-    return [s.asset, { ...s, columns: s.columns.map((c) => {
+    const prior = cached.get(s.asset);
+    const was = prior?.columns ?? [];
+    const notNull = (s.notNull ?? []).filter((n) => (prior?.notNull ?? []).some((v) => sameName(v, n)));
+    const { notNull: _n, ...rest } = s;
+    return [s.asset, { ...rest, ...(notNull.length ? { notNull } : {}), columns: s.columns.map((c) => {
       const keys = was.find((w) => w.name === c.name && w.jsonKeys?.length)?.jsonKeys;
       return keys && !c.jsonKeys ? { ...c, jsonKeys: keys } : c;
     }) }];
