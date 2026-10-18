@@ -1,6 +1,6 @@
 {
   "name": "croft",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Start a croft data pipeline from nothing: install, croft init, and the validate → preview → run loop. Inside a project, croft's own versioned skill takes over.",
   "author": { "name": "Zabaca", "url": "https://github.com/Zabaca/croft" },
   "homepage": "https://croft.zabaca.com",
