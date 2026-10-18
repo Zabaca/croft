@@ -44,7 +44,8 @@ export const mdPath = (doc: Doc) => `/${doc.id}.md`
 export function asMarkdown(doc: Doc, site: URL): string {
   const lines = [`# ${doc.data.title}`, '']
   if (doc.data.description) lines.push(`> ${doc.data.description}`, '')
-  lines.push((doc.body ?? '').trim(), '', `Source: ${new URL(htmlPath(doc), site).href}`, '')
+  // The generated pages escape `<` in prose so the HTML renders it; an agent reads the Markdown as text.
+  lines.push((doc.body ?? '').trim().replaceAll('&lt;', '<'), '', `Source: ${new URL(htmlPath(doc), site).href}`, '')
   // Links inside the body are site-relative; an agent reading the file elsewhere needs them whole, and a link to
   // another docs page goes to that page's Markdown twin.
   return lines.join('\n').replace(/\]\((\/[^)\s]*)\)/g, (_, p: string) => `](${new URL(twinOf(p), site).href})`)
