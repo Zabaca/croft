@@ -816,8 +816,10 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
           if (Date.now() - progress.lastAt >= timeoutMs) stepAc.abort(timeoutError(step, timeoutMs, progress));
         }, Math.max(10, Math.min(1000, Math.floor(timeoutMs / 4))));
         const started = Date.now();
-        // The check sources of the asset's last ok step: a check not among them is new or edited (§3f).
-        const previous = runs.lastCheckSources(asset);
+        // The check sources of the asset's last ok step: a check not among them is new or edited (§3f). The blocking
+        // checks count only blocking ones, so a warning made blocking covers the whole table once (D107).
+        const previous = runs.lastCheckSources(asset, { runId });
+        const previousBlocking = runs.lastCheckSources(asset, { blocking: true, runId });
         try {
           if (beforeStart !== undefined) throw beforeStart;
           // --rebuild of an ingest or an incremental TS transform: confirmation, trash and reset first, once per run;
@@ -844,7 +846,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
           if (!out) {
             const input: StepInput = {
               step, project, env, warehouse: warehouse!, runs, runId, attempt, maxAttempts, signal, progress, log,
-              ...withChecks(step, previous), ...withReadBy(step, getCatalog(runs, asset)),
+              ...withChecks(step, previousBlocking), ...withReadBy(step, getCatalog(runs, asset)),
               ...(o.http ? { http: o.http } : {}), ...(o.fault ? { fault: o.fault } : {}), ...(o.now ? { now: o.now } : {}),
             };
             if (step.kind === "sql") {

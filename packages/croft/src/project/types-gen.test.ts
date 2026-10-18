@@ -10,7 +10,8 @@ import { type CatalogAsset, type CatalogColumn, putCatalog } from "../history/ca
 import { RunsDb } from "../history/runs-db.ts";
 import { renderRows } from "../db/values.ts";
 import { previewDirectory } from "../run/preview.ts";
-import { generateInputTypes, renderTypes, rowTypeName, type TypeSource, TYPES_DIR, tsType, typeSources } from "./types-gen.ts";
+import type { StepResult } from "../core/types.ts";
+import { generateInputTypes, renderTypes, rowTypeName, type TypeSource, TYPES_DIR, tsType, typeSources, vouchedNotNull } from "./types-gen.ts";
 
 const made: string[] = [];
 afterAll(() => {
@@ -40,6 +41,23 @@ function seed(stateDir: string, entries: CatalogAsset[], source: "run" | "previe
     db.close();
   }
 }
+
+/** A finished run whose step for `asset` ended `status` with these check results (what RunsDb.lastStepChecks
+ *  reads); returns its id, for the catalog entry's lastRunId. */
+function ran(stateDir: string, asset: string, checks: StepResult["checks"], status: StepResult["status"] = "ok"): string {
+  const db = RunsDb.open(stateDir);
+  try {
+    const r = db.createRun({ trigger: "manual", human: true, argv: [] });
+    db.startStep({ runId: r.id, asset, attempt: 1, reason: "requested" });
+    db.finishStep(r.id, asset, 1, { status });
+    db.finishRun(r.id, status === "ok" ? "succeeded" : "failed", { data: { runId: r.id, steps: [{ asset, status, checks }] } });
+    return r.id;
+  } finally {
+    db.close();
+  }
+}
+
+const passed = (check: string, blocking?: boolean) => ({ check, ok: true, ...(blocking === undefined ? {} : { blocking }), failing: 0 });
 
 // ---------------------------------------------------------------------------------------------------------
 
@@ -220,6 +238,27 @@ declare global {
     });
   });
 
+  test("a column a blocking not_null check vouches for is never NULL, in both row types (D107)", () => {
+    const r = renderTypes([{
+      asset: "triage", from: "run", key: ["id"], notNull: ["ID", "Label", "meta", "note", "Odd Name"],
+      columns: [
+        { name: "id", type: "BIGINT" }, { name: "label", type: "VARCHAR" }, { name: "score", type: "DECIMAL(10,2)" },
+        { name: "meta", type: "JSON" }, { name: "note", type: "VARCHAR", pending: true }, { name: "Odd Name", type: "BIGINT" },
+      ],
+    }]);
+    const text = r.files.get("triage.d.ts")!;
+    // Names match as DuckDB's do, without regard to case; the key stays the key.
+    expect(text).toContain("export type TriageRow = {\n  /** BIGINT, the key */\n  id: number | bigint;\n"
+      + "  /** VARCHAR, never NULL: a blocking not_null check */\n  label: string;\n  /** DECIMAL(10,2) */\n  score: number | null;\n");
+    expect(text).toContain("  /** BIGINT, never NULL: a blocking not_null check */\n  \"Odd Name\": number | bigint;\n");
+    expect(text).toContain("export type TriageReadRow = {\n  /** BIGINT, the key */\n  id: number | string;\n"
+      + "  /** VARCHAR, never NULL: a blocking not_null check */\n  label: string;\n  /** DECIMAL(10,2) */\n  score: string | null;\n");
+    // A JSON column stays unknown (a JSON null is not SQL NULL), and a pending one's type is not settled.
+    expect(text).toContain("  /** JSON */\n  meta: unknown;\n");
+    expect(text).toContain("  /** VARCHAR, NULL in every row so far: its type is not settled */\n  note: unknown;\n");
+    expect(r.types.TriageRow!.columnTypes).toMatchObject({ label: "string", score: "number | null", "Odd Name": "number | bigint" });
+  });
+
   test("where the columns came from: a preview, or an SQL asset's code as it is now", () => {
     const r = renderTypes([
       { asset: "stripe_charges", from: "preview", key: [], columns: [{ name: "amount", type: "BIGINT" }] },
@@ -301,10 +340,38 @@ describe("typeSources: the column cache", () => {
     ]);
   });
 
+  test("a live entry's notNull: the blocking not_null checks the step that built it passed (D107)", () => {
+    const root = tempRoot();
+    const state = join(root, ".croft");
+    const run = ran(state, "triage", [
+      passed("unique(id)", true), passed("not_null(id)", true), passed("not_null(label, \"Odd Name\")", true),
+      passed("not_null(reason)", false), passed("label IN ('a', 'b')", true),
+    ]);
+    seed(state, [entry("triage", [col("id", "BIGINT"), col("label", "VARCHAR"), col("reason", "VARCHAR"), col("Odd Name", "INTEGER")], { key: ["id"], lastRunId: run })]);
+    seed(previewDirectory(state), [entry("drafts", [col("label", "VARCHAR")], { lastRunId: run })], "preview");
+    const [live, previewed] = typeSources(state);
+    expect(live!.notNull).toEqual(["id", "label", "Odd Name"]);
+    // The preview's runs.sqlite records no steps.
+    expect(previewed!.asset).toBe("drafts");
+    expect(previewed!.notNull).toBeUndefined();
+  });
+
   test("no runs.sqlite: nothing, and nothing is created", () => {
     const root = tempRoot();
     expect(typeSources(join(root, ".croft"))).toEqual([]);
     expect(existsSync(join(root, ".croft"))).toBe(false);
+  });
+});
+
+describe("vouchedNotNull: the columns a step's passing blocking not_null checks cover (D107)", () => {
+  test("blocking not_null only: not a warning, a failure, an older croft's unmarked result, unique or a rule", () => {
+    const results: StepResult["checks"] = [
+      passed("not_null(id)", true), passed("not_null(a, \"B c\")", true), passed("not_null(id, a)", true),
+      passed("not_null(w)", false), { check: "not_null(f)", ok: false, blocking: true, failing: 1 }, passed("not_null(old)"),
+      passed("unique(u)", true), passed("r IS NOT NULL", true), passed("not_null(", true),
+    ];
+    expect(vouchedNotNull("t", results)).toEqual(["id", "a", "B c"]);
+    expect(vouchedNotNull("t", null)).toEqual([]);
   });
 });
 
@@ -349,6 +416,47 @@ describe("generateInputTypes: .croft/types on disk", () => {
     const r = generateInputTypes(root, { code: [{ asset: "open_issues", from: "code", file: "assets/open_issues.sql", key: [], columns: [{ name: "author_login", type: "VARCHAR" }] }] });
     expect(r.types.OpenIssuesRow!.columns).toEqual(["author_login", "_loaded_at"]);
     expect(readFileSync(join(r.dir, "open_issues.d.ts"), "utf8")).not.toContain("author:");
+  });
+
+  test("narrowing follows the record of the table as last built, in every write mode (D107)", () => {
+    const root = tempRoot();
+    const state = join(root, ".croft");
+    const label = (r: ReturnType<typeof generateInputTypes>, asset: string) => r.types[rowTypeName(asset)]!.columnTypes.label;
+    const vouched = ran(state, "merged", [passed("not_null(label)", true)]);
+    const warned = ran(state, "warned", [passed("not_null(label)", false)]);
+    const older = ran(state, "older", [passed("not_null(label)")]);
+    const restored = ran(state, "restored", []);
+    seed(state, [
+      // A merge leaves old rows unchecked, but they passed the check when they were written or when it was new (§3f).
+      entry("merged", [col("label", "VARCHAR")], { write: "merge", key: ["id"], lastRunId: vouched }),
+      // A warning never refused a row; a step an older croft recorded does not say which checks were blocking; a
+      // restore runs no checks.
+      entry("warned", [col("label", "VARCHAR")], { lastRunId: warned }),
+      entry("older", [col("label", "VARCHAR")], { lastRunId: older }),
+      entry("restored", [col("label", "VARCHAR")], { lastRunId: restored }),
+    ]);
+    const r = generateInputTypes(root);
+    expect(["merged", "warned", "older", "restored"].map((a) => [a, label(r, a)])).toEqual([
+      ["merged", "string"], ["warned", "string | null"], ["older", "string | null"], ["restored", "string | null"],
+    ]);
+    // A later run that did not end ok wrote the table (a chunked transform's committed chunks): nothing is vouched for.
+    const failed = ran(state, "merged", [], "failed");
+    seed(state, [entry("merged", [col("label", "VARCHAR")], { write: "merge", key: ["id"], lastRunId: failed })]);
+    expect(label(generateInputTypes(root), "merged")).toBe("string | null");
+  });
+
+  test("code sources narrow where the code's not_null and the last run both say so (D107)", () => {
+    const root = tempRoot();
+    const state = join(root, ".croft");
+    const run = ran(state, "open_issues", [passed("not_null(author, title)", true)]);
+    seed(state, [entry("open_issues", [col("author", "VARCHAR"), col("title", "VARCHAR"), col("body", "VARCHAR")], { kind: "sql", lastRunId: run })]);
+    const r = generateInputTypes(root, { code: [{
+      asset: "open_issues", from: "code", key: [], notNull: ["author", "body"],
+      columns: [{ name: "author", type: "VARCHAR" }, { name: "title", type: "VARCHAR" }, { name: "body", type: "VARCHAR" }],
+    }] });
+    // author: both. title: the code dropped the check, so the next build may write NULL. body: the check is new,
+    // and the table has not passed it yet.
+    expect(r.types.OpenIssuesRow!.columnTypes).toMatchObject({ author: "string", title: "string | null", body: "string | null" });
   });
 
   test("code sources keep the JSON keys a run saw in a column of the same name", () => {

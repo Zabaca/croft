@@ -100,10 +100,10 @@ describe("checksHook: blocking checks in the write transaction", () => {
     const checks = checksOf({ key: ["id"], checks: ["amount >= 0", "min_rows(2)"], warnings: ["amount > 1000"] });
     const r = await load(w, "orders", people(3), { key: ["id"], checks: hook(checks) });
     expect(r.checks).toEqual([
-      { check: "unique(id)", ok: true, failing: 0 },
-      { check: "not_null(id)", ok: true, failing: 0 },
-      { check: "amount >= 0", ok: true, failing: 0 },
-      { check: "min_rows(2)", ok: true, failing: 0 },
+      { check: "unique(id)", ok: true, blocking: true, failing: 0 },
+      { check: "not_null(id)", ok: true, blocking: true, failing: 0 },
+      { check: "amount >= 0", ok: true, blocking: true, failing: 0 },
+      { check: "min_rows(2)", ok: true, blocking: true, failing: 0 },
     ]);
     expect((await read(w, "SELECT count(*)::INTEGER AS n FROM orders"))[0]).toEqual({ n: 3 });
   });
@@ -141,9 +141,9 @@ describe("checksHook: blocking checks in the write transaction", () => {
       '  id=2  email="p2@x.io"  amount=20  author=NULL  updated_at="2026-09-22T11:00:00+00:00"',
     ]);
     expect(e.problem.details?.results).toEqual([
-      { check: "unique(id)", ok: true, failing: 0 },
-      { check: "not_null(id)", ok: true, failing: 0 },
-      { check: "not_null(author)", ok: false, failing: 1, sample: [expect.objectContaining({ id: 2 })] },
+      { check: "unique(id)", ok: true, blocking: true, failing: 0 },
+      { check: "not_null(id)", ok: true, blocking: true, failing: 0 },
+      { check: "not_null(author)", ok: false, blocking: true, failing: 1, sample: [expect.objectContaining({ id: 2 })] },
     ]);
     expect(await snapshot()).toEqual(before);
     delete COLUMNS.note;
@@ -163,7 +163,7 @@ describe("checksHook: blocking checks in the write transaction", () => {
     // A warning's sample too, after the commit.
     const r = await load(w, "orders", [{ ...rows[0]!, author: "a1" }], { key: ["id"], columns: base, checks: hook(checks) });
     const out = await w.read((sql) => runWarnings(sql, { asset: "orders", table: '"warehouse"."main"."orders"', loadedAt: r.loadedAt, rows: r.rows }, checks, { file: FILE }), { purpose: "test" });
-    expect(out.results).toEqual([{ check: "amount > 10", ok: false, failing: 1, sample: [{ id: 1, email: "2026-09-22T11:00:00Z", amount: 5, author: "a1", updated_at: "2026-09-22T04:00:00-07:00" }] }]);
+    expect(out.results).toEqual([{ check: "amount > 10", ok: false, blocking: false, failing: 1, sample: [{ id: 1, email: "2026-09-22T11:00:00Z", amount: 5, author: "a1", updated_at: "2026-09-22T04:00:00-07:00" }] }]);
     expect(out.problems[0]!.details!.sample).toEqual(out.results[0]!.sample!);
     // unique's sample (a QUALIFY query) as well.
     const twins = [{ id: 1, email: "e", amount: 5, author: "a", updated_at: T1 }, { id: 2, email: "e", amount: 5, author: "a", updated_at: T2 }];
@@ -189,7 +189,7 @@ describe("checksHook: blocking checks in the write transaction", () => {
   test("NULL passes a rule; not_null is how to refuse it", async () => {
     const w = warehouse();
     const rows = people(3, (i) => ({ amount: i === 2 ? null : 5 }));
-    expect((await load(w, "orders", rows, { checks: hook(checksOf({ checks: ["amount >= 0"] })) })).checks).toEqual([{ check: "amount >= 0", ok: true, failing: 0 }]);
+    expect((await load(w, "orders", rows, { checks: hook(checksOf({ checks: ["amount >= 0"] })) })).checks).toEqual([{ check: "amount >= 0", ok: true, blocking: true, failing: 0 }]);
     const e = await rejection(load(w, "other", rows, { checks: hook(checksOf({ checks: ["amount >= 0", "not_null(amount)"] })) }));
     expect(e.problem.message.split("\n")[0]).toBe("not_null(amount): 1 of 3 rows");
   });
@@ -202,7 +202,7 @@ describe("checksHook: blocking checks in the write transaction", () => {
     const change = [{ id: 3, email: "p3@x.io", amount: 99, author: "a3" }];
     // Known check: only the changed row (id 3) is checked.
     const ok = await load(w, "orders", change, { key: ["id"], write: "merge", now: T1, checks: hook(rule, ["  amount >= 0 "]) });
-    expect(ok.checks).toEqual([{ check: "amount >= 0", ok: true, failing: 0 }]);
+    expect(ok.checks).toEqual([{ check: "amount >= 0", ok: true, blocking: true, failing: 0 }]);
     // New (not in previous) or no record at all: the whole table, which has the old bad row.
     for (const previous of [["amount >= 1"], [], null, undefined]) {
       const e = await rejection(load(w, "orders", [{ ...change[0], amount: 100 + (previous?.length ?? 7) }], { key: ["id"], write: "merge", now: T2, checks: hook(rule, previous) }));
@@ -217,7 +217,7 @@ describe("checksHook: blocking checks in the write transaction", () => {
     await load(w, "orders", rows, { key: ["id"], now: T0 });
     const r = await load(w, "orders", rows, { key: ["id"], now: T1, checks: hook(checksOf({ checks: ["amount >= 0"] }), ["amount >= 0"]) });
     expect(r.rows).toMatchObject({ unchanged: 2, added: 0, updated: 0 });
-    expect(r.checks).toEqual([{ check: "amount >= 0", ok: true, failing: 0 }]);
+    expect(r.checks).toEqual([{ check: "amount >= 0", ok: true, blocking: true, failing: 0 }]);
   });
 
   test("unique covers the whole table after the write; duplicates are sampled together", async () => {
@@ -241,7 +241,7 @@ describe("checksHook: blocking checks in the write transaction", () => {
     expect(e.problem.message).toBe("min_rows(5): the table has 3 rows");
     expect(e.problem.details).toMatchObject({ check: "min_rows(5)", failing: 2, sample: [] });
     const r = await load(w, "orders", people(5), { checks: hook(checksOf({ checks: ["min_rows(5)"] })) });
-    expect(r.checks).toEqual([{ check: "min_rows(5)", ok: true, failing: 0 }]);
+    expect(r.checks).toEqual([{ check: "min_rows(5)", ok: true, blocking: true, failing: 0 }]);
   });
 
   test("a chunk that is not its run's last skips min_rows (the table is not finished); every other check runs", async () => {
@@ -252,9 +252,9 @@ describe("checksHook: blocking checks in the write transaction", () => {
     // The first chunk of a first build: 2 rows of 5.
     const r = await load(w, "orders", people(2), { key: ["id"], write: "merge", checks: chunk });
     expect(r.checks).toEqual([
-      { check: "unique(id)", ok: true, failing: 0 },
-      { check: "not_null(id)", ok: true, failing: 0 },
-      { check: "amount >= 0", ok: true, failing: 0 },
+      { check: "unique(id)", ok: true, blocking: true, failing: 0 },
+      { check: "not_null(id)", ok: true, blocking: true, failing: 0 },
+      { check: "amount >= 0", ok: true, blocking: true, failing: 0 },
     ]);
     // Row checks still block a chunk.
     const e = await rejection(load(w, "orders", people(3, (i) => (i === 3 ? { amount: -1 } : {})), { key: ["id"], write: "merge", checks: chunk }));
@@ -314,7 +314,7 @@ describe("checksHook: blocking checks in the write transaction", () => {
     }
     // Ones that are one expression after all (a comment is a comment, a string a string) run as checks.
     const passed = await load(w, "orders", people(3), { now: T1, checks: hook([evil("amount > 0 /* ) OR true; DROP TABLE victim; -- */")]) });
-    expect(passed.checks).toEqual([{ check: "amount > 0 /* ) OR true; DROP TABLE victim; -- */", ok: true, failing: 0 }]);
+    expect(passed.checks).toEqual([{ check: "amount > 0 /* ) OR true; DROP TABLE victim; -- */", ok: true, blocking: true, failing: 0 }]);
     const e = await rejection(load(w, "orders", people(4), { now: T2, checks: hook([evil("'; DROP TABLE victim; --' = email")]) }));
     expect(e.code).toBe("CHECK_FAILED");
     expect(await read(w, "SELECT count(*)::INTEGER AS n FROM victim")).toEqual([{ n: 1 }]);
@@ -329,9 +329,9 @@ describe("runWarnings: non-blocking checks after the commit", () => {
     const r = await load(w, "orders", people(3), { key: ["id"], now: T0, checks: hook(checks) });
     const out = await w.read((sql) => runWarnings(sql, { asset: "orders", table: '"warehouse"."main"."orders"', loadedAt: r.loadedAt, rows: r.rows }, checks, { file: FILE }), { purpose: "test" });
     expect(out.results).toEqual([
-      { check: "amount < 25", ok: false, failing: 1, sample: [{ id: 3, email: "p3@x.io", amount: 30, author: "a3" }] },
-      { check: "not_null(author)", ok: true, failing: 0 },
-      { check: "min_rows(10)", ok: false, failing: 7, sample: [] },
+      { check: "amount < 25", ok: false, blocking: false, failing: 1, sample: [{ id: 3, email: "p3@x.io", amount: 30, author: "a3" }] },
+      { check: "not_null(author)", ok: true, blocking: false, failing: 0 },
+      { check: "min_rows(10)", ok: false, blocking: false, failing: 7, sample: [] },
     ]);
     expect(out.problems.map((p) => [p.severity, p.code, p.message.split("\n")[0]])).toEqual([
       ["warning", "CHECK_FAILED", "warning amount < 25: 1 of 3 rows"],
@@ -348,7 +348,7 @@ describe("runWarnings: non-blocking checks after the commit", () => {
     const checks = checksOf({ warnings: ["amount < 100"] });
     const ctx = { asset: "orders", table: '"warehouse"."main"."orders"', loadedAt: r.loadedAt, rows: r.rows };
     const batch = await w.read((sql) => runWarnings(sql, ctx, checks), { purpose: "test" });
-    expect(batch).toEqual({ problems: [], results: [{ check: "amount < 100", ok: true, failing: 0 }] });
+    expect(batch).toEqual({ problems: [], results: [{ check: "amount < 100", ok: true, blocking: false, failing: 0 }] });
     const whole = await w.read((sql) => runWarnings(sql, ctx, checks, { previous: [] }), { purpose: "test" });
     expect(whole.problems.map((p) => p.message.split("\n")[0])).toEqual(["warning amount < 100: 1 of 3 rows (the whole table: a new or edited check)"]);
   });
@@ -358,7 +358,7 @@ describe("runWarnings: non-blocking checks after the commit", () => {
     const r = await load(w, "orders", people(2), { now: T0 });
     const checks = checksOf({ warnings: ["nope > 1", "amount > 0"] });
     const out = await w.read((sql) => runWarnings(sql, { asset: "orders", table: '"warehouse"."main"."orders"', loadedAt: r.loadedAt, rows: r.rows }, checks, { file: FILE }), { purpose: "test" });
-    expect(out.results).toEqual([{ check: "nope > 1", ok: false }, { check: "amount > 0", ok: true, failing: 0 }]);
+    expect(out.results).toEqual([{ check: "nope > 1", ok: false, blocking: false }, { check: "amount > 0", ok: true, blocking: false, failing: 0 }]);
     expect(out.problems.map((p) => [p.severity, p.code])).toEqual([["warning", "CHECK_INVALID"]]);
     expect(out.problems[0]!.message).toContain('the warning "nope > 1" could not run');
   });

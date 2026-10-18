@@ -324,6 +324,19 @@ describe("checks and warnings on every kind of step", () => {
     expect(out.step("issues").error?.details).toMatchObject({ check: "amount > 0", failing: 1, scope: "table" });
   });
 
+  test("a warning made blocking covers the whole table once: the rows it only warned about are checked (D107)", async () => {
+    const root = makeProject({ "assets/issues.ts": issuesIngest(`\n  warnings: ["amount > 0"],`) });
+    api.state.zones = [{ id: 1, state: "open", amount: 0 }];
+    const warned = await run2(root);
+    expect(warned.exit).toBe(0);
+    expect(warned.step("issues").checks).toContainEqual({ check: "amount > 0", ok: false, blocking: false, failing: 1, sample: expect.any(Array) });
+    const blocking = parseChecks({ asset: "issues", file: "assets/issues.ts", key: ["id"], checks: ["amount > 0"], warnings: [] }).checks;
+    api.state.zones.push({ id: 2, state: "open", amount: 3 });
+    const out = await run2(root, { patch: { issues: { checks: blocking } } });
+    expect(out.exit).toBe(3);
+    expect(out.step("issues").error?.details).toMatchObject({ check: "amount > 0", failing: 1, scope: "table" });
+  });
+
   test("a column that stopped arriving names the assets that read it (readBy per column)", async () => {
     const root = makeProject({
       "assets/wide.ts": `import { ingest } from "@zabaca/croft";

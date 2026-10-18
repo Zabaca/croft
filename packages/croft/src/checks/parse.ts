@@ -357,7 +357,7 @@ function invalid(asset: string, file: string | undefined, text: string, blocking
 const firstLine = (e: unknown) => String((e as Error)?.message ?? e).split("\n")[0]!;
 
 /** A column name as a check's source shows it: bare when it is a plain lower-case identifier, else quoted. */
-function displayIdent(name: string): string {
+export function displayIdent(name: string): string {
   return /^[a-z_][a-z0-9_]*$/.test(name) ? name : quoteIdent(name);
 }
 

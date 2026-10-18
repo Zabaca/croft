@@ -40,7 +40,10 @@ export interface StepResult {
   rows: { in: number; added: number; updated: number; unchanged: number; deleted: number; total: number };
   schemaChanges: SchemaChange[]; cursor?: { before?: string; after?: string; sinceUsed?: string };
   inputs?: { input: string; seenBefore: string | null; seenAfter: string; rows: number }[];
-  requests?: number; checks: { check: string; ok: boolean; failing?: number; sample?: Row[] }[];
+  requests?: number;
+  /** Every check and warning the step ran. `blocking` is false for a warning (§3f); a step an older croft recorded
+   *  has none (RunsDb.lastStepChecks, D107). */
+  checks: { check: string; ok: boolean; blocking?: boolean; failing?: number; sample?: Row[] }[];
   trashed?: { path: string; rows: number }; logsCommand: string; durationMs: number; error?: Problem;
   /** Present when this step created the table ("new table, 31 columns (7 JSON)", §4.2): its columns
    *  without croft's _loaded_at, and how many of them are JSON. */
