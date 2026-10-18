@@ -1,0 +1,23 @@
+{
+  "$comment": "Every known croft project outside this repository. Hand-maintained: access, root, state and tier are facts no script can derive. access is `github` (clone repo), `local:<repo path>` (git archive of HEAD off this machine) or `ssh:<host>:<repo path>`; root is the croft project's directory inside the repo (where croft.json is) when it is not the repo root; state is a checkout on this machine whose .croft/runs.sqlite holds the run history, since .croft/ is never committed (local access defaults to its own path). The survey's output names private repos and quotes their code, so it stays out of git: see .consumer-survey/ in .gitignore. To find unregistered projects, look for croft.json under ~/Projects (skip node_modules and worktrees) and on ryzen-9.",
+  "snapshotDate": "2026-10-18",
+  "consumers": [
+    {
+      "id": "ceo-seo",
+      "repo": "Zabaca/ceo",
+      "access": "github",
+      "root": "packages/seo",
+      "state": "~/Projects/zabaca/ceo/packages/seo",
+      "tier": "consumer",
+      "notes": "SEO research for client sites (DataForSEO). Pins croft 0.1.0. A package inside ceo's monorepo, beside ceo's zbc infra; runs every command through bin/croft, which pulls credentials out of ceo's sops secrets."
+    },
+    {
+      "id": "leave-guide",
+      "repo": null,
+      "access": "local:~/Projects/research",
+      "root": "apps/leave-guide/sources",
+      "tier": "consumer",
+      "notes": "Legal sources for a leave-law guide (CourtListener, eCFR, Federal Register, case.law). Pins croft 0.1.0. Local-only repo, no remote; archived at HEAD, so commit before surveying. Its lib/ reads specs from ../law, outside the project."
+    }
+  ]
+}

@@ -12,3 +12,6 @@ out
 
 # eval transcripts (the per-run JSON summaries are kept)
 packages/croft/evals/results/*/
+
+# consumer-mining evidence and cases: quotes private consumer repos, never committed (docs/consumers/registry.json)
+.consumer-survey/
