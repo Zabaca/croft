@@ -1210,6 +1210,35 @@ export default ingest({
     expect(await rows(root, "select id, known from known order by id")).toEqual([{ id: 1n, known: true }, { id: 2n, known: true }]);
   });
 
+  test("ingest.md's recipe: a merge ingest skips what earlier runs saved and does a batch of the rest per run", async () => {
+    const root = makeProject({
+      "assets/lookups.ts": `import { ingest } from "@zabaca/croft";
+
+const ids = ["a", "b", "c", "d", "e"];
+
+export default ingest({
+  key: "id",
+  write: "merge",
+  async *rows({ query, log }) {
+    const saved = await query<{ id: string }>("select id from lookups").catch(() => []);
+    const done = new Set(saved.map((r) => r.id));
+    const todo = ids.filter((id) => !done.has(id)).slice(0, 2);
+    log("looked up", todo.join(","));
+    for (const id of todo) yield { id, n: id.charCodeAt(0) };
+  },
+});
+` });
+    // Each run saves its batch; the next one skips it, and once everything is saved a run yields nothing.
+    const logged: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const out = await runIn(root, ["lookups"]);
+      expect(out.exit).toBe(0);
+      logged.push(readFileSync(logPath(join(root, ".croft"), out.data.runId, "lookups"), "utf8").match(/looked up (\S*)/)?.[1] ?? "");
+    }
+    expect(logged).toEqual(["a,b", "c,d", "e", ""]);
+    expect(await rows(root, "select id from lookups order by id")).toEqual(["a", "b", "c", "d", "e"].map((id) => ({ id })));
+  });
+
   test("ctx.query is one sandboxed SELECT: writes, other files and the state folder are refused", async () => {
     api.state.raw = `[{"id": 1}]`;
     const root = makeProject({ "assets/probe.ts": `import { ingest } from "@zabaca/croft";

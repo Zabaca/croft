@@ -81,6 +81,8 @@ export interface InitResult {
   timezone: string;
   files: FileChange[];
   relocation: { reason: string; dir: string; database: string; stateDir: string } | null;
+  /** A package.json above the project whose "workspaces" take it in (claimingWorkspace), or null. */
+  workspace: WorkspaceClaim | null;
   tsconfig: TsconfigEdit | null;
   appSteps: string[];
   install: InstallOutcome;
@@ -103,6 +105,45 @@ export function relocationPlan(root: string, reason: string, home = homedir()): 
 }
 
 interface Write { abs: string; rel: string; text: string; action: FileAction; mode?: number; note?: string }
+
+export interface WorkspaceClaim {
+  /** The workspace's package.json (absolute). */
+  file: string;
+  /** Its "workspaces" pattern that matches the project. */
+  pattern: string;
+  /** The pattern that leaves the project out: "!" and its path from the workspace root. */
+  exclude: string;
+}
+
+/**
+ * The workspace that would take in a croft project at `root`: the nearest package.json above it with "workspaces"
+ * (a list, or { packages: [...] }), when one of its patterns matches the project's path and no "!" pattern leaves it
+ * out; null otherwise (DESIGN.md §2, D102). A project pins its own croft (D42), but a workspace member's bun install
+ * is the workspace's: it installs every member and keeps the lockfile at the workspace root [V: Bun 1.3.14], and a
+ * package manager that hoists leaves the project's node_modules without its croft (INSTALL_FAILED). Patterns are
+ * matched with Bun.Glob; a package.json that does not parse is passed over.
+ */
+export function claimingWorkspace(root: string): WorkspaceClaim | null {
+  for (let dir = dirname(resolve(root)); ; dir = dirname(dir)) {
+    const file = join(dir, "package.json");
+    let ws: unknown;
+    try {
+      ws = existsSync(file) ? (JSON.parse(readFileSync(file, "utf8")) as { workspaces?: unknown }).workspaces : undefined;
+    } catch {
+      ws = undefined;
+    }
+    const list = Array.isArray(ws) ? ws : Array.isArray((ws as { packages?: unknown } | undefined)?.packages) ? (ws as { packages: unknown[] }).packages : null;
+    if (list) {
+      const rel = relative(dir, resolve(root)).split(sep).join("/");
+      const patterns = list.filter((p): p is string => typeof p === "string").map((p) => p.trim().replace(/^\.\//, "").replace(/\/+$/, ""));
+      const matches = (p: string) => p === rel || new Bun.Glob(p).match(rel);
+      const pattern = patterns.find((p) => !p.startsWith("!") && matches(p));
+      if (!pattern || patterns.some((p) => p.startsWith("!") && matches(p.slice(1).replace(/^\.\//, "")))) return null;
+      return { file, pattern, exclude: `!${rel}` };
+    }
+    if (dirname(dir) === dir) return null;
+  }
+}
 
 export async function initProject(o: InitOptions): Promise<InitResult> {
   const target = resolve(o.target);
@@ -189,7 +230,7 @@ export async function initProject(o: InitOptions): Promise<InitResult> {
   return {
     mode: app ? "app" : "new", base, root, version, timezone,
     files: writes.map((w) => ({ path: w.rel, action: w.action, ...(w.note ? { note: w.note } : {}) })),
-    relocation, tsconfig, appSteps, install, example,
+    relocation, workspace: claimingWorkspace(root), tsconfig, appSteps, install, example,
   };
 }
 
@@ -231,7 +272,7 @@ async function refreshClaude(target: string, o: InitOptions): Promise<InitResult
   return {
     mode: "claude", base, root, version, timezone,
     files: writes.map((w) => ({ path: w.rel, action: w.action })),
-    relocation: null, tsconfig: null, appSteps: [], install: { ran: false, reason: "not needed for --claude" },
+    relocation: null, workspace: null, tsconfig: null, appSteps: [], install: { ran: false, reason: "not needed for --claude" },
     example: { ran: false, reason: "not needed for --claude" },
   };
 }

@@ -212,6 +212,15 @@ function configPage(): string {
     "When the project sits in a synced folder (iCloud ~/Documents or ~/Desktop, Dropbox, OneDrive, network",
     "drives, WSL /mnt/<drive>), croft moves the database and .croft/ to ~/.local/share/croft/<project>-<hash>/",
     "and records the new paths in database and stateDir. Asset files stay in the project folder.",
+    "",
+    "One warehouse for several git worktrees of one repository: by default each worktree has its own",
+    "warehouse.duckdb and .croft/, so what a run in one loads, the others never see. To share one, set database",
+    "and stateDir to one place outside the worktrees, with an absolute or ~/ path, for example",
+    '  "database": "~/.local/share/croft/shop/warehouse.duckdb", "stateDir": "~/.local/share/croft/shop/.croft"',
+    "Set both: the state folder holds the run history and the locks that let one writer in at a time. The asset",
+    "files still come from the worktree a command runs in, so a run there writes what that branch's code makes,",
+    "and croft status compares each asset's code with the code of its last run, whichever worktree ran it. Turn",
+    "scheduling on in one worktree only.",
   ].join("\n");
 }
 

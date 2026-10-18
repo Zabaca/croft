@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
+import { DuckDBInstance } from "@duckdb/node-api";
 import { linkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
@@ -111,5 +112,35 @@ describe("errors", () => {
     // A JavaScript error is a croft bug, not a problem with the query: it passes through unchanged.
     const bug = new TypeError("cannot read properties of undefined");
     expect(mapQueryError(bug, "query")).toBe(bug);
+  });
+
+  test("->> and -> take everything to their left: such a failure's hint says to parenthesise, other failures keep theirs", async () => {
+    const instance = await DuckDBInstance.create(":memory:");
+    const conn = await instance.connect();
+    try {
+      await conn.run(`CREATE TABLE t AS SELECT '{"k":"v","n":2}'::JSON AS j, true AS a`);
+      const value = async (expr: string) => (await conn.runAndReadAll(`SELECT ${expr} AS r FROM t`)).getRowObjectsJson()[0]!.r;
+      const failure = (expr: string) => conn.run(`SELECT ${expr} AS r FROM t`).then(() => null, (e: Error) => e);
+      // Alone, and parenthesised, ->> compares as written [V].
+      expect(await value(`j->>'k' = 'v'`)).toBe(true);
+      expect(await value(`a AND (j->>'k') = 'v'`)).toBe(true);
+      expect(await value(`a AND json_extract_string(j, 'k') = 'v'`)).toBe(true);
+      // After AND, OR, NOT, = or ||, what precedes it becomes the JSON it reads [V].
+      for (const expr of [`a AND j->>'k' = 'v'`, `false OR j->>'k' = 'v'`, `NOT j->>'k' = 'v'`, `1 = 1 AND j->>'k' = 'v'`, `j->>'n' = '2' AND j->>'k' = 'v'`]) {
+        const e = mapQueryError(await failure(expr), "query") as CroftError;
+        expect([expr, e.code]).toEqual([expr, "QUERY_FAILED"]);
+        expect(e.message, expr).toContain("Failed to cast value");
+        expect(e.problem.hint, expr).toContain("(j->>'k') = 'v'");
+      }
+      const arrow = mapQueryError(await failure(`j->'n' = 2`), "query") as CroftError;
+      expect(arrow.message).toContain("json_extract(JSON, BOOLEAN)");
+      expect(arrow.problem.hint).toContain("parenthesise");
+      // A conversion error over plain text is about the data.
+      const text = mapQueryError(await failure(`CAST(j->>'k' AS INTEGER)`), "query") as CroftError;
+      expect(text.problem.hint).toBe("fix the query; DuckDB's message says what went wrong");
+    } finally {
+      conn.closeSync();
+      instance.closeSync();
+    }
   });
 });

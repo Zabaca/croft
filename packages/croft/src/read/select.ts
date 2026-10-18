@@ -47,7 +47,20 @@ export function mapQueryError(err: unknown, profile: Profile): unknown {
   }
   // Everything else went wrong while DuckDB bound or ran the query (Binder, Catalog, Conversion, Invalid
   // Input, Out of Range, IO, ...); details.duckdbErrorType says which.
-  return new CroftError("QUERY_FAILED", { message: first, hint: "fix the query; DuckDB's message says what went wrong", details });
+  return new CroftError("QUERY_FAILED", { message: first, hint: jsonArrowHint(first) ?? "fix the query; DuckDB's message says what went wrong", details });
+}
+
+/**
+ * DuckDB's `->>` and `->` take everything to their left as the JSON they read: they bind more loosely than AND, OR,
+ * NOT, = and || [V: select.test.ts]. So `a AND j->>'k' = 'v'` runs as `((a AND j)->>'k') = 'v'` and fails casting a
+ * whole JSON value ("Conversion Error: Failed to cast value to numerical: {...}"), and `j->'k' = 2` as
+ * `j->('k' = 2)` ("json_extract(JSON, BOOLEAN)"). DuckDB's message then names the data, not the precedence, so these
+ * two shapes get a hint that does (D102). null for any other message.
+ */
+export function jsonArrowHint(first: string): string | null {
+  if (!/^Conversion Error: .*Failed to cast value[^:]*: [[{]/.test(first) && !/'json_extract(?:_string)?\([^)]*BOOLEAN/.test(first)) return null;
+  return "DuckDB's ->> and -> take everything to their left as the JSON they read, so a AND j->>'k' = 'v' runs as "
+    + "((a AND j)->>'k') = 'v'; parenthesise each one, (j->>'k') = 'v', or write json_extract_string(j, 'k')";
 }
 
 /**

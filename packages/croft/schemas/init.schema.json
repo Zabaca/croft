@@ -87,6 +87,16 @@
                 }
               ]
             },
+            "workspace": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkspaceClaim"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "tsconfig": {
               "anyOf": [
                 {
@@ -121,6 +131,7 @@
             "timezone",
             "files",
             "relocation",
+            "workspace",
             "tsconfig",
             "appSteps",
             "install",
@@ -544,6 +555,26 @@
         "file",
         "status",
         "reason"
+      ],
+      "additionalProperties": false
+    },
+    "WorkspaceClaim": {
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": "string"
+        },
+        "pattern": {
+          "type": "string"
+        },
+        "exclude": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "file",
+        "pattern",
+        "exclude"
       ],
       "additionalProperties": false
     }

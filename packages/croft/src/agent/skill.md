@@ -34,6 +34,7 @@ croft status                # failed, stale, held, never run, edited since its l
   catches a column renamed upstream. A BIGINT is `number | bigint`: `Number(row.x)` before arithmetic.
 - Use `ctx.http` and `res.json()` (lossless numbers), never raw fetch + JSON.parse for API data.
 - Nested fields are JSON: `col->>'field'`, `col->>'$[*].name'`, `json_each(col)`. `croft describe` lists keys.
+  Parenthesise them beside AND, OR, NOT or =: `a AND (col->>'k') = 'v'` (without, DuckDB reads `a AND col` as the JSON).
 - Columns named like SQL keywords must be quoted: `"order"`.
 - Apps read with `import { query } from "@zabaca/croft/read"`; `query<"x">(sql)` types the rows as table x's (croft docs serve). It talks to `croft serve` when one is running (found via CROFT_URL or .croft/serve.json), otherwise opens the file briefly. Never open the .duckdb files directly.
 - `croft serve` runs until stopped: ask the user to start it in their own terminal instead of running it in your shell.
@@ -78,6 +79,7 @@ croft status                # failed, stale, held, never run, edited since its l
 ## Output
 - JSON timestamps carry the project offset; ::DATE uses the croft.json timezone.
 - `query` rows are capped: check data.truncatedRows before concluding anything; aggregate in SQL.
+- `query` cuts values at 80 characters, with `--json` too (data.truncatedValues counts them); add `--full-values`.
 
 ## Long work
 - Off a TTY, `croft run` returns after ~100 s with exit 6 and keeps running: `croft wait <runId> --timeout 100s`.
