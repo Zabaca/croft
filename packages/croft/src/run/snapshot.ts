@@ -26,6 +26,7 @@ import { hasState } from "../db/state.ts";
 import { LeaseSql, type DuckWarehouse } from "../db/warehouse.ts";
 import { RESERVED } from "../load/contract.ts";
 import { quoteIdent, quoteLiteral, readTableSchema, type RealColumn } from "../load/evolve.ts";
+import { jsonArrowHint } from "../read/select.ts";
 import { isoMicros } from "../safety/guards.ts";
 import { assertOneSelect } from "../sql/gate.ts";
 
@@ -103,8 +104,10 @@ export class OwnTableQuery {
           ? `${this.o.asset} has no table yet (this is its first load), so ctx.query has nothing to read`
           : `ctx.query failed: ${message.split("\n")[0]}`,
         hint: missing
-          ? "on the first run there is nothing saved yet; handle it, e.g. `const known = since === undefined ? [] : await query(...)`"
-          : `ctx.query reads ${this.o.asset} as it was before this run; check the SQL`,
+          // `since` is undefined on every run of an ingest without a cursor, so only a cursor ingest can go by it.
+          ? "on the first run there is nothing saved yet; handle it, e.g. `const known = since === undefined ? [] : await query(...)` "
+            + "with a cursor, or `await query(...).catch(() => [])` without one (croft docs ingest)"
+          : jsonArrowHint(message.split("\n")[0]!) ?? `ctx.query reads ${this.o.asset} as it was before this run; check the SQL`,
         details: { sql: sql.slice(0, 500), duckdb: message.split("\n")[0] },
       });
     }

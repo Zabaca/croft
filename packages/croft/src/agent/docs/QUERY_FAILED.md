@@ -12,7 +12,13 @@ built an asset but could not compare it with the live table reports it as a warn
 
 Nothing was written.
 
-What to do: fix the SQL; DuckDB's message says what went wrong. Look at the columns and their types first:
-croft describe <asset> shows them, and croft query "DESCRIBE <asset>" too. Cast explicitly (TRY_CAST(x AS BIGINT)
-gives NULL instead of failing). In asset code, handle the first run, when there is nothing saved to read yet, and
-await every ctx.query inside rows().
+What to do: fix the SQL. DuckDB's message names what failed, though not always why. Look at the columns and their
+types first: croft describe <asset> shows them, and croft query "DESCRIBE <asset>" too. Cast explicitly
+(TRY_CAST(x AS BIGINT) gives NULL instead of failing). In asset code, handle the first run, when there is nothing
+saved to read yet, and await every ctx.query inside rows().
+
+"Failed to cast value" quoting a whole JSON value ({...} or [...]), or json_extract called with a BOOLEAN, is
+usually not about the data: DuckDB's ->> and -> take everything to their left as the JSON they read, binding more
+loosely than AND, OR, NOT, = and ||. `a AND j->>'k' = 'v'` runs as `((a AND j)->>'k') = 'v'`. Put each one in
+parentheses, `a AND (j->>'k') = 'v'`, or write json_extract_string(j, 'k'); the hint says so when the message has
+that shape (croft docs sql).

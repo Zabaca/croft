@@ -8,7 +8,8 @@ returns an array of rows. ROW_NOT_OBJECT means croft got something else:
 - rows() itself returned something that is neither an async generator nor an array;
 - map() in a file ingest returned something that is not an object (return null drops a row on purpose; an arrow
   function with a block body needs a return);
-- a JSON file holds values that are not objects (a JSON file is an array of objects, or one object per line).
+- a JSON file holds values that are not objects (a JSON file is an array of objects, or one object per line), or
+  a YAML file holds items that are not mappings (a list of mappings, one mapping, or one mapping per document).
 
 Nothing was written for the step, and its cursor did not move.
 

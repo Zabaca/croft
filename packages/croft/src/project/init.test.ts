@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { CroftError } from "../core/errors.ts";
 import { isValidTimeZone } from "../core/time.ts";
 import { claudeBlock, CROFT_VERSION, SKILL_PATH, skillMd, skillStamp } from "../agent/templates.ts";
-import { appInstructions, appRootOf, bunInstall, detectTimeZone, initProject, relocationPlan, type InitOptions } from "./init.ts";
+import { appInstructions, appRootOf, bunInstall, claimingWorkspace, detectTimeZone, initProject, relocationPlan, type InitOptions } from "./init.ts";
 import { loadProject, relocationDir } from "./root.ts";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "croft-init-")));
@@ -283,6 +283,33 @@ describe("croft init --claude", () => {
     expect(r.files.map((f) => f.path)).toEqual(["CLAUDE.md", SKILL_PATH]);
     expect(read(join(parent, "CLAUDE.md"))).toBe("# Monorepo\n");
     expect(existsSync(join(parent, SKILL_PATH))).toBe(false);
+  });
+});
+
+describe("a project inside a package-manager workspace", () => {
+  test("init names the workspace whose globs take the project in, and the pattern that leaves it out", async () => {
+    const mono = fresh({ "package.json": JSON.stringify({ private: true, workspaces: ["packages/*", "apps/web"] }), "packages/ui/package.json": "{}" });
+    const r = await initProject(opts(join(mono, "packages", "pipelines")));
+    expect(r.workspace).toEqual({ file: join(mono, "package.json"), pattern: "packages/*", exclude: "!packages/pipelines" });
+    expect(claimingWorkspace(join(mono, "packages", "pipelines", "deeper"))).toBeNull();          // packages/* is one level
+    expect(claimingWorkspace(join(mono, "apps", "web"))).toMatchObject({ pattern: "apps/web", exclude: "!apps/web" });
+    expect(claimingWorkspace(join(mono, "tools", "data"))).toBeNull();
+  });
+
+  test("an excluded project, the { packages } form, an app's data/ and no workspace at all", async () => {
+    const excluded = fresh({ "package.json": JSON.stringify({ workspaces: ["packages/*", "!packages/pipelines"] }) });
+    expect(claimingWorkspace(join(excluded, "packages", "pipelines"))).toBeNull();
+    expect(claimingWorkspace(join(excluded, "packages", "web"))).toMatchObject({ exclude: "!packages/web" });
+    const yarn = fresh({ "package.json": JSON.stringify({ workspaces: { packages: ["./libs/**"] } }) });
+    expect(claimingWorkspace(join(yarn, "libs", "a", "data"))).toMatchObject({ pattern: "libs/**", exclude: "!libs/a/data" });
+    // An app inside the workspace: the croft project is its data/, which "apps/*" does not take in.
+    const app = fresh({ "package.json": JSON.stringify({ workspaces: ["apps/*"] }), "apps/web/package.json": JSON.stringify({ name: "web" }) });
+    const r = await initProject(opts(join(app, "apps", "web")));
+    expect(r.mode).toBe("app");
+    expect(r.workspace).toBeNull();
+    const broken = fresh({ "package.json": "{ not json" });
+    expect(claimingWorkspace(join(broken, "packages", "x"))).toBeNull();
+    expect((await initProject(opts(join(fresh(), "plain")))).workspace).toBeNull();
   });
 });
 

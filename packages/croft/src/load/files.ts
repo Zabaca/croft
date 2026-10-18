@@ -7,16 +7,17 @@
 //                   copy-on-write clone where the file system has one), so the sha256 recorded is exactly the
 //                   content loaded even if the user edits the file mid-run, and the write step reads only inside
 //                   the state folder the sandbox always allows; decides each CSV's encoding (UTF-8, else UTF-16
-//                   by its byte-order mark, else latin-1, with CSV_ENCODING_GUESSED; a declared csv.encoding wins)
+//                   by its byte-order mark, else latin-1, with CSV_ENCODING_GUESSED; a declared csv.encoding wins),
+//                   its line endings (a file mixing CRLF and LF is read from a copy with LF outside quotes, D101)
 //                   and dialect (header, delimiter, skip) in a private in-memory DuckDB; and stages rows as NDJSON
-//                   when JavaScript must see them (JSON files, map()).
+//                   when JavaScript must see them (JSON and YAML files, map()).
 //   buildFileBatch  inside the write lease: a typed TEMP table for write.ts. CSV is read with all_varchar and
 //                   union_by_name and typed by croft's CSV text rules (money, d/m/y dates decided once per column
 //                   and stored in _croft.columns.format), never by DuckDB's sniffer; Parquet keeps its types,
-//                   normalized to croft's lattice; JSON goes through the ordinary cast.ts pipeline. Every value is
-//                   verified by the same round-trip loss check as API rows (a value that does not parse with the
-//                   stored format is TYPE_CONFLICT). DUPLICATE_ROWS_ACROSS_FILES is reported here, because it needs
-//                   the table.
+//                   normalized to croft's lattice; JSON and YAML go through the ordinary cast.ts pipeline. Every
+//                   value is verified by the same round-trip loss check as API rows (a value that does not parse
+//                   with the stored format is TYPE_CONFLICT). DUPLICATE_ROWS_ACROSS_FILES is reported here, because
+//                   it needs the table.
 //   recordFiles     inside the same transaction: _croft.files.
 //
 // Why encoding and header are decided at extraction, not in the write lease: a read_csv that fails (a latin-1 file
@@ -46,7 +47,8 @@
 // dialect, while an explicit dialect fails loudly and names the line; INSERT … BY NAME matches case-insensitively;
 // rows a transaction inserts get transaction-local rowids (from 36028797018960000), contiguous in insertion (file)
 // order; `filename = '<name>'` names the file column so a CSV column called "filename" survives.
-import { constants, copyFileSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { constants, copyFileSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { CroftError, problem } from "../core/errors.ts";
 import type { Fix, Problem, Sql, ValueKind } from "../core/types.ts";
@@ -187,6 +189,7 @@ export interface ByteHttp {
 
 const EXTENSIONS: Record<string, FileFormat> = {
   ".csv": "csv", ".tsv": "tsv", ".tab": "tsv", ".json": "json", ".ndjson": "ndjson", ".jsonl": "ndjson", ".parquet": "parquet", ".pq": "parquet",
+  ".yaml": "yaml", ".yml": "yaml",
 };
 
 /** The format a file name (or URL path) implies, `.gz` looked through. */
@@ -204,6 +207,7 @@ export function formatFromContentType(contentType: string | null | undefined): F
   if (t === "application/x-ndjson" || t === "application/ndjson" || t === "application/jsonl" || t === "application/x-jsonlines" || t === "application/jsonlines") return "ndjson";
   if (t === "application/json" || t.endsWith("+json")) return "json";
   if (t === "application/vnd.apache.parquet" || t === "application/x-parquet" || t === "application/parquet") return "parquet";
+  if (t === "application/yaml" || t === "application/x-yaml" || t === "text/yaml" || t === "text/x-yaml") return "yaml";
   return undefined;
 }
 
@@ -304,8 +308,8 @@ export async function extractFiles(input: ExtractFilesInput): Promise<FileExtrac
       formats.add(f);
     } else if (load.includes(p)) {
       throw new CroftError("ASSET_INVALID", {
-        message: `cannot tell the format of ${p.path}: its name has no .csv, .tsv, .json, .ndjson, .jsonl or .parquet extension${p.url ? " and the server sent no recognized Content-Type" : ""}`,
-        hint: 'set the format in the asset: format: "csv" (or "tsv", "json", "ndjson", "parquet")',
+        message: `cannot tell the format of ${p.path}: its name has no .csv, .tsv, .json, .ndjson, .jsonl, .parquet or .yaml extension${p.url ? " and the server sent no recognized Content-Type" : ""}`,
+        hint: 'set the format in the asset: format: "csv" (or "tsv", "json", "ndjson", "parquet", "yaml")',
         asset, runId, details: { file: p.path, contentType: p.contentType ?? null },
       });
     }
@@ -367,9 +371,9 @@ export async function extractFiles(input: ExtractFilesInput): Promise<FileExtrac
   const contextPaths = new Set(context.map((p) => p.path));
 
   const map = typeof config.map === "function" ? config.map : undefined;
-  const staged = format === "json" || format === "ndjson" || map !== undefined;
+  const staged = jsonLike(format) || map !== undefined;
   // CSV dialects, Parquet checks and map() reads use a private in-memory DuckDB (never the warehouse).
-  const needsDb = format !== "json" && format !== "ndjson";
+  const needsDb = !jsonLike(format);
   let mem: Awaited<ReturnType<typeof openMemory>> | null = null;
   let columnTypes: Record<string, string> | undefined;
   try {
@@ -383,7 +387,7 @@ export async function extractFiles(input: ExtractFilesInput): Promise<FileExtrac
     if ((format === "csv" || format === "tsv") && db) {
       // Findings about a file read only for fallback rows were reported when it was loaded.
       const found: Problem[] = [];
-      await decideDialects(db, read, { asset, runId, format, csv: config.csv, knownColumns: input.knownColumns ?? [], warnings: found, abort });
+      await decideDialects(db, read, { asset, runId, format, csv: config.csv, knownColumns: input.knownColumns ?? [], warnings: found, abort, log });
       warnings.push(...found.filter((w) => !contextPaths.has(String(w.details?.file ?? ""))));
     }
     // Parquet: a corrupt file fails here, before the write lease, with its name.
@@ -398,13 +402,15 @@ export async function extractFiles(input: ExtractFilesInput): Promise<FileExtrac
       }
     }
 
-    // 6. Rows JavaScript must see: JSON files, and every format when map() cleans rows.
+    // 6. Rows JavaScript must see: JSON and YAML files, and every format when map() cleans rows.
     if (staged) {
       columnTypes = format === "parquet" ? {} : undefined;
       const source = stagedRows({ load: read, format, map, db, asset, runId, abort, columnTypes });
       await writeStage({
         dir: stageDir, asset, runId, source, knownColumns: input.knownColumns ?? [], signal,
         ...(input.previewRows !== undefined ? { maxRows: input.previewRows } : {}),
+        // YAML numbers are parsed as JavaScript numbers (yamlRows): the fix is in the file, not in code.
+        ...(format === "yaml" ? { unsafeIntegerHint: "quote such values in the YAML file (id: \"12345678901234567890\") so they are read as text with every digit" } : {}),
       });
     }
   } finally {
@@ -415,6 +421,9 @@ export async function extractFiles(input: ExtractFilesInput): Promise<FileExtrac
     `${gone.length ? `; ${gone.length} gone` : ""}`);
   return result([...present.map(publicStatus), ...gone], staged, columnTypes);
 }
+
+/** Formats whose rows are parsed in JavaScript and go through the API pipeline (§3b): JSON, NDJSON and YAML. */
+const jsonLike = (f: FileFormat) => f === "json" || f === "ndjson" || f === "yaml";
 
 function keyList(key: string | string[] | undefined): string[] {
   if (key === undefined) return [];
@@ -700,6 +709,7 @@ interface DialectContext {
   knownColumns: readonly KnownName[];
   warnings: Problem[];
   abort: () => void;
+  log: (...args: unknown[]) => void;
 }
 
 /**
@@ -735,7 +745,7 @@ async function decideDialects(db: Sql, load: Present[], c: DialectContext): Prom
   for (const p of load) {
     c.abort();
     if (!p.local) continue;
-    const gzip = await isGzip(p.local);
+    let gzip = await isGzip(p.local);
     let encoding: CsvEncoding = cfg.encoding ?? "utf-8";
     let guessed = false;
     if (!cfg.encoding && !(await isUtf8File(p.local, gzip))) {
@@ -749,6 +759,15 @@ async function decideDialects(db: Sql, load: Present[], c: DialectContext): Prom
         details: { file: p.path, encoding },
       }));
     }
+    if (p.size > 0 && encoding !== "utf-16") {
+      // Lines ending in both CRLF and LF: read a copy with LF everywhere outside quotes (normalizeLineEndings).
+      const fixed = await normalizeLineEndings(p.local, gzip, `${p.local}-lf.csv`);
+      if (fixed) {
+        c.log(`${p.path}: ${fixed.crlf} line${fixed.crlf === 1 ? "" : "s"} end in CRLF and ${fixed.lf} in LF; read with LF line endings`);
+        p.local = fixed.path;
+        gzip = false;
+      }
+    }
     if (p.size === 0) {
       // An empty file has no rows and no header to read; it is never handed to read_csv.
       p.csv = {
@@ -761,9 +780,12 @@ async function decideDialects(db: Sql, load: Present[], c: DialectContext): Prom
     try {
       row = await sniff(db, p.local, { encoding, delimiter: declaredDelim, skip: cfg.skip, header: cfg.header, gzip });
     } catch (e) {
-      // With a declared delimiter a ragged file makes the sniffer give up; a strict read names the line.
+      // A ragged file can make the sniffer give up on every dialect, which names no line. A strict read with the
+      // declared delimiter, or else the first usual one the header line holds, names the first line that does not
+      // fit; when every line fits it, DuckDB's own words are all there is.
       const head = (await firstLines(p.local, 1, encoding, gzip, cfg.skip ?? 0))[0] ?? "";
-      const why = declaredDelim ? await strictProbe(db, p.local, { delimiter: declaredDelim, encoding, skip: cfg.skip ?? 0, gzip }, head.split(declaredDelim).length) : null;
+      const delim = declaredDelim ?? [",", ";", "\t", "|"].find((d) => head.includes(d));
+      const why = delim ? await strictProbe(db, p.local, { delimiter: delim, encoding, skip: cfg.skip ?? 0, gzip }, head.split(delim).length) : null;
       throw unreadable(c.asset, c.runId, p.path, why ? new Error(why) : e, [p]);
     }
     // A file whose rows do not all have the same number of fields makes the sniffer fall back to one column
@@ -830,6 +852,74 @@ async function decideDialects(db: Sql, load: Present[], c: DialectContext): Prom
       details: { file: p.path, lines, columns: cells },
     });
   }
+}
+
+/**
+ * Line endings, when a file mixes them. A CSV whose lines end in CRLF but for one appended row ending in a bare LF
+ * (or the other way round) makes DuckDB's sniffer give up on every dialect, and a declared delimiter, quote and
+ * header do not help (files.test.ts) [V]. Outside quotes a line ending only separates rows, so the load reads a copy
+ * with LF everywhere outside quotes, written next to the snapshot: no value changes (a line break inside a quoted
+ * cell, which Excel writes as a bare LF in a CRLF file, is kept byte for byte and is no mix), and the sha256 recorded
+ * stays the file's own, so the file is not "changed" by it (D101). Returns that copy and how many line endings of
+ * each kind it found, or null when the file has one kind. It works on bytes, which are the same in UTF-8 and
+ * latin-1 for `"`, CR and LF, and takes `"` as the quote, as every export croft has met does; a UTF-16 file is not
+ * checked. A gzip file's copy is plain text.
+ */
+async function normalizeLineEndings(path: string, gzip: boolean, out: string): Promise<{ path: string; crlf: number; lf: number } | null> {
+  // Cheap first: is there a CRLF and a bare LF anywhere, quotes ignored (indexOf runs natively).
+  let crlf = false;
+  let lf = false;
+  let lastCr = false;
+  for await (const chunk of byteStream(path, gzip)) {
+    for (let i = chunk.indexOf(10); i >= 0; i = chunk.indexOf(10, i + 1)) {
+      if (i > 0 ? chunk[i - 1] === 13 : lastCr) crlf = true;
+      else lf = true;
+    }
+    if (chunk.length > 0) lastCr = chunk[chunk.length - 1] === 13;
+    if (crlf && lf) break;
+  }
+  if (!crlf || !lf) return null;
+  // Then exactly, outside quotes, writing the copy on the way: a CR outside quotes is held until the next byte
+  // shows whether it ends a CRLF (dropped) or stands alone (kept).
+  let quoted = false;
+  let heldCr = false;
+  let crlfs = 0;
+  let lfs = 0;
+  const fh = await open(out, "w");
+  try {
+    for await (const chunk of byteStream(path, gzip)) {
+      const buf = new Uint8Array(chunk.length + 1);
+      let n = 0;
+      for (let i = 0; i < chunk.length; i++) {
+        const b = chunk[i]!;
+        if (heldCr) {
+          heldCr = false;
+          if (b === 10) {
+            crlfs++;
+            buf[n++] = 10;
+            continue;
+          }
+          buf[n++] = 13;
+        }
+        if (b === 34) quoted = !quoted;
+        else if (!quoted && b === 13) {
+          heldCr = true;
+          continue;
+        } else if (!quoted && b === 10) lfs++;
+        buf[n++] = b;
+      }
+      await fh.write(buf.subarray(0, n));
+    }
+    if (heldCr) await fh.write(new Uint8Array([13]));
+  } finally {
+    await fh.close();
+  }
+  if (crlfs === 0 || lfs === 0) {
+    // Every bare LF was inside quotes: one kind of line ending after all.
+    rmSync(out, { force: true });
+    return null;
+  }
+  return { path: out, crlf: crlfs, lf: lfs };
 }
 
 /** Read the whole file with a fixed dialect and `fields` text columns; DuckDB's error (naming the first line
@@ -926,7 +1016,9 @@ async function* stagedRows(o: StagedRowsInput): AsyncGenerator<Row[]> {
         if (!isPlainRow(raw)) {
           throw new CroftError("ROW_NOT_OBJECT", {
             message: `row ${n} of ${p.path} is ${article(typeLabel(raw))}, not an object`,
-            hint: "a JSON file holds one object per row: an array of objects, or one object per line (NDJSON)",
+            hint: o.format === "yaml"
+              ? "a YAML file holds one mapping per row: a list of mappings, one mapping, or one mapping per document (---)"
+              : "a JSON file holds one object per row: an array of objects, or one object per line (NDJSON)",
             asset: o.asset, runId: o.runId, details: { file: p.path, row: n, type: typeLabel(raw) },
           });
         }
@@ -999,6 +1091,9 @@ async function* fileRows(p: Present, o: StagedRowsInput): AsyncGenerator<unknown
     case "ndjson":
       yield* ndjsonRows(local, p.path, o);
       return;
+    case "yaml":
+      yield* yamlRows(local, p.path, o);
+      return;
     case "csv":
     case "tsv": {
       // map() sees the file's own columns, as text (NULL for an empty cell), under their header names.
@@ -1028,12 +1123,12 @@ async function* fileRows(p: Present, o: StagedRowsInput): AsyncGenerator<unknown
   }
 }
 
-function decodeUtf8(bytes: Uint8Array, file: string, o: { asset: string; runId: string }): string {
+function decodeUtf8(bytes: Uint8Array, file: string, o: { asset: string; runId: string }, kind = "JSON"): string {
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/^﻿/, "");
   } catch {
     throw new CroftError("FILE_UNREADABLE", {
-      message: `${file} is not valid UTF-8; JSON files must be UTF-8`,
+      message: `${file} is not valid UTF-8; ${kind} files must be UTF-8`,
       hint: "re-export the file as UTF-8",
       asset: o.asset, runId: o.runId, details: { file },
     });
@@ -1066,6 +1161,31 @@ async function* jsonRows(local: string, file: string, o: StagedRowsInput): Async
     });
   }
   const rows = Array.isArray(doc) ? doc : [doc];
+  for (let i = 0; i < rows.length; i += CHUNK) yield rows.slice(i, i + CHUNK);
+}
+
+/**
+ * A YAML file's rows, read as a JSON file's are: a top-level list is one row per item, a mapping is one row, and a
+ * file of several documents (---) is one row per document, since Bun.YAML.parse returns such a stream as a list
+ * [V]. A null item or an empty document (a trailing ---, a file of comments) has no row; JSON has no such thing to
+ * skip. Bun follows YAML 1.2's core schema [V], so the values are what any YAML reader makes of them: dates and
+ * yes/no stay text, as JSON strings do, an unquoted 007 is the number 7, and a number is a JavaScript number, so an
+ * integer beyond ±2^53 has lost digits before croft sees it (UNSAFE_INTEGER, whose hint says to quote it in the
+ * file). The rows then follow JSON's rules (§7, D101).
+ */
+async function* yamlRows(local: string, file: string, o: StagedRowsInput): AsyncGenerator<unknown[]> {
+  const text = decodeUtf8(fileBytes(local), file, o, "YAML");
+  let doc: unknown;
+  try {
+    doc = Bun.YAML.parse(text);
+  } catch (e) {
+    throw new CroftError("FILE_UNREADABLE", {
+      message: `${file} is not valid YAML: ${(e as Error).message}`,
+      hint: "fix the file: a line indented differently from its neighbours, or a bracket or quote left open, is the usual cause",
+      asset: o.asset, runId: o.runId, details: { file, error: (e as Error).message },
+    });
+  }
+  const rows = (Array.isArray(doc) ? doc : [doc]).filter((r) => r !== null && r !== undefined);
   for (let i = 0; i < rows.length; i += CHUNK) yield rows.slice(i, i + CHUNK);
 }
 
@@ -1129,8 +1249,8 @@ export async function buildFileBatch(tx: Sql, input: BuildFileBatchInput): Promi
   const replaceFiles = extract.incremental ? [...extract.load] : undefined;
   let batch: TypedBatchResult;
   let formats: Record<string, string> = {};
-  if (extract.staged && (extract.format === "json" || extract.format === "ndjson")) {
-    // JSON goes through exactly the API pipeline (§3b).
+  if (extract.staged && jsonLike(extract.format)) {
+    // JSON (and YAML) goes through exactly the API pipeline (§3b).
     const manifest = readStageManifest(extract.stageDir);
     batch = await buildTypedBatch(tx, { manifest, knownColumns: input.knownColumns, pins: input.pins, readBy: input.readBy, source: "json" });
   } else {
@@ -1761,11 +1881,26 @@ function unreadable(asset: string, runId: string | undefined, file: string, e: u
   const first = msg.split("\n").filter((l) => l.trim() !== "").slice(0, 6).join("\n");
   return new CroftError("FILE_UNREADABLE", {
     message: `cannot read ${file}: ${first}`,
-    hint: /dialect|column|Expected Number|quote|line/i.test(msg)
-      ? "the file's rows do not all have the same columns; fix the file, or declare csv: { delimiter, header, skip } in the asset"
-      : "check that the file is complete and in the declared format",
+    hint: unreadableHint(msg),
     asset, ...(runId ? { runId } : {}), details: { file, duckdb: first },
   });
+}
+
+/**
+ * Only a strict read's "Expected Number of Columns" proves a ragged line. "It was not possible to automatically
+ * detect the CSV parsing dialect" says only that no dialect fit every line it sampled: a line with another number of
+ * fields, a quote never closed, a preamble, or (before croft normalized them, D101) mixed line endings all end there,
+ * so its hint names the usual causes rather than one. Words such as "line" or "column" appear in nearly every DuckDB
+ * message and prove nothing (D102).
+ */
+export function unreadableHint(msg: string): string {
+  if (/Expected Number of Columns/i.test(msg)) {
+    return "a line of the file does not have the same columns as its header (DuckDB names it above); fix that line, or declare csv: { delimiter, header, skip } in the asset if croft read the file with the wrong ones";
+  }
+  if (/detect the CSV parsing dialect/i.test(msg)) {
+    return "DuckDB found no one delimiter, quote and header that fit every line; the usual causes are a line with more or fewer fields than the others, a quote that is never closed, or lines before the header. Look at the file, then fix it or declare csv: { delimiter, header, skip } in the asset";
+  }
+  return "check that the file is complete and in the declared format";
 }
 
 function abortError(signal: AbortSignal, asset: string, runId: string): CroftError {

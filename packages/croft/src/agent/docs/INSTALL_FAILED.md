@@ -14,8 +14,16 @@ not checked, or not fully. Its file is tsconfig.json, or none:
 - a tsconfig.json whose "include" leaves out .croft/types (a project made before croft generated input row types):
   tsc ran, but read every input row as a Row, so it cannot catch a column renamed upstream (UNKNOWN_INPUT_COLUMN).
 
+A project inside a workspace (a folder the "workspaces" of a package.json above it take in, such as packages/*)
+is installed as one of the workspace's members: bun install there installs the whole workspace and keeps the
+lockfile at its root, and a package manager that hoists packages leaves the project's node_modules without croft.
+croft init says so when it creates a project in such a folder.
+
 What to do:
 - Packages: run bun install in the project folder (the hint gives the exact command) and fix what it reports.
+- A project inside a workspace: leave it out of the workspace, with a "!" pattern after the one that takes it in
+  ("workspaces": ["packages/*", "!packages/data"]), then run bun install in the project folder. It is the user's
+  package.json: ask first.
 - The scheduler: follow the hint (log in to the Mac's desktop session for launchd; install and start cron on Linux),
   then croft schedule on again; ask the user before installing system software. Without an OS job, scheduling
   still works: croft schedule on --no-os-job, and keep croft serve running, which ticks every minute (croft docs

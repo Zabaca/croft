@@ -167,6 +167,13 @@ export function describe(r: InitResult, from: string): string {
     lines.push(`This folder is in ${r.relocation.reason}; file sync can corrupt a database mid-write, so the database and`,
       `.croft/ live in ${r.relocation.dir} instead (recorded in croft.json). Your asset files stay here.`);
   }
+  if (r.workspace) {
+    // A workspace member's install is the workspace's (project/init.ts claimingWorkspace).
+    const w = r.workspace;
+    const file = relative(from, w.file);
+    lines.push(`${file.startsWith("..") || file === "" ? w.file : file} takes this project into its workspaces ("${w.pattern}"), but a croft project`,
+      `installs its own pinned croft: add "${w.exclude}" to that "workspaces" list, then run bun install in ${where(r.root)}.`);
+  }
   if (r.tsconfig) {
     const t = r.tsconfig;
     if (t.status === "applied") lines.push(`${t.file}: edited, so your app's type-check skips data/'s pipelines and query<"table">() is typed.`);

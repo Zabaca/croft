@@ -4,7 +4,7 @@ export type ColumnType = "BOOLEAN" | "BIGINT" | "HUGEINT" | "DOUBLE" | "VARCHAR"
   | "TIMESTAMPTZ" | "JSON" | `DECIMAL(${number},${number})` | (string & {});
 export type ColumnPin = ColumnType | { type: ColumnType; format?: string };   // format: strptime pattern
 export type RowSource = AsyncIterable<Row | Row[]> | Iterable<Row | Row[]> | Promise<Row[]>;
-export type FileFormat = "csv" | "tsv" | "json" | "ndjson" | "parquet";
+export type FileFormat = "csv" | "tsv" | "json" | "ndjson" | "parquet" | "yaml";
 
 export interface Common {
   description?: string;

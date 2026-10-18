@@ -4,6 +4,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { CroftError } from "../core/errors.ts";
 import { openMemory } from "../db/connect.ts";
 import { ensureState } from "../db/state.ts";
 import { renderValueRows, resultShape } from "../db/values.ts";
@@ -123,7 +124,14 @@ describe("OwnTableQuery", () => {
     const q = new OwnTableQuery({ warehouse: w, asset: "fresh", dir: join(state, "staging", "r4", "fresh"), stateDir: state, timezone: "UTC" });
     try {
       await expect(q.query("select * from fresh")).rejects.toMatchObject({ code: "QUERY_FAILED", message: expect.stringContaining("has no table yet") });
+      // `since` is undefined on every run of an ingest without a cursor: the hint gives such an ingest its own way.
+      const first = await q.query("select * from fresh").catch((e: CroftError) => e);
+      expect((first as CroftError).problem.hint).toContain("`await query(...).catch(() => [])` without one");
       expect(await q.query("select 42 as x")).toEqual([{ x: 42 }]);
+      // A comparison after AND that ->> swallowed gets the precedence hint here too.
+      const arrow = await q.query(`select true AND '{"k":"v"}'::JSON->>'k' = 'v' as r`).catch((e: CroftError) => e);
+      expect(arrow).toMatchObject({ code: "QUERY_FAILED" });
+      expect((arrow as CroftError).problem.hint).toContain("(j->>'k') = 'v'");
     } finally {
       q.close();
     }

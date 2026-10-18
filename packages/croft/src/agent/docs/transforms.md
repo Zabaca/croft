@@ -6,6 +6,8 @@ those first, snapshots them for the code, and knows to update the transform when
 SQL does badly: an API or LLM call per row, parsing, scoring with a library. For filters, joins and aggregates,
 write an SQL asset instead (croft docs sql). Shared code goes in lib/, imported with a relative path
 (import { triage } from "../lib/triage.ts"); an edit there counts as an edit of every asset that imports it.
+Asset code runs in the project folder (croft changes into it, and scheduled runs start there), so a file path in
+code, in assets/ or lib/ alike, is relative to the project folder: readFileSync("files/rules.json").
 
 Start with croft new transform <name>. It writes the per-row kind below: keyed and incremental, reading with
 newRows() the asset with a key that changed most recently, with confirmAbove set and a comment where the paid call
