@@ -661,7 +661,7 @@ describe("validateDefinition: ingests", () => {
     ["file list empty", files({ file: [] }), "file", "file is an empty list"],
     ["file list entry", files({ file: ["a.csv", 3] }), "file", "file[1] must be a path, glob or URL, got 3"],
     ["file a number", files({ file: 3 }), "file", "file must be a path, glob or URL (or a list of them), got 3"],
-    ["format unknown", files({ format: "cvs" }), "format", 'format must be one of csv, tsv, json, ndjson, parquet, got "cvs"; did you mean "csv"?'],
+    ["format unknown", files({ format: "cvs" }), "format", 'format must be one of csv, tsv, json, ndjson, parquet, yaml, got "cvs"; did you mean "csv"?'],
     ["csv not an object", files({ csv: true }), "csv", "csv must be an object of CSV options, got true"],
     ["csv unknown key", files({ csv: { headers: true } }), "csv", 'unknown key "headers" in csv; did you mean "header"?'],
     ["csv delimiter", files({ csv: { delimiter: "" } }), "delimiter", 'csv.delimiter must be a character such as ";" or "|", got ""'],

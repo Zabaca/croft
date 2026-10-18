@@ -356,6 +356,8 @@ export interface StageOptions {
   signal?: AbortSignal;
   partRows?: number;
   sinceUsed?: string | number;
+  /** UNSAFE_INTEGER's hint when the numbers came from a parser croft ran itself (a YAML file) rather than rows(). */
+  unsafeIntegerHint?: string;
 }
 
 /** manifest.json: the shared StageManifest plus what typing needs from staging. */
@@ -529,7 +531,7 @@ export async function writeStage(o: StageOptions): Promise<StageManifestFile> {
   for (const [col, u] of unsafe) {
     warnings.push(problem("UNSAFE_INTEGER", {
       message: `column ${col}: ${u.count} integer${u.count === 1 ? "" : "s"} beyond ±2^53 reached croft as JS numbers and may have lost digits (e.g. ${u.value} in row ${u.row}, ${u.path})`,
-      hint: "parse responses with ctx.http's res.json() (lossless: big integers become bigint), or yield such values as strings or bigint",
+      hint: o.unsafeIntegerHint ?? "parse responses with ctx.http's res.json() (lossless: big integers become bigint), or yield such values as strings or bigint",
       asset: o.asset, runId: o.runId,
       details: { column: col, count: u.count, row: u.row, path: u.path, sample: String(u.value) },
     }));
