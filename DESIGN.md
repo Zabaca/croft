@@ -2770,6 +2770,8 @@ Each phase is usable end to end, and each ships `--json`, error codes, docs page
 
 **The 0.2.0 release (2026-10-18).** Typed reads for apps: `query<"table">()` from `@zabaca/croft/read`, the `<Asset>ReadRow` types and the global `CroftTables` (D100), and `croft init` in an app excluding `data/assets` and `data/lib` while including `data/.croft/types` (D42). Also since 0.1.0: `croft query` groups thousands only in integer columns, `croft wait` returns once the run's process has exited, the hook's outside-the-project case uses a temp folder of its own, and `BUN_TESTED` is 1.4.3. The full suite passed on macOS arm64 (3,675 tests). The `npm pack` tarball was inspected (328 files: `dist/read.js` with its chunks and `read.d.ts` declaring `CroftTables`, `bin/croft.mjs` with its `#!/bin/sh` shebang and mode 755, `schemas/`, 115 docs pages, README and LICENSE; no tests, test kits, fixtures or evals), then installed in a temporary folder: `croft init` made a project, the example ran, a query answered, `.croft/types` held `ExampleSalesReadRow`, an app's `query<"example_sales">` typechecked (a missing column was an error) and ran, and `croft init` in an app printed the new tsconfig edit. It was published from that tarball and tagged `croft-v0.2.0`.
 
+**The 0.2.1 release (2026-10-18).** Package metadata only: the npm README follows the repository README's message (packages/site/test/readmes.test.ts keeps the two in step), and `package.json` gains `homepage`, `repository`, `bugs` and `keywords`. No code changed.
+
 The total is about 14.5 engineer-weeks and roughly 14–16k lines. The user chose to ship all five phases as v1.
 
 **Post-v1 candidates, in order:**

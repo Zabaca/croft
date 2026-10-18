@@ -1,55 +1,102 @@
 # croft
 
-Local data pipelines in TypeScript, on one DuckDB file. croft pulls data from APIs and files, transforms it with SQL or TypeScript, keeps the tables fresh on a schedule, and lets an app read them. It is a single CLI, and Claude Code can drive it from a cold start.
+**The whole data pipeline, in TypeScript.**
 
-Docs: https://croft.zabaca.com (for agents: [llms.txt](https://croft.zabaca.com/llms.txt)).
+croft is one tool that pulls data from APIs and files, transforms it, keeps it fresh on a schedule, and serves it to your app. Pipelines are TypeScript, with SQL where you want it, and everything lives in one DuckDB file on your machine. No Python, no servers, no glue between tools.
 
-- **Ingest:** APIs (keyset, cursor, Link-header and page pagination) and files (CSV, JSON, Parquet, globs and URLs). Loads are incremental, types are inferred, and schema changes are handled.
-- **Transform:** one SQL `SELECT` per file, or a TypeScript transform (for example, one LLM call per row, which is incremental and never re-bills). Checks run inside the write transaction.
-- **Keep it fresh:** schedules in plain words (`every hour`, `weekdays at 9am`). croft installs one per-user OS job. `croft serve` answers app queries over HTTP and steps aside for every write.
-- **Grow safely:** changes never destroy data without asking. There is a trash, and `restore`, `delete`, `rename` and `--rebuild`, each gated by a single `croft confirm`.
-
-## Install
-
-croft needs [Bun](https://bun.sh) 1.3.14 or newer, on macOS or Linux (native Windows is not supported; WSL works).
+[Website](https://croft.zabaca.com) · [Quickstart](https://croft.zabaca.com/docs/quickstart/) · [Docs](https://croft.zabaca.com/docs/) · [GitHub](https://github.com/Zabaca/croft) · [For AI agents: llms.txt](https://croft.zabaca.com/llms.txt)
 
 ```sh
-bun add -g @zabaca/croft       # the `croft` launcher, in ~/.bun/bin
-croft init my-data             # scaffolds a project, installs it, runs an offline example
-cd my-data
+bun add -g @zabaca/croft
+croft init my-data && cd my-data
 croft query "from example_sales limit 5"
 ```
 
-Every project pins its own croft version in `package.json`. The global `croft` only finds the project and runs that pinned copy.
+croft needs [Bun](https://bun.sh) 1.3.14 or newer, on macOS or Linux (WSL works).
 
-## A first pipeline
+## One tool, end to end
 
-```sh
-croft new api stripe_charges --pagination cursor   # a commented, working template
-croft secrets set STRIPE_KEY                        # stored in .env (never printed)
-croft validate                                      # static checks and a bind check
-croft preview stripe_charges                        # build in a sandbox and diff
-croft run stripe_charges
-croft new sql daily_revenue                         # SQL over what you loaded
-croft run                                           # everything that is stale
-croft schedule on                                   # hourly, via the OS job
+A croft project is a folder. Each file in `assets/` becomes one table, and `croft run` brings them up to date in order.
+
+**Ingest.** Bring data in from any API or from files. Incremental, typed, and safe to rerun.
+
+```ts
+// assets/stripe_charges.ts
+export default ingest({
+  key: "id",
+  schedule: "every hour",
+  async *rows({ http }) { … },
+});
 ```
 
-`croft help` lists every command. `croft docs --list` shows the offline docs: topics, templates, and a page for every error code. Every command takes `--json` and prints one envelope, `{ok, data, problems[], next[]}`. The JSON Schemas for these envelopes ship in `schemas/`.
+**Transform.** One SQL query per table, or a TypeScript function per row, with checks that run before anything is saved.
 
-## With Claude Code
+```sql
+-- assets/revenue_by_month.sql
+-- check: revenue >= 0
+SELECT month, sum(amount) AS revenue
+FROM stripe_charges
+GROUP BY month
+```
 
-`croft init` writes a managed `CLAUDE.md` block and `.claude/skills/croft/SKILL.md`, so Claude Code knows the loop: `croft new` → `croft validate` → `croft preview` → `croft run`. Destructive actions only run through `croft confirm <token>`, and one permission rule gates them all (`croft docs claude-permissions`). `croft init --claude --with-hook` also adds a hook that validates each edit under `assets/`.
+**Schedule.** A schedule in plain words. Everything downstream updates after it.
 
-## Apps
+**Serve.** Read the tables from any Bun or Node app, typed by table name.
 
 ```ts
 import { query } from "@zabaca/croft/read";
-const rows = await query<"daily_revenue">("select * from daily_revenue order by day desc limit 7");
+
+const rows = await query<"revenue_by_month">("from revenue_by_month order by month");
 ```
 
-`@zabaca/croft/read` runs under Bun and Node. It talks to `croft serve` when one is running, and otherwise opens the database briefly. `query<"daily_revenue">` types the rows from the table's real columns, which croft writes to `.croft/types` after each run; include that folder in the app's `tsconfig.json` (`croft docs serve`).
+## Typed across SQL and TypeScript
+
+After every run, croft writes a TypeScript type for each table from its real columns. Rename a column in SQL, and `croft validate --types` flags the TypeScript that still reads the old name, before anything runs:
+
+```text
+error UNKNOWN_INPUT_COLUMN  assets/region_labels.ts:9:65
+      revenue_by_region has no column "revenue"
+      fix: revenue_by_region has these columns: region, orders, total, _loaded_at
+```
+
+## What it replaces
+
+| Job | The usual stack | croft |
+|---|---|---|
+| Load from APIs and files | dlt, Airbyte or custom Python scripts | `ingest()` in a `.ts` file |
+| Transform | dbt models (SQL and YAML) | a `.sql` file, or `transform()` in TypeScript |
+| Test the data | dbt tests | checks that run before every save |
+| Schedule and orchestrate | Dagster, Airflow or cron | `schedule: "every hour"` |
+| Catch a broken column | when the warehouse runs the model | before anything runs, from SQL into the TypeScript that reads it |
+| Store | a warehouse to host and pay for | one DuckDB file on your machine |
+| Read from your app | a client and credentials per warehouse | `@zabaca/croft/read`, typed by table |
+
+croft does these jobs; it does not read those tools' projects. It is built for one machine and one DuckDB file. If your team already runs a warehouse with dbt, keep it.
+
+## Built for coding agents
+
+Claude Code, or any coding agent, can run a croft project from a cold start:
+
+- Every command takes `--json`, and every problem has a stable code, a hint with the next command, and often a fix the agent can apply as is.
+- `croft validate` checks every change without running it; `croft preview` builds it in a sandbox and diffs it against the live table.
+- Anything that could lose data stops and waits for a person: every destructive step ends in `croft confirm`, so one permission rule gates them all.
+- `croft init` writes a skill and a `CLAUDE.md` block, pinned to the project's croft version. Without a project yet, the repository's Claude Code plugin teaches the start:
+
+  ```text
+  /plugin marketplace add Zabaca/croft
+  /plugin install croft@croft
+  ```
+
+## Your data stays safe
+
+Some data can't be fetched again, so croft never throws it away on its own. Every write is all-or-nothing, and a failed check keeps the old data. Anything replaced or deleted goes to a trash first, and `croft restore` brings it back. A crash, even `kill -9`, never leaves half a write.
+
+## Links
+
+- Website and docs: https://croft.zabaca.com
+- Source, issues and the design: https://github.com/Zabaca/croft
+- For AI agents: https://croft.zabaca.com/llms.txt
 
 ## License
 
-MIT
+[MIT](https://github.com/Zabaca/croft/blob/main/packages/croft/LICENSE)
