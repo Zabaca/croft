@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Start a croft data pipeline from nothing: install, croft init, and the validate → preview → run loop. Inside a project, croft's own versioned skill takes over.",
   "author": { "name": "Zabaca", "url": "https://github.com/Zabaca/croft" },
-  "homepage": "https://croft.james-99a.workers.dev",
+  "homepage": "https://croft.zabaca.com",
   "license": "MIT",
   "keywords": ["data", "pipelines", "duckdb", "etl", "croft"]
 }

@@ -5,7 +5,7 @@ description: Start a local data pipeline with croft (TypeScript + one DuckDB fil
 
 croft is one CLI for local data pipelines: ingests pull from APIs and files, transforms are one SQL SELECT
 (or TypeScript per row), and everything lives in one DuckDB file. Each file in `assets/` makes one table with
-the file's name. Docs: https://croft.james-99a.workers.dev/llms.txt (every page as Markdown).
+the file's name. Docs: https://croft.zabaca.com/llms.txt (every page as Markdown).
 
 ## Is there a project already?
 
