@@ -1,0 +1,133 @@
+# Publishes @zabaca/croft to npm when a croft-v<version> tag is pushed (DESIGN.md §10 item 8, "Releases").
+#
+# Trusted publishing: there is no npm token. @zabaca/croft names this repository and this workflow file as its
+# trusted publisher on npmjs.com, and the publish job proves it is this workflow with a GitHub OIDC token. npm
+# accepts that only from GitHub-hosted runners, with npm >= 11.5.1, and adds provenance because the repository
+# is public (it then requires package.json's repository.url to name this repository, which it does).
+#
+# Two jobs, so what is published is byte for byte what was tested: `pack` runs the suite on the tagged commit
+# and packs it, and `publish` uploads that tarball. It is packed with `npm pack`, as 0.1.0 to 0.2.1 were by
+# hand: it runs `prepack` (the read client's build, scripts/build-read.ts) and writes bin/croft.mjs with mode
+# 755, where `bun pm pack` copies the checkout's 777.
+name: publish-npm
+on:
+  push:
+    tags: ["croft-v*"]
+  workflow_dispatch:
+concurrency: publish-npm
+jobs:
+  pack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.state.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: git identity
+        run: git config --global user.email ci@zabaca.com && git config --global user.name "croft ci"
+      - run: bun install --frozen-lockfile
+      # A tag that names another version than package.json would publish something the tag does not describe.
+      - name: the tag names package.json's version
+        if: github.ref_type == 'tag'
+        run: |
+          VERSION=$(jq -r .version packages/croft/package.json)
+          if [ "${GITHUB_REF_NAME}" != "croft-v${VERSION}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} but packages/croft/package.json is ${VERSION}"
+            exit 1
+          fi
+      - name: already on npm?
+        id: state
+        run: |
+          VERSION=$(jq -r .version packages/croft/package.json)
+          if npm view "@zabaca/croft@${VERSION}" version >/dev/null 2>&1; then
+            echo "publish=no" >> "$GITHUB_OUTPUT"
+            echo "@zabaca/croft@${VERSION} is already on npm; nothing to do"
+          else
+            echo "publish=yes" >> "$GITHUB_OUTPUT"
+          fi
+      - name: typecheck
+        if: steps.state.outputs.publish == 'yes'
+        working-directory: packages/croft
+        run: bun run typecheck
+      - name: test
+        if: steps.state.outputs.publish == 'yes'
+        working-directory: packages/croft
+        env:
+          CROFT_CI: "1"
+        run: bun test
+      # The site test keeps the npm README in step with the repository's (packages/site/test/readmes.test.ts).
+      - name: site test
+        if: steps.state.outputs.publish == 'yes'
+        working-directory: packages/site
+        run: bun test
+      - name: pack
+        if: steps.state.outputs.publish == 'yes'
+        working-directory: packages/croft
+        run: |
+          mkdir -p "${RUNNER_TEMP}/pack"
+          npm pack --pack-destination "${RUNNER_TEMP}/pack"
+      # What 0.2.0's release checked by hand: the read client and its types, an executable bin, and no tests,
+      # test kits, fixtures or evals.
+      - name: the tarball holds what ships, and nothing else
+        if: steps.state.outputs.publish == 'yes'
+        run: |
+          TARBALL=$(ls "${RUNNER_TEMP}"/pack/*.tgz)
+          tar -tzvf "${TARBALL}" > "${RUNNER_TEMP}/contents.txt"
+          grep -E ' package/dist/read\.js$' "${RUNNER_TEMP}/contents.txt"
+          grep -E ' package/dist/read\.d\.ts$' "${RUNNER_TEMP}/contents.txt"
+          grep -E '^-rwxr-xr-x .* package/bin/croft\.mjs$' "${RUNNER_TEMP}/contents.txt"
+          if grep -E '\.test\.ts$|testkit|/fixtures/|package/evals/|package/tests/' "${RUNNER_TEMP}/contents.txt"; then
+            echo "::error::the tarball holds test files"
+            exit 1
+          fi
+          echo "$(wc -l < "${RUNNER_TEMP}/contents.txt") files"
+      - uses: actions/upload-artifact@v4
+        if: steps.state.outputs.publish == 'yes'
+        with:
+          name: tarball
+          path: ${{ runner.temp }}/pack/*.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: pack
+    if: needs.pack.outputs.publish == 'yes'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball
+          path: ${{ runner.temp }}/pack
+      # No registry-url: it would write an .npmrc that expects a token.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: an npm that speaks OIDC
+        run: npm install -g npm@^11.5.1 && npm --version
+      # A dry run prints any correction npm would make to the manifest; any at all means the published package
+      # would not be the one packed (zbc's npm dropped a bin entry this way).
+      - name: refuse if npm would rewrite the manifest
+        run: |
+          TARBALL=$(ls "${RUNNER_TEMP}"/pack/*.tgz)
+          npm publish --dry-run --access public "${TARBALL}" 2>&1 | tee "${RUNNER_TEMP}/dry-run.log"
+          if grep -qiE 'auto-corrected|was invalid and removed' "${RUNNER_TEMP}/dry-run.log"; then
+            echo "::error::npm would rewrite @zabaca/croft's package.json on publish; not publishing"
+            exit 1
+          fi
+      # Verbose, because a failed OIDC exchange otherwise says only ENEEDAUTH; the oidc lines name the reason
+      # (usually a trusted-publisher setting on npmjs.com that does not match this repository or file). The
+      # registry answers 202 and holds the version as "Validating" for a while, so `npm view` may not see it at
+      # once; do not re-run this workflow while it does.
+      - name: publish
+        run: npm publish --access public --loglevel verbose "$(ls "${RUNNER_TEMP}"/pack/*.tgz)"
