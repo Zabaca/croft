@@ -1,0 +1,32 @@
+/* croft's palette on Starlight: a field green accent on warm greys. Starlight's :root is its dark theme and
+   [data-theme='light'] its light one; only the accent and grey ramps are changed. */
+:root {
+  --sl-color-accent-low: #1d3323;
+  --sl-color-accent: #5f9c6c;
+  --sl-color-accent-high: #c9e6cf;
+  --sl-color-white: #faf8f2;
+  --sl-color-gray-1: #ece8dd;
+  --sl-color-gray-2: #c9c4b6;
+  --sl-color-gray-3: #9b9585;
+  --sl-color-gray-4: #5f5a4e;
+  --sl-color-gray-5: #3b3830;
+  --sl-color-gray-6: #26241f;
+  --sl-color-black: #171613;
+  --sl-font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+}
+:root[data-theme='light'] {
+  --sl-color-accent-low: #d7eadb;
+  --sl-color-accent: #2f6b3e;
+  --sl-color-accent-high: #1b3d24;
+  --sl-color-white: #171613;
+  --sl-color-gray-1: #26241f;
+  --sl-color-gray-2: #3b3830;
+  --sl-color-gray-3: #5f5a4e;
+  --sl-color-gray-4: #8a8476;
+  --sl-color-gray-5: #c9c4b6;
+  --sl-color-gray-6: #ece8dd;
+  --sl-color-gray-7: #f6f3ea;
+  --sl-color-black: #fcfbf7;
+}
+/* The generated pages keep the CLI's aligned tables as text blocks; let them scroll rather than wrap. */
+.sl-markdown-content pre { white-space: pre; }
