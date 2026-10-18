@@ -29,7 +29,10 @@
 //                   it does not apply to; and a transform whose input was never built and is not built by the
 //                   run either is skipped with INPUT_NOT_BUILT, whose fix (the run that builds the input) leads
 //                   next (run/plan.ts)
-//   holds           an asset another run holds the lease of: the run would wait for it
+//   holds           an asset another run holds the lease of: the run would wait for it. An asset inside a known wait
+//                   (a server's Retry-After not over, a request budget still spent: HTTP_WAIT, D105) is held, as
+//                   the run holds it. How many requests a step will make is not shown: only its code knows, and
+//                   the rows it would make them for are counted only where the cost guard counts them
 //
 // Nothing is created: without runs.sqlite the project has never run, and everything is "never built". A dry
 // run never issues a confirmation token.
@@ -47,10 +50,11 @@ import { lookbackWords, selectorWords } from "../project/resolve.ts";
 import type { Project } from "../project/root.ts";
 import { cursorTypeOfPin } from "../project/ts-asset.ts";
 import { plannedTrashPath } from "../safety/trash.ts";
+import { planWaits } from "../schedule/due.ts";
 import { croftError, fromSince, shrinkImpact } from "./ingest.ts";
 import {
   type BehaviorSide, buildFirst, cursorTypesOf, FROM_ONLY_MERGE, loadErrors, pendingBehavior, pendingPins, type PlannedStep, planRun, rebuildCommand,
-  type RunPlan, skipProblem,
+  type PlanInput, type RunPlan, skipProblem,
 } from "./plan.ts";
 import { rebuildImpact, rebuildKindOf, rebuildNotes, rebuildTrashes, rebuildWords } from "./rebuild.ts";
 import { checkRunFlags, shrinkCommand, withProjectChecks } from "./runner.ts";
@@ -92,12 +96,15 @@ interface History {
   leased: Map<string, string>;
   /** Rows each asset's committed steps wrote (added + updated), with when they finished: pending-row estimates. */
   writes: Map<string, { finishedAt: string; rows: number }[]>;
+  /** The assets inside a known wait, which the run would hold (D105). */
+  waits: NonNullable<PlanInput["waits"]>;
 }
 
-function readHistory(stateDir: string): History {
-  const empty: History = { catalog: [], leased: new Map(), writes: new Map() };
+function readHistory(project: Project, now: Date): History {
+  const stateDir = project.paths.stateDir;
+  const empty: History = { catalog: [], leased: new Map(), writes: new Map(), waits: () => null };
   if (!existsSync(join(stateDir, RUNS_DB_FILE))) return empty;
-  const db = RunsDb.open(stateDir);
+  const db = RunsDb.open(stateDir, { now: () => now });
   try {
     const leased = new Map<string, string>();
     for (const l of listLeases(db)) if (l.alive) leased.set(l.asset, l.runId);
@@ -110,7 +117,7 @@ function readHistory(stateDir: string): History {
       list.push({ finishedAt: r.finished_at, rows: Number(r.n) });
       writes.set(r.asset, list);
     }
-    return { catalog: allCatalog(db), leased, writes };
+    return { catalog: allCatalog(db), leased, writes, waits: planWaits(db, project, now) };
   } finally {
     db.close();
   }
@@ -120,13 +127,14 @@ function readHistory(stateDir: string): History {
  *  (USAGE_ERROR, BACKFILL_UNSUPPORTED, BACKFILL_WOULD_DUPLICATE, CURSOR_TYPE_MISMATCH for an asset named exactly). */
 export async function dryRun(i: DryRunInput): Promise<DryRunOutcome> {
   const { project } = i;
-  const history = readHistory(project.paths.stateDir);
+  const now = i.now ?? clockNow();
+  const history = readHistory(project, now);
   const entries = new Map(history.catalog.map((c) => [c.asset, c]));
   const planned = await planRun({
     root: project.root, timezone: project.timezone, selectors: i.selectors, catalog: history.catalog,
     cursorTypes: cursorTypesOf(history.catalog), only: i.only === true, upstream: i.upstream === true,
     ...(i.from !== undefined ? { from: i.from } : {}), ...(i.importTimeoutMs !== undefined ? { importTimeoutMs: i.importTimeoutMs } : {}),
-    ...(i.rebuild ? { rebuild: true } : {}),
+    ...(i.rebuild ? { rebuild: true } : {}), waits: history.waits,
     // A mistyped name's fix is this dry run again, never a real run.
     retry: (selectors) => [...runWords({ ...i, selectors }), "--dry-run"].join(" "),
   });
@@ -136,7 +144,6 @@ export async function dryRun(i: DryRunInput): Promise<DryRunOutcome> {
   // As a run does (runner.ts withProjectChecks): a TS transform whose inputs name no asset fails before it runs
   // (UNKNOWN_TABLE with a did-you-mean edit fix).
   const plan = await withProjectChecks(planned, project);
-  const now = i.now ?? clockNow();
   const steps: DryRunStep[] = [];
   const problems: Problem[] = [...plan.problems];
   /** Steps that would fail before they run, or are skipped because an input would: the runner skips what reads
@@ -183,6 +190,12 @@ export async function dryRun(i: DryRunInput): Promise<DryRunOutcome> {
       out.skippedBecause = `input ${stopped} ${blocked.get(stopped)}`;
     }
     if (step.action === "skip") out.skippedBecause = step.reason;
+    // Inside a known wait (HTTP_WAIT, D105): the run holds it and its readers go ahead, as the runner does.
+    if (step.hold && step.action !== "skip" && errors.length === 0) {
+      out.action = "skip";
+      out.hold = step.hold;
+      out.skippedBecause = step.reason;
+    }
 
     if (out.action !== "skip" && out.problems.length === 0 && ingest) {
       try {

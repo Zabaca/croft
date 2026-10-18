@@ -19,12 +19,20 @@ export interface ServeConfig {
 }
 /** Where secrets come from besides the shell and .env (§9.8 "Secrets", D108): a command whose output is dotenv. */
 export interface SecretsFrom { command: string[] }
+/** A request budget for one host (http.budgets, D104): at most this many requests ctx.http sends to it in any
+ *  rolling minute, hour or day, counted across runs and previews in runs.sqlite. At least one is set. */
+export interface HostBudget { perMinute?: number; perHour?: number; perDay?: number }
+export interface HttpConfig {
+  /** By host as ctx.http sees it in a URL ("api.example.com", or "127.0.0.1:8080" with a port), lower case. */
+  budgets: Record<string, HostBudget>;
+}
 export interface CroftConfig {
   database: string;                  // as written: relative to the root, or absolute after relocation
   timezone: string;
   readCopy: boolean;
   notify: NotifyConfig;
   concurrency: number;               // parallel extractions in one run
+  http: HttpConfig;
   serve: ServeConfig;
   stateDir: string | null;           // set when .croft/ was relocated off a synced folder
   secretsFrom: SecretsFrom | null;   // run only when a secret is needed and not set in the shell or .env
@@ -35,6 +43,7 @@ export const DEFAULTS = {
   readCopy: false,
   notify: { desktop: true, webhook: null },
   concurrency: 4,
+  http: { budgets: {} },
   serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 30_000, maxConcurrent: 4, maxBytes: 64 * 1024 * 1024, maxRows: 100_000, allowOrigins: [] },
 } as const;
 
@@ -46,6 +55,7 @@ export const CONFIG_KEYS: { key: string; type: string; default: string; descript
   { key: "notify.desktop", type: "boolean", default: "true", description: "desktop notification when a scheduled run fails" },
   { key: "notify.webhook", type: "string | null", default: "null", description: "http(s) URL that receives the failure envelope of a scheduled run" },
   { key: "concurrency", type: "integer", default: String(DEFAULTS.concurrency), description: "extractions that run at the same time in one run (1-64)" },
+  { key: "http.budgets", type: "object", default: "{}", description: "requests ctx.http may send to each host across runs and previews, e.g. {\"api.example.com\": {\"perHour\": 50, \"perDay\": 125}} (perMinute, perHour, perDay)" },
   { key: "serve.port", type: "integer", default: String(DEFAULTS.serve.port), description: "read server port" },
   { key: "serve.host", type: "string", default: `"${DEFAULTS.serve.host}"`, description: "read server address; anything but loopback must sit behind HTTPS" },
   { key: "serve.queryTimeoutMs", type: "integer", default: String(DEFAULTS.serve.queryTimeoutMs), description: "deadline for one query over HTTP" },
@@ -57,8 +67,10 @@ export const CONFIG_KEYS: { key: string; type: string; default: string; descript
   { key: "secretsFrom.command", type: "string[]", default: "null", description: "a command, run from the project folder without a shell, that prints the secrets the shell and .env lack as KEY=value lines, e.g. [\"sops\", \"-d\", \"--output-type\", \"dotenv\", \"secrets.enc.yaml\"] (croft docs secrets)" },
 ];
 
-const TOP_KEYS = ["$schema", "database", "timezone", "readCopy", "notify", "concurrency", "serve", "stateDir", "secretsFrom"];
+const TOP_KEYS = ["$schema", "database", "timezone", "readCopy", "notify", "concurrency", "http", "serve", "stateDir", "secretsFrom"];
 const NOTIFY_KEYS = ["desktop", "webhook"];
+const HTTP_KEYS = ["budgets"];
+const BUDGET_KEYS = ["perMinute", "perHour", "perDay"];
 const SERVE_KEYS = ["port", "host", "queryTimeoutMs", "maxConcurrent", "maxBytes", "maxRows", "allowOrigins"];
 const SECRETS_FROM_KEYS = ["command"];
 
@@ -195,6 +207,42 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined, p
     else add("notify.webhook", `"notify.webhook" must be an http(s) URL or null; found ${show(n.webhook)}`, `set it to a URL like "https://hooks.slack.com/services/…", or remove it`);
   }
 
+  // http.budgets (D104): host → {perMinute?, perHour?, perDay?}. A key is a host as a URL has it, never a URL.
+  const h = obj("http", "http");
+  unknownKeys(h, HTTP_KEYS, "http");
+  const budgets: Record<string, HostBudget> = {};
+  if (h.budgets !== undefined) {
+    if (!isPlainObject(h.budgets)) {
+      add("http.budgets", `"http.budgets" must be an object by host, like {"api.example.com": {"perHour": 50}}; found ${show(h.budgets)}`,
+        'write it as {"<host>": {"perHour": <requests>}} (croft docs config)');
+    } else {
+      for (const [host, v] of Object.entries(h.budgets)) {
+        const path = joinPath("http.budgets", host);
+        const name = budgetHost(host);
+        if (name !== host) {
+          add(path, `"http.budgets" keys are hosts like "api.example.com"; found ${show(host)}`,
+            name ? `use "${name}": the host alone, in lower case, without a scheme or a path` : "use the host of the API's URLs, without a scheme or a path",
+            name ? editFix(path, `use "${name}"`, `"${host}"`, `"${name}"`) : undefined);
+          continue;
+        }
+        if (!isPlainObject(v)) {
+          add(path, `"${path}" must be an object like {"perHour": 50, "perDay": 125}; found ${show(v)}`, `write it as {"perHour": <requests>}`);
+          continue;
+        }
+        unknownKeys(v, BUDGET_KEYS, path);
+        const budget: HostBudget = {};
+        for (const k of BUDGET_KEYS as (keyof HostBudget)[]) {
+          // An invalid count is reported, and the config is refused: the fallback only fills in the hint.
+          if (v[k] !== undefined) budget[k] = int(v, joinPath(path, k), k, 50, 1, 1_000_000_000);
+        }
+        if (!BUDGET_KEYS.some((k) => k in v)) {
+          add(path, `"${path}" sets no limit; it takes "perMinute", "perHour" and "perDay"`, `add one, such as "perHour": 50, or remove "${host}"`);
+        }
+        budgets[host] = budget;
+      }
+    }
+  }
+
   // serve
   const s = obj("serve", "serve");
   unknownKeys(s, SERVE_KEYS, "serve");
@@ -257,7 +305,7 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined, p
   }
 
   if (issues.length) return { ok: false, issues };
-  return { ok: true, config: { database, timezone, readCopy, notify: { desktop, webhook }, concurrency, serve, stateDir, secretsFrom } };
+  return { ok: true, config: { database, timezone, readCopy, notify: { desktop, webhook }, concurrency, http: { budgets }, serve, stateDir, secretsFrom } };
 }
 
 /**
@@ -516,6 +564,18 @@ function isFile(p: string): boolean {
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** The host a key of http.budgets names, as ctx.http matches it (URL.host: lower case, with a port when it has
+ *  one): "API.Example.com" and "https://api.example.com/v1" give "api.example.com"; null when it names none. */
+export function budgetHost(key: string): string | null {
+  const text = key.trim();
+  if (!text) return null;
+  try {
+    return new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `https://${text}`).host || null;
+  } catch {
+    return null;
+  }
 }
 
 function isHttpUrl(s: string): boolean {

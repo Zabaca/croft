@@ -347,6 +347,39 @@ describe("backoff: a failed transform is never retried every minute", () => {
   });
 });
 
+describe("an ingest inside a known wait (D105)", () => {
+  test("a fire inside the server's Retry-After is held (backoff), still due, and runs once the wait is over", async () => {
+    const p = await pipeline();
+    const codeHash = factsOf(p).issues!.codeHash!;
+    const asked = problem("HTTP_ERROR", { message: "429", hint: "later", retryable: true, details: { status: 429, retryAfterMs: 2 * 3_600_000 } });
+    recordStep(p, { asset: "issues", at: "2026-09-22T10:30:00Z", status: "failed", human: false, error: asked, codeHash });
+    let w = await work(p, "2026-09-22T11:00:30Z");
+    expect(view(w, "issues")).toMatchObject({ due: true, held: { code: "backoff", reason: "the API asked to wait (429); tries again after 12:30" } });
+    expect(w.groups).toEqual([]);
+    // The --due run's plan holds it the same way, should a tick have named it.
+    scheduling(p, "on");
+    const db = p.db(at("2026-09-22T11:00:30Z"));
+    try {
+      const h = duePlanning({ project: p.project, runs: db, now: at("2026-09-22T11:00:30Z") })
+        .hold({ asset: "issues", file: "assets/issues.ts", kind: "rows", codeHash, ok: true });
+      expect(h).toMatchObject({ hold: "retry_after", problem: { code: "HTTP_WAIT", severity: "warning", details: { until: "2026-09-22T12:30:00.000Z", status: 429 } } });
+    } finally {
+      db.close();
+    }
+    w = await work(p, "2026-09-22T12:30:30Z");
+    expect(view(w, "issues")).toMatchObject({ due: true, held: null });
+    expect(w.groups).toEqual([["issues"]]);
+  });
+
+  test("a short wait already over by the next fire holds nothing", async () => {
+    const p = await pipeline();
+    const codeHash = factsOf(p).issues!.codeHash!;
+    const asked = problem("HTTP_ERROR", { message: "429", hint: "later", retryable: true, details: { status: 429, retryAfterMs: 600_000 } });
+    recordStep(p, { asset: "issues", at: "2026-09-22T10:30:00Z", status: "failed", human: false, error: asked, codeHash });
+    expect(view(await work(p, "2026-09-22T11:00:30Z"), "issues")).toMatchObject({ due: true, held: null });
+  });
+});
+
 describe("groups: one run per connected group of due assets", () => {
   test("independent pipelines run apart; ingests that feed one transform run together", async () => {
     const p = schedProject({

@@ -8,7 +8,8 @@ import { croftJson } from "../agent/templates.ts";
 import { CONFIG_KEYS, DEFAULTS, validateConfig } from "./root.ts";
 
 type Schema = {
-  type?: string | string[]; properties?: Record<string, Schema>; additionalProperties?: boolean; required?: string[];
+  type?: string | string[]; properties?: Record<string, Schema>; additionalProperties?: boolean | Schema; required?: string[];
+  propertyNames?: Schema; minProperties?: number;
   minimum?: number; maximum?: number; minLength?: number; minItems?: number; pattern?: string; items?: Schema; default?: unknown;
   description?: string; $schema?: string; $id?: string; title?: string;
 };
@@ -17,7 +18,7 @@ const SCHEMA_PATH = fileURLToPath(new URL("../../croft.schema.json", import.meta
 const schema = JSON.parse(readFileSync(SCHEMA_PATH, "utf8")) as Schema;
 
 const SUPPORTED = new Set(["type", "properties", "additionalProperties", "required", "minimum", "maximum", "minLength", "minItems", "pattern",
-  "items", "default", "description", "$schema", "$id", "title", "markdownDescription"]);
+  "items", "default", "description", "$schema", "$id", "title", "markdownDescription", "propertyNames", "minProperties"]);
 
 function typeOf(v: unknown): string[] {
   if (v === null) return ["null"];
@@ -49,7 +50,10 @@ function valid(s: Schema, v: unknown): boolean {
     for (const [k, x] of Object.entries(o)) {
       const sub = s.properties?.[k];
       if (sub) { if (!valid(sub, x)) return false; } else if (s.additionalProperties === false) return false;
+      else if (typeof s.additionalProperties === "object" && !valid(s.additionalProperties, x)) return false;
+      if (s.propertyNames && !valid(s.propertyNames, k)) return false;
     }
+    if (s.minProperties !== undefined && Object.keys(o).length < s.minProperties) return false;
   }
   return true;
 }
@@ -68,6 +72,8 @@ const VALID: unknown[] = [
   { ...tz, serve: { port: 65535 }, notify: {}, stateDir: null },
   { ...tz, secretsFrom: { command: ["sops", "-d", "--output-type", "dotenv", "secrets.enc.yaml"] } },
   { ...tz, secretsFrom: { command: ["/opt/homebrew/bin/sops"] } }, { ...tz, secretsFrom: null },
+  { ...tz, http: {} }, { ...tz, http: { budgets: {} } },
+  { ...tz, http: { budgets: { "api.example.com": { perHour: 50, perDay: 125 }, "127.0.0.1:8080": { perMinute: 1 }, "[::1]:9000": { perDay: 1_000_000_000 } } } },
 ];
 const INVALID: unknown[] = [
   [], "croft", null, 42,
@@ -100,6 +106,13 @@ const INVALID: unknown[] = [
   { ...tz, secretsFrom: "sops -d secrets.yaml" }, { ...tz, secretsFrom: {} }, { ...tz, secretsFrom: { command: [] } },
   { ...tz, secretsFrom: { command: "sops" } }, { ...tz, secretsFrom: { command: ["sops", ""] } }, { ...tz, secretsFrom: { command: ["sops", 1] } },
   { ...tz, secretsFrom: { command: ["sops"], format: "json" } },
+  { ...tz, http: [] }, { ...tz, http: { budget: {} } }, { ...tz, http: { budgets: [] } }, { ...tz, http: { budgets: 50 } },
+  { ...tz, http: { budgets: { "https://api.example.com": { perHour: 5 } } } },
+  { ...tz, http: { budgets: { "api.example.com/v1": { perHour: 5 } } } },
+  { ...tz, http: { budgets: { "API.example.com": { perHour: 5 } } } },
+  { ...tz, http: { budgets: { "api.example.com": 50 } } }, { ...tz, http: { budgets: { "api.example.com": {} } } },
+  { ...tz, http: { budgets: { "api.example.com": { perHour: 0 } } } }, { ...tz, http: { budgets: { "api.example.com": { perHour: 1.5 } } } },
+  { ...tz, http: { budgets: { "api.example.com": { perHour: "50" } } } }, { ...tz, http: { budgets: { "api.example.com": { perWeek: 5 } } } },
 ];
 
 /** Meaning the schema cannot express; croft reports these (croft validate, doctor) and editors do not. */

@@ -204,9 +204,18 @@ export default ingest({
 
 - since: the saved cursor (minus lookback) in its own JSON type, undefined on the first run, or the value of
   croft run <name> --from <when> (a date, an ISO time or -90d; merge ingests only).
-- http.get(url, {headers, query, retries, timeoutMs}) and http.post(url, body, {...}): retries network errors,
-  429 and 5xx, honors Retry-After, and throws HTTP_ERROR for 400 and above. null and undefined query values are
-  dropped, so since can be passed as is. res.json() keeps big integers exact; res.text; res.next.
+- http.get(url, {headers, query, retries, timeoutMs, okStatus}) and http.post(url, body, {...}): retries network
+  errors, 429 and 5xx, honors Retry-After, and throws HTTP_ERROR for 400 and above. null and undefined query values
+  are dropped, so since can be passed as is. res.json() keeps big integers exact; res.text; res.next.
+  - okStatus: [404] returns those statuses as a response (res.status) instead of throwing, for "does this
+    exist". An unlisted 429 or 5xx is still retried and thrown; never .catch(() => null) a request.
+  - http.head(url) gets the status and headers only. http.getBytes(url) keeps the body as res.bytes (a
+    Uint8Array) for PDFs, images and gzip, which res.text would corrupt; res.bytes.byteLength is its size.
+  - Conditional requests: send headers {"If-None-Match": etag} or {"If-Modified-Since": date}; an unchanged
+    resource answers 304, a response with an empty body, not an error.
+  - croft.json "http": {"budgets": {"api.example.com": {"perHour": 50, "perDay": 125}}} caps the requests to a
+    host across runs and previews (perMinute, perHour, perDay); a spent budget sends nothing and stops the step
+    with HTTP_BUDGET_SPENT until it frees (croft docs HTTP_BUDGET_SPENT).
 - secret("NAME"): only names listed in secrets: [...]; a missing value is SECRET_MISSING.
 - log(...): goes to the step's log (croft logs <name>), redacted.
 - query(sql): one SELECT over this asset's own table, e.g. which ids it already has.

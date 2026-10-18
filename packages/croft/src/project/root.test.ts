@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { scanJson } from "./json-locate.ts";
 import {
-  configProblems, findRoot, loadProject, parseConfig, physicalPath, readConfig, relocationDir, syncedLocation, type ConfigIssue,
+  configProblems, findRoot, loadProject, parseConfig, physicalPath, readConfig, relocationDir, syncedLocation, type ConfigIssue, validateConfig,
 } from "./root.ts";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "croft-root-")));
@@ -70,7 +70,7 @@ describe("loadProject", () => {
     expect(p.timezone).toBe("Asia/Tokyo");
     expect(p.config).toEqual({
       database: "warehouse.duckdb", timezone: "Asia/Tokyo", readCopy: false,
-      notify: { desktop: true, webhook: null }, concurrency: 4,
+      notify: { desktop: true, webhook: null }, concurrency: 4, http: { budgets: {} },
       serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 30000, maxConcurrent: 4, maxBytes: 67108864, maxRows: 100000, allowOrigins: [] },
       stateDir: null, secretsFrom: null,
     });
@@ -264,7 +264,7 @@ describe("croft.json validation messages", () => {
     const [j] = issues('{"timezone": "UTC", "serve": {"prot": 1}}');
     expect(j!.message).toBe('unknown key "serve.prot"; did you mean "serve.port"?');
     const [k] = issues('{"timezone": "UTC", "colour": 1}');
-    expect(k!.message).toBe('unknown key "colour"; croft.json takes "database", "timezone", "readCopy", "notify", "concurrency", "serve", "stateDir", "secretsFrom"');
+    expect(k!.message).toBe('unknown key "colour"; croft.json takes "database", "timezone", "readCopy", "notify", "concurrency", "http", "serve", "stateDir", "secretsFrom"');
   });
 
   test("time zones: misspelled case, a city, and a fixed offset", () => {
@@ -286,6 +286,25 @@ describe("croft.json validation messages", () => {
       '"concurrency" must be a whole number from 1 to 64; found "8"',
     ]);
     expect(list[1]!.fix).toMatchObject({ replace: { from: '"8"', to: "8" } });
+  });
+
+  test("http.budgets: hosts, not URLs, and whole numbers of requests per window", () => {
+    const ok = validateConfig({ timezone: "UTC", http: { budgets: { "api.example.com": { perHour: 50, perDay: 125 } } } });
+    expect(ok.ok && ok.config.http).toEqual({ budgets: { "api.example.com": { perHour: 50, perDay: 125 } } });
+    const [u] = issues('{"timezone": "UTC", "http": {"budgets": {"https://API.example.com/v1": {"perHour": 5}}}}');
+    expect(u).toMatchObject({
+      path: "http.budgets.https://API.example.com/v1",
+      message: '"http.budgets" keys are hosts like "api.example.com"; found "https://API.example.com/v1"',
+      hint: 'use "api.example.com": the host alone, in lower case, without a scheme or a path',
+      fix: { kind: "edit", replace: { from: '"https://API.example.com/v1"', to: '"api.example.com"' } },
+    });
+    expect(issues('{"timezone": "UTC", "http": {"budgets": {"api.example.com": {}}}}')[0]!.message)
+      .toBe('"http.budgets.api.example.com" sets no limit; it takes "perMinute", "perHour" and "perDay"');
+    expect(issues('{"timezone": "UTC", "http": {"budgets": {"api.example.com": {"perHour": 0}}}}')[0]!.message)
+      .toBe('"http.budgets.api.example.com.perHour" must be a whole number from 1 to 1000000000; found 0');
+    expect(issues('{"timezone": "UTC", "http": {"budgets": {"api.example.com": {"perHr": 5}}}}')[0]!.message)
+      .toBe('unknown key "http.budgets.api.example.com.perHr"; did you mean "http.budgets.api.example.com.perHour"?');
+    expect(issues('{"timezone": "UTC", "http": {"budget": {}}}')[0]!.message).toBe('unknown key "http.budget"; did you mean "http.budgets"?');
   });
 
   test("database, notify and serve values", () => {

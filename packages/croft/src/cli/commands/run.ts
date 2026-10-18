@@ -36,7 +36,7 @@ import { dryRun, formatDryRun, refuseToken } from "../../run/dry-run.ts";
 import { croftError } from "../../run/ingest.ts";
 import { cursorTypesOf, loadErrors, type PlannedStep, planRun, readMirror, type RunPlan } from "../../run/plan.ts";
 import { checkRunFlags, executeRun, jsonSafe, lockWaitText, redactValue, type RunData, type RunEvent, type RunSummary } from "../../run/runner.ts";
-import { type AssetFacts, duePlanning, dueWork, FACTS_SETTING } from "../../schedule/due.ts";
+import { type AssetFacts, duePlanning, dueWork, FACTS_SETTING, readPlanWaits } from "../../schedule/due.ts";
 import type { CommandImpl, CommandResult, Ctx } from "../command.ts";
 import { dispatchOf } from "../main.ts";
 import { formatCount, formatDuration } from "../render.ts";
@@ -91,13 +91,15 @@ export function toResult(s: RunSummary): CommandResult<RunData> {
 /** What the flags ask of the plan. */
 interface PlanFlags { selectors: readonly string[]; only: boolean; upstream: boolean; from?: string; rebuild?: boolean; due?: { now: Date } }
 
-/** The run's plan, from the catalog mirror in runs.sqlite (never the warehouse). */
-async function planFor(project: Project, f: PlanFlags): Promise<RunPlan> {
+/** The run's plan, from the catalog mirror in runs.sqlite (never the warehouse). A run by hand holds what is inside
+ *  a known wait (D105). */
+async function planFor(project: Project, f: PlanFlags, now: Date): Promise<RunPlan> {
   if (f.due) return duePlan(project, f.selectors, f.due.now);
   const catalog = readMirror(project.paths.stateDir);
   return planRun({
     root: project.root, timezone: project.timezone, selectors: f.selectors, catalog, cursorTypes: cursorTypesOf(catalog),
     only: f.only, upstream: f.upstream, ...(f.from !== undefined ? { from: f.from } : {}), ...(f.rebuild ? { rebuild: true } : {}),
+    waits: readPlanWaits(project, now),
   });
 }
 
@@ -253,9 +255,9 @@ export const run: CommandImpl<RunData | DryRunData> = {
     let planned: RunPlan | undefined;
     if (!foreground) {
       // Report usage problems here, at once, rather than from a child nobody is watching.
-      const plan = planned = await planFor(project, flags);
+      const plan = planned = await planFor(project, flags, ctx.now());
       checkRunFlags(plan, { selectors, ...(from !== undefined ? { from } : {}), allowShrink, rebuild, ...(confirmToken !== undefined ? { confirmToken } : {}) });
-      const willRun = plan.steps.some((s) => s.action !== "skip" && loadErrors(s).length === 0);
+      const willRun = plan.steps.some((s) => s.action !== "skip" && !s.hold && loadErrors(s).length === 0);
       if (willRun) {
         const runId = pickRunId(project.timezone, ctx.now());
         const childArgs = args.filter((a) => a !== "--events");
@@ -281,7 +283,7 @@ export const run: CommandImpl<RunData | DryRunData> = {
     // records its own.
     let plan: RunPlan;
     try {
-      plan = planned ?? await planFor(project, flags);
+      plan = planned ?? await planFor(project, flags, ctx.now());
     } catch (e) {
       if (detachedChild && runIdFlag !== undefined) {
         const err = croftError(e) ?? new CroftError("INTERNAL_ERROR", { message: String(e), hint: "report this croft bug" });

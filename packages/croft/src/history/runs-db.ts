@@ -39,6 +39,9 @@ const MIGRATIONS: readonly string[] = [
    CREATE INDEX IF NOT EXISTS runs_by_status ON runs (status);`,
   // 2 (phase 3): per-project settings, such as scheduling on/off/paused.
   `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);`,
+  // 3: requests sent to a host with a budget in croft.json (http.budgets, D104), one row per attempt, kept a day.
+  `CREATE TABLE IF NOT EXISTS http_requests (host TEXT, at TEXT, run_id TEXT, asset TEXT);
+   CREATE INDEX IF NOT EXISTS http_requests_by_host ON http_requests (host, at);`,
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 
@@ -445,6 +448,17 @@ export class RunsDb {
     return row ? toStep(row) : null;
   }
 
+  /** latestStep of every asset with a step, by asset name. */
+  latestSteps(): StepRecord[] {
+    const rows = this.sqlite
+      .query(`SELECT s.* FROM steps s JOIN (SELECT asset, max(started_at) AS at FROM steps GROUP BY asset) m
+              ON m.asset = s.asset AND m.at = s.started_at ORDER BY s.asset, s.attempt DESC`)
+      .all() as StepRow[];
+    const out = new Map<string, StepRecord>();
+    for (const r of rows) if (!out.has(r.asset)) out.set(r.asset, toStep(r));
+    return [...out.values()];
+  }
+
   /**
    * StepResult.checks of the asset's latest `ok` step, from that run's stored summary: what every row of its table
    * passed (§3f: a new or edited check covers the whole table once, then each write's rows). null when unknown:
@@ -661,6 +675,20 @@ export class RunsDb {
 
   setScheduling(s: SchedulingSetting): void {
     this.setSetting("scheduling", s);
+  }
+
+  // ---- requests to hosts with a budget (http/budget.ts, D104) ----
+
+  /** When the requests to `host` recorded after `after` (ISO-8601 UTC, exclusive) were sent, oldest first. */
+  requestTimes(host: string, after: string): string[] {
+    return (this.sqlite.query("SELECT at FROM http_requests WHERE host = ? AND at > ? ORDER BY at")
+      .all(host, after) as { at: string }[]).map((r) => r.at);
+  }
+
+  /** Records one request sent to `host` now; requests to it older than `forget` are dropped. */
+  recordRequest(host: string, who: { runId: string; asset: string }, forget: string): void {
+    this.sqlite.query("DELETE FROM http_requests WHERE host = ? AND at <= ?").run(host, forget);
+    this.sqlite.query("INSERT INTO http_requests (host, at, run_id, asset) VALUES (?, ?, ?, ?)").run(host, this.nowIso(), who.runId, who.asset);
   }
 
   // ---- catalog mirror of _croft.* (DuckDB wins on disagreement) ----

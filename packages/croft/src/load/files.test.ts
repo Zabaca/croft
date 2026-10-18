@@ -24,10 +24,12 @@ afterAll(async () => {
   await closeAllWarehouses();
 });
 
-const noHttp: Http = {
+// No getBytes: a download takes extractFiles' own fetch, as it does for any client without one.
+const noHttp = {
   get: () => Promise.reject(new Error("no network in this test")),
   post: () => Promise.reject(new Error("no network in this test")),
-};
+  head: () => Promise.reject(new Error("no network in this test")),
+} as Omit<Http, "getBytes"> as Http;
 
 let runSeq = 0;
 
@@ -1141,6 +1143,7 @@ describe("URLs", () => {
     const http: Http & ByteHttp = {
       get: () => Promise.reject(new Error("get() must not be used for downloads")),
       post: () => Promise.reject(new Error("unused")),
+      head: () => Promise.reject(new Error("unused")),
       async getBytes(url: string, init?: HttpInit): Promise<HttpResponse & { bytes: Uint8Array }> {
         calls.push(`${url} ${JSON.stringify(init?.headers ?? {})}`);
         const bytes = new TextEncoder().encode("id\n1\n");

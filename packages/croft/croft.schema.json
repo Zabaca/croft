@@ -51,6 +51,47 @@
       "maximum": 64,
       "default": 4
     },
+    "http": {
+      "description": "settings for ctx.http, the requests assets make",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "budgets": {
+          "description": "requests ctx.http may send to each host across runs and previews, e.g. {\"api.example.com\": {\"perHour\": 50, \"perDay\": 125}} (perMinute, perHour, perDay)",
+          "type": "object",
+          "default": {},
+          "propertyNames": {
+            "pattern": "^([a-z0-9.-]+|\\[[0-9a-f:.]+\\])(:[0-9]+)?$"
+          },
+          "additionalProperties": {
+            "description": "the most requests to this host in any rolling minute, hour or day",
+            "type": "object",
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "perMinute": {
+                "description": "requests in any 60 seconds",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000000
+              },
+              "perHour": {
+                "description": "requests in any 60 minutes",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000000
+              },
+              "perDay": {
+                "description": "requests in any 24 hours",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000000
+              }
+            }
+          }
+        }
+      }
+    },
     "serve": {
       "description": "the read server, the local HTTP server apps query through",
       "type": "object",

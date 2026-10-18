@@ -41,6 +41,8 @@
 //              Checks and warnings run on the preview table after the write, all of them, with the scope a real
 //              run would give them (a new or edited check covers the whole table), so a failing blocking check
 //              still leaves the table to explore; the asset then fails with CHECK_FAILED, as the real run would.
+//   budgets    a preview's requests are real: they take from croft.json's http.budgets in the live runs.sqlite, as a
+//              run's do (D104). A preview is not held by a known wait (HTTP_WAIT, D105): it is the way to try now
 //   approve    a successful preview is human-initiated, so it approves the asset's code for the scheduler
 //              (RunsDb.approveCode in the live runs.sqlite, DESIGN.md §6 "The scheduler only runs code a human
 //              has run")
@@ -63,6 +65,7 @@ import type { CatalogAsset } from "../history/catalog.ts";
 import { putCatalog } from "../history/catalog.ts";
 import { LogWriter } from "../history/logs.ts";
 import { newRunId, RunsDb } from "../history/runs-db.ts";
+import { requestBudget } from "../http/budget.ts";
 import { isReservedColumn, normalizeType, quoteIdent, quoteLiteral } from "../load/evolve.ts";
 import { type ProjectEnv, secretsCommandHash } from "../project/env.ts";
 import type { Project } from "../project/root.ts";
@@ -227,15 +230,17 @@ export async function runPreview(i: PreviewInput): Promise<PreviewOutcome> {
       mkdirSync(join(dir, "logs"), { recursive: true });
       await emptyPreview(pdb, runId, i.signal);
       const runs = RunsDb.open(dir);
+      const liveRuns = Object.keys(project.config.http.budgets).length > 0 ? RunsDb.open(stateDir, { now: clock }) : null;
       try {
         const snap = await snapshotLive(live, [...needs], dir, clock, i.signal);
         const pureInputs = [...needs].filter((n) => !candidates.includes(n));
         await prepare(pdb, snap, pureInputs, runId, i.signal);
-        const engine = new Engine(i, { plan, byName, named, snap, pdb, runs, runId, dir, cap, mirror });
+        const engine = new Engine(i, { plan, byName, named, snap, pdb, runs, liveRuns, runId, dir, cap, mirror });
         for (const name of candidates) await engine.visit(name);
         return engine.finish(snap.at ? formatInstant(snap.at, tz) : null);
       } finally {
         runs.close();
+        liveRuns?.close();
       }
     }, { purpose: "croft preview", ...(i.signal ? { signal: i.signal } : {}) });
   } finally {
@@ -398,6 +403,9 @@ interface EngineContext {
   snap: LiveSnapshot;
   pdb: DuckWarehouse;
   runs: RunsDb;
+  /** The live runs.sqlite, open while croft.json sets request budgets: a preview's requests are real, so they count
+   *  against the same budgets as a run's (D104). null without budgets. */
+  liveRuns: RunsDb | null;
   runId: string;
   dir: string;
   cap: number;
@@ -567,9 +575,10 @@ class Engine {
         fitted = g.limit;
         log.write(`at most ${rows} rows of each input: ${asset} makes requests, and ${cap} rows of each would be ${g.pending} input rows, more than its confirmAbove of ${g.limit}`);
       }
+      const budget = this.c.liveRuns ? requestBudget(this.c.liveRuns, this.project.config.http.budgets, { runId, asset }) : undefined;
       const input: StepInput = {
         step: previewStep(step, rows, fetch), project: this.project, env: this.i.env, warehouse: pdb, runs, runId, attempt: 1, maxAttempts: 1,
-        signal: stepSignal, progress, log, preview: { rows },
+        signal: stepSignal, progress, log, preview: { rows }, ...(budget ? { budget } : {}),
         ...readByOf(step, this.c.mirror.find((m) => m.asset === asset) ?? null),
         ...(this.i.http ? { http: this.i.http } : {}), ...(this.i.now ? { now: this.i.now } : {}),
       };

@@ -1,7 +1,13 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
+import { RunsDb } from "../history/runs-db.ts";
 import { fail } from "../index.ts";
 import { ProjectEnv } from "../project/env.ts";
+import type { HostBudget } from "../project/root.ts";
+import { budgetFor, requestBudget, spentOf } from "./budget.ts";
 import {
   buildUrl, createHttp, displayUrl, encodeBody, excerpt, nextLink, parseJsonLossless, parseLinkHeader, parseRetryAfter,
   type HttpOptions,
@@ -102,7 +108,13 @@ const server = Bun.serve({
   },
 });
 const BASE = `http://127.0.0.1:${server.port}`;
-afterAll(() => server.stop(true));
+const dirs: string[] = [];
+const opened: RunsDb[] = [];
+afterAll(() => {
+  server.stop(true);
+  for (const r of opened) r.close();
+  for (const d of dirs) rmSync(d, { recursive: true, force: true });
+});
 beforeEach(() => {
   hits.clear();
   seen.length = 0;
@@ -123,6 +135,16 @@ async function httpError(p: Promise<unknown>): Promise<CroftError> {
     return e as CroftError;
   }
   throw new Error("expected HTTP_ERROR");
+}
+
+async function budgetError(p: Promise<unknown>): Promise<CroftError> {
+  try {
+    await p;
+  } catch (e) {
+    expect((e as CroftError).code).toBe("HTTP_BUDGET_SPENT");
+    return e as CroftError;
+  }
+  throw new Error("expected HTTP_BUDGET_SPENT");
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -460,6 +482,140 @@ describe("getBytes", () => {
     const t0 = performance.now();
     expect(await aborted.getBytes(`${BASE}/slow`, { query: { ms: 2000 } }).then(() => null, (x: unknown) => x)).toBe(reason);
     expect(performance.now() - t0).toBeLessThan(1000);
+  });
+});
+
+describe("okStatus, head() and conditional requests (D103)", () => {
+  test("a listed 4xx is returned as a response, once, with its body; an unlisted one still throws", async () => {
+    const { http } = client();
+    const res = await http.get(`${BASE}/not-found`, { okStatus: [404] });
+    expect(res.status).toBe(404);
+    expect(res.json<object>()).toEqual({ message: "Not Found" });
+    expect(hits.get("not-found")).toBe(1);
+    expect((await httpError(http.get(`${BASE}/not-found`, { okStatus: [410] }))).problem.details).toMatchObject({ status: 404 });
+  });
+
+  test("an unlisted 429 or 5xx is still retried and thrown: okStatus never swallows a rate limit or an outage", async () => {
+    const { http } = client();
+    const e = await httpError(http.get(`${BASE}/down`, { okStatus: [404] }));
+    expect(e.problem.details).toMatchObject({ status: 502, attempts: 4 });
+    expect(e.problem.retryable).toBe(true);
+    const limited = await http.get(`${BASE}/rate-limited`, { okStatus: [404] });
+    expect(limited.status).toBe(200);
+    expect(http.attempts).toBe(4 + 2);
+  });
+
+  test("a listed 5xx is the code's own answer: returned at once, not retried", async () => {
+    const { http } = client();
+    const res = await http.get(`${BASE}/flaky`, { okStatus: [500] });
+    expect(res.status).toBe(500);
+    expect(res.text).toBe("boom");
+    expect(hits.get("flaky")).toBe(1);
+  });
+
+  test("head() sends HEAD and returns the status and headers, with an empty text", async () => {
+    const { http } = client();
+    const res = await http.head(`${BASE}/binary`);
+    expect(seen[0]!.method).toBe("HEAD");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("etag")).toBe('"v1"');
+    expect(res.text).toBe("");
+    expect(http.requests).toBe(1);
+    const gone = await http.head(`${BASE}/not-found`, { okStatus: [404] });
+    expect(gone.status).toBe(404);
+  });
+
+  test("a conditional get() answered 304 is a response, not an error", async () => {
+    const { http } = client();
+    const res = await http.get(`${BASE}/binary`, { headers: { "If-None-Match": '"v1"' } });
+    expect(res.status).toBe(304);
+    expect(res.text).toBe("");
+    expect(res.headers.get("etag")).toBe('"v1"');
+  });
+});
+
+describe("request budgets (D104)", () => {
+  /** A budget over a fresh runs.sqlite whose clock the test moves. */
+  function budgeted(budgets: Record<string, HostBudget>) {
+    const dir = mkdtempSync(join(tmpdir(), "croft-budget-"));
+    dirs.push(dir);
+    let at = Date.parse("2026-10-18T10:00:00Z");
+    const runs = RunsDb.open(dir, { now: () => new Date(at) });
+    opened.push(runs);
+    const budget = requestBudget(runs, budgets, { runId: "r_1018_1000_abcd", asset: "items" })!;
+    return { runs, budget, advance: (ms: number) => { at += ms; } };
+  }
+  const host = new URL(BASE).host;
+
+  test("requests within the budget are sent and recorded per attempt; the next one is not sent", async () => {
+    const { runs, budget } = budgeted({ [host]: { perHour: 3 } });
+    const { http, lines } = client({ budget });
+    await http.get(`${BASE}/echo`);
+    await http.get(`${BASE}/flaky`, { retries: 1 }).catch(() => null);   // two attempts, both counted
+    expect(runs.requestTimes(host, "1970-01-01T00:00:00Z")).toHaveLength(3);
+    const sent = seen.length;
+    const e = await budgetError(http.get(`${BASE}/echo`));
+    expect(seen.length).toBe(sent);
+    expect(e.problem.details).toMatchObject({
+      method: "GET", host, window: "hour", limit: 3, used: 3, freeAt: "2026-10-18T11:00:00.000Z", retryAfterMs: 3_600_000, attempts: 0,
+    });
+    expect(e.problem.retryable).toBe(true);
+    expect(e.problem.effect).toContain("not sent");
+    expect(e.message).toContain(`the request budget for ${host} is spent (3 of 3 per hour)`);
+    expect(lines.some((l) => l.includes("budget"))).toBe(false);
+  });
+
+  test("the budget is shared across clients (steps, runs), and frees as the oldest request leaves the window", async () => {
+    const { budget, advance } = budgeted({ [host]: { perMinute: 2, perDay: 3 } });
+    await client({ budget }).http.get(`${BASE}/echo`);
+    advance(30_000);
+    await client({ budget }).http.get(`${BASE}/echo`);
+    const spent = await budgetError(client({ budget, maxRetryAfterMs: 1000 }).http.get(`${BASE}/echo`));
+    expect(spent.problem.details).toMatchObject({ window: "minute", used: 2, freeAt: "2026-10-18T10:01:00.000Z", retryAfterMs: 30_000 });
+    advance(30_000);
+    await client({ budget }).http.get(`${BASE}/echo`);
+    // The day's 3 are spent now: it frees when the first request is a day old.
+    const day = await budgetError(client({ budget }).http.get(`${BASE}/echo`));
+    expect(day.problem.details).toMatchObject({ window: "day", limit: 3, freeAt: "2026-10-19T10:00:00.000Z" });
+  });
+
+  test("a budget that frees within maxRetryAfterMs is waited out, like a Retry-After", async () => {
+    let at = Date.parse("2026-10-18T10:00:00Z");
+    const times: number[] = [];
+    const take = (url: string) => {
+      const spent = spentOf(host, { perMinute: 1 }, times, at);
+      if (!spent && new URL(url).host === host) times.push(at);
+      return spent;
+    };
+    const { http, lines } = client({ budget: { take } });
+    await http.get(`${BASE}/echo`);
+    at += 59_800;   // 200 ms before the first request leaves the minute
+    const t0 = performance.now();
+    const waiting = http.get(`${BASE}/echo`);
+    setTimeout(() => { at += 200; }, 100);
+    await waiting;
+    expect(performance.now() - t0).toBeGreaterThanOrEqual(150);
+    expect(lines[0]).toContain(`the request budget for ${host} is spent (1 of 1 per minute); waiting 200 ms for it`);
+  });
+
+  test("a host without a budget is neither limited nor recorded; a budget names the host with its port, or the hostname", async () => {
+    const { runs, budget } = budgeted({ "api.example.com": { perHour: 1 } });
+    await client({ budget }).http.get(`${BASE}/echo`);
+    await client({ budget }).http.get(`${BASE}/echo`);
+    expect(runs.requestTimes(host, "1970-01-01T00:00:00Z")).toEqual([]);
+    expect(budgetFor({ "127.0.0.1": { perHour: 1 } }, `${BASE}/echo`)?.host).toBe("127.0.0.1");
+    expect(budgetFor({ [host]: { perHour: 1 }, "127.0.0.1": { perHour: 9 } }, `${BASE}/echo`)?.host).toBe(host);
+    expect(budgetFor({ "api.example.com": { perHour: 1 } }, "https://API.example.com/v1?x=1")?.host).toBe("api.example.com");
+    expect(requestBudget(runs, {}, { runId: "r", asset: "a" })).toBeUndefined();
+  });
+
+  test("spentOf: rolling windows, the window that frees last, and a request exactly a window old no longer counts", () => {
+    const t = Date.parse("2026-10-18T10:00:00Z");
+    expect(spentOf("h", { perHour: 2 }, [t - 3_600_000, t - 10], t)).toBeNull();
+    expect(spentOf("h", { perHour: 2 }, [t - 3_599_999, t - 10], t)).toMatchObject({ window: "hour", used: 2, waitMs: 1 });
+    const both = spentOf("h", { perMinute: 1, perHour: 2 }, [t - 1_000_000, t - 10], t)!;
+    expect(both).toMatchObject({ window: "hour", freeAt: new Date(t - 1_000_000 + 3_600_000).toISOString() });
+    expect(spentOf("h", {}, [t, t, t], t)).toBeNull();
   });
 });
 
