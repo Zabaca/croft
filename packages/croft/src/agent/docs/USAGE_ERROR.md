@@ -7,6 +7,7 @@ The command, its arguments or its flags are wrong, or they do not fit the projec
 - flags that do not fit, such as --from on a transform (BACKFILL_UNSUPPORTED says more), or --rebuild
   without asset names;
 - a value that does not parse: --from, --follow, --timeout, --rows, --limit, --for, --at;
+- a place croft backup cannot use: a folder inside the state folder other than .croft/backups/, or a file;
 - a command that cannot run in this state: a second croft serve for one project, a rename while another is
   unfinished, croft wait for a run id that does not exist;
 - environment settings croft reads that are malformed (CROFT_NOW, CROFT_URL, CROFT_JOB_LABEL).

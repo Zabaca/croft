@@ -27,15 +27,37 @@
 //
 // Retention: the BACKUPS_KEPT (3) newest backups, by the stamp their names start with, pruned after each backup,
 // along with temporary files a killed backup left. doctor lists them (listBackups) without creating anything.
+//
+// Project backups (`croft backup [<dir>]`, D109; §6 "Backups of the project's data") are the second kind: a folder
+// <project>-<stamp>/ made in <dir> (default .croft/backups/), holding the warehouse, runs.sqlite and the trash as
+// one consistent moment, and backup.json. backupProject takes the file the way every croft writer does: a write
+// intent (croft serve's query worker steps aside), then the write lock, then, under that lease and nothing else:
+//   1. CHECKPOINT, so the file holds every commit (a copy without it missed rows still in the WAL, 1,500 of
+//      5,001,500 [V]), and the WAL is checked folded, as the read copy does (db/readcopy.ts);
+//   2. the warehouse cloned by a child process (the same cp as above), runs.sqlite written with VACUUM INTO (one
+//      read transaction of SQLite's own, so a run writing its steps meanwhile cannot tear it), and the trash folder
+//      cloned whole (trash files are written only through the warehouse's own connection, so none is half written
+//      while this process holds the lock).
+// A clone takes about a millisecond whatever the size (172 MB: 1.3 ms, against 61 ms for a plain copy, 156 ms for
+// EXPORT DATABASE and 197 ms for ATTACH + COPY FROM DATABASE [V]); the last two also rewrite every row and are
+// confined to the sandbox's allowed_directories, so a backup on another disk would be refused. A clone needs the
+// same filesystem, so a backup for another one is staged in .croft/backups/ under the lease and copied across after
+// it, holding nothing. The folder is built under a .croft-partial-<pid>- name and renamed into place, so a half
+// backup never looks like one; a name already taken gets -2, -3…, so nothing is ever overwritten, and croft never
+// deletes a project backup.
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, sep } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { currentIdentity } from "../core/proc.ts";
-import { now as clockNow } from "../core/time.ts";
+import { formatInstant, now as clockNow } from "../core/time.ts";
 import type { LockHolder } from "../core/types.ts";
 import { RUNS_DB_FILE, RunsDb } from "../history/runs-db.ts";
+import { physicalPath, type Project } from "../project/root.ts";
 import { type IntentEntry, liveIntents } from "./intent.ts";
+import { assertWalFolded } from "./readcopy.ts";
+import { CROFT_VERSION } from "./state.ts";
+import type { WaitPolicy, WarehouseOptions } from "./warehouse.ts";
 
 /** The runs.sqlite setting that records the engine the last writer ran. */
 export const ENGINE_SETTING = "duckdb";
@@ -287,22 +309,24 @@ async function copyInto(src: string, dst: string, o: BackupOptions): Promise<Clo
   }
 }
 
-/** Clone `src` to `dst` in a child process: the platform's clone command, then a plain copy. */
-async function cloneFile(src: string, dst: string, o: BackupOptions): Promise<CloneMethod> {
+/** Clone `src` to `dst` in a child process: the platform's clone command, then a plain copy. `recursive`: `src` is a
+ *  folder, copied whole (cp -R; macOS clones each file with -c, GNU cp with reflink=auto). */
+async function cloneFile(src: string, dst: string, o: Pick<BackupOptions, "cp" | "platform" | "signal">, recursive = false): Promise<CloneMethod> {
   const cps = o.cp ?? CP_PATHS;
   const cp = cps.find((p) => existsSync(p));
   if (!cp) throw new Error(`cp was not found (looked for ${cps.join(", ")})`);
   const platform = o.platform ?? process.platform;
   const fast: { method: CloneMethod; flag: string } | null = platform === "darwin" ? { method: "clone", flag: "-c" }
     : platform === "linux" ? { method: "reflink", flag: REFLINK_AUTO } : null;
+  const tree = recursive ? ["-R"] : [];
   if (fast) {
-    const r = await runCp(cp, [fast.flag, src, dst], o.signal);
+    const r = await runCp(cp, [...tree, fast.flag, src, dst], o.signal);
     if (r.ok) return fast.method;
-    rmSync(dst, { force: true });
+    rmSync(dst, { force: true, recursive });
   }
-  const r = await runCp(cp, [src, dst], o.signal);
+  const r = await runCp(cp, [...tree, src, dst], o.signal);
   if (r.ok) return "copy";
-  rmSync(dst, { force: true });
+  rmSync(dst, { force: true, recursive });
   if (o.signal?.aborted) throw aborted(o.signal, "backing up the warehouse");
   throw new Error(`${cp} could not copy ${src}: ${r.why}`);
 }
@@ -390,4 +414,291 @@ function alive(pid: number): boolean {
   } catch (e) {
     return (e as NodeJS.ErrnoException).code === "EPERM";
   }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Project backups (croft backup)
+
+/** The file in a project backup that says what it holds; written last, so a folder without it is no backup. */
+export const BACKUP_MANIFEST = "backup.json";
+/** The name a project backup is built under until it is complete: then <pid>-<its final name>. */
+const PARTIAL_PREFIX = ".croft-partial-";
+/** safety/trash.ts TRASH_DIR, named here: that module loads what doctor, which imports this one, must not. */
+const TRASH_FOLDER = "trash";
+
+export interface ProjectBackupOptions {
+  /** The folder the backup's own folder is made in; default <state>/backups. Created when missing. */
+  dir?: string;
+  /** The clock for the name and createdAt; default core/time now() (CROFT_NOW). */
+  now?: () => Date;
+  isTTY?: boolean;
+  waits?: Partial<WaitPolicy>;
+  onWait?: WarehouseOptions["onWait"];
+  lookupHolder?: WarehouseOptions["lookupHolder"];
+  /** Ends a wait, or a copy, at once (Ctrl-C). */
+  signal?: AbortSignal;
+  platform?: NodeJS.Platform;
+  cp?: readonly string[];
+  /** The filesystem a folder is on (statSync().dev); tests give two folders different ones. */
+  deviceOf?: (dir: string) => number;
+  /** Called under the lease once everything is copied (tests: what a reader or writer sees meanwhile). */
+  leased?: (e: { staging: string }) => void | Promise<void>;
+}
+
+/** One file of a backup, relative to its folder. */
+export interface BackupFile { path: string; bytes: number }
+
+/** backup.json: what the folder holds, and what wrote it. */
+export interface BackupManifest {
+  croftBackup: 1;
+  /** The moment the backup holds: its checkpoint (UTC ISO). */
+  createdAt: string;
+  croftVersion: string;
+  /** The DuckDB engine that wrote the warehouse copy (v1.5.5). */
+  duckdb: string;
+  /** _croft.meta format_version of the warehouse copy, or null when it has none. */
+  formatVersion: string | null;
+  project: { root: string; database: string; stateDir: string; timezone: string };
+  files: BackupFile[];
+  restore: string;
+}
+
+export interface ProjectBackup {
+  /** The backup's folder. */
+  path: string;
+  /** The moment it holds: its checkpoint, in the project offset. */
+  createdAt: string;
+  /** Every byte of it, files as they read: a clone counts in full, though it shares the disk's blocks. */
+  bytes: number;
+  warehouse: { file: string; bytes: number; method: CloneMethod };
+  /** null when the project has no runs.sqlite. */
+  runs: { file: string; bytes: number } | null;
+  /** null when the trash is empty. */
+  trash: { dir: string; versions: number; bytes: number } | null;
+  /** On the same filesystem as the warehouse: a mistake is undone from it, a lost disk is not. */
+  sameDisk: boolean;
+  /** How long it held the warehouse (croft serve and writers waited that long). */
+  heldMs: number;
+  duckdb: string;
+  formatVersion: string | null;
+}
+
+/** Back up the project's data, the warehouse, runs.sqlite and the trash as one moment, to a new folder. */
+export async function backupProject(project: Pick<Project, "root" | "timezone" | "paths">, o: ProjectBackupOptions = {}): Promise<ProjectBackup> {
+  const { database, stateDir } = project.paths;
+  const at = o.now ?? clockNow;
+  if (!existsSync(database)) {
+    throw new CroftError("DB_NOT_FOUND", {
+      message: `there is no warehouse to back up: ${database} does not exist (croft creates it on the first run that writes a table)`,
+      hint: "croft run builds it; if croft built tables before, the file was moved or deleted: ask the user where it went",
+      effect: "nothing was written",
+      fix: { kind: "command", description: "see whether croft built tables before", command: "croft status" },
+      file: database,
+    });
+  }
+  const parent = destination(o.dir ?? backupsDir(stateDir), stateDir);
+  const devOf = o.deviceOf ?? ((d: string) => statSync(d).dev);
+  const local = backupsDir(stateDir);
+  ensureDir(parent);
+  removePartials(parent);
+  // A clone needs one filesystem: for another one, the copies made under the lease go to .croft/backups/ first.
+  const sameDisk = devOf(parent) === devOf(dirname(database));
+  const staged = !sameDisk && devOf(ensureDir(local)) === devOf(dirname(database));
+  if (staged) removePartials(local);
+  const name = `${nameSafe(basename(project.root))}-${at().toISOString().replace(/\.\d+Z$/, "Z").replace(/[-:]/g, "")}`;
+  const partial = (dir: string) => join(dir, `${PARTIAL_PREFIX}${process.pid}-${name}`);
+  const staging = partial(staged ? local : parent);
+  const across = staged ? partial(parent) : null;
+  try {
+    mkdirSync(staging);
+    const runsFile = join(stateDir, RUNS_DB_FILE);
+    const trashSrc = join(stateDir, TRASH_FOLDER);
+    // DuckDB is imported only here (doctor imports this module before it checks the binding).
+    const { openWarehouse } = await import("./warehouse.ts");
+    const { version } = await import("@duckdb/node-api");
+    const w = openWarehouse({
+      path: database, mode: "read_write", timezone: project.timezone, root: project.root, stateDir,
+      ...(o.isTTY !== undefined ? { isTTY: o.isTTY } : {}), ...(o.waits ? { waits: o.waits } : {}),
+      ...(o.onWait ? { onWait: o.onWait } : {}), ...(o.lookupHolder ? { lookupHolder: o.lookupHolder } : {}),
+    });
+    let leased: { createdAt: Date; method: CloneMethod; heldMs: number; formatVersion: string | null; runs: boolean; trash: boolean };
+    try {
+      // The lease is the checkpoint and the copies, nothing else.
+      leased = await w.write("back up the warehouse", async (sql) => {
+        const started = Date.now();
+        await sql.exec("CHECKPOINT");
+        const createdAt = at();
+        assertWalFolded(database);
+        let formatVersion: string | null = null;
+        try {
+          const row = (await sql.all<{ value: string }>("SELECT value FROM _croft.meta WHERE key = 'format_version'"))[0];
+          formatVersion = row ? String(row.value) : null;
+        } catch { /* a warehouse croft never wrote its state into */ }
+        const method = await cloneFile(database, join(staging, basename(database)), o);
+        const runs = existsSync(runsFile);
+        if (runs) vacuumInto(stateDir, join(staging, RUNS_DB_FILE));
+        const trash = hasVersions(trashSrc);
+        if (trash) await cloneFile(trashSrc, join(staging, TRASH_FOLDER), o, true);
+        await o.leased?.({ staging });
+        return { createdAt, method, heldMs: Date.now() - started, formatVersion, runs, trash };
+      }, { runId: "", transaction: false, ...(o.signal ? { signal: o.signal } : {}) });
+    } finally {
+      await w.close();
+    }
+    const files = listFiles(staging);
+    const manifest: BackupManifest = {
+      croftBackup: 1, createdAt: leased.createdAt.toISOString(), croftVersion: CROFT_VERSION, duckdb: version(),
+      formatVersion: leased.formatVersion,
+      project: { root: project.root, database, stateDir, timezone: project.timezone },
+      files,
+      restore: "croft docs backup: with croft serve and the scheduler stopped, put these files where backup.json's project names them",
+    };
+    writeFileSync(join(staging, BACKUP_MANIFEST), JSON.stringify(manifest, null, 2) + "\n");
+    // The folder takes its name only once it is whole, and never a name that is taken; across filesystems the copy
+    // is a plain one, whatever the staging clone was.
+    const method = across ? await cloneFile(staging, across, o, true) : leased.method;
+    const path = freeName(parent, name);
+    renameSync(across ?? staging, path);
+    if (across) rmSync(staging, { recursive: true, force: true });
+    const size = (rel: string) => files.filter((f) => f.path === rel || f.path.startsWith(`${rel}/`)).reduce((n, f) => n + f.bytes, 0);
+    const warehouseFile = basename(database);
+    const versions = files.filter((f) => f.path.startsWith(`${TRASH_FOLDER}/`) && f.path.endsWith(".duckdb")).length;
+    return {
+      path, createdAt: formatInstant(leased.createdAt, project.timezone), bytes: files.reduce((n, f) => n + f.bytes, 0),
+      warehouse: { file: warehouseFile, bytes: size(warehouseFile), method },
+      runs: leased.runs ? { file: RUNS_DB_FILE, bytes: size(RUNS_DB_FILE) } : null,
+      trash: leased.trash ? { dir: TRASH_FOLDER, versions, bytes: size(TRASH_FOLDER) } : null,
+      sameDisk, heldMs: leased.heldMs, duckdb: version(), formatVersion: leased.formatVersion,
+    };
+  } catch (e) {
+    rmSync(staging, { recursive: true, force: true });
+    if (across) rmSync(across, { recursive: true, force: true });
+    if (e instanceof CroftError) throw e;
+    if (o.signal?.aborted) throw aborted(o.signal, "backing up the project");
+    throw notWritten(parent, e);
+  }
+}
+
+/** The folder to make the backup in. Inside the state folder only its backups/ will do: the rest is what is copied. */
+function destination(dir: string, stateDir: string): string {
+  const at = physicalPath(dir).path;
+  const state = physicalPath(stateDir).path;
+  const backups = join(state, BACKUPS_DIR);
+  const within = (p: string, d: string) => p === d || p.startsWith(d + sep);
+  if (within(at, state) && !within(at, backups)) {
+    throw new CroftError("USAGE_ERROR", {
+      message: `croft backup cannot put a backup in ${dir}: it is inside croft's state folder (${state}), which the backup copies`,
+      hint: `leave the folder out to use ${backups}, or name a folder outside the project, ideally on another disk`,
+      effect: "nothing was written",
+      fix: { kind: "command", description: "back up to the default folder", command: "croft backup" },
+    });
+  }
+  if (existsSync(at) && !statSync(at).isDirectory()) {
+    throw new CroftError("USAGE_ERROR", {
+      message: `croft backup makes its folder inside ${dir}, which is a file`,
+      hint: "name a folder (croft creates it when it is missing); each backup is a new folder inside it",
+      effect: "nothing was written",
+    });
+  }
+  return at;
+}
+
+function ensureDir(dir: string): string {
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    throw notWritten(dir, e);
+  }
+  return dir;
+}
+
+function notWritten(dir: string, e: unknown): CroftError {
+  const why = String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 300);
+  const errno = (e as NodeJS.ErrnoException)?.code;
+  return new CroftError("PROJECT_NOT_WRITABLE", {
+    message: `croft could not write the backup in ${dir}: ${why}`,
+    hint: `make room in ${dir} (or make it writable, or name another folder), then run croft backup again; the warehouse was not changed`,
+    effect: "nothing was written: no partial backup is left",
+    fix: { kind: "manual", requiresHuman: true, description: `free disk space in ${dir}, or make it writable, then run croft backup again` },
+    details: { backups: dir, error: why, ...(errno ? { errno } : {}) },
+  });
+}
+
+/** runs.sqlite as of now, written whole by SQLite itself: a read transaction, so its writers are not held up. */
+function vacuumInto(stateDir: string, to: string): void {
+  const db = RunsDb.open(stateDir);
+  try {
+    db.sqlite.run("VACUUM INTO ?", [to]);
+  } finally {
+    db.close();
+  }
+}
+
+/** Whether the trash holds any version (a folder per asset, each with <time>.duckdb files). */
+function hasVersions(trash: string): boolean {
+  try {
+    return readdirSync(trash, { recursive: true }).some((f) => String(f).endsWith(".duckdb"));
+  } catch {
+    return false;
+  }
+}
+
+/** Every file under `dir`, relative to it with / separators, and its size (a stat each). */
+function listFiles(dir: string): BackupFile[] {
+  const out: BackupFile[] = [];
+  for (const f of readdirSync(dir, { recursive: true }).map(String).sort()) {
+    const st = statSync(join(dir, f));
+    if (st.isFile()) out.push({ path: f.split(sep).join("/"), bytes: st.size });
+  }
+  return out;
+}
+
+/** `name` in `dir`, or name-2, name-3… when it is taken: a backup never replaces another. */
+function freeName(dir: string, name: string): string {
+  for (let i = 1; ; i++) {
+    const path = join(dir, i === 1 ? name : `${name}-${i}`);
+    if (!existsSync(path)) return path;
+  }
+}
+
+/** A project folder's name as part of a file name. */
+function nameSafe(name: string): string {
+  return name.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^[._]+/, "") || "croft";
+}
+
+/** Remove the partial backups of processes that are gone (a backup killed halfway). */
+function removePartials(dir: string): void {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.startsWith(PARTIAL_PREFIX)) continue;
+    const pid = Number(name.slice(PARTIAL_PREFIX.length).split("-")[0]);
+    if (pid === process.pid || (Number.isInteger(pid) && pid > 0 && alive(pid))) continue;
+    rmSync(join(dir, name), { recursive: true, force: true });
+  }
+}
+
+/** The project backups in a folder (folders with a backup.json), newest first. Reads the folder only (doctor). */
+export function listProjectBackups(dir: string): { path: string; createdAt: string; bytes: number }[] {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out: { path: string; createdAt: string; bytes: number }[] = [];
+  for (const name of names) {
+    if (name.startsWith(".")) continue;
+    const path = join(dir, name);
+    try {
+      const m = JSON.parse(readFileSync(join(path, BACKUP_MANIFEST), "utf8")) as Partial<BackupManifest>;
+      if (m.croftBackup !== 1 || typeof m.createdAt !== "string") continue;
+      out.push({ path, createdAt: m.createdAt, bytes: (m.files ?? []).reduce((n, f) => n + (Number(f.bytes) || 0), 0) });
+    } catch { /* not a project backup */ }
+  }
+  return out.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
 }

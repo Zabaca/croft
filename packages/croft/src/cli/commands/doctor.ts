@@ -35,7 +35,7 @@ import { dirname, join, relative, sep } from "node:path";
 import { CroftError, problem } from "../../core/errors.ts";
 import { now, offsetSeconds } from "../../core/time.ts";
 import type { LockHolder, Problem } from "../../core/types.ts";
-import { BACKUPS_KEPT, backupsDir, compareEngineVersions, type EngineRecord, listBackups, recordedEngine } from "../../db/backup.ts";
+import { BACKUPS_KEPT, backupsDir, compareEngineVersions, type EngineRecord, listBackups, listProjectBackups, recordedEngine } from "../../db/backup.ts";
 import { filesystemKind, folderKind, type FsKind } from "../../db/fs-kind.ts";
 import { isHolderAlive, liveIntents } from "../../db/intent.ts";
 import { readCopyStatus, readCopySummary } from "../../db/readcopy.ts";
@@ -967,8 +967,9 @@ function checkDrift(r: Report, d: DoctorDeps, project: Project): void {
 
 /**
  * Pre-upgrade backups (§6 "Before an engine upgrade", db/backup.ts): how many, their size and the newest, in
- * .croft/backups/. When the DuckDB this croft loads is newer than the engine runs.sqlite recorded, the next command
- * that writes backs the warehouse up first, and the line says so (info). No line with neither. Reads only.
+ * .croft/backups/, and the croft backup folders there (D109; ones made elsewhere are not known). When the DuckDB this
+ * croft loads is newer than the engine runs.sqlite recorded, the next command that writes backs the warehouse up
+ * first, and the line says so (info). No line with none of them. Reads only.
  */
 function checkBackups(r: Report, d: DoctorDeps, project: Project, probe: DuckdbProbe): void {
   let at: Date;
@@ -981,9 +982,10 @@ function checkBackups(r: Report, d: DoctorDeps, project: Project, probe: DuckdbP
   } catch { /* runs.sqlite cannot be read: nothing pending that doctor can tell */ }
   const running = probe.ok ? probe.version : null;
   const pending = running !== null && rec !== null && existsSync(project.paths.database) && compareEngineVersions(running, rec.version) > 0;
-  if (list.length === 0 && !pending) return;
-  const bare = (v: string) => v.replace(/^v(?=\d)/, "");
   const dir = backupsDir(stateDir);
+  const made = listProjectBackups(dir);
+  if (list.length === 0 && made.length === 0 && !pending) return;
+  const bare = (v: string) => v.replace(/^v(?=\d)/, "");
   const shownDir = `${inside(project.root, dir) ? relative(project.root, dir) : dir}/`;
   const parts: string[] = [];
   if (list.length) {
@@ -991,13 +993,17 @@ function checkBackups(r: Report, d: DoctorDeps, project: Project, probe: DuckdbP
     const newest = list[0]!;
     const count = list.length === 1 ? "1 before a DuckDB upgrade" : `${formatCount(list.length)} before DuckDB upgrades`;
     parts.push(`backups: ${count}, ${formatBytes(bytes)} in ${shownDir} (newest ${agoText(newest.at, at)}: ${newest.from} → ${newest.to}; the ${BACKUPS_KEPT} newest are kept)`);
-  } else {
-    parts.push("backups: none yet");
   }
+  if (made.length) {
+    const bytes = made.reduce((sum, b) => sum + b.bytes, 0);
+    const what = `${formatCount(made.length)} by croft backup, ${formatBytes(bytes)}${list.length ? "" : ` in ${shownDir}`} (newest ${agoText(made[0]!.createdAt, at)})`;
+    parts.push(list.length ? what : `backups: ${what}`);
+  }
+  if (!list.length && !made.length) parts.push("backups: none yet");
   if (pending) parts.push(`the next croft command that writes backs the warehouse up first (DuckDB ${bare(rec!.version)} → ${bare(running!)})`);
   r.add("project", "backups", pending ? "info" : "ok", parts.join(" · "), undefined, {
     backups: list.map((b) => ({ path: b.path, at: b.at, from: b.from, to: b.to, bytes: b.bytes, wal: b.wal !== null })),
-    recorded: rec?.version ?? null, running, pending,
+    projectBackups: made, recorded: rec?.version ?? null, running, pending,
   });
 }
 

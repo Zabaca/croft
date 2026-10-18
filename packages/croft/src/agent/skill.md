@@ -76,6 +76,8 @@ croft status                # failed, stale, held, never run, edited since its l
   check with `croft secrets --json`. Never read .env.
 - Warehouse file missing (DB_NOT_FOUND in status): ask the user where it went before running anything; a run
   builds a new, empty one and refetches from the sources.
+- Backup: croft backup (into .croft/backups/), or croft backup <folder> on another disk; safe while croft serve
+  runs. Never copy warehouse*.duckdb by hand. Putting a backup back replaces data: ask the user (croft docs backup).
 
 ## Output
 - JSON timestamps carry the project offset; ::DATE uses the croft.json timezone.

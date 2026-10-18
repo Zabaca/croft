@@ -77,3 +77,6 @@ spent too, and a token minted before the table was written, rebuilt or restored 
 When a croft upgrade brings a newer DuckDB, croft copies warehouse.duckdb (and warehouse.duckdb.wal, when there is
 one) whole to .croft/backups/ before the newer engine opens it for the first time. A backup is a plain DuckDB file
 of the warehouse as it was; ask the user before deleting one.
+
+The trash and these backups live in .croft/, next to the warehouse. A copy of the whole project's data, on another
+disk if you like, is croft backup (croft docs backup).

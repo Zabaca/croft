@@ -16,6 +16,7 @@ import { CroftError } from "../core/errors.ts";
 import type { Envelope } from "../core/types.ts";
 import { didYouMean } from "../project/suggest.ts";
 import type { Command, CommandImpl } from "./command.ts";
+import type { backup } from "./commands/backup.ts";
 import type { confirm } from "./commands/confirm.ts";
 import type { context } from "./commands/context.ts";
 import type { del } from "./commands/delete.ts";
@@ -70,6 +71,7 @@ export interface CommandData {
   delete: DataOf<typeof del>;
   restore: DataOf<typeof restore>;
   new: DataOf<typeof newAsset>;
+  backup: DataOf<typeof backup>;
 }
 
 /** The envelope every command prints, whatever its data (schemas/envelope.schema.json). */
@@ -78,7 +80,7 @@ export type AnyEnvelope = Envelope<unknown>;
 /** The commands with a schema, in the order of CommandData. */
 export const SCHEMA_COMMANDS = [
   "init", "doctor", "docs", "help", "version", "secrets", "context", "status", "describe", "query", "logs",
-  "run", "wait", "confirm", "validate", "preview", "schedule", "serve", "rename", "delete", "restore", "new",
+  "run", "wait", "confirm", "validate", "preview", "schedule", "serve", "rename", "delete", "restore", "new", "backup",
 ] as const satisfies readonly (keyof CommandData)[];
 
 export type SchemaCommand = (typeof SCHEMA_COMMANDS)[number];
