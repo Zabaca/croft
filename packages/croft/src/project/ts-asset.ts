@@ -24,7 +24,7 @@ import { dirname, extname, isAbsolute, join, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { CroftError, problem, type Code, type ProblemInit } from "../core/errors.ts";
 import { guardImport } from "../core/output.ts";
-import type { CursorType, Incremental, Problem, WriteMode } from "../core/types.ts";
+import type { CursorType, Incremental, OnceColumn, Problem, WriteMode } from "../core/types.ts";
 import { parseSchedule } from "../schedule/types.ts";
 import type { AssetDefinition } from "../types.ts";
 import { safeType } from "../load/evolve.ts";
@@ -940,9 +940,12 @@ export function validateDefinition(value: unknown, o: ValidateOptions): Validati
     if (cfg.rows === undefined) c.invalid("rows", "a transform needs rows(): the code that turns its inputs into rows", "add async *rows({ rows, newRows }) { ... }");
     else requireFunction(c, cfg, "rows", "async *rows({ newRows }) { ... }");
     if (cfg.incremental !== undefined) {
-      if (typeof cfg.incremental !== "boolean") {
-        c.invalid("incremental", `a transform's incremental is true or false, got ${describe(cfg.incremental)}`,
-          "incremental: true processes only input rows written since the last run (read them with newRows())");
+      if (isPlainObject(cfg.incremental)) {
+        const once = keyOnce(c, cfg.incremental, common);
+        if (once) incremental = { kind: "new-rows", inputs, ...(once.length ? { once } : {}) };
+      } else if (typeof cfg.incremental !== "boolean") {
+        c.invalid("incremental", `a transform's incremental is true, false or { once: "key" }, got ${describe(cfg.incremental)}`,
+          'incremental: true processes only input rows written since the last run (read them with newRows()); { once: "key" } each output key once');
       } else if (cfg.incremental) incremental = { kind: "new-rows", inputs };
     }
     if (cfg.confirmAbove !== undefined) {
@@ -1000,6 +1003,57 @@ export function validateDefinition(value: unknown, o: ValidateOptions): Validati
     ...(confirmAbove !== undefined ? { confirmAbove } : {}),
   };
   return done(spec);
+}
+
+/**
+ * A transform's incremental: { once: "key", from? } (§3e, D106): each output key column, and the input column
+ * newRows() reads it from (`from`, else the column of the same name). It needs the transform's key, which is what
+ * it computes once: without one it is [], so that INCREMENTAL_WITHOUT_KEY says so, and write: "append" (which that
+ * rule allows) is refused here. null when it is invalid (reported).
+ */
+function keyOnce(c: Checker, inc: Record<string, unknown>, common: Common): OnceColumn[] | null {
+  let ok = true;
+  for (const k of Object.keys(definedEntries(inc))) {
+    if (k === "once" || k === "from") continue;
+    const guess = didYouMean(k, ["once", "from"]);
+    c.invalid("incremental", `incremental has an unknown key "${k}"${guess ? `; did you mean "${guess}"?` : ""}`,
+      'incremental: { once: "key" }, with from: { <key column>: "<input column>" } when the input names it differently');
+    ok = false;
+  }
+  if (inc.once !== "key") {
+    c.invalid("incremental", `incremental.once is "key", got ${describe(inc.once)}`,
+      'incremental: { once: "key" } computes each output key once; incremental: true processes changed input rows again');
+    return null;
+  }
+  if (common.key.length === 0) {
+    if (common.write === "append") {
+      c.invalid("incremental", 'incremental: { once: "key" } computes each output key once, and this transform has no key',
+        'add key: "id" (the column that identifies an output row)');
+      return null;
+    }
+    return [];
+  }
+  const from = new Map<string, string>();
+  if (inc.from !== undefined) {
+    if (!isPlainObject(inc.from)) {
+      c.invalid("incremental", `incremental.from maps key columns to input columns, got ${describe(inc.from)}`,
+        `for example from: { ${common.key[0]}: "id" }: ${common.key[0]} is read from the input's id column`);
+      return null;
+    }
+    for (const [k, v] of Object.entries(definedEntries(inc.from))) {
+      const col = common.key.find((x) => x.toLowerCase() === k.toLowerCase());
+      if (!col) {
+        const guess = didYouMean(k, common.key);
+        c.invalid("incremental", `incremental.from names ${JSON.stringify(k)}, which is not a key column (key: ${common.key.join(", ")})${guess ? `; did you mean "${guess}"?` : ""}`,
+          "from maps each output key column to the input column it is read from");
+        ok = false;
+      } else if (typeof v !== "string" || v.trim() === "") {
+        c.invalid("incremental", `incremental.from.${k} must name an input column, got ${describe(v)}`, `for example from: { ${col}: "id" }`);
+        ok = false;
+      } else from.set(col, v);
+    }
+  }
+  return ok ? common.key.map((key) => ({ key, from: from.get(key) ?? key })) : null;
 }
 
 // Keys that belong to another kind of asset get a message that says where they belong.

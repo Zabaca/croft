@@ -12,11 +12,14 @@ newRows() the asset with a key that changed most recently, with confirmAbove set
 goes. The file passes croft validate as written; then edit the input, the per-row work, what each row yields and
 the checks. Preview it with croft preview <name> --rows 20 once it makes paid calls.
 
-There are two kinds:
+There are two kinds, and the incremental one has two settings:
 
-  incremental: true   processes each input row once, read with newRows(); an input row that changed comes
-                      again. Rows are merged into the table by key, in chunks. For per-row work, and always
-                      for code that pays per row.
+  incremental: true   processes each input row once, read with newRows(); an input row that changed in any
+                      column comes again, so code that pays per row pays again, and its new output replaces
+                      the stored one. Rows are merged into the table by key, in chunks. For per-row work.
+  incremental:        the same, but each output key once: newRows() leaves out an input row whose key the
+    { once: "key" }   table already holds, so an edit upstream (a note, a label) never pays again. For code
+                      that pays per row, unless a changed row should be paid for again (below).
   not incremental     recomputes the whole table from rows() whenever an input or the code changes, and
                       replaces the table (unchanged rows keep their _loaded_at). For whole-table computations
                       that make no requests.
@@ -33,7 +36,7 @@ export default transform({
   description: "A label for every issue, suggested by a classification API",
   inputs: ["github_issues"],
   key: "issue_id",
-  incremental: true,              // each issue is sent once; an issue that changed is sent again
+  incremental: { once: "key", from: { issue_id: "id" } },   // each issue is sent once, even after an edit
   secrets: ["CLASSIFIER_KEY"],
   checks: ["not_null(label)", "confidence BETWEEN 0 AND 1"],
 
@@ -161,10 +164,34 @@ loaded like an ingest's rows (columns: { x: "DECIMAL(18,2)" } pins a type).
 - A chunk that could not commit (a failed check, a busy database) is kept, and the next attempt commits it
   without running the code again while the code, the checks and the input rows are unchanged; change any of
   them and it is computed again.
-- Changing the code applies to new input rows only: rows built earlier keep their values, so paid calls are
-  never repeated implicitly (croft status shows EDITED_SINCE_LAST_RUN). croft preview <name> --rebuild shows
-  how a rebuild would differ, within its --rows cap; croft run <name> --rebuild redoes every row, after moving
-  the table to the trash and asking for a confirmation. Ask the user before running it.
+- Changing the code applies to new input rows only (under { once: "key" }, to new keys only): rows built
+  earlier keep their values, so paid calls are never repeated implicitly (croft status shows
+  EDITED_SINCE_LAST_RUN). croft preview <name> --rebuild shows how a rebuild would differ, within its --rows
+  cap; croft run <name> --rebuild redoes every row, after moving the table to the trash and asking for a
+  confirmation. Ask the user before running it.
+
+## Once per key: incremental: { once: "key" }
+
+incremental: true hands an input row over again whenever any of its columns changes upstream: an edited note
+or label, a new search that finds the same record, an upstream rebuild that restamps every row. Code that pays
+per row then pays again, and its new output replaces the stored answer. With { once: "key" } the unit of work is
+the transform's key instead:
+
+- newRows() leaves out each input row whose output key the table already holds, and of several new rows with
+  the same output key it hands over the first. The code never sees, or pays for, a key twice.
+- The output key is read from the input row: each key column from the input column of the same name, or from
+  the one from names: { once: "key", from: { issue_id: "id" } }. The input's own key may differ: an input
+  keyed (term_id, case_id) and a transform keyed case_id fetch each case once, however many terms find it. An
+  input read with newRows() without such a column is UNKNOWN_INPUT_COLUMN.
+- Yield a row for every key the code paid for, even an empty answer (a status column says so): a key with no
+  row in the table is not done, and its input row comes again when it changes.
+- The cost guard counts only the rows newRows() would hand over, so an upstream rewrite of rows whose keys are
+  stored asks nothing. croft run --dry-run reads no tables, so its estimate still counts them.
+- An input row deleted upstream leaves its output in the table, as with incremental: true. croft run <name>
+  --rebuild computes every key again (it empties the table first, after a confirmation).
+
+Keep incremental: true when a changed input row should be paid for again, such as a summary of text that was
+edited. Switching between the two is a code change: it applies from the next run, to the rows still to come.
 
 ## The cost guard
 

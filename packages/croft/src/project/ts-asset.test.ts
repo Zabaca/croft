@@ -743,7 +743,14 @@ describe("validateDefinition: transforms", () => {
     ["duplicate inputs", xform({ inputs: ["a", "a"] }), "inputs", "inputs lists a more than once"],
     ["no rows", transform({ inputs: ["a"] } as unknown as TransformConfig), "rows", "a transform needs rows(): the code that turns its inputs into rows"],
     ["rows not a function", xform({ rows: "select 1" }), "rows", 'rows must be a function, got "select 1"'],
-    ["incremental not boolean", xform({ incremental: "updated_at" }), "incremental", 'a transform\'s incremental is true or false, got "updated_at"'],
+    ["incremental not boolean", xform({ incremental: "updated_at" }), "incremental", 'a transform\'s incremental is true, false or { once: "key" }, got "updated_at"'],
+    ["once not key", xform({ key: "issue_id", incremental: { once: "row" } }), "incremental", 'incremental.once is "key", got "row"'],
+    ["once missing", xform({ key: "issue_id", incremental: {} }), "incremental", 'incremental.once is "key", got nothing'],
+    ["once unknown key", xform({ key: "issue_id", incremental: { once: "key", form: { issue_id: "id" } } }), "incremental", 'incremental has an unknown key "form"; did you mean "from"?'],
+    ["once from a list", xform({ key: "issue_id", incremental: { once: "key", from: ["id"] } }), "incremental", "incremental.from maps key columns to input columns, got a list"],
+    ["once from a non-key", xform({ key: "issue_id", incremental: { once: "key", from: { issue: "id" } } }), "incremental", 'incremental.from names "issue", which is not a key column (key: issue_id); did you mean "issue_id"?'],
+    ["once from an empty column", xform({ key: "issue_id", incremental: { once: "key", from: { issue_id: "" } } }), "incremental", 'incremental.from.issue_id must name an input column, got ""'],
+    ["once without a key, appending", xform({ write: "append", incremental: { once: "key" } }), "incremental", 'incremental: { once: "key" } computes each output key once, and this transform has no key'],
     ["confirmAbove", xform({ confirmAbove: 1.5 }), "confirmAbove", "confirmAbove must be a whole number of input rows, got 1.5"],
     ["schedule on a transform", xform({ schedule: "hourly" }), "schedule", "transforms have no schedule: they run when their inputs change"],
     ["file on a transform", xform({ file: "x.csv" }), "file", "file belongs to file ingests: use ingest({ file: ... })"],
@@ -755,6 +762,19 @@ describe("validateDefinition: transforms", () => {
     expect(p.code).toBe("ASSET_INVALID");
     expect(p.message).toBe(message);
     expect(p.details?.key).toBe(key);
+  });
+
+  test("incremental: { once: \"key\" } resolves each key column to the input column it is read from (D106)", () => {
+    const same = validateDefinition(xform({ key: ["term", "id"], incremental: { once: "key" } }), O);
+    expect(same.problems).toEqual([]);
+    expect(same.spec?.incremental).toEqual({ kind: "new-rows", inputs: ["github_issues"], once: [{ key: "term", from: "term" }, { key: "id", from: "id" }] });
+    // from names a key column without regard to case, as DuckDB names do; the spec keeps the key's own spelling.
+    const mapped = validateDefinition(xform({ key: "issue_id", incremental: { once: "key", from: { ISSUE_ID: "id" } } }), O);
+    expect(mapped.problems).toEqual([]);
+    expect(mapped.spec?.incremental).toEqual({ kind: "new-rows", inputs: ["github_issues"], once: [{ key: "issue_id", from: "id" }] });
+    expect(validateDefinition(xform({ key: "issue_id", incremental: true }), O).spec?.incremental).toEqual({ kind: "new-rows", inputs: ["github_issues"] });
+    // Without a key, the incremental rule says what is missing, once.
+    expect(codes(validateDefinition(xform({ incremental: { once: "key" } }), O).problems)).toEqual(["INCREMENTAL_WITHOUT_KEY"]);
   });
 });
 

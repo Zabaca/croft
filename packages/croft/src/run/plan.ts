@@ -236,12 +236,15 @@ export function rebuildCommand(asset: string, o: { allowShrink?: boolean } = {})
 /**
  * The incremental TS transforms that read `ingest` with newRows() and whose code makes requests (the cost guard's
  * transforms), among `readers`. A --rebuild of the ingest gives every row a new _loaded_at, so each of them would
- * process every row again and pay for it: the rebuild's confirmation counts them (run/rebuild.ts). Sorted.
+ * process every row again and pay for it: the rebuild's confirmation counts them (run/rebuild.ts). Not one with
+ * incremental: { once: "key" } (D106): it pays only for keys its table does not hold, which a refetch does not add
+ * by restamping rows, and its own cost guard counts and asks for those. Sorted.
  */
 export function paidReadersOf(ingest: string, readers: readonly string[], byName: ReadonlyMap<string, Pick<ResolvedAsset, "kind" | "ts" | "incremental" | "usesHttp">>): string[] {
   return readers.filter((r) => {
     const a = byName.get(r);
     if (!a || stepKindOf(a) !== "transform" || a.incremental.kind !== "new-rows" || a.usesHttp !== true) return false;
+    if (a.incremental.once) return false;
     const reads = a.ts?.readsNewRows;
     return !reads || reads.includes(ingest);
   }).sort();

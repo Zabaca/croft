@@ -14,7 +14,9 @@
 //               rows() is not processed row by row. An input the scan missed is counted when newRows() first
 //               reads it, before its first row is handed over. A preview (StepInput.preview) counts at most its
 //               --rows of each input and, with nobody to ask, refuses a count over confirmAbove; croft preview
-//               without --rows first lowers its cap to one that fits (previewGuard)
+//               without --rows first lowers its cap to one that fits (previewGuard). Under incremental:
+//               { once: "key" } (D106) newRows() and the count both leave out the input rows whose output key the
+//               table holds, one row per key (run/snapshot.ts OnceFilter), so the count is the rows that pay
 //   extract     NO database lock: rows(ctx) → NDJSON parts (load/stage.ts); ctx.rows/newRows/query read Parquet
 //               snapshots of the inputs through a private DuckDB (run/inputs.ts); ctx.http, ctx.secret, ctx.log;
 //               console output and fds 1 and 2 go to the step log (core/output.ts)
@@ -59,7 +61,7 @@ import { readStoredColumns } from "../safety/guards.ts";
 import { codeError, createdTable, croftError, FAIRNESS_YIELD_MS, fault, jsonKeys, type StepProgress, toKnown } from "./ingest.ts";
 import { stepAborted, TransformInputs } from "./inputs.ts";
 import type { PlannedStep } from "./plan.ts";
-import { countAfter, type InputFacts, type InputSnapshot, readInputFacts, type SeenPosition } from "./snapshot.ts";
+import { countAfter, type InputFacts, type InputSnapshot, type OnceFilter, readInputFacts, type SeenPosition } from "./snapshot.ts";
 import { inputsInZone } from "./sql.ts";
 import type { StepInput, StepOutcome } from "./step.ts";
 
@@ -219,9 +221,10 @@ export async function runTransform(i: StepInput): Promise<StepOutcome> {
   const internal = new AbortController();
   const ctxSignal = AbortSignal.any([signal, internal.signal]);
   const chunk = new ChunkState();
+  const once = onceOf(step);
   const inputs: TransformInputs = new TransformInputs({
     warehouse, asset, file: step.file, root: project.root, stageDir, stateDir, timezone: project.timezone, signal: ctxSignal,
-    inputs: inputNames, facts: state.facts, saved: new Map(committed), incremental,
+    inputs: inputNames, facts: state.facts, saved: new Map(committed), incremental, ...(once ? { once } : {}),
     ...(i.preview ? { limit: i.preview.rows } : {}),
     onRow: () => progress.touch(),
     ...(chunked ? { onRequest: (): Promise<void> => chunk.request(() => inputs.chunkPositions()) } : {}),
@@ -370,6 +373,16 @@ function costGuarded(step: PlannedStep): boolean {
   return step.incremental.kind === "new-rows" && (step.usesHttp ?? step.loaded?.usesHttp ?? false);
 }
 
+/**
+ * incremental: { once: "key" } of a step (§3e "Once per key", D106): newRows() and the cost guard's count leave out
+ * the input rows whose output key the table holds. `rebuild`: the count for --rebuild, whose table goes to the trash
+ * before the code runs, so none of its keys count. undefined for any other step.
+ */
+function onceOf(step: PlannedStep, rebuild = false): OnceFilter | undefined {
+  if (step.incremental.kind !== "new-rows" || !step.incremental.once) return undefined;
+  return { asset: step.asset, columns: step.incremental.once, ...(rebuild ? { absent: true } : {}) };
+}
+
 /** The declared inputs of a transform step. */
 function inputsOf(step: PlannedStep): readonly string[] {
   return step.inputs.length ? step.inputs : step.spec?.inputs ?? [];
@@ -389,15 +402,17 @@ export interface GuardCount {
 
 /**
  * The rows after the position of each keyed input the code reads with newRows() (a lookup read with rows() is not
- * processed row by row). `cap`: croft preview's --rows, the most newRows() hands over of each input.
+ * processed row by row). `cap`: croft preview's --rows, the most newRows() hands over of each input. A once-per-key
+ * transform counts only the rows newRows() would hand over (onceOf), so its count is the paid work: an upstream
+ * rewrite that changed no key asks nothing. `rebuild`: its table is about to go to the trash.
  */
 async function guardCount(step: PlannedStep, warehouse: DuckWarehouse, positions: ReadonlyMap<string, SeenPosition | null>,
-  signal: AbortSignal, cap?: number): Promise<GuardCount> {
+  signal: AbortSignal, cap?: number, rebuild = false): Promise<GuardCount> {
   const inputs = inputsOf(step);
   const limit = step.confirmAbove ?? step.spec?.confirmAbove ?? DEFAULT_CONFIRM_ABOVE;
   const reads = step.loaded?.readsNewRows;
   const counted = reads ? inputs.filter((n) => reads.includes(n)) : [...inputs];
-  const all = counted.length ? await pendingCounts(warehouse, counted, positions, signal) : {};
+  const all = counted.length ? await pendingCounts(warehouse, counted, positions, signal, onceOf(step, rebuild)) : {};
   const counts = Object.fromEntries(Object.entries(all).map(([k, n]) => [k, cap === undefined ? n : Math.min(n, cap)]));
   return { limit, counts, pending: Object.values(counts).reduce((a, b) => a + b, 0), counted };
 }
@@ -438,19 +453,19 @@ export async function previewGuard(step: PlannedStep, warehouse: DuckWarehouse, 
  */
 export async function rebuildGuard(step: PlannedStep, warehouse: DuckWarehouse, signal: AbortSignal): Promise<GuardCount | null> {
   if (!costGuarded(step)) return null;
-  return guardCount(step, warehouse, new Map(), signal);
+  return guardCount(step, warehouse, new Map(), signal, undefined, true);
 }
 
 /** Input rows after the positions, per keyed input (the rows newRows() can hand over). */
 async function pendingCounts(warehouse: DuckWarehouse, inputs: readonly string[], positions: ReadonlyMap<string, SeenPosition | null>,
-  signal: AbortSignal): Promise<Record<string, number>> {
+  signal: AbortSignal, once?: OnceFilter): Promise<Record<string, number>> {
   return warehouse.read(async (db) => {
     const out: Record<string, number> = {};
     for (const input of inputs) {
       const facts = await readInputFacts(db, input);
       // Without a key an input cannot be read with newRows() (INPUT_NEEDS_KEY), so it adds nothing to pay for.
       if (!facts || facts.key.length === 0) continue;
-      out[input] = await countAfter(db, input, facts, positions.get(input) ?? null);
+      out[input] = await countAfter(db, input, facts, positions.get(input) ?? null, once);
     }
     return out;
   }, { purpose: "count the input rows a transform would process", signal });

@@ -24,6 +24,9 @@ What to do:
   const { author } = row, read { author_login: author }, which keeps the variable's name.
 - The column never existed: check the input's columns and correct the code.
 - A column that exists but is NULL in a row reads as null; only a column the input does not have throws.
+- A transform with incremental: { once: "key" } reads its output key from each input row, by the key columns'
+  names. When the input names a key column differently, say which column it comes from:
+  incremental: { once: "key", from: { issue_id: "id" } }. No row of that input was processed.
 
 Guarded rows work with spread ({ ...row }), JSON.stringify, Object.keys and `in`. structuredClone(row) does
 not: copy with { ...row }.

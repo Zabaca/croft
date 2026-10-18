@@ -498,8 +498,9 @@ function transformTemplate(name: string, input: TemplateInput): Template {
     ...block("// ", [
       "When this applies: per-row work that SQL cannot do, above all one API or LLM call per row (classify, enrich, "
       + "summarize, geocode), or parsing and scoring with a library. It is incremental: newRows() hands each input row over "
-      + "once, and again only when it changes upstream, so a paid call is never repeated for rows already done. For "
-      + "filters, joins and aggregates, write SQL instead (croft new sql <name>).",
+      + "once, and again when any of its columns changes upstream, which pays for that row again. To pay once per key "
+      + "whatever changes upstream, write incremental: { once: \"key\" } (croft docs transforms). For filters, joins and "
+      + "aggregates, write SQL instead (croft new sql <name>).",
       `It reads ${input.asset}${why}. To edit: inputs and newRows() for the asset it should read, the per-row work (the `
       + "paid call goes where the comment shows), what each row yields, and the checks. Once it makes paid calls, preview "
       + `it with croft preview ${name} --rows 20: each input row is one call.`,
@@ -516,7 +517,8 @@ function transformTemplate(name: string, input: TemplateInput): Template {
     note(`  inputs: [${JSON.stringify(input.asset)}],`, "the assets this code reads; croft builds them first"),
     note(`  key: ${tsKey(outKey)},`, `one output row per input row, by the key of ${input.asset}`),
     note("  incremental: true,", "newRows() gives only rows not processed yet; results merge"),
-    note("", "by key, committed in chunks, so a failure loses little"),
+    note("", "by key, committed in chunks, so a failure loses little;"),
+    note("", "{ once: \"key\" } skips keys the table already holds"),
     note("  confirmAbove: 1000,", "the cost guard: a run that would send more input rows than"),
     note("", "this to code that makes requests asks first (a first build,"),
     note("", "a large upstream change). Raise it only with the user's yes."),
