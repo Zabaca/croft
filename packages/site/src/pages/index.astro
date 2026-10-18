@@ -1,25 +1,52 @@
 ---
-// The homepage. Every terminal transcript on it is real croft 0.1.0 output, from the project the Quickstart builds
-// (docs/quickstart.md shows the same runs), trimmed only where a line says so.
+// The homepage, for people. Agents have their own front door: the Worker answers `/` with /llms.txt when a request
+// does not ask for HTML, and the docs carry the detail.
+//
+// The pitch: one tool for the whole data pipeline, all in TypeScript. The tools it replaces are named once, in the
+// comparison table, and as "replaces", never "compatible with": croft reads no dbt project or dlt pipeline. The code
+// samples are the Quickstart's (docs/quickstart.md), cut down.
 import version from '../generated-version.json'
 import mark from '../assets/mark.svg?raw'
 
-const title = 'croft: data pipelines your agent can run'
+const title = 'croft: the whole data pipeline, in TypeScript'
 const description =
-  'Local data pipelines in TypeScript, on one DuckDB file. Ingest APIs and files, transform with SQL or TypeScript, keep the tables fresh, and let Claude Code drive it all.'
+  'One tool for the whole data pipeline, in TypeScript: pull data from APIs and files, transform it, and keep it fresh on a schedule. One CLI, one DuckDB file, no Python.'
 const canonical = new URL('/', Astro.site).href
 
-// Braces in a template's text start an expression, so code samples with braces are strings.
-const stripeCharges = `<span class="cm">// assets/stripe_charges.ts</span>
+// Braces in a template's text start an expression, so the code samples are strings.
+const ingestCode = `<span class="cm">// assets/stripe_charges.ts</span>
 export default ingest({
   key: <span class="s">"id"</span>,
-  incremental: {
-    field: <span class="s">"created"</span>, unit: <span class="s">"s"</span>,
-    lookback: <span class="s">"30 days"</span>,
-  },
   schedule: <span class="s">"every hour"</span>,
-  async *rows({ since, http }) { … },
+  async *rows({ http }) { … },
 });`
+const appCode = `<span class="kw">import</span> { query } <span class="kw">from</span> <span class="s">"@zabaca/croft/read"</span>;
+
+<span class="kw">const</span> rows = <span class="kw">await</span> query(
+  <span class="s">"from revenue_by_month order by month"</span>,
+);`
+const typeCode = `<span class="cm">// .croft/types/revenue_by_region.d.ts, written by croft</span>
+<span class="kw">export type</span> RevenueByRegionRow = {
+  region: string;            <span class="cm">// VARCHAR, the key</span>
+  orders: number | bigint | null;
+  revenue: number | null;    <span class="cm">// DOUBLE</span>
+};`
+const typeError = `<span class="p">$</span> croft validate --types
+<span class="err">error UNKNOWN_INPUT_COLUMN</span>  assets/region_labels.ts:9:65
+      revenue_by_region has no column "revenue"
+      <span class="k">fix:</span> revenue_by_region has these columns:
+           region, orders, total, _loaded_at`
+const sqlCode = `<span class="cm">-- assets/revenue_by_month.sql</span>
+<span class="cm">-- check: revenue >= 0</span>
+SELECT month,
+       sum(amount) AS revenue
+FROM stripe_charges
+GROUP BY month`
+const runCode = `<span class="p">$</span> croft schedule on
+<span class="p">$</span> croft status
+ASSET              NEXT
+stripe_charges     every hour
+revenue_by_month   after inputs`
 ---
 
 <html lang="en">
@@ -44,189 +71,166 @@ export default ingest({
     </script>
     <style is:global>
       :root {
-        --ground: #f6f3ea;
-        --raised: #fffdf7;
-        --sunk: #ece7da;
+        --ground: #f7f4ec;
+        --raised: #fffdf8;
+        --sunk: #eee9dc;
         --ink: #1b1a16;
-        --ink-2: #4a463c;
-        --ink-3: #7a7466;
-        --rule: #ddd6c6;
+        --ink-2: #4c483e;
+        --ink-3: #7c7668;
+        --rule: #e0d9c9;
         --green: #2f6b3e;
-        --green-2: #3f8a52;
-        --green-wash: #dfeee2;
-        --ochre: #b8741f;
-        --term: #191814;
-        --term-ink: #e9e4d6;
-        --term-dim: #9a9381;
-        --term-ok: #8fd19e;
-        --term-err: #f08b7a;
-        --term-key: #e8b765;
-        --mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+        --green-2: #3d8550;
+        --ochre: #b0701e;
         --sans: ui-sans-serif, -apple-system, 'Segoe UI', Inter, Roboto, 'Helvetica Neue', Arial, sans-serif;
+        --mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
         color-scheme: light;
       }
       @media (prefers-color-scheme: dark) {
         :root:not([data-theme='light']) {
           --ground: #141411;
           --raised: #1c1b17;
-          --sunk: #11100e;
+          --sunk: #24231e;
           --ink: #f1ede2;
-          --ink-2: #c7c1b2;
+          --ink-2: #c4beaf;
           --ink-3: #8f8979;
           --rule: #2f2d27;
           --green: #7cc28c;
           --green-2: #95d4a3;
-          --green-wash: #1d3022;
           --ochre: #e0a24a;
-          --term: #0d0d0b;
           color-scheme: dark;
         }
       }
       :root[data-theme='dark'] {
         --ground: #141411;
         --raised: #1c1b17;
-        --sunk: #11100e;
+        --sunk: #24231e;
         --ink: #f1ede2;
-        --ink-2: #c7c1b2;
+        --ink-2: #c4beaf;
         --ink-3: #8f8979;
         --rule: #2f2d27;
         --green: #7cc28c;
         --green-2: #95d4a3;
-        --green-wash: #1d3022;
         --ochre: #e0a24a;
-        --term: #0d0d0b;
         color-scheme: dark;
       }
       * { box-sizing: border-box; }
       html { -webkit-text-size-adjust: 100%; }
-      body {
-        margin: 0;
-        background: var(--ground);
-        color: var(--ink);
-        font: 16px/1.6 var(--sans);
-        text-rendering: optimizeLegibility;
-      }
+      body { margin: 0; background: var(--ground); color: var(--ink); font: 17px/1.65 var(--sans); }
       a { color: var(--green); text-underline-offset: 3px; }
       code, pre { font-family: var(--mono); }
-      .wrap { max-width: 72rem; margin: 0 auto; padding-inline: 1.25rem; }
+      .wrap { max-width: 62rem; margin: 0 auto; padding-inline: 1.25rem; }
     </style>
     <style>
-      /* ── header ─────────────────────────────────────────────── */
-      header { border-bottom: 1px solid var(--rule); }
-      .bar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding-block: 0.9rem; }
-      .brand { display: flex; align-items: center; gap: 0.55rem; color: var(--ink); text-decoration: none; font-weight: 650; font-size: 1.15rem; letter-spacing: -0.01em; }
+      header .wrap { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding-block: 1.1rem; }
+      .brand { display: flex; align-items: center; gap: 0.55rem; color: var(--ink); text-decoration: none; font-weight: 650; font-size: 1.15rem; }
       .brand :global(svg) { width: 1.6rem; height: 1.6rem; display: block; }
-      nav { display: flex; flex-wrap: wrap; gap: 0.25rem 1.25rem; font-size: 0.95rem; }
+      nav { display: flex; gap: 1.4rem; font-size: 0.97rem; }
       nav a { color: var(--ink-2); text-decoration: none; }
       nav a:hover { color: var(--ink); }
 
-      /* ── hero ───────────────────────────────────────────────── */
-      .hero > * { min-width: 0; }
-      .hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 3rem; align-items: center; padding-block: 4.5rem 4rem; }
-      .eyebrow { font: 600 0.8rem/1 var(--mono); color: var(--ochre); letter-spacing: 0.06em; text-transform: uppercase; margin: 0 0 1.1rem; }
-      h1 { font-size: clamp(2.3rem, 4.6vw, 3.6rem); line-height: 1.04; letter-spacing: -0.035em; margin: 0 0 1.25rem; font-weight: 720; }
+      .hero { text-align: center; padding-block: 5rem 4.5rem; }
+      h1 { font-size: clamp(2.3rem, 5.5vw, 3.8rem); line-height: 1.05; letter-spacing: -0.035em; margin: 0 auto 1.3rem; max-width: 22ch; font-weight: 720; text-wrap: balance; }
       h1 em { font-style: normal; color: var(--green); }
-      .lede { font-size: 1.15rem; color: var(--ink-2); margin: 0 0 1.75rem; max-width: 34rem; }
-      .install { display: flex; align-items: center; gap: 0.75rem; background: var(--raised); border: 1px solid var(--rule); border-radius: 10px; padding: 0.7rem 0.7rem 0.7rem 1rem; max-width: min(30rem, 100%); }
-      .install code { flex: 1; min-width: 0; font-size: 0.95rem; white-space: nowrap; overflow-x: auto; }
-      .install code::before { content: '$ '; color: var(--ink-3); }
-      .copy { font: 600 0.8rem/1 var(--sans); border: 1px solid var(--rule); background: var(--ground); color: var(--ink-2); border-radius: 7px; padding: 0.5rem 0.7rem; cursor: pointer; }
-      .copy:hover { color: var(--ink); border-color: var(--ink-3); }
-      .ctas { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 1.25rem; }
-      .btn { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.7rem 1.1rem; border-radius: 9px; font-weight: 600; text-decoration: none; font-size: 0.97rem; }
+      .lede { font-size: clamp(1.1rem, 2vw, 1.25rem); color: var(--ink-2); margin: 0 auto 2.2rem; max-width: 36rem; }
+      .ctas { display: flex; flex-wrap: wrap; justify-content: center; gap: 0.75rem; }
+      .btn { display: inline-flex; align-items: center; padding: 0.8rem 1.3rem; border-radius: 10px; font-weight: 600; text-decoration: none; }
       .btn.primary { background: var(--green); color: var(--ground); }
       .btn.primary:hover { background: var(--green-2); }
       .btn.ghost { color: var(--ink); border: 1px solid var(--rule); }
       .btn.ghost:hover { border-color: var(--ink-3); }
-      .needs { margin-top: 1rem; font-size: 0.88rem; color: var(--ink-3); }
+      .fine { margin-top: 1.1rem; font-size: 0.9rem; color: var(--ink-3); }
 
-      /* ── terminal ───────────────────────────────────────────── */
-      .term { background: var(--term); color: var(--term-ink); border-radius: 12px; box-shadow: 0 1px 0 rgba(0,0,0,.04), 0 18px 50px -24px rgba(20, 30, 20, 0.55); overflow: hidden; border: 1px solid rgba(255,255,255,0.06); }
-      .term-top { display: flex; align-items: center; gap: 0.4rem; padding: 0.65rem 0.9rem; border-bottom: 1px solid rgba(255,255,255,0.07); }
-      .term-top i { width: 0.6rem; height: 0.6rem; border-radius: 50%; background: #3a3832; }
-      .term-top span { margin-left: 0.5rem; font: 0.75rem var(--mono); color: var(--term-dim); }
-      .term pre { margin: 0; padding: 1rem 1.1rem 1.2rem; font-size: 0.78rem; line-height: 1.6; overflow-x: auto; }
-      .term .p { color: var(--term-dim); }
-      .term .c { color: var(--term-ink); font-weight: 600; }
-      .term .ok { color: var(--term-ok); }
-      .term .err { color: var(--term-err); }
-      .term .k { color: var(--term-key); }
-      .term .d { color: var(--term-dim); }
+      section { padding-block: 4.5rem; border-top: 1px solid var(--rule); }
+      h2 { font-size: clamp(1.6rem, 3.4vw, 2.2rem); letter-spacing: -0.025em; line-height: 1.15; margin: 0 0 0.75rem; font-weight: 700; }
+      .intro { color: var(--ink-2); max-width: 38rem; margin: 0 0 2.5rem; font-size: 1.08rem; }
 
-      /* ── sections ───────────────────────────────────────────── */
-      section { padding-block: 4rem; border-top: 1px solid var(--rule); }
-      h2 { font-size: clamp(1.6rem, 3vw, 2.2rem); letter-spacing: -0.025em; line-height: 1.15; margin: 0 0 0.9rem; font-weight: 700; }
-      .sub { color: var(--ink-2); font-size: 1.08rem; max-width: 44rem; margin: 0 0 2.25rem; }
-      .three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1.25rem; }
-      .card { background: var(--raised); border: 1px solid var(--rule); border-radius: 12px; padding: 1.4rem 1.4rem 1.2rem; display: flex; flex-direction: column; }
-      .card h3 { margin: 0 0 0.35rem; font-size: 1.1rem; letter-spacing: -0.01em; }
-      .card .tag { font: 600 0.72rem/1 var(--mono); color: var(--ochre); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 0.7rem; }
-      .card p { margin: 0 0 1rem; color: var(--ink-2); font-size: 0.97rem; }
-      .card pre { margin: auto 0 0; background: var(--sunk); border-radius: 8px; padding: 0.8rem 0.9rem; font-size: 0.76rem; line-height: 1.55; overflow-x: auto; color: var(--ink); }
-      .card pre .cm { color: var(--ink-3); }
-      .card pre .s { color: var(--green); }
-      .card a.more { margin-top: 0.9rem; font-size: 0.9rem; font-weight: 600; text-decoration: none; }
 
-      .tree { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr); gap: 2.5rem; align-items: start; margin-bottom: 2.75rem; }
-      .tree pre { margin: 0; background: var(--raised); border: 1px solid var(--rule); border-radius: 12px; padding: 1.1rem 1.25rem; font-size: 0.82rem; line-height: 1.75; overflow-x: auto; }
-      .tree pre .cm { color: var(--ink-3); }
-      .tree pre b { color: var(--green); font-weight: 600; }
-      .tree ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 1rem; }
-      .tree li { padding-left: 1.4rem; position: relative; color: var(--ink-2); }
-      .tree li::before { content: ''; position: absolute; left: 0; top: 0.62em; width: 0.55rem; height: 0.55rem; border-radius: 2px; background: var(--green); }
-      .tree li strong { color: var(--ink); }
+      .two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 3rem; }
+      .points { list-style: none; margin: 0; padding: 0; display: grid; gap: 1.1rem; }
+      .points li { padding-left: 1.6rem; position: relative; color: var(--ink-2); }
+      .points li::before { content: '✓'; position: absolute; left: 0; color: var(--green); font-weight: 700; }
+      .points strong { color: var(--ink); }
 
-      .agent { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.25rem; }
-      .agent .term pre { font-size: 0.74rem; }
-      .label { font: 600 0.78rem/1.3 var(--sans); color: var(--ink-2); margin: 0 0 0.6rem; }
-      .points { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem 2.5rem; margin: 2.25rem 0 0; padding: 0; list-style: none; }
-      .points li { color: var(--ink-2); }
-      .points strong { color: var(--ink); display: block; margin-bottom: 0.15rem; }
-      .points code, .sub code, .safe code, .tree code { font-size: 0.88em; background: var(--sunk); padding: 0.1em 0.35em; border-radius: 4px; color: var(--ink); }
+      .chat { background: var(--raised); border: 1px solid var(--rule); border-radius: 14px; padding: 1.4rem 1.5rem; display: grid; gap: 1rem; align-self: start; }
+      .msg { font-size: 0.97rem; }
+      .msg b { display: block; font-size: 0.78rem; letter-spacing: 0.05em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 0.2rem; }
+      .msg.you { color: var(--ink); }
+      .msg.claude { color: var(--ink-2); }
+      .msg.ask { border-left: 3px solid var(--ochre); padding-left: 0.9rem; }
 
-      .safe { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.9rem 2.5rem; margin: 0; padding: 0; list-style: none; }
-      .safe li { padding: 0.95rem 1.1rem; background: var(--raised); border: 1px solid var(--rule); border-radius: 10px; color: var(--ink-2); font-size: 0.97rem; }
-      .safe strong { color: var(--ink); }
+      .facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1.25rem; }
+      .facts div { padding: 1.3rem 0 0; border-top: 2px solid var(--green); }
+      .facts h3 { margin: 0 0 0.35rem; font-size: 1.05rem; }
+      .facts p { margin: 0; color: var(--ink-2); font-size: 0.97rem; }
 
-      .stack { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--rule); border-radius: 12px; overflow: hidden; background: var(--raised); }
-      .stack div { padding: 1.3rem 1.4rem; }
-      .stack div + div { border-left: 1px solid var(--rule); }
-      .stack .was { font: 0.82rem var(--mono); color: var(--ink-3); text-decoration: line-through; text-decoration-color: var(--ochre); }
-      .stack .now { font-weight: 650; margin-top: 0.3rem; font-size: 1.05rem; }
-      .stack p { margin: 0.35rem 0 0; color: var(--ink-2); font-size: 0.93rem; }
-      .nots { margin-top: 1.25rem; color: var(--ink-2); font-size: 0.98rem; }
+      .end { text-align: center; }
+      .install { display: inline-flex; align-items: center; gap: 0.75rem; max-width: 100%; background: var(--raised); border: 1px solid var(--rule); border-radius: 10px; padding: 0.65rem 0.65rem 0.65rem 1rem; margin: 0.5rem 0 1.5rem; }
+      .install code { min-width: 0; overflow-x: auto; white-space: nowrap; font-size: 0.95rem; }
+      .install code::before { content: '$ '; color: var(--ink-3); }
+      .copy { font: 600 0.8rem/1 var(--sans); border: 1px solid var(--rule); background: var(--ground); color: var(--ink-2); border-radius: 7px; padding: 0.5rem 0.7rem; cursor: pointer; }
+      .copy:hover { color: var(--ink); }
 
-      .end { text-align: center; padding-block: 4.5rem; }
-      .end .install { margin: 1.5rem auto 0; }
-      .end .ctas { justify-content: center; }
-
-      footer { border-top: 1px solid var(--rule); padding-block: 1.75rem 2.5rem; color: var(--ink-3); font-size: 0.88rem; }
+      footer { border-top: 1px solid var(--rule); padding-block: 1.75rem 2.5rem; color: var(--ink-3); font-size: 0.9rem; }
       footer .wrap { display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; justify-content: space-between; }
       footer a { color: var(--ink-2); }
-      footer .links { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; }
+      footer span:last-child { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; }
 
-      @media (max-width: 900px) {
-        .hero, .tree, .agent { grid-template-columns: minmax(0, 1fr); }
-        .hero { padding-block: 3rem; gap: 2.25rem; }
-        .three { grid-template-columns: minmax(0, 1fr); }
-        .stack { grid-template-columns: minmax(0, 1fr); }
-        .stack div + div { border-left: 0; border-top: 1px solid var(--rule); }
+      @media (max-width: 820px) {
+        .facts, .two { grid-template-columns: minmax(0, 1fr); }
+        .two { gap: 2rem; }
+        .hero { padding-block: 3.5rem 3rem; }
+        section { padding-block: 3.25rem; }
       }
-      @media (max-width: 640px) {
-        .points, .safe { grid-template-columns: minmax(0, 1fr); }
-        nav .optional { display: none; }
+
+      .eyebrow { display: inline-block; font: 600 0.8rem/1 var(--mono); color: var(--ochre); letter-spacing: 0.06em; text-transform: uppercase; margin: 0 0 1.2rem; }
+      h1 .tools { white-space: nowrap; }
+
+      .map { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.25rem; }
+      .map li { background: var(--raised); border: 1px solid var(--rule); border-radius: 14px; padding: 1.4rem 1.5rem 1.5rem; display: flex; flex-direction: column; }
+      .map .was { font: 600 0.78rem/1 var(--mono); color: var(--ochre); text-transform: uppercase; letter-spacing: 0.06em; display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.9rem; }
+      .map h3 { margin: 0 0 0.4rem; font-size: 1.15rem; letter-spacing: -0.01em; }
+      .map p { margin: 0 0 1.1rem; color: var(--ink-2); font-size: 0.98rem; }
+      .map pre { margin: auto 0 0; background: var(--sunk); border-radius: 9px; padding: 0.85rem 1rem; font-size: 0.78rem; line-height: 1.6; overflow-x: auto; color: var(--ink); }
+      .map pre :global(.cm) { color: var(--ink-3); }
+      .map pre :global(.s) { color: var(--green); }
+      .map pre :global(.p) { color: var(--ink-3); }
+      .map pre :global(.kw) { color: var(--ochre); }
+
+      .cmp-wrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 14px; background: var(--raised); }
+      .cmp { width: 100%; border-collapse: collapse; font-size: 0.97rem; min-width: 34rem; }
+      .cmp th, .cmp td { text-align: left; padding: 0.85rem 1.1rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+      .cmp tbody tr:last-child th, .cmp tbody tr:last-child td { border-bottom: 0; }
+      .cmp thead th { font: 600 0.78rem/1.2 var(--mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); }
+      .cmp tbody th { font-weight: 600; color: var(--ink); width: 28%; }
+      .cmp td { color: var(--ink-2); }
+      .cmp .us { color: var(--ink); background: color-mix(in srgb, var(--green) 9%, transparent); }
+      .cmp thead .us { color: var(--green); }
+      .cmp code { font-size: 0.86em; background: var(--sunk); padding: 0.1em 0.35em; border-radius: 4px; }
+
+      .honest { margin: 1.5rem 0 0; color: var(--ink-3); font-size: 0.93rem; max-width: 44rem; }
+
+      .typed { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr); gap: 3rem; align-items: start; }
+      .typed-code pre { margin: 0; background: var(--raised); border: 1px solid var(--rule); border-radius: 12px; padding: 1rem 1.1rem; font-size: 0.78rem; line-height: 1.6; overflow-x: auto; color: var(--ink); }
+      .typed-code pre :global(.cm), .typed-code pre :global(.p) { color: var(--ink-3); }
+      .typed-code pre :global(.kw) { color: var(--ochre); }
+      .typed-code pre :global(.err) { color: #d9604c; font-weight: 600; }
+      .typed-code pre :global(.k) { color: var(--green); }
+      .caption { margin: 1rem 0 0.5rem; font-size: 0.9rem; color: var(--ink-3); }
+      .caption code { font-size: 0.9em; }
+      .agent { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 3rem; align-items: start; }
+
+      @media (max-width: 820px) {
+        .map, .agent, .typed { grid-template-columns: minmax(0, 1fr); }
+        h1 .tools { white-space: normal; }
       }
     </style>
   </head>
   <body>
     <header>
-      <div class="wrap bar">
+      <div class="wrap">
         <a class="brand" href="/"><Fragment set:html={mark} />croft</a>
         <nav aria-label="Main">
           <a href="/docs/">Docs</a>
-          <a href="/docs/quickstart/">Quickstart</a>
-          <a class="optional" href="/docs/reference/cli/">Reference</a>
-          <a class="optional" href="/llms.txt">llms.txt</a>
           <a href="https://github.com/Zabaca/croft">GitHub</a>
         </nav>
       </div>
@@ -234,201 +238,145 @@ export default ingest({
 
     <main>
       <div class="wrap hero">
-        <div>
-          <p class="eyebrow">croft {version.version} · MIT</p>
-          <h1>Data pipelines <em>your agent can run.</em></h1>
-          <p class="lede">
-            croft pulls data from APIs and files, transforms it with SQL or TypeScript, and keeps the tables fresh, all
-            in one DuckDB file on your machine. It is one CLI, and Claude Code can drive it from a cold start.
-          </p>
-          <div class="install">
-            <code id="install">bun add -g @zabaca/croft</code>
-            <button class="copy" type="button" data-copy="install">Copy</button>
-          </div>
-          <div class="ctas">
-            <a class="btn primary" href="/docs/quickstart/">Quickstart →</a>
-            <a class="btn ghost" href="/docs/">Read the docs</a>
-          </div>
-          <p class="needs">Needs Bun 1.3.14+ on macOS or Linux. No Python, no Docker, no server.</p>
+        <p class="eyebrow">Data pipelines for TypeScript</p>
+        <h1>The whole data pipeline, <em>in TypeScript.</em></h1>
+        <p class="lede">
+          croft is one tool that pulls data from APIs and files, transforms it, keeps it fresh on a schedule, and
+          serves it to your app. Pipelines are TypeScript, with SQL where you want it, and everything lives in one
+          DuckDB file. No Python, no servers, no glue between tools.
+        </p>
+        <div class="ctas">
+          <a class="btn primary" href="/docs/quickstart/">Get started</a>
+          <a class="btn ghost" href="/docs/concepts/">How it works</a>
         </div>
-
-        <div class="term" role="img" aria-label="A croft session: validate, preview and run a SQL transform">
-          <div class="term-top"><i></i><i></i><i></i><span>~/my-data</span></div>
-          <pre><span class="p">$</span> <span class="c">croft validate</span>
-checked 2 assets in 98 ms
-<span class="ok">0 errors, 0 warnings</span>
-
-<span class="p">$</span> <span class="c">croft preview revenue_by_region</span>
-Preview: your real tables are not changed.
-revenue_by_region 4 rows (new table)   +4 added · 0 removed
-  <span class="k">columns</span>  region VARCHAR · orders BIGINT · revenue DOUBLE
-  <span class="k">checks</span>   <span class="ok">ok</span> unique(region) · <span class="ok">ok</span> not_null(region) · <span class="ok">ok</span> revenue &gt; 0
-  <span class="k">sample</span>   region  orders  revenue
-           East    50      2637.5
-           North   17      885.5
-
-<span class="p">$</span> <span class="c">croft run revenue_by_region</span>
-run r_1018_0045_ecsl · 1 asset
-<span class="ok">ok</span>       revenue_by_region  4 rows (57 ms) · new table, 3 columns
-                            added 4 · updated 0 · checks 4/4 ok
-done 57 ms · 1 updated · 0 failed
-<span class="d">next: croft query "from revenue_by_region limit 5"</span></pre>
-        </div>
+        <p class="fine">Free and open source · macOS and Linux</p>
       </div>
 
       <section>
         <div class="wrap">
-          <h2>One folder. One file per table.</h2>
-          <p class="sub">
-            Each file in <code>assets/</code> makes one table with the file's name, and <code>croft run</code> brings them
-            up to date. A table that reads an updated table is rebuilt after it, in the same run. croft reads the
-            dependencies from your SQL; there is no DAG to declare.
-          </p>
-          <div class="tree">
-<pre>my-data/
-  croft.json
-  assets/
-    <b>stripe_charges.ts</b>   <span class="cm"># ingest: Stripe, incremental</span>
-    <b>sales.ts</b>            <span class="cm"># ingest: CSV exports</span>
-    <b>daily_revenue.sql</b>   <span class="cm"># transform: one SELECT</span>
-    <b>lead_scores.ts</b>      <span class="cm"># transform: LLM per row</span>
-  lib/                  <span class="cm"># shared code</span>
-  warehouse.duckdb      <span class="cm"># every table, one file</span></pre>
-            <ul>
-              <li><strong>Every write is all-or-nothing.</strong> Checks run on the rows before they are saved; a failed check writes nothing and the table keeps its data.</li>
-              <li><strong>Types are inferred, schema changes handled.</strong> New fields appear as columns, nested objects become JSON, and real conflicts fail loudly with the fix.</li>
-              <li><strong>Apps read it directly.</strong> <code>import {'{'} query {'}'} from "@zabaca/croft/read"</code> works under Bun and Node, through <code>croft serve</code> when one is running.</li>
+          <h2>One tool, end to end</h2>
+          <p class="intro">A croft project is a folder of TypeScript and SQL files. Each file becomes one table, and croft runs them in order.</p>
+          <ol class="map">
+            <li>
+              <div class="was">Ingest</div>
+              <h3>Bring data in</h3>
+              <p>From Stripe, GitHub or any API, or from CSV exports. Incremental, typed, and safe to rerun.</p>
+              <pre set:html={ingestCode} />
+            </li>
+            <li>
+              <div class="was">Transform</div>
+              <h3>Shape it</h3>
+              <p>A SQL query or a TypeScript function per table, with checks that run before anything is saved.</p>
+              <pre set:html={sqlCode} />
+            </li>
+            <li>
+              <div class="was">Schedule</div>
+              <h3>Keep it fresh</h3>
+              <p>A schedule in plain words. Everything downstream updates after it, in order.</p>
+              <pre set:html={runCode} />
+            </li>
+            <li>
+              <div class="was">Serve</div>
+              <h3>Use it in your app</h3>
+              <p>Query the tables from any Bun or Node app, with no database server to run.</p>
+              <pre set:html={appCode} />
+            </li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <div class="wrap typed">
+          <div>
+            <h2>Typed across SQL and TypeScript</h2>
+            <p class="intro">Every table gets a TypeScript type, generated from its real columns. Change a SQL query, and croft checks the TypeScript that reads it, before anything runs.</p>
+            <ul class="points">
+              <li><strong>Rename a column, see what breaks.</strong> Code that reads the old name fails the check, with the columns it could read instead.</li>
+              <li><strong>Mistyped SQL is caught early.</strong> Every query is checked against the columns it reads, without running it.</li>
+              <li><strong>Typed in your app too.</strong> <code>query&lt;"revenue_by_month"&gt;()</code> returns that table's columns, and a renamed one breaks your app's type-check.</li>
+              <li><strong>Autocomplete for your data.</strong> Your editor knows each table's columns and their types.</li>
             </ul>
           </div>
-
-          <div class="three">
-            <div class="card">
-              <div class="tag">Ingest · the dlt part</div>
-              <h3>APIs and files</h3>
-              <p>Cursor, keyset, Link-header and page pagination; CSV, JSON and Parquet, globs and URLs. Incremental with a lookback for records that change.</p>
-<pre set:html={stripeCharges} />
-              <a class="more" href="/docs/guides/ingest/">Ingests →</a>
-            </div>
-            <div class="card">
-              <div class="tag">Transform · the SQLMesh part</div>
-              <h3>SQL or TypeScript</h3>
-              <p>One SELECT per file, with checks in the header. Or TypeScript per row, such as an LLM call that is incremental and never re-bills a row.</p>
-<pre><span class="cm">-- assets/revenue_by_region.sql</span>
-<span class="cm">-- key: region</span>
-<span class="cm">-- check: revenue > 0</span>
-SELECT region,
-       count(*)    AS orders,
-       sum(amount) AS revenue
-FROM example_sales
-GROUP BY region</pre>
-              <a class="more" href="/docs/guides/sql/">SQL transforms →</a>
-            </div>
-            <div class="card">
-              <div class="tag">Keep fresh · the Dagster part</div>
-              <h3>Schedules in plain words</h3>
-              <p>One per-user OS job runs what is due. Transforms follow their inputs. The scheduler only runs code a person has run by hand.</p>
-<pre><span class="p">$</span> croft validate
-duckdb_releases: daily at 6am
-  (cron 0 6 * * *); next
-  2026-10-18 06:00,
-  2026-10-19 06:00, …
-
-<span class="p">$</span> croft schedule on</pre>
-              <a class="more" href="/docs/guides/scheduling/">Scheduling →</a>
-            </div>
+          <div class="typed-code">
+            <pre set:html={typeCode} />
+            <p class="caption">After renaming <code>revenue</code> to <code>total</code> in the SQL:</p>
+            <pre set:html={typeError} />
           </div>
         </div>
       </section>
 
       <section>
         <div class="wrap">
-          <h2>Built for the agent. Guarded for you.</h2>
-          <p class="sub">
-            Every command takes <code>--json</code>. Every problem has a stable code, a hint with the literal next
-            command, and often a fix the agent can apply as is. Anything destructive stops and waits for a person.
+          <h2>What it replaces</h2>
+          <p class="intro">A typical data stack is several tools, in Python and YAML, glued together. croft is one, in TypeScript.</p>
+          <div class="cmp-wrap">
+            <table class="cmp">
+              <thead>
+                <tr><th scope="col">Job</th><th scope="col">The usual stack</th><th scope="col" class="us">croft</th></tr>
+              </thead>
+              <tbody>
+                <tr><th scope="row">Load from APIs and files</th><td>dlt, Airbyte or custom Python scripts</td><td class="us"><code>ingest()</code> in a <code>.ts</code> file</td></tr>
+                <tr><th scope="row">Transform</th><td>dbt models (SQL and YAML)</td><td class="us">a <code>.sql</code> file, or <code>transform()</code> in TypeScript</td></tr>
+                <tr><th scope="row">Test the data</th><td>dbt tests</td><td class="us">checks that run before every save</td></tr>
+                <tr><th scope="row">Schedule and orchestrate</th><td>Dagster, Airflow or cron</td><td class="us"><code>schedule: "every hour"</code></td></tr>
+                <tr><th scope="row">Catch a broken column</th><td>when the warehouse runs the model</td><td class="us">before anything runs, from SQL into the TypeScript that reads it</td></tr>
+                <tr><th scope="row">Store</th><td>a warehouse to host and pay for</td><td class="us">one DuckDB file on your machine</td></tr>
+                <tr><th scope="row">Read from your app</th><td>a client and credentials per warehouse</td><td class="us"><code>@zabaca/croft/read</code>, typed by table</td></tr>
+                <tr><th scope="row">Language</th><td>Python, YAML and SQL</td><td class="us">TypeScript, and SQL where you want it</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="honest">
+            croft does these jobs; it does not read those tools' projects. It is built for one machine and one DuckDB
+            file. If your team already runs a warehouse with dbt, keep it.
           </p>
-          <div class="agent">
-            <div>
-              <p class="label">A typo, caught before anything runs, with the edit that fixes it</p>
-              <div class="term">
-                <div class="term-top"><i></i><i></i><i></i><span>croft validate</span></div>
-                <pre><span class="err">error UNKNOWN_COLUMN</span>  assets/revenue_by_region.sql:8:7
-      Referenced column "ammount" not found in FROM clause.
-      <span class="k">fix:</span> replace ammount with amount on line 8
+        </div>
+      </section>
 
-<span class="p">$</span> <span class="c">croft validate --json</span>
-<span class="d">…</span> "fix": {'{'}
-      "kind": "edit",
-      "file": "assets/revenue_by_region.sql",
-      "line": 8,
-      "replace": {'{'} "from": "ammount", "to": "amount" {'}'}
-    {'}'} <span class="d">…</span></pre>
-              </div>
-            </div>
-            <div>
-              <p class="label">A destructive step, stopped until the person says yes</p>
-              <div class="term">
-                <div class="term-top"><i></i><i></i><i></i><span>croft delete duckdb_releases</span></div>
-                <pre><span class="k">needs confirmation:</span> delete duckdb_releases,
-  the whole table: 64 rows
-  first: the 64 rows go to the trash
-    (croft restore duckdb_releases brings them back)
-  ask the user; if they agree:
-    croft confirm c_8ef55d    (valid 15 min)
-<span class="err">error CONFIRMATION_REQUIRED</span>  duckdb_releases
-      effect: nothing was changed
-<span class="d">exit 5</span></pre>
-              </div>
-            </div>
+      <section>
+        <div class="wrap agent">
+          <div>
+            <h2>And your agent can run it</h2>
+            <p class="intro">Tell Claude Code what you want. It writes the pipeline, and croft checks every step.</p>
+            <ul class="points">
+              <li><strong>Mistakes are caught early.</strong> croft checks each change before it runs, and tells the agent exactly what to fix.</li>
+              <li><strong>Try before it's real.</strong> Every change can be previewed first, without touching your tables.</li>
+              <li><strong>You stay in charge.</strong> Anything that could lose data stops and waits for your OK.</li>
+            </ul>
           </div>
-          <ul class="points">
-            <li><strong>A skill in every project.</strong> <code>croft init</code> writes the croft skill and a <code>CLAUDE.md</code> block, stamped with the project's pinned version.</li>
-            <li><strong>One permission rule.</strong> Every destructive path ends in <code>croft confirm</code>, so <code>"ask": ["Bash(croft confirm:*)"]</code> gates them all.</li>
-            <li><strong>A loop that touches no data.</strong> <code>validate</code> binds every SELECT against its inputs' columns without running anything; <code>preview</code> builds in a sandbox and diffs.</li>
-            <li><strong>Docs offline, and here as Markdown.</strong> <code>croft docs</code> has a page for every error code. This site serves <a href="/llms.txt">llms.txt</a> and a <code>.md</code> twin of every page.</li>
-          </ul>
+          <div class="chat" aria-label="An example conversation">
+            <div class="msg"><b>An example</b></div>
+            <div class="msg you"><b>You</b>Pull my Stripe charges in every hour and show me revenue by month.</div>
+            <div class="msg claude"><b>Claude</b>Done. stripe_charges loads every hour, and revenue_by_month is built from it. I previewed both first: 1,204 charges, 14 months.</div>
+            <div class="msg claude ask"><b>Claude</b>Turning on the hourly schedule runs it without me. Shall I?</div>
+          </div>
         </div>
       </section>
 
       <section>
         <div class="wrap">
-          <h2>Nothing implicit destroys your data.</h2>
-          <p class="sub">Ingested data may be impossible to fetch again. So croft never refetches or deletes it on its own.</p>
-          <ul class="safe">
-            <li><strong>Deleting an asset file</strong> leaves its table in place.</li>
-            <li><strong>Changing an ingest's key or cursor</strong> stops the run and asks how to go on.</li>
-            <li><strong>An API that suddenly returns nothing</strong> trips the shrink guard instead of wiping the table.</li>
-            <li><strong>Rebuilds, deletes and restores</strong> go to the trash first; <code>croft restore</code> brings them back.</li>
-            <li><strong>A half-finished edit</strong> is held by the scheduler until a person runs it once.</li>
-            <li><strong>A crash, even <code>kill -9</code></strong>, never leaves half a write. Cursors move only on commit.</li>
-          </ul>
-        </div>
-      </section>
-
-      <section>
-        <div class="wrap">
-          <h2>Three tools' jobs, in one CLI.</h2>
-          <p class="sub">For people who are not data engineers and who build with an agent. No compatibility with their formats, and no jargon to learn.</p>
-          <div class="stack">
-            <div><div class="was">dlt</div><div class="now">ingest()</div><p>APIs and files into typed tables, incremental, with schema changes handled.</p></div>
-            <div><div class="was">SQLMesh</div><div class="now">.sql and transform()</div><p>Transforms with checks, rebuilt when their code or inputs change.</p></div>
-            <div><div class="was">Dagster</div><div class="now">schedule: "every hour"</div><p>A schedule in plain words, and transforms that follow their inputs.</p></div>
+          <h2>Your data stays safe</h2>
+          <p class="intro">Some data can't be fetched again. croft never throws it away on its own.</p>
+          <div class="facts">
+            <div><h3>Nothing half-saved</h3><p>Each update is saved whole or not at all, and a failed check keeps the old data.</p></div>
+            <div><h3>A trash you can undo</h3><p>Anything replaced or deleted goes to the trash first, and comes back with one command.</p></div>
+            <div><h3>On your machine</h3><p>One file on your computer. No account, no server, no cloud to pay for.</p></div>
           </div>
-          <p class="nots">Everything else is Bun and one DuckDB library. <code>bun.lock</code> is the whole environment.</p>
         </div>
       </section>
 
       <section class="end">
         <div class="wrap">
-          <h2>Five minutes to a first pipeline.</h2>
+          <h2>Try it in five minutes</h2>
+          <p class="intro" style="margin-inline: auto">Install it, then follow the Quickstart.</p>
           <div class="install">
-            <code id="install-2">bun add -g @zabaca/croft &amp;&amp; croft init my-data</code>
-            <button class="copy" type="button" data-copy="install-2">Copy</button>
+            <code id="install">bun add -g @zabaca/croft</code>
+            <button class="copy" type="button" data-copy="install">Copy</button>
           </div>
           <div class="ctas">
-            <a class="btn primary" href="/docs/quickstart/">Follow the Quickstart →</a>
-            <a class="btn ghost" href="/docs/agents/">With Claude Code</a>
+            <a class="btn primary" href="/docs/quickstart/">Open the Quickstart</a>
           </div>
+          <p class="fine">Needs <a href="https://bun.sh">Bun</a>.</p>
         </div>
       </section>
     </main>
@@ -436,11 +384,11 @@ duckdb_releases: daily at 6am
     <footer>
       <div class="wrap">
         <span>croft {version.version} · MIT · by <a href="https://zabaca.com">Zabaca</a></span>
-        <span class="links">
+        <span>
           <a href="/docs/">Docs</a>
-          <a href="https://www.npmjs.com/package/@zabaca/croft">npm</a>
           <a href="https://github.com/Zabaca/croft">GitHub</a>
-          <a href="/llms.txt">For agents: llms.txt</a>
+          <a href="https://www.npmjs.com/package/@zabaca/croft">npm</a>
+          <a href="/llms.txt">For AI agents</a>
         </span>
       </div>
     </footer>
