@@ -36,7 +36,12 @@
 //   renamed         a file renamed outside croft (ASSET_RENAMED, plan.ts) never runs: named, its step fails before
 //                   it runs; otherwise it is skipped with the problem. next leads with `croft rename <old> <new>`
 //   retries         2 by default, after 30 s and 2 min (or the server's longer Retry-After, up to 5 min), for
-//                   retryable errors only
+//                   retryable errors only. A longer wait (a Retry-After, or a spent request budget: HTTP_BUDGET_SPENT)
+//                   ends the step with nextRetryAt
+//   budgets         each step's ctx.http takes its requests from croft.json's http.budgets, counted in runs.sqlite
+//                   across runs (http/budget.ts, D104)
+//   known waits     a run by hand holds an asset whose latest step was told to wait and whose wait is not over
+//                   (HTTP_WAIT, schedule/due.ts knownWaits, D105): skipped with the warning, its readers going ahead
 //   no progress     no row yielded and no request completed for `timeout` (10 min) → TIMEOUT
 //   signals         the caller's AbortSignal (SIGINT/SIGTERM): the step is interrupted, its transaction
 //                   discarded, the run marked interrupted, exit 130
@@ -75,6 +80,7 @@ import { acquire, release, tryAcquire } from "../history/leases.ts";
 import { logDir, logPath, NOT_STARTED_RECORD, openLog, type LogWriter, writeRunRecord } from "../history/logs.ts";
 import { reconcile } from "../history/reconcile.ts";
 import { RunsDb, type RunStatus, type RunTrigger } from "../history/runs-db.ts";
+import { requestBudget } from "../http/budget.ts";
 import type { HttpOptions } from "../http/http.ts";
 import { holderText, staticSecrets } from "../cli/commands/describe.ts";
 import { redactProblem } from "../cli/render.ts";
@@ -83,7 +89,7 @@ import type { CheckHookResult, WriteBatchInput } from "../load/write.ts";
 import { outsideCapture, setOutputRedactor } from "../core/output.ts";
 import { formatInstant, now as clockNow } from "../core/time.ts";
 import { refreshReadCopy } from "../db/readcopy.ts";
-import { scheduleHeld } from "../schedule/due.ts";
+import { planWaits, scheduleHeld } from "../schedule/due.ts";
 import { notifyScheduledFailure, type ScheduledFailure } from "../schedule/notify.ts";
 import { discoverAssets } from "../project/discover.ts";
 import { tsFingerprint } from "../project/ts-asset.ts";
@@ -109,9 +115,10 @@ export const RETRY_DELAYS_MS: readonly number[] = [30_000, 120_000];
  *  nextRetryAt (like ctx.http's maxRetryAfterMs inside one attempt). */
 export const RETRY_WAIT_LIMIT_MS = 300_000;
 
-/** The wait a failed request's server asked for (HTTP_ERROR details.retryAfterMs), or null. */
+/** The wait a failed request's server asked for (HTTP_ERROR details.retryAfterMs), or the time until a spent request
+ *  budget frees (HTTP_BUDGET_SPENT, D104: a Retry-After croft gives itself), or null. */
 export function retryAfterOf(p: Problem): number | null {
-  const v = p.code === "HTTP_ERROR" ? p.details?.retryAfterMs : undefined;
+  const v = p.code === "HTTP_ERROR" || p.code === "HTTP_BUDGET_SPENT" ? p.details?.retryAfterMs : undefined;
   return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
 }
 
@@ -495,7 +502,9 @@ function nextSteps(steps: StepResult[], problems: Problem[], deferred: ReadonlyM
     if (isRetryable(s.error)) {
       next.push({
         command: `croft run ${s.asset}`,
-        reason: s.nextRetryAt ? `the API asks to wait; run it again after ${s.nextRetryAt}` : "the error is temporary; run it again later",
+        reason: !s.nextRetryAt ? "the error is temporary; run it again later"
+          : s.error.code === "HTTP_BUDGET_SPENT" ? `its request budget frees at ${s.nextRetryAt}; run it again after that`
+          : `the API asks to wait; run it again after ${s.nextRetryAt}`,
       });
     }
   }
@@ -521,7 +530,7 @@ function nextSteps(steps: StepResult[], problems: Problem[], deferred: ReadonlyM
 }
 
 /** Codes whose warning a held step carries (the plan's --due holds). */
-const HOLD_CODES: ReadonlySet<string> = new Set(["SCHEDULE_HELD", "LARGE_REPROCESS"]);
+const HOLD_CODES: ReadonlySet<string> = new Set(["SCHEDULE_HELD", "LARGE_REPROCESS", "HTTP_WAIT"]);
 
 /** Why a held step does not run (PlannedStep.hold). */
 const HOLD_WORDS: Record<Hold, string> = {
@@ -529,6 +538,7 @@ const HOLD_WORDS: Record<Hold, string> = {
   large_reprocess: "held: it would process too many input rows without a person's yes (LARGE_REPROCESS)",
   paused: "held: scheduling is paused",
   leased: "held: another run holds it",
+  retry_after: "held: the API asked to wait (HTTP_WAIT)",
 };
 
 /** The reasons a planner gives only because the asset looked stale; the runner re-checks them. */
@@ -634,7 +644,11 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
     try {
       // --only and --upstream are the planner's; they go through as they are (plan.ts PlanInput).
       const narrowing = { ...(o.only ? { only: true } : {}), ...(o.upstream ? { upstream: true } : {}), ...(o.rebuild ? { rebuild: true } : {}) };
-      plan = o.plan ?? await planRun({ root: project.root, timezone: project.timezone, selectors: o.selectors, cursorTypes: cursorTypes(runs), ...narrowing });
+      // A run by hand holds an asset inside a known wait (D105); a scheduled run is handed the plan with its own holds.
+      plan = o.plan ?? await planRun({
+        root: project.root, timezone: project.timezone, selectors: o.selectors, cursorTypes: cursorTypes(runs), ...narrowing,
+        ...(scheduled ? {} : { waits: planWaits(runs, project, clock()) }),
+      });
       checkRunFlags(plan, o);
       plan = await withProjectChecks(plan, project, env);
       // No file-ingest directories in the sandbox: extractFiles snapshots every file into the state folder, and
@@ -842,9 +856,11 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
             }
           }
           if (!out) {
+            // croft.json's per-host request budgets, counted in this runs.sqlite across runs (D104).
+            const budget = requestBudget(runs, project.config.http.budgets, { runId, asset });
             const input: StepInput = {
               step, project, env, warehouse: warehouse!, runs, runId, attempt, maxAttempts, signal, progress, log,
-              ...withChecks(step, previous), ...withReadBy(step, getCatalog(runs, asset)),
+              ...(budget ? { budget } : {}), ...withChecks(step, previous), ...withReadBy(step, getCatalog(runs, asset)),
               ...(o.http ? { http: o.http } : {}), ...(o.fault ? { fault: o.fault } : {}), ...(o.now ? { now: o.now } : {}),
             };
             if (step.kind === "sql") {
@@ -1012,7 +1028,9 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
             : `held: run ${leasedBy.get(asset)} holds it; it stays due`;
           skipped(step, held);
           if (hp) problems.push({ ...hp, asset: hp.asset ?? asset, runId });
-          return `input ${asset} is ${held}`;
+          // A known wait (D105) keeps the asset's table as it is, which is what its readers read anyway; every other
+          // hold stops them, since the held code may change what they would read.
+          return step.hold === "retry_after" ? null : `input ${asset} is ${held}`;
         }
         const errors = loadErrors(step);
         if (errors.length > 0) {

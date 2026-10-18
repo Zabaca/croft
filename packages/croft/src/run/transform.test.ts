@@ -874,6 +874,40 @@ export default transform({
   });
 });
 
+describe("ctx.http in a transform (D103)", () => {
+  test("head(), getBytes() and okStatus work as in an ingest, and each counts as a request of the step", async () => {
+    const server = Bun.serve({
+      port: 0, hostname: "127.0.0.1",
+      fetch(req) {
+        if (new URL(req.url).pathname === "/missing") return new Response("no such case", { status: 404 });
+        return new Response(new Uint8Array([0xff, 0x00, 0x01]), { headers: { etag: '"e1"' } });
+      },
+    });
+    servers.push(server);
+    const api = `http://127.0.0.1:${server.port}`;
+    const h = harness({
+      "assets/t.ts": `import { transform } from "@zabaca/croft";
+export default transform({
+  inputs: ["issues"],
+  key: "issue_id",
+  async *rows({ rows, http }) {
+    for await (const r of rows<{ id: number }>("issues")) {
+      const head = await http.head("${api}/file.pdf");
+      const file = await http.getBytes("${api}/file.pdf");
+      const gone = await http.get("${api}/missing", { okStatus: [404] });
+      yield { issue_id: r.id, etag: head.headers.get("etag"), size: file.bytes.byteLength, gone: gone.status };
+    }
+  },
+});
+`,
+    });
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1], S1) });
+    const out = await step(h, await plan(h, "t"));
+    expect(out.result.requests).toBe(3);
+    expect(await all(h, `SELECT issue_id::INTEGER AS id, etag, size::INTEGER AS size, gone::INTEGER AS gone FROM t`)).toEqual([{ id: 1, etag: '"e1"', size: 3, gone: 404 }]);
+  });
+});
+
 describe("a failed chunk is not paid for twice", () => {
   function counter(): { url: string; calls: () => number } {
     let calls = 0;

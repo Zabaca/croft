@@ -90,14 +90,21 @@ export interface HttpInit {
   headers?: Record<string, string>;
   query?: Record<string, string | number | boolean | null | undefined>;   // null/undefined omitted
   retries?: number; timeoutMs?: number;
+  // Statuses of 400 and above the code handles itself, returned as a response instead of thrown: { okStatus: [404] }
+  // for "does this exist". Never retried. An unlisted 429 or 5xx is still retried and thrown (D103).
+  okStatus?: number[];
 }
 export interface HttpResponse {
   status: number; url: string; headers: Headers; text: string;
   json<T = unknown>(): T;                    // lossless: unsafe integers → bigint
   next?: string;                             // rel="next" from the Link header
 }
+/** getBytes(): the body as raw bytes; `text` decodes them as UTF-8 only when read. */
+export interface HttpBytesResponse extends HttpResponse { bytes: Uint8Array }
 export interface Http {
   get(url: string, init?: HttpInit): Promise<HttpResponse>;
   post(url: string, body: unknown, init?: HttpInit): Promise<HttpResponse>;
+  head(url: string, init?: HttpInit): Promise<HttpResponse>;              // status and headers; text is ""
+  getBytes(url: string, init?: HttpInit): Promise<HttpBytesResponse>;     // PDFs, images, gzip: bytes, not text
 }
 export interface AssetDefinition { readonly __croft: "ingest" | "transform"; readonly config: RowsIngest | FileIngest | TransformConfig }

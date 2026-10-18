@@ -15,7 +15,7 @@ export interface Check { source: string; kind: "unique" | "not_null" | "min_rows
 // not import (src/read.ts's declarations are type-checked against this file without them).
 export type Reason = "requested" | "schedule_due" | "never_built" | "code_changed" | "input_changed"
   | "input_replaced" | "rebuild" | "backfill";
-export type Hold = "code_not_run_by_hand" | "large_reprocess" | "paused" | "leased";
+export type Hold = "code_not_run_by_hand" | "large_reprocess" | "paused" | "leased" | "retry_after";
 export interface PlanStep { asset: string; action: "fetch" | "rebuild" | "update" | "skip";
   reasons: Reason[]; hold?: Hold; window?: { sinceValue: string | number; sinceType: CursorType };
   confirmation?: Impact }

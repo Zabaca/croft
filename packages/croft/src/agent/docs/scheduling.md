@@ -49,6 +49,9 @@ user), a pause, and an asset another run holds.
   30 s and 2 min. Deterministic errors (HTTP 4xx, TYPE_CONFLICT, CHECK_FAILED, SQL errors) are not retried.
 - A failed ingest waits for its next fire. A failed transform waits for a change to its code or inputs (15
   minutes after a retryable failure). Nothing is retried every minute.
+- When the API said when to come back (a long Retry-After, or a request budget in croft.json that is spent:
+  HTTP_BUDGET_SPENT), a fire inside that wait stays due and runs once it is over; croft run <asset> by hand is
+  held until then too (HTTP_WAIT).
 - A desktop notification names the project, the asset and the error, unless croft.json says
   "notify": {"desktop": false}. "notify": {"webhook": "https://..."} also posts the failure envelope (what
   croft run --json prints, with .env values redacted) to that URL. .croft/logs/notify.log says why a

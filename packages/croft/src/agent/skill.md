@@ -45,6 +45,10 @@ croft status                # failed, stale, held, never run, edited since its l
   (`croft new api x --pagination cursor`).
 - Records that change after creation (payments, refunds, orders, tickets) need an updated-since field or a
   lookback: incremental: { field: "created", unit: "s", lookback: "30 days" }. Epoch cursors need `unit`.
+- A status the code expects (a 404 for "not there"): `http.get(url, { okStatus: [404] })`, never
+  `.catch(() => null)`, which also hides 429s and outages. Bytes (PDFs, images): `http.getBytes(url)`.
+- An API with a stated quota (so many requests an hour or a day): ask the user to put it in croft.json
+  `"http": {"budgets": {"<host>": {"perHour": 50}}}`. HTTP_WAIT or HTTP_BUDGET_SPENT: wait until the time it gives.
 
 ## Ask the user first (show the printed impact; wait for an explicit yes in this conversation)
 - `croft confirm <token>` (every destructive action ends here: rebuild of an ingest or incremental TS transform,

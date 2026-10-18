@@ -55,7 +55,9 @@ export default transform({
 An SDK works as well as ctx.http (openai, @anthropic-ai/sdk and others; create the client inside rows() with
 the key from secret()). croft detects requests either way and applies the cost guard below. ctx.http retries
 network errors, 429 and 5xx, honors Retry-After, redacts secrets from its errors, and res.json() keeps big
-integers exact.
+integers exact. An API that allows so many requests an hour or a day gets a budget in croft.json, which ctx.http
+keeps across runs: "http": {"budgets": {"api.example.com": {"perHour": 50, "perDay": 125}}} (croft docs
+HTTP_BUDGET_SPENT). A budget counts ctx.http's requests only, not an SDK's.
 
 ## Per row, without requests
 
@@ -124,8 +126,9 @@ export default transform({
 - rows(name): every row of an input, streamed. newRows(name): in an incremental transform, the input's rows it
   has not processed yet (all of them on the first run); in a full-refresh one, the same as rows(name).
 - query(sql, ...params): one SELECT over the declared inputs, e.g. a lookup or an aggregate; $1, $2 are params.
-- http.get / http.post, secret("NAME") (names listed in secrets only), log(...) to the step's log (croft logs
-  <name>), signal (aborted on timeout or Ctrl-C), and preview (true under croft preview).
+- http.get / http.post / http.head / http.getBytes, as in an ingest (croft docs ingest: okStatus, bytes, 304s),
+  secret("NAME") (names listed in secrets only), log(...) to the step's log (croft logs <name>), signal (aborted
+  on timeout or Ctrl-C), and preview (true under croft preview).
 - Only the inputs can be read: any other table in rows(), newRows() or query() is UNDECLARED_INPUT, and so is
   the transform's own table. Asset code never opens the database itself (ASSET_OPENS_DATABASE): no
   @duckdb/node-api, no @zabaca/croft/read.

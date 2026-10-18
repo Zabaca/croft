@@ -34,6 +34,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   confirmations: ["token", "command", "impact", "impact_hash", "created_at", "expires_at", "used_at"],
   catalog: ["asset", "json", "source", "refreshed_at"],
   settings: ["key", "value"],
+  http_requests: ["host", "at", "run_id", "asset"],
 };
 
 describe("schema", () => {
@@ -224,6 +225,30 @@ describe("steps", () => {
     expect(db.latestStep("orders")).toMatchObject({ runId: r1.id, attempt: 2, status: "ok" });
     expect(db.latestStep("orders", { failed: true })).toMatchObject({ runId: r1.id, attempt: 1, status: "failed" });
     expect(db.latestStep("nothing")).toBeNull();
+  });
+
+  test("latestSteps: latestStep of every asset", () => {
+    const r1 = db.createRun({ trigger: "manual", human: true, argv: [] });
+    db.startStep({ runId: r1.id, asset: "orders", attempt: 1, reason: "requested" });
+    db.finishStep(r1.id, "orders", 1, { status: "failed" });
+    clock += 1000;
+    db.startStep({ runId: r1.id, asset: "orders", attempt: 2, reason: "requested" });
+    db.startStep({ runId: r1.id, asset: "zones", attempt: 1, reason: "requested" });
+    expect(db.latestSteps().map((s) => [s.asset, s.attempt])).toEqual([["orders", 2], ["zones", 1]]);
+  });
+
+  test("http_requests: requests to a host after a time, oldest first; a host's rows past `forget` are dropped as it records", () => {
+    const who = { runId: "r_0922_1700_abcd", asset: "orders" };
+    db.recordRequest("api.example.com", who, "2026-09-21T17:00:00.000Z");
+    clock += 60_000;
+    db.recordRequest("api.example.com", who, "2026-09-21T17:01:00.000Z");
+    db.recordRequest("other.example.com", who, "2026-09-21T17:01:00.000Z");
+    expect(db.requestTimes("api.example.com", "2026-09-22T16:00:00.000Z")).toEqual(["2026-09-22T17:00:00.000Z", "2026-09-22T17:01:00.000Z"]);
+    expect(db.requestTimes("api.example.com", "2026-09-22T17:00:00.000Z")).toEqual(["2026-09-22T17:01:00.000Z"]);
+    clock += 86_400_000;
+    db.recordRequest("api.example.com", who, "2026-09-22T17:00:30.000Z");
+    expect(db.requestTimes("api.example.com", "1970-01-01T00:00:00.000Z")).toEqual(["2026-09-22T17:01:00.000Z", "2026-09-23T17:01:00.000Z"]);
+    expect(db.requestTimes("other.example.com", "1970-01-01T00:00:00.000Z")).toHaveLength(1);
   });
 
   test("lastCheckSources: the checks the asset's last ok step ran, from its run's summary; null when unknown", () => {

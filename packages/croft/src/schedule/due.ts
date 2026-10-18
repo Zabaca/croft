@@ -28,6 +28,9 @@
 //     ASSET_INVALID: not retryable) waits for a change to its code or inputs; a retryable one (after its own
 //     retries), a crash or an interruption waits RETRY_BACKOFF_MS, or the server's longer Retry-After. Never every
 //     minute. An ingest needs none of this: it is due again only at its next fire;
+//   - an ingest whose fire comes inside a known wait (knownWait, D105): its latest step failed with a server's
+//     Retry-After that has not passed, or with HTTP_BUDGET_SPENT while its host's budget is still spent. It stays
+//     due and runs once the wait is over;
 //   - a transform whose last step was skipped for an input that is still held (any of the above, SCHEDULE_HELD
 //     included, or failed and backed off) and has not changed since: a run would only skip it again. It waits for
 //     that input, and is due again once the input changes or is released.
@@ -60,8 +63,9 @@ import { zonedParts } from "../core/time.ts";
 import type { AssetKind, Hold, Incremental, Problem, Reason } from "../core/types.ts";
 import type { CatalogAsset } from "../history/catalog.ts";
 import { RUNS_DB_FILE, RunsDb, type ScheduleStateRow, type StepRecord } from "../history/runs-db.ts";
+import { budgetState } from "../http/budget.ts";
 import type { ResolvedAsset } from "../project/resolve.ts";
-import { loadProject, type Project } from "../project/root.ts";
+import { type HostBudget, loadProject, type Project } from "../project/root.ts";
 import { deletedByCroft } from "../safety/trash.ts";
 import type { DuePlanning, StepKind } from "../run/plan.ts";
 import { staleReasons } from "../run/staleness.ts";
@@ -819,6 +823,93 @@ export function clockWords(at: Date, timezone: string, now: Date): string {
   return p.year === n.year && p.month === n.month && p.day === n.day ? clock : `${MONTHS[p.month - 1]} ${p.day} ${clock}`;
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// Known waits (D105): an asset whose next request the API, or the project's request budget, has said must wait
+
+/** "Not before `until`" for an asset's next request: its latest step failed with a server's Retry-After
+ *  (HTTP_ERROR details.retryAfterMs, from when the step ended), or with HTTP_BUDGET_SPENT while its host's budget is
+ *  still spent now (asked again, so a budget raised in croft.json, or one freed since, ends the wait). */
+export interface KnownWait {
+  until: string;
+  code: "HTTP_ERROR" | "HTTP_BUDGET_SPENT";
+  runId: string;
+  /** HTTP_ERROR: the status that asked to wait (429, 503). */
+  status: number | null;
+  /** HTTP_BUDGET_SPENT: the host whose budget is spent. */
+  host: string | null;
+}
+
+/** The wait the step left, or null: none, or over by `now`. Only a failed step leaves one. */
+export function knownWait(step: StepRecord | null, o: { runs: RunsDb; budgets: Readonly<Record<string, HostBudget>>; now: Date }): KnownWait | null {
+  const e = step?.status === "failed" ? step.error : null;
+  if (!step || !e) return null;
+  if (e.code === "HTTP_ERROR") {
+    const asked = Number(e.details?.retryAfterMs);
+    if (!Number.isFinite(asked) || asked <= 0) return null;
+    const until = Date.parse(step.finishedAt ?? step.startedAt) + asked;
+    if (!(until > o.now.getTime())) return null;
+    const status = Number(e.details?.status);
+    return { until: new Date(until).toISOString(), code: "HTTP_ERROR", runId: step.runId, status: Number.isFinite(status) ? status : null, host: null };
+  }
+  if (e.code === "HTTP_BUDGET_SPENT") {
+    const host = typeof e.details?.host === "string" ? e.details.host : null;
+    const budget = host !== null && Object.hasOwn(o.budgets, host) ? o.budgets[host]! : null;
+    const spent = budget ? budgetState(o.runs, host!, budget) : null;
+    if (!spent) return null;
+    return { until: spent.freeAt, code: "HTTP_BUDGET_SPENT", runId: step.runId, status: null, host };
+  }
+  return null;
+}
+
+/** Every asset's known wait, from the latest step of each in runs.sqlite: a run by hand holds these (D105). */
+export function knownWaits(runs: RunsDb, budgets: Readonly<Record<string, HostBudget>>, now: Date): Map<string, KnownWait> {
+  const out = new Map<string, KnownWait>();
+  for (const s of runs.latestSteps()) {
+    const w = knownWait(s, { runs, budgets, now });
+    if (w) out.set(s.asset, w);
+  }
+  return out;
+}
+
+/** run/plan.ts PlanInput.waits for a run by hand, read from runs.sqlite once (D105). */
+export function planWaits(runs: RunsDb, project: Pick<Project, "timezone" | "config">, now: Date): (asset: string, file: string) => { reason: string; problem: Problem } | null {
+  const waits = knownWaits(runs, project.config.http.budgets, now);
+  return (asset, file) => {
+    const w = waits.get(asset);
+    return w ? waitHeld(asset, file, w, project.timezone, now) : null;
+  };
+}
+
+/** planWaits from the project's runs.sqlite, which is never created here (a project that never ran has none). */
+export function readPlanWaits(project: Pick<Project, "timezone" | "config" | "paths">, now: Date): ReturnType<typeof planWaits> {
+  if (!existsSync(join(project.paths.stateDir, RUNS_DB_FILE))) return () => null;
+  const runs = RunsDb.open(project.paths.stateDir, { now: () => now });
+  try {
+    return planWaits(runs, project, now);
+  } finally {
+    runs.close();
+  }
+}
+
+/** HTTP_WAIT: the step is held, not run, until the wait is over. `reason` is the held step's, after "held: ". */
+export function waitHeld(asset: string, file: string, w: KnownWait, timezone: string, now: Date): { reason: string; problem: Problem } {
+  const at = clockWords(new Date(w.until), timezone, now);
+  const asked = w.code === "HTTP_BUDGET_SPENT"
+    ? `the request budget for ${w.host} in croft.json is spent until ${at}`
+    : `the API answered ${w.status ?? "with an error"} in run ${w.runId} and asked to wait until ${at}`;
+  const p = problem("HTTP_WAIT", {
+    asset, file,
+    message: `${asset} is held: ${asked}; running it now would only spend a request on the same answer`,
+    hint: w.code === "HTTP_BUDGET_SPENT"
+      ? `run it after ${at} (croft run ${asset}); if the API allows more, raise http.budgets.${w.host} in croft.json`
+      : `run it after ${at}: croft run ${asset}`,
+    effect: "the step did not run; its table and saved position are as they were",
+    fix: { kind: "manual", description: `wait until ${at}, then croft run ${asset}` },
+    details: { until: w.until, code: w.code, runId: w.runId, status: w.status, host: w.host },
+  });
+  return { reason: `${asked}; croft run ${asset} after that`, problem: { ...p, severity: "warning" } };
+}
+
 /** SCHEDULE_HELD (§6): the asset's code is not the code a human last ran. The reason is what status shows. A hash
  *  that moved only with croft.json's timezone is said as such (§8), not as an edit. */
 export function scheduleHeld(o: {
@@ -1018,6 +1109,7 @@ export async function dueWork(i: DueInput): Promise<DueWork> {
       project, now, scheduling, approved: h.state?.approvedCodeHash ?? null, leasedBy: leased.get(f.asset) ?? null,
       startingRun: starting.get(f.asset) ?? null, failedStart: failedStartOf(f.asset, h.lastOk), primaryDue: due.has(f.asset),
       inputs: transform ? inputsOf(f) : [], entry, deleted: runs ? deletedByCroft(runs, f.asset) : false,
+      wait: runs && !transform ? knownWait(h.latest, { runs, budgets: project.config.http.budgets, now }) : null,
     });
     if (hold) holds.set(f.asset, hold);
     view.held = hold;
@@ -1111,6 +1203,8 @@ interface HoldContext {
   entry: (name: string) => CatalogAsset | null;
   /** croft delete removed its table (deletedByCroft). */
   deleted: boolean;
+  /** An ingest's known wait (knownWait), or null. */
+  wait: KnownWait | null;
 }
 
 /** The first hold that applies (see the top of this file), or null. Waiting for an input comes after (dueWork). */
@@ -1135,6 +1229,12 @@ function holdOf(f: AssetFacts, h: History, c: HoldContext): { code: HoldCode; re
   if (c.failedStart && (c.primaryDue || f.kind !== "ingest")) {
     const until = clockWords(new Date(Date.parse(c.failedStart.at) + RETRY_BACKOFF_MS), c.project.timezone, c.now);
     return { code: "backoff", reason: `the scheduled run ${c.failedStart.runId} did not start it (${c.failedStart.reason}); tries again after ${until}` };
+  }
+  // An ingest is due again only at its next fire, whatever failed; one whose fire comes inside a wait the API (or
+  // the request budget) set waits it out, still due, rather than spend a request on the same answer (D105).
+  if (c.primaryDue && f.kind === "ingest" && c.wait) {
+    const words = c.wait.code === "HTTP_BUDGET_SPENT" ? `the request budget for ${c.wait.host} is spent` : `the API asked to wait (${c.wait.status ?? "HTTP_ERROR"})`;
+    return { code: "backoff", reason: `${words}; tries again after ${clockWords(new Date(c.wait.until), c.project.timezone, c.now)}` };
   }
   if (!c.primaryDue || f.kind === "ingest") return null;
   return backoff(f, h, c);
@@ -1308,6 +1408,14 @@ export function duePlanning(o: { project: Project; runs: RunsDb; now: Date; fire
             hold: "large_reprocess" as Hold, reason: "held: the cost guard needs a person (LARGE_REPROCESS)",
             problem: { ...r, severity: "warning" as const, asset: step.asset },
           };
+        }
+      }
+      // An ingest inside a wait the API or the request budget set (D105): held, still due, as the tick's view says.
+      if (step.kind === "rows" || step.kind === "file") {
+        const w = knownWait(runs.latestStep(step.asset), { runs, budgets: project.config.http.budgets, now });
+        if (w) {
+          const h = waitHeld(step.asset, step.file, w, project.timezone, now);
+          return { hold: "retry_after" as Hold, reason: `held: ${h.reason}`, problem: h.problem };
         }
       }
       const lease = runs.sqlite.query("SELECT run_id, pid, proc_start, boot_id FROM leases WHERE asset = ?").get(step.asset) as

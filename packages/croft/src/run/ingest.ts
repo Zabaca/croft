@@ -354,20 +354,26 @@ export function trackedHttp(http: HttpClient, progress: StepProgress, redact: (t
   return {
     get: wrap("GET", (url, init) => http.get(url, init)),
     post: wrap("POST", (url, body, init) => http.post(url, body, init)),
-    // File downloads: counted like any request, but the body (a whole file, maybe binary) is not previewed.
-    getBytes: async (url, init) => {
-      try {
-        const res = await http.getBytes(url, init);
-        progress.request({ status: res.status, label: redact(`GET ${displayUrl(res.url)}`) });
-        return res;
-      } catch (e) {
-        const d = croftError(e)?.problem.details;
-        progress.request({ ...(typeof d?.status === "number" ? { status: d.status } : {}), label: redact(`GET ${String(d?.url ?? url)}`) });
-        throw e;
-      }
-    },
+    head: wrap("HEAD", (url, init) => http.head(url, init)),
+    getBytes: bytesTracked(http, progress, redact),
     get requests() { return http.requests; },
     get attempts() { return http.attempts; },
+  };
+}
+
+/** getBytes() with the step's counters: a download (a file ingest's, or the code's own PDF) counts like any request,
+ *  but its body, a whole file and maybe binary, is not previewed. */
+export function bytesTracked(http: Pick<HttpClient, "getBytes">, progress: StepProgress, redact: (text: string) => string): HttpClient["getBytes"] {
+  return async (url, init) => {
+    try {
+      const res = await http.getBytes(url, init);
+      progress.request({ status: res.status, label: redact(`GET ${displayUrl(res.url)}`) });
+      return res;
+    } catch (e) {
+      const d = croftError(e)?.problem.details;
+      progress.request({ ...(typeof d?.status === "number" ? { status: d.status } : {}), label: redact(`GET ${String(d?.url ?? url)}`) });
+      throw e;
+    }
   };
 }
 
@@ -599,7 +605,7 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
 
   // 3. Extract, with no database lock.
   const http = trackedHttp(createHttp({
-    ...i.http, signal, redact: (t) => i.env.redact(t), log: (line) => log.write(line),
+    ...i.http, signal, redact: (t) => i.env.redact(t), log: (line) => log.write(line), ...(i.budget ? { budget: i.budget } : {}),
   }), progress, (t) => i.env.redact(t));
   const own = new OwnTableQuery({ warehouse, asset, dir: stageDir, stateDir, timezone: project.timezone, signal, ...(fresh ? { absent: true } : {}) });
   let manifest: Awaited<ReturnType<typeof writeStage>> | null = null;
@@ -711,7 +717,7 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
     }));
   } catch (e) {
     const err = signal.aborted ? abortReason(signal, asset) : stageFailure(e, step, project.root);
-    if (err.code === "HTTP_ERROR") err.problem.details = { ...err.problem.details, rowsBeforeError: progress.rows };
+    if (err.code === "HTTP_ERROR" || err.code === "HTTP_BUDGET_SPENT") err.problem.details = { ...err.problem.details, rowsBeforeError: progress.rows };
     throw parts?.saved(err) ?? err;
   } finally {
     own.close();

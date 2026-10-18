@@ -56,7 +56,7 @@ import { MANIFEST_FILE, readStageManifest, type StageManifestFile, writeStage } 
 import type { KnownColumn } from "../load/types.ts";
 import { type CheckContext, type InputPosition, writeBatch, type WriteResult } from "../load/write.ts";
 import { readStoredColumns } from "../safety/guards.ts";
-import { codeError, createdTable, croftError, FAIRNESS_YIELD_MS, fault, jsonKeys, type StepProgress, toKnown } from "./ingest.ts";
+import { bytesTracked, codeError, createdTable, croftError, FAIRNESS_YIELD_MS, fault, jsonKeys, type StepProgress, toKnown } from "./ingest.ts";
 import { stepAborted, TransformInputs } from "./inputs.ts";
 import type { PlannedStep } from "./plan.ts";
 import { countAfter, type InputFacts, type InputSnapshot, readInputFacts, type SeenPosition } from "./snapshot.ts";
@@ -227,8 +227,9 @@ export async function runTransform(i: StepInput): Promise<StepOutcome> {
     ...(chunked ? { onRequest: (): Promise<void> => chunk.request(() => inputs.chunkPositions()) } : {}),
     ...(guard ? { onNewInput: (input: string, snap: InputSnapshot) => countLate(guard!, step, input, snap, !i.confirm) } : {}),
   });
-  const http = trackedHttp(createHttp({ ...i.http, signal: ctxSignal, redact: (t) => i.env.redact(t), log: (line) => log.write(line) }),
-    progress, (t) => i.env.redact(t));
+  const http = trackedHttp(createHttp({
+    ...i.http, signal: ctxSignal, redact: (t) => i.env.redact(t), log: (line) => log.write(line), ...(i.budget ? { budget: i.budget } : {}),
+  }), progress, (t) => i.env.redact(t));
   const output: OutputSink = { write: (text) => (log.closed ? writeStderr(i.env.redact(text)) : log.write(text)) };
   const ctx: TransformContext = Object.freeze({
     asset, runId, preview: i.preview !== undefined, signal: ctxSignal, http,
@@ -778,7 +779,10 @@ function trackedHttp(http: HttpClient, progress: StepProgress, redact: (text: st
         throw e;
       }
     };
-  return { get: wrap("GET", (url, init) => http.get(url, init)), post: wrap("POST", (url, body, init) => http.post(url, body, init)) };
+  return {
+    get: wrap("GET", (url, init) => http.get(url, init)), post: wrap("POST", (url, body, init) => http.post(url, body, init)),
+    head: wrap("HEAD", (url, init) => http.head(url, init)), getBytes: bytesTracked(http, progress, redact),
+  };
 }
 
 // ---------------------------------------------------------------------------------------------------------

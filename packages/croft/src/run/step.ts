@@ -13,6 +13,7 @@ import type { ConfirmAction, Confirmation, Impact, Problem } from "../core/types
 import type { DuckWarehouse } from "../db/warehouse.ts";
 import type { LogWriter } from "../history/logs.ts";
 import type { RunsDb } from "../history/runs-db.ts";
+import type { RequestBudget } from "../http/budget.ts";
 import type { HttpOptions } from "../http/http.ts";
 import type { WriteBatchInput } from "../load/write.ts";
 import type { ProjectEnv } from "../project/env.ts";
@@ -47,6 +48,9 @@ export interface StepInput {
   preview?: { rows: number };
   /** HTTP settings for ctx.http (tests shorten retries); the signal, redaction and log are the step's own. */
   http?: Partial<Omit<HttpOptions, "signal" | "redact" | "log">>;
+  /** The step's share of croft.json's per-host request budgets (http/budget.ts, D104), over the live runs.sqlite
+   *  in a preview too: a preview's requests are real. Absent: no budgets. */
+  budget?: RequestBudget;
   /** CROFT_FAULT: kill the process at this named point (crash tests). */
   fault?: string;
   /** The clock for stamps; default core/time now() (CROFT_NOW freezes it). */

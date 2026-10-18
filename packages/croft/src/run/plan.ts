@@ -30,6 +30,10 @@
 // every input row again (action rebuild), and an SQL or full-refresh TS transform is recomputed as always. What the
 // run takes besides them (downstream, --upstream) runs as in any run. The runner trashes and asks (run/rebuild.ts).
 //
+// A known wait (§8 "Retries", D105): in a run by hand, an asset whose latest step the API told to wait (a long
+// Retry-After not over yet) or whose host's request budget is still spent is held (PlanInput.waits), with HTTP_WAIT:
+// running it now would only spend a request on the same answer. --due has the scheduler's own hold for it.
+//
 // --due in a scheduled run (§6 "The scheduler only runs code a human has run"): with DuePlanning.imports, a TS
 // asset whose code is not the code a human last ran is not imported at all (project/resolve.ts importApproved): its
 // step is planned from what the scheduler knows of it (PlannedStep.notImported) and held.
@@ -90,7 +94,7 @@ export interface PlannedStep {
   action: "fetch" | "rebuild" | "update" | "skip";
   reasons: Reason[];
   /** Why the scheduler (or the cost guard) holds the step back; a held step does not run. A manual run holds
-   *  nothing: it asks for confirmation instead (the planner never sets it before phase 3). */
+   *  only an asset inside a known wait (retry_after, D105); for the rest it asks for confirmation instead. */
   hold?: Hold;
   /** Why the step runs, or why it is skipped, in words: "requested", "requested; SQL changed (assets/x.sql)",
    *  "input github_issues may have new rows". Run output shows it under the step when it is not "requested". */
@@ -218,6 +222,9 @@ export interface PlanInput {
    *  ingest is taken as schedule_due, a transform only for its staleness (one that is up to date by now is
    *  skipped), and every step, downstream included, gets the scheduler's holds. */
   due?: DuePlanning;
+  /** A run by hand (not --due): the step of an asset whose next request must wait (schedule/due.ts knownWaits and
+   *  waitHeld, D105) is held with that reason and an HTTP_WAIT warning, and runs nothing. */
+  waits?: (asset: string, file: string) => { reason: string; problem: Problem } | null;
 }
 
 /** TS assets get 2 retries after a retryable error (§8 "Retries"). */
@@ -599,6 +606,14 @@ export async function planRun(i: PlanInput): Promise<RunPlan> {
       }
     }
     if (i.due) applyDue(step, i.due);
+    else if (i.waits && step.action !== "skip") {
+      const w = i.waits(step.asset, step.file);
+      if (w) {
+        step.hold = "retry_after";
+        step.reason = `held: ${w.reason}`;
+        step.problems.push(w.problem);
+      }
+    }
     if (step.kind === "file" && step.action !== "skip" && a.ts?.definition) {
       for (const d of fileDirsOf(i.root, a.ts.definition.config as FileIngest)) fileDirs.add(d);
     }

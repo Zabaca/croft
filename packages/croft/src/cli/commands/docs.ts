@@ -339,7 +339,8 @@ function internalsPage(): string {
     "",
     "Observability and coordination state lives in .croft/runs.sqlite and stays readable while the",
     "warehouse is locked: runs, steps, leases, lock_holder, lock_waiters, schedule_state, tick,",
-    "confirmations and catalog (a mirror of _croft; the warehouse wins).",
+    "confirmations, catalog (a mirror of _croft; the warehouse wins), settings and http_requests (the",
+    "requests sent to hosts with a budget in croft.json, kept a day).",
     "",
     "Never write to either by hand; query _croft tables with croft query.",
   ].join("\n");

@@ -419,7 +419,8 @@ function fakeHttp(reply: (call: Call, n: number) => Reply): { http: Http; calls:
     const r = reply(call, calls.length);
     return { status: 200, url, headers: new Headers(), text: JSON.stringify(r.body), json: <T>() => r.body as T, ...(r.next ? { next: r.next } : {}) };
   };
-  return { http: { get, post: () => Promise.reject(new Error("no POST in these templates")) }, calls };
+  const none = () => Promise.reject(new Error("only GET in these templates"));
+  return { http: { get, post: none, head: none, getBytes: none }, calls };
 }
 
 /** Import a written template and run its rows() with a fake context; every batch, flattened. */
