@@ -77,3 +77,25 @@ jobs:
           bun packages/croft/bin/croft.mjs --version
           bun packages/croft/bin/croft.mjs doctor --json > doctor.json || true
           cat doctor.json
+
+  # The website (packages/site): its pages are generated from croft's own docs, and its tests hold the plugin's skill
+  # and the hand-written pages to the commands croft has. A failed build here is a docs page croft can no longer back.
+  site:
+    name: site
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - run: bun install --frozen-lockfile
+      - name: build
+        working-directory: packages/site
+        run: bun run build
+      - name: test
+        working-directory: packages/site
+        run: bun test

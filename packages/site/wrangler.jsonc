@@ -1,0 +1,20 @@
+// The site as one Worker: the static Astro build in dist/ as assets, and worker/index.ts in front of `/` and
+// `/docs/*` only, where it picks HTML or Markdown by Accept. Deployed by zbc (packages/infra/environments/
+// production/site.ts), which runs the build first. No route here: a hostname belongs to the zbc instance, so a
+// second deploy of this file under another name could never claim it.
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "croft",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-15",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "run_worker_first": ["/", "/docs/*"],
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  },
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": { "enabled": false }
+}

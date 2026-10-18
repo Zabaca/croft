@@ -1,0 +1,7 @@
+dist/
+.astro/
+.wrangler/
+# Written by scripts/reference.ts from croft's own docs before every dev and build.
+src/content/docs/docs/guides/
+src/content/docs/docs/reference/
+src/generated-version.json

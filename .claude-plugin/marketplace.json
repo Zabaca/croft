@@ -1,0 +1,11 @@
+{
+  "name": "croft",
+  "owner": { "name": "Zabaca", "url": "https://github.com/Zabaca/croft" },
+  "plugins": [
+    {
+      "name": "croft",
+      "source": "./packages/croft/plugin",
+      "description": "Teaches an agent to start a croft project from nothing: install, croft init, and the loop. Each project then carries its own skill for its pinned croft version."
+    }
+  ]
+}

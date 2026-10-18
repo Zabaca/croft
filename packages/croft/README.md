@@ -2,6 +2,8 @@
 
 Local data pipelines in TypeScript, on one DuckDB file. croft pulls data from APIs and files, transforms it with SQL or TypeScript, keeps the tables fresh on a schedule, and lets an app read them. It is a single CLI, and Claude Code can drive it from a cold start.
 
+Docs: https://croft.james-99a.workers.dev (for agents: [llms.txt](https://croft.james-99a.workers.dev/llms.txt)).
+
 - **Ingest:** APIs (keyset, cursor, Link-header and page pagination) and files (CSV, JSON, Parquet, globs and URLs). Loads are incremental, types are inferred, and schema changes are handled.
 - **Transform:** one SQL `SELECT` per file, or a TypeScript transform (for example, one LLM call per row, which is incremental and never re-bills). Checks run inside the write transaction.
 - **Keep it fresh:** schedules in plain words (`every hour`, `weekdays at 9am`). croft installs one per-user OS job. `croft serve` answers app queries over HTTP and steps aside for every write.
