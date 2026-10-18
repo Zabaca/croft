@@ -87,8 +87,9 @@ describe("croft init (command)", () => {
     expect(r.exit).toBe(0);
     expect(readFileSync(join(app, "tsconfig.json"), "utf8")).toBe(tsconfig);
     expect(r.stdout).toContain("Created data/ next to your app");
-    expect(r.stdout).toContain(`tsconfig.json was not changed. So that your app's type-check (next build, tsc) skips data/, make this edit:`);
-    expect(r.stdout).toContain(`  +  "exclude": ["node_modules", "data"]`);
+    expect(r.stdout).toContain(`tsconfig.json was not changed. So that your app's type-check (next build, tsc) skips data/'s pipelines and types query<"table">(), make this edit:`);
+    expect(r.stdout).toContain(`  +  "exclude": ["node_modules", "data/assets", "data/lib"],`);
+    expect(r.stdout).toContain(`  +  "include": ["**/*", "data/.croft/types/**/*.d.ts"]`);
     expect(r.stdout).toContain("In your app:\n  npm install @zabaca/croft@");
     expect(r.stdout).toContain("  CLAUDE.md: created (points Claude Code at data/)");
     expect(r.stdout).toContain(`  ${SKILL_PATH}: created`);

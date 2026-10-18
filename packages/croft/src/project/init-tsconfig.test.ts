@@ -11,78 +11,109 @@ const NEXT = `{
   "exclude": ["node_modules"]
 }
 `;
+const TYPES = "data/.croft/types/**/*.d.ts";
+const SKIPPED = ["data/assets", "data/lib"];
 
 function edited(text: string) {
   const plan = planExclude(text);
   expect(plan.status).toBe("needed");
-  return { plan, after: plan.after!, value: toValue(parseJsonc(plan.after!)) as { exclude: string[] } };
+  return { plan, after: plan.after!, value: toValue(parseJsonc(plan.after!)) as { exclude?: string[]; include?: string[] } };
 }
 
-describe("planExclude", () => {
-  test("a Next.js tsconfig: one line changes, every other byte stays", () => {
+describe("planExclude: skip the project's Bun-only folders, include its row types", () => {
+  test("a Next.js tsconfig: two lines change, every other byte stays", () => {
     const { plan, after, value } = edited(NEXT);
-    expect(after).toBe(NEXT.replace(`"exclude": ["node_modules"]`, `"exclude": ["node_modules", "data"]`));
-    expect(value.exclude).toEqual(["node_modules", "data"]);
+    expect(after).toBe(NEXT
+      .replace(`".next/types/**/*.ts"]`, `".next/types/**/*.ts", "${TYPES}"]`)
+      .replace(`"exclude": ["node_modules"]`, `"exclude": ["node_modules", "data/assets", "data/lib"]`));
+    expect(value.exclude).toEqual(["node_modules", ...SKIPPED]);
+    expect(value.include).toContain(TYPES);
     expect(plan.diff).toBe([
       "--- tsconfig.json",
       "+++ tsconfig.json",
-      "@@ line 8 @@",
+      "@@ line 7 @@",
+      `-  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],`,
       `-  "exclude": ["node_modules"]`,
-      `+  "exclude": ["node_modules", "data"]`,
+      `+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts", "${TYPES}"],`,
+      `+  "exclude": ["node_modules", "data/assets", "data/lib"]`,
     ].join("\n"));
+    expect(plan.reason).toBe(`tsconfig.json would type-check data/'s pipelines, which need Bun's types, and would not see data/'s table types, which type query<"table">()`);
   });
 
-  test("no exclude: adds one that keeps node_modules excluded", () => {
+  test("no include and no exclude: TypeScript's defaults are written out, node_modules kept excluded", () => {
     const { after, value } = edited(`{\n  "compilerOptions": { "strict": true }\n}\n`);
-    expect(after).toBe(`{\n  "compilerOptions": { "strict": true },\n  "exclude": ["node_modules", "data"]\n}\n`);
-    expect(value.exclude).toEqual(["node_modules", "data"]);
+    expect(after).toBe(`{\n  "compilerOptions": { "strict": true },\n  "exclude": ["node_modules", "data/assets", "data/lib"],\n  "include": ["**/*", "${TYPES}"]\n}\n`);
+    expect(value).toMatchObject({ exclude: ["node_modules", ...SKIPPED], include: ["**/*", TYPES] });
   });
 
   test("multi-line arrays keep their indentation, with or without a trailing comma", () => {
-    const multi = `{\n    "exclude": [\n        "node_modules",\n        "dist"\n    ]\n}\n`;
-    expect(edited(multi).after).toBe(`{\n    "exclude": [\n        "node_modules",\n        "dist",\n        "data"\n    ]\n}\n`);
-    const trailing = `{\n  "exclude": [\n    "node_modules",\n  ],\n}\n`;
+    const multi = `{\n    "include": ["src"],\n    "exclude": [\n        "node_modules",\n        "dist"\n    ]\n}\n`;
+    // src/ does not reach data/: only the types are added.
+    expect(edited(multi).after).toBe(`{\n    "include": ["src", "${TYPES}"],\n    "exclude": [\n        "node_modules",\n        "dist"\n    ]\n}\n`);
+    const trailing = `{\n  "include": [\n    "**/*",\n  ],\n  "exclude": [\n    "node_modules",\n  ],\n}\n`;
     const t = edited(trailing);
-    expect(t.after).toBe(`{\n  "exclude": [\n    "node_modules",\n    "data",\n  ],\n}\n`);
-    expect(t.value.exclude).toEqual(["node_modules", "data"]);
+    expect(t.after).toBe(`{\n  "include": [\n    "**/*",\n    "${TYPES}",\n  ],\n  "exclude": [\n    "node_modules",\n    "data/assets",\n    "data/lib",\n  ],\n}\n`);
+    expect(t.value).toEqual({ include: ["**/*", TYPES], exclude: ["node_modules", ...SKIPPED] });
   });
 
   test("comments survive (JSONC)", () => {
-    const text = `// app config\n{\n  /* compiler */\n  "compilerOptions": {}, // trailing note\n  "exclude": [] // none yet\n}\n`;
+    const text = `// app config\n{\n  /* compiler */\n  "compilerOptions": {}, // trailing note\n  "include": ["**/*.ts"], // ours\n  "exclude": [] // none yet\n}\n`;
     const { after, value } = edited(text);
-    expect(after).toBe(`// app config\n{\n  /* compiler */\n  "compilerOptions": {}, // trailing note\n  "exclude": ["data"] // none yet\n}\n`);
-    expect(value.exclude).toEqual(["data"]);
+    expect(after).toBe(`// app config\n{\n  /* compiler */\n  "compilerOptions": {}, // trailing note\n  "include": ["**/*.ts", "${TYPES}"], // ours\n  "exclude": ["data/assets", "data/lib"] // none yet\n}\n`);
+    expect(value).toEqual({ compilerOptions: {}, include: ["**/*.ts", TYPES], exclude: ["data/assets", "data/lib"] });
   });
 
   test("a trailing comma after the last property stays", () => {
-    const { after, value } = edited(`{\n  "compilerOptions": {},\n}\n`);
-    expect(after).toBe(`{\n  "compilerOptions": {},\n  "exclude": ["node_modules", "data"],\n}\n`);
-    expect(value.exclude).toEqual(["node_modules", "data"]);
+    const { after } = edited(`{\n  "compilerOptions": {},\n}\n`);
+    expect(after).toBe(`{\n  "compilerOptions": {},\n  "exclude": ["node_modules", "data/assets", "data/lib"],\n  "include": ["**/*", "${TYPES}"],\n}\n`);
   });
 
-  test("not needed when data is already excluded or not included at all", () => {
-    for (const ex of [`"data"`, `"./data"`, `"data/"`, `"data/**"`, `"data/**/*"`]) {
-      expect(planExclude(`{"exclude": ["node_modules", ${ex}]}`).status).toBe("not_needed");
+  test("only what is missing is added; nothing when all of it is there", () => {
+    const half = edited(`{"include": ["**/*", "${TYPES}"], "exclude": ["node_modules", "data/assets"]}`);
+    expect(half.value).toEqual({ include: ["**/*", TYPES], exclude: ["node_modules", "data/assets", "data/lib"] });
+    expect(half.plan.reason).toBe("tsconfig.json would type-check data/'s pipelines, which need Bun's types");
+    expect(planExclude(`{"include": ["**/*", "${TYPES}"], "exclude": ["data/assets/**", "data/lib"]}`).status).toBe("not_needed");
+    // An include that never reaches data/ needs no exclusion, only the types.
+    for (const inc of [`"src"`, `"next-env.d.ts"`, `"*.ts"`]) {
+      const e = edited(`{"include": [${inc}]}`);
+      expect(e.value).toEqual({ include: [JSON.parse(inc), TYPES] });
     }
-    expect(planExclude(`{"include": ["src", "next-env.d.ts", "*.ts"]}`)).toMatchObject({ status: "not_needed" });
-    expect(planExclude(`{"files": ["index.ts"]}`)).toMatchObject({ status: "not_needed" });
     // Patterns that do reach data/.
     for (const inc of [`"**/*.ts"`, `"."`, `"data"`, `"d*/**/*.ts"`, `"./**/*"`]) {
-      expect(planExclude(`{"include": [${inc}]}`).status).toBe("needed");
+      expect(edited(`{"include": [${inc}]}`).value.exclude).toEqual(["node_modules", ...SKIPPED]);
     }
-    expect(planExclude(`{"extends": "./base.json", "files": ["a.ts"]}`).status).toBe("needed");
+    // "files" alone reaches nothing else: the types get an "include" of their own.
+    expect(edited(`{"files": ["index.ts"]}`).value).toEqual({ files: ["index.ts"], include: [TYPES] });
+  });
+
+  test("an app that excludes all of data/ already: the types are left to the user, with the edit", () => {
+    for (const ex of [`"data"`, `"./data"`, `"data/"`, `"data/**"`, `"data/**/*"`]) {
+      const p = planExclude(`{"exclude": ["node_modules", ${ex}]}`);
+      expect(p.status).toBe("manual");
+      expect(p.reason).toContain(`replace "data" in its "exclude" with "data/assets" and "data/lib", and add "${TYPES}"`);
+    }
+  });
+
+  test("extends: the base may set its own include, so a new one is not written; the exclusion still is", () => {
+    const e = edited(`{"extends": "./base.json"}`);
+    expect(e.value).toEqual({ extends: "./base.json", exclude: ["node_modules", ...SKIPPED] });
+    expect(e.plan.reason).toContain(`add "${TYPES}" to its "include" by hand (it extends another config)`);
+    // With an include of its own, it is edited as usual.
+    expect(edited(`{"extends": "./base.json", "include": ["src"]}`).value.include).toEqual(["src", TYPES]);
   });
 
   test("manual when the file cannot be edited safely", () => {
     expect(planExclude(`{"exclude": "node_modules"}`).status).toBe("manual");
+    expect(planExclude(`{"include": "src"}`).status).toBe("manual");
     expect(planExclude(`{"exclude": [}`).status).toBe("manual");
     expect(planExclude(`[1, 2]`).status).toBe("manual");
     expect(planExclude(`{/* never closed`).status).toBe("manual");
   });
 
-  test("a single-line object gets an inline property", () => {
-    expect(edited(`{"compilerOptions": {}}`).after).toBe(`{"compilerOptions": {}, "exclude": ["node_modules", "data"]}`);
-    expect(edited(`{}`).value.exclude).toEqual(["node_modules", "data"]);
+  test("a single-line object gets inline properties", () => {
+    expect(edited(`{"compilerOptions": {}}`).after)
+      .toBe(`{"compilerOptions": {}, "exclude": ["node_modules", "data/assets", "data/lib"], "include": ["**/*", "${TYPES}"]}`);
+    expect(edited(`{}`).value).toEqual({ exclude: ["node_modules", ...SKIPPED], include: ["**/*", TYPES] });
   });
 });
 

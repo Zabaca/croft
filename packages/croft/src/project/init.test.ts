@@ -157,8 +157,13 @@ describe("croft init in an existing app repo", () => {
     ]);
 
     expect(r.tsconfig).toEqual({
-      file: "tsconfig.json", status: "suggested", reason: "tsconfig.json would type-check data/, which needs Bun's types",
-      diff: `--- tsconfig.json\n+++ tsconfig.json\n@@ line 4 @@\n-  "exclude": ["node_modules"]\n+  "exclude": ["node_modules", "data"]`,
+      file: "tsconfig.json", status: "suggested",
+      reason: `tsconfig.json would type-check data/'s pipelines, which need Bun's types, and would not see data/'s table types, which type query<"table">()`,
+      diff: [
+        "--- tsconfig.json", "+++ tsconfig.json", "@@ line 3 @@",
+        `-  "include": ["**/*.ts", "**/*.tsx"],`, `-  "exclude": ["node_modules"]`,
+        `+  "include": ["**/*.ts", "**/*.tsx", "data/.croft/types/**/*.d.ts"],`, `+  "exclude": ["node_modules", "data/assets", "data/lib"]`,
+      ].join("\n"),
     });
     expect(r.appSteps).toEqual([
       `bun add @zabaca/croft@${CROFT_VERSION}`,
@@ -175,7 +180,9 @@ describe("croft init in an existing app repo", () => {
     const r = await initProject(opts(yes, { confirmEdit: async (e) => { asked.push(e.diff); return true; } }));
     expect(asked).toHaveLength(1);
     expect(r.tsconfig?.status).toBe("applied");
-    expect(read(join(yes, "tsconfig.json"))).toBe(APP_TSCONFIG.replace(`["node_modules"]`, `["node_modules", "data"]`));
+    expect(read(join(yes, "tsconfig.json"))).toBe(APP_TSCONFIG
+      .replace(`"**/*.tsx"]`, `"**/*.tsx", "data/.croft/types/**/*.d.ts"]`)
+      .replace(`["node_modules"]`, `["node_modules", "data/assets", "data/lib"]`));
 
     const no = fresh(APP);
     const r2 = await initProject(opts(no, { confirmEdit: async () => false }));
@@ -183,11 +190,12 @@ describe("croft init in an existing app repo", () => {
     expect(read(join(no, "tsconfig.json"))).toBe(APP_TSCONFIG);
   });
 
-  test("no tsconfig, or one that already excludes data: nothing to suggest", async () => {
+  test("no tsconfig: nothing to suggest; one that excludes all of data/: the types edit, by hand", async () => {
     const plain = fresh({ "package.json": "{}" });
     expect((await initProject(opts(plain))).tsconfig).toBeNull();
     const done = fresh({ "package.json": "{}", "tsconfig.json": `{"exclude": ["node_modules", "data"]}` });
-    expect((await initProject(opts(done))).tsconfig).toBeNull();
+    expect((await initProject(opts(done))).tsconfig).toMatchObject({ file: "tsconfig.json", status: "manual" });
+    expect(read(join(done, "tsconfig.json"))).toBe(`{"exclude": ["node_modules", "data"]}`);
   });
 
   test("refuses a second init, and a data/ that holds other files, without writing anything", async () => {

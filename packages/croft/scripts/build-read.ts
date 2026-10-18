@@ -93,6 +93,8 @@ export interface ReadError extends Error {
 export declare function query<T extends Record<string, unknown> = Record<string, unknown>>(
   sql: string, params?: unknown[], options?: ReadOptions,
 ): Promise<T[]>;
+/** query<"daily_revenue">(sql): the rows typed as that table's, once .croft/types has its type (TableRow). */
+export declare function query<N extends string>(sql: string, params?: unknown[], options?: ReadOptions): Promise<TableRow<N>[]>;
 `;
 writeFileSync(join(outdir, "read.d.ts"), dts);
 

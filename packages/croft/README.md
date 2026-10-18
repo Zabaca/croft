@@ -45,10 +45,10 @@ croft schedule on                                   # hourly, via the OS job
 
 ```ts
 import { query } from "@zabaca/croft/read";
-const rows = await query("select * from daily_revenue order by day desc limit 7");
+const rows = await query<"daily_revenue">("select * from daily_revenue order by day desc limit 7");
 ```
 
-`@zabaca/croft/read` runs under Bun and Node. It talks to `croft serve` when one is running, and otherwise opens the database briefly.
+`@zabaca/croft/read` runs under Bun and Node. It talks to `croft serve` when one is running, and otherwise opens the database briefly. `query<"daily_revenue">` types the rows from the table's real columns, which croft writes to `.croft/types` after each run; include that folder in the app's `tsconfig.json` (`croft docs serve`).
 
 ## License
 

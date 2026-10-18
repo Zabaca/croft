@@ -1,10 +1,15 @@
 // Generated input types (DESIGN.md §3e "The context API", §6 "Ways to try a change" 1, §11 phase 5): the row
 // type of every asset with known columns, so a TS transform's `rows("x")`, `newRows("x")` and `query<"x">(sql)`
-// are checked by name, and `croft validate --types` catches a column renamed or removed upstream.
+// are checked by name, and `croft validate --types` catches a column renamed or removed upstream. An app's
+// `query<"x">(sql)` from @zabaca/croft/read is typed by name the same way, with the values that module returns.
 //
-//   .croft/types/<asset>.d.ts   `export type <Asset>Row = { column: type; ... }`, one per asset
-//   .croft/types/index.d.ts     adds each of them to croft's CroftAssets interface (src/types.ts) by module
-//                               augmentation; the project tsconfig.json includes ".croft/types" (croft init)
+//   .croft/types/<asset>.d.ts   `export type <Asset>Row = { column: type; ... }` as a TS transform is handed it,
+//                               and `<Asset>ReadRow` as @zabaca/croft/read returns it (json mode, below)
+//   .croft/types/index.d.ts     adds each Row to croft's CroftAssets interface (src/types.ts) by module
+//                               augmentation; the project tsconfig.json includes ".croft/types" (croft init).
+//                               It adds each ReadRow to the global CroftTables interface that @zabaca/croft/read
+//                               declares (src/read-types.ts): global, so it reaches an app whose own copy of
+//                               croft is not the project's (an app with the project in data/)
 //
 // The folder is always <root>/.croft/types, even when croft.json relocates the state folder: tsconfig.json can
 // only name it relative to the project. It is croft's: every generation rewrites the files that changed and
@@ -22,6 +27,10 @@
 //   BIGINT → number | bigint (bigint beyond ±2^53); HUGEINT and DECIMAL(38,0) → bigint; DECIMAL up to 15
 //   digits → number, wider → string; dates, times and timestamps → string (never Date: §3e); JSON → unknown
 //   (its parsed value, of no known shape); UUID, BLOB, INTERVAL → string; lists → arrays; MAP → {key, value}[].
+// ReadRow types are what @zabaca/croft/read returns (mode "json"): BIGINT → number | string (text beyond
+//   ±2^53); HUGEINT and every DECIMAL → string; the rest as above. A DOUBLE that is NaN or ±Infinity arrives as
+//   its text in json mode; the types say number, since a warehouse rarely holds one and number | string on every
+//   DOUBLE would make the common case unusable.
 // Every column may be NULL but the key (KEY_NULL and the key's implied not_null refuse NULL keys) and croft's
 // _loaded_at and _file. A pending column (NULL in every row so far) is unknown: its type is not settled.
 // STRUCT field names are not claimed: the column cache upper-cases them (load/evolve.ts normalizeType).
@@ -139,13 +148,18 @@ function element(ts: string): string {
   return ts.includes("|") || ts.includes("{") ? `(${ts})` : ts;
 }
 
-/** The TypeScript type of a value of this DuckDB type, as a TS transform is handed it (db/values.ts, mode "ts").
- *  Not NULL-able at the top: the caller adds `| null` where a column may hold NULL. */
-export function tsType(sqlType: string): string {
+/** How a value reaches code (db/values.ts RenderMode): "ts" as a TS transform is handed it, "json" as
+ *  @zabaca/croft/read returns it. */
+export type TypeMode = "ts" | "json";
+
+/** The TypeScript type of a value of this DuckDB type, as a TS transform is handed it (db/values.ts, mode "ts"),
+ *  or as @zabaca/croft/read returns it (mode "json"). Not NULL-able at the top: the caller adds `| null` where a
+ *  column may hold NULL. */
+export function tsType(sqlType: string, mode: TypeMode = "ts"): string {
   const t = sqlType.trim();
   const list = /^(.*)\[\d*\]$/s.exec(t);
   if (list) {
-    const inner = tsType(list[1]!);
+    const inner = tsType(list[1]!, mode);
     return inner === "unknown" ? "unknown[]" : `${element(orNull(inner))}[]`;
   }
   const m = /^([A-Za-z_][A-Za-z0-9_]*(?: [A-Za-z_][A-Za-z0-9_]*)*)\s*(?:\((.*)\))?$/s.exec(t);
@@ -153,6 +167,7 @@ export function tsType(sqlType: string): string {
   const base = m[1]!.toUpperCase();
   const args = m[2];
   if (base === "DECIMAL" || base === "NUMERIC") {
+    if (mode === "json") return "string";
     const [p, s] = args === undefined ? [18, 3] : splitTop(args).map(Number);
     if (p === undefined || !Number.isInteger(p)) return "unknown";
     if (p === 38 && (s ?? 0) === 0) return "bigint";              // HUGEINT's stand-in in Parquet snapshots
@@ -161,14 +176,14 @@ export function tsType(sqlType: string): string {
   if (base === "MAP" && args !== undefined) {
     const [k, v] = splitTop(args);
     if (k === undefined || v === undefined) return "unknown";
-    return `{ key: ${tsType(k)}; value: ${orNull(tsType(v))} }[]`;
+    return `{ key: ${tsType(k, mode)}; value: ${orNull(tsType(v, mode))} }[]`;
   }
   if (base === "STRUCT") return "{ [field: string]: unknown }";
   if (base === "UNION") return "{ tag: string; value: unknown }";
   if (BOOLEAN.has(base)) return "boolean";
   if (NUMBER.has(base)) return "number";
-  if (SAFE_OR_BIG.has(base)) return "number | bigint";
-  if (BIG.has(base)) return "bigint";
+  if (SAFE_OR_BIG.has(base)) return mode === "json" ? "number | string" : "number | bigint";
+  if (BIG.has(base)) return mode === "json" ? "string" : "bigint";
   if (STRING.has(base)) return "string";
   return "unknown";                                               // JSON, and any type croft does not know
 }
@@ -178,6 +193,9 @@ export function tsType(sqlType: string): string {
 export function rowTypeName(asset: string): string {
   return `${asset.split("_").filter(Boolean).map((w) => w[0]!.toUpperCase() + w.slice(1)).join("")}Row`;
 }
+
+/** The name of the same rows as @zabaca/croft/read returns them: GithubIssuesRow → GithubIssuesReadRow. */
+export const readTypeName = (rowType: string) => `${rowType.slice(0, -3)}ReadRow`;
 
 // ---------------------------------------------------------------------------------------------------------
 // The files
@@ -211,7 +229,7 @@ function commentLines(text: string): string[] {
 }
 
 /** A column's TypeScript type, and the comment above it. */
-function columnType(c: TypedColumn, key: readonly string[]): { ts: string; note: string } {
+function columnType(c: TypedColumn, key: readonly string[], mode: TypeMode = "ts"): { ts: string; note: string } {
   const type = c.type.trim() || "unknown";
   const isKey = key.some((k) => sameName(k, c.name));
   const own = sameName(c.name, RESERVED.loadedAt) ? "when croft loaded the row" : sameName(c.name, RESERVED.file) ? "the file the row came from" : null;
@@ -221,18 +239,19 @@ function columnType(c: TypedColumn, key: readonly string[]): { ts: string; note:
     ts = "unknown";
     note = `${type}, NULL in every row so far: its type is not settled`;
   } else {
-    const base = tsType(type);
+    const base = tsType(type, mode);
     ts = isKey || own ? base : orNull(base);
-    note = own ? `${type}: ${own}; readable, but left out of { ...row }`
+    // A transform's rows are guarded proxies that leave croft's columns out of a spread; an app's are plain objects.
+    note = own ? (mode === "ts" ? `${type}: ${own}; readable, but left out of { ...row }` : `${type}: ${own}`)
       : isKey ? `${type}, the key`
         : c.jsonKeys?.length ? `${type} (keys seen: ${c.jsonKeys.join(", ")})` : type;
   }
   return { ts, note };
 }
 
-function columnLine(c: TypedColumn, key: readonly string[]): string[] {
+function columnLine(c: TypedColumn, key: readonly string[], mode: TypeMode): string[] {
   const name = IDENTIFIER.test(c.name) ? c.name : JSON.stringify(c.name);
-  const { ts, note } = columnType(c, key);
+  const { ts, note } = columnType(c, key, mode);
   return [`  /** ${commentSafe(note)} */`, `  ${name}: ${ts};`];
 }
 
@@ -242,8 +261,17 @@ function withLoadedAt(s: TypeSource): readonly TypedColumn[] {
   return [...s.columns, { name: RESERVED.loadedAt, type: "TIMESTAMPTZ" }];
 }
 
-function rowType(s: TypeSource, typeName: string, columns: readonly TypedColumn[]): string {
-  return [`export type ${typeName} = {`, ...columns.flatMap((c) => columnLine(c, s.key)), "};"].join("\n");
+function rowType(s: TypeSource, typeName: string, columns: readonly TypedColumn[], mode: TypeMode = "ts"): string {
+  return [`export type ${typeName} = {`, ...columns.flatMap((c) => columnLine(c, s.key, mode)), "};"].join("\n");
+}
+
+/** The ReadRow type with its comment: the same columns as @zabaca/croft/read returns them. */
+function readRowType(s: TypeSource, typeName: string, columns: readonly TypedColumn[]): string {
+  const q = JSON.stringify(s.asset);
+  return [
+    ...commentLines(`The same rows as an app reads them: query<${q}>(sql) from @zabaca/croft/read. DECIMAL, HUGEINT and integers beyond ±2^53 arrive as strings there.`),
+    rowType(s, readTypeName(typeName), columns, "json"),
+  ].join("\n");
 }
 
 /** The text of every file of .croft/types for these sources (file name → text), and the row types by name.
@@ -263,6 +291,7 @@ export function renderTypes(sources: readonly TypeSource[]): { files: Map<string
   const files = new Map<string, string>();
   const types: Record<string, GeneratedType> = {};
   const entries: string[] = [];
+  const readEntries: string[] = [];
   let indexRow = "";
   for (const s of sorted) {
     const typeName = names.get(s.asset)!;
@@ -276,11 +305,13 @@ export function renderTypes(sources: readonly TypeSource[]): { files: Map<string
     const header = commentLines(`${s.asset}: its rows as TS transforms read them: ctx.rows(${q}), ctx.newRows(${q}) and ctx.query<${q}>(sql). ${origin(s)}`);
     if (inIndex) {
       // An asset named index: its row type is declared in index.d.ts itself.
-      indexRow = `${[...header, rowType(s, typeName, columns)].join("\n")}\n`;
+      indexRow = `${[...header, rowType(s, typeName, columns), "", readRowType(s, typeName, columns)].join("\n")}\n`;
       entries.push(`    ${s.asset}: ${typeName};`);
+      readEntries.push(`    ${s.asset}: ${readTypeName(typeName)};`);
     } else {
-      files.set(`${s.asset}.d.ts`, `${[...header, HEADER_TAIL, rowType(s, typeName, columns)].join("\n")}\n`);
+      files.set(`${s.asset}.d.ts`, `${[...header, HEADER_TAIL, rowType(s, typeName, columns), "", readRowType(s, typeName, columns)].join("\n")}\n`);
       entries.push(`    ${s.asset}: import("./${s.asset}.js").${typeName};`);
+      readEntries.push(`    ${s.asset}: import("./${s.asset}.js").${readTypeName(typeName)};`);
     }
   }
   if (sorted.length) {
@@ -288,13 +319,19 @@ export function renderTypes(sources: readonly TypeSource[]): { files: Map<string
       "// Input row types by asset name, for TS transforms: ctx.rows(\"x\") and ctx.newRows(\"x\") hand over x's row type,",
       "// and ctx.query<\"x\">(sql) returns x's rows. Reading a column x does not have is then a type error, which",
       "// croft validate --types reports. rows<Row>(\"x\") opts out, for column names computed at run time.",
+      "// For apps, query<\"x\">(sql) from @zabaca/croft/read returns x's rows as that module renders them.",
       HEADER_TAIL,
-      "// It applies when tsconfig.json includes \".croft/types\".",
+      "// It applies when tsconfig.json includes \".croft/types\" (an app with the project in data/: data/.croft/types).",
       ...(indexRow ? [indexRow.trimEnd()] : []),
       "export {};",
       "declare module \"@zabaca/croft\" {",
       "  interface CroftAssets {",
       ...entries,
+      "  }",
+      "}",
+      "declare global {",
+      "  interface CroftTables {",
+      ...readEntries,
       "  }",
       "}",
       "",

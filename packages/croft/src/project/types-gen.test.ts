@@ -1,12 +1,14 @@
 // Generated input types (project/types-gen.ts): the DuckDB → TypeScript mapping, the files' text, and what
 // generateInputTypes writes to .croft/types from the column cache. The real-tsc tests (the types match what a TS
 // transform is handed, and catch a renamed column) are in types-gen-tsc.test.ts.
+import { DuckDBInstance } from "@duckdb/node-api";
 import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CatalogAsset, type CatalogColumn, putCatalog } from "../history/catalog.ts";
 import { RunsDb } from "../history/runs-db.ts";
+import { renderRows } from "../db/values.ts";
 import { previewDirectory } from "../run/preview.ts";
 import { generateInputTypes, renderTypes, rowTypeName, type TypeSource, TYPES_DIR, tsType, typeSources } from "./types-gen.ts";
 
@@ -82,6 +84,44 @@ describe("tsType: DuckDB types as a TS transform receives them (db/values.ts, mo
   });
 });
 
+describe("tsType in json mode: DuckDB types as @zabaca/croft/read returns them (db/values.ts, mode json)", () => {
+  test("strings where JSON cannot hold the number: HUGEINT, every DECIMAL, and BIGINT beyond ±2^53", () => {
+    const cases: [string, string][] = [
+      ["BOOLEAN", "boolean"], ["INTEGER", "number"], ["DOUBLE", "number"],
+      ["BIGINT", "number | string"], ["UBIGINT", "number | string"],
+      ["HUGEINT", "string"], ["BIGNUM", "string"],
+      ["DECIMAL(10,2)", "string"], ["DECIMAL(38,0)", "string"], ["DECIMAL", "string"],
+      ["VARCHAR", "string"], ["TIMESTAMPTZ", "string"], ["DATE", "string"], ["JSON", "unknown"],
+      ["BIGINT[]", "(number | string | null)[]"], ["MAP(VARCHAR, HUGEINT)", "{ key: string; value: string | null }[]"],
+    ];
+    for (const [sql, ts] of cases) expect([sql, tsType(sql, "json")]).toEqual([sql, ts]);
+  });
+
+  test("the types say what the read API hands over: each rendered value is one of its type's members", async () => {
+    const db = await DuckDBInstance.create(":memory:");
+    const conn = await db.connect();
+    try {
+      const sql = `SELECT true AS b, 7::INTEGER AS i, 1.5::DOUBLE AS d, 42::BIGINT AS small, 9007199254740993::BIGINT AS big,
+        12345678901234567890123::HUGEINT AS huge, 12.34::DECIMAL(10,2) AS dec, 'x' AS v,
+        TIMESTAMPTZ '2026-09-01 10:00:00+00' AS ts, DATE '2026-09-01' AS day`;
+      const reader = await conn.runAndReadAll(sql);
+      const [row] = renderRows(reader, { mode: "json", timezone: "UTC" }) as Record<string, unknown>[];
+      const types: Record<string, string> = {
+        b: "BOOLEAN", i: "INTEGER", d: "DOUBLE", small: "BIGINT", big: "BIGINT", huge: "HUGEINT", dec: "DECIMAL(10,2)",
+        v: "VARCHAR", ts: "TIMESTAMPTZ", day: "DATE",
+      };
+      for (const [col, type] of Object.entries(types)) {
+        const members = tsType(type, "json").split(" | ");
+        expect([col, members.includes(typeof row![col])]).toEqual([col, true]);
+      }
+      expect(row!.small).toBe(42);
+      expect(row!.big).toBe("9007199254740993");
+    } finally {
+      conn.disconnectSync();
+    }
+  });
+});
+
 describe("rowTypeName", () => {
   test("PascalCase plus Row: a name no asset, keyword or croft type takes", () => {
     expect(rowTypeName("github_issues")).toBe("GithubIssuesRow");
@@ -107,7 +147,11 @@ const ISSUES: TypeSource = {
 };
 
 /** A file's leading comment as one line. */
-const header = (text: string) => text.split("\n").filter((l) => l.startsWith("// ")).map((l) => l.slice(3)).join(" ");
+const header = (text: string) => {
+  const lines = text.split("\n");
+  const end = lines.findIndex((l) => !l.startsWith("// "));
+  return lines.slice(0, end === -1 ? lines.length : end).map((l) => l.slice(3)).join(" ");
+};
 
 describe("renderTypes: one file per asset, and an index that augments CroftAssets", () => {
   test("an asset's row type: keys are never NULL, a pending column is unknown, odd names are quoted", () => {
@@ -129,16 +173,39 @@ export type GithubIssuesRow = {
   /** TIMESTAMPTZ: when croft loaded the row; readable, but left out of { ...row } */
   _loaded_at: string;
 };
+
+// The same rows as an app reads them: query<"github_issues">(sql) from @zabaca/croft/read. DECIMAL, HUGEINT and
+// integers beyond ±2^53 arrive as strings there.
+export type GithubIssuesReadRow = {
+  /** BIGINT, the key */
+  id: number | string;
+  /** VARCHAR */
+  title: string | null;
+  /** JSON (keys seen: id, login) */
+  user: unknown;
+  /** VARCHAR, NULL in every row so far: its type is not settled */
+  closed_at: unknown;
+  /** DOUBLE */
+  "Weird Name": number | null;
+  /** TIMESTAMPTZ: when croft loaded the row */
+  _loaded_at: string;
+};
 `);
     expect(r.files.get("index.d.ts")).toBe(`// Input row types by asset name, for TS transforms: ctx.rows("x") and ctx.newRows("x") hand over x's row type,
 // and ctx.query<"x">(sql) returns x's rows. Reading a column x does not have is then a type error, which
 // croft validate --types reports. rows<Row>("x") opts out, for column names computed at run time.
+// For apps, query<"x">(sql) from @zabaca/croft/read returns x's rows as that module renders them.
 // Generated by croft after each run and preview, and by croft validate --types; edits are overwritten.
-// It applies when tsconfig.json includes ".croft/types".
+// It applies when tsconfig.json includes ".croft/types" (an app with the project in data/: data/.croft/types).
 export {};
 declare module "@zabaca/croft" {
   interface CroftAssets {
     github_issues: import("./github_issues.js").GithubIssuesRow;
+  }
+}
+declare global {
+  interface CroftTables {
+    github_issues: import("./github_issues.js").GithubIssuesReadRow;
   }
 }
 `);

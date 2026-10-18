@@ -169,10 +169,10 @@ export function describe(r: InitResult, from: string): string {
   }
   if (r.tsconfig) {
     const t = r.tsconfig;
-    if (t.status === "applied") lines.push(`${t.file}: added "data" to "exclude", so your app's type-check skips the pipelines.`);
+    if (t.status === "applied") lines.push(`${t.file}: edited, so your app's type-check skips data/'s pipelines and query<"table">() is typed.`);
     else if (t.status === "manual") lines.push(`${t.file}: ${t.reason}.`);
     else {
-      lines.push(`${t.file} was not changed. So that your app's type-check (next build, tsc) skips data/, make this edit${t.status === "declined" ? " when you are ready" : ""}:`);
+      lines.push(`${t.file} was not changed. So that your app's type-check (next build, tsc) skips data/'s pipelines and types query<"table">(), make this edit${t.status === "declined" ? " when you are ready" : ""}:`);
       if (t.diff) lines.push(indent(t.diff));
     }
   }

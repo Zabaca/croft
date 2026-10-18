@@ -70,8 +70,23 @@ describe("scripts/build-read.ts", () => {
   });
 
   // The same consumer must compile against dist/read.d.ts (by package name) and against src/read.ts.
-  const CONSUMER = (from: string) => `import { query, type ReadError, type ReadOptions } from "${from}";
+  const CONSUMER = (from: string) => `import { query, type ReadError, type ReadOptions, type TableRow } from "${from}";
+// What a project's .croft/types/index.d.ts adds after a run: each table's rows, by name.
+declare global {
+  interface CroftTables { daily_revenue: { day: string; revenue: string | null } }
+}
 const options: ReadOptions = { project: "/p", url: "http://127.0.0.1:7447", token: "t", limit: 10, timeoutMs: 5000 };
+export async function byName(): Promise<string> {
+  const rows = await query<"daily_revenue">("FROM daily_revenue", [], options);
+  const day: string = rows[0]!.day;
+  const one: TableRow<"daily_revenue"> = rows[0]!;
+  // @ts-expect-error a column the table does not have
+  rows[0]!.total;
+  // A table with no generated type yet: plain rows, and no error.
+  const unbuilt = await query<"never_built">("FROM never_built");
+  const cell: unknown = unbuilt[0]?.anything;
+  return day + String(one.revenue) + String(cell);
+}
 export async function demo(): Promise<string> {
   const typed: { day: string; revenue: string }[] = await query<{ day: string; revenue: string }>("SELECT 1", ["x"], options);
   const loose = await query("SELECT 1");
