@@ -7,6 +7,7 @@ import { join } from "node:path";
 import type { Server } from "bun";
 import { parseChecks } from "../checks/parse.ts";
 import { checksHook } from "../checks/run.ts";
+import { inputsSeenOf } from "../cli/commands/describe.ts";
 import { CroftError } from "../core/errors.ts";
 import type { Problem, Sql } from "../core/types.ts";
 import { ensureState } from "../db/state.ts";
@@ -26,7 +27,7 @@ import { behaviorHash, behaviorLabel, behaviorWords, DEFAULT_RETRIES, DEFAULT_TI
 import { staleReasons } from "./staleness.ts";
 import type { ConfirmDecision, ConfirmRequest, StepInput, StepOutcome } from "./step.ts";
 import { cleanupProjects, makeProject, PKG, writeFiles } from "./testkit.ts";
-import { CHUNK, pendingChunkDir, rowsWithin, runTransform } from "./transform.ts";
+import { CHUNK, pendingChunkDir, previewGuard, rebuildGuard, rowsWithin, runTransform } from "./transform.ts";
 
 const g = globalThis as Record<string, unknown>;
 const opened: { runs: RunsDb }[] = [];
@@ -1187,6 +1188,145 @@ export default transform({
   });
 });
 
+describe("incremental: { once: \"key\" }: paid work once per key (D106)", () => {
+  const ONCE = `incremental: { once: "key", from: { issue_id: "id" } },`;
+  const once = (extra = "") => incremental("issues", extra).replace("incremental: true,", ONCE);
+
+  test("an input row edited after its key was computed is not handed over again, and its stored answer stays", async () => {
+    const h = harness({ "assets/t.ts": once(), "assets/plain.ts": incremental() });
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2, 3], S1) });
+    const s = await plan(h, "t");
+    const plain = await plan(h, "plain");
+    expect(s.incremental).toEqual({ kind: "new-rows", inputs: ["issues"], once: [{ key: "issue_id", from: "id" }] });
+    expect(s.words).toBe("updates rows by issue_id; processes each key once; a changed input row of a key it holds is not processed again");
+    await step(h, s);
+    expect(g.__t_seen).toEqual(["1", "2", "3"]);
+    await step(h, plain);
+
+    // A bookkeeping edit of issue 2 and a new issue 4: only the new key reaches the code.
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: [...issues([2], S2, () => "edited"), ...issues([4], S2)] });
+    g.__t_seen = [];
+    const out = await step(h, s);
+    expect(g.__t_seen).toEqual(["4"]);
+    expect(out.result.reason).toBe("requested; 1 new input row");
+    expect(out.result.rows).toMatchObject({ in: 1, added: 1, updated: 0, total: 4 });
+    expect(await all(h, `SELECT title FROM t WHERE issue_id = 2`)).toEqual([{ title: "issue 2" }]);
+    // incremental: true hands both over, as before, and overwrites the answer.
+    g.__t_seen = [];
+    await step(h, plain);
+    expect(g.__t_seen).toEqual(["2", "4"]);
+    expect(await all(h, `SELECT title FROM plain WHERE issue_id = 2`)).toEqual([{ title: "edited" }]);
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([3], S3, () => "edited") });
+
+    // An edit after the last row handed over stays after the position: left out again, run after run, and the input
+    // still counts as read in full (nothing stale), with nothing pending in croft describe.
+    for (let n = 0; n < 2; n++) {
+      g.__t_seen = [];
+      expect((await step(h, s)).result.rows.in).toBe(0);
+      expect(g.__t_seen).toEqual([]);
+    }
+    expect(await all(h, `SELECT seen_key::VARCHAR AS k, input_last_loaded_at::VARCHAR AS l FROM _croft.inputs WHERE asset = 't'`))
+      .toEqual([{ k: `["4"]`, l: "2026-03-01 02:00:00.000003-08" }]);
+    const seen = await h.w.read((db) => inputsSeenOf(db as never, "t", ["issues"], { once: s.incremental.kind === "new-rows" ? s.incremental.once! : [] }), { purpose: "test" });
+    expect(seen.issues?.pendingRows).toBe(0);
+    const unfiltered = await h.w.read((db) => inputsSeenOf(db as never, "t", ["issues"]), { purpose: "test" });
+    expect(unfiltered.issues?.pendingRows).toBe(1);
+
+    // A preview hands over only the keys the table does not hold either, and its cap counts those: three edited
+    // rows come first in position order, and --rows 1 still reaches the new key.
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: [...issues([1, 2], S3, () => "edited"), ...issues([5], S3)] });
+    g.__t_seen = [];
+    await step(h, s, { preview: { rows: 1 } });
+    expect(g.__t_seen).toEqual(["5"]);
+  });
+
+  test("an output key read from an input with another key: each key once, the first row in position order, a NULL kept", async () => {
+    const h = harness({
+      "assets/cases.ts": `import { transform } from "@zabaca/croft";
+const g = globalThis as any;
+export default transform({
+  inputs: ["candidates"],
+  key: "cluster_id",
+  incremental: { once: "key" },
+  async *rows({ newRows }) {
+    for await (const r of newRows("candidates")) {
+      (g.__t_seen ??= []).push(r.term_id + "/" + r.cluster_id);
+      if (r.cluster_id !== null) yield { cluster_id: r.cluster_id, text: "case " + r.cluster_id };
+    }
+  },
+});
+`,
+    });
+    const columns = { term_id: "BIGINT", row_id: "BIGINT", cluster_id: "BIGINT", note: "VARCHAR" };
+    const cand = (term: number, row: number, cluster: number | null, stamp: string, note = "") =>
+      ({ term_id: String(term), row_id: String(row), cluster_id: cluster === null ? null : String(cluster), note, _loaded_at: stamp });
+    await seed(h, "candidates", { columns, key: ["term_id", "row_id"], rows: [cand(2, 1, 10, S1), cand(1, 1, 10, S1), cand(1, 2, 11, S1), cand(1, 3, null, S1), cand(2, 2, null, S1)] });
+    const s = await plan(h, "cases");
+    await step(h, s);
+    // (1, 1) comes before (2, 1) in (_loaded_at, key) order, so cluster 10 is computed from it; both NULLs come.
+    expect(g.__t_seen).toEqual(["1/10", "1/11", "1/null", "2/null"]);
+    expect(await all(h, `SELECT cluster_id FROM cases ORDER BY 1`)).toEqual([{ cluster_id: 10 }, { cluster_id: 11 }]);
+
+    // A new search finds cluster 11 again and cluster 12 for the first time; an old candidate's note is edited.
+    await seed(h, "candidates", { columns, key: ["term_id", "row_id"], rows: [cand(3, 1, 11, S2), cand(3, 2, 12, S2), cand(2, 1, 10, S2, "checked")] });
+    g.__t_seen = [];
+    await step(h, s);
+    expect(g.__t_seen).toEqual(["3/12"]);
+    expect(await all(h, `SELECT count(*)::INTEGER AS n FROM cases`)).toEqual([{ n: 3 }]);
+  });
+
+  test("an input without the column the key is read from: UNKNOWN_INPUT_COLUMN with the from to write, before any row", async () => {
+    const h = harness({ "assets/t.ts": incremental().replace("incremental: true,", `incremental: { once: "key" },`) });
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2], S1) });
+    const err = await failure(step(h, await plan(h, "t")));
+    expect(err.code).toBe("UNKNOWN_INPUT_COLUMN");
+    expect(err.problem.message).toBe(`issues has no column "issue_id", which incremental: { once: "key" } reads the key of t from`);
+    expect(err.problem.fix).toMatchObject({ kind: "edit", file: "assets/t.ts", description: `incremental: { once: "key", from: { issue_id: "<column of issues>" } }` });
+    expect(err.problem.details).toMatchObject({ input: "issues", column: "issue_id", columns: ["id", "title"] });
+    expect(g.__t_seen).toBeUndefined();
+  });
+
+  test("the cost guard counts the keys that pay: an upstream rewrite of every row asks nothing; --rebuild counts every key", async () => {
+    const h = harness({
+      "assets/t.ts": `import { transform } from "@zabaca/croft";
+const g = globalThis as any;
+export default transform({
+  inputs: ["issues"],
+  key: "issue_id",
+  ${ONCE}
+  confirmAbove: 3,
+  async *rows({ newRows, http }) {
+    for await (const r of newRows("issues")) {
+      if (g.__t_api) await http.get(g.__t_api);
+      (g.__t_seen ??= []).push(String(r.id));
+      yield { issue_id: r.id };
+    }
+  },
+});
+`,
+    });
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2, 3], S1) });
+    const s = await plan(h, "t");
+    expect(s.usesHttp).toBe(true);
+    await step(h, s);
+    // Every row restamped (an upstream rebuild) and one new: one row to pay for, under confirmAbove.
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: [...issues([1, 2, 3], S2, () => "refetched"), ...issues([4], S2)] });
+    g.__t_seen = [];
+    await step(h, s);
+    expect(g.__t_seen).toEqual(["4"]);
+    // Four new keys go over it, and are counted before any code runs.
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([5, 6, 7, 8], S3) });
+    g.__t_seen = [];
+    const err = await failure(step(h, s));
+    expect(err.code).toBe("LARGE_REPROCESS");
+    expect(err.problem.details).toEqual({ pending: 4, confirmAbove: 3, inputs: { issues: 4 } });
+    expect(g.__t_seen).toEqual([]);
+    expect((await previewGuard(s, h.w, 100, new AbortController().signal))?.pending).toBe(4);
+    // A rebuild trashes the table first, so every key pays again.
+    expect((await rebuildGuard(s, h.w, new AbortController().signal))?.pending).toBe(8);
+  });
+});
+
 describe("croft preview's row cap", () => {
   test("each input gives at most `rows` rows, to rows(), newRows() and query(); ctx.preview is true", async () => {
     const h = harness({
@@ -1221,8 +1361,17 @@ export default transform({
 });
 
 describe("a crash in the middle of a chunk (CROFT_FAULT=mid_chunk)", () => {
-  test("the process dies after one committed chunk; the next run resumes after it", async () => {
-    const h = harness({ "assets/t.ts": incremental().replace(`(g.__t_seen ??= []).push(String(r.id));`, `require("node:fs").appendFileSync(g.__t_file ?? "/dev/null", r.id + "\\n");`) });
+  // Before the resume, rows 1-5 are edited upstream (restamped after every other row): rows 1-4 were committed before
+  // the crash, row 5 was lost with its chunk. incremental: true processes all five again after 6-10; once per key
+  // (D106) only row 5, whose key the table does not hold.
+  test.each([
+    ["incremental: true", "incremental: true,", ["6", "7", "8", "9", "10", "1", "2", "3", "4", "5"]],
+    ["once per key", `incremental: { once: "key", from: { issue_id: "id" } },`, ["6", "7", "8", "9", "10", "5"]],
+  ] as [string, string, string[]][])("%s: the process dies after one committed chunk; the next run resumes after it", async (_label, mode, resumed) => {
+    const h = harness({
+      "assets/t.ts": incremental().replace("incremental: true,", mode)
+        .replace(`(g.__t_seen ??= []).push(String(r.id));`, `require("node:fs").appendFileSync(g.__t_file ?? "/dev/null", r.id + "\\n");`),
+    });
     await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], S1) });
     await h.w.close();
     const seenFile = join(h.root, "seen.txt");
@@ -1273,8 +1422,9 @@ console.log("finished without the fault");
 
     writeFileSync(seenFile, "");
     g.__t_file = seenFile;
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2, 3, 4, 5], S2, () => "edited") });
     await step(h, await plan(h, "t"));
-    expect(readFileSync(seenFile, "utf8").trim().split("\n")).toEqual(["5", "6", "7", "8", "9", "10"]);
+    expect(readFileSync(seenFile, "utf8").trim().split("\n")).toEqual(resumed);
     expect(await all(h, `SELECT count(*)::INTEGER AS n FROM t`)).toEqual([{ n: 10 }]);
   }, 30_000);
 });

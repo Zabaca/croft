@@ -29,6 +29,7 @@ croft status                # failed, stale, held, never run, edited since its l
 - Avoid now()/current_date in assets (values freeze until the next rebuild); compute ages at query time.
 - Set `key` whenever records have an id. Incremental API ingests need a key.
 - TS transforms that call an API or LLM per row: keep `incremental: true` + `newRows()` (the template default).
+  A changed input row is sent, and paid for, again; to pay once per key, write `incremental: { once: "key" }`.
   Preview them with `--rows 20`: by default a preview hands them up to 1,000 input rows, each a paid call.
 - TS transforms read `newRows("x")` with no type argument: rows get x's column types, and `croft validate --types`
   catches a column renamed upstream. A BIGINT is `number | bigint`: `Number(row.x)` before arithmetic.

@@ -10,7 +10,9 @@
 // - The inputs of a TS transform (§3e "User code never holds the warehouse lock"): snapshotInput copies one
 //   input to <staging>/<asset>/in/<input>/, ordered by (_loaded_at, key), in full (all.parquet: rows() and
 //   query()) or only the rows after the transform's composite position in that input (new.parquet:
-//   newRows()). run/inputs.ts streams them.
+//   newRows()). run/inputs.ts streams them. A transform with incremental: { once: "key" } (D106) copies to
+//   new.parquet only the rows whose output key its own table does not hold yet, one per key: croft reads the
+//   transform's table here, under its own lease, while the code still cannot (UNDECLARED_INPUT).
 //
 // Parquet has no HUGEINT: DuckDB writes it as DOUBLE, which rounds 170141183460469231731687303715884105727 [V,
 // run/snapshot.test.ts]. HUGEINT columns are therefore written as text and cast back in the view. (DESIGN.md
@@ -19,7 +21,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { DuckDBConnection } from "@duckdb/node-api";
 import { CroftError } from "../core/errors.ts";
-import type { Sql } from "../core/types.ts";
+import type { OnceColumn, Sql } from "../core/types.ts";
 import type { Row } from "../types.ts";
 import { canonicalPath, openMemory } from "../db/connect.ts";
 import { hasState } from "../db/state.ts";
@@ -233,12 +235,64 @@ export function positionOrder(columns: readonly RealColumn[], key: readonly Real
   return cols.length ? ` ORDER BY ${cols.join(", ")}` : "";
 }
 
-/** How many rows of an input come after a position (all of them for null): the cost guard's count. */
-export async function countAfter(db: Sql, input: string, facts: InputFacts, pos: SeenPosition | null): Promise<number> {
+/**
+ * newRows() of a transform with incremental: { once: "key" } (§3e "Once per key", D106). Of the rows after the
+ * position, it hands over only those whose output key the transform's table does not hold, and of several rows
+ * with the same output key only the first in position order: a changed input row of a key already computed never
+ * reaches the code (or its paid calls) again. The output key is read from the input row, each key column from the
+ * input column `from` names.
+ */
+export interface OnceFilter {
+  /** The transform, whose table holds the keys already computed. */
+  asset: string;
+  columns: readonly OnceColumn[];
+  /** --rebuild: the table is about to go to the trash, so none of its keys count (rebuildGuard). */
+  absent?: boolean;
+}
+
+/** The `from` columns of a once-per-key transform that the input does not have (compared as DuckDB names are,
+ *  without case). */
+export function onceMissing(columns: readonly RealColumn[], once: readonly OnceColumn[]): OnceColumn[] {
+  return once.filter((o) => !columns.some((c) => c.name.toLowerCase() === o.from.toLowerCase()));
+}
+
+/**
+ * The SQL of a once-per-key filter over the input aliased SOURCE (run inside a lease): a WHERE term that leaves out
+ * the rows whose output key the table holds (none while it has no table, or lacks a key column), and a QUALIFY that
+ * keeps the first row of each output key, in position order. A row with a NULL in a `from` column is kept as it
+ * is: it has no output key to compare, and the merge refuses a NULL key (KEY_NULL) rather than croft hiding it.
+ * Each key column is compared with the input value cast to its type (TRY_CAST: a value that does not cast matches
+ * nothing, and the code gets the row). null when the input lacks a `from` column: newRows() refuses such an input
+ * (UNKNOWN_INPUT_COLUMN), and a count then counts every row, which errs toward asking.
+ */
+async function onceSql(db: Sql, facts: InputFacts, once: OnceFilter): Promise<{ where: string | null; qualify: string } | null> {
+  if (onceMissing(facts.columns, once.columns).length > 0) return null;
+  const col = (name: string) => facts.columns.find((c) => c.name.toLowerCase() === name.toLowerCase())!;
+  const from = once.columns.map((o) => ({ key: o.key, src: col(o.from) }));
+  const ref = (c: RealColumn) => `${SOURCE}.${quoteIdent(c.name)}`;
+  const nulls = from.map((f) => `${ref(f.src)} IS NULL`).join(" OR ");
+  const qualify = `${nulls} OR row_number() OVER (PARTITION BY ${from.map((f) => ref(f.src)).join(", ")}${positionOrder(facts.columns, facts.key)}) = 1`;
+  const own = once.absent ? null : await readTableSchema(db, once.asset);
+  const held = own ? from.map((f) => ({ ...f, out: own.find((c) => c.name.toLowerCase() === f.key.toLowerCase()) })) : [];
+  if (!own || held.some((h) => !h.out)) return { where: null, qualify };
+  const OWN = "__croft_own";
+  const match = held.map((h) => {
+    const value = h.out!.type === h.src.type ? ref(h.src) : `TRY_CAST(${ref(h.src)} AS ${h.out!.type})`;
+    return `${OWN}.${quoteIdent(h.out!.name)} = ${value}`;
+  });
+  return { where: `NOT EXISTS (SELECT 1 FROM main.${quoteIdent(once.asset)} AS ${OWN} WHERE ${match.join(" AND ")})`, qualify };
+}
+
+/** How many rows of an input come after a position (all of them for null): the cost guard's count, and for a
+ *  once-per-key transform (`once`) only the rows newRows() would hand over. */
+export async function countAfter(db: Sql, input: string, facts: InputFacts, pos: SeenPosition | null, once?: OnceFilter): Promise<number> {
   const hasStamp = facts.columns.some((c) => c.name === RESERVED.loadedAt);
-  const where = pos && hasStamp ? afterPosition(pos, facts.key) : null;
+  const after = pos && hasStamp ? afterPosition(pos, facts.key) : null;
+  const filter = once ? await onceSql(db, facts, once) : null;
+  const where = [after ? `(${after.sql})` : null, filter?.where ?? null].filter(Boolean);
   const [row] = await db.all<{ n: number | bigint }>(
-    `SELECT count(*) AS n FROM main.${quoteIdent(input)}${where ? ` WHERE ${where.sql}` : ""}`, where?.params ?? []);
+    `SELECT count(*) AS n FROM (SELECT 1 FROM main.${quoteIdent(input)} AS ${SOURCE}${where.length ? ` WHERE ${where.join(" AND ")}` : ""}`
+    + `${filter ? ` QUALIFY ${filter.qualify}` : ""})`, after?.params ?? []);
   return Number(row?.n ?? 0);
 }
 
@@ -265,6 +319,8 @@ export interface InputSnapshotOptions {
   after?: SeenPosition | null;
   /** At most this many rows, the first in position order (croft's preview row cap). */
   limit?: number;
+  /** A "new" snapshot of a once-per-key transform: only the rows whose output key is not computed yet (D106). */
+  once?: OnceFilter;
   signal?: AbortSignal;
 }
 
@@ -280,15 +336,30 @@ export async function snapshotInput(warehouse: DuckWarehouse, o: InputSnapshotOp
     if (!facts) return null;
     const hasStamp = facts.columns.some((c) => c.name === RESERVED.loadedAt);
     const after = o.kind === "new" && o.after && hasStamp ? o.after : null;
-    const where = after ? afterPosition(after, facts.key) : null;
+    const position = after ? afterPosition(after, facts.key) : null;
+    // Once per key (D106), decided here, under the same lease as the copy: against the table as committed when the
+    // step first reads the input. A key the step computes after that comes from a row of this copy, and the QUALIFY
+    // keeps one row per key, so the code never gets it twice.
+    const once = o.kind === "new" && o.once ? await onceSql(db, facts, o.once) : null;
+    if (o.kind === "new" && o.once && !once) {
+      const missing = onceMissing(facts.columns, o.once.columns).map((c) => c.from);
+      throw new CroftError("UNKNOWN_INPUT_COLUMN", {
+        asset: o.once.asset, message: `${o.input} has no column ${missing.map((m) => JSON.stringify(m)).join(", ")}, which incremental: { once: "key" } reads the output key from`,
+        hint: `name the input column each key column is read from: incremental: { once: "key", from: { <key column>: "<column of ${o.input}>" } }`,
+        details: { input: o.input, columns: missing },
+      });
+    }
+    const where = [position ? `(${position.sql})` : null, once?.where ?? null].filter(Boolean);
     const col = (c: RealColumn) => `${SOURCE}.${quoteIdent(c.name)}`;
     const select = facts.columns.map((c) => AS_TEXT.has(c.type) ? `CAST(${col(c)} AS VARCHAR) AS ${quoteIdent(c.name)}` : `${col(c)} AS ${quoteIdent(c.name)}`);
     // One row past the cap tells a capped copy from an input with exactly `limit` rows; readers stop at the cap.
     const limit = o.limit !== undefined ? ` LIMIT ${Math.max(0, Math.floor(o.limit)) + 1}` : "";
-    // WHERE binds the table's own (typed) columns; ORDER BY names them through the alias (positionOrder).
+    // WHERE binds the table's own (typed) columns; ORDER BY names them through the alias (positionOrder). QUALIFY
+    // runs before ORDER BY and LIMIT, so a preview's cap counts the rows the code would get.
     const [row] = await db.all<{ Count: number | bigint }>(
-      `COPY (SELECT ${select.join(", ")} FROM main.${quoteIdent(o.input)} AS ${SOURCE}${where ? ` WHERE ${where.sql}` : ""}${positionOrder(facts.columns, facts.key)}${limit})
-       TO ${quoteLiteral(path)} (FORMAT parquet)`, where?.params ?? []);
+      `COPY (SELECT ${select.join(", ")} FROM main.${quoteIdent(o.input)} AS ${SOURCE}${where.length ? ` WHERE ${where.join(" AND ")}` : ""}`
+      + `${once ? ` QUALIFY ${once.qualify}` : ""}${positionOrder(facts.columns, facts.key)}${limit})
+       TO ${quoteLiteral(path)} (FORMAT parquet)`, position?.params ?? []);
     const copied = Number(row?.Count ?? 0);
     const capped = o.limit !== undefined && copied > o.limit;
     return { input: o.input, kind: o.kind, path, facts, rows: capped ? Math.floor(o.limit!) : copied, capped, after };

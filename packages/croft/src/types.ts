@@ -41,9 +41,15 @@ export interface FileIngest extends IngestBase {
 }
 export interface TransformConfig extends Common {
   inputs: string[];                          // assets this code reads
-  incremental?: boolean;                     // newRows() + merge instead of replace; chunked commits (§3e)
+  incremental?: boolean | KeyOnce;           // newRows() + merge instead of replace; chunked commits (§3e)
   confirmAbove?: number;                     // cost guard threshold, default 1000 input rows (§5)
   rows(ctx: TransformContext): RowSource;
+}
+/** incremental: { once: "key" } (§3e, D106): newRows() skips an input row whose output key the table already holds,
+ *  so the code runs (and pays) once per key; edits to other columns of the input row never send it again. */
+export interface KeyOnce {
+  once: "key";
+  from?: Record<string, string>;             // output key column → the input column it is read from (default: same name)
 }
 
 export interface BaseContext {

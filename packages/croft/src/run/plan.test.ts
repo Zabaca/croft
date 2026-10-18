@@ -7,7 +7,7 @@ import { RunsDb } from "../history/runs-db.ts";
 import { tsFingerprint } from "../project/ts-asset.ts";
 import {
   backfillUnsupported, behaviorHash, behaviorLabel, behaviorWords, type BehaviorSide, type DuePlanning, FROM_ONLY_MERGE, fileDirsOf, isGlob, loadErrors,
-  pendingBehavior, pendingPins, type PlannedStep, planRun, rebuildCommand, rebuildSelectors, type RunPlan, resolveWrite, selectAssets, skipProblem, staleViewOf,
+  paidReadersOf, pendingBehavior, pendingPins, type PlannedStep, planRun, rebuildCommand, rebuildSelectors, type RunPlan, resolveWrite, selectAssets, skipProblem, staleViewOf,
 } from "./plan.ts";
 import { staleReasons } from "./staleness.ts";
 import { cleanupProjects, makeProject, writeFiles } from "./testkit.ts";
@@ -83,6 +83,9 @@ describe("behavior", () => {
     expect(behaviorWords("merge", ["issue_id"], { kind: "new-rows", inputs: ["github_issues"] }))
       .toBe("updates rows by issue_id; processes new and changed input rows once");
     expect(behaviorWords("append", [], { kind: "new-rows", inputs: ["events"] })).toBe("adds the new rows; processes new and changed input rows once");
+    // incremental: { once: "key" } (D106): each key once, whatever changes in its row.
+    expect(behaviorWords("merge", ["issue_id"], { kind: "new-rows", inputs: ["github_issues"], once: [{ key: "issue_id", from: "id" }] }))
+      .toBe("updates rows by issue_id; processes each key once; a changed input row of a key it holds is not processed again");
   });
 
   test("the behavior hash changes with write, key and cursor field, not with the lookback", () => {
@@ -678,6 +681,17 @@ describe("planRun --rebuild (§4.1, §6)", () => {
     expect(plain.triage).toMatchObject({ action: "update" });
     expect(plain.triage!.rebuild).toBeUndefined();
     expect(codes(plain.triage)).toEqual(["EDITED_SINCE_LAST_RUN"]);
+  });
+
+  test("an ingest's paid readers: incremental transforms that make requests, but not one that pays once per key (D106)", () => {
+    const reader = (incremental: Incremental, usesHttp = true) => ({ kind: "ts" as const, incremental, usesHttp });
+    const byName = new Map([
+      ["labels", reader({ kind: "new-rows", inputs: ["api"] })],
+      ["once", reader({ kind: "new-rows", inputs: ["api"], once: [{ key: "id", from: "id" }] })],
+      ["quiet", reader({ kind: "new-rows", inputs: ["api"] }, false)],
+      ["whole", reader({ kind: "none" })],
+    ]);
+    expect(paidReadersOf("api", ["whole", "quiet", "once", "labels"], byName)).toEqual(["labels"]);
   });
 });
 

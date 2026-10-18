@@ -8,7 +8,10 @@ export type Incremental =
   | { kind: "none" }
   | { kind: "cursor"; field: string; unit?: "s" | "ms"; lookbackMs: number }
   | { kind: "files" }
-  | { kind: "new-rows"; inputs: string[] };                  // TS newRows()
+  | { kind: "new-rows"; inputs: string[]; once?: OnceColumn[] };   // TS newRows(); once: { once: "key" } (D106)
+/** incremental: { once: "key" } as resolved (§3e, D106): each output key column, and the input column newRows()
+ *  reads it from to tell whether the table already holds the key. */
+export interface OnceColumn { key: string; from: string }
 export interface Check { source: string; kind: "unique" | "not_null" | "min_rows" | "rule";
   blocking: boolean; scope: "batch" | "table"; sql: string; reads: string[] }
 // ResolvedAsset (§10) is project/resolve.ts's: it carries the loaded TS and SQL modules, whose types core/ does

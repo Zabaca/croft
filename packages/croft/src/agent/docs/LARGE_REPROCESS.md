@@ -16,4 +16,7 @@ How the run asks:
 Other ways forward:
 - Try the code on a few rows first: croft preview <asset> --rows 20 (nothing real changes).
 - If the user wants runs this size to go ahead without asking, raise confirmAbove in the asset, with their yes.
+- Rows that changed upstream but whose results the transform already holds need not be paid for again:
+  incremental: { once: "key" } hands over only keys the table does not hold, and the guard counts only those
+  (croft docs transforms). Under incremental: true each changed row is sent again.
 - A transform that should make no requests at all: remove them, and the guard no longer applies.
