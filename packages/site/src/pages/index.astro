@@ -12,6 +12,8 @@ const title = 'croft: the whole data pipeline, in TypeScript'
 const description =
   'One tool for the whole data pipeline, in TypeScript: pull data from APIs and files, transform it, and keep it fresh on a schedule. One CLI, one DuckDB file, no Python.'
 const canonical = new URL('/', Astro.site).href
+// public/og.png, rendered from src/assets/og.svg. The docs pages name the same card (astro.config.mjs).
+const ogImage = new URL('/og.png', Astro.site).href
 
 // Braces in a template's text start an expression, so the code samples are strings.
 const ingestCode = `<span class="cm">// assets/stripe_charges.ts</span>
@@ -62,6 +64,13 @@ revenue_by_month   after inputs`
     <meta property="og:description" content={description} />
     <meta property="og:url" content={canonical} />
     <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="croft" />
+    <meta property="og:locale" content="en" />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content={title} />
+    <meta name="twitter:card" content="summary_large_image" />
     <script is:inline>
       // Follow the theme chosen in the docs (Starlight stores it as starlight-theme), else the system's.
       try {

@@ -1,0 +1,18 @@
+<!-- The share card (og:image) for every page. Crawlers don't read SVG, so public/og.png is this, rendered:
+     rsvg-convert -w 1200 -h 630 src/assets/og.svg -o public/og.png -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <rect width="1200" height="630" fill="#f7f4ec"/>
+  <g transform="translate(96 96) scale(2.5)">
+    <rect x="2" y="2" width="28" height="28" rx="7" fill="#2f5d3a"/>
+    <path d="M8 11h16M8 16h12M8 21h8" stroke="#f3e7c9" stroke-width="2.6" stroke-linecap="round"/>
+    <circle cx="23" cy="21" r="2.2" fill="#e0a24a"/>
+  </g>
+  <text x="196" y="156" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="46" font-weight="700" fill="#1b1a16">croft</text>
+  <text font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="84" font-weight="700" letter-spacing="-2.5" fill="#1b1a16">
+    <tspan x="96" y="330">The whole data pipeline,</tspan>
+    <tspan x="96" y="428" fill="#2f6b3e">in TypeScript.</tspan>
+  </text>
+  <text x="96" y="528" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="32" fill="#4c483e">One CLI, one DuckDB file, no Python.</text>
+  <text x="1104" y="528" text-anchor="end" font-family="Menlo, monospace" font-size="28" fill="#7c7668">croft.zabaca.com</text>
+  <rect y="606" width="1200" height="24" fill="#2f6b3e"/>
+</svg>

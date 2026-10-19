@@ -2,6 +2,9 @@ import starlight from '@astrojs/starlight'
 import { defineConfig } from 'astro/config'
 import { SITE } from './site.mjs'
 
+// Starlight writes every og: and twitter: tag but the image, and already asks for a large card.
+const ogImage = new URL('/og.png', SITE).href
+
 // Static output only: the homepage is src/pages/index.astro, the docs are Starlight under /docs/, and the
 // agent-facing files (llms.txt, llms-full.txt, a .md twin of every docs page, robots.txt) are endpoints in
 // src/pages that Astro renders to files at build time. worker/index.ts only picks between those files.
@@ -26,6 +29,10 @@ export default defineConfig({
           tag: 'link',
           attrs: { rel: 'alternate', type: 'text/plain', href: '/llms.txt', title: 'croft docs, for agents' },
         },
+        { tag: 'meta', attrs: { property: 'og:image', content: ogImage } },
+        { tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },
+        { tag: 'meta', attrs: { property: 'og:image:height', content: '630' } },
+        { tag: 'meta', attrs: { property: 'og:image:alt', content: 'croft: the whole data pipeline, in TypeScript' } },
       ],
       sidebar: [
         {
