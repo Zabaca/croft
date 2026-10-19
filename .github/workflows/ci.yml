@@ -9,9 +9,44 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  # Whether croft itself needs testing. A push or pull request that touches only the website, the infrastructure
+  # (zbc), the repository README or docs/ skips the suite and the smokes: croft's tests read none of those, and the
+  # site job below runs for every change anyway. Tags, manual runs and a first push of a branch test everything.
+  changes:
+    name: what changed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      croft: ${{ steps.diff.outputs.croft }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -eu
+          base=""
+          if [ "$EVENT" = push ] && [ "$REF_TYPE" = branch ]; then base="$BEFORE"; fi
+          if [ "$EVENT" = pull_request ]; then base="$BASE"; fi
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "croft=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          rest=$(git diff --name-only "$base" "$GITHUB_SHA" \
+            | grep -vE '^(packages/site/|packages/infra/|vendor/zbc/|docs/|README\.md$|zbc\.config\.ts$|\.zbc-vendor\.json$|\.sops\.yaml$)' || true)
+          if [ -n "$rest" ]; then echo "croft=true" >> "$GITHUB_OUTPUT"; else echo "croft=false" >> "$GITHUB_OUTPUT"; fi
+          echo "outside the site and infra: ${rest:-nothing}"
+
   # Tier 1 (DESIGN.md §10 item 8): macOS arm64, Linux x64 glibc and Linux arm64, on the Bun floor and latest.
   test:
     name: ${{ matrix.os }} · bun ${{ matrix.bun }}
+    needs: changes
+    if: needs.changes.outputs.croft == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -42,6 +77,8 @@ jobs:
   # Smoke: Alpine (musl) installs and prints its version, and a fresh project runs its example and answers a query.
   alpine:
     name: alpine smoke
+    needs: changes
+    if: needs.changes.outputs.croft == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     container: oven/bun:1.3.14-alpine
@@ -63,6 +100,8 @@ jobs:
   # Smoke: native Windows is unsupported in v1 (DESIGN.md §2); croft must say so clearly, not crash.
   windows:
     name: windows smoke
+    needs: changes
+    if: needs.changes.outputs.croft == 'true'
     runs-on: windows-2025
     timeout-minutes: 15
     steps:
