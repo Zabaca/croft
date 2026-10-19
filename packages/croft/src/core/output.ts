@@ -432,7 +432,10 @@ function pump(f: CapturedFds, flush: boolean): void {
       }
     } catch { /* keep reading from where it was */ }
   }
-  const cut = flush || f.partial.length > MAX_PARTIAL ? f.partial.length : f.partial.lastIndexOf("\n") + 1;
+  // Whole lines only; the unfinished tail waits for its newline, unless it alone is past MAX_PARTIAL (a line that
+  // never ends). Measuring all that was read instead split the last line of any read over 64 KB in two.
+  const whole = f.partial.lastIndexOf("\n") + 1;
+  const cut = flush || f.partial.length - whole > MAX_PARTIAL ? f.partial.length : whole;
   if (cut <= 0) return;
   const text = f.partial.slice(0, cut).replace(/\n$/, "");
   f.partial = f.partial.slice(cut);

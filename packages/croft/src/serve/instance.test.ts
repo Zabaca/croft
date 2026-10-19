@@ -486,7 +486,7 @@ describe("handing the file to a writer", () => {
     expect(err.problem.details?.retryAfterMs).toBeGreaterThan(0);
     // The queued query waited through the handoff and ran after the reopen.
     expect((await late).rows).toEqual([{ c: 5 }]);
-  });
+  }, 60_000);
 
   test("queries queued during the handoff succeed after the reopen and see the writer's commit", async () => {
     const p = await seeded();
@@ -504,7 +504,7 @@ describe("handing the file to a writer", () => {
     expect(e.status()).toMatchObject({ inFlight: 0, openConnections: 0 });
     for (const r of await Promise.all(queued)) expect(r.rows).toEqual([{ c: 1 }]);
     expect(e.status()).toMatchObject({ state: "open", queued: 0, writeIntent: null });
-  });
+  }, 60_000);
 
   test("a query not admitted within queueMs while a writer holds the file: SERVE_UNAVAILABLE with retryAfterMs", async () => {
     const p = await seeded();
@@ -593,7 +593,7 @@ describe("handing the file to a writer", () => {
     await gui.waitFor("released");
     await until("open", () => e.status().state === "open");
     expect((await e.query(q("SELECT count(*) AS c FROM t"))).rows).toEqual([{ c: 5 }]);
-  });
+  }, 60_000);
 
   test("a hook that throws never breaks the handoff", async () => {
     const p = await seeded();

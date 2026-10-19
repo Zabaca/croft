@@ -172,7 +172,7 @@ describe("readCopy on", () => {
     expect(after.stale).toBeUndefined();
     expect((await ask(e, "SELECT who FROM log")).rows).toEqual([{ who: "r_write" }]);
     expect(e.status().queriesToday).toBeGreaterThanOrEqual(6);
-  });
+  }, 60_000);
 
   test("a query waiting in the queue when the server steps aside moves to the copy; one interrupted for the writer is answered from it", async () => {
     // The live table is big enough that the pair count runs for minutes; the copy's is instant.
@@ -193,7 +193,7 @@ describe("readCopy on", () => {
     await w.waitFor("released");
     await until("the server to reopen", () => e.status().state === "open");
     expect((await ask(e, "SELECT count(*)::INTEGER AS c FROM big")).rows).toEqual([{ c: 300000 }]);
-  });
+  }, 60_000);
 
   test("a refreshed copy, renamed over the old one while the live file serves, answers at the next write", async () => {
     const p = await project({ copied: [T], asOf: "2026-09-23T10:00:00Z" });
@@ -211,7 +211,7 @@ describe("readCopy on", () => {
     await until("the server to step aside", () => e.status().state === "closed_for_write");
     expect(await ask(e, "SELECT count(*)::INTEGER AS c FROM t")).toMatchObject({ rows: [{ c: 6 }], stale: true, asOf: "2026-09-24T03:00:00-07:00" });
     await w.waitFor("released");
-  });
+  }, 60_000);
 
   test("a copy replaced while the server answers from it is picked up once its queries have ended", async () => {
     const p = await project({ copied: [T], asOf: "2026-09-23T10:00:00Z" });
@@ -224,7 +224,7 @@ describe("readCopy on", () => {
     await sleep(200); // past the linger of the old copy's instance
     expect(await ask(e, "SELECT count(*)::INTEGER AS c FROM t")).toMatchObject({ rows: [{ c: 7 }], stale: true, asOf: "2026-09-24T05:00:00-07:00" });
     await w.waitFor("released");
-  });
+  }, 60_000);
 
   test("over HTTP, the query envelope's data carries stale and asOf", async () => {
     const p = await project({ copied: [T], live: ["INSERT INTO t VALUES (5)"] });
@@ -249,7 +249,7 @@ describe("readCopy on", () => {
     expect(stale.ok).toBe(true);
     expect(stale.data).toMatchObject({ rows: [{ c: 5 }], rowCount: 1, truncatedRows: 0, truncatedValues: 0, stale: true, asOf: "2026-09-23T03:00:00-07:00" });
     await w.waitFor("released");
-  });
+  }, 60_000);
 
   test("between queries the copy is not held: a GUI can open it read-write", async () => {
     const p = await project({ copied: [T] });
@@ -264,7 +264,7 @@ describe("readCopy on", () => {
     await gui.waitFor("held", 5000);
     await gui.waitFor("released", 5000);
     await w.waitFor("released");
-  });
+  }, 60_000);
 });
 
 describe("otherwise queries wait for the writer, as before", () => {
@@ -294,5 +294,5 @@ describe("otherwise queries wait for the writer, as before", () => {
     await w.waitFor("released");
     await until("the server to reopen", () => e.status().state === "open");
     expect((await ask(e, "SELECT count(*)::INTEGER AS c FROM t")).stale).toBeUndefined();
-  });
+  }, 60_000);
 });

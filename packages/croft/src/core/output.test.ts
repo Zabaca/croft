@@ -109,6 +109,37 @@ describe("captureOutput: file descriptors 1 and 2", () => {
     expect(JSON.parse(r.stdout)).toEqual({ n: 50_001, first: `line-${"x".repeat(94)}`, last: "after", size: 0 });
   });
 
+  test("a pump that reads more than 64 KB ending mid-line keeps that line whole", async () => {
+    // 2,000 lines of 100 bytes, stopped at byte 150,050 (inside line 1,501) for longer than a pump interval.
+    const r = await script(`
+      const sink = out.collectingSink();
+      await out.captureOutput(sink, async () => {
+        const sh = 'f=$(mktemp); yes line-${"x".repeat(94)} | head -n 2000 > "$f"; head -c 150050 "$f"; sleep 0.3; tail -c +150051 "$f"';
+        await Bun.spawn(["sh", "-c", sh], { stdio: ["ignore", "inherit", "inherit"] }).exited;
+      });
+      const lines = sink.lines.join("\\n").split("\\n");
+      process.stdout.write(JSON.stringify({ n: lines.length, whole: lines.every((l) => l === lines[0]) }) + "\\n");
+    `);
+    expect(r.code, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout)).toEqual({ n: 2000, whole: true });
+  });
+
+  test("a line that never ends is passed on once it is past 64 KB, not held to the end", async () => {
+    const r = await script(`
+      const got = [];
+      const start = Date.now();
+      await out.captureOutput({ write: (t) => void got.push({ ms: Date.now() - start, chars: t.length }) }, async () => {
+        await Bun.spawn(["sh", "-c", "head -c 200000 /dev/zero | tr '\\\\\\\\0' x; sleep 1; echo"], { stdio: ["ignore", "inherit", "inherit"] }).exited;
+      });
+      process.stdout.write(JSON.stringify({ firstMs: got[0].ms, chars: got.reduce((n, g) => n + g.chars, 0) }) + "\\n");
+    `);
+    expect(r.code, r.stderr).toBe(0);
+    const { firstMs, chars } = JSON.parse(r.stdout);
+    expect(chars).toBe(200_000);
+    // It arrived during the second the line stayed open, not when the scope ended.
+    expect(firstMs).toBeLessThan(800);
+  });
+
   test("a subprocess started at an import's top level goes to the import's sink", async () => {
     const file = join(mkdtempSync(join(dir, "m-")), "shell.ts");
     writeFileSync(file, `import { $ } from "bun";\nawait $\`echo top-level shell\`;\nexport default 7;\n`);
