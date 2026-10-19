@@ -1,4 +1,4 @@
-# croft
+# <img src="https://croft.zabaca.com/favicon.svg" alt="" width="34" height="34" align="top"> croft
 
 **The whole data pipeline, in TypeScript.**
 
