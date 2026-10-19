@@ -14,7 +14,7 @@ import { CODES } from '../../croft/src/core/errors.ts'
 import { GUIDES, hrefFor, REFERENCE, toWebMarkdown } from '../scripts/reference.ts'
 import { SITE } from '../site.mjs'
 import { twinOf } from '../src/lib/twin.ts'
-import { markdownFor, wantsHtml } from '../worker/index.ts'
+import { byteRange, markdownFor, wantsHtml } from '../worker/index.ts'
 
 const ROOT = join(import.meta.dir, '..')
 const PLUGIN = join(ROOT, '../croft/plugin')
@@ -130,6 +130,16 @@ describe('the worker', () => {
     expect(markdownFor('/docs/reference/errors/unknown-column')).toBe('/docs/reference/errors/unknown-column.md')
     expect(markdownFor('/docs/quickstart.md')).toBeNull()
     expect(markdownFor('/_astro/x.css')).toBeNull()
+  })
+
+  test('the video in byte ranges, as Safari asks for it', () => {
+    expect(byteRange('bytes=0-1', 100)).toEqual({ start: 0, end: 1 })
+    expect(byteRange('bytes=0-', 100)).toEqual({ start: 0, end: 99 })
+    expect(byteRange('bytes=90-200', 100)).toEqual({ start: 90, end: 99 })
+    expect(byteRange('bytes=-10', 100)).toEqual({ start: 90, end: 99 })
+    expect(byteRange('bytes=100-', 100)).toBe('unsatisfiable')
+    expect(byteRange('bytes=0-1,5-6', 100)).toBeNull()
+    expect(byteRange(null, 100)).toBeNull()
   })
 
   test('links inside a twin go to twins', () => {

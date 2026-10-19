@@ -1,5 +1,6 @@
 // The site as one Worker: the static Astro build in dist/ as assets, and worker/index.ts in front of `/` and
-// `/docs/*` only, where it picks HTML or Markdown by Accept. Deployed by zbc (packages/infra/environments/
+// `/docs/*` only, where it picks HTML or Markdown by Accept, and of the homepage's video, which it serves in byte
+// ranges. Deployed by zbc (packages/infra/environments/
 // production/site.ts), which runs the build first. No route here: a hostname belongs to the zbc instance, so a
 // second deploy of this file under another name could never claim it.
 {
@@ -10,7 +11,7 @@
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
-    "run_worker_first": ["/", "/docs/*"],
+    "run_worker_first": ["/", "/docs/*", "/croft-demo.mp4"],
     "html_handling": "auto-trailing-slash",
     "not_found_handling": "404-page"
   },
