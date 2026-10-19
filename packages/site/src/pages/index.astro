@@ -10,7 +10,7 @@ import mark from '../assets/mark.svg?raw'
 
 const title = 'croft: the whole data pipeline, in TypeScript'
 const description =
-  'One tool for the whole data pipeline, in TypeScript: pull data from APIs and files, transform it, and keep it fresh on a schedule. One CLI, one DuckDB file, no Python.'
+  'One tool for the whole data pipeline, in TypeScript: pull data from APIs and files, transform it, and keep it fresh on a schedule. One CLI, one DuckDB file.'
 const canonical = new URL('/', Astro.site).href
 // public/og.png, rendered from src/assets/og.svg. The docs pages name the same card (astro.config.mjs).
 const ogImage = new URL('/og.png', Astro.site).href
@@ -141,7 +141,7 @@ revenue_by_month   after inputs`
       .hero { text-align: center; padding-block: 5rem 4.5rem; }
       h1 { font-size: clamp(2.3rem, 5.5vw, 3.8rem); line-height: 1.05; letter-spacing: -0.035em; margin: 0 auto 1.3rem; max-width: 22ch; font-weight: 720; text-wrap: balance; }
       h1 em { font-style: normal; color: var(--green); }
-      .lede { font-size: clamp(1.1rem, 2vw, 1.25rem); color: var(--ink-2); margin: 0 auto 2.2rem; max-width: 36rem; }
+      .lede { font-size: clamp(1.1rem, 2vw, 1.25rem); color: var(--ink-2); margin: 0 auto 2.2rem; max-width: 36rem; text-wrap: balance; }
       .ctas { display: flex; flex-wrap: wrap; justify-content: center; gap: 0.75rem; }
       .btn { display: inline-flex; align-items: center; padding: 0.8rem 1.3rem; border-radius: 10px; font-weight: 600; text-decoration: none; }
       .btn.primary { background: var(--green); color: var(--ground); }
@@ -149,6 +149,8 @@ revenue_by_month   after inputs`
       .btn.ghost { color: var(--ink); border: 1px solid var(--rule); }
       .btn.ghost:hover { border-color: var(--ink-3); }
       .fine { margin-top: 1.1rem; font-size: 0.9rem; color: var(--ink-3); }
+      .demo { margin: 3rem auto 0; max-width: 56rem; border-radius: 16px; overflow: hidden; border: 1px solid var(--rule); background: var(--sunk); box-shadow: 0 24px 60px -30px rgb(27 26 22 / 0.35); }
+      .demo video { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9; }
 
       section { padding-block: 4.5rem; border-top: 1px solid var(--rule); }
       h2 { font-size: clamp(1.6rem, 3.4vw, 2.2rem); letter-spacing: -0.025em; line-height: 1.15; margin: 0 0 0.75rem; font-weight: 700; }
@@ -250,16 +252,19 @@ revenue_by_month   after inputs`
       <div class="wrap hero">
         <p class="eyebrow">Data pipelines for TypeScript</p>
         <h1>The whole data pipeline, <em>in TypeScript.</em></h1>
-        <p class="lede">
-          croft is one tool that pulls data from APIs and files, transforms it, keeps it fresh on a schedule, and
-          serves it to your app. Pipelines are TypeScript, with SQL where you want it, and everything lives in one
-          DuckDB file. No Python, no servers, no glue between tools.
-        </p>
+        <p class="lede">Pull data in, transform it, keep it fresh. One CLI, one DuckDB file.</p>
         <div class="ctas">
           <a class="btn primary" href="/docs/quickstart/">Get started</a>
           <a class="btn ghost" href="/docs/concepts/">How it works</a>
         </div>
         <p class="fine">Free and open source · macOS and Linux</p>
+        <!-- The launch video (docs/launch/product-hunt/video/), a real croft 0.3.0 session in one minute. Captions
+             are in the picture, so it reads muted. preload="none": the 3.5 MB loads only when someone presses play. -->
+        <div class="demo">
+          <video controls playsinline preload="none" poster="/croft-demo-poster.jpg" width="1920" height="1080">
+            <source src="/croft-demo.mp4" type="video/mp4" />
+          </video>
+        </div>
       </div>
 
       <section>
