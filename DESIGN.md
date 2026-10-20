@@ -101,7 +101,7 @@ Created my-data/ (croft 0.1.0, timezone America/Los_Angeles)
 Installed dependencies (bun install, 2.1 s)
 Ran example_sales: 120 rows · checks ok
 Next: cd my-data && croft query "from example_sales limit 5"
-Claude Code: CLAUDE.md and .claude/skills/croft/SKILL.md are ready.
+Claude Code: CLAUDE.md, .claude/skills/croft/SKILL.md and .claude/agents/croft.md are ready.
 ```
 
 **The launcher.** The global `croft` is only a launcher:
@@ -125,6 +125,7 @@ The bin is `bin/croft.mjs`, a small plain-JavaScript entry. Its `#!/bin/sh` firs
 | `.gitignore` | `warehouse*.duckdb*`, `.croft/`, `.env`, `node_modules/` |
 | `CLAUDE.md` | a managed block between markers (§9); appended if the file already exists |
 | `.claude/skills/croft/SKILL.md` | the version-stamped skill (§9) |
+| `.claude/agents/croft.md` | the version-stamped subagent that preloads the skill (§9 item 2a, D110) |
 | `.claude/settings.json` | only with `--with-hook`: the PostToolUse hook that runs `croft validate --hook` after each edit, merged into an existing file (§9 item 7, D97). Without the flag init never writes it (D27). |
 | `assets/example_sales.ts` | a file ingest of `files/example_sales.csv`, so the first run needs no network; its comment points at `croft new --list` for the next asset |
 | `files/example_sales.csv` | 120 rows of sample data |
@@ -140,7 +141,7 @@ Both take absolute and `~/` paths, which is also how several git worktrees of on
 - It creates the project in a `data/` subfolder with its own `package.json`, `tsconfig.json` and `.gitignore`.
 - It adds `"data"` to the root `tsconfig.json` `exclude` list, so `next build` does not type-check assets without Bun types. Build (D100): it excludes `data/assets` and `data/lib` instead, and adds `data/.croft/types/**/*.d.ts` to `include`, so the app's `query<"table">()` is typed; excluding all of `data/` would drop the types too. It shows this edit as a diff and applies it only with confirmation on a TTY; otherwise it prints it.
 - It appends a root `CLAUDE.md` block that points at `data/`. The block says: "read croft data only with `import { query } from "@zabaca/croft/read"`; never open the .duckdb file directly".
-- It also writes the skill at the app root (`.claude/skills/croft/SKILL.md`), so Claude Code started at the app root can load the skill the root block names. That is a new croft-owned file, never an overwrite. `init --claude` and `doctor` handle both copies. A parent folder counts as the app root only when croft's own files are there (the skill, or croft markers in its `CLAUDE.md`), so `--claude` never writes into a folder croft never touched.
+- It also writes the skill and the agent at the app root (`.claude/skills/croft/SKILL.md`, `.claude/agents/croft.md`), so Claude Code started at the app root can load the skill the root block names, and hand work to the agent. Those are new croft-owned files, never an overwrite. `init --claude` and `doctor` handle both copies. A parent folder counts as the app root only when croft's own files are there (the skill, or croft markers in its `CLAUDE.md`), so `--claude` never writes into a folder croft never touched.
 - It prints the app-side steps: `bun add @zabaca/croft@<version>`, pinned to the project's croft version (or `pnpm add`, `yarn add` or `npm install`, picked from the app's lockfile), plus `serverExternalPackages: ['@duckdb/node-api']` when `next` is one of the app's dependencies.
 
 **`croft init` inside a package-manager workspace.** A project pins its own croft and keeps its own `bun.lock` (D42). A folder that the `workspaces` of a `package.json` above it take in (`packages/*`) is a workspace member instead: `bun install` there installs every member and keeps the lockfile at the workspace root, and the project's `node_modules` only links into the root's store [V: Bun 1.3.14]; a package manager that hoists leaves it without croft (`INSTALL_FAILED`). So init looks for the nearest `package.json` above the project with `workspaces` (a list, or `{ packages }`) and matches its patterns with `Bun.Glob`. When one takes the project in and no `!` pattern leaves it out, init prints the file, the pattern and the exclusion to add (`"!packages/pipelines"`), and returns them as `data.workspace` (D102). It edits nothing, because the workspace's `package.json` is the user's; `INSTALL_FAILED`'s page says the same.
@@ -194,7 +195,7 @@ Both take absolute and `~/` paths, which is also how several git worktrees of on
 | Bun's and DuckDB's tzdata disagree for the project zone | compare offsets every 12 h over the next 2 years, and every 15 min across transitions | `TZDATA_MISMATCH` (a warning): the first mismatching instant with both offsets; take days from SQL until Bun and croft are upgraded. Also raised when DuckDB does not know the zone |
 | Referenced secret missing | declared `secrets` vs environment and `.env`; the names come from importing the asset configs, as `croft secrets` does. Finding the assets needs DuckDB, so without a loadable binding the check is skipped with an info line | `SECRET_MISSING`: "add NAME=… to .env (or `croft secrets set NAME`)". A warning in `doctor`; it is an error only when an asset that needs the secret runs. With croft.json's `secretsFrom` (§9.8, D108), a name neither has is left to the command, which doctor never runs: an info line names it |
 | `secretsFrom` program not found | `Bun.which` of its first element on `PATH` and on the `PATH` scheduled runs get (§8), without running it | `SECRETS_COMMAND_FAILED` (a warning): install it, or give its absolute path |
-| Claude files older than the CLI | version stamp in SKILL.md | `CLAUDE_FILES_OUTDATED`: `croft init --claude` |
+| Claude files older than the CLI | version stamps in SKILL.md and the agent | `CLAUDE_FILES_OUTDATED`: `croft init --claude` |
 | Scheduler not ticking | scheduling on, and no tick for 3 min since the latest of the last heartbeat, turning it on and the end of a pause | `SCHEDULER_STALE` (a warning), with the tail of the tick log and a likely cause (§8) |
 
 ```
@@ -248,7 +249,7 @@ Phases 1 and 2 named the server "croft's read server", because their texts could
 
 ```
 my-data/
-  croft.json  package.json  tsconfig.json  .env  CLAUDE.md  .claude/skills/croft/SKILL.md
+  croft.json  package.json  tsconfig.json  .env  CLAUDE.md  .claude/skills/croft/SKILL.md  .claude/agents/croft.md
   assets/
     github_issues.ts     (a) API ingest: secret, ascending keyset pages, incremental → merge
     stripe_charges.ts    (a) API ingest: newest-first cursor pages, epoch cursor with lookback → merge
@@ -2259,6 +2260,45 @@ croft status                # failed, stale, held, never run, edited since its l
 - Never retry a non-retryable error unchanged.
 ```
 
+**2a. `.claude/agents/croft.md`** (D110), written wherever the skill is, and stamped and refreshed the same way. It makes the skill an agent with one job, used two ways. The main conversation hands it the project's data work as a subagent, and its `skills` field preloads the whole skill, so it starts with its manual. Or a person starts a session as it (`claude --agent croft`, or `"agent": "croft"` in `.claude/settings.json`), and its text replaces Claude Code's system prompt; there `skills` preloads nothing, so its text has it load the skill. What it adds to the skill is who can say yes. A subagent cannot ask the user anything (Claude Code takes `AskUserQuestion` from every subagent [V: code.claude.com/docs/en/sub-agents, read 2026-10-19]), and a yes in the task another agent wrote came before the user saw any impact, so as a subagent every "ask the user first" becomes "stop and return the impact and the command", run only when the main conversation answers with the user's yes; in its own session it asks, as the skill says. Stopping is the same both ways, and an agent unsure which it is acts as a subagent. Its front matter must be valid YAML: Claude Code skips an agent file whose wrapped `description` holds a `: `, and lists no error (a one-line one it reads anyway) [V: Claude Code 2.1.304, 2026-10-19]; `templates.test.ts` parses it. `agent/templates.test.ts` compares the shipped file with this text byte for byte, and `agent/contract.test.ts` checks the commands it names.
+
+```markdown
+---
+name: croft
+description: This project's data warehouse and BI, built with croft (DuckDB). Use proactively for any work on the
+  project's data, such as adding a source (an API, files, an export), building tables and reports, adding checks or
+  schedules, fixing a failed run, or answering a question from the data.
+skills:
+  - croft
+model: inherit
+---
+<!-- croft 0.1.0 -->
+You own this project's data warehouse. croft keeps it in one folder: each file in assets/ makes one table in one
+DuckDB file, ingests bring sources in, and transforms shape them into the tables people and apps read. Your job is
+to make the warehouse useful: bring in the data the project needs, model it into tables a report can read, and
+answer questions from it with numbers you have checked.
+
+The croft skill is your manual. As a subagent you start with it preloaded; a session started as this agent does
+not preload it, so if it is not in your context, load the `croft` skill before anything else. Start with
+`croft context --json`, and make every change through the skill's loop.
+
+You run either as a session of your own (`claude --agent croft`), where the user is talking to you, or as a
+subagent, where another agent handed you a task and the user cannot answer you. Where the skill says to ask the
+user first, stop either way: show the printed impact and the exact command, and end your turn.
+- In your own session, run it after the user's explicit yes, as the skill says.
+- As a subagent, return the impact and the command, for the main conversation to put to the user. A yes in your
+  task came before the user saw the impact, so it never counts; run it only when that conversation answers what
+  you returned with the user's yes. When unsure which you are, act as a subagent.
+- A missing secret: the user sets it with `croft secrets set NAME` in their own terminal; tell them, or return it.
+  Never read .env.
+
+When you finish, say:
+- the tables you added or changed, and what each one holds;
+- the commands that verified them, and what they showed;
+- for a question: the answer, the query behind it, and what it covers (dates, filters, truncated rows);
+- what is left undone, and why.
+```
+
 **3. The machine-readable contract** is in §4.3. In summary:
 
 - Every command has `--json`, with `schemaVersion: 1`, frozen by golden tests and published JSON Schemas (phase 5: `schemas/` in the package, generated from the TypeScript types, §4.3, D99).
@@ -3495,6 +3535,11 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Options: tell users to copy `warehouse.duckdb` by hand; `EXPORT DATABASE` or `ATTACH … COPY FROM DATABASE` on croft's own connection; `CHECKPOINT` plus a child-process clone under a write lease, as the read copy does. For where: a folder the user must name; `.croft/backups/` by default; a folder outside the project by default. For putting it back: a `croft restore` of backups; a separate command; manual steps.
 - Choice: `croft backup [<dir>]`, a new folder per backup in `<dir>` or `.croft/backups/`, with the warehouse checkpointed and cloned, `runs.sqlite` through `VACUUM INTO` and the trash cloned, all under one write lease behind a write intent, and `backup.json` written last; staged in `.croft/backups/` and copied across after the lease when `<dir>` is on another filesystem; never overwritten, never deleted. Putting one back is manual, documented in `croft docs backup`.
 - Reason: a hand copy while a writer or croft serve holds the file, or with commits in the WAL, is torn or short: a clone without `CHECKPOINT` missed 1,500 committed rows [V]. The lease is the one protocol every croft process already obeys, so croft serve steps aside and runs wait without new code, and the clone keeps it to milliseconds (172 MB: checkpoint 1.8 ms, clone 1.3 ms) where a plain copy took 61 ms, `EXPORT DATABASE` 156 ms and `COPY FROM DATABASE` 197 ms [V]; the last two rewrite every row and write only inside the sandbox's `allowed_directories`, so they could not reach another disk ("file system operations are disabled by configuration") [V]. `.croft/backups/` as the default works with no argument and clones for free, at the price of sharing the disk, which the output says; it is relocated with the state folder off synced folders. Restoring by hand keeps `croft restore` the trash's alone, and replacing a whole warehouse is rare and needs the user anyway; a command for it would need its own confirmation and checks against a running croft serve. The cost: a project with no cloning filesystem holds the file for a full copy, as the read copy does.
+
+**D110. A croft subagent next to the skill. (new, 2026-10-19; extends §9)**
+- Options: leave delegation to the user, who writes their own subagent around the skill; ship an agent only in the Claude Code plugin; have `croft init` write one into the project, beside the skill. For how it gets the skill: tell it in its text to load the skill; preload it through the `skills` field.
+- Choice: `croft init` writes `.claude/agents/croft.md` (§9 item 2a) wherever it writes the skill (the project, and the app root for a project in `data/`), stamped with the croft version; `init --claude` rewrites it and `doctor`'s `CLAUDE_FILES_OUTDATED` covers it. It preloads the skill with `skills: [croft]` and also says to load the skill when it is not in its context, which is the case in a session started as the agent. It names no `tools`, so it has what the session gives subagents, under the session's permission rules, with `model: inherit`. The plugin ships one too (`croft:croft`), whose text sends it to the project's skill inside a project and to the plugin's getting-started skill before there is one.
+- Reason: every project, however small, benefits from a warehouse and the reports on it, and the person who wants one most often asks their coding agent for it; a subagent that owns that work keeps the main conversation's context for the app, and a team gets one by name instead of writing it. The project copy is versioned with the skill it preloads, as the skill is with the CLI, so they never disagree; the plugin's copy cannot be, and only routes. Preloading is documented ("the full skill content is injected") [V: code.claude.com/docs/en/sub-agents, read 2026-10-19], and a session on a new project found the project skill by its bare name: the agent, with every tool denied, quoted the skill's Orient line and version stamp [V: Claude Code 2.1.304, 2026-10-19]. A session started as the agent (`claude -p --agent croft`) does not preload it and had no `AskUserQuestion`, and the agent's text was its system prompt [V: Claude Code 2.1.304, 2026-10-19]; the sentence in its text covers that case, and the person in that session can answer in the conversation. The one rule that depends on how it runs is asking. In a session of its own the user is there, and the skill's rule holds as written. As a subagent it has no `AskUserQuestion` [V, same page], and a yes it read in its task was given before the impact existed, so its text turns each ask-first step into a stop that returns the impact and the command, and runs it only when the main conversation answers with the user's yes. A subagent cannot check that answer, and does not need to: the main conversation could run `croft confirm` itself, so the gate is the person, through the `ask` rule below, not which agent types the command. In a session told up front that "the user already said yes", the subagent ran `croft delete`, stopped at the confirmation and returned; the main conversation then sent it the approval and it confirmed [V: Claude Code 2.1.304, haiku, 2026-10-19]. Both start by stopping with the impact and the command, so an agent that cannot tell which it is loses nothing by acting as a subagent. Permission prompts still reach the user from a subagent [V, same page], so the `ask` rule on `croft confirm` (item 7) gates it as well.
 
 ---
 

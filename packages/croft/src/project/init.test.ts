@@ -5,7 +5,7 @@ import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CroftError } from "../core/errors.ts";
 import { isValidTimeZone } from "../core/time.ts";
-import { claudeBlock, CROFT_VERSION, SKILL_PATH, skillMd, skillStamp } from "../agent/templates.ts";
+import { AGENT_PATH, agentMd, claudeBlock, CROFT_VERSION, SKILL_PATH, skillMd, skillStamp } from "../agent/templates.ts";
 import { appInstructions, appRootOf, bunInstall, claimingWorkspace, detectTimeZone, initProject, relocationPlan, type InitOptions } from "./init.ts";
 import { loadProject, relocationDir } from "./root.ts";
 
@@ -51,12 +51,13 @@ describe("croft init in an empty folder", () => {
     const r = await initProject(opts(target));
     expect(r).toMatchObject({ mode: "new", root: target, base: target, timezone: "Asia/Tokyo", relocation: null, tsconfig: null, appSteps: [] });
     expect(tree(target)).toEqual([
-      ".claude/", ".claude/skills/", ".claude/skills/croft/", ".claude/skills/croft/SKILL.md", ".croft/", ".env", ".env.example",
+      ".claude/", ".claude/agents/", ".claude/agents/croft.md", ".claude/skills/", ".claude/skills/croft/", ".claude/skills/croft/SKILL.md",
+      ".croft/", ".env", ".env.example",
       ".gitignore", "CLAUDE.md", "assets/", "assets/example_sales.ts", "croft.json", "files/", "files/example_sales.csv",
       "package.json", "tsconfig.json",
     ]);
     expect(r.files.map((f) => f.path)).toEqual([
-      "croft.json", "package.json", "tsconfig.json", ".gitignore", ".env", ".env.example", "CLAUDE.md", SKILL_PATH,
+      "croft.json", "package.json", "tsconfig.json", ".gitignore", ".env", ".env.example", "CLAUDE.md", SKILL_PATH, AGENT_PATH,
       "assets/example_sales.ts", "files/example_sales.csv",
     ]);
     expect(r.files.every((f) => f.action === "created")).toBe(true);
@@ -68,6 +69,7 @@ describe("croft init in an empty folder", () => {
     expect(read(join(target, ".gitignore"))).toContain("warehouse*.duckdb*\n.croft/\n.env\nnode_modules/\n");
     expect(read(join(target, "CLAUDE.md"))).toBe(claudeBlock("project"));
     expect(skillStamp(read(join(target, SKILL_PATH)))).toBe(CROFT_VERSION);
+    expect(read(join(target, AGENT_PATH))).toBe(agentMd());
     expect(read(join(target, "files/example_sales.csv")).trimEnd().split("\n")).toHaveLength(121);
     expect(statSync(join(target, ".env")).mode & 0o777).toBe(0o600);
     // The result is a valid project.
@@ -143,9 +145,11 @@ describe("croft init in an existing app repo", () => {
     for (const f of ["package.json", "tsconfig.json", "README.md", "bun.lock", "src/page.tsx"]) expect(read(join(app, f))).toBe(before[f]!);
     expect(read(join(app, "CLAUDE.md"))).toBe(`# Shop\n\nUse pnpm.\n\n${claudeBlock("app")}`);
     expect(read(join(app, SKILL_PATH))).toBe(skillMd());
+    expect(read(join(app, AGENT_PATH))).toBe(agentMd());
 
     expect(tree(join(app, "data"))).toEqual([
-      ".claude/", ".claude/skills/", ".claude/skills/croft/", ".claude/skills/croft/SKILL.md", ".croft/", ".env", ".env.example",
+      ".claude/", ".claude/agents/", ".claude/agents/croft.md", ".claude/skills/", ".claude/skills/croft/", ".claude/skills/croft/SKILL.md",
+      ".croft/", ".env", ".env.example",
       ".gitignore", "CLAUDE.md", "assets/", "assets/example_sales.ts", "croft.json", "files/", "files/example_sales.csv",
       "package.json", "tsconfig.json",
     ]);
@@ -153,7 +157,8 @@ describe("croft init in an existing app repo", () => {
     expect(r.files.map((f) => `${f.path}:${f.action}`)).toEqual([
       "data/croft.json:created", "data/package.json:created", "data/tsconfig.json:created", "data/.gitignore:created",
       "data/.env:created", "data/.env.example:created", "data/CLAUDE.md:created", `data/${SKILL_PATH}:created`,
-      "data/assets/example_sales.ts:created", "data/files/example_sales.csv:created", "CLAUDE.md:appended", `${SKILL_PATH}:created`,
+      `data/${AGENT_PATH}:created`, "data/assets/example_sales.ts:created", "data/files/example_sales.csv:created",
+      "CLAUDE.md:appended", `${SKILL_PATH}:created`, `${AGENT_PATH}:created`,
     ]);
 
     expect(r.tsconfig).toEqual({
@@ -234,15 +239,21 @@ describe("croft init --claude", () => {
     await initProject(opts(root));
     const again = await initProject(opts(root, { claudeOnly: true }));
     expect(again.mode).toBe("claude");
-    expect(again.files).toEqual([{ path: "CLAUDE.md", action: "unchanged" }, { path: SKILL_PATH, action: "unchanged" }]);
+    expect(again.files).toEqual([
+      { path: "CLAUDE.md", action: "unchanged" }, { path: SKILL_PATH, action: "unchanged" }, { path: AGENT_PATH, action: "unchanged" },
+    ]);
 
     // An older croft wrote these: a different block and an older stamp. The user's own text stays.
     writeFileSync(join(root, "CLAUDE.md"), "# Mine\n\n<!-- croft:start (managed by `croft init --claude`) -->\nold\n<!-- croft:end -->\n\n## More of mine\n");
     writeFileSync(join(root, SKILL_PATH), skillMd("0.0.1"));
+    writeFileSync(join(root, AGENT_PATH), agentMd("0.0.1"));
     const refreshed = await initProject(opts(root, { claudeOnly: true }));
-    expect(refreshed.files).toEqual([{ path: "CLAUDE.md", action: "replaced" }, { path: SKILL_PATH, action: "replaced" }]);
+    expect(refreshed.files).toEqual([
+      { path: "CLAUDE.md", action: "replaced" }, { path: SKILL_PATH, action: "replaced" }, { path: AGENT_PATH, action: "replaced" },
+    ]);
     expect(read(join(root, "CLAUDE.md"))).toBe(`# Mine\n\n${claudeBlock("project")}\n## More of mine\n`);
     expect(skillStamp(read(join(root, SKILL_PATH)))).toBe(CROFT_VERSION);
+    expect(skillStamp(read(join(root, AGENT_PATH)))).toBe(CROFT_VERSION);
     const third = await initProject(opts(root, { claudeOnly: true }));
     expect(third.files.every((f) => f.action === "unchanged")).toBe(true);
     // Nothing else was touched.
@@ -256,7 +267,9 @@ describe("croft init --claude", () => {
     rmSync(join(root, "CLAUDE.md"));
     const r = await initProject(opts(join(root, "assets"), { claudeOnly: true }));
     expect(r.root).toBe(root);
-    expect(r.files).toEqual([{ path: "CLAUDE.md", action: "created" }, { path: SKILL_PATH, action: "created" }]);
+    expect(r.files).toEqual([
+      { path: "CLAUDE.md", action: "created" }, { path: SKILL_PATH, action: "created" }, { path: AGENT_PATH, action: "created" },
+    ]);
 
     const e = await refusal(initProject(opts(fresh(), { claudeOnly: true })));
     expect(e.code).toBe("PROJECT_NOT_FOUND");
@@ -266,11 +279,13 @@ describe("croft init --claude", () => {
     const app = fresh({ "package.json": "{}", "CLAUDE.md": "# App\n" });
     await initProject(opts(app));
     writeFileSync(join(app, SKILL_PATH), skillMd("0.0.1"));
+    rmSync(join(app, AGENT_PATH));
     const r = await initProject(opts(app, { claudeOnly: true }));
     expect(r.root).toBe(join(app, "data"));
     expect(r.files).toEqual([
       { path: "data/CLAUDE.md", action: "unchanged" }, { path: `data/${SKILL_PATH}`, action: "unchanged" },
-      { path: "CLAUDE.md", action: "unchanged" }, { path: SKILL_PATH, action: "replaced" },
+      { path: `data/${AGENT_PATH}`, action: "unchanged" },
+      { path: "CLAUDE.md", action: "unchanged" }, { path: SKILL_PATH, action: "replaced" }, { path: AGENT_PATH, action: "created" },
     ]);
     expect(read(join(app, "CLAUDE.md"))).toBe(`# App\n\n${claudeBlock("app")}`);
   });
@@ -280,9 +295,10 @@ describe("croft init --claude", () => {
     await initProject(opts(join(parent, "data")));                  // package.json is in the parent, not in data/
     expect(appRootOf(join(parent, "data"))).toBeNull();
     const r = await initProject(opts(join(parent, "data"), { claudeOnly: true }));
-    expect(r.files.map((f) => f.path)).toEqual(["CLAUDE.md", SKILL_PATH]);
+    expect(r.files.map((f) => f.path)).toEqual(["CLAUDE.md", SKILL_PATH, AGENT_PATH]);
     expect(read(join(parent, "CLAUDE.md"))).toBe("# Monorepo\n");
     expect(existsSync(join(parent, SKILL_PATH))).toBe(false);
+    expect(existsSync(join(parent, AGENT_PATH))).toBe(false);
   });
 });
 

@@ -10,8 +10,8 @@ import { initProject } from "../project/init.ts";
 import { parseConfig } from "../project/root.ts";
 import { parseDotenv } from "../project/env.ts";
 import {
-  BLOCK_END, BLOCK_START, claudeBlock, croftJson, CROFT_VERSION, findBlock, gitignorePatterns, packageJson, scaffold,
-  SKILL_PATH, skillMd, skillStamp, tsconfigJson, UnbalancedBlock, upsertBlock,
+  AGENT_PATH, agentMd, BLOCK_END, BLOCK_START, claudeBlock, croftJson, CROFT_VERSION, findBlock, gitignorePatterns,
+  packageJson, scaffold, SKILL_PATH, skillMd, skillStamp, tsconfigJson, UnbalancedBlock, upsertBlock,
 } from "./templates.ts";
 
 const DESIGN = readFileSync(new URL("../../../../DESIGN.md", import.meta.url), "utf8");
@@ -26,6 +26,7 @@ function designBlock(marker: string): string {
 
 const CLAUDE_MD_9 = designBlock("**1. The `CLAUDE.md` managed block:**");
 const SKILL_MD_9 = designBlock("**2. `.claude/skills/croft/SKILL.md`:**");
+const AGENT_MD_9 = designBlock("**2a. `.claude/agents/croft.md`**");
 
 // Phase 5 ships every command and flag DESIGN.md §9 names, so both texts ship word for word: no line is cut or
 // reworded, and SKILL.md has no "This version" section (earlier phases rendered one from core/phase.ts to name what
@@ -114,6 +115,46 @@ describe("the Claude files are DESIGN.md §9, word for word", () => {
     expect(text.split("\n").indexOf("---", 1)).toBeGreaterThan(1);
   });
 
+  test("the agent (D110), stamped with the version", () => {
+    expect(agentMd("0.1.0")).toBe(AGENT_MD_9);
+    expect(agentMd()).toBe(AGENT_MD_9.replace("<!-- croft 0.1.0 -->", `<!-- croft ${CROFT_VERSION} -->`));
+    expect(agentMd()).not.toMatch(/\{\{\w*\}\}/);
+  });
+
+  test("agent front matter: named croft, preloads the croft skill, inherits the model and the session's tools", () => {
+    const lines = agentMd().split("\n");
+    const front = lines.slice(1, lines.indexOf("---", 1));
+    expect(lines[0]).toBe("---");
+    expect(front[0]).toBe("name: croft");
+    expect(front[1]!.startsWith("description: ")).toBe(true);
+    expect(front.slice(front.indexOf("skills:"), front.indexOf("skills:") + 2)).toEqual(["skills:", "  - croft"]);
+    expect(skillMd().split("\n")[1]).toBe("name: croft");          // the name the agent preloads
+    expect(front).toContain("model: inherit");
+    expect(front.some((l) => /^(tools|disallowedTools|permissionMode):/.test(l))).toBe(false);
+  });
+
+  test("the skill's and the agent's front matter is valid YAML (Claude Code skips an agent file whose isn't)", () => {
+    const front = (text: string) => Bun.YAML.parse(text.split("\n---\n")[0]!.slice("---\n".length)) as Record<string, unknown>;
+    const agent = front(agentMd());
+    expect(agent).toMatchObject({ name: "croft", skills: ["croft"], model: "inherit" });
+    expect(agent.description).toStartWith("This project's data warehouse and BI");
+    expect(front(skillMd())).toMatchObject({ name: "croft" });
+    expect(front(skillMd()).description).toStartWith("Build and operate");
+  });
+
+  test("the agent stops at every ask-first step; as a subagent, which cannot ask the user, it hands it back", () => {
+    const agent = agentMd();
+    expect(skillMd()).toContain("\n## Ask the user first");
+    expect(agent).toContain("Where the skill says to ask the\nuser first, stop either way: show the printed impact and the exact command, and end your turn.");
+    expect(agent).toContain("- In your own session, run it after the user's explicit yes, as the skill says.");
+    expect(agent).toContain("- As a subagent, return the impact and the command, for the main conversation to put to the user.");
+    expect(agent).toContain("A yes in your\n  task came before the user saw the impact, so it never counts");
+    expect(agent).toContain("When unsure which you are, act as a subagent.");
+    // A session started as the agent (claude --agent croft) does not preload the skill, so the text loads it.
+    expect(agent).toContain("if it is not in your context, load the `croft` skill before anything else");
+    expect(agent).toContain("Never read .env.");
+  });
+
   test("the app block points at data/ and at @zabaca/croft/read", () => {
     const app = claudeBlock("app");
     expect(app.startsWith(BLOCK_START)).toBe(true);
@@ -127,6 +168,7 @@ describe("the Claude files are DESIGN.md §9, word for word", () => {
 describe("skillStamp", () => {
   test("reads the version line, or null", () => {
     expect(skillStamp(skillMd("9.8.7"))).toBe("9.8.7");
+    expect(skillStamp(agentMd("9.8.7"))).toBe("9.8.7");
     expect(skillStamp("---\nname: croft\n---\nno stamp\n")).toBeNull();
   });
 });
@@ -206,7 +248,7 @@ describe("project templates", () => {
   test("the scaffold file list", () => {
     expect(scaffold({ timezone: "UTC" }).map((f) => f.path)).toEqual([
       "croft.json", "package.json", "tsconfig.json", ".gitignore", ".env", ".env.example", "CLAUDE.md",
-      SKILL_PATH, "assets/example_sales.ts", "files/example_sales.csv",
+      SKILL_PATH, AGENT_PATH, "assets/example_sales.ts", "files/example_sales.csv",
     ]);
   });
 

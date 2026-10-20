@@ -7,10 +7,15 @@ croft is built to be driven by an agent. In practice the agent writes most asset
 
 ## What a project gives the agent
 
-`croft init` writes two files for Claude Code, and `croft init --claude` refreshes them after an upgrade:
+`croft init` writes three files for Claude Code, and `croft init --claude` refreshes them after an upgrade:
 
 - **A managed block in `CLAUDE.md`**, between markers, that says the project uses croft, names the loop, and forbids reading `.env` or touching the warehouse except through croft.
 - **The skill, `.claude/skills/croft/SKILL.md`**, stamped with the project's croft version. It holds the loop, the conventions, the API pagination rules, the recipes (a failed run, a backfill, a rename, a wrong number) and the list of things to ask the user first. Because it ships with the pinned copy, it always describes the version the project runs, and `croft doctor` reports `CLAUDE_FILES_OUTDATED` when it falls behind.
+- **An agent, `.claude/agents/croft.md`**, that owns the project's data: adding sources, building tables and reports, fixing failed runs and answering questions from the warehouse. It works two ways:
+  - **As a subagent.** Claude hands it the data work on its own, or when asked (`@agent-croft`). It starts with the whole skill preloaded, and the main conversation keeps its context for the app. A subagent cannot ask the person anything, so where the skill says to ask first, it stops and returns the impact and the exact command for the main conversation to put to the person.
+  - **As a session of its own.** `claude --agent croft` starts a session that is the agent, with the person talking to it directly; `"agent": "croft"` in `.claude/settings.json` makes that the default. It loads the skill first, and asks before each destructive step as the skill says.
+
+  It is stamped and refreshed with the skill.
 
 `croft init --with-hook` also adds a Claude Code hook that runs `croft validate --hook` after every edit under `assets/` or `lib/`, so a broken asset is caught on the edit that broke it.
 

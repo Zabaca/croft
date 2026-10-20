@@ -2,10 +2,10 @@
 // Text files live next to this module so they can be read and reviewed as they ship: skill.md and
 // claude-md.md are the §9 texts word for word (agent/templates.test.ts compares them byte for byte, and
 // agent/contract.test.ts checks that every command and flag they name exists), and project/ holds the
-// scaffold. Files whose names would change behavior inside this repository are stored under neutral
-// names and renamed on write: a real .gitignore would apply to croft's own source tree (and npm drops
-// .gitignore files when packing), and a real CLAUDE.md or .claude/skills/ folder would be loaded by
-// Claude Code sessions working on croft.
+// scaffold; agent.md is the subagent of §9 item 2a (D110), compared the same way. Files whose names would
+// change behavior inside this repository are stored under neutral names and renamed on write: a real
+// .gitignore would apply to croft's own source tree (and npm drops .gitignore files when packing), and a
+// real CLAUDE.md or .claude/ folder would be loaded by Claude Code sessions working on croft.
 import { readFileSync } from "node:fs";
 import pkg from "../../package.json" with { type: "json" };
 
@@ -14,6 +14,8 @@ export const CROFT_VERSION: string = pkg.version;
 
 /** Where the skill lives in a project; Claude Code discovers skills under .claude/skills/<name>/. */
 export const SKILL_PATH = ".claude/skills/croft/SKILL.md";
+/** Where the subagent lives; Claude Code discovers project subagents under .claude/agents/. */
+export const AGENT_PATH = ".claude/agents/croft.md";
 export const CLAUDE_MD = "CLAUDE.md";
 
 // The managed block's markers. The start marker carries a note after "croft:start", so it is matched
@@ -30,7 +32,12 @@ export function skillMd(version: string = CROFT_VERSION): string {
   return read("./skill.md").replace("{{version}}", version);
 }
 
-/** The version stamped into a SKILL.md (`<!-- croft 0.1.0 -->`), or null when there is none. */
+/** The subagent that preloads the skill, stamped like SKILL.md (D110). */
+export function agentMd(version: string = CROFT_VERSION): string {
+  return read("./agent.md").replace("{{version}}", version);
+}
+
+/** The version stamped into a SKILL.md or the agent (`<!-- croft 0.1.0 -->`), or null when there is none. */
 export function skillStamp(text: string): string | null {
   return /^<!-- croft (\S+) -->$/m.exec(text)?.[1] ?? null;
 }
@@ -150,6 +157,7 @@ export function scaffold(o: ScaffoldOptions): TemplateFile[] {
     { path: ".env.example", text: env },
     { path: CLAUDE_MD, text: claudeBlock("project") },
     { path: SKILL_PATH, text: skillMd(version) },
+    { path: AGENT_PATH, text: agentMd(version) },
     { path: "assets/example_sales.ts", text: read("./project/assets/example_sales.ts") },
     { path: "files/example_sales.csv", text: read("./project/files/example_sales.csv") },
   ];

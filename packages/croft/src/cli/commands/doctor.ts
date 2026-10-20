@@ -39,7 +39,7 @@ import { BACKUPS_KEPT, backupsDir, compareEngineVersions, type EngineRecord, lis
 import { filesystemKind, folderKind, type FsKind } from "../../db/fs-kind.ts";
 import { isHolderAlive, liveIntents } from "../../db/intent.ts";
 import { readCopyStatus, readCopySummary } from "../../db/readcopy.ts";
-import { CLAUDE_MD, claudeBlock, findBlock, SKILL_PATH, skillStamp } from "../../agent/templates.ts";
+import { AGENT_PATH, CLAUDE_MD, claudeBlock, findBlock, SKILL_PATH, skillStamp } from "../../agent/templates.ts";
 import { type DriftEntry, driftTexts, recentDrift } from "../../history/drift.ts";
 import { listLeases } from "../../history/leases.ts";
 import { RUNS_DB_FILE, RunsDb } from "../../history/runs-db.ts";
@@ -1110,15 +1110,18 @@ function checkSecretsCommand(r: Report, d: DoctorDeps, project: Project, from: S
   }
 }
 
-/** CLAUDE.md's managed block and SKILL.md's version stamp against this croft (CLAUDE_FILES_OUTDATED). */
+/** CLAUDE.md's managed block, and the version stamps of SKILL.md and the agent, against this croft
+ *  (CLAUDE_FILES_OUTDATED). */
 export function claudeFilesStatus(root: string): { ok: boolean; reasons: string[] } {
   const reasons: string[] = [];
   const check = (dir: string, kind: "project" | "app", prefix: string) => {
-    const skill = join(dir, ...SKILL_PATH.split("/"));
-    if (!existsSync(skill)) reasons.push(`${prefix}${SKILL_PATH} is missing`);
-    else {
-      const stamp = skillStamp(readFileSync(skill, "utf8"));
-      if (stamp !== CROFT_VERSION) reasons.push(`${prefix}${SKILL_PATH} is for croft ${stamp ?? "(no version stamp)"}; this is croft ${CROFT_VERSION}`);
+    for (const path of [SKILL_PATH, AGENT_PATH]) {
+      const file = join(dir, ...path.split("/"));
+      if (!existsSync(file)) reasons.push(`${prefix}${path} is missing`);
+      else {
+        const stamp = skillStamp(readFileSync(file, "utf8"));
+        if (stamp !== CROFT_VERSION) reasons.push(`${prefix}${path} is for croft ${stamp ?? "(no version stamp)"}; this is croft ${CROFT_VERSION}`);
+      }
     }
     const claude = join(dir, CLAUDE_MD);
     let block: string | null = null;
@@ -1140,13 +1143,13 @@ export function claudeFilesStatus(root: string): { ok: boolean; reasons: string[
 function checkClaudeFiles(r: Report, root: string): void {
   const s = claudeFilesStatus(root);
   if (s.ok) {
-    r.add("project", "claude", "ok", `Claude files match croft ${CROFT_VERSION} (CLAUDE.md, ${SKILL_PATH})`);
+    r.add("project", "claude", "ok", `Claude files match croft ${CROFT_VERSION} (CLAUDE.md, ${SKILL_PATH}, ${AGENT_PATH})`);
     return;
   }
   const p = problem("CLAUDE_FILES_OUTDATED", {
     message: `the Claude Code files are out of date: ${s.reasons.join("; ")}`,
     hint: "run croft init --claude",
-    fix: { kind: "command", description: "refresh CLAUDE.md's croft block and the croft skill", command: "croft init --claude" },
+    fix: { kind: "command", description: "refresh CLAUDE.md's croft block, the croft skill and the croft agent", command: "croft init --claude" },
     details: { reasons: s.reasons },
   });
   r.add("project", "claude", "warn", `CLAUDE_FILES_OUTDATED ${s.reasons[0]}${s.reasons.length > 1 ? ` (+${s.reasons.length - 1} more)` : ""}`, p);

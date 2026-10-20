@@ -1,7 +1,7 @@
 {
   "name": "croft",
   "version": "0.3.0",
-  "description": "Start a croft data pipeline from nothing: install, croft init, and the validate → preview → run loop. Inside a project, croft's own versioned skill takes over.",
+  "description": "Start a croft data pipeline from nothing: install, croft init, and the validate → preview → run loop, as a skill and as a croft subagent. Inside a project, croft's own versioned skill and agent take over.",
   "author": { "name": "Zabaca", "url": "https://github.com/Zabaca/croft" },
   "homepage": "https://croft.zabaca.com",
   "license": "MIT",

@@ -5,7 +5,7 @@
     {
       "name": "croft",
       "source": "./packages/croft/plugin",
-      "description": "Teaches an agent to start a croft project from nothing: install, croft init, and the loop. Each project then carries its own skill for its pinned croft version."
+      "description": "Teaches an agent to start a croft project from nothing: install, croft init, and the loop, with a croft subagent to hand the data work to. Each project then carries its own skill and agent for its pinned croft version."
     }
   ]
 }

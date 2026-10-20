@@ -34,7 +34,7 @@ import type { Ctx } from "../cli/command.ts";
 import { docs } from "../cli/commands/docs.ts";
 import { COMMANDS } from "../cli/commands/index.ts";
 import { EXEMPT, type Finding, registered, scan, sourceFiles, sourceStrings, SRC } from "./contract-testkit.ts";
-import { claudeBlock, scaffold, skillMd, tsconfigJson } from "./templates.ts";
+import { agentMd, claudeBlock, scaffold, skillMd, tsconfigJson } from "./templates.ts";
 
 // ---------------------------------------------------------------------------------------------------------
 // What the agent reads
@@ -101,11 +101,12 @@ describe("croft tells the agent to use only what this build has", () => {
     expect(scan("t", "the project's own tsc --noEmit; croft validate --types")).toEqual([]);
   });
 
-  test("CLAUDE.md (project and app) and SKILL.md", () => {
+  test("CLAUDE.md (project and app), SKILL.md and the agent", () => {
     const findings = [
       ...scan("CLAUDE.md", claudeBlock("project")),
       ...scan("CLAUDE.md (app)", claudeBlock("app")),
       ...scan("SKILL.md", skillMd()),
+      ...scan("agents/croft.md", agentMd()),
     ];
     expect(findings).toEqual([]);
   });

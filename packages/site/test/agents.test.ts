@@ -1,6 +1,7 @@
 // What an agent reads must agree with what croft does.
 //
-// The plugin's skill (packages/croft/plugin) teaches the start of a project before an agent has seen the docs, and
+// The plugin's skill (packages/croft/plugin) teaches the start of a project before an agent has seen the docs, its
+// agent hands that start, or a project's own skill, to a subagent (D110), and
 // the docs pages teach the same start at length. Two documents that say the same thing drift, and a skill that is
 // confidently wrong is worse than none. So every line of every ```sh block in the skill must appear, verbatim, in a
 // ```sh block of a hand-written docs page; every `croft <command>` named in the skill or those pages must be a
@@ -19,6 +20,7 @@ import { byteRange, markdownFor, wantsHtml } from '../worker/index.ts'
 const ROOT = join(import.meta.dir, '..')
 const PLUGIN = join(ROOT, '../croft/plugin')
 const SKILL = readFileSync(join(PLUGIN, 'skills/getting-started/SKILL.md'), 'utf8')
+const AGENT = readFileSync(join(PLUGIN, 'agents/croft.md'), 'utf8')
 const DOCS_DIR = join(ROOT, 'src/content/docs/docs')
 const PAGES = readdirSync(DOCS_DIR)
   .filter((f) => f.endsWith('.md'))
@@ -62,6 +64,21 @@ describe('the plugin skill', () => {
     expect(plugin.homepage).toBe(SITE)
   })
 
+  test('ships an agent that routes to the project skill or this one, and hands ask-first steps back', () => {
+    expect(AGENT.startsWith('---\nname: croft\ndescription: ')).toBe(true)
+    // Claude Code skips an agent file whose front matter is not valid YAML, without an error (D110).
+    for (const text of [AGENT, SKILL]) {
+      const front = Bun.YAML.parse(text.split('\n---\n')[0]!.slice('---\n'.length)) as Record<string, unknown>
+      expect(typeof front.name).toBe('string')
+      expect(typeof front.description).toBe('string')
+    }
+    expect(AGENT).toContain("the project has its own `croft` skill")
+    expect(AGENT).toContain("load this plugin's `croft:getting-started` skill")
+    expect(AGENT).toContain('- As a subagent, return the impact and the command, for the main conversation to put to the user.')
+    expect(AGENT).toContain('`claude --agent croft:croft`')
+    expect(SKILL).toContain('`.claude/agents/croft.md`')
+  })
+
   test('is listed by the repository marketplace', () => {
     const market = JSON.parse(readFileSync(join(ROOT, '../../.claude-plugin/marketplace.json'), 'utf8'))
     expect(market.plugins.map((p: { source: string }) => p.source)).toContain('./packages/croft/plugin')
@@ -69,7 +86,7 @@ describe('the plugin skill', () => {
 })
 
 describe('commands named to an agent', () => {
-  for (const { name, text } of [{ name: 'SKILL.md', text: SKILL }, ...PAGES]) {
+  for (const { name, text } of [{ name: 'SKILL.md', text: SKILL }, { name: 'agents/croft.md', text: AGENT }, ...PAGES]) {
     test(`${name} names only commands croft has`, () => {
       for (const cmd of croftCommands(text)) expect(COMMAND_NAMES.has(cmd), `croft ${cmd}`).toBe(true)
     })

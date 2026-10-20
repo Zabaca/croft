@@ -23,8 +23,9 @@ croft init my-data
 cd my-data
 ```
 
-`croft init` installs the project's pinned croft, runs an offline example, and writes the project skill and a
-`CLAUDE.md` block. From then on, follow the project skill. Inside an existing app (a `package.json` is there),
+`croft init` installs the project's pinned croft, runs an offline example, and writes the project skill, a
+`croft` subagent that preloads it (`.claude/agents/croft.md`) and a `CLAUDE.md` block. From then on, follow the
+project skill, or hand the project's data work to that agent. Inside an existing app (a `package.json` is there),
 `croft init` puts the project in `data/` and never overwrites the app's files.
 
 ## The loop, in short

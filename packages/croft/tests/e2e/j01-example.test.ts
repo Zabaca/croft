@@ -10,7 +10,7 @@ const ENVELOPE = ["command", "croftVersion", "data", "database", "durationMs", "
 test("journey 1: init → run example_sales → query/status/describe/context → run again keeps _loaded_at", async () => {
   const { project: p, init } = await initProject("my-data");
   expect(init.json).toMatchObject({ ok: true, command: "init" });
-  for (const f of ["croft.json", "package.json", "tsconfig.json", ".env", ".env.example", ".gitignore", "CLAUDE.md", ".claude/skills/croft/SKILL.md", "assets/example_sales.ts", "files/example_sales.csv"]) {
+  for (const f of ["croft.json", "package.json", "tsconfig.json", ".env", ".env.example", ".gitignore", "CLAUDE.md", ".claude/skills/croft/SKILL.md", ".claude/agents/croft.md", "assets/example_sales.ts", "files/example_sales.csv"]) {
     expect(p.exists(f)).toBe(true);
   }
   const cfg = JSON.parse(p.read("croft.json"));

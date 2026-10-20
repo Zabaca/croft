@@ -35,7 +35,7 @@ describe("croft init (command)", () => {
     expect(r.exit).toBe(0);
     expect(r.env).toMatchObject({ ok: true, command: "init", problems: [] });
     expect(r.env.data).toMatchObject({ mode: "new", root: join(cwd, "my-data"), version: CROFT_VERSION });
-    expect(r.env.data.files).toHaveLength(10);
+    expect(r.env.data.files).toHaveLength(11);
     expect(r.env.next).toEqual([
       { command: "cd my-data && bun install", reason: "install croft and its DuckDB binding into the project" },
       { command: "cd my-data && croft run example_sales", reason: "load the example table from files/example_sales.csv (no network needed)" },
@@ -49,7 +49,7 @@ describe("croft init (command)", () => {
     expect(r.exit).toBe(0);
     const lines = r.stdout.split("\n");
     expect(lines[0]).toMatch(new RegExp(`^Created shop data/ \\(croft ${CROFT_VERSION.replace(/\./g, "\\.")}, timezone [\\w/+-]+\\)$`));
-    expect(r.stdout).toContain("Claude Code: CLAUDE.md and .claude/skills/croft/SKILL.md are ready.");
+    expect(r.stdout).toContain("Claude Code: CLAUDE.md, .claude/skills/croft/SKILL.md and .claude/agents/croft.md are ready.");
     expect(r.stdout).toContain("next: cd 'shop data' && croft run example_sales");
   });
 
@@ -247,7 +247,7 @@ describe("init output helpers", () => {
       ".croft/ live in /Users/a/.local/share/croft/p-12345678 instead (recorded in croft.json). Your asset files stay here.",
       "Installed dependencies (bun install, 2.1 s)",
       "Ran example_sales: 120 rows · checks ok",
-      "Claude Code: CLAUDE.md and .claude/skills/croft/SKILL.md are ready. croft docs claude-permissions suggests permission rules.",
+      "Claude Code: CLAUDE.md, .claude/skills/croft/SKILL.md and .claude/agents/croft.md are ready. croft docs claude-permissions suggests permission rules.",
     ]);
     const failed = describeInit(result({ install: { ran: true, ok: false, command: "bun install", ms: 900, output: "error: offline" } }), "/w");
     expect(failed).toContain("bun install failed after 900 ms; the project is created but cannot run yet:\n    error: offline");

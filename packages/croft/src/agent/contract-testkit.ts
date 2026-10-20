@@ -21,9 +21,9 @@ export const optionsOf = (name: string): Set<string> => new Set([
 const everyFlag = new Set([...COMMANDS.flatMap((c) => Object.keys(c.options)), ...Object.keys(GLOBAL_OPTIONS)]);
 
 // Flags of other programs that croft's texts quote (bun, git, curl, tsc's --pretty, which validate --types
-// passes, and sops's --output-type, in the secretsFrom example). A camelCase flag (tsc --noEmit) is never croft's:
-// FLAG matches only whole lower-case kebab words.
-const FOREIGN_FLAGS = new Set(["no-env-file", "pretty", "output-type"]);
+// passes, sops's --output-type, in the secretsFrom example, and claude's --agent, in the agent's text). A camelCase
+// flag (tsc --noEmit) is never croft's: FLAG matches only whole lower-case kebab words.
+const FOREIGN_FLAGS = new Set(["no-env-file", "pretty", "output-type", "agent"]);
 const FLAG = /(?<![\w-])--([a-z][a-z-]*)(?![\w])/g;
 
 /** Where a command's span ends: the next backtick, arrow, clause break or command. */

@@ -197,7 +197,9 @@ export function describe(r: InitResult, from: string): string {
       ? `Ran ${r.example.asset}: ${r.example.rows.toLocaleString("en-US")} rows · checks ${r.example.checks}`
       : `${r.example.asset} did not run cleanly; see croft logs ${r.example.asset} --failed`);
   }
-  const claudeFiles = r.mode === "app" ? "CLAUDE.md (here and in data/) and the croft skill" : "CLAUDE.md and .claude/skills/croft/SKILL.md";
+  const claudeFiles = r.mode === "app"
+    ? "CLAUDE.md (here and in data/), the croft skill and the croft agent"
+    : "CLAUDE.md, .claude/skills/croft/SKILL.md and .claude/agents/croft.md";
   lines.push(`Claude Code: ${claudeFiles} are ready. croft docs claude-permissions suggests permission rules.`);
   if (hookInstalled(r)) lines.push(HOOK_LINE);
   return lines.join("\n");

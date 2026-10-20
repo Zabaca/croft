@@ -1,5 +1,11 @@
 # croft
 
+## Why croft exists
+
+Every project benefits from a BI layer: a warehouse with all the data that matters in one place, and a pipeline that keeps it fresh. Not only companies with a data team, but a vibe-coded app, a side project, a company just getting started. croft exists so they can have one, and so the AI and the human working on the project can both query it, build reports and find insights from the same place.
+
+When weighing a change, favor what keeps that true: a first warehouse should take minutes and no data-engineering background, and everything croft offers a person it should offer an agent too (and the reverse).
+
 This project uses [zbc](https://github.com/Zabaca/zbc) for infrastructure scaffolding.
 
 ## Layout

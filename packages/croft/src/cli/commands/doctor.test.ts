@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { CODES } from "../../core/errors.ts";
 import { offsetSeconds } from "../../core/time.ts";
-import { CROFT_VERSION, SKILL_PATH, skillMd } from "../../agent/templates.ts";
+import { AGENT_PATH, agentMd, CROFT_VERSION, SKILL_PATH, skillMd } from "../../agent/templates.ts";
 import { ENGINE_SETTING } from "../../db/backup.ts";
 import type { FsKind } from "../../db/fs-kind.ts";
 import { STATE_DDL } from "../../db/state.ts";
@@ -708,20 +708,26 @@ export default ingest({ secrets: names, key: "id", async *rows() { await Bun.wri
     });
   });
 
-  test("CLAUDE_FILES_OUTDATED: old stamp, missing skill, edited block; fixed by croft init --claude", async () => {
+  test("CLAUDE_FILES_OUTDATED: old stamp, missing skill or agent, edited block; fixed by croft init --claude", async () => {
     const root = await project();
     writeFileSync(join(root, SKILL_PATH), skillMd("0.0.1"));
+    writeFileSync(join(root, AGENT_PATH), agentMd("0.0.1"));
     const old = await runDoctor(root, deps());
     const p = old.problems.find((x) => x.code === "CLAUDE_FILES_OUTDATED")!;
-    expect(p.message).toContain(`${SKILL_PATH} is for croft 0.0.1; this is croft ${CROFT_VERSION}`);
-    expect(p.fix).toEqual({ kind: "command", description: "refresh CLAUDE.md's croft block and the croft skill", command: "croft init --claude" });
+    expect(p.details!.reasons).toEqual([
+      `${SKILL_PATH} is for croft 0.0.1; this is croft ${CROFT_VERSION}`, `${AGENT_PATH} is for croft 0.0.1; this is croft ${CROFT_VERSION}`,
+    ]);
+    expect(p.fix).toEqual({
+      kind: "command", description: "refresh CLAUDE.md's croft block, the croft skill and the croft agent", command: "croft init --claude",
+    });
     expect(CODES.CLAUDE_FILES_OUTDATED.severity).toBe("warning");
 
     rmSync(join(root, SKILL_PATH));
+    rmSync(join(root, AGENT_PATH));                // a project an older croft made has no agent
     writeFileSync(join(root, "CLAUDE.md"), "<!-- croft:start -->\nold words\n<!-- croft:end -->\n");
     const worse = await runDoctor(root, deps());
     expect(worse.problems.find((x) => x.code === "CLAUDE_FILES_OUTDATED")!.details!.reasons).toEqual([
-      `${SKILL_PATH} is missing`, `CLAUDE.md's croft block differs from croft ${CROFT_VERSION}'s`,
+      `${SKILL_PATH} is missing`, `${AGENT_PATH} is missing`, `CLAUDE.md's croft block differs from croft ${CROFT_VERSION}'s`,
     ]);
 
     await initProject({ target: root, claudeOnly: true });

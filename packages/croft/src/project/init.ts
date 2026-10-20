@@ -3,7 +3,7 @@
 //   - a folder with a package.json (an app) gets a croft project in data/, and the app's own files are
 //     never overwritten: the root CLAUDE.md gets a managed block, and the tsconfig "exclude" edit is only
 //     applied after a yes on a TTY (otherwise it is printed);
-//   - --claude only refreshes the Claude files (managed block replaced in place, SKILL.md rewritten).
+//   - --claude only refreshes the Claude files (managed block replaced in place, SKILL.md and the agent rewritten).
 // Everything is planned first and written afterwards, so a refusal (an existing project, unbalanced
 // CLAUDE.md markers) leaves the disk untouched. Nothing here imports DuckDB: init must work before
 // `bun install` has fetched the native binding.
@@ -14,8 +14,8 @@ import { CroftError } from "../core/errors.ts";
 import type { Problem } from "../core/types.ts";
 import { checkTimeZone, systemTimeZone } from "../core/time.ts";
 import {
-  BLOCK_START, CLAUDE_MD, claudeBlock, CROFT_PACKAGE, CROFT_VERSION, gitignorePatterns, scaffold, SKILL_PATH,
-  skillMd, UnbalancedBlock, upsertBlock, type BlockAction,
+  AGENT_PATH, agentMd, BLOCK_START, CLAUDE_MD, claudeBlock, CROFT_PACKAGE, CROFT_VERSION, gitignorePatterns, scaffold,
+  SKILL_PATH, skillMd, UnbalancedBlock, upsertBlock, type BlockAction,
 } from "../agent/templates.ts";
 import { planExclude } from "./init-tsconfig.ts";
 import { CONFIG_FILE, findRoot, relocationDir, syncedLocation } from "./root.ts";
@@ -182,9 +182,9 @@ export async function initProject(o: InitOptions): Promise<InitResult> {
   if (app) {
     const claude = join(target, CLAUDE_MD);
     writes.push({ abs: claude, rel: CLAUDE_MD, ...blockWrite(claude, claudeBlock("app")), note: `points Claude Code at ${DATA_DIR}/` });
-    // Claude Code runs from the app folder, so the skill the root block names must be discoverable there too.
-    const skill = join(target, ...SKILL_PATH.split("/"));
-    writes.push({ ...planManaged(skill, skillMd(version)), rel: SKILL_PATH });
+    // Claude Code runs from the app folder, so the skill the root block names, and the agent, must be
+    // discoverable there too.
+    writes.push(...managedWrites(target, version, rel));
     const tsconfig = join(target, "tsconfig.json");
     if (existsSync(tsconfig)) tsPlan = planExclude(readFileSync(tsconfig, "utf8"), "tsconfig.json", DATA_DIR);
     appSteps.push(...appInstructions(target, version));
@@ -234,7 +234,7 @@ export async function initProject(o: InitOptions): Promise<InitResult> {
   };
 }
 
-/** --claude: refresh CLAUDE.md's block and the skill of the project at (or above, or in data/ of) target. */
+/** --claude: refresh CLAUDE.md's block, the skill and the agent of the project at (or above, or in data/ of) target. */
 async function refreshClaude(target: string, o: InitOptions): Promise<InitResult> {
   const root = existsSync(join(target, CONFIG_FILE)) ? target : findRoot(target);
   if (!root) {
@@ -251,13 +251,11 @@ async function refreshClaude(target: string, o: InitOptions): Promise<InitResult
   const writes: Write[] = [];
   const claude = join(root, CLAUDE_MD);
   writes.push({ abs: claude, rel: rel(claude), ...blockWrite(claude, claudeBlock("project")) });
-  const skill = join(root, ...SKILL_PATH.split("/"));
-  writes.push({ ...planManaged(skill, skillMd(version)), rel: rel(skill) });
+  writes.push(...managedWrites(root, version, rel));
   if (parent) {
     const appClaude = join(parent, CLAUDE_MD);
     writes.push({ abs: appClaude, rel: CLAUDE_MD, ...blockWrite(appClaude, claudeBlock("app")) });
-    const appSkill = join(parent, ...SKILL_PATH.split("/"));
-    writes.push({ ...planManaged(appSkill, skillMd(version)), rel: SKILL_PATH });
+    writes.push(...managedWrites(parent, version, rel));
   }
   try {
     for (const w of writes) apply(w);
@@ -293,10 +291,10 @@ export function appRootOf(root: string): string | null {
 }
 
 /** A scaffold file: created when absent; an existing file is kept, except the ones croft manages or can
- *  merge into without losing anything (CLAUDE.md's block, the skill, .gitignore patterns). */
+ *  merge into without losing anything (CLAUDE.md's block, the skill, the agent, .gitignore patterns). */
 function planFile(abs: string, text: string, path: string): Omit<Write, "rel"> {
   if (path === CLAUDE_MD) return { abs, ...blockWrite(abs, text) };
-  if (path === SKILL_PATH) return planManaged(abs, text);
+  if (path === SKILL_PATH || path === AGENT_PATH) return planManaged(abs, text);
   if (!existsSync(abs)) return { abs, text, action: "created" };
   if (path === ".gitignore") {
     const existing = readFileSync(abs, "utf8");
@@ -309,7 +307,15 @@ function planFile(abs: string, text: string, path: string): Omit<Write, "rel"> {
   return { abs, text: "", action: "skipped", note: "already exists; left as it was" };
 }
 
-/** A file croft owns outright (the skill): written when absent or different. */
+/** The files croft owns outright in a folder Claude Code may start in: the skill and the agent. */
+function managedWrites(dir: string, version: string, rel: (abs: string) => string): Write[] {
+  return ([[SKILL_PATH, skillMd(version)], [AGENT_PATH, agentMd(version)]] as const).map(([path, text]) => {
+    const abs = join(dir, ...path.split("/"));
+    return { ...planManaged(abs, text), rel: rel(abs) };
+  });
+}
+
+/** A file croft owns outright (the skill, the agent): written when absent or different. */
 function planManaged(abs: string, text: string): Omit<Write, "rel"> {
   if (!existsSync(abs)) return { abs, text, action: "created" };
   return { abs, text, action: readFileSync(abs, "utf8") === text ? "unchanged" : "replaced" };

@@ -14,6 +14,12 @@ croft query "from example_sales limit 5"
 
 croft needs [Bun](https://bun.sh) 1.3.14 or newer, on macOS or Linux (WSL works).
 
+## Why croft
+
+Every project has data worth asking about: signups, payments, usage, support, the spreadsheet someone keeps by hand. A BI layer, a warehouse with all of it in one place and a pipeline that keeps it fresh, is not only for big companies with a data team. A vibe-coded app, a side project, a company of two just getting started: all of them benefit from one.
+
+That used to mean a stack of tools to host and wire together, so most projects went without. croft makes it one folder and one file, small enough to start on day one. With everything that matters in one warehouse, you and your coding agent can both query it, build reports and find insights.
+
 ## One tool, end to end
 
 A croft project is a folder. Each file in `assets/` becomes one table, and `croft run` brings them up to date in order.
@@ -80,7 +86,7 @@ Claude Code, or any coding agent, can run a croft project from a cold start:
 - Every command takes `--json`, and every problem has a stable code, a hint with the next command, and often a fix the agent can apply as is.
 - `croft validate` checks every change without running it; `croft preview` builds it in a sandbox and diffs it against the live table.
 - Anything that could lose data stops and waits for a person: every destructive step ends in `croft confirm`, so one permission rule gates them all.
-- `croft init` writes a skill and a `CLAUDE.md` block, pinned to the project's croft version. Without a project yet, the repository's Claude Code plugin teaches the start:
+- `croft init` writes a skill, a `croft` agent built on it, and a `CLAUDE.md` block, pinned to the project's croft version. Claude hands the agent the project's data work (a new source, a report, a question) as a subagent, which runs the loop on its own and returns anything that needs a person's yes; or start a session as it with `claude --agent croft`. Without a project yet, the repository's Claude Code plugin teaches the start, as a skill and as the same agent:
 
   ```text
   /plugin marketplace add Zabaca/croft
