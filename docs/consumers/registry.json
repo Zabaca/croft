@@ -7,7 +7,7 @@
       "repo": "Zabaca/ceo",
       "access": "github",
       "root": "packages/seo",
-      "state": "~/Projects/zabaca/ceo/packages/seo",
+      "state": "~/Library/Application Support/Varnick/Home/packages/seo",
       "tier": "consumer",
       "notes": "SEO research for client sites (DataForSEO). Pins croft 0.1.0. A package inside ceo's monorepo, beside ceo's zbc infra; runs every command through bin/croft, which pulls credentials out of ceo's sops secrets."
     },
