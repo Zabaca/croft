@@ -28,8 +28,9 @@ import { isAbsolute, sep } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { mapSandboxError, type Profile } from "../db/connect.ts";
 import { physicalPath } from "../project/root.ts";
+import { pivotWithoutValuesIn } from "./lex.ts";
 import {
-  asciiLower, type AstNode, collect, finiteJson, foreignQueryNode, literal, location, looksLikePath, positional, stringOf, TABLE_ARGUMENT_FUNCTIONS, tableArguments,
+  args, asciiLower, type AstNode, charIndex, collect, constant, finiteJson, foreignQueryNode, literal, location, looksLikePath, positional, stringOf, TABLE_ARGUMENT_FUNCTIONS, tableArguments,
   type Use, walk,
 } from "./ast.ts";
 
@@ -58,8 +59,9 @@ export type TableFunctionKind =
 const kinds = (kind: TableFunctionKind, names: string) => names.trim().split(/\s+/).map((n) => [n, kind] as const);
 
 /**
- * Every table function and table macro of DuckDB 1.5.5, classified. gate.test.ts fails when DuckDB ships
- * one that is not listed here; until it is classified, the gate refuses it.
+ * Every table function and table macro of DuckDB 2.0.0, classified. gate.test.ts fails when DuckDB ships
+ * one that is not listed here (until it is classified, the gate refuses it), and when one listed here is no
+ * longer shipped.
  */
 export const TABLE_FUNCTIONS: ReadonlyMap<string, TableFunctionKind> = new Map([
   ...kinds("serve", "range generate_series unnest json_each json_tree"),
@@ -70,6 +72,9 @@ export const TABLE_FUNCTIONS: ReadonlyMap<string, TableFunctionKind> = new Map([
     duckdb_memory duckdb_optimizers duckdb_prepared_statements duckdb_profiling_settings duckdb_schemas
     duckdb_secret_types duckdb_secrets duckdb_sequences duckdb_settings duckdb_table_sample duckdb_tables
     duckdb_temporary_files duckdb_types duckdb_variables duckdb_views which_secret
+    duckdb_available_metrics duckdb_dialects duckdb_eviction_queues duckdb_extension_repositories
+    duckdb_external_resource_types duckdb_external_resources duckdb_grammar_extensions
+    duckdb_secret_type_parameters duckdb_triggers sql_tokenize
     pragma_collations pragma_database_size pragma_metadata_info pragma_platform pragma_show
     pragma_storage_info pragma_table_info pragma_user_agent pragma_version
     pg_timezone_names icu_calendar_names sql_auto_complete check_peg_parser
@@ -78,17 +83,18 @@ export const TABLE_FUNCTIONS: ReadonlyMap<string, TableFunctionKind> = new Map([
     read_csv read_csv_auto read_json read_json_auto read_json_objects read_json_objects_auto read_ndjson
     read_ndjson_auto read_ndjson_objects read_parquet parquet_scan read_text read_blob read_duckdb glob
     sniff_csv parquet_metadata parquet_schema parquet_file_metadata parquet_kv_metadata parquet_full_metadata
-    parquet_bloom_probe`),
+    parquet_bloom_probe read_single_csv_file read_single_json_file read_single_parquet_file`),
   ...kinds("table", [...TABLE_ARGUMENT_FUNCTIONS].join(" ")),
   ...kinds("hidden-sql", "query query_table json_execute_serialized_sql"),
   ...kinds("effect", `
     checkpoint force_checkpoint enable_logging disable_logging truncate_duckdb_logs enable_profiling
-    disable_profiling enable_peg_parser disable_peg_parser arrow_scan arrow_scan_dumb`),
+    disable_profiling arrow_scan arrow_scan_dumb create_external_resource deregister_external_resource
+    destroy_external_resource register_external_resource register_external_resource_type`),
 ]);
 
-// Scalar functions: write_log writes into the instance's log; over HTTP, settings and variables reveal
-// paths, and sleep_ms only holds a worker.
-const SCALAR_DENIED = new Set(["write_log"]);
+// Scalar functions: write_log writes into the instance's log, setval moves a sequence; over HTTP, settings and
+// variables reveal paths, and sleep_ms only holds a worker.
+const SCALAR_DENIED = new Set(["write_log", "setval"]);
 const SERVE_SCALAR_DENIED = new Set(["current_setting", "getvariable", "sleep_ms"]);
 // SHOW forms that are not DESCRIBE: they list names, never paths.
 const SHOW_LISTS = new Set(["tables", "databases", "variables", "__show_tables_expanded"]);
@@ -108,18 +114,12 @@ const SHOW_NAMES: Record<string, string> = { __show_tables_expanded: "SHOW ALL T
 export const SERVE_MAX_LIST_VALUES = 10_000_000;
 const LIST_BUILDERS = new Set(["range", "generate_series"]);
 
-/** 1-based line and column of a DuckDB position, which counts code points (verified with emoji). */
+/** 1-based line and column (in code points) of a DuckDB position, which counts UTF-8 bytes on 2.0 (verified with
+ *  emoji and CJK). */
 export function lineColumn(sql: string, position: number): { line: number; column: number } {
-  const chars = Array.from(sql);
-  let line = 1;
-  let column = 1;
-  for (let i = 0; i < Math.min(position, chars.length); i++) {
-    if (chars[i] === "\n") {
-      line++;
-      column = 1;
-    } else column++;
-  }
-  return { line, column };
+  const before = sql.slice(0, charIndex(sql, position));
+  const lineStart = before.lastIndexOf("\n") + 1;
+  return { line: before.split("\n").length, column: Array.from(before.slice(lineStart)).length + 1 };
 }
 
 interface Serialized {
@@ -177,6 +177,16 @@ export async function assertOneSelect(conn: DuckDBConnection, sql: string, o: Ga
   if (s.error) {
     if (s.error_type === "parser") throw syntaxError(sql, s, o);
     const code = o.notSelectCode ?? "QUERY_NOT_SELECT";
+    // DuckDB 2.0 cannot serialize a PIVOT whose columns depend on the data (no IN list): name the fix.
+    const pivot = pivotWithoutValuesIn(sql);
+    if (pivot) {
+      throw new CroftError(code, {
+        message: `PIVOT ... ON ${pivot.column} lists no values, so its columns depend on the data; croft runs SELECTs whose columns it can know`,
+        hint: `list the values: ON ${pivot.column} IN ('pro', 'basic'), or use sum(x) FILTER (WHERE ${pivot.column} = 'pro')`,
+        file: o.file,
+        details: { duckdb: s.error_message, column: pivot.column },
+      });
+    }
     throw new CroftError(code, {
       message: code === "QUERY_NOT_SELECT"
         ? "query runs exactly one SELECT (DESCRIBE, SUMMARIZE and SHOW also work)"
@@ -206,47 +216,52 @@ const str = stringOf;
 function literalPaths(n: Node | undefined): string[] | null {
   const one = literal(n);
   if (one !== null) return [one];
-  if (n?.class === "FUNCTION" && lower(str(n.function_name)) === "list_value" && Array.isArray(n.children) && n.children.length) {
-    const all = (n.children as Node[]).map(literal);
-    return all.every((p): p is string => p !== null) ? all : null;
+  if (n?.class === "FUNCTION" && lower(str(n.function_name)) === "list_value") {
+    const all = args(n).map((a) => (a.name ? null : literal(a.expression)));
+    return all.length && all.every((p): p is string => p !== null) ? all : null;
   }
   return null;
 }
 
 const NUMERIC_TYPES = new Set(["TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT",
-  "FLOAT", "DOUBLE", "DECIMAL"]);
+  "FLOAT", "DOUBLE", "DECIMAL", "INT", "INT1", "INT2", "INT4", "INT8", "INT16", "INT32", "INT64", "INT128", "LONG", "SHORT", "SIGNED", "REAL",
+  "FLOAT4", "FLOAT8", "NUMERIC", "UINT8", "UINT16", "UINT32", "UINT64", "UINT128", "BYTEINT", "UBYTEINT"]);
 
-/** A numeric literal's value (through casts to numeric types and a unary minus); null for anything else. A
- *  HUGEINT constant comes as {upper, lower}: Infinity with its sign, since no list of that length fits. */
-function numericLiteral(n: Node | undefined): number | null {
+/** A numeric literal's value (through casts to numeric types and a unary minus); null when `n` is computed
+ *  (a column, a function, a string), "unknown" when it is a constant of a shape croft does not know, so the
+ *  caller can refuse rather than guess. */
+function numericLiteral(n: Node | undefined): number | null | "unknown" {
   if (!n) return null;
   if (n.class === "CAST") {
-    const to = str((n.cast_type as { id?: unknown } | undefined)?.id);
-    return NUMERIC_TYPES.has(to) ? numericLiteral(n.child as Node | undefined) : null;
+    const to = str((n.type_expr as { type_name?: unknown } | undefined)?.type_name);
+    if (!to) return "unknown";
+    return NUMERIC_TYPES.has(to.toUpperCase()) ? numericLiteral(n.child as Node | undefined) : null;
   }
-  if (n.class === "FUNCTION" && str(n.function_name) === "-" && Array.isArray(n.children) && n.children.length === 1) {
-    const v = numericLiteral(n.children[0] as Node);
-    return v === null ? null : -v;
+  if (n.class === "FUNCTION" && (str(n.function_name) === "-" || str(n.function_name) === "+")) {
+    const a = args(n);
+    if (a.length !== 1) return null;
+    const v = numericLiteral(a[0]!.expression);
+    return typeof v === "number" && str(n.function_name) === "-" ? -v : v;
   }
   if (n.class !== "CONSTANT") return null;
-  const v = n.value as { type?: { id?: string; type_info?: { scale?: number } }; is_null?: boolean; value?: unknown } | undefined;
-  if (!v || v.is_null || !NUMERIC_TYPES.has(str(v.type?.id))) return null;
-  if (v.value && typeof v.value === "object") {
-    const upper = Number((v.value as { upper?: unknown }).upper);
-    return Number.isFinite(upper) ? (upper < 0 ? -Infinity : Infinity) : null;
-  }
-  const x = typeof v.value === "number" ? v.value : typeof v.value === "string" ? Number(v.value) : NaN;
-  if (!Number.isFinite(x)) return null;
-  return v.type?.id === "DECIMAL" ? x / 10 ** (v.type.type_info?.scale ?? 0) : x;
+  const c = constant(n);
+  if (!c) return "unknown";
+  if (c.kind === "STRING" || c.kind === "BOOLEAN" || c.kind === "NULL_LITERAL") return null;
+  if (c.kind !== "INTEGER" && c.kind !== "NUMERIC") return "unknown";
+  const x = Number(c.text.replace(/_/g, ""));
+  // 1e400 is Infinity: no list of that length fits, which listSize treats as such.
+  return Number.isNaN(x) ? "unknown" : x;
 }
 
-/** How many values range()/generate_series() with these arguments build; null unless every bound is a literal. */
-function listSize(name: string, args: Node[]): number | null {
-  const n = args.map(numericLiteral);
+/** How many values range()/generate_series() with these arguments build; null unless every bound is a literal,
+ *  "unknown" when a bound is a constant croft cannot read. */
+function listSize(name: string, list: Node[]): number | null | "unknown" {
+  const n = list.map(numericLiteral);
+  if (n.includes("unknown")) return "unknown";
   if (n.length === 0 || n.length > 3 || n.some((x) => x === null)) return null;
-  const [start, stop, step] = n.length === 1 ? [0, n[0]!, 1] : [n[0]!, n[1]!, n.length === 3 ? n[2]! : 1];
+  const [start, stop, step] = (n.length === 1 ? [0, n[0], 1] : [n[0], n[1], n.length === 3 ? n[2] : 1]) as number[];
   if (step === 0) return null; // DuckDB refuses it
-  const span = (stop - start) / step;
+  const span = (stop! - start!) / step!;
   if (!Number.isFinite(span)) return span > 0 ? Infinity : 0;
   const size = name === "generate_series" ? Math.floor(span) + 1 : Math.ceil(span);
   return Math.max(0, size);
@@ -300,8 +315,8 @@ class Checker {
     walk(stmt, (n) => {
       if (typeof n.function_name !== "string" || tables.has(n) || !LIST_BUILDERS.has(lower(n.function_name))) return;
       const size = listSize(lower(n.function_name), positional(n));
-      if (size === null || size <= SERVE_MAX_LIST_VALUES) return;
-      const values = Number.isFinite(size) ? `${size.toLocaleString("en-US")} values` : "more values than memory holds";
+      if (size === null || (size !== "unknown" && size <= SERVE_MAX_LIST_VALUES)) return;
+      const values = size === "unknown" ? "values croft cannot count" : Number.isFinite(size) ? `${size.toLocaleString("en-US")} values` : "more values than memory holds";
       const cap = SERVE_MAX_LIST_VALUES.toLocaleString("en-US");
       throw this.serveDenied(`${n.function_name}() as a value`, location(n),
         `builds a list of ${values} in one expression, which DuckDB cannot interrupt; over HTTP such a list may hold at most ${cap} values`,
@@ -312,6 +327,7 @@ class Checker {
   private async scalar(name: string, at?: number): Promise<void> {
     const n = lower(name);
     if (this.serve && (SCALAR_DENIED.has(n) || SERVE_SCALAR_DENIED.has(n))) throw this.serveDenied(`${name}()`, at);
+    if (n === "setval") throw this.notSelect(`${name}() changes a sequence; croft runs read-only SELECTs`, "remove it", at);
     if (SCALAR_DENIED.has(n)) {
       throw this.notSelect(`${name}() writes to DuckDB's log; croft runs read-only SELECTs`, "remove it; croft keeps its own logs", at);
     }
@@ -343,7 +359,7 @@ class Checker {
         throw this.notSelect(`${name}() runs SQL or reads a table named in a string, which croft cannot check`,
           "write the SELECT, or name the table, directly in the query", at);
       case "effect":
-        throw this.notSelect(`${name}() changes DuckDB's state (logging, profiling, the parser or a checkpoint); croft runs read-only SELECTs`,
+        throw this.notSelect(`${name}() changes DuckDB's state (logging, profiling, external resources or a checkpoint); croft runs read-only SELECTs`,
           "remove it; croft manages checkpoints, logging and profiling itself", at);
       case undefined:
         throw this.notSelect(`${name}() is not a table function croft allows; croft cannot tell what it reads or changes`,

@@ -146,9 +146,10 @@ describe("proven hazards (DESIGN.md §7, Appendix B)", () => {
 
   test("1.005 into DECIMAL(18,2): the cast reads the text, and the rounding is refused as PIN_ROUNDED", async () => {
     const db = await testDb();
-    // Casting the JSON value goes through DOUBLE (1.00); the text gives 1.01. Neither may pass silently.
+    // DuckDB 1.5.5 cast the JSON value through DOUBLE (1.00); 2.0 gives 1.01, as the text does. croft still reads the
+    // text, the one reading both engines agree on, and the rounding may not pass silently either way.
     expect(await db.all(`SELECT CAST('1.005'::JSON AS DECIMAL(18,2))::VARCHAR AS via_json, CAST('1.005' AS DECIMAL(18,2))::VARCHAR AS via_text`))
-      .toEqual([{ via_json: "1.00", via_text: "1.01" }]);
+      .toEqual([{ via_json: "1.01", via_text: "1.01" }]);
     // DECIMAL(18,2) holds more digits than a JSON number carries: numbers are refused, strings are exact.
     expect((await failure(db.load([{ amount: 1.005 }], { pins: { amount: "DECIMAL(18,2)" } }))).code).toBe("DECIMAL_PRECISION_UNSUPPORTED");
     const e = await failure(db.load([{ amount: "1.25" }, { amount: "1.005" }], { pins: { amount: "DECIMAL(18,2)" } }));

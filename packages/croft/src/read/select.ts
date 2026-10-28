@@ -42,6 +42,13 @@ export function mapQueryError(err: unknown, profile: Profile): unknown {
   if (kind === "Binder" && column) {
     return new CroftError("UNKNOWN_COLUMN", { message: first.replace(/^Binder Error: /, ""), hint: "check the column name (croft describe <table> lists them)", details });
   }
+  if (kind === "Binder" && /Deprecated lambda arrow \(->\)/.test(first)) {
+    return new CroftError("LAMBDA_ARROW", {
+      message: "the query writes a lambda with an arrow (x -> …), which DuckDB 2.0 no longer reads",
+      hint: "write lambdas with the lambda keyword: list_transform(l, lambda x: x + 1), list_reduce(l, lambda a, b: a + b)",
+      details,
+    });
+  }
   if (kind === "Parser") {
     return new CroftError("SQL_SYNTAX", { message: first, hint: "fix the SQL near the reported position", details });
   }
@@ -51,16 +58,17 @@ export function mapQueryError(err: unknown, profile: Profile): unknown {
 }
 
 /**
- * DuckDB's `->>` and `->` take everything to their left as the JSON they read: they bind more loosely than AND, OR,
- * NOT, = and || [V: select.test.ts]. So `a AND j->>'k' = 'v'` runs as `((a AND j)->>'k') = 'v'` and fails casting a
- * whole JSON value ("Conversion Error: Failed to cast value to numerical: {...}"), and `j->'k' = 2` as
- * `j->('k' = 2)` ("json_extract(JSON, BOOLEAN)"). DuckDB's message then names the data, not the precedence, so these
- * two shapes get a hint that does (D102). null for any other message.
+ * DuckDB's `->` takes everything to its left as the JSON it reads, and what follows it up to a comparison as the
+ * path: it binds more loosely than AND, OR, NOT, = and || [V: select.test.ts]. So `j->'k' = 2` runs as
+ * `j->('k' = 2)` ("json_extract(JSON, BOOLEAN)"), and `a AND j->'k'` as `(a AND j)->'k'`, which fails casting a whole
+ * JSON value ("Conversion Error: Failed to cast value to numerical: {...}"). DuckDB's message then names the data,
+ * not the precedence, so these two shapes get a hint that does (D102). `->>` bound as loosely before DuckDB 2.0; it
+ * now binds tightly and compares as written. null for any other message.
  */
 export function jsonArrowHint(first: string): string | null {
   if (!/^Conversion Error: .*Failed to cast value[^:]*: [[{]/.test(first) && !/'json_extract(?:_string)?\([^)]*BOOLEAN/.test(first)) return null;
-  return "DuckDB's ->> and -> take everything to their left as the JSON they read, so a AND j->>'k' = 'v' runs as "
-    + "((a AND j)->>'k') = 'v'; parenthesise each one, (j->>'k') = 'v', or write json_extract_string(j, 'k')";
+  return "DuckDB's -> takes everything to its left as the JSON it reads, and what follows as the path, so j->'k' = 2 runs as "
+    + "j->('k' = 2); parenthesise it, (j->'k') = 2, or write json_extract(j, 'k')";
 }
 
 /**

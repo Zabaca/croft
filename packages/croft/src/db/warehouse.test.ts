@@ -251,11 +251,16 @@ describe("Sql wrapper", () => {
         9007199254740993n, 170141183460469231731687303715884105727n, [1, 2], { a: 1, big: 9007199254740993n }, "x'; DROP TABLE p; --",
         new Date("2024-01-02T03:04:05.678Z"),
       ]);
+    }, { runId: "r" });
+    // A second statement is refused, and on DuckDB 2.0 the refusal aborts the transaction: the write commits nothing,
+    // and says so instead of committing an empty transaction.
+    const failed = await rejection(w.write("sql", async (tx) => {
+      await tx.exec("INSERT INTO p (i) VALUES (2)");
       const e = await rejection(tx.exec("INSERT INTO p (i) VALUES (1); DROP TABLE p"));
       expect(e.code).toBe("SQL_NOT_ONE_STATEMENT");
-    }, { runId: "r" }).catch((e) => {
-      throw e;
-    });
+    }, { runId: "r" }));
+    expect(failed.code).toBe("INTERNAL_ERROR");
+    expect(failed.message).toContain("nothing was committed");
     const rows = await w.read((db) => db.all("SELECT * FROM p"), { purpose: "t" });
     expect(rows).toEqual([{
       i: 9007199254740993n, h: 170141183460469231731687303715884105727n, l: [1, 2], j: { a: 1, big: 9007199254740993n },
@@ -296,14 +301,14 @@ describe("DDL before DML", () => {
     return w;
   }
 
-  test("DuckDB itself only fails at COMMIT (why the guard exists)", async () => {
+  test("DuckDB 2.0 commits DML then DDL (1.5.5 failed at COMMIT, why the guard exists; it stays, as a rule croft keeps)", async () => {
     const w = await seeded();
     const err = await w.write("raw", async (tx) => {
-      // Bypass the Sql wrapper to show the late failure.
+      // Bypass the Sql wrapper.
       await tx.connection.run("UPDATE t SET v = 'x' WHERE id = 1");
       await tx.connection.run("ALTER TABLE t ADD COLUMN c INTEGER");
     }, { runId: "r" }).then(() => null, (e: Error) => e);
-    expect(err?.message).toContain("another transaction has altered this table");
+    expect(err).toBeNull();
   });
 
   test("the wrapper throws DDL_AFTER_DML at the ALTER and nothing is committed", async () => {

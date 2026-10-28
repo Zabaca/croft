@@ -1,7 +1,7 @@
 // A lexer for DuckDB's SQL that knows no grammar: the tokens DuckDB would see, without comments, with their
 // parenthesis depth, and the items of a PIVOT's ON list. project/sql-asset.ts finds a PIVOT without IN with it
-// (PIVOT_NEEDS_VALUES) and project/rename.ts rewrites names with it. It uses no Bun-only APIs, so read.ts can
-// import it.
+// (PIVOT_NEEDS_VALUES), the gate names one in its hint, and project/rename.ts rewrites names with it. It uses no
+// Bun-only APIs, so read.ts can import it through gate.ts.
 import { asciiLower } from "./ast.ts";
 
 /** A token of lexSql: a bare word (keyword or name), a quoted name, `(`, `)` or `,`, or anything else (a
@@ -89,10 +89,10 @@ export function lexSql(sql: string): { tokens: SqlToken[]; statements: number } 
 }
 
 export interface PivotWithoutValues {
-  /** JS string index of the ON item that lists no values, else of the PIVOT keyword. */
+  /** JS string index of the ON item that lists no values. */
   index: number;
-  /** The ON item as written ("product"), when found. */
-  column?: string;
+  /** The ON item as written ("product"). */
+  column: string;
 }
 
 export const PIVOT_WORDS: ReadonlySet<string> = new Set(["pivot", "pivot_wider"]);
@@ -138,4 +138,21 @@ export function onItemWithoutValues(tokens: Token[], from: number, sql: string):
     }
   }
   return done(k);
+}
+
+/**
+ * The first ON item of a PIVOT in `sql` that lists no values (`PIVOT t ON b`, or `ON b IN (SELECT ...)`), by the
+ * text alone; null when there is none. DuckDB 2.0 counts such a PIVOT as one statement but cannot serialize it
+ * ("Only SELECT statements can be serialized"): its columns depend on the data. Callers ask this only once DuckDB
+ * has refused to serialize the statement for a reason other than its syntax.
+ */
+export function pivotWithoutValuesIn(sql: string): PivotWithoutValues | null {
+  const { tokens } = lexSql(sql);
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]!;
+    if (t.kind !== "word" || !PIVOT_WORDS.has(asciiLower(t.text))) continue;
+    const item = onItemWithoutValues(tokens, i, sql);
+    if (item) return item;
+  }
+  return null;
 }

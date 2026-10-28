@@ -128,10 +128,10 @@ describe("OwnTableQuery", () => {
       const first = await q.query("select * from fresh").catch((e: CroftError) => e);
       expect((first as CroftError).problem.hint).toContain("`await query(...).catch(() => [])` without one");
       expect(await q.query("select 42 as x")).toEqual([{ x: 42 }]);
-      // A comparison after AND that ->> swallowed gets the precedence hint here too.
-      const arrow = await q.query(`select true AND '{"k":"v"}'::JSON->>'k' = 'v' as r`).catch((e: CroftError) => e);
+      // A comparison that -> swallowed gets the precedence hint here too.
+      const arrow = await q.query(`select true AND '{"k":"v"}'::JSON->'k' = '"v"' as r`).catch((e: CroftError) => e);
       expect(arrow).toMatchObject({ code: "QUERY_FAILED" });
-      expect((arrow as CroftError).problem.hint).toContain("(j->>'k') = 'v'");
+      expect((arrow as CroftError).problem.hint).toContain("(j->'k') = 2");
     } finally {
       q.close();
     }

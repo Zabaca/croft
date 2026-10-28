@@ -123,7 +123,7 @@ describe("croft doctor --json", () => {
       expect(["ok", "warn", "error", "info"]).toContain(c.status);
       expect(["environment", "project", "scheduling"]).toContain(c.section);
     }
-    expect(check(checks, "duckdb").text).toMatch(/^duckdb 1\.5\.5 binding \w+-\w+ · json, parquet, icu built in$/);
+    expect(check(checks, "duckdb").text).toMatch(/^duckdb 2\.0\.0 binding \w+-\w+ · json, parquet, icu built in$/);
     expect(check(checks, "warehouse")).toMatchObject({ status: "ok", details: { exists: true, writable: true, heldBy: null } });
     expect(check(checks, "warehouse").text).toMatch(/^warehouse\.duckdb [\d.]+ (KB|MB) · writable · not held · duckdb 1\.5\.5 · croft format 1$/);
     expect(env.data.summary).toEqual({ ok: checks.filter((c) => c.status === "ok").length, info: checks.filter((c) => c.status === "info").length, warnings: 0, errors: 0 });
@@ -205,7 +205,7 @@ describe("environment checks", () => {
     const probe = probeDuckdb(SELF_ROOT);
     expect(probe).toMatchObject({ ok: true, platformArch: `${process.platform}-${process.arch}` });
     if (probe.ok) {
-      expect(probe.version).toMatch(/^v1\.5\.\d+$/);
+      expect(probe.version).toMatch(/^v2\.0\.\d+$/);
       for (const e of ["json", "parquet", "icu"]) expect(probe.extensions).toContain(e);
     }
     const nowhere = probeDuckdb(join(base, "no-such-install"));

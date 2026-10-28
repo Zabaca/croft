@@ -42,7 +42,7 @@
 import { readFileSync, realpathSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { DuckDBConnection } from "@duckdb/node-api";
+import type { DuckDBConnection, DuckDBResult } from "@duckdb/node-api";
 import { CroftError, problem, type ProblemInit } from "../core/errors.ts";
 import type { Fix, Problem } from "../core/types.ts";
 import type { Row } from "../types.ts";
@@ -368,9 +368,10 @@ export class TransformInputs {
   /** Stream a snapshot's rows chunk by chunk on a connection of its own. */
   private async *stream(snap: InputSnapshot, extra: string[]): AsyncGenerator<Row[]> {
     const conn = await this.acquire();
+    let result: DuckDBResult | null = null;
     try {
       const cap = snap.capped ? ` LIMIT ${snap.rows}` : "";
-      const result = await conn.stream(
+      result = await conn.stream(
         `SELECT ${[snapshotColumnsSql(snap.facts.columns), ...extra].join(", ")} FROM read_parquet(${quoteLiteral(snap.path)})${cap}`);
       const shape = resultShape(result);
       const ctx = { mode: "ts" as const, timezone: this.o.timezone };
@@ -382,6 +383,11 @@ export class TransformInputs {
         yield renderValueRows(chunk.getRows(), shape, ctx);
       }
     } finally {
+      // A stream left partly read (a transform that stopped early, or an abort) blocks the connection on DuckDB 2.0
+      // until it is closed (RESOURCE_IN_USE); closing again does nothing.
+      try {
+        result?.closeSync();
+      } catch {}
       this.release(conn);
     }
   }

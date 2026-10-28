@@ -4,12 +4,16 @@
 // against their declared inputs with it (UNDECLARED_INPUT). SQL assets (project/sql-asset.ts) also use it for
 // catalog prefixes (CATALOG_PREFIX) and volatile functions (VOLATILE_SQL).
 //
-// Shapes verified on DuckDB 1.5.5: a table reference is a BASE_TABLE node with catalog_name, schema_name and
-// table_name; a function call carries function_name (a table function sits under a TABLE_FUNCTION node's
-// `function` key); a CTE's name is a key of its query node's cte_map.map; a DuckDB position is query_location;
-// `current_date` and the other clock keywords are COLUMN_REF nodes, not functions.
+// Shapes verified on DuckDB 2.0.0: a table reference is a BASE_TABLE node with catalog_name, schema_name and
+// table_name; a function call carries function_name and its arguments as `arguments: [{name, expression}]`
+// (name "" when positional; `children` is left only on OPERATOR and CONJUNCTION nodes); a table function sits
+// under a TABLE_FUNCTION node's `function` key; a constant is `literal: {kind, text}` (STRING, INTEGER,
+// NUMERIC, BOOLEAN, NULL_LITERAL), the text as written; a CTE's name is a key of its query node's cte_map.map; a
+// DuckDB position is query_location, a UTF-8 byte offset; `SHOW t` is a SHOW_REF with show_type SHOW and no
+// query, SHOW TABLES and the like are SHOW_SPECIAL; `current_date` and the other clock keywords are COLUMN_REF
+// nodes, not functions.
 //
-// CTE scopes, as DuckDB 1.5.5 binds them (ast.test.ts checks every case against the unoptimized plan): the CTEs
+// CTE scopes, as DuckDB 2.0.0 binds them (ast.test.ts checks every case against the unoptimized plan): the CTEs
 // of a query node (a SELECT_NODE, or a SET_OPERATION_NODE for a WITH over a whole UNION) are in scope in that
 // node and everything under it. Inside the CTE list, a CTE's body sees only the CTEs listed before it, not
 // itself or later ones: `WITH orders AS (SELECT * FROM orders WHERE …)` reads the table orders. A recursive
@@ -37,6 +41,7 @@ export type Use =
     /** The table macro (TABLE_ARGUMENT_FUNCTIONS) whose argument names it; absent for a table in FROM. */
     via?: string;
   }
+  /** SHOW TABLES, SHOW ALL TABLES (or a bare DESCRIBE), SHOW databases: a SHOW_SPECIAL. */
   | { kind: "show"; name: string };
 
 /** Table functions and table macros whose first argument (or `source :=`) names the table they read. */
@@ -49,9 +54,10 @@ export const asciiLower = (s: string): string => s.replace(/[A-Z]/g, (c) => c.to
 export const stringOf = (v: unknown): string => (typeof v === "string" ? v : "");
 
 /**
- * json_serialize_sql's output made JSON: DuckDB writes a DOUBLE constant beyond range as a bare `Infinity`
- * (`SELECT 1e400`, verified on 1.5.5), which JSON.parse refuses. Such tokens outside strings (`Infinity`,
- * `-Infinity`, `NaN`) become strings; the text is returned unchanged when it has none.
+ * json_serialize_sql's output made JSON. DuckDB 1.5.5 wrote a DOUBLE constant beyond range as a bare `Infinity`
+ * (`SELECT 1e400`), which JSON.parse refuses; 2.0 writes every constant as its text, so this is a guard should a
+ * bare token come back. Such tokens outside strings (`Infinity`, `-Infinity`, `NaN`) become strings; the text is
+ * returned unchanged when it has none.
  */
 export function finiteJson(text: string): string {
   if (!/Infinity|NaN/.test(text)) return text;
@@ -77,11 +83,31 @@ export function finiteJson(text: string): string {
   return out + text.slice(from);
 }
 
-/** A node's position in the SQL (DuckDB counts code points), or undefined when it has none. */
+/** A node's position in the SQL (a UTF-8 byte offset; charIndex makes it a string index), or undefined when it
+ *  has none. */
 export function location(node: AstNode): number | undefined {
   const loc = node.query_location;
   // json_serialize_sql uses 2^64-1 for "no location"; JSON.parse rounds it to ~1.8e19.
   return typeof loc === "number" && loc < 2 ** 53 ? loc : undefined;
+}
+
+/** The string index (UTF-16 units) of a DuckDB position, which counts UTF-8 bytes into `sql`; sql.length when
+ *  the position is past the end. A position inside a character counts as that character. */
+export function charIndex(sql: string, byteOffset: number): number {
+  let bytes = 0;
+  let i = 0;
+  while (i < sql.length && bytes < byteOffset) {
+    const c = sql.codePointAt(i)!;
+    bytes += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+    if (bytes > byteOffset) break;
+    i += c > 0xffff ? 2 : 1;
+  }
+  return i;
+}
+
+/** A string index as DuckDB's position: the UTF-8 bytes before it. */
+export function byteOffset(sql: string, index: number): number {
+  return new TextEncoder().encode(sql.slice(0, index)).length;
 }
 
 /** A set of ASCII-lowercased CTE names in scope: shared, never changed once built. */
@@ -98,9 +124,10 @@ const widen = (scope: Scope, names: readonly string[]): Scope => (names.length ?
 export function collect(ast: unknown): { uses: Use[]; ctes: Set<string> } {
   const uses: Use[] = [];
   const ctes = new Set<string>();
-  const stack: { node: unknown; head: boolean; scope: Scope }[] = [{ node: ast, head: false, scope: NO_CTES }];
+  // `at`: a table function's position, which DuckDB 2.0 puts on its TABLE_FUNCTION node, not on the call.
+  const stack: { node: unknown; head: boolean; scope: Scope; at?: number }[] = [{ node: ast, head: false, scope: NO_CTES }];
   while (stack.length) {
-    const { node, head, scope } = stack.pop()!;
+    const { node, head, scope, at: headAt } = stack.pop()!;
     if (Array.isArray(node)) {
       for (let i = node.length - 1; i >= 0; i--) stack.push({ node: node[i], head: false, scope });
       continue;
@@ -109,7 +136,7 @@ export function collect(ast: unknown): { uses: Use[]; ctes: Set<string> } {
     const rec = node as AstNode;
     const hidden = (catalog: string, schema: string, name: string) => catalog === "" && schema === "" && scope.has(asciiLower(name));
     if (typeof rec.function_name === "string") {
-      uses.push(head ? { kind: "table_function", name: rec.function_name, fn: rec, at: location(rec) } : { kind: "scalar", name: rec.function_name, at: location(rec) });
+      uses.push(head ? { kind: "table_function", name: rec.function_name, fn: rec, at: location(rec) ?? headAt } : { kind: "scalar", name: rec.function_name, at: location(rec) });
       if (head && TABLE_ARGUMENT_FUNCTIONS.has(asciiLower(rec.function_name))) {
         for (const t of tableArguments(rec) ?? []) {
           uses.push({ kind: "relation", catalog: t.catalog, schema: t.schema, name: t.name, at: t.at, cte: hidden(t.catalog, t.schema, t.name), via: rec.function_name });
@@ -122,7 +149,12 @@ export function collect(ast: unknown): { uses: Use[]; ctes: Set<string> } {
       uses.push({ kind: "relation", catalog, schema, name: rec.table_name, at: location(rec), cte: hidden(catalog, schema, rec.table_name) });
     }
     if (rec.type === "SHOW_REF" && rec.query == null && typeof rec.table_name === "string" && rec.table_name !== "") {
-      uses.push({ kind: "show", name: rec.table_name.replace(/^"(.*)"$/, "$1") });
+      if (rec.show_type === "SHOW") {
+        // `SHOW t` describes the table t: a use of it, like `DESCRIBE t` (whose query reads it).
+        const catalog = stringOf(rec.catalog_name);
+        const schema = stringOf(rec.schema_name);
+        uses.push({ kind: "relation", catalog, schema, name: rec.table_name, at: location(rec), cte: hidden(catalog, schema, rec.table_name) });
+      } else uses.push({ kind: "show", name: rec.table_name.replace(/^"(.*)"$/, "$1") });
     }
     const map = (rec.cte_map as { map?: unknown } | undefined)?.map;
     const listed: string[] = [];
@@ -131,7 +163,7 @@ export function collect(ast: unknown): { uses: Use[]; ctes: Set<string> } {
     // The node's own parts see all of its CTEs; a recursive CTE's recursive part sees the CTE itself.
     const inner = widen(scope, listed);
     const recursive = rec.type === "RECURSIVE_CTE_NODE" && typeof rec.cte_name === "string" ? widen(scope, [asciiLower(rec.cte_name)]) : null;
-    const next: { node: unknown; head: boolean; scope: Scope }[] = [];
+    const next: { node: unknown; head: boolean; scope: Scope; at?: number }[] = [];
     for (const [k, v] of Object.entries(rec)) {
       if (!v || typeof v !== "object") continue;
       if (k === "cte_map" && Array.isArray(map)) {
@@ -139,7 +171,8 @@ export function collect(ast: unknown): { uses: Use[]; ctes: Set<string> } {
         map.forEach((e: unknown, i: number) => next.push({ node: e, head: false, scope: widen(scope, listed.slice(0, i)) }));
         continue;
       }
-      next.push({ node: v, head: rec.type === "TABLE_FUNCTION" && k === "function", scope: recursive && k === "right" ? recursive : inner });
+      const head = rec.type === "TABLE_FUNCTION" && k === "function";
+      next.push({ node: v, head, scope: recursive && k === "right" ? recursive : inner, ...(head ? { at: location(rec) } : {}) });
     }
     for (let i = next.length - 1; i >= 0; i--) stack.push(next[i]!);
   }
@@ -148,29 +181,49 @@ export function collect(ast: unknown): { uses: Use[]; ctes: Set<string> } {
 
 // ---- Arguments --------------------------------------------------------------------------------------------
 
-/** A table function's positional arguments: named ones come as `name := v` (an alias) or `name = v`. */
-export function positional(fn: AstNode): AstNode[] {
-  const children = Array.isArray(fn.children) ? (fn.children as AstNode[]) : [];
-  return children.filter((c) => !stringOf(c.alias) && !(c.type === "COMPARE_EQUAL" && (c.left as AstNode | undefined)?.class === "COLUMN_REF"));
+/** A function call's arguments as written, in order: `name` is "" for a positional one and the name of
+ *  `name := v`. */
+export function args(fn: AstNode): { name: string; expression: AstNode }[] {
+  const list = Array.isArray(fn.arguments) ? (fn.arguments as unknown[]) : [];
+  const out: { name: string; expression: AstNode }[] = [];
+  for (const a of list) {
+    const e = (a as { expression?: unknown } | null)?.expression;
+    if (e && typeof e === "object") out.push({ name: stringOf((a as { name?: unknown }).name), expression: e as AstNode });
+  }
+  return out;
 }
 
-/** A table function's named argument `name := v` or `name = v` (ASCII case-insensitive), or undefined. */
+/** `name = v` among a table function's arguments: DuckDB parses it as a comparison with a column. */
+const isEqualsNamed = (e: AstNode) => e.type === "COMPARE_EQUAL" && (e.left as AstNode | undefined)?.class === "COLUMN_REF";
+
+/** A function's positional arguments: named ones come as `name := v` or `name = v`. */
+export function positional(fn: AstNode): AstNode[] {
+  return args(fn).filter((a) => !a.name && !stringOf(a.expression.alias) && !isEqualsNamed(a.expression)).map((a) => a.expression);
+}
+
+/** A function's named argument `name := v` or `name = v` (ASCII case-insensitive), or undefined. */
 export function namedArgument(fn: AstNode, name: string): AstNode | undefined {
-  const children = Array.isArray(fn.children) ? (fn.children as AstNode[]) : [];
-  for (const c of children) {
-    if (asciiLower(stringOf(c.alias)) === name) return c;
-    const left = c.left as AstNode | undefined;
-    if (c.type === "COMPARE_EQUAL" && left?.class === "COLUMN_REF" && Array.isArray(left.column_names)
-      && left.column_names.length === 1 && asciiLower(stringOf(left.column_names[0])) === name) return c.right as AstNode | undefined;
+  for (const { name: n, expression: e } of args(fn)) {
+    if (asciiLower(n || stringOf(e.alias)) === name) return e;
+    const left = e.left as AstNode | undefined;
+    if (isEqualsNamed(e) && Array.isArray(left!.column_names) && left!.column_names.length === 1
+      && asciiLower(stringOf(left!.column_names[0])) === name) return e.right as AstNode | undefined;
   }
   return undefined;
 }
 
-/** The string of a VARCHAR literal, or null. */
-export function literal(n: AstNode | undefined): string | null {
+/** A constant's literal: its kind (STRING, INTEGER, NUMERIC, BOOLEAN, NULL_LITERAL) and text as written, or
+ *  null when `n` is not a constant of that shape. */
+export function constant(n: AstNode | undefined): { kind: string; text: string } | null {
   if (n?.class !== "CONSTANT") return null;
-  const v = n.value as { type?: { id?: string }; is_null?: boolean; value?: unknown } | undefined;
-  return v && !v.is_null && (v.type?.id === "VARCHAR" || v.type?.id === "STRING_LITERAL") && typeof v.value === "string" ? v.value : null;
+  const l = n.literal as { kind?: unknown; text?: unknown } | undefined;
+  return l && typeof l.kind === "string" && typeof l.text === "string" ? { kind: l.kind, text: l.text } : null;
+}
+
+/** The string of a string literal, or null. */
+export function literal(n: AstNode | undefined): string | null {
+  const c = constant(n);
+  return c?.kind === "STRING" ? c.text : null;
 }
 
 /** A table a table macro names. */
@@ -299,7 +352,7 @@ export function catalogPrefixes(ast: unknown): PrefixedRelation[] {
 
 /**
  * Functions whose value changes from one run to the next with the same input (DESIGN.md §3c "Volatile SQL"):
- * a table built with them keeps the value of its last rebuild. DuckDB 1.5.5's own stability markers
+ * a table built with them keeps the value of its last rebuild. DuckDB 2.0.0's own stability markers
  * (duckdb_functions().stability VOLATILE or CONSISTENT_WITHIN_QUERY) minus NOT_VOLATILE, plus what the markers
  * miss: current_localtime and current_localtimestamp are marked CONSISTENT, and the macros ago,
  * pg_conf_load_time and pg_postmaster_start_time expand to current_timestamp. ast.test.ts fails when DuckDB
@@ -309,14 +362,16 @@ export const VOLATILE_FUNCTIONS: ReadonlySet<string> = new Set(`
   now today current_date current_time current_timestamp get_current_time get_current_timestamp
   transaction_timestamp current_localtime current_localtimestamp localtime localtimestamp ago
   pg_conf_load_time pg_postmaster_start_time
-  random setseed gen_random_uuid uuid uuidv4 uuidv7 nextval currval
-  txid_current current_transaction_id current_query_id current_connection_id current_query stats`.trim().split(/\s+/));
+  random setseed gen_random_uuid uuid uuidv4 uuidv7 nextval currval setval
+  txid_current current_transaction_id current_query_id current_connection_id current_query stats vector_type`.trim().split(/\s+/));
 
 /** Functions DuckDB marks VOLATILE or CONSISTENT_WITHIN_QUERY that give an asset the same values on every run:
- *  the database's own names (always "main" and the warehouse's name), and functions that return no value
- *  (error() fails the query, sleep_ms waits; the gate refuses write_log). */
+ *  the database's own names (always "main" and the warehouse's name), functions that return no value (error()
+ *  fails the query, sleep_ms waits; the gate refuses write_log), and settings and variables, which croft's
+ *  sandbox fixes for every run (DuckDB 2.0 marks current_setting and getvariable CONSISTENT_WITHIN_QUERY). */
 export const NOT_VOLATILE: ReadonlySet<string> = new Set(`
-  current_database current_catalog current_schema current_schemas in_search_path error sleep_ms write_log`.trim().split(/\s+/));
+  current_database current_catalog current_schema current_schemas in_search_path error sleep_ms write_log
+  current_setting getvariable`.trim().split(/\s+/));
 
 /** Bare keywords DuckDB parses as a column reference (a COLUMN_REF node, not a function) and binds to the
  *  clock when no column has the name [V 1.5.5]. */
@@ -344,4 +399,57 @@ export function volatileUses(ast: unknown): VolatileUse[] {
     }
   });
   return out;
+}
+
+// ---- Arrow lambdas (LAMBDA_ARROW) -------------------------------------------------------------------------
+
+/** The functions that take a lambda: duckdb_functions() lists a LAMBDA parameter for exactly these (ast.test.ts
+ *  holds the list to it). `COLUMNS(c -> …)` is list_filter over the columns in the AST. */
+export const LAMBDA_FUNCTIONS: ReadonlySet<string> = new Set(`
+  apply array_apply array_filter array_reduce array_transform filter invoke list_apply list_filter list_reduce
+  list_transform reduce`.trim().split(/\s+/));
+
+/** An arrow lambda (`x -> x + 1`) as written, with the `lambda` form that replaces it when croft can split it. */
+export interface ArrowLambda { text?: string; to?: string; at?: number }
+
+/**
+ * Every lambda written with an arrow (`x -> …`, `(a, b) -> …`), which DuckDB 2.0 refuses ("Deprecated lambda arrow
+ * (->) detected"): a SINGLE_ARROW LAMBDA that is an argument of a LAMBDA_FUNCTIONS call, or the expression of a
+ * `COLUMNS(...)` star. JSON's `j->'k'` parses as a SINGLE_ARROW lambda too, but it is never such an argument, so it
+ * is left alone. `sql` is the text the AST was parsed from: the lambda's span is cut from it.
+ */
+export function arrowLambdas(ast: unknown, sql: string): ArrowLambda[] {
+  const found = new Set<AstNode>();
+  const arrow = (n: AstNode | undefined) => n?.class === "LAMBDA" && n.syntax_type === "SINGLE_ARROW";
+  walk(ast, (node) => {
+    if (node.class === "FUNCTION" && LAMBDA_FUNCTIONS.has(asciiLower(stringOf(node.function_name)))) {
+      for (const a of args(node)) if (arrow(a.expression)) found.add(a.expression);
+    } else if (node.class === "STAR" && node.columns === true && arrow(node.expr as AstNode | undefined)) found.add(node.expr as AstNode);
+  });
+  return [...found].map((l) => {
+    const at = location(l);
+    return { ...lambdaRewrite(l, sql), ...(at !== undefined ? { at } : {}) };
+  });
+}
+
+/** `(a, b) -> a + b` as written and as `lambda a, b: a + b`, from the lambda's byte span and its parameters'; {}
+ *  when the span cannot be split at its arrow. */
+function lambdaRewrite(l: AstNode, sql: string): { text?: string; to?: string } {
+  const lhs = l.lhs as AstNode | undefined;
+  const at = location(l);
+  const length = l.query_location_length;
+  const lhsAt = lhs ? location(lhs) : undefined;
+  const lhsLength = lhs?.query_location_length;
+  if (at === undefined || typeof length !== "number" || lhsAt === undefined || typeof lhsLength !== "number") return {};
+  const start = charIndex(sql, at);
+  const end = charIndex(sql, at + length);
+  const paramsEnd = charIndex(sql, lhsAt + lhsLength);
+  if (!(start <= paramsEnd && paramsEnd < end)) return {};
+  const text = sql.slice(start, end);
+  const arrowAt = /^\s*->\s*/.exec(sql.slice(paramsEnd, end));
+  let params = sql.slice(start, paramsEnd).trim();
+  if (params.startsWith("(") && params.endsWith(")")) params = params.slice(1, -1).trim();
+  const body = sql.slice(paramsEnd + (arrowAt?.[0].length ?? 0), end);
+  if (!arrowAt || !params || !body.trim()) return { text };
+  return { text, to: `lambda ${params}: ${body}` };
 }

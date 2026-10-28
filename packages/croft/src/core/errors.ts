@@ -29,6 +29,7 @@ export const CODES = {
   SQL_NOT_SELECT: { category: "project", severity: "error", exit: 2 },
   SQL_NOT_ONE_STATEMENT: { category: "project", severity: "error", exit: 2 },
   PIVOT_NEEDS_VALUES: { category: "project", severity: "error", exit: 2 },
+  LAMBDA_ARROW: { category: "project", severity: "error", exit: 2 },
   CATALOG_PREFIX: { category: "project", severity: "error", exit: 2 },
   SQL_READS_FILES: { category: "project", severity: "error", exit: 2 },
   INPUT_NEEDS_KEY: { category: "project", severity: "error", exit: 2 },

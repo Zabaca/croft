@@ -69,8 +69,14 @@ describe("mapAssetError: mapQueryError, located in the asset's file", () => {
     }
   });
 
-  test("a parser error without an excerpt keeps the file, without a line", async () => {
+  test("a parser error at the end of the input points at the last word (DuckDB 2.0: \"at or near\")", async () => {
     const e = await mapped("SELECT id FROM github_issues WHERE");
+    expect(e.problem.code).toBe("SQL_SYNTAX");
+    expect(e.problem).toMatchObject({ file: "assets/open_issues.sql", line: 1, column: 30 });
+  });
+
+  test("a parser error without an excerpt keeps the file, without a line", () => {
+    const e = mapAssetError(new Error("Parser Error: syntax error at end of input"), { file: "assets/open_issues.sql", lineOffset: 0, body: "SELECT 1 WHERE" }) as CroftError;
     expect(e.problem.code).toBe("SQL_SYNTAX");
     expect(e.problem.file).toBe("assets/open_issues.sql");
     expect(e.problem.line).toBeUndefined();
@@ -262,8 +268,8 @@ describe("ShadowCatalog.bind", () => {
 
   test("QUOTE_IDENTIFIER, then the syntax error that remains after quoting", async () => {
     const r = await cat.bind(asset("a", "SELECT id, order\nFROM github_issues\nWHERE id >", { headerLines: 2 }));
-    expect(r.problems.map((p) => [p.code, p.line, p.column])).toEqual([["QUOTE_IDENTIFIER", 3, 12], ["SQL_SYNTAX", undefined, undefined]]);
-    expect(r.problems[1]).toMatchObject({ asset: "a", file: "assets/a.sql", message: "Parser Error: syntax error at end of input" });
+    expect(r.problems.map((p) => [p.code, p.line, p.column])).toEqual([["QUOTE_IDENTIFIER", 3, 12], ["SQL_SYNTAX", 5, 10]]);
+    expect(r.problems[1]).toMatchObject({ asset: "a", file: "assets/a.sql", message: 'Parser Error: syntax error at or near ">"' });
     const inner = await cat.bind(asset("a", "SELECT id, order\nFROM github_issues\nWHERE id > > 1", { headerLines: 2 }));
     expect(inner.problems.map((p) => [p.code, p.line, p.column])).toEqual([["QUOTE_IDENTIFIER", 3, 12], ["SQL_SYNTAX", 5, 12]]);
   });

@@ -719,6 +719,34 @@ export default transform({
     expect(g.__t_seen).toEqual([2, 3]);
   });
 
+  test("a loop left early inside a stream closes it: the connection runs the next query (DuckDB 2.0: RESOURCE_IN_USE)", async () => {
+    const h = harness({
+      "assets/t.ts": `import { transform } from "@zabaca/croft";
+const g = globalThis as any;
+export default transform({
+  inputs: ["issues"],
+  key: "issue_id",
+  async *rows({ rows, query }) {
+    for await (const r of rows("issues")) {
+      if (r.id === 2) break;
+    }
+    const [{ n }] = await query("SELECT 42 AS n");
+    let seen = 0;
+    for await (const _ of rows("issues")) seen++;
+    g.__t_after = { n, seen };
+    yield { issue_id: 1 };
+  },
+});
+`,
+    });
+    const ids = Array.from({ length: 5000 }, (_, i) => i + 1);
+    await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues(ids, S1) });
+    const s = await plan(h, "t");
+    await step(h, s);
+    expect(g.__t_after).toEqual({ n: 42, seen: 5000 });
+    delete g.__t_after;
+  });
+
   test("two inputs: newRows() of one, rows() and query() of the other inside the loop; pages of rows", async () => {
     CHUNK.rows = 2;
     const h = harness({

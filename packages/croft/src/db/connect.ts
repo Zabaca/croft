@@ -29,7 +29,7 @@ export interface SandboxSpec {
   memoryLimit?: string;     // e.g. "4GB"; set before locking (serve)
   threads?: number;
   /** false: the optimizer is off on every connection (sql/bind.ts's shadow catalog, whose plans sql/deps.ts reads:
-   *  the optimizer prunes scans). Set before locking, since the lock refuses SET enable_optimizer. */
+   *  the optimizer prunes scans). Set globally before locking, since the lock refuses changing it. */
   optimizer?: false;
 }
 
@@ -203,8 +203,6 @@ async function applySandbox(conn: DuckDBConnection, spec: SandboxSpec, key: stri
         details: { expected: fingerprint, actual: configured.get(key) ?? null },
       });
     }
-    // On DuckDB 1.5.5 the optimizer switch is per connection, and PRAGMA disable_optimizer still works once locked.
-    if (spec.optimizer === false) await conn.run("PRAGMA disable_optimizer");
     return;
   }
   try {
@@ -218,7 +216,8 @@ async function applySandbox(conn: DuckDBConnection, spec: SandboxSpec, key: stri
   }
   if (spec.memoryLimit) await conn.run(`SET GLOBAL memory_limit = ${sqlString(spec.memoryLimit)}`);
   if (spec.threads) await conn.run(`SET GLOBAL threads = ${Math.max(1, Math.floor(spec.threads))}`);
-  if (spec.optimizer === false) await conn.run("PRAGMA disable_optimizer");
+  // A global setting on DuckDB 2.0, so every later connection inherits it; the lock refuses changing it after.
+  if (spec.optimizer === false) await conn.run("SET GLOBAL enable_optimizer = false");
   await conn.run(`SET allowed_directories = [${dirs.map(sqlString).join(", ")}]`);
   await conn.run("SET enable_external_access = false");
   await conn.run("SET lock_configuration = true");

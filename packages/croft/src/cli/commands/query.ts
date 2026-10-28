@@ -27,7 +27,7 @@
 // read-only (it waits while a preview is building it), with the same one-SELECT gate and the state folder protected:
 // the preview's views read the Parquet snapshots in .croft/preview/, which a query can reach only through them.
 // Without a preview it is DB_NOT_FOUND; a table the preview does not hold is UNKNOWN_TABLE, listing what it holds.
-import { type DuckDBConnection, DuckDBInstance, DuckDBResultReader } from "@duckdb/node-api";
+import { type DuckDBConnection, DuckDBInstance, type DuckDBResult, DuckDBResultReader } from "@duckdb/node-api";
 import { existsSync } from "node:fs";
 import { CroftError } from "../../core/errors.ts";
 import type { Problem } from "../../core/types.ts";
@@ -149,8 +149,9 @@ async function selectRows(conn: DuckDBConnection, sql: string, limit: number, tz
   } catch (e) {
     throw mapQueryError(e, "query");
   }
+  let result: DuckDBResult | null = null;
   try {
-    const result = await stmt.stream();
+    result = await stmt.stream();
     const reader = new DuckDBResultReader(result);
     await reader.readUntil(limit);
     const columns = resultColumns(reader);
@@ -180,6 +181,10 @@ async function selectRows(conn: DuckDBConnection, sql: string, limit: number, tz
   } catch (e) {
     throw mapQueryError(e, "query");
   } finally {
+    // On DuckDB 2.0 a stream left partly read (a failure mid-count) blocks the connection until it is closed.
+    try {
+      result?.closeSync();
+    } catch {}
     stmt.destroySync();
   }
 }

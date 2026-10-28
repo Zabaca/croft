@@ -20,9 +20,9 @@ import type { DuckDBConnection } from "@duckdb/node-api";
 import { CroftError, problem } from "../core/errors.ts";
 import type { Problem } from "../core/types.ts";
 import { canonicalJson, losslessReviver } from "../load/stage.ts";
-import { dollarTag, lexSql, onItemWithoutValues, PIVOT_WORDS, type PivotWithoutValues } from "../sql/lex.ts";
+import { dollarTag, lexSql, PIVOT_WORDS, type PivotWithoutValues, pivotWithoutValuesIn } from "../sql/lex.ts";
 import {
-  asciiLower, type AstNode, catalogPrefixes, collect, finiteJson, looksLikePath, relationNames, stringOf, volatileUses, walk,
+  type ArrowLambda, arrowLambdas, asciiLower, type AstNode, byteOffset, catalogPrefixes, charIndex, collect, finiteJson, literal, looksLikePath, positional, relationNames, stringOf, volatileUses, walk,
 } from "../sql/ast.ts";
 import { assertOneSelect, lineColumn, type SelectAst, TABLE_FUNCTIONS } from "../sql/gate.ts";
 import { type DiscoveredAsset, suggestName } from "./discover.ts";
@@ -236,7 +236,7 @@ export interface LoadedSqlAsset {
    *  DuckDB's parse tree, so it proves an asset unchanged across an engine upgrade (run/engine-change.ts). */
   sourceHash: string;
   /** Everything loading found: HEADER_UNKNOWN_KEY, SQL_SYNTAX, SQL_NOT_ONE_STATEMENT, SQL_NOT_SELECT,
-   *  PIVOT_NEEDS_VALUES, CATALOG_PREFIX, SQL_READS_FILES, QUERY_PATH_DENIED, ASSET_INVALID (an unreadable
+   *  PIVOT_NEEDS_VALUES, LAMBDA_ARROW, CATALOG_PREFIX, SQL_READS_FILES, QUERY_PATH_DENIED, ASSET_INVALID (an unreadable
    *  file), and the warning VOLATILE_SQL. */
   problems: Problem[];
 }
@@ -277,7 +277,7 @@ export async function loadSqlAsset(a: Pick<DiscoveredAsset, "name" | "file" | "p
   parsed.problems.forEach(add);
   const at = new Locator(parsed.body, file, parsed.header.lines);
 
-  // 2. PIVOT without IN: before the gate, which would count the rewrite's statements.
+  // 2. PIVOT without IN: before the gate, which would only call it not a SELECT.
   const pivot = await pivotWithoutValues(o.conn, parsed.body);
   if (pivot) {
     add(pivotProblem(pivot, at));
@@ -296,6 +296,7 @@ export async function loadSqlAsset(a: Pick<DiscoveredAsset, "name" | "file" | "p
     for (const p of catalogPrefixes(ast)) add(prefixProblem(p, o.assetNames, parsed.body, at));
     const volatile = volatileUses(ast);
     if (volatile.length) add(volatileProblem(name, volatile, at));
+    for (const l of arrowLambdas(ast, parsed.body)) add(lambdaArrowProblem(l, at));
     out.astInputs = relationNames(ast);
   }
 
@@ -314,12 +315,14 @@ export async function loadSqlAsset(a: Pick<DiscoveredAsset, "name" | "file" | "p
 }
 
 /**
- * The code hash of an SQL asset (§8): sha256 over the AST without query_location and with every `*_name`
- * identifier lowercased, plus the header and the project time zone. Whitespace, comments and keyword or
- * identifier case do not change it; changing the time zone does (`::DATE` results depend on it).
+ * The code hash of an SQL asset (§8): sha256 over the AST without query_location and query_location_length,
+ * with every `*_name` identifier and `qualified_name.path` part lowercased, plus the header and the project time
+ * zone. Whitespace, comments and keyword or identifier case do not change it; changing the time zone does
+ * (`::DATE` results depend on it). The AST is DuckDB's, so a new engine changes every hash: v 2 is DuckDB
+ * 2.0's tree (run/engine-change.ts tells such a change from an edit).
  *
- * `*_name` covers table, schema, catalog, function and star-qualifier names, which never name an output
- * column. Column references (`column_names`) and aliases keep their case: DuckDB names an unaliased
+ * `*_name` and `qualified_name` cover table, schema, catalog, function, type and star-qualifier names, which
+ * never name an output column. Column references (`column_names`) and aliases keep their case: DuckDB names an unaliased
  * expression's column after the text as written (`sum(AMOUNT)` is a column "sum(AMOUNT)") [V], so a case
  * change there can rename a column, and a spurious rebuild is safe where a missed one is not. The header
  * counts without its line count, so a blank line added to it changes nothing. Pass an AST parsed losslessly
@@ -327,7 +330,7 @@ export async function loadSqlAsset(a: Pick<DiscoveredAsset, "name" | "file" | "p
  */
 export function sqlFingerprint(ast: SelectAst, header: SqlHeader, timezone: string): string {
   const material = canonicalJson({
-    v: 1,
+    v: 2,
     timezone,
     header: headerMaterial(header),
     ast: normalizeAst(ast),
@@ -348,7 +351,12 @@ function normalizeAst(v: unknown): unknown {
   if (!v || typeof v !== "object" || Object.getPrototypeOf(v) !== Object.prototype) return v;
   const out: Record<string, unknown> = {};
   for (const [k, x] of Object.entries(v)) {
-    if (k === "query_location") continue;
+    if (k === "query_location" || k === "query_location_length") continue;
+    if (k === "qualified_name" && x && typeof x === "object" && Array.isArray((x as { path?: unknown }).path)) {
+      // The table, function or type name again, as its parts: as case-blind as the *_name keys beside it.
+      out[k] = { ...normalizeAst(x) as object, path: (x as { path: unknown[] }).path.map((p) => (typeof p === "string" ? asciiLower(p) : p)) };
+      continue;
+    }
     out[k] = k.endsWith("_name") && typeof x === "string" ? asciiLower(x) : normalizeAst(x);
   }
   return out;
@@ -367,11 +375,11 @@ async function serializeOne(conn: DuckDBConnection, sql: string): Promise<Select
 
 // ---- Locations --------------------------------------------------------------------------------------------
 
-/** Positions in the body (DuckDB's code points, or a JS string index) as the file's line and column. */
+/** Positions in the body (DuckDB's UTF-8 byte offsets, or a JS string index) as the file's line and column. */
 class Locator {
   constructor(readonly body: string, readonly file: string, readonly lineOffset: number) {}
 
-  /** A DuckDB position (code points into the body). */
+  /** A DuckDB position (UTF-8 bytes into the body). */
   at(pos?: number): { file: string; line?: number; column?: number } {
     if (pos === undefined) return { file: this.file };
     const p = lineColumn(this.body, pos);
@@ -380,42 +388,30 @@ class Locator {
 
   /** A JS string index into the body. */
   atIndex(index: number): { file: string; line?: number; column?: number } {
-    return this.at(Array.from(this.body.slice(0, index)).length);
+    return this.at(byteOffset(this.body, index));
   }
 }
 
 // ---- PIVOT without IN -------------------------------------------------------------------------------------
 
-/** A PIVOT whose columns depend on the data, or null. DuckDB's statement count decides; the lexer only finds
- *  where it is. */
+/** A PIVOT whose columns depend on the data, or null. DuckDB decides (it cannot serialize the statement, for a
+ *  reason other than its syntax); the lexer only finds where it is. */
 async function pivotWithoutValues(conn: DuckDBConnection, sql: string): Promise<PivotWithoutValues | null> {
-  const lexed = lexSql(sql);
-  const pivots = lexed.tokens.filter((t) => t.kind === "word" && PIVOT_WORDS.has(asciiLower(t.text)));
-  if (!pivots.length) return null;
-  let count: number;
-  try {
-    count = (await conn.extractStatements(sql)).count;
-  } catch {
-    return null;                                     // a syntax error: the gate reports it
-  }
-  if (count <= lexed.statements) return null;
-  for (const p of pivots) {
-    const item = onItemWithoutValues(lexed.tokens, lexed.tokens.indexOf(p), sql);
-    if (item) return item;
-  }
-  return { index: pivots[0]!.index };
+  if (!lexSql(sql).tokens.some((t) => t.kind === "word" && PIVOT_WORDS.has(asciiLower(t.text)))) return null;
+  const reader = await conn.runAndReadAll("SELECT json_serialize_sql($1::VARCHAR)", [sql]);
+  const s = JSON.parse(finiteJson(String(reader.getRowsJS()[0]?.[0] ?? "{}"))) as { error?: boolean; error_type?: string };
+  if (!s.error || s.error_type === "parser") return null;   // a SELECT, or a syntax error the gate reports
+  return pivotWithoutValuesIn(sql);
 }
 
 function pivotProblem(p: PivotWithoutValues, at: Locator): Problem {
-  const on = p.column ?? "product";
+  const on = p.column;
   return problem("PIVOT_NEEDS_VALUES", {
-    message: p.column
-      ? `PIVOT ... ON ${on} lists no values, so its columns depend on the data; croft cannot check or plan it`
-      : "a PIVOT lists no values (IN (...)), so its columns depend on the data; croft cannot check or plan it",
+    message: `PIVOT ... ON ${on} lists no values, so its columns depend on the data; croft cannot check or plan it`,
     hint: `list the values: ON ${on} IN ('pro', 'basic'), or use sum(x) FILTER (WHERE ${on} = 'pro')`,
     ...at.atIndex(p.index),
     fix: { kind: "edit", description: `list the values the pivot makes columns of: ON ${on} IN ('a', 'b')`, file: at.file, ...lineOf(at.atIndex(p.index)) },
-    ...(p.column ? { details: { column: p.column } } : {}),
+    details: { column: on },
   });
 }
 
@@ -434,7 +430,7 @@ function fileReads(ast: unknown): FileRead[] {
     if (u.kind === "relation" && looksLikePath(u.name)) {
       out.push({ shown: u.via ? `${u.via}('${u.name}')` : `'${u.name}'`, paths: [u.name], ...(u.at !== undefined ? { at: u.at } : {}) });
     } else if (u.kind === "table_function" && TABLE_FUNCTIONS.get(asciiLower(u.name)) === "path") {
-      const paths = literalStrings((u.fn.children as AstNode[] | undefined)?.[0]);
+      const paths = literalStrings(positional(u.fn)[0]);
       out.push({ shown: `${u.name}(${paths.map((p) => `'${p}'`).join(", ")})`, paths, ...(u.at !== undefined ? { at: u.at } : {}) });
     }
   }
@@ -443,13 +439,9 @@ function fileReads(ast: unknown): FileRead[] {
 
 /** 'a' or ['a', 'b'] as strings; anything else none. */
 function literalStrings(n: AstNode | undefined): string[] {
-  if (n?.class === "CONSTANT") {
-    const v = n.value as { is_null?: boolean; value?: unknown } | undefined;
-    return v && !v.is_null && typeof v.value === "string" ? [v.value] : [];
-  }
-  if (n?.class === "FUNCTION" && asciiLower(stringOf(n.function_name)) === "list_value" && Array.isArray(n.children)) {
-    return (n.children as AstNode[]).flatMap(literalStrings);
-  }
+  const one = literal(n);
+  if (one !== null) return [one];
+  if (n?.class === "FUNCTION" && asciiLower(stringOf(n.function_name)) === "list_value") return positional(n).flatMap(literalStrings);
   return [];
 }
 
@@ -520,7 +512,7 @@ function prefixProblem(p: { shown: string; name: string; at?: number }, assetNam
 
 /** The qualified name written at a DuckDB position (`Other . "Main".orders`), and its last part as written. */
 function qualifiedNameAt(body: string, pos: number): { text: string; last: string } | null {
-  const start = Array.from(body).slice(0, pos).join("").length;
+  const start = charIndex(body, pos);
   const part = /^(?:"(?:[^"]|"")*"|[A-Za-z_\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*)/;
   let i = start;
   let last = "";
@@ -535,6 +527,20 @@ function qualifiedNameAt(body: string, pos: number): { text: string; last: strin
   }
   const text = body.slice(start, i);
   return text === last ? null : { text, last };
+}
+
+function lambdaArrowProblem(l: ArrowLambda, at: Locator): Problem {
+  const where = at.at(l.at);
+  const shown = l.text ?? "x -> …";
+  return problem("LAMBDA_ARROW", {
+    message: `${shown} is a lambda written with an arrow, which DuckDB 2.0 no longer reads; it writes lambda x: … instead`,
+    hint: l.to ? `write it as ${l.to}` : "write the lambda as lambda x: <expression> (lambda a, b: … for two parameters)",
+    ...where,
+    fix: l.text && l.to
+      ? { kind: "edit", description: `write the lambda with the lambda keyword: ${l.to}`, file: at.file, ...lineOf(where), replace: { from: l.text, to: l.to } }
+      : { kind: "manual", description: "rewrite each arrow lambda: x -> x + 1 becomes lambda x: x + 1, (a, b) -> a + b becomes lambda a, b: a + b" },
+    ...(l.text ? { details: { lambda: l.text, ...(l.to ? { rewrite: l.to } : {}) } } : {}),
+  });
 }
 
 function volatileProblem(asset: string, uses: { shown: string; at?: number }[], at: Locator): Problem {
