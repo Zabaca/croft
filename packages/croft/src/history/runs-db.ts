@@ -42,6 +42,9 @@ const MIGRATIONS: readonly string[] = [
   // 3: requests sent to a host with a budget in croft.json (http.budgets, D104), one row per attempt, kept a day.
   `CREATE TABLE IF NOT EXISTS http_requests (host TEXT, at TEXT, run_id TEXT, asset TEXT);
    CREATE INDEX IF NOT EXISTS http_requests_by_host ON http_requests (host, at);`,
+  // 4: the source each SQL code hash was made from, and by which DuckDB (run/engine-change.ts): an engine upgrade
+  // changes every SQL code hash, and the source proves the asset itself did not change.
+  `CREATE TABLE IF NOT EXISTS code_sources (code_hash TEXT PRIMARY KEY, source_hash TEXT, engine TEXT, recorded_at TEXT);`,
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 
@@ -570,6 +573,21 @@ export class RunsDb {
     const row = this.sqlite.query("SELECT approved_code_hash FROM schedule_state WHERE asset = ?").get(asset) as
       { approved_code_hash: string | null } | null;
     return row?.approved_code_hash ?? null;
+  }
+
+  /** Record that the SQL code hash `codeHash` was made from the source `sourceHash` by the DuckDB `engine` (v1.5.5). */
+  noteCodeSource(codeHash: string, sourceHash: string, engine: string): void {
+    this.sqlite.query(
+      `INSERT INTO code_sources (code_hash, source_hash, engine, recorded_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT (code_hash) DO UPDATE SET source_hash = excluded.source_hash, engine = excluded.engine, recorded_at = excluded.recorded_at`,
+    ).run(codeHash, sourceHash, engine, this.nowIso());
+  }
+
+  /** The source and engine an SQL code hash was made from, or null when none was recorded (before croft 0.4). */
+  codeSource(codeHash: string): { sourceHash: string; engine: string; recordedAt: string } | null {
+    const row = this.sqlite.query("SELECT source_hash, engine, recorded_at FROM code_sources WHERE code_hash = ?").get(codeHash) as
+      { source_hash: string; engine: string; recorded_at: string } | null;
+    return row ? { sourceHash: row.source_hash, engine: row.engine, recordedAt: row.recorded_at } : null;
   }
 
   /** Record croft.json's secretsFrom command (project/env.ts secretsCommandHash) as one a person has run with: a

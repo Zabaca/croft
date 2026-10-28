@@ -39,7 +39,7 @@ import type { Check, Problem } from "../core/types.ts";
 import { quoteIdent } from "../load/evolve.ts";
 import { editDistance } from "../project/suggest.ts";
 import {
-  asciiLower, type AstNode, collect, finiteJson, literal, looksLikePath, relationNames, TABLE_ARGUMENT_FUNCTIONS, tableArguments, walk,
+  asciiLower, type AstNode, collect, finiteJson, foreignQueryNode, literal, looksLikePath, relationNames, TABLE_ARGUMENT_FUNCTIONS, tableArguments, walk,
 } from "../sql/ast.ts";
 import { TABLE_FUNCTIONS } from "../sql/gate.ts";
 
@@ -160,6 +160,11 @@ export async function vetCheck(serialize: (sql: string) => Promise<string>, asse
     return bad("is a list of values, not one condition", "write one condition per check, or join conditions with AND");
   }
   if (hasParameter(stmts[0]!)) return bad("uses a parameter ($1 or ?); a check has none", "write the value into the check");
+  const foreign = foreignQueryNode(node);
+  if (foreign) {
+    return bad(`holds a ${foreign.type.replace(/_QUERY_NODE$|_NODE$/, "").replace(/_/g, " ")} statement; a check only reads`,
+      "a CTE that writes or exports (INSERT, UPDATE, DELETE or COPY inside WITH) is not a read; write one SQL expression");
+  }
   for (const u of collect(node).uses) {
     if (u.kind === "relation") {
       // A path in FROM, or a table macro's table given as a path: DuckDB reads the file (a replacement scan).

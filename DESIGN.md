@@ -507,7 +507,7 @@ Tables named in a blocking `-- check:` subquery are dependencies too, but they o
 
 1. `DESCRIBE <body>`, for the output names as the SELECT wrote them. A view (and any subquery) renames a repeated name: `SELECT * FROM a JOIN b USING (id)` over two assets yields `_loaded_at` and `_loaded_at_1` [V].
 2. `CREATE OR REPLACE TEMP VIEW __body AS <sql>`, with the body verbatim.
-3. `CREATE TEMP TABLE __croft_next AS SELECT *, row_number() OVER () AS _croft_seq FROM (SELECT COLUMNS(c -> lower(c) NOT IN ('_loaded_at', '_file', '_croft_seq', <renamed copies of those>)) FROM __body)`. The rows are materialized once. The table is not named `next`, because `next` is a valid asset name that a TEMP table would shadow for unqualified reads in checks.
+3. `CREATE TEMP TABLE __croft_next AS SELECT *, row_number() OVER () AS _croft_seq FROM (SELECT COLUMNS(lambda c: lower(c) NOT IN ('_loaded_at', '_file', '_croft_seq', <renamed copies of those>)) FROM __body)`. The rows are materialized once. The table is not named `next`, because `next` is a valid asset name that a TEMP table would shadow for unqualified reads in checks.
 
 This form has several properties [V]:
 
@@ -2439,8 +2439,8 @@ src/
                        journal; findRenamed: ASSET_RENAMED), types-gen.ts (.croft/types: each asset's row type from
                        the column cache, and the CroftAssets augmentation)
   sql/                 ast.ts (serialize, walk: collect, location; CTE scopes, relationNames, catalog prefixes,
-                       file refs, volatile functions; gate.ts imports it),
-                       deps.ts (AST ∪ unoptimized-plan scans), gate.ts (extractStatements + serialize: one SELECT;
+                       file refs, volatile functions, query node types; gate.ts imports it),
+                       lex.ts (tokens without a grammar; a PIVOT's ON items), deps.ts (AST ∪ unoptimized-plan scans), gate.ts (extractStatements + serialize: one SELECT;
                        AST walk: literal paths, table-function allowlist, serve allowlist),
                        bind.ts (shadow catalog, prepare, error → code mapping)
   db/                  connect.ts (factory: time zone + sandbox; canonicalPath without opening the file),
@@ -3340,7 +3340,7 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - Reason: `DECIMAL(38,0)` holds at most 10^38 − 1, so the `COPY` fails on HUGEINT's 39-digit values. Ordering by the text would put 10 before 9 and break positions.
 
 **D71. Reserved names in an SQL step's output. (new, 2026-09-24)**
-- Options: `COLUMNS(c -> c NOT IN ('_loaded_at', '_file'))` over the view, as §3c first had it; `DESCRIBE` the body first, then drop every reserved name and the view's renamed copies of them, without regard to case.
+- Options: `COLUMNS(lambda c: c NOT IN ('_loaded_at', '_file'))` over the view, as §3c first had it; `DESCRIBE` the body first, then drop every reserved name and the view's renamed copies of them, without regard to case.
 - Choice: the second, into `__croft_next`, with `_croft_seq` added in the same `CREATE`. Repeated reserved names are not `DUPLICATE_OUTPUT_COLUMN`, and a SELECT of only reserved columns is `ASSET_INVALID`. A changed shape recreates the table with `CREATE OR REPLACE … LIMIT 0` rather than through the ingest's `ALTER`s (§3c, §5).
 - Reason: a view renames a repeated name, so `SELECT *` over a join of two assets gives `_loaded_at` and `_loaded_at_1` [V], and the case-sensitive filter copied `_loaded_at_1` and `_LOADED_AT` into the table as junk columns. `next` is a valid asset name that a TEMP table would shadow. `LIMIT 0` keeps STRUCT, MAP and ENUM types that the ingest's type whitelist refuses.
 
@@ -3672,7 +3672,7 @@ All spikes ran on macOS arm64 with `@duckdb/node-api` 1.5.5-r.5 (DuckDB 1.5.5), 
 | Process locks | `fs.openSync`+`closeSync` on the held file released DuckDB's lock (a child then wrote); opening and closing a second read-only instance in the same process did the same; `statSync` and APFS `COPYFILE_FICLONE` did not; `DuckDBInstance.fromCache` shares one instance across realpath and case-variant paths and refuses a different configuration; a byte copy without `CHECKPOINT` missed 500 WAL rows, and with it was complete |
 | Transactions | DELETE or UPDATE followed by ALTER on the same table failed at COMMIT; ALTER before DML, including MERGE, worked |
 | Dependencies | the unoptimized bound plan found `query_table`, `query()`, table macros, PIVOT with IN, and correct CTE shadowing; the optimized plan dropped scans under `WHERE false` and `LIMIT 0`; `current_date`/`current_timestamp` are COLUMN_REF nodes in the AST; the 75 reserved keywords break `FROM <name>` |
-| SQL wrapper | a temp view plus `COLUMNS(c -> c <> '_loaded_at')` handled `SELECT *` over assets, trailing `;` and `--`; `extractStatements` counts statements; a failing check after CREATE OR REPLACE rolled back cleanly |
+| SQL wrapper | a temp view plus `COLUMNS(lambda c: c <> '_loaded_at')` handled `SELECT *` over assets, trailing `;` and `--`; `extractStatements` counts statements; a failing check after CREATE OR REPLACE rolled back cleanly |
 | TS positions and values | stream order of a merged input was not stamp order, and a max-stamp position skipped 3 of 5 rows; a naive TIMESTAMP passed through `Date` came back as TIMESTAMPTZ shifted 8 h without microseconds; HUGEINT became DOUBLE in Parquet and survived as DECIMAL(38,0) within 38 digits (the build stores text, D70); a cache-busted `import()` kept the old `lib/` module |
 | Scheduling math | wall-clock matching skips 02:30 on 2026-03-08 and doubles 01:30 on 2026-11-01 in Los Angeles; `TimeZone` is per connection and changes `::DATE` keys |
 | Staging precision | `read_json` into JSON columns re-rendered `3.14159265358979323846` as `3.141592653589793` and `1.50` as `1.5`; integers beyond int64 kept their digits; JSON→DECIMAL(18,2) gave `1.00` for `1.005` while text gave `1.01`; TRY_CAST of JSON `1.7` to BIGINT gave 2 |

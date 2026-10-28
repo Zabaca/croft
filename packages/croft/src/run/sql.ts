@@ -7,7 +7,7 @@
 //             names as written say which columns are croft's (left out) and which repeat (DUPLICATE_OUTPUT_COLUMN)
 //   view      CREATE OR REPLACE TEMP VIEW __body AS <body>, verbatim: a trailing `;` or `--` comment is fine
 //   next      CREATE TEMP TABLE __croft_next AS SELECT *, row_number() OVER () AS _croft_seq
-//               FROM (SELECT COLUMNS(c -> lower(c) NOT IN ('_loaded_at', '_file', …)) FROM __body)
+//               FROM (SELECT COLUMNS(lambda c: lower(c) NOT IN ('_loaded_at', '_file', …)) FROM __body)
 //             (named apart from `next`, an asset name a TEMP table would shadow)
 //   write     load/table-batch.ts → writeBatch kind "sql": a diff like a replace ingest, so unchanged rows keep
 //             their stamps; a changed shape recreates the table; a duplicate key is CHECK_FAILED unique(key); then
@@ -243,7 +243,7 @@ async function materialize(tx: Sql, step: PlannedStep, where: AssetErrorOptions)
   try {
     await tx.exec(`CREATE OR REPLACE TEMP TABLE ${quoteIdent(NEXT_TABLE)} AS
       SELECT *, row_number() OVER () AS ${quoteIdent(RESERVED.seq)}
-      FROM (SELECT COLUMNS(c -> lower(c) NOT IN (${[...drop].map(quoteLiteral).join(", ")})) FROM ${quoteIdent(BODY_VIEW)})`);
+      FROM (SELECT COLUMNS(lambda c: lower(c) NOT IN (${[...drop].map(quoteLiteral).join(", ")})) FROM ${quoteIdent(BODY_VIEW)})`);
   } catch (e) {
     throw located(e, step, where, false);
   }

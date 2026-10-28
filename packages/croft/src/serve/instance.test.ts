@@ -27,7 +27,7 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 // A query that runs for hours unless interrupted, and passes the serve gate (range() is allowed).
 const SLOW = "SELECT sum(a.range * b.range) AS s FROM range(10000000) a, range(1000000) b";
 // A query that interrupts cannot stop for seconds (one list_reduce call over 20M values; p.n = 20000000).
-const STUCK = "SELECT list_reduce(range(n), (a, b) -> a + b) AS x FROM p";
+const STUCK = "SELECT list_reduce(range(n), lambda a, b: a + b) AS x FROM p";
 
 // ---- engines ------------------------------------------------------------------------------------------
 
@@ -647,7 +647,7 @@ describe("handing the file to a writer", () => {
     expect((await e.query(q("SELECT count(*) AS c FROM t"))).rows).toEqual([{ c: 5 }]);
     // A constant list DuckDB folds while planning (the gate's literal cap allows 10,000,000 values): stuck in prepare.
     const planned = Date.now();
-    const folded = await rejection(e.query(q("SELECT list_reduce(range(10000000), (a, b) -> a + b) AS x")));
+    const folded = await rejection(e.query(q("SELECT list_reduce(range(10000000), lambda a, b: a + b) AS x")));
     expect(folded.code).toBe("TIMEOUT");
     expect(Date.now() - planned).toBeLessThan(300 + 1500 + SLACK);
     expect((await e.query(q("SELECT count(*) AS c FROM t"))).rows).toEqual([{ c: 5 }]);

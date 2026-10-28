@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { DuckDBConnection } from "@duckdb/node-api";
 import { openMemory } from "../db/connect.ts";
 import {
-  type AstNode, catalogPrefixes, collect, finiteJson, location, NOT_VOLATILE, relationNames, tableArguments, VOLATILE_FUNCTIONS, VOLATILE_KEYWORDS,
+  type AstNode, catalogPrefixes, collect, finiteJson, foreignQueryNode, location, NOT_VOLATILE, relationNames, tableArguments, VOLATILE_FUNCTIONS, VOLATILE_KEYWORDS,
   volatileUses, walk,
 } from "./ast.ts";
 import { planScans } from "./deps.ts";
@@ -71,7 +71,7 @@ describe("relationNames", () => {
   });
 
   test("agrees with the unoptimized plan on every scope case", async () => {
-    const db2 = await openMemory({ timezone: "UTC" });
+    const db2 = await openMemory({ timezone: "UTC", optimizer: false });
     try {
       const shadow = await db2.connect();
       await shadow.run("CREATE TABLE orders (id BIGINT, amount DOUBLE)");
@@ -194,4 +194,18 @@ test("walk visits every node in the AST's order", async () => {
     if (n.class === "COLUMN_REF" || n.type === "BASE_TABLE") seen.push(String(n.class ?? n.type));
   });
   expect(seen).toEqual(["COLUMN_REF", "BASE_TABLE"]);
+});
+
+test("foreignQueryNode: reads pass, any other query node is returned, an unknown one included", async () => {
+  for (const sql of ["select 1", "select 1 union select 2", "with recursive r(n) as (select 1 union all select n + 1 from r where n < 3) select * from r",
+    "with x as materialized (select 1) select * from x", "pivot t on b in ('x') using sum(a)", "describe t", "show tables"]) {
+    expect([sql, foreignQueryNode(await ast(sql))]).toEqual([sql, null]);
+  }
+  const tree = await ast("with x as (select 1) select * from x where 1 in (select 1)");
+  let n = 0;
+  walk(tree, (node) => {
+    if (node.type === "SELECT_NODE" && n++ === 1) node.type = "COPY_QUERY_NODE";
+  });
+  expect(foreignQueryNode(tree)?.type).toBe("COPY_QUERY_NODE");
+  expect(foreignQueryNode({ node: { type: "SELECT_NODE", from_table: { type: "SUBQUERY", subquery: { node: { type: "MERGE_INTO_NODE" } } } } })).toEqual({ type: "MERGE_INTO_NODE" });
 });

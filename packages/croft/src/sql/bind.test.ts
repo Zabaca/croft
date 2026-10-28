@@ -1,10 +1,9 @@
-import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { DuckDBConnection } from "@duckdb/node-api";
 import { CroftError } from "../core/errors.ts";
 import { openMemory } from "../db/connect.ts";
 import type { LoadedSqlAsset } from "../project/sql-asset.ts";
 import { duckdbPosition, mapAssetError, ShadowCatalog, type ShadowColumn } from "./bind.ts";
-import * as deps from "./deps.ts";
 
 let db: Awaited<ReturnType<typeof openMemory>>;
 let conn: DuckDBConnection;
@@ -14,34 +13,6 @@ beforeAll(async () => {
   await conn.run("CREATE TABLE github_issues (id BIGINT, title VARCHAR, created_at TIMESTAMPTZ)");
 });
 afterAll(() => db.close());
-
-// Until sql/deps.ts planScans is built (builder A of the same wave), a stand-in with its contract: the scans of
-// the unoptimized plan, ASCII-lowercased, unique and sorted. It goes away by itself once the real one exists.
-async function standInPlanScans(c: DuckDBConnection, body: string): Promise<string[] | null> {
-  await c.run("PRAGMA disable_optimizer");
-  try {
-    const reader = await c.runAndReadAll(`EXPLAIN (FORMAT json) ${body}`);
-    const out = new Set<string>();
-    const walk = (n: unknown): void => {
-      if (Array.isArray(n)) return n.forEach(walk);
-      if (!n || typeof n !== "object") return;
-      const table = (n as { extra_info?: { Table?: unknown } }).extra_info?.Table;
-      if (typeof table === "string") out.add(table.split(".").at(-1)!.toLowerCase());
-      walk((n as { children?: unknown }).children);
-    };
-    walk(JSON.parse(String(reader.getRowsJS()[0]![1])));
-    return [...out].sort();
-  } catch {
-    return null;
-  } finally {
-    await c.run("PRAGMA enable_optimizer");
-  }
-}
-// The stub throws before it looks at its connection; the real one fails on the missing connection instead.
-const planScansIsStub = await Promise.resolve()
-  .then(() => deps.planScans(undefined as unknown as DuckDBConnection, "SELECT 1"))
-  .then(() => false, (e: unknown) => String((e as Error | undefined)?.message).startsWith("PHASE_STUB"));
-if (planScansIsStub) mock.module("./deps.ts", () => ({ planScans: standInPlanScans }));
 
 /** The error DuckDB gives when preparing `sql`. */
 async function duckError(sql: string): Promise<Error> {
@@ -135,7 +106,7 @@ function asset(name: string, body: string, o: { headerLines?: number; astInputs?
   const lines = o.headerLines ?? 0;
   return {
     name, file: `assets/${name}.sql`, path: `/project/assets/${name}.sql`, ok: true,
-    header: { key: [], checks: [], warnings: [], lines }, body, headerLines: lines, astInputs: o.astInputs ?? [], problems: [],
+    header: { key: [], checks: [], warnings: [], lines }, body, headerLines: lines, astInputs: o.astInputs ?? [], sourceHash: `source_${name}`, problems: [],
   };
 }
 

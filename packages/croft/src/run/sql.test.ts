@@ -65,7 +65,7 @@ function sqlStep(name: string, body: string, o: StepSpec = {}): PlannedStep {
   const file = `assets/${name}.sql`;
   const sql: LoadedSqlAsset = {
     name, file, path: `/project/${file}`, ok: o.ok ?? true, header: { key, checks: [], warnings: [], lines: header.length }, body,
-    headerLines: header.length, astInputs: o.inputs ?? [], codeHash: `code_${name}`, problems: o.problems ?? [],
+    headerLines: header.length, astInputs: o.inputs ?? [], codeHash: `code_${name}`, sourceHash: `source_${name}`, problems: o.problems ?? [],
   };
   const none = { kind: "none" } as const;
   return {

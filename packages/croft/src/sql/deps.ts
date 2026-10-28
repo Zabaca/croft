@@ -1,48 +1,50 @@
 // Dependencies from the unoptimized bound plan (DESIGN.md §3c "Dependencies"): the scans of
-// `PRAGMA disable_optimizer; EXPLAIN (FORMAT json) <body>` over the shadow catalog. The AST walk (sql/ast.ts
+// `EXPLAIN (FORMAT json) <body>`, optimizer off, over the shadow catalog. The AST walk (sql/ast.ts
 // relationNames) scopes CTE names and reads table macros' tables as DuckDB binds them, and the golden corpus
 // holds it to this plan case by case; the plan is the net under it for whatever a macro or a rewrite hides
 // from the parse tree. The optimizer must be off: it prunes scans (`WHERE false`, `LIMIT 0`) [V]. An SQL
 // asset's inputs are relationNames ∪ planScans.
 //
 // Verified on DuckDB 1.5.5 (deps.test.ts, and the golden corpus in deps-corpus/):
-// - PRAGMA disable_optimizer works on a connection whose configuration is locked (SET enable_optimizer is
-//   refused there), and nothing reports the setting, so it is read back by explaining `SELECT 1 WHERE false`:
-//   the optimizer turns that into EMPTY_RESULT.
+// - The connection comes with the optimizer off (db/connect.ts SandboxSpec.optimizer, which ShadowCatalog
+//   passes); planScans never switches it, since a locked configuration refuses SET enable_optimizer. Nothing
+//   reports the setting, so it is read back by explaining `SELECT 1 WHERE false`: the optimizer turns that into
+//   EMPTY_RESULT.
 // - A table scan is a plan node whose extra_info has "Table": the catalog, schema and table, each quoted when
 //   DuckDB would quote it (`"temp".main.t`, `memory.main."we.ird"`).
 // - A CTE's scan appears once, under the CTE node; a table named in an unused CTE is not scanned; DESCRIBE
 //   scans nothing (it reads the catalog).
 // - EXPLAIN goes through prepare(), which refuses a second statement, and never runs the body.
 import type { DuckDBConnection } from "@duckdb/node-api";
+import { CroftError } from "../core/errors.ts";
 import { asciiLower } from "./ast.ts";
 
 /**
  * The tables `body`'s unoptimized plan scans, ASCII-lowercased, unique and sorted. `conn` must hold every
- * table the body reads (sql/bind.ts's shadow catalog, never the warehouse); it is left with the optimizer
- * setting it had. null when the body does not bind there: the bind check reports why.
+ * table the body reads (sql/bind.ts's shadow catalog, never the warehouse) and have the optimizer off (opened
+ * with `optimizer: false`); INTERNAL_ERROR otherwise. null when the body does not bind there: the bind check
+ * reports why.
  *
  * Only tables in a `main` schema count (any catalog: a temp table is `temp.main.x`), as in relationNames.
  * `body` is an asset's body that loadSqlAsset accepted: a trailing `;` or `--` comment is fine, and so is a
- * comment on its first line. Not safe to call concurrently on one connection (the optimizer switch is per
- * connection).
+ * comment on its first line.
  */
 export async function planScans(conn: DuckDBConnection, body: string): Promise<string[] | null> {
-  const wasOn = await optimizerOn(conn);
-  if (wasOn) await conn.run("PRAGMA disable_optimizer");
-  try {
-    let plans: unknown[];
-    try {
-      plans = await explain(conn, body);
-    } catch {
-      return null;
-    }
-    const tables = new Set<string>();
-    for (const plan of plans) collectScans(plan, tables);
-    return [...tables].sort();
-  } finally {
-    if (wasOn) await conn.run("PRAGMA enable_optimizer");
+  if (await optimizerOn(conn)) {
+    throw new CroftError("INTERNAL_ERROR", {
+      message: "dependency plans need a connection with the optimizer off (openMemory with optimizer: false)",
+      hint: "report this croft bug",
+    });
   }
+  let plans: unknown[];
+  try {
+    plans = await explain(conn, body);
+  } catch {
+    return null;
+  }
+  const tables = new Set<string>();
+  for (const plan of plans) collectScans(plan, tables);
+  return [...tables].sort();
 }
 
 /** Whether the connection's optimizer is on: it turns `WHERE false` into an empty result. */

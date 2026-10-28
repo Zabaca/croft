@@ -104,7 +104,7 @@ export class ShadowCatalog {
 
   /** An empty in-memory database set to the project time zone, sandboxed like every croft connection. */
   static async open(timezone: string): Promise<ShadowCatalog> {
-    const db = await openMemory({ timezone });
+    const db = await openMemory({ timezone, optimizer: false });
     try {
       return new ShadowCatalog(db, await db.connect());
     } catch (e) {

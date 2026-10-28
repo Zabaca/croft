@@ -106,6 +106,32 @@ describe("rejects", () => {
     expect((await code("copy t to 'out.csv'")).problem.hint).toContain("exports are post-v1");
   });
 
+  test("a CTE that writes or exports is refused, nested ones too, and an unknown query node fails closed", async () => {
+    // DuckDB 2.0 parses `WITH x AS (DELETE … RETURNING *)` and `WITH x AS (COPY …)` as one SELECT and runs them.
+    // The parser here answers with those trees: every SELECT_NODE after the outer one gets the foreign type.
+    const as = (type: string): DuckDBConnection => new Proxy(conn, {
+      get(target, key) {
+        if (key !== "runAndReadAll") return Reflect.get(target, key, target);
+        return async (sql: string, params?: unknown[]) => {
+          const reader = await target.runAndReadAll(sql, params as never);
+          if (!sql.includes("json_serialize_sql")) return reader;
+          let n = 0;
+          const text = String(reader.getRowsJS()[0]![0]).replace(/"type":"SELECT_NODE"/g, (m) => (n++ === 0 ? m : `"type":"${type}"`));
+          return { getRowsJS: () => [[text]] };
+        };
+      },
+    });
+    for (const [type, word] of [["DELETE_QUERY_NODE", "DELETE"], ["COPY_QUERY_NODE", "COPY"], ["INSERT_QUERY_NODE", "INSERT"], ["MERGE_INTO_NODE", "MERGE INTO"]] as const) {
+      for (const sql of ["with x as (select * from t) select * from x", "select * from t where a in (with x as (select 1) select * from x)"]) {
+        const e = await code(sql, undefined, as(type));
+        expect([type, sql, e.code]).toEqual([type, sql, "QUERY_NOT_SELECT"]);
+        expect(e.message).toContain(`${word} statement`);
+        expect(e.problem.hint).toContain("a CTE that writes or exports");
+      }
+      expect((await code("with x as (select 1) select * from x", { notSelectCode: "SQL_NOT_SELECT" }, as(type))).code).toBe("SQL_NOT_SELECT");
+    }
+  });
+
   test("SQL assets report SQL_NOT_SELECT", async () => {
     expect((await code("insert into t values (1, 'a')", { notSelectCode: "SQL_NOT_SELECT" })).code).toBe("SQL_NOT_SELECT");
   });
@@ -296,7 +322,7 @@ describe("serve profile", () => {
       "select range(1, 200000001, 2)",
       "select range(1.5e8)",
       "select range(0::BIGINT, 50000000::BIGINT)",
-      "select list_reduce(range(20000000), (a, b) -> a + b)",
+      "select list_reduce(range(20000000), lambda a, b: a + b)",
       "select a from t where a in (select unnest(range(100000000)))",
       "select range(170141183460469231731687303715884105727)",
     ]) {

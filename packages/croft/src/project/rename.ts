@@ -54,7 +54,8 @@ import type { CatalogAsset } from "../history/catalog.ts";
 import { newRunId, RUNS_DB_FILE, RunsDb } from "../history/runs-db.ts";
 import { type DiscoveredAsset, discoverAssets, nameProblem, sqlKeywordNames } from "./discover.ts";
 import { loadProject, type Project } from "./root.ts";
-import { lexSql, parseSqlHeader } from "./sql-asset.ts";
+import { lexSql } from "../sql/lex.ts";
+import { parseSqlHeader } from "./sql-asset.ts";
 import { didYouMean } from "./suggest.ts";
 
 /** A place in the project's code that names the old asset. */

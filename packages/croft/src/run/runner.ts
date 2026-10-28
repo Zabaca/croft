@@ -67,6 +67,7 @@
 import { appendFileSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { version as duckdbVersion } from "@duckdb/node-api";
 import { checksHook, runWarnings } from "../checks/run.ts";
 import { CroftError, exitCodeFor } from "../core/errors.ts";
 import type { Confirmation, CursorType, Fix, Hold, LockHolder, Problem, Reason, StepResult } from "../core/types.ts";
@@ -808,6 +809,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
         const log = openLog(paths.stateDir, runId, asset, { redact: (t) => env.redact(t) });
         if (scheduled) recordAttempt(runs, step, attempt, clock());
         runs.startStep({ runId, asset, attempt, reason: step.reason, ...(codeHash ? { codeHash } : {}), logPath: logPath(paths.stateDir, runId, asset) });
+        noteSource(runs, step);
         // What the asset's top-level code printed when the plan imported it (core/output.ts).
         if (attempt === 1) for (const line of step.output ?? []) log.write(line);
         log.write(`${formatInstant(new Date(), project.timezone)} ${asset} attempt ${attempt} of ${maxAttempts} (run ${runId}): ${step.behavior}`);
@@ -890,7 +892,10 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
           }
           runs.finishStep(runId, asset, attempt, { status: out.result.status, reason: out.result.reason, rows: out.result.rows });
           const ran = out.result.status === "ok" || out.result.status === "unchanged";
-          if (ran && (o.human ?? true) && codeHash) runs.approveCode(asset, codeHash);
+          if (ran && (o.human ?? true) && codeHash) {
+            runs.approveCode(asset, codeHash);
+            noteSource(runs, step);
+          }
           // A person ran an asset that reads secrets under croft.json's secretsFrom command: the scheduler may run it (D108).
           if (ran && (o.human ?? true) && step.spec?.secrets.length && project.config.secretsFrom) {
             runs.approveSecretsCommand(secretsCommandHash(project.config.secretsFrom));
@@ -1163,6 +1168,11 @@ function readText(path: string): string {
 }
 
 /** The code hash a step runs: the loaded TS module's, or the SQL file's fingerprint. */
+/** An SQL step's code hash with the source and engine it came from (run/engine-change.ts). */
+function noteSource(runs: RunsDb, step: PlannedStep): void {
+  if (step.sql?.codeHash && step.sql.sourceHash) runs.noteCodeSource(step.sql.codeHash, step.sql.sourceHash, duckdbVersion());
+}
+
 function codeHashOf(step: PlannedStep): string | undefined {
   return step.codeHash ?? step.sql?.codeHash;
 }

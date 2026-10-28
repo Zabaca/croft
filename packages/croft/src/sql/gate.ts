@@ -29,7 +29,7 @@ import { CroftError } from "../core/errors.ts";
 import { mapSandboxError, type Profile } from "../db/connect.ts";
 import { physicalPath } from "../project/root.ts";
 import {
-  asciiLower, type AstNode, collect, finiteJson, literal, location, looksLikePath, positional, stringOf, TABLE_ARGUMENT_FUNCTIONS, tableArguments,
+  asciiLower, type AstNode, collect, finiteJson, foreignQueryNode, literal, location, looksLikePath, positional, stringOf, TABLE_ARGUMENT_FUNCTIONS, tableArguments,
   type Use, walk,
 } from "./ast.ts";
 
@@ -266,6 +266,11 @@ class Checker {
   }
 
   async check(stmt: SelectAst): Promise<void> {
+    const foreign = foreignQueryNode(stmt);
+    if (foreign) {
+      throw this.notSelect(`the query holds a ${foreign.type.replace(/_QUERY_NODE$|_NODE$/, "").replace(/_/g, " ")} statement; croft runs read-only SELECTs`,
+        "a CTE that writes or exports (INSERT, UPDATE, DELETE or COPY inside WITH) is not a read; keep the SELECT, and let croft write tables", foreign.at);
+    }
     for (const u of collect(stmt).uses) {
       if (u.kind === "scalar") await this.scalar(u.name, u.at);
       else if (u.kind === "table_function") await this.tableFunction(u.name, u.fn, u.at);
