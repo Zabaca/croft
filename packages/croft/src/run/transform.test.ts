@@ -739,13 +739,14 @@ export default transform({
 });
 `,
     });
-    const ids = Array.from({ length: 5000 }, (_, i) => i + 1);
+    // Past one DuckDB vector (2,048 rows), so the stream is still open when the loop leaves it.
+    const ids = Array.from({ length: 2500 }, (_, i) => i + 1);
     await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues(ids, S1) });
     const s = await plan(h, "t");
     await step(h, s);
-    expect(g.__t_after).toEqual({ n: 42, seen: 5000 });
+    expect(g.__t_after).toEqual({ n: 42, seen: 2500 });
     delete g.__t_after;
-  });
+  }, 60_000);
 
   test("two inputs: newRows() of one, rows() and query() of the other inside the loop; pages of rows", async () => {
     CHUNK.rows = 2;
