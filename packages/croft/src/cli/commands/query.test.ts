@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
-import { cleanup as cleanupChildren, spawnHolder } from "../../read/testkit.ts";
+import { cleanup as cleanupChildren, releaseHolder, spawnHolder } from "../../read/testkit.ts";
 import { putCatalog } from "../../history/catalog.ts";
 import { CHARGES_TS, cleanup, cli, DEAD, ISSUES_CATALOG, ISSUES_SEED, ISSUES_TS, makeProject, runsDb, seed, shape } from "./inspect-testkit.ts";
 import { parseLimit } from "./query.ts";
@@ -362,10 +362,14 @@ describe("croft query: usage and state", () => {
 
   test("a query waits for another program's lock to go, then answers", async () => {
     const p = await issues();
-    const holder = spawnHolder(p.database, 1200);
+    // Held until the query has waited a while, however slow the machine: the wait is ours to end.
+    const holder = spawnHolder(p.database, "release");
     await holder.waitFor("held");
     const started = Date.now();
-    const r = await cli(["query", "select count(*) AS n from github_issues", "--json"], { cwd: p.root });
+    const pending = cli(["query", "select count(*) AS n from github_issues", "--json"], { cwd: p.root });
+    await Bun.sleep(600);
+    releaseHolder(holder);
+    const r = await pending;
     expect(r.exit).toBe(0);
     expect(r.json.data.rows).toEqual([{ n: 3 }]);
     expect(Date.now() - started).toBeGreaterThan(500);

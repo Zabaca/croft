@@ -25,6 +25,7 @@ afterAll(async () => {
 });
 beforeEach(() => {
   api.state.log.length = 0;
+  api.state.slowGate = null;   // a test that failed while holding /slow never holds the next one
 });
 
 async function count(root: string, table: string): Promise<number> {
@@ -62,7 +63,10 @@ async function inProcess(root: string, argv: string[], o: { stdinTTY?: boolean; 
 describe("detached runs", () => {
   test("off a TTY the run detaches; after --follow the parent exits 6 with croft wait; wait returns the result", async () => {
     api.state.slowPages = 10;
-    api.state.slowDelayMs = 250;
+    api.state.slowDelayMs = 50;
+    // The source answers only once the test has seen the run running mid-extract, however slow the machine.
+    let open!: () => void;
+    api.state.slowGate = new Promise<void>((r) => (open = r));
     const root = makeProject({ "assets/slow.ts": slowPages(api.url) });
     const parent = startCli(root, ["run", "slow", "--json", "--follow", "1s"]);
     const first = await parent.done;
@@ -72,11 +76,18 @@ describe("detached runs", () => {
     const runId = env.data.runId as string;
     expect(env.next).toEqual([{ command: `croft wait ${runId} --timeout 100s`, reason: "still running" }]);
 
-    // The run outlives the process that started it.
-    const still = await cli(root, ["wait", runId, "--timeout", "0.1s", "--json"]);
+    // The run outlives the process that started it: it is extracting, its first page in, held at its second. Its
+    // progress is written at most every 500 ms, so it is asked for until it is there.
+    await until(() => api.state.log.filter((l) => l.path === "/slow").length >= 2);
+    const still = await until(async () => {
+      const r = await cli(root, ["wait", runId, "--timeout", "0.1s", "--json"]);
+      return r.json?.data?.progress ? r : null;
+    });
     expect(still.code).toBe(6);
     expect(still.json!.data).toMatchObject({ runId, status: "running" });
     expect(still.json!.data.progress).toMatchObject({ asset: "slow", phase: "extract" });
+    open();
+    api.state.slowGate = null;
 
     const done = await cli(root, ["wait", runId, "--timeout", "30s", "--json"]);
     expect(done.code).toBe(0);

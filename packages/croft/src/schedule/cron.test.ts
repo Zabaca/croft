@@ -445,8 +445,13 @@ describe("latestFireAtOrBefore", () => {
   });
 });
 
+// These guard the algorithm, not the machine: a scan minute by minute through the lookback (millions of steps for
+// "0 0 29 2 *") takes seconds, while the real one takes about 3 ms on a laptop, the first use of a zone included. The
+// bound sits far from both, so a busy CI runner (9 ms once against an earlier 5 ms bound) never fails it.
+const FAST_MS = 200;
+
 describe("performance", () => {
-  test("nextFires for 3 fires takes under 5 ms, even for a zone used for the first time", () => {
+  test(`nextFires for 3 fires takes under ${FAST_MS} ms, even for a zone used for the first time`, () => {
     const cases: [string, string][] = [
       ["*/15 * * * *", "Pacific/Chatham"], ["0 * * * *", "America/Sao_Paulo"], ["30 2 * * *", "America/Denver"],
       ["0 9 * * 1-5", "Europe/Berlin"], ["0 0 1 * *", "Asia/Tokyo"], ["30 8 * * mon", "Africa/Cairo"],
@@ -458,7 +463,7 @@ describe("performance", () => {
       const fires = nextFires(text, tz, after, 3);
       const ms = performance.now() - t0;
       expect(fires.length).toBe(3);
-      expect({ text, tz, fast: ms < 5 }).toEqual({ text, tz, fast: true });
+      expect({ text, tz, fast: ms < FAST_MS }).toEqual({ text, tz, fast: true });
     }
   });
 
@@ -468,7 +473,7 @@ describe("performance", () => {
       latestFireAtOrBefore(text, LA, now);
       const t0 = performance.now();
       latestFireAtOrBefore(text, LA, now);
-      expect({ text, fast: performance.now() - t0 < 5 }).toEqual({ text, fast: true });
+      expect({ text, fast: performance.now() - t0 < FAST_MS }).toEqual({ text, fast: true });
     }
   });
 });

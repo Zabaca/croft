@@ -5,7 +5,7 @@ import { CroftError } from "../core/errors.ts";
 import { closeAllWarehouses, openWarehouse } from "../db/warehouse.ts";
 import { type DirectTimings, directQuery, inProcessWarehouse, isOpen, openCount, openUsers } from "./direct.ts";
 import type { SelectRequest } from "./wire.ts";
-import { cleanup, makeProject, seed, sleep, spawnHolder, spawnIdle, writeIntent } from "./testkit.ts";
+import { cleanup, makeProject, releaseHolder, seed, sleep, spawnHolder, spawnIdle, writeIntent } from "./testkit.ts";
 
 afterAll(async () => {
   await closeAllWarehouses();
@@ -192,14 +192,16 @@ describe("write-intent handshake", () => {
 describe("lock conflicts", () => {
   test("retries while another process writes, then sees its commit", async () => {
     const p = await makeProject({ seed: SALES });
-    const writer = spawnHolder(p.database, 700, "INSERT INTO sales (id) VALUES (42)");
+    // Held until the query has retried for a while, however slow the machine: the wait is ours to end.
+    const writer = spawnHolder(p.database, "release", "INSERT INTO sales (id) VALUES (42)");
     await writer.waitFor("held");
     const t0 = Date.now();
-    const rows = await directQuery(p.project, req("SELECT max(id) AS m FROM sales"), { ...FAST, lockRetryMs: 5000 });
-    const waited = Date.now() - t0;
+    const pending = directQuery(p.project, req("SELECT max(id) AS m FROM sales"), { ...FAST, lockRetryMs: 30_000 });
+    await Bun.sleep(400);
+    releaseHolder(writer);
+    const rows = await pending;
     expect(rows).toEqual([{ m: 42 }]);
-    expect(waited).toBeGreaterThanOrEqual(400);
-    expect(waited).toBeLessThan(4000);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(400);
   });
 
   test("DB_HELD_BY_OTHER_PROGRAM names the holder after lockRetryMs", async () => {

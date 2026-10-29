@@ -68,6 +68,9 @@ export interface MockState {
   /** /slow: pages and the delay before each. */
   slowPages: number;
   slowDelayMs: number;
+  /** /slow answers its pages after the first only once this settles (null: at once): a test that must see the run
+   *  mid-extract, with the first page's progress recorded, holds it there for as long as it takes. */
+  slowGate?: Promise<void> | null;
   /** Every request's path and query. */
   log: { path: string; query: Record<string, string> }[];
 }
@@ -126,6 +129,7 @@ export function mockApi(): MockApi {
         case "/slow": {
           const page = Number(query.page ?? 1);
           await Bun.sleep(state.slowDelayMs);
+          if (state.slowGate && page > 1) await state.slowGate;
           const rows = [{ id: page * 2 - 1, page }, { id: page * 2, page }];
           return json({ rows, more: page < state.slowPages });
         }

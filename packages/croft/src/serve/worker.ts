@@ -180,12 +180,11 @@ export function toWire(e: unknown): WireError {
   return { kind: "error", name: err.name, message: err.message };
 }
 
-/** The peak resident set of this process, in bytes. getrusage reports it in bytes on macOS and in KiB on Linux, and
- *  Bun passes it on as it is: a peak below the current resident set can only be KiB. */
-function peakRss(): number {
-  const max = process.resourceUsage().maxRSS;
-  const now = process.memoryUsage().rss;
-  return Math.max(max >= now ? max : max * 1024, now);
+/** The peak resident set of this process, in bytes. getrusage reports it in bytes on macOS and in KiB elsewhere, and
+ *  Bun passes it on as it is. The unit goes by the platform, not by the value: macOS's peak can lag the current
+ *  resident set by a few pages, and reading such a peak as KiB made it 1024 times too large. */
+export function peakRss(platform: NodeJS.Platform = process.platform, usage = process.resourceUsage().maxRSS, rss = process.memoryUsage().rss): number {
+  return Math.max(platform === "darwin" ? usage : usage * 1024, rss);
 }
 
 /** The worker's side: one instance, its connections, and the queries running on them. */

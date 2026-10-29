@@ -316,7 +316,7 @@ export default ingest({
   });
 
   test("an edit while the step waits for the file (a GUI holds it) holds the step once it has the file", async () => {
-    const { spawnHolder, cleanup } = await import("../read/testkit.ts");
+    const { releaseHolder, spawnHolder, cleanup } = await import("../read/testkit.ts");
     const root = makeProject({
       "assets/items.ts": `import { ingest } from "@zabaca/croft";
 export default ingest({
@@ -332,12 +332,14 @@ export default ingest({
     const { now } = nextFire();
     const plan = await duePlan(loadProject({ root }), ["items"], now);
     expect(plan.steps.map((s) => [s.asset, s.hold ?? null])).toEqual([["items", null]]);
-    const holder = spawnHolder(join(root, "warehouse.duckdb"), 2500);
+    // Held until the file is edited, however slow the machine: the run is still waiting when it changes.
+    const holder = spawnHolder(join(root, "warehouse.duckdb"), "release");
     try {
       await holder.waitFor("held");
       const running = due(root, ["items"], plan, now);
       await Bun.sleep(700);
       writeFileSync(join(root, "lib/rows.ts"), `export const rows = [{ id: 1, title: "test" }];\n`);
+      releaseHolder(holder);
       const out = await running;
       expect(out.data.steps[0]).toMatchObject({ asset: "items", status: "skipped" });
       expect(out.data.steps[0]!.skippedBecause).toStartWith("held (SCHEDULE_HELD): ");

@@ -16,7 +16,7 @@ import { listTrash } from "../safety/trash.ts";
 import { planRun } from "./plan.ts";
 import { Rebuilds } from "./rebuild.ts";
 import { type RunEvent, withProjectChecks } from "./runner.ts";
-import { cleanupProjects, cli, cliEnv, keysetIssues, linkItems, makeProject, mockApi, runIn, simpleGet, slowPages } from "./testkit.ts";
+import { cleanupProjects, cli, cliEnv, keysetIssues, linkItems, makeProject, mockApi, runIn, simpleGet, slowPages, startCli, until } from "./testkit.ts";
 
 const api = mockApi();
 afterAll(async () => {
@@ -1469,18 +1469,22 @@ describe("a lock wait and Ctrl-C", () => {
 
   // DESIGN §5 "Lock conflicts": after 2 s the holder is printed.
   test("a run waiting for the file names its holder after 2 s: a waiting event, in events.ndjson for a detached run's id", async () => {
-    const { spawnHolder, cleanup } = await import("../read/testkit.ts");
+    const { releaseHolder, spawnHolder, cleanup } = await import("../read/testkit.ts");
     api.state.zones = [{ zone: 1 }];
     const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
     expect((await runIn(root, ["zones"])).exit).toBe(0);
     await closeAllWarehouses();
-    const holder = spawnHolder(join(root, "warehouse.duckdb"), 3000);
+    // Held until the run has said it waits, however long the run takes to get there.
+    const holder = spawnHolder(join(root, "warehouse.duckdb"), "release");
     try {
       await holder.waitFor("held");
       const events: RunEvent[] = [];
       // The id a detached run's parent picks: the wait comes before the run exists (reconcile opens the file).
       const runId = "r_0101_0000_wait";
-      const out = await runIn(root, ["zones"], { runId, onEvent: (_l, e) => events.push(e) });
+      const running = runIn(root, ["zones"], { runId, onEvent: (_l, e) => events.push(e) });
+      await until(() => events.some((e) => e.type === "waiting"), 30_000);
+      releaseHolder(holder);
+      const out = await running;
       expect(out.exit).toBe(0);
       const waiting = events.filter((e) => e.type === "waiting");
       expect(waiting).toHaveLength(1);
@@ -1492,20 +1496,25 @@ describe("a lock wait and Ctrl-C", () => {
     } finally {
       cleanup();
     }
-  }, 20_000);
+  }, 60_000);
 
   test("croft run prints the holder on stderr while it waits, detached or not; with --events as the waiting event", async () => {
-    const { spawnHolder, cleanup } = await import("../read/testkit.ts");
+    const { releaseHolder, spawnHolder, cleanup } = await import("../read/testkit.ts");
     api.state.zones = [{ zone: 1 }];
     const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
     expect((await runIn(root, ["zones"])).exit).toBe(0);
     await closeAllWarehouses();
     try {
       for (const args of [["--json"], ["--foreground"], ["--json", "--events"]]) {
-        // Long enough that the run, once started, still waits over 2 s.
-        const holder = spawnHolder(join(root, "warehouse.duckdb"), 4500);
+        // Held until the run has printed that it waits, however long the run takes to get there.
+        const holder = spawnHolder(join(root, "warehouse.duckdb"), "release");
         await holder.waitFor("held");
-        const r = await cli(root, ["run", "zones", ...args]);
+        const started = startCli(root, ["run", "zones", ...args]);
+        let printed = "";
+        started.proc.stderr!.on("data", (d) => (printed += d));
+        await until(() => /waiting for the warehouse|"type":"waiting"/.test(printed), 30_000);
+        releaseHolder(holder);
+        const r = await started.done;
         expect(r.code, `${args.join(" ")}\n${r.stderr}`).toBe(0);
         if (args.includes("--events")) {
           const waiting = r.stderr.split("\n").filter((l) => l.startsWith("{")).map((l) => JSON.parse(l) as RunEvent).filter((e) => e.type === "waiting");

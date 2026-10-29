@@ -5,3 +5,9 @@
 // spawns.
 process.env.CROFT_FORBID_OS_JOBS = "1";
 process.env.CROFT_NOTIFY_DRY = "1";
+
+// Bun's default per-test timeout is 5 s. A test that normally takes 1-3 s (a CLI process or two, a query worker)
+// hit it on a busy CI runner, four in one run (ubuntu, 2026-10-19); timing that a test checks is its own
+// assertion, never this. Tests that set their own timeout keep it.
+import { setDefaultTimeout } from "bun:test";
+setDefaultTimeout(60_000);
