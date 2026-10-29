@@ -22,9 +22,9 @@ import { addProject } from "../../schedule/registry.ts";
 import { scan } from "../../agent/contract-testkit.ts";
 import { SELF_ROOT } from "../launcher.ts";
 import { main } from "../main.ts";
-import { BUN_TESTED } from "../version.ts";
+import { BUN_FLOOR, BUN_TESTED } from "../version.ts";
 import {
-  type DoctorCheck, type DoctorDeps, type DuckdbProbe, duckdbOffsets, formatBytes, formatDoctor, probeDuckdb, runDoctor,
+  defaultDeps, type DoctorCheck, type DoctorDeps, type DuckdbProbe, duckdbOffsets, formatBytes, formatDoctor, probeDuckdb, runDoctor,
 } from "./doctor.ts";
 import { agoText, SINCE_KEY } from "./schedule.ts";
 
@@ -54,6 +54,10 @@ function deps(o: Partial<DoctorDeps> = {}): DoctorDeps {
     wsl: false, probeDuckdb: () => OK_PROBE, rosetta: () => false, synced: () => null, filesystem: () => LOCAL, lockWaitMs: 150, healthTimeoutMs: 300, ...o,
   };
 }
+
+/** For croft doctor through main(): the Bun its check sees (CROFT_BUN_VERSION). CI also runs the newest Bun, which may
+ *  be newer than BUN_TESTED; these tests are about the other checks, and the Bun line has its own test above. */
+const PINNED_BUN = { CROFT_BUN_VERSION: BUN_FLOOR };
 
 const check = (checks: DoctorCheck[], id: string) => checks.find((c) => c.id === id)!;
 
@@ -107,7 +111,7 @@ describe("croft doctor --json", () => {
     symlinkSync(SELF_ROOT, join(root, "node_modules", "@zabaca", "croft"));
     const before = tree(root);
     let stdout = "";
-    const exit = await main(["doctor", "--json"], { cwd: join(root, "assets"), env: {}, stdout: (t) => { stdout += t; }, stderr: () => {} });
+    const exit = await main(["doctor", "--json"], { cwd: join(root, "assets"), env: PINNED_BUN, stdout: (t) => { stdout += t; }, stderr: () => {} });
     const env = JSON.parse(stdout);
     expect(exit).toBe(0);
     expect(env).toMatchObject({ schemaVersion: 1, ok: true, command: "doctor", database: "warehouse.duckdb", timezone: "Asia/Tokyo", problems: [], next: [] });
@@ -144,6 +148,12 @@ describe("croft doctor --json", () => {
 });
 
 describe("environment checks", () => {
+  test("CROFT_BUN_VERSION is the Bun the check sees; without it, the running one", () => {
+    expect(defaultDeps({ CROFT_BUN_VERSION: "9.0.0" }).bunVersion).toBe("9.0.0");
+    expect(defaultDeps({}).bunVersion).toBe(Bun.version);
+    expect(defaultDeps({ CROFT_BUN_VERSION: " " }).bunVersion).toBe(Bun.version);
+  });
+
   test("Bun floor, and a Bun newer than the tested one", async () => {
     const dir = await project();
     const old = await runDoctor(dir, deps({ bunVersion: "1.3.13" }));
@@ -278,7 +288,7 @@ describe("the assets line (croft validate's counts)", () => {
     });
     expect(problems).toEqual([]);
     let out = "";
-    const exit = await main(["doctor"], { cwd: root, env: {}, stdout: (t) => { out += t; }, stderr: () => {}, stdoutTTY: false });
+    const exit = await main(["doctor"], { cwd: root, env: PINNED_BUN, stdout: (t) => { out += t; }, stderr: () => {}, stdoutTTY: false });
     expect(exit).toBe(1);
     expect(out).toContain("  error 3 assets · 1 error, 1 warning (details: croft validate)");
   });
@@ -326,12 +336,12 @@ describe("a croft rename that did not finish (its journal, .croft/rename.json)",
     });
 
     let out = "";
-    const exit = await main(["doctor", "--json"], { cwd: root, env: {}, stdout: (t) => { out += t; }, stderr: () => {} });
+    const exit = await main(["doctor", "--json"], { cwd: root, env: PINNED_BUN, stdout: (t) => { out += t; }, stderr: () => {} });
     const env = JSON.parse(out);
     expect(exit).toBe(2);
     expect(env.next).toEqual([{ command: "croft rename example_sales sales", reason: "finish renaming example_sales to sales" }]);
     out = "";
-    await main(["doctor"], { cwd: root, env: {}, stdout: (t) => { out += t; }, stderr: () => {}, stdoutTTY: false });
+    await main(["doctor"], { cwd: root, env: PINNED_BUN, stdout: (t) => { out += t; }, stderr: () => {}, stdoutTTY: false });
     expect(out).toContain(`  error ASSET_RENAMED ${text}`);
     expect(out).toContain("croft rename example_sales sales");
   });
@@ -813,7 +823,7 @@ describe("human output", () => {
     const root = await project();
     writeFileSync(join(root, ".env"), "GOOD=1\nnot a pair\n");
     let out = "";
-    const exit = await main(["doctor"], { cwd: root, env: {}, stdout: (t) => { out += t; }, stderr: () => {}, stdoutTTY: false });
+    const exit = await main(["doctor"], { cwd: root, env: PINNED_BUN, stdout: (t) => { out += t; }, stderr: () => {}, stdoutTTY: false });
     expect(exit).toBe(0);
     expect(out).toContain("  warn  ENV_FILE_INVALID .env: line 2");
     expect(out).toContain("        fix: fix that line of .env (KEY=value)\n");
@@ -826,7 +836,7 @@ describe("human output", () => {
   test("the real command prints sections and exits 0 on a healthy project", async () => {
     const root = await project();
     let out = "";
-    const exit = await main(["doctor"], { cwd: root, env: {}, stdout: (t) => { out += t; }, stderr: () => {}, stdoutTTY: false });
+    const exit = await main(["doctor"], { cwd: root, env: PINNED_BUN, stdout: (t) => { out += t; }, stderr: () => {}, stdoutTTY: false });
     expect(exit).toBe(0);
     expect(out.split("\n")[0]).toBe("Environment");
     expect(out).toContain("\nProject\n");
