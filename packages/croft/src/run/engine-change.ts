@@ -8,8 +8,9 @@
 // - runs.sqlite's code_sources (croft ≥ 0.4) records, per code hash, the source hash it was made from and the engine
 //   that made it. An old hash whose source is the source now, made by another engine, is an engine change.
 // - A hash recorded by croft 0.3 has no row. It counts when it is the hash the asset was last built with, that build
-//   predates the engine switch (the engine runs.sqlite records, ENGINE_SETTING, is still the old one, or was recorded
-//   after the build), and the file's mtime is not newer than that build. A git checkout bumps mtimes, so such a
+//   predates the engine switch (the engine runs.sqlite records, ENGINE_SETTING, is still an older one, or this one was
+//   recorded after the build), and the file's mtime is not newer than that build. croft 0.3 records its engine at
+//   its first write, so with no engine recorded nothing is proven. A git checkout bumps mtimes, so such a
 //   project falls to the safe side: an edit.
 // TS assets are not affected: their code hash is their bundle's (project/ts-asset.ts), which no engine enters.
 import { readFileSync, statSync } from "node:fs";
@@ -61,10 +62,11 @@ export function engineChange(runs: Pick<RunsDb, "codeSource" | "getSetting">, wa
   if (builtAt === null) return null;
   const record = runs.getSetting<Partial<EngineRecord>>(ENGINE_SETTING);
   const recorded = typeof record?.version === "string" ? record.version : null;
+  if (recorded === null) return null;
   if (recorded === engine) {
     const switchedAt = Date.parse(String(record?.recordedAt ?? ""));
     if (!Number.isFinite(switchedAt) || builtAt >= switchedAt) return null;
-  }
+  } else if (compareEngineVersions(recorded, engine) > 0) return null;
   let mtime: number;
   try {
     mtime = statSync(now.path).mtimeMs;
@@ -75,9 +77,8 @@ export function engineChange(runs: Pick<RunsDb, "codeSource" | "getSetting">, wa
   return { from: previousEngine(engine, recorded, now.stateDir), to: engine };
 }
 
-/** The engine before `engine`: the newest pre-upgrade backup made to it names it, else the recorded engine, else
- *  1.5.5 (the engine of every croft before 0.4). */
-function previousEngine(engine: string, recorded: string | null, stateDir?: string): string {
+/** The engine before `engine`: the newest pre-upgrade backup made to it names it, else the recorded engine. */
+function previousEngine(engine: string, recorded: string, stateDir?: string): string {
   if (stateDir) {
     try {
       const to = engine.replace(/^v(?=\d)/, "");
@@ -87,8 +88,9 @@ function previousEngine(engine: string, recorded: string | null, stateDir?: stri
       // No backups folder: the record says.
     }
   }
-  if (recorded !== null && compareEngineVersions(recorded, engine) < 0) return recorded;
-  return "v1.5.5";
+  // The record is this engine once it wrote: the backup made then names the one before; without it, 1.5.5 (the
+  // engine of every croft before 0.4).
+  return recorded !== engine ? recorded : "v1.5.5";
 }
 
 /** The later of two ISO instants, in ms; null when neither is one. */

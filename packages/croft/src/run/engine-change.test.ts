@@ -70,9 +70,18 @@ describe("without one (a build croft 0.3 recorded)", () => {
     expect(engineChange(db, "old", { sourceHash: "s", path, entry: entry({ lastLoadedAt: null }) }, "v2.0.0")).toBeNull();
   });
 
+  test("no engine recorded, or a newer one, proves nothing", () => {
+    setMtime("2026-09-30T00:00:00Z");
+    const now = { sourceHash: "s", path, entry: entry() };
+    expect(engineChange(db, "old", now, "v2.0.0")).toBeNull();
+    db.setSetting(ENGINE_SETTING, { version: "v2.1.0", recordedAt: "2026-09-01T00:00:00.000Z" });
+    expect(engineChange(db, "old", now, "v2.0.0")).toBeNull();
+  });
+
   test("the engine before: the newest backup made to this one names it, else the record, else 1.5.5", () => {
     setMtime("2026-09-30T00:00:00Z");
     const now = { sourceHash: "s", path, entry: entry(), stateDir: dir };
+    db.setSetting(ENGINE_SETTING, { version: "v2.0.0", recordedAt: "2026-10-02T00:00:00.000Z" });
     expect(engineChange(db, "old", now, "v2.0.0")?.from).toBe("v1.5.5");
     db.setSetting(ENGINE_SETTING, { version: "v1.4.3", recordedAt: "2026-09-01T00:00:00.000Z" });
     expect(engineChange(db, "old", now, "v2.0.0")?.from).toBe("v1.4.3");
