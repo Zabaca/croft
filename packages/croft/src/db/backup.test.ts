@@ -106,6 +106,21 @@ describe("compareEngineVersions", () => {
     expect(compareEngineVersions("v1.6.0", "v1.5.5-dev3")).toBeGreaterThan(0);
     expect(compareEngineVersions("v1.6.0-dev12", "v1.6.0-dev9")).not.toBe(0);
   });
+
+  test("across DuckDB 2: 2.0.0 is newer than every 1.x, and the names of such backups parse", () => {
+    expect(compareEngineVersions("v1.5.5", "v2.0.0")).toBeLessThan(0);
+    expect(compareEngineVersions("v2.0.0", "v1.10.9")).toBeGreaterThan(0);
+    expect(compareEngineVersions("v2.0.0", "v2.0.0-dev3")).toBeGreaterThan(0);
+    expect(compareEngineVersions("2.1.0", "v2.0.10")).toBeGreaterThan(0);
+    const state = mkdtempSync(join(tmpdir(), "croft-backups-2-"));
+    try {
+      mkdirSync(join(state, BACKUPS_DIR));
+      writeFileSync(join(state, BACKUPS_DIR, "20261028T120000.123Z-1.5.5-to-2.0.0.duckdb"), "x");
+      expect(listBackups(state).map((b) => [b.from, b.to, b.at])).toEqual([["1.5.5", "2.0.0", "2026-10-28T12:00:00.123Z"]]);
+    } finally {
+      rmSync(state, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("backupBeforeUpgrade", () => {

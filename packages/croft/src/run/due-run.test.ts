@@ -3,9 +3,10 @@
 // and what reads them; the cost guard holds instead of asking; overlaps skip instead of waiting; retries as for
 // any run; last_attempt_at and last_fire_at recorded; the after-run hooks (read copy, failure notification).
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { currentIdentity } from "../core/proc.ts";
+import { ENGINE_SETTING } from "../db/backup.ts";
 import { closeAllWarehouses, warehouseFor } from "../db/warehouse.ts";
 import { tryAcquire } from "../history/leases.ts";
 import { RunsDb } from "../history/runs-db.ts";
@@ -535,5 +536,100 @@ export default ingest({${HOURLY}
     expect(r.code).toBe(0);
     expect(r.json?.data).toMatchObject({ status: "succeeded", steps: [] });
     expect(r.json?.next).toEqual([]);
+  });
+});
+
+// D114: an SQL asset's code hash is DuckDB's parse tree, so a new DuckDB changes it although no file changed. The
+// project is made to look as croft would find it after an upgrade: the SQL asset built and approved under an older
+// engine's hash, which runs.sqlite records with the same source.
+describe("a DuckDB upgrade (run/engine-change.ts)", () => {
+  let seq = 0;
+  async function asIfBuiltBy(root: string, asset: string, engine: string, o: { sourceRow?: boolean } = {}): Promise<string> {
+    await closeAllWarehouses();
+    const old = `built-by-${engine}-${++seq}`;
+    const db = runsDb(root);
+    let current: string;
+    try {
+      current = db.approvedCode(asset)!;
+      const source = db.codeSource(current)!;
+      expect(source.engine).not.toBe(engine);
+      if (o.sourceRow ?? true) db.noteCodeSource(old, source.sourceHash, engine);
+      // croft 0.3 recorded its engine; the 2.0 writer that built the project here recorded its own.
+      else db.setSetting(ENGINE_SETTING, { version: engine, recordedAt: "2026-01-01T00:00:00.000Z" });
+      db.approveCode(asset, old);
+      const entry = db.catalogGet<Record<string, unknown>>(asset)!;
+      db.catalogPut(asset, { ...entry.value, codeHash: old }, entry.source);
+      db.sqlite.query("UPDATE steps SET code_hash = ? WHERE asset = ?").run(old, asset);
+    } finally {
+      db.close();
+    }
+    const { DuckDBInstance } = await import("@duckdb/node-api");
+    const instance = await DuckDBInstance.create(loadProject({ root }).paths.database);
+    const conn = await instance.connect();
+    await conn.run("UPDATE _croft.assets SET code_hash = $1 WHERE name = $2", [old, asset]);
+    conn.closeSync();
+    instance.closeSync();
+    return current;
+  }
+
+  test("the SQL asset rebuilds once, unedited and unheld, and the scheduled run approves its new hash", async () => {
+    const root = await pipeline();
+    const now = await asIfBuiltBy(root, "open_issues", "v1.5.5");
+    const plan = await planRun({ root, timezone: "UTC", selectors: [] });
+    const step = plan.steps.find((s) => s.asset === "open_issues")!;
+    expect(step.reason).toContain("DuckDB upgraded (1.5.5 → 2.0.0)");
+    expect(step.approvalCarries).toBe(true);
+    const status = await cli(root, ["status", "--json"], cliEnv());
+    expect(status.json, status.stderr).toBeDefined();
+    expect(JSON.stringify(status.json)).not.toContain("EDITED_SINCE_LAST_RUN");
+    // The tick does not hold it.
+    const views = await scheduleView({ root, now: nextFire().now });
+    expect(views.find((v) => v.asset === "open_issues")?.held ?? null).toBeNull();
+    // The scheduled run rebuilds it and approves the new hash; the next run has nothing to do.
+    const out = await runDue(root, ["open_issues"], nextFire().now);
+    expect(out.data.steps).toMatchObject([{ asset: "open_issues", status: "ok" }]);
+    const db = runsDb(root);
+    try {
+      expect(db.approvedCode("open_issues")).toBe(now);
+    } finally {
+      db.close();
+    }
+    const again = await planRun({ root, timezone: "UTC", selectors: [] });
+    expect(again.steps.find((s) => s.asset === "open_issues")!.reasons).not.toContain("code_changed");
+  });
+
+  test("a build croft 0.3 recorded (no source row) counts when the file is not newer than the build", async () => {
+    const root = await pipeline();
+    await asIfBuiltBy(root, "open_issues", "v1.5.5", { sourceRow: false });
+    const old = new Date(Date.now() - 86_400_000);
+    utimesSync(join(root, "assets/open_issues.sql"), old, old);
+    const plan = await planRun({ root, timezone: "UTC", selectors: [] });
+    expect(plan.steps.find((s) => s.asset === "open_issues")!.reason).toContain("DuckDB upgraded (1.5.5 → 2.0.0)");
+  });
+
+  test("a build croft 0.3 recorded, from a file touched since (a git checkout): the safe side, an edit, held", async () => {
+    const root = await pipeline();
+    await asIfBuiltBy(root, "open_issues", "v1.5.5", { sourceRow: false });
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(join(root, "assets/open_issues.sql"), later, later);
+    const touched = await planRun({ root, timezone: "UTC", selectors: [] });
+    const step = touched.steps.find((s) => s.asset === "open_issues")!;
+    expect(step.reason).toContain("SQL changed");
+    expect(JSON.stringify((await cli(root, ["status", "--json"], cliEnv())).json)).toContain("EDITED_SINCE_LAST_RUN");
+    const out = await runDue(root, ["open_issues"], nextFire().now);
+    expect(out.data.steps[0]!.skippedBecause).toStartWith("held (SCHEDULE_HELD)");
+  });
+
+  test("a real edit is still an edit: EDITED_SINCE_LAST_RUN and SCHEDULE_HELD", async () => {
+    const root = await pipeline();
+    await asIfBuiltBy(root, "open_issues", "v1.5.5");
+    writeFileSync(join(root, "assets/open_issues.sql"), "select id, title, 1 as edited from issues\n");
+    const plan = await planRun({ root, timezone: "UTC", selectors: [] });
+    const step = plan.steps.find((s) => s.asset === "open_issues")!;
+    expect(step.reason).toContain("SQL changed");
+    expect(step.approvalCarries).toBeUndefined();
+    expect(JSON.stringify((await cli(root, ["status", "--json"], cliEnv())).json)).toContain("EDITED_SINCE_LAST_RUN");
+    const out = await runDue(root, ["open_issues"], nextFire().now);
+    expect(out.data.steps[0]!.skippedBecause).toStartWith("held (SCHEDULE_HELD)");
   });
 });

@@ -49,6 +49,7 @@ import type { DuckDBConnection } from "@duckdb/node-api";
 import { CroftError, isCode, problem } from "../core/errors.ts";
 import { now as clockNow } from "../core/time.ts";
 import type { LockHolder, Problem, Sql } from "../core/types.ts";
+import { newerStorage } from "../db/connect.ts";
 import type { DuckWarehouse, LeaseSql } from "../db/warehouse.ts";
 import type { CatalogAsset } from "../history/catalog.ts";
 import { newRunId, RUNS_DB_FILE, RunsDb } from "../history/runs-db.ts";
@@ -964,7 +965,9 @@ let attachSeq = 0;
 async function rewriteTrashFile(w: DuckWarehouse, path: string, from: string, to: string, runId: string): Promise<void> {
   const alias = `croft_rename_${process.pid}_${++attachSeq}`;
   await w.write(`rename ${from} in the trash`, async (sql: LeaseSql) => {
-    await sql.exec(`ATTACH ${quoteLiteral(path)} AS ${quoteIdent(alias)}`);
+    await sql.exec(`ATTACH ${quoteLiteral(path)} AS ${quoteIdent(alias)}`).catch((e: unknown) => {
+      throw newerStorage(e, { database: path }) ?? e;
+    });
     try {
       await sql.exec("BEGIN TRANSACTION");
       try {

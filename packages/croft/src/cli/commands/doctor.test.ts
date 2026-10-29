@@ -1312,6 +1312,20 @@ describe("tables changed outside croft, drift and backups (§5 \"Out-of-band cha
     expect(after.text).toBe(`backups: 2 before DuckDB upgrades, 3 KB in .croft/backups/ (newest ${newest}: 1.5.3 → 1.5.4; the 3 newest are kept)`);
   });
 
+  test("a backup made across DuckDB 2 names the way back to croft 0.3", async () => {
+    const root = await project();
+    await croftWarehouse(root);
+    const dir = join(root, ".croft", "backups");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "20261028T100000.000Z-1.5.5-to-2.0.0.duckdb"), "x".repeat(1000));
+    const db = RunsDb.open(join(root, ".croft"));
+    db.setSetting(ENGINE_SETTING, { version: "v2.0.0", recordedAt: "2026-10-28T10:00:00.000Z" });
+    db.close();
+    const line = check((await runDoctor(root, deps({ env: { CROFT_NOW: NOW } }))).data.checks, "backups");
+    expect(line.text).toEndWith(" · croft 0.3.x cannot open this project once croft ≥ 0.4 has; the warehouse as DuckDB 1.5.5 left it is .croft/backups/20261028T100000.000Z-1.5.5-to-2.0.0.duckdb");
+    expect(line.details).toMatchObject({ rollback: join(dir, "20261028T100000.000Z-1.5.5-to-2.0.0.duckdb") });
+  });
+
   test("an upgrade pending with no backup yet", async () => {
     const root = await project();
     await croftWarehouse(root);

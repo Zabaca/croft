@@ -202,7 +202,7 @@ async function open(project: Project, path: string, t: DirectTimings): Promise<D
   const deadline = start + t.lockRetryMs;
   for (let attempt = 0; ; attempt++) {
     try {
-      return (await openInstance(path, "read_only")).instance;
+      return (await openInstance(path, "read_only", { stateDir: project.paths.stateDir })).instance;
     } catch (e) {
       const conflict = lockConflict(e);
       if (!conflict) throw e;

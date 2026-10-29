@@ -440,6 +440,11 @@ describe("fingerprint", () => {
     expect(await tsFingerprint(entry, { root, timezone: TZ })).toBe(before);
   });
 
+  test("no DuckDB enters it: the same value on DuckDB 1.5.5 and 2.0.0 (D114: only SQL assets rebuild on an upgrade)", async () => {
+    const root = project({ "assets/issue_triage.ts": TRIAGE_ASSET, "lib/triage.ts": TRIAGE_LIB });
+    expect(await tsFingerprint(join(root, "assets/issue_triage.ts"), { root, timezone: TZ })).toBe("e99039ee891d27cbe38dc23801b18a33e5175d842b8ad5c2381148a94d4ebda6");
+  });
+
   test("changed by a lib/ edit, but not by an edit to lib/ code the asset never reaches", async () => {
     const root = project({ "assets/issue_triage.ts": TRIAGE_ASSET, "lib/triage.ts": TRIAGE_LIB });
     const entry = join(root, "assets/issue_triage.ts");

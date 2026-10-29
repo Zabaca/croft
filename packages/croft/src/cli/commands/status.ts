@@ -66,7 +66,8 @@ import type { ResolvedAsset, ResolvedProject } from "../../project/resolve.ts";
 import type { Project } from "../../project/root.ts";
 import { readServeRecord } from "../../read/locate.ts";
 import { deletedByCroft } from "../../safety/trash.ts";
-import { editedProblem, staleReasons, type StaleView } from "../../run/staleness.ts";
+import { type EngineChange, engineWords } from "../../run/engine-change.ts";
+import { editedProblem, engineChangeOf, staleReasons, type StaleView } from "../../run/staleness.ts";
 import type { AssetScheduleView, HoldCode } from "../../schedule/due.ts";
 import { croftHome, type CroftHome } from "../../schedule/home.ts";
 import type { CommandImpl, CommandResult, Ctx, Next } from "../command.ts";
@@ -111,6 +112,8 @@ export interface StatusAsset {
   hold?: { code: HoldCode; reason: string };
   /** Its code differs from the code its last run used. */
   edited: boolean;
+  /** SQL: its code hash moved only because DuckDB changed (D114): stale, and not edited. */
+  engineChanged?: { from: string; to: string };
   filesGone?: string[];
   schemaChangedAt?: string;
   /** An incremental TS transform whose input was replaced since it read it (input_replaced): each such input, and
@@ -620,8 +623,9 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
         const ran = step && step.status !== "skipped" && step.attempt >= 1 ? step : db ? lastRanStep(db, name) : null;
         const current = def?.codeHash;
         const ranWith = ran?.codeHash ?? cat?.codeHash ?? null;
-        // A code hash that differs only because croft.json's timezone changed is no edit (resolve.ts timeZoneChanged).
-        if (current && ranWith) edited = current !== ranWith && !(def?.timeZoneChanged && ranWith === cat?.codeHash);
+        // A code hash that differs only because croft.json's timezone or DuckDB changed is no edit (resolve.ts
+        // timeZoneChanged, engineChanged).
+        if (current && ranWith) edited = current !== ranWith && !((def?.timeZoneChanged || def?.engineChanged) && ranWith === cat?.codeHash);
         else if (ran) {
           try {
             edited = statSync(file.path).mtimeMs > Date.parse(ran.startedAt);
@@ -650,6 +654,8 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
         stale: reasons.length > 0, staleReasons: reasons, held: !!file && hold !== null && HUMAN_HOLDS.has(hold.code), edited,
       };
       if (file && hold) out.hold = { code: hold.code, reason: hold.reason };
+      const engine = view && reasons.includes("code_changed") ? engineChangeOf(view) : null;
+      if (engine) out.engineChanged = engine;
       if (file && deleted && (status === "never_run" || status === "skipped")) out.deleted = true;
       // §6 "Restore": an incremental TS transform processes new input rows only, so a replaced input's older rows
       // are redone by `--rebuild` alone; the row says which input, and whether a restore replaced it.
@@ -803,9 +809,11 @@ const REASON_WORDS: Partial<Record<Reason, string>> = {
   input_replaced: "an input was replaced",
 };
 
-/** "stale: code changed, inputs changed", or null when nothing but never_built (the row's head says that). */
-export function staleText(reasons: readonly Reason[]): string | null {
-  const words = reasons.filter((r) => r !== "never_built").map((r) => REASON_WORDS[r] ?? r.replaceAll("_", " "));
+/** "stale: code changed, inputs changed", or null when nothing but never_built (the row's head says that). A code
+ *  hash that moved only with DuckDB says "DuckDB upgraded (1.5.5 → 2.0.0)" instead of "code changed". */
+export function staleText(reasons: readonly Reason[], engine?: EngineChange): string | null {
+  const words = reasons.filter((r) => r !== "never_built")
+    .map((r) => (r === "code_changed" && engine ? engineWords(engine) : REASON_WORDS[r] ?? r.replaceAll("_", " ")));
   return words.length ? `stale: ${words.join(", ")}` : null;
 }
 
@@ -899,7 +907,7 @@ export function statusText(a: StatusAsset, now: Date, renamed?: RenamedRow, conf
   }
   // An incremental TS transform's replaced input is redone by --rebuild alone (§6 "Restore"): its own words.
   const replaced = replacedText(a);
-  const stale = staleText(replaced ? a.staleReasons.filter((r) => r !== "input_replaced") : a.staleReasons);
+  const stale = staleText(replaced ? a.staleReasons.filter((r) => r !== "input_replaced") : a.staleReasons, a.engineChanged);
   // The command goes on a healthy row only: a failed or held one already names what to do first.
   if (stale) notes.push(head === "ok" ? `${stale} (croft run ${a.asset})` : stale);
   if (replaced) notes.push(stale ? replaced : `stale: ${replaced}`);

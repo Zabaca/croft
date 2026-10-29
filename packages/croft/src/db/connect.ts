@@ -10,12 +10,14 @@
 // - fromCache shares one instance across realpath, `..` and case variants of a path and refuses a
 //   different config for a cached path; ":memory:" is never shared.
 // - A closed and reopened instance comes back unconfigured, so configuration is checked per connection.
-import { DuckDBConnection, DuckDBInstance } from "@duckdb/node-api";
+import { DuckDBConnection, DuckDBInstance, version } from "@duckdb/node-api";
 import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { availableParallelism, totalmem } from "node:os";
 import { physicalPath } from "../project/root.ts";
 import { basename, dirname, join, resolve } from "node:path";
 import { CroftError } from "../core/errors.ts";
+
+const DUCKDB_VERSION = version().replace(/^v(?=\d)/, "");
 
 export type Profile = "warehouse" | "query" | "serve" | "memory";
 export type AccessMode = "read_only" | "read_write";
@@ -121,7 +123,7 @@ const modeByPath = new Map<string, AccessMode>();
  * Open (or reuse) the instance for a database file. The one place croft calls DuckDBInstance.fromCache.
  * Lock conflicts surface as DuckDB's IO Error; db/warehouse.ts retries them.
  */
-export async function openInstance(path: string, mode: AccessMode): Promise<{ instance: DuckDBInstance; path: string }> {
+export async function openInstance(path: string, mode: AccessMode, o: { stateDir?: string } = {}): Promise<{ instance: DuckDBInstance; path: string }> {
   const real = canonicalPath(path);
   const prior = modeByPath.get(real);
   if (prior && prior !== mode) {
@@ -130,7 +132,12 @@ export async function openInstance(path: string, mode: AccessMode): Promise<{ in
       hint: "report this croft bug",
     });
   }
-  const instance = await DuckDBInstance.fromCache(real, instanceConfig(mode));
+  let instance: DuckDBInstance;
+  try {
+    instance = await DuckDBInstance.fromCache(real, instanceConfig(mode));
+  } catch (e) {
+    throw newerStorage(e, { database: real, ...o }) ?? e;
+  }
   modeByPath.set(real, mode);
   return { instance, path: real };
 }
@@ -241,6 +248,36 @@ export function lockConflict(err: unknown): LockConflict | null {
   const held = msg.match(/Conflicting lock is held in (?:(.+?) \(PID (\d+)\)|PID (\d+)\b)/);
   const pid = held?.[2] ?? held?.[3];
   return { path: file, program: held?.[1] ?? null, pid: pid !== undefined ? Number(pid) : null };
+}
+
+/**
+ * DB_NEWER_FORMAT (details.kind "storage") for DuckDB's refusal of a file a newer DuckDB made ("Trying to read a
+ * database file with version number 999, but we can only read versions between 64 and 68. The database file was
+ * created with an newer version of DuckDB." [V: 1.5.5 on a 2.0 file]); null for any other error. `database` is the
+ * file; with `stateDir`, the newest pre-upgrade backup in it is named, the way back to the older croft.
+ */
+export function newerStorage(err: unknown, o: { database: string; stateDir?: string }): CroftError | null {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (!/database file with version number|created with an? newer version of DuckDB/.test(msg)) return null;
+  const backup = o.stateDir ? newestBackup(o.stateDir) : null;
+  return new CroftError("DB_NEWER_FORMAT", {
+    message: `${o.database} was written by a newer DuckDB than this croft's (${DUCKDB_VERSION}); it cannot read the file`,
+    hint: backup
+      ? `use the croft that wrote it (the project's pinned version); to go back to this croft, restore the backup made before the upgrade: ${backup}`
+      : "use the croft that wrote it: the project pins its version in package.json (bun install there)",
+    retryable: false,
+    details: { kind: "storage", database: o.database, duckdbVersion: DUCKDB_VERSION, duckdb: msg.split("\n")[0], backup },
+  });
+}
+
+/** The newest pre-upgrade backup in <stateDir>/backups (db/backup.ts names them <stamp>-<from>-to-<to>.duckdb). */
+function newestBackup(stateDir: string): string | null {
+  try {
+    const names = readdirSync(join(stateDir, "backups")).filter((n) => /^\d{8}T\d{6}(?:\.\d+)?Z-.+-to-.+\.duckdb$/.test(n)).sort();
+    return names.length ? join(stateDir, "backups", names[names.length - 1]!) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** True for DuckDB's sandbox refusal ("file system operations are disabled by configuration"). */

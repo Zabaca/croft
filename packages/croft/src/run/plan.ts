@@ -80,7 +80,8 @@ import { loadProject } from "../project/root.ts";
 import type { LoadedSqlAsset } from "../project/sql-asset.ts";
 import type { LoadedTsAsset, TsAssetSpec } from "../project/ts-asset.ts";
 import type { FileIngest } from "../types.ts";
-import { editedProblem, type StaleView, staleReasons } from "./staleness.ts";
+import { engineWords } from "./engine-change.ts";
+import { editedProblem, engineChangeOf, type StaleView, staleReasons } from "./staleness.ts";
 
 export type StepKind = "rows" | "file" | "transform" | "sql";
 
@@ -150,6 +151,9 @@ export interface PlannedStep {
   /** --due: a TS asset whose code is not the code a human last ran, so it was not imported (DuePlanning.imports):
    *  planned from what the scheduler knows of it, with no module, and held. */
   notImported?: true;
+  /** SQL: the approved code is this source under an older DuckDB (ResolvedAsset.approvalCarries): the scheduler runs
+   *  it, and the run approves the new code hash. */
+  approvalCarries?: true;
   /** ASSET_RENAMED (§6): the asset, or an input it needs that was never built, looks like a file renamed outside
    *  croft (or a croft rename that did not finish). A run never builds it from scratch: named exactly, the step fails
    *  before it runs with ASSET_RENAMED; otherwise it is skipped, and so is what needs it (see the top of the file). */
@@ -164,7 +168,7 @@ export interface PlannedStep {
 export interface DuePlanning {
   /** Why the scheduler must not run this step now (SCHEDULE_HELD, LARGE_REPROCESS, paused, leased), or null.
    *  `reason` becomes the step's reason; `problem` (a warning) goes with the skipped step. */
-  hold(step: { asset: string; file: string; kind: StepKind; codeHash?: string; ok: boolean; secrets?: readonly string[] }): { hold: Hold; reason: string; problem?: Problem } | null;
+  hold(step: { asset: string; file: string; kind: StepKind; codeHash?: string; ok: boolean; secrets?: readonly string[]; approvalCarries?: boolean }): { hold: Hold; reason: string; problem?: Problem } | null;
   /** The fire a due ingest handles (its schedule as written), or null. */
   fire(step: { asset: string; schedule?: string }): string | null;
   /** What the scheduled run may import (§6): a TS asset only when the code hash of its bundle (computed without
@@ -645,7 +649,7 @@ function applyDue(step: PlannedStep, due: DuePlanning): void {
   }
   const h = due.hold({
     asset: step.asset, file: step.file, kind: step.kind, ...(step.codeHash ? { codeHash: step.codeHash } : {}), ok: loadErrors(step).length === 0,
-    ...(step.spec ? { secrets: step.spec.secrets } : {}),
+    ...(step.spec ? { secrets: step.spec.secrets } : {}), ...(step.approvalCarries ? { approvalCarries: true } : {}),
   });
   if (h) {
     step.hold = h.hold;
@@ -670,6 +674,7 @@ function viewOf(a: ResolvedAsset, inputs: readonly string[], entry: (name: strin
     ...(a.codeHash ? { codeHash: a.codeHash } : {}), entry: entry(a.name),
     inputEntries: Object.fromEntries(inputs.map((x) => [x, entry(x)])),
     ...(a.timeZoneChanged ? { builtInZone: a.timeZoneChanged.from } : {}),
+    ...(a.engineChanged ? { engineChanged: a.engineChanged } : {}),
   };
 }
 
@@ -740,6 +745,7 @@ function stepOf(a: ResolvedAsset, t: Taken, c: StepContext): PlannedStep {
   return {
     asset: a.name, file: a.file, path: a.path, kind, action, reasons, reason: reasonText(a, t, view), problems,
     ...(rebuild ? { rebuild: true as const } : {}), ...(a.notImported ? { notImported: true as const } : {}),
+    ...(a.approvalCarries ? { approvalCarries: true as const } : {}),
     ...(t.readers.length ? { neededBy: [...t.readers] } : {}),
     ...(a.ts ? { loaded: a.ts } : {}), ...(spec ? { spec } : {}), ...(a.sql ? { sql: a.sql } : {}),
     inputs: [...c.inputs], orderAfter: [...new Set([...a.orderAfter, ...c.inputs])], readBy: c.readBy,
@@ -1093,8 +1099,9 @@ function reasonText(a: ResolvedAsset, t: Taken, view: StaleView): string {
   const forwardOnly = a.kind === "ts" && a.incremental.kind === "new-rows" && !rebuild;
   if (t.reasons.has("never_built")) parts.push("never built");
   const zone = a.timeZoneChanged;
+  const engine = engineChangeOf(view);
   if (t.reasons.has("code_changed")) {
-    parts.push(zone ? `time zone changed (${zone.from} → ${zone.to})` : `${a.kind === "sql" ? "SQL" : "code"} changed (${a.file})`);
+    parts.push(zone ? `time zone changed (${zone.from} → ${zone.to})` : engine ? engineWords(engine) : `${a.kind === "sql" ? "SQL" : "code"} changed (${a.file})`);
   }
   const entry = view.entry;
   const changed: string[] = [];

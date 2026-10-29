@@ -232,8 +232,8 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
       name, kind: a.kind, inputs: inputsOf(a),
       outputColumns: a.kind === "sql" ? bound.outputs.get(name)?.map((c) => ({ name: c.name, type: c.type })) ?? null : null,
       behavior: a.behavior,
-      // A time zone change alone is no code change (project/resolve.ts timeZoneChanged).
-      codeChanged: !!(a.codeHash && built?.codeHash && a.codeHash !== built.codeHash && !a.timeZoneChanged),
+      // A time zone or DuckDB change alone is no code change (project/resolve.ts timeZoneChanged, engineChanged).
+      codeChanged: !!(a.codeHash && built?.codeHash && a.codeHash !== built.codeHash && !a.timeZoneChanged && !a.engineChanged),
       // §8: the cron form and the next fire times, in the project time zone.
       ...(a.schedule ? {
         schedule: { ...a.schedule, next: nextFires(a.schedule.cron, timezone, now, NEXT_FIRES).map((t) => formatInstant(t, timezone)) },

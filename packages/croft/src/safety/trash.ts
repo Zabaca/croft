@@ -239,7 +239,11 @@ export async function withTrashFile<T>(sql: Sql, path: string, fn: (alias: strin
   const { canonicalPath } = await import("../db/connect.ts");
   const alias = `croft_trash_ro_${process.pid}_${++attachSeq}`;
   // The sandbox allows the state folder by its canonical path.
-  await sql.exec(`ATTACH ${quoteLiteral(canonicalPath(path))} AS ${quoteIdent(alias)} (READ_ONLY)`);
+  const { newerStorage } = await import("../db/connect.ts");
+  await sql.exec(`ATTACH ${quoteLiteral(canonicalPath(path))} AS ${quoteIdent(alias)} (READ_ONLY)`).catch((e: unknown) => {
+    // A trash file a newer DuckDB made: DB_NEWER_FORMAT, not a raw IO error.
+    throw newerStorage(e, { database: path }) ?? e;
+  });
   try {
     return await fn(alias);
   } finally {
