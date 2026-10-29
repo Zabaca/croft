@@ -681,6 +681,22 @@
         "edited": {
           "type": "boolean"
         },
+        "engineChanged": {
+          "type": "object",
+          "properties": {
+            "from": {
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "from",
+            "to"
+          ],
+          "additionalProperties": false
+        },
         "filesGone": {
           "type": "array",
           "items": {

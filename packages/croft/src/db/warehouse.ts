@@ -436,7 +436,7 @@ export class DuckWarehouse implements Warehouse {
         throw waitAborted(signal);
       }
       try {
-        const { instance } = await openInstance(this.path, this.mode);
+        const { instance } = await openInstance(this.path, this.mode, { stateDir: this.stateDir });
         if (this.intentHeld) intents.resume(this.stateDir); // announce again before anything else happens
         this.instance = instance;
         this.waitingOn = null;

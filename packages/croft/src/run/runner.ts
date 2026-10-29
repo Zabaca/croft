@@ -892,7 +892,8 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
           }
           runs.finishStep(runId, asset, attempt, { status: out.result.status, reason: out.result.reason, rows: out.result.rows });
           const ran = out.result.status === "ok" || out.result.status === "unchanged";
-          if (ran && (o.human ?? true) && codeHash) {
+          // A scheduled run approves too when the approval carried over from an older DuckDB (run/engine-change.ts).
+          if (ran && ((o.human ?? true) || step.approvalCarries) && codeHash) {
             runs.approveCode(asset, codeHash);
             noteSource(runs, step);
           }
@@ -1197,7 +1198,9 @@ export async function holdAtStart(step: PlannedStep, runs: RunsDb, project: Pick
     : await tsFingerprint(step.path, { root: project.root, timezone: project.timezone }).catch(() => undefined);
   // croft delete removed its table since the plan: held whatever the approval (a build from scratch needs a person).
   const deleted = deletedByCroft(runs, step.asset);
-  if (!deleted && approved !== null && planned === approved && current === approved) {
+  // An SQL asset whose approved code is this source under an older DuckDB keeps its approval (run/engine-change.ts).
+  const carries = step.kind === "sql" && step.approvalCarries === true && current === planned;
+  if (!deleted && approved !== null && ((planned === approved && current === approved) || carries)) {
     if (!(step.spec?.secrets.length && secretsCommandUnapproved(project, runs))) return null;
     const h = secretsCommandHeld({ asset: step.asset, file: step.file, secretsFrom: project.config.secretsFrom! });
     return { why: `held (SCHEDULE_HELD): ${h.reason}`, problem: h.problem };

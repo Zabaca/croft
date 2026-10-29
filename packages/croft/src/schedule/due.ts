@@ -58,6 +58,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { version as duckdbVersion } from "@duckdb/node-api";
 import { CODES, isCode, problem } from "../core/errors.ts";
 import { recordAlive } from "../core/proc.ts";
 import { zonedParts } from "../core/time.ts";
@@ -70,6 +71,7 @@ import type { ResolvedAsset } from "../project/resolve.ts";
 import { type HostBudget, loadProject, type Project, type SecretsFrom } from "../project/root.ts";
 import { deletedByCroft } from "../safety/trash.ts";
 import type { DuePlanning, StepKind } from "../run/plan.ts";
+import { engineChange, sourceHashOf } from "../run/engine-change.ts";
 import { staleReasons } from "../run/staleness.ts";
 import type { SchedulingSetting } from "./os.ts";
 import { latestFireAtOrBefore, nextFires, parseSchedule, type Schedule } from "./types.ts";
@@ -292,7 +294,8 @@ export function keyOf(root: string, path: string, timezone: string, deps: { file
   } catch {
     return "";
   }
-  const h = createHash("sha256").update(bytes).update("\0").update(timezone);
+  // The engine: an SQL asset's code hash is DuckDB's parse tree (run/engine-change.ts), so a new DuckDB reads it again.
+  const h = createHash("sha256").update(bytes).update("\0").update(timezone).update("\0").update(duckdbVersion());
   if (deps) {
     for (const rel of [...new Set(deps.files ?? [])].sort()) {
       const abs = resolve(root, rel);
@@ -1147,6 +1150,7 @@ export async function dueWork(i: DueInput): Promise<DueWork> {
       inputs: transform ? inputsOf(f) : [], entry, deleted: runs ? deletedByCroft(runs, f.asset) : false,
       secretsHeld: commandUnapproved && readsSecrets(f),
       wait: runs && !transform ? knownWait(h.latest, { runs, budgets: project.config.http.budgets, now }) : null,
+      approvalCarries: carriesOver(runs, f, h.state?.approvedCodeHash ?? null, project, entry(f.asset)),
     });
     if (hold) holds.set(f.asset, hold);
     view.held = hold;
@@ -1244,6 +1248,16 @@ interface HoldContext {
   secretsHeld: boolean;
   /** An ingest's known wait (knownWait), or null. */
   wait: KnownWait | null;
+  /** SQL: the approved code is this source under an older DuckDB (run/engine-change.ts): approved all the same. */
+  approvalCarries: boolean;
+}
+
+/** Whether an SQL asset's approved code is its source now under an older DuckDB (run/engine-change.ts): the file
+ *  is read again, its header and body hashed, and compared with what runs.sqlite recorded for the approved hash. */
+function carriesOver(runs: RunsDb | null, f: AssetFacts, approved: string | null, project: Project, entry: CatalogAsset | null): boolean {
+  if (!runs || f.kind !== "sql" || f.codeHash === null || approved === null || f.codeHash === approved) return false;
+  const path = resolve(project.root, f.file);
+  return engineChange(runs, approved, { sourceHash: sourceHashOf(path, f.file, project.timezone), path, entry, stateDir: project.paths.stateDir }) !== null;
 }
 
 /** The first hold that applies (see the top of this file), or null. Waiting for an input comes after (dueWork). */
@@ -1254,7 +1268,7 @@ function holdOf(f: AssetFacts, h: History, c: HoldContext): { code: HoldCode; re
     const resume = c.scheduling.via === "serve" ? "croft schedule on --no-os-job" : "croft schedule on";
     return { code: "paused", reason: `scheduling is paused${until}; ${resume} resumes it` };
   }
-  if (c.deleted || f.codeHash === null || f.codeHash !== c.approved) {
+  if (c.deleted || f.codeHash === null || (f.codeHash !== c.approved && !c.approvalCarries)) {
     return { code: "SCHEDULE_HELD", reason: scheduleHeld({
       asset: f.asset, file: f.file, approved: c.approved, editedAt: editedAt(c.project.root, f.file), loads: f.ok && f.codeHash !== null, now: c.now,
       timeZoneChanged: f.timeZoneChanged ?? null, deleted: c.deleted,
@@ -1427,14 +1441,15 @@ export function duePlanning(o: { project: Project; runs: RunsDb; now: Date; fire
   const facts = runs.getSetting<Record<string, AssetFacts>>(FACTS_SETTING) ?? {};
   const commandUnapproved = secretsCommandUnapproved(project, runs);
   return {
-    hold(step: { asset: string; file: string; kind: StepKind; codeHash?: string; ok: boolean; secrets?: readonly string[] }) {
+    hold(step: { asset: string; file: string; kind: StepKind; codeHash?: string; ok: boolean; secrets?: readonly string[]; approvalCarries?: boolean }) {
       if (scheduling.state === "paused") {
         return { hold: "paused" as Hold, reason: "held: scheduling is paused" };
       }
       if (scheduling.state === "off") return { hold: "paused" as Hold, reason: "held: scheduling is off" };
       const approved = runs.approvedCode(step.asset);
       const deleted = deletedByCroft(runs, step.asset);
-      if (deleted || step.codeHash === undefined || step.codeHash !== approved) {
+      // An approval that carries over from an older DuckDB (run/engine-change.ts) is an approval.
+      if (deleted || step.codeHash === undefined || (step.codeHash !== approved && !(approved !== null && step.approvalCarries))) {
         // The tick found (and noted) whether only the time zone moved this code's hash.
         const known = Object.hasOwn(facts, step.asset) ? facts[step.asset] : undefined;
         const zone = known && known.codeHash === (step.codeHash ?? null) && known.approved === approved ? known.timeZoneChanged ?? null : null;

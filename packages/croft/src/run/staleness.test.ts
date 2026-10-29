@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { CatalogAsset, InputSeen } from "../history/catalog.ts";
-import { editedProblem, noteTimeZoneChange, type StaleView, staleReasons, timeZoneChange } from "./staleness.ts";
+import { editedProblem, engineChangeOf, noteEngineChange, noteTimeZoneChange, type StaleView, staleReasons, timeZoneChange } from "./staleness.ts";
 
 // Stamps: microseconds apart matter (a Date would lose them).
 const S1 = "2026-09-22T10:00:00.000001Z";
@@ -153,6 +153,23 @@ describe("editedProblem", () => {
   test("ingests: the next run fetches with the new code", () => {
     const p = editedProblem(view({ asset: "charges", kind: "ingest", inputs: [], codeHash: "h2", entry: entry("charges", { kind: "ingest" }) }))!;
     expect(p).toMatchObject({ message: "charges edited since its last run", fix: { kind: "command", command: "croft run charges" } });
+  });
+});
+
+describe("engine changes (D114)", () => {
+  test("an SQL hash that moved only with DuckDB still rebuilds, and is no edit; noted by hash pair for views made without it", () => {
+    const change = { from: "v1.5.5", to: "v2.0.0" };
+    const v = view({ codeHash: "h2", engineChanged: change });
+    expect(engineChangeOf(v)).toEqual(change);
+    expect(staleReasons(v)).toEqual(["code_changed"]);
+    expect(editedProblem(v)).toBeNull();
+    noteEngineChange("eng-now", "eng-then", change);
+    const noted = view({ codeHash: "eng-now", entry: entry("daily_revenue", { codeHash: "eng-then", inputsSeen: { charges: seen(S1) } }) });
+    expect(engineChangeOf(noted)).toEqual(change);
+    expect(editedProblem(noted)).toBeNull();
+    const edited = view({ codeHash: "eng-now", entry: entry("daily_revenue", { codeHash: "eng-other", inputsSeen: { charges: seen(S1) } }) });
+    expect(engineChangeOf(edited)).toBeNull();
+    expect(editedProblem(edited)?.code).toBe("EDITED_SINCE_LAST_RUN");
   });
 });
 

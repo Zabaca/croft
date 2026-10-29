@@ -1004,9 +1004,16 @@ function checkBackups(r: Report, d: DoctorDeps, project: Project, probe: DuckdbP
   }
   if (!list.length && !made.length) parts.push("backups: none yet");
   if (pending) parts.push(`the next croft command that writes backs the warehouse up first (DuckDB ${bare(rec!.version)} → ${bare(running!)})`);
+  // The way back across DuckDB 2.0 (D111): croft 0.3 runs DuckDB 1.5.5, and refuses runs.sqlite once croft 0.4 opened it.
+  const major = (v: string) => Number(/^v?(\d+)/.exec(v)?.[1] ?? 0);
+  const across = list.find((b) => major(b.from) < 2 && major(b.to) >= 2);
+  const rollback = across
+    ? `croft 0.3.x cannot open this project once croft ≥ 0.4 has; the warehouse as DuckDB ${across.from} left it is ${inside(project.root, across.path) ? relative(project.root, across.path) : across.path}`
+    : null;
+  if (rollback) parts.push(rollback);
   r.add("project", "backups", pending ? "info" : "ok", parts.join(" · "), undefined, {
     backups: list.map((b) => ({ path: b.path, at: b.at, from: b.from, to: b.to, bytes: b.bytes, wal: b.wal !== null })),
-    projectBackups: made, recorded: rec?.version ?? null, running, pending,
+    projectBackups: made, recorded: rec?.version ?? null, running, pending, rollback: across?.path ?? null,
   });
 }
 

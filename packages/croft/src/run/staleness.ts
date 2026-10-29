@@ -26,10 +26,15 @@
 // (ResolvedAsset.timeZoneChanged), and notes it here by hash pair (noteTimeZoneChange), so a view made without it
 // (status, the runner's re-check) knows too. A pair of hashes proves the fact for good: sha256 of the same code in
 // two zones.
+//
+// An engine change (D114, run/engine-change.ts) is the same for SQL assets: their code hash is DuckDB's parse tree, so
+// a new DuckDB changes it. resolveProject proves the source unchanged (ResolvedAsset.engineChanged) and notes it here
+// by hash pair (noteEngineChange): code_changed, and no EDITED_SINCE_LAST_RUN.
 import { problem } from "../core/errors.ts";
 import { parseInstant } from "../core/time.ts";
 import type { AssetKind, Problem, Reason } from "../core/types.ts";
 import type { CatalogAsset } from "../history/catalog.ts";
+import type { EngineChange } from "./engine-change.ts";
 
 /** One asset as staleness sees it: the definition's side and the catalog mirror's. */
 export interface StaleView {
@@ -51,6 +56,9 @@ export interface StaleView {
   /** The code is what its last build ran, and only the project time zone changed since: the zone it was built in
    *  (ResolvedAsset.timeZoneChanged.from). Optional: a change noted by resolveProject counts too. */
   builtInZone?: string;
+  /** The source is what its last build ran, and only DuckDB changed since (ResolvedAsset.engineChanged). Optional: a
+   *  change noted by resolveProject counts too. */
+  engineChanged?: EngineChange;
 }
 
 /** Time zone changes resolveProject found, by `${codeHash now}\n${codeHash built with}`: the zone of the build. */
@@ -66,6 +74,20 @@ export function noteTimeZoneChange(codeHash: string, builtWith: string, zone: st
 export function timeZoneChange(v: Pick<StaleView, "codeHash" | "entry" | "builtInZone">): string | null {
   if (!codeChanged(v)) return null;
   return v.builtInZone ?? zoneChanges.get(`${v.codeHash}\n${v.entry!.codeHash}`) ?? null;
+}
+
+/** Engine changes resolveProject found, by `${codeHash now}\n${codeHash built with}`. */
+const engineChanges = new Map<string, EngineChange>();
+
+/** Note that `codeHash` and `builtWith` are the same SQL source parsed by two DuckDB engines. */
+export function noteEngineChange(codeHash: string, builtWith: string, change: EngineChange): void {
+  engineChanges.set(`${codeHash}\n${builtWith}`, change);
+}
+
+/** The engines the asset's code hash moved between when only DuckDB changed; null otherwise. */
+export function engineChangeOf(v: Pick<StaleView, "codeHash" | "entry" | "engineChanged">): EngineChange | null {
+  if (!codeChanged(v)) return null;
+  return v.engineChanged ?? engineChanges.get(`${v.codeHash}\n${v.entry!.codeHash}`) ?? null;
 }
 
 /** Why the asset is stale, in the order of core/types.ts Reason; empty when it is fresh. */
@@ -90,9 +112,10 @@ export function staleReasons(v: StaleView): Reason[] {
 }
 
 /** EDITED_SINCE_LAST_RUN when the asset's code changed since it was built; for an incremental TS transform it
- *  says how many rows older code built. null when unedited, never built, or when only the time zone changed. */
+ *  says how many rows older code built. null when unedited, never built, or when only the time zone or DuckDB
+ *  changed. */
 export function editedProblem(v: StaleView): Problem | null {
-  if (!v.entry || !codeChanged(v) || timeZoneChange(v) !== null) return null;
+  if (!v.entry || !codeChanged(v) || timeZoneChange(v) !== null || engineChangeOf(v) !== null) return null;
   const details = { codeHash: v.codeHash, builtWith: v.entry.codeHash, rows: v.entry.rows };
   const base = { asset: v.asset, file: v.file, details };
   if (v.kind === "ts" && v.incremental) {

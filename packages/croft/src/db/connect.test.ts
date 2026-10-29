@@ -1,12 +1,12 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import type { DuckDBConnection, DuckDBInstance } from "@duckdb/node-api";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import {
   allowedDirectories, canonicalPath, connect, instanceConfig, isSandboxDenial, lockConflict, mapSandboxError,
-  openInstance, openMemory, type SandboxSpec, serveResources,
+  newerStorage, openInstance, openMemory, type SandboxSpec, serveResources,
 } from "./connect.ts";
 
 const cleanup: (() => void)[] = [];
@@ -304,4 +304,28 @@ describe("canonicalPath never opens the warehouse file", () => {
       cleanup();
     }
   }, 30_000);
+});
+
+describe("newerStorage: a file a newer DuckDB made", () => {
+  // DuckDB 1.5.5's refusal of a file DuckDB 2.0 made [V]; a file newer than 2.0 cannot be made yet, so 2.0's own
+  // wording is matched by its two stable parts.
+  const S1 = "IO Error: Trying to read a database file with version number 999, but we can only read versions between 64 and 68.\n"
+    + "The database file was created with an newer version of DuckDB.\n\nNewer DuckDB version might introduce backward incompatible changes";
+
+  test("DB_NEWER_FORMAT, kind storage, naming the newest pre-upgrade backup", () => {
+    const state = mkdtempSync(join(tmpdir(), "croft-newer-"));
+    try {
+      expect(newerStorage(new Error("IO Error: Could not set lock on file"), { database: "w.duckdb" })).toBeNull();
+      const bare = newerStorage(new Error(S1), { database: "/p/warehouse.duckdb", stateDir: state })!;
+      expect(bare.code).toBe("DB_NEWER_FORMAT");
+      expect(bare.problem).toMatchObject({ retryable: false, details: { kind: "storage", database: "/p/warehouse.duckdb", backup: null } });
+      mkdirSync(join(state, "backups"));
+      for (const n of ["20261001T000000Z-1.5.4-to-1.5.5.duckdb", "20261028T120000Z-1.5.5-to-2.0.0.duckdb", "notes.txt"]) writeFileSync(join(state, "backups", n), "");
+      const named = newerStorage(new Error(S1), { database: "/p/warehouse.duckdb", stateDir: state })!;
+      expect(named.problem.details?.backup).toBe(join(state, "backups", "20261028T120000Z-1.5.5-to-2.0.0.duckdb"));
+      expect(named.problem.hint).toContain("20261028T120000Z-1.5.5-to-2.0.0.duckdb");
+    } finally {
+      rmSync(state, { recursive: true, force: true });
+    }
+  });
 });

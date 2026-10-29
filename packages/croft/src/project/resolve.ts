@@ -15,7 +15,9 @@
 //    commit and never blocks (§3f), so it reads them as they are (run/plan.ts skips one whose table is not built);
 //    as an ordering edge it closed a cycle whenever it read a table downstream of its asset (§3c's own example);
 // 5. an asset whose code hash differs from the one it was built with only because croft.json's timezone changed
-//    gets timeZoneChanged (see "Time zone changes" below).
+//    gets timeZoneChanged (see "Time zone changes" below); an SQL asset whose code hash moved only because DuckDB
+//    changed gets engineChanged, and approvalCarries when the code a person approved is the same source
+//    (run/engine-change.ts).
 //
 // With selectors, a TS file whose text calls ingest() only (sniffKind) is imported when it is selected or
 // needed before the selection (upstream of it, or read by its blocking checks: neededBy), and left unimported
@@ -43,11 +45,12 @@ import { CroftError, isCode } from "../core/errors.ts";
 import { captureImport, collectingSink, defaultOutputRedactor } from "../core/output.ts";
 import type { AssetKind, Check, CursorType, Incremental, Problem, WriteMode } from "../core/types.ts";
 import { openMemory } from "../db/connect.ts";
-import { allCatalog } from "../history/catalog.ts";
+import { allCatalog, getCatalog } from "../history/catalog.ts";
 import { RUNS_DB_FILE, RunsDb } from "../history/runs-db.ts";
 import { losslessReviver } from "../load/stage.ts";
 import type { ApprovedImports, StepKind } from "../run/plan.ts";
-import { noteTimeZoneChange } from "../run/staleness.ts";
+import { type EngineChange, engineChange } from "../run/engine-change.ts";
+import { noteEngineChange, noteTimeZoneChange } from "../run/staleness.ts";
 import { parseSchedule, type Schedule } from "../schedule/types.ts";
 import { finiteJson } from "../sql/ast.ts";
 import { type BindResult, ShadowCatalog } from "../sql/bind.ts";
@@ -141,6 +144,12 @@ export interface ResolvedAsset {
   /** The code is the code its last build ran, and only croft.json's timezone changed since: `from` is the zone it
    *  was built in, `to` the project's now. It still rebuilds (code_changed), but nothing was edited. */
   timeZoneChanged?: { from: string; to: string };
+  /** SQL: the source is the source its last build ran, and only DuckDB changed since (run/engine-change.ts). It
+   *  still rebuilds (code_changed), but nothing was edited. */
+  engineChanged?: EngineChange;
+  /** SQL: the code a person approved (approved_code_hash) is this source under an older DuckDB, so the approval
+   *  carries over to this code hash: the scheduler runs it, and the run approves this hash. */
+  approvalCarries?: true;
   description?: string;
   /** TS: calls ctx.http, fetch or an HTTP package (TRANSFORM_MAKES_REQUESTS, the cost guard). */
   usesHttp?: boolean;
@@ -198,6 +207,7 @@ export async function resolveProject(i: ResolveInput): Promise<ResolvedProject> 
     }
     const assets = discovery.assets.map((a) => byName.get(a.name)!);
     await findTimeZoneChanges(assets, i, connection);
+    findEngineChanges(assets, i);
     const { graph, problems: cycles } = buildGraph(nodesOf(assets));
     return {
       assets,
@@ -311,6 +321,46 @@ async function rehasher(a: ResolvedAsset, connection: () => Promise<DuckDBConnec
     // Unreadable now (the file changed under us, say): nothing is claimed.
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Engine changes (run/engine-change.ts, D114)
+
+/** Set engineChanged on each SQL asset whose code hash differs from its build's only because DuckDB changed, and
+ *  approvalCarries where the approved code is the same source; note the change for run/staleness.ts. */
+function findEngineChanges(assets: readonly ResolvedAsset[], i: ResolveInput): void {
+  let stateDir: string;
+  try {
+    stateDir = loadProject({ root: i.root }).paths.stateDir;
+  } catch {
+    return;
+  }
+  if (!existsSync(join(stateDir, RUNS_DB_FILE))) return;
+  let db: RunsDb;
+  try {
+    db = RunsDb.open(stateDir);
+  } catch {
+    return;
+  }
+  try {
+    for (const a of assets) {
+      if (a.kind !== "sql" || !a.sql || !a.codeHash || a.timeZoneChanged) continue;
+      const entry = getCatalog(db, a.name);
+      const now = { sourceHash: a.sql.sourceHash, path: a.path, entry, stateDir };
+      const was = i.builtHashes ? i.builtHashes(a.name) : entry?.codeHash ?? null;
+      if (was && was !== a.codeHash) {
+        const change = engineChange(db, was, now);
+        if (change) {
+          a.engineChanged = change;
+          noteEngineChange(a.codeHash, was, change);
+        }
+      }
+      const approved = db.approvedCode(a.name);
+      if (approved && approved !== a.codeHash && engineChange(db, approved, now)) a.approvalCarries = true;
+    }
+  } finally {
+    db.close();
+  }
 }
 
 // ---------------------------------------------------------------------------------------------------------
