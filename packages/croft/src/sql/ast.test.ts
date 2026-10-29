@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { DuckDBConnection } from "@duckdb/node-api";
 import { openMemory } from "../db/connect.ts";
 import {
-  type AstNode, catalogPrefixes, collect, finiteJson, foreignQueryNode, location, NOT_VOLATILE, relationNames, tableArguments, VOLATILE_FUNCTIONS, VOLATILE_KEYWORDS,
+  arrowLambdas, type AstNode, catalogPrefixes, charIndex, collect, finiteJson, foreignQueryNode, LAMBDA_FUNCTIONS, location, NOT_VOLATILE, relationNames, tableArguments, VOLATILE_FUNCTIONS, VOLATILE_KEYWORDS,
   volatileUses, walk,
 } from "./ast.ts";
 import { planScans } from "./deps.ts";
@@ -179,11 +179,9 @@ describe("volatileUses", () => {
   });
 });
 
-test("finiteJson quotes DuckDB's bare Infinity outside strings", async () => {
+test("finiteJson quotes a bare Infinity outside strings (DuckDB 1.5.5 wrote one; 2.0 writes constants as text)", async () => {
   const raw = String((await conn.runAndReadAll("SELECT json_serialize_sql('SELECT 1e400, -1e400')")).getRowsJS()[0]![0]);
-  expect(() => JSON.parse(raw)).toThrow();
-  const values = JSON.parse(finiteJson(raw)).statements[0].node.select_list.map((n: { value: { value: unknown } }) => n.value?.value ?? n);
-  expect(values[0]).toBe("Infinity");
+  expect(JSON.parse(finiteJson(raw)).statements[0].node.select_list.map((n: AstNode) => n.literal)).toEqual([{ kind: "NUMERIC", text: "1e400" }, { kind: "NUMERIC", text: "-1e400" }]);
   expect(JSON.parse(finiteJson('{"a":Infinity,"b":[-Infinity,NaN,-1],"c":"x:Infinity,\\"NaN"}'))).toEqual({ a: "Infinity", b: ["-Infinity", "NaN", -1], c: 'x:Infinity,"NaN' });
   expect(finiteJson('{"a":1}')).toBe('{"a":1}');
 });
@@ -208,4 +206,32 @@ test("foreignQueryNode: reads pass, any other query node is returned, an unknown
   });
   expect(foreignQueryNode(tree)?.type).toBe("COPY_QUERY_NODE");
   expect(foreignQueryNode({ node: { type: "SELECT_NODE", from_table: { type: "SUBQUERY", subquery: { node: { type: "MERGE_INTO_NODE" } } } } })).toEqual({ type: "MERGE_INTO_NODE" });
+});
+
+describe("arrowLambdas (LAMBDA_ARROW)", () => {
+  test("LAMBDA_FUNCTIONS is every function DuckDB gives a LAMBDA parameter", async () => {
+    const reader = await conn.runAndReadAll("SELECT DISTINCT function_name FROM duckdb_functions() WHERE list_contains(parameter_types, 'LAMBDA') ORDER BY 1");
+    expect([...LAMBDA_FUNCTIONS].sort()).toEqual(reader.getRowsJS().map((r) => String(r[0])));
+  });
+
+  test("arrow lambdas with their rewrite; JSON's -> and lambda-keyword lambdas are left alone", async () => {
+    const sql = "SELECT list_transform(tags, t -> upper(t)), list_reduce(l, (a, b) -> a + b), j->'k', j->>'k', list_filter(l, lambda x: x > 1), "
+      + "COLUMNS(c -> c LIKE 'a%'), apply(l, x -> x->'k') FROM t";
+    expect(arrowLambdas(await ast(sql), sql).map(({ text, to }) => ({ text, to }))).toEqual([
+      { text: "t -> upper(t)", to: "lambda t: upper(t)" },
+      { text: "(a, b) -> a + b", to: "lambda a, b: a + b" },
+      { text: "c -> c LIKE 'a%'", to: "lambda c: c LIKE 'a%'" },
+      // `x -> x->'k'` parses as `(x -> x)->'k'`: found, but not split, so its fix is a manual one.
+      { text: undefined, to: undefined },
+    ]);
+    const plain = "SELECT j->'k', (j->'a')->>'b', list_transform(l, lambda x: x + 1) FROM t";
+    expect(arrowLambdas(await ast(plain), plain)).toEqual([]);
+  });
+
+  test("the span is cut by bytes, so text before it may hold any character", async () => {
+    const sql = "SELECT '😀日本é', list_transform(l, x -> x || 'ü') FROM t";
+    const [l] = arrowLambdas(await ast(sql), sql);
+    expect(l).toMatchObject({ text: "x -> x || 'ü'", to: "lambda x: x || 'ü'" });
+    expect(sql.slice(charIndex(sql, l!.at!))).toStartWith("x -> x");
+  });
 });

@@ -92,6 +92,21 @@ describe("errors", () => {
     expect(mapQueryError("not an error", "query")).toBe("not an error");
   });
 
+  test("DuckDB 2.0's refusal of an arrow lambda is LAMBDA_ARROW, with the lambda keyword in the hint", async () => {
+    const instance = await DuckDBInstance.create(":memory:");
+    const conn = await instance.connect();
+    try {
+      const e = await conn.run("SELECT list_transform([1, 2], x -> x + 1)").then(() => null, (err: Error) => err);
+      const mapped = mapQueryError(e, "query") as CroftError;
+      expect(mapped.code).toBe("LAMBDA_ARROW");
+      expect(mapped.problem.hint).toContain("lambda x: x + 1");
+      expect(mapped.problem.details).toMatchObject({ duckdbErrorType: "Binder" });
+    } finally {
+      conn.disconnectSync();
+      instance.closeSync();
+    }
+  });
+
   test("runtime errors in a user's query are QUERY_FAILED, not SQL_SYNTAX; parser errors stay SQL_SYNTAX", () => {
     for (const [msg, kind] of [
       ["Conversion Error: Could not convert string 'abc' to INT32", "Conversion"],
@@ -114,27 +129,27 @@ describe("errors", () => {
     expect(mapQueryError(bug, "query")).toBe(bug);
   });
 
-  test("->> and -> take everything to their left: such a failure's hint says to parenthesise, other failures keep theirs", async () => {
+  test("-> takes everything to its left (->> no longer does on DuckDB 2.0): such a failure's hint says to parenthesise, other failures keep theirs", async () => {
     const instance = await DuckDBInstance.create(":memory:");
     const conn = await instance.connect();
     try {
       await conn.run(`CREATE TABLE t AS SELECT '{"k":"v","n":2}'::JSON AS j, true AS a`);
       const value = async (expr: string) => (await conn.runAndReadAll(`SELECT ${expr} AS r FROM t`)).getRowObjectsJson()[0]!.r;
       const failure = (expr: string) => conn.run(`SELECT ${expr} AS r FROM t`).then(() => null, (e: Error) => e);
-      // Alone, and parenthesised, ->> compares as written [V].
-      expect(await value(`j->>'k' = 'v'`)).toBe(true);
-      expect(await value(`a AND (j->>'k') = 'v'`)).toBe(true);
-      expect(await value(`a AND json_extract_string(j, 'k') = 'v'`)).toBe(true);
-      // After AND, OR, NOT, = or ||, what precedes it becomes the JSON it reads [V].
-      for (const expr of [`a AND j->>'k' = 'v'`, `false OR j->>'k' = 'v'`, `NOT j->>'k' = 'v'`, `1 = 1 AND j->>'k' = 'v'`, `j->>'n' = '2' AND j->>'k' = 'v'`]) {
+      // On DuckDB 2.0, ->> binds more tightly than AND, OR, NOT and =: it compares as written [V].
+      for (const expr of [`j->>'k' = 'v'`, `a AND j->>'k' = 'v'`, `false OR j->>'k' = 'v'`, `1 = 1 AND j->>'k' = 'v'`, `j->>'n' = '2' AND j->>'k' = 'v'`]) {
+        expect([expr, await value(expr)]).toEqual([expr, true]);
+      }
+      expect(await value(`a AND (j->'k') = '"v"'`)).toBe(true);
+      // -> still takes what precedes it, and what follows up to =, as the JSON and the path it reads [V].
+      for (const [expr, says] of [[`j->'n' = 2`, "json_extract(JSON, BOOLEAN)"], [`j->'n' > 1`, "json_extract(JSON, BOOLEAN)"],
+        [`a AND j->'k' = '"v"'`, "json_extract(BOOLEAN, BOOLEAN)"], [`a AND j->'k'`, "Failed to cast value"]] as const) {
         const e = mapQueryError(await failure(expr), "query") as CroftError;
         expect([expr, e.code]).toEqual([expr, "QUERY_FAILED"]);
-        expect(e.message, expr).toContain("Failed to cast value");
-        expect(e.problem.hint, expr).toContain("(j->>'k') = 'v'");
+        expect(e.message, expr).toContain(says);
+        expect(e.problem.hint, expr).toContain("(j->'k') = 2");
+        expect(e.problem.hint, expr).not.toContain("->>");
       }
-      const arrow = mapQueryError(await failure(`j->'n' = 2`), "query") as CroftError;
-      expect(arrow.message).toContain("json_extract(JSON, BOOLEAN)");
-      expect(arrow.problem.hint).toContain("parenthesise");
       // A conversion error over plain text is about the data.
       const text = mapQueryError(await failure(`CAST(j->>'k' AS INTEGER)`), "query") as CroftError;
       expect(text.problem.hint).toBe("fix the query; DuckDB's message says what went wrong");

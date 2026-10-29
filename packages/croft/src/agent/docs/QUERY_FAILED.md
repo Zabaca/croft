@@ -18,7 +18,9 @@ types first: croft describe <asset> shows them, and croft query "DESCRIBE <asset
 saved to read yet, and await every ctx.query inside rows().
 
 "Failed to cast value" quoting a whole JSON value ({...} or [...]), or json_extract called with a BOOLEAN, is
-usually not about the data: DuckDB's ->> and -> take everything to their left as the JSON they read, binding more
-loosely than AND, OR, NOT, = and ||. `a AND j->>'k' = 'v'` runs as `((a AND j)->>'k') = 'v'`. Put each one in
-parentheses, `a AND (j->>'k') = 'v'`, or write json_extract_string(j, 'k'); the hint says so when the message has
-that shape (croft docs sql).
+usually not about the data: DuckDB's -> takes everything to its left as the JSON it reads, and what follows up to a
+comparison as the path, binding more loosely than AND, OR, NOT, = and ||. `j->'k' = 2` runs as `j->('k' = 2)`, and
+`a AND j->'k'` as `(a AND j)->'k'`. Put it in parentheses, `(j->'k') = 2`, or write json_extract(j, 'k'); the hint
+says so when the message has that shape (croft docs sql). ->> compares as written.
+
+A lambda written with an arrow (x -> x + 1) is LAMBDA_ARROW, not this code: DuckDB 2.0 reads lambda x: x + 1.

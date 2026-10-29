@@ -39,7 +39,7 @@ import type { Check, Problem } from "../core/types.ts";
 import { quoteIdent } from "../load/evolve.ts";
 import { editDistance } from "../project/suggest.ts";
 import {
-  asciiLower, type AstNode, collect, finiteJson, foreignQueryNode, literal, looksLikePath, relationNames, TABLE_ARGUMENT_FUNCTIONS, tableArguments, walk,
+  arrowLambdas, asciiLower, type AstNode, collect, finiteJson, foreignQueryNode, literal, looksLikePath, relationNames, TABLE_ARGUMENT_FUNCTIONS, tableArguments, walk,
 } from "../sql/ast.ts";
 import { TABLE_FUNCTIONS } from "../sql/gate.ts";
 
@@ -112,7 +112,7 @@ export async function analyzeChecks(conn: DuckDBConnection, asset: string, check
   for (const c of checks) {
     const v = await vetCheck(serialize, asset, c);
     if (v.ok) out.push({ ...c, reads: v.reads });
-    else problems.push(invalid(asset, o.file, c.source, c.blocking, v.why, v.hint));
+    else problems.push(invalid(asset, o.file, c.source, c.blocking, v.why, v.hint, v.fix));
   }
   return { checks: out, problems };
 }
@@ -125,7 +125,7 @@ export function probeSql(asset: string, expr: string): string {
   return `SELECT (\n${expr}\n) FROM ${quoteIdent(asset)}`;
 }
 
-export type Vetting = { ok: true; reads: string[] } | { ok: false; why: string; hint: string };
+export type Vetting = { ok: true; reads: string[] } | { ok: false; why: string; hint: string; fix?: { from: string; to: string } };
 
 /**
  * Whether a check is safe and well-formed, with the tables its rule reads. `serialize` returns
@@ -160,6 +160,15 @@ export async function vetCheck(serialize: (sql: string) => Promise<string>, asse
     return bad("is a list of values, not one condition", "write one condition per check, or join conditions with AND");
   }
   if (hasParameter(stmts[0]!)) return bad("uses a parameter ($1 or ?); a check has none", "write the value into the check");
+  const probe = probeSql(asset, c.sql);
+  const arrow = arrowLambdas(node, probe)[0];
+  if (arrow) {
+    return {
+      ok: false, why: `writes a lambda with an arrow (${arrow.text ?? "x -> …"}), which DuckDB 2.0 no longer reads`,
+      hint: arrow.to ? `write it as ${arrow.to}` : "write the lambda as lambda x: <expression>",
+      ...(arrow.text && arrow.to ? { fix: { from: arrow.text, to: arrow.to } } : {}),
+    };
+  }
   const foreign = foreignQueryNode(node);
   if (foreign) {
     return bad(`holds a ${foreign.type.replace(/_QUERY_NODE$|_NODE$/, "").replace(/_/g, " ")} statement; a check only reads`,
@@ -198,6 +207,7 @@ export async function vetCheck(serialize: (sql: string) => Promise<string>, asse
       }
     }
     if (u.kind === "scalar" && asciiLower(u.name) === "write_log") return bad("calls write_log(), which writes to DuckDB's log", "remove it");
+    if (u.kind === "scalar" && asciiLower(u.name) === "setval") return bad("calls setval(), which changes a sequence", "remove it");
   }
   const self = asciiLower(asset);
   return { ok: true, reads: relationNames(node).filter((t) => t !== self) };
@@ -206,7 +216,7 @@ export async function vetCheck(serialize: (sql: string) => Promise<string>, asse
 /** Every string literal among a table function's arguments, named ones included, nested ones too. */
 function stringArguments(fn: AstNode): string[] {
   const out: string[] = [];
-  walk(fn.children, (n) => {
+  walk(fn.arguments, (n) => {
     const s = literal(n);
     if (s !== null) out.push(s);
   });

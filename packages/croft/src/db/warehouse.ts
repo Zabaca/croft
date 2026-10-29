@@ -124,6 +124,11 @@ function toDuck(v: unknown): DuckDBValue {
  * statement, so a value concatenated into SQL can never smuggle in a second one.
  */
 export class LeaseSql implements Sql {
+  /** The first statement DuckDB refused inside a write's transaction. On DuckDB 2.0 any refusal, a failed prepare
+   *  included, aborts the transaction, and a COMMIT after it ends the transaction without writing anything and
+   *  without an error [V]; write() refuses to commit then. */
+  failed: Error | null = null;
+
   constructor(readonly connection: DuckDBConnection, private readonly ctx: RenderContext, private readonly guard: TxGuard | null) {}
 
   async all<T = Row>(sql: string, params: unknown[] = []): Promise<T[]> {
@@ -150,6 +155,7 @@ export class LeaseSql implements Sql {
     try {
       stmt = await this.connection.prepare(sql);
     } catch (e) {
+      if (this.guard) this.failed ??= e as Error;
       if (/Cannot prepare multiple statements/.test((e as Error).message)) {
         throw new CroftError("SQL_NOT_ONE_STATEMENT", { message: "croft runs one SQL statement per call", hint: "report this croft bug", details: { sql: sql.slice(0, 200) } });
       }
@@ -161,8 +167,14 @@ export class LeaseSql implements Sql {
         throw new CroftError("INTERNAL_ERROR", { message: "write() owns the transaction; do not BEGIN, COMMIT or ROLLBACK inside it", hint: "report this croft bug" });
       }
       this.guard?.check(type, sql);
-      if (params.length) stmt.bind(params.map(toDuck));
-      const out = read ? await stmt.runAndReadAll() : (await stmt.run(), undefined);
+      let out: DuckDBResultReader | undefined;
+      try {
+        if (params.length) stmt.bind(params.map(toDuck));
+        out = read ? await stmt.runAndReadAll() : (await stmt.run(), undefined);
+      } catch (e) {
+        if (this.guard) this.failed ??= e as Error;
+        throw e;
+      }
       this.guard?.record(type, sql);
       return out;
     } finally {
@@ -249,6 +261,14 @@ export class DuckWarehouse implements Warehouse {
         await conn.run("BEGIN TRANSACTION");
         try {
           const result = await fn(tx);
+          if (tx.failed) {
+            // The body went on after a statement DuckDB refused: the transaction is aborted, and COMMIT would
+            // silently write nothing.
+            throw new CroftError("INTERNAL_ERROR", {
+              message: `write "${label}" went on after a statement failed (${tx.failed.message.split("\n")[0]}); nothing was committed`,
+              hint: "report this croft bug",
+            });
+          }
           await conn.run("COMMIT");
           return result;
         } catch (e) {

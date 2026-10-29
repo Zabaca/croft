@@ -5,11 +5,11 @@
 // from the parse tree. The optimizer must be off: it prunes scans (`WHERE false`, `LIMIT 0`) [V]. An SQL
 // asset's inputs are relationNames ∪ planScans.
 //
-// Verified on DuckDB 1.5.5 (deps.test.ts, and the golden corpus in deps-corpus/):
+// Verified on DuckDB 2.0.0 (deps.test.ts, and the golden corpus in deps-corpus/):
 // - The connection comes with the optimizer off (db/connect.ts SandboxSpec.optimizer, which ShadowCatalog
-//   passes); planScans never switches it, since a locked configuration refuses SET enable_optimizer. Nothing
-//   reports the setting, so it is read back by explaining `SELECT 1 WHERE false`: the optimizer turns that into
-//   EMPTY_RESULT.
+//   passes); planScans never switches it, since on 2.0 the setting is global and a locked configuration refuses
+//   it, PRAGMA disable_optimizer included. It is read back by explaining `SELECT 1 WHERE false`: the optimizer
+//   turns that into EMPTY_RESULT.
 // - A table scan is a plan node whose extra_info has "Table": the catalog, schema and table, each quoted when
 //   DuckDB would quote it (`"temp".main.t`, `memory.main."we.ird"`).
 // - A CTE's scan appears once, under the CTE node; a table named in an unused CTE is not scanned; DESCRIBE

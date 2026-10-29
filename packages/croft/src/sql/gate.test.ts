@@ -101,8 +101,10 @@ describe("rejects", () => {
       "pivot t on b",
     ]) {
       const e = await code(sql);
-      expect([sql, e.code]).toEqual([sql, sql === "pivot t on b" ? "SQL_NOT_ONE_STATEMENT" : "QUERY_NOT_SELECT"]);
+      expect([sql, e.code]).toEqual([sql, "QUERY_NOT_SELECT"]);
     }
+    // DuckDB 2.0 counts a PIVOT without IN as one statement and cannot serialize it: the hint names the fix.
+    expect((await code("pivot t on b")).problem.hint).toBe("list the values: ON b IN ('pro', 'basic'), or use sum(x) FILTER (WHERE b = 'pro')");
     expect((await code("copy t to 'out.csv'")).problem.hint).toContain("exports are post-v1");
   });
 
@@ -143,14 +145,16 @@ describe("rejects", () => {
     const tail = await code("select * from t where");
     expect(tail.code).toBe("SQL_SYNTAX");
     expect(tail.problem.line).toBe(1);
-    expect(tail.problem.column).toBe(22);
+    expect(tail.problem.column).toBe(17); // DuckDB 2.0 points at `where`: "syntax error at or near"
     const first = await code("selec 1");
     expect(first.problem).toMatchObject({ line: 1, column: 1 });
   });
 
-  test("positions count code points, not bytes or UTF-16 units", async () => {
+  test("DuckDB's positions count UTF-8 bytes; columns count code points, not bytes or UTF-16 units", async () => {
     const e = await code("select '😀日本' = = 1");
     expect(e.problem.column).toBe(16);
+    const second = await code("select 'é'\nfrom t where = 1");
+    expect(second.problem).toMatchObject({ line: 2, column: 14 });
   });
 });
 
@@ -348,6 +352,25 @@ describe("serve profile", () => {
     // croft query (a local CLI with no writer to hand the file to) keeps them.
     await assertOneSelect(conn, "select range(150000000)");
   });
+
+  test("a bound written as a constant croft cannot read is refused, not guessed (fail closed)", async () => {
+    // A literal kind this croft does not know, as a later DuckDB might serialize one.
+    const forged: DuckDBConnection = new Proxy(conn, {
+      get(target, key) {
+        if (key !== "runAndReadAll") return Reflect.get(target, key, target);
+        return async (sql: string, params?: unknown[]) => {
+          const reader = await target.runAndReadAll(sql, params as never);
+          if (!sql.includes("json_serialize_sql")) return reader;
+          const text = String(reader.getRowsJS()[0]![0]).replace(/"kind":"INTEGER","text":"7"/g, '"kind":"SOMETHING_NEW","text":"7"');
+          return { getRowsJS: () => [[text]] };
+        };
+      },
+    });
+    const e = await code("select range(7)", { profile: "serve" }, forged);
+    expect(e.code).toBe("QUERY_PATH_DENIED");
+    expect(e.message).toContain("values croft cannot count");
+    await assertOneSelect(forged, "select * from range(7)", { profile: "serve" });
+  });
 });
 
 describe("every profile: functions with side effects or SQL the gate cannot see", () => {
@@ -359,8 +382,10 @@ describe("every profile: functions with side effects or SQL the gate cannot see"
       ["select * from truncate_duckdb_logs()", "truncate_duckdb_logs"],
       ["select * from enable_profiling()", "enable_profiling"],
       ["select * from disable_profiling()", "disable_profiling"],
-      ["select * from enable_peg_parser()", "enable_peg_parser"],
-      ["select * from disable_peg_parser()", "disable_peg_parser"],
+      ["select * from register_external_resource('x', 'y')", "register_external_resource"],
+      ["select * from create_external_resource('x')", "create_external_resource"],
+      ["select setval('s', 5)", "setval"],
+      ["select * from t where a = setval('s', 5)", "setval"],
       ["select * from checkpoint()", "checkpoint"],
       ["select * from force_checkpoint()", "force_checkpoint"],
       ["select * from query('select 1')", "query"],
@@ -397,6 +422,10 @@ describe("every profile: functions with side effects or SQL the gate cannot see"
     const names = reader.getRowsJS().map((r) => String(r[0]));
     const unclassified = names.filter((n) => !TABLE_FUNCTIONS.has(n));
     expect(unclassified).toEqual([]);
+    // And the other way: a name DuckDB no longer ships is dropped from the list. histogram and histogram_values are
+    // table macros DuckDB lists too.
+    const gone = [...TABLE_FUNCTIONS.keys()].filter((n) => !names.includes(n));
+    expect(gone).toEqual([]);
   });
 
   test("enable_logging would write files and change the instance: it never runs", async () => {

@@ -137,9 +137,13 @@ export async function answer(conn: DuckDBConnection, sql: string, o: AnswerOptio
   } catch (e) {
     throw mapQueryError(e, "serve");
   } finally {
-    // A partly read stream keeps its query open on the connection (and its memory until garbage collection);
-    // the next statement on the connection closes it.
-    if (result && !finished) await conn.run("SELECT 1").catch(() => {});
+    // On DuckDB 2.0 a partly read stream blocks its connection from starting another statement (RESOURCE_IN_USE)
+    // until it is closed. closeSync is idempotent, and waits out a fetch in flight.
+    if (result && !finished) {
+      try {
+        result.closeSync();
+      } catch {}
+    }
     try {
       stmt.destroySync();
     } catch {}

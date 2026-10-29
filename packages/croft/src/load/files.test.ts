@@ -174,6 +174,19 @@ describe("DuckDB and Bun behaviors this module relies on", () => {
     return { dir, conn, sql: new LeaseSql(conn, { mode: "ts", timezone: "UTC" }, null) };
   }
 
+  test("Parquet TIMESTAMP_NS becomes microseconds by rounding on DuckDB 2.0 (1.5.5 truncated): D115", async () => {
+    const { dir, sql } = await memory();
+    const f = join(dir, "ns.parquet");
+    await sql.exec(`COPY (SELECT * FROM (VALUES (1, '2024-01-01 00:00:00.0000004'::TIMESTAMP_NS), (2, '2024-01-01 00:00:00.0000005'::TIMESTAMP_NS),
+      (3, '2024-01-01 00:00:00.123456789'::TIMESTAMP_NS), (4, '2024-12-31 23:59:59.9999995'::TIMESTAMP_NS)) v(i, t)) TO '${f}' (FORMAT parquet)`);
+    const col = parquetColumn("t", "TIMESTAMP_NS");
+    expect(await sql.all(`SELECT (${col.expr})::VARCHAR AS t FROM read_parquet('${f}') ORDER BY i`)).toEqual([
+      { t: "2024-01-01 00:00:00" }, { t: "2024-01-01 00:00:00.000001" }, { t: "2024-01-01 00:00:00.123457" },
+      // Half a microsecond before midnight on New Year's Eve rounds into the next year.
+      { t: "2025-01-01 00:00:00" },
+    ]);
+  });
+
   test("a latin-1 CSV read as UTF-8 fails and aborts the transaction; JavaScript's fatal decoder agrees", async () => {
     const { dir, conn, sql } = await memory();
     copyFileSync(join(FIXTURES, "latin1.csv"), join(dir, "l.csv"));
@@ -1248,7 +1261,7 @@ describe("Parquet", () => {
     });
     expect(r.batch!.formats).toEqual({});
     expect(await q(p, `SELECT small, int32, float32, uid, st::VARCHAR AS st, list::VARCHAR AS list, m::VARCHAR AS m, ts_ns::VARCHAR AS ts, big::VARCHAR AS big, extra, _file FROM t ORDER BY small`)).toEqual([
-      { small: 1, int32: 100000, float32: 0.1, uid: "6f1c2a3b-0000-4000-8000-000000000001", st: '{"a":1,"b":[1,2]}', list: "[1,2,3]", m: '{"k":1}', ts: "2024-01-01 10:00:00.123456", big: "9007199254740993", extra: null, _file: "files/p/1.parquet" },
+      { small: 1, int32: 100000, float32: 0.1, uid: "6f1c2a3b-0000-4000-8000-000000000001", st: '{"a":1,"b":[1,2]}', list: "[1,2,3]", m: '{"k":1}', ts: "2024-01-01 10:00:00.123457", big: "9007199254740993", extra: null, _file: "files/p/1.parquet" },
       { small: 2, int32: null, float32: 2.5, uid: null, st: null, list: "[]", m: '{"k":2,"j":3}', ts: "2024-01-02 00:00:00", big: "2", extra: null, _file: "files/p/1.parquet" },
       { small: 3, int32: 5000000000, float32: null, uid: null, st: null, list: null, m: null, ts: null, big: null, extra: "later", _file: "files/p/2.parquet" },
     ]);

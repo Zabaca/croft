@@ -65,7 +65,7 @@ describe("ensureState", () => {
   test("records format_version, duckdb_version and croft_version", async () => {
     const w = warehouse();
     const meta = await w.write("state", (tx) => ensureState(tx), { runId: "r" });
-    expect(meta).toEqual({ format_version: String(FORMAT_VERSION), duckdb_version: expect.stringMatching(/^v1\.5\.5/), croft_version: CROFT_VERSION });
+    expect(meta).toEqual({ format_version: String(FORMAT_VERSION), duckdb_version: expect.stringMatching(/^v2\.0\.0/), croft_version: CROFT_VERSION });
     expect(await w.read((db) => readMeta(db), { purpose: "t" })).toEqual(meta);
     expect(CROFT_VERSION).toMatch(/^\d+\.\d+\.\d+/);
   });

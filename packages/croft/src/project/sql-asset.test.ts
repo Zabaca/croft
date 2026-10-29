@@ -346,6 +346,13 @@ JOIN (PIVOT refunds ON order_id) AS r ON true`);
       });
     });
 
+    test("text before the table may hold any character: DuckDB's byte positions still find it", async () => {
+      const p = only(await load("SELECT '😀日本é' AS s, o.id\nFROM  Other . \"Main\".orders o WHERE o.note = 'ü'"), "CATALOG_PREFIX");
+      expect(p).toMatchObject({ line: 2, column: 7, fix: { kind: "edit", replace: { from: 'Other . "Main".orders', to: "orders" } } });
+      const q = only(await load("SELECT 'ü' AS s FROM other.main.orders"), "CATALOG_PREFIX");
+      expect(q).toMatchObject({ line: 1, column: 22, fix: { replace: { from: "other.main.orders", to: "orders" } } });
+    });
+
     test("a table macro's table with a prefix, as written", async () => {
       const p = only(await load("SELECT * FROM histogram(other.main.orders, amount)"), "CATALOG_PREFIX");
       expect(p).toMatchObject({ line: 1, column: 25, fix: { kind: "edit", replace: { from: "other.main.orders", to: "orders" } } });
@@ -356,6 +363,30 @@ JOIN (PIVOT refunds ON order_id) AS r ON true`);
       const p = only(await load("SELECT * FROM _croft.assets"), "CATALOG_PREFIX");
       expect(p.message).toBe("_croft.assets is outside the project's tables; an SQL asset reads only those, by plain name, so croft can track its inputs");
       expect(p.fix).not.toHaveProperty("replace");
+    });
+  });
+
+  describe("LAMBDA_ARROW", () => {
+    test("an arrow lambda is an error with the edit that rewrites it, located at the lambda", async () => {
+      const a = await load("-- key: id\nSELECT id,\n  list_transform(tags, t -> upper(t)) AS up,\n  list_reduce(l, (a, b) -> a + b) AS total\nFROM orders");
+      expect(a.ok).toBe(false);
+      expect(a.problems.map((p) => [p.code, p.line, p.column])).toEqual([["LAMBDA_ARROW", 3, 24], ["LAMBDA_ARROW", 4, 18]]);
+      expect(a.problems[0]).toMatchObject({
+        severity: "error", hint: "write it as lambda t: upper(t)",
+        fix: { kind: "edit", file: "assets/open_issues.sql", line: 3, replace: { from: "t -> upper(t)", to: "lambda t: upper(t)" } },
+      });
+      expect(a.problems[1]!.fix).toMatchObject({ replace: { from: "(a, b) -> a + b", to: "lambda a, b: a + b" } });
+    });
+
+    test("COLUMNS(c -> …) too; JSON's -> and the lambda keyword are fine", async () => {
+      expect(only(await load("SELECT COLUMNS(c -> c LIKE 'a%') FROM orders"), "LAMBDA_ARROW").fix).toMatchObject({ replace: { from: "c -> c LIKE 'a%'", to: "lambda c: c LIKE 'a%'" } });
+      expect((await load("SELECT payload->'user' AS u, payload->>'login' AS l, list_transform(tags, lambda t: upper(t)) AS up FROM orders")).problems).toEqual([]);
+    });
+
+    test("applying the fix gives an asset that loads", async () => {
+      const text = "SELECT list_filter(tags, t -> t <> '') AS kept FROM orders";
+      const fix = only(await load(text), "LAMBDA_ARROW").fix as { replace: { from: string; to: string } };
+      expect((await load(text.replace(fix.replace.from, fix.replace.to))).problems).toEqual([]);
     });
   });
 

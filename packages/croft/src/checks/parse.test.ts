@@ -237,6 +237,12 @@ describe("validateChecks: DuckDB's parser, on any connection", () => {
     }
   });
 
+  test("an arrow lambda is CHECK_INVALID with the edit that rewrites it", async () => {
+    const [p] = await validateChecks(conn, "orders", [rule("len(list_filter(tags, t -> t <> '')) > 0")], { file: "assets/orders.sql" });
+    expect(p).toMatchObject({ code: "CHECK_INVALID", hint: "write it as lambda t: t <> ''", fix: { kind: "edit", file: "assets/orders.sql", replace: { from: "t -> t <> ''", to: "lambda t: t <> ''" } } });
+    expect(await validateChecks(conn, "orders", [rule("len(list_filter(tags, lambda t: t <> '')) > 0"), rule("payload->>'k' = 'v'")])).toEqual([]);
+  });
+
   test("files, SQL in strings, side effects and parameters are refused", async () => {
     expect(await invalidOf("id IN (SELECT id FROM 'files/ids.csv')")).toContain("reads the file files/ids.csv");
     expect(await invalidOf("id IN (SELECT id FROM read_csv('files/ids.csv'))")).toContain("calls read_csv()");
@@ -244,6 +250,7 @@ describe("validateChecks: DuckDB's parser, on any connection", () => {
     expect(await invalidOf("id IN (SELECT id FROM query('SELECT 1 AS id'))")).toContain("calls query()");
     expect(await invalidOf("(SELECT count(*) FROM checkpoint()) = 0")).toContain("calls checkpoint()");
     expect(await invalidOf("write_log('x') IS NULL")).toContain("write_log()");
+    expect(await invalidOf("setval('s', 1) > 0")).toContain("setval()");
     expect(await invalidOf("amount > $1")).toContain("parameter");
     expect(await invalidOf("amount > ?")).toContain("parameter");
     // Harmless table functions are fine.
