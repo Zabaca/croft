@@ -12,7 +12,7 @@ import { bootId, currentIdentity, procStart } from "../core/proc.ts";
 import { intentDir, intentFileName } from "../db/intent.ts";
 import type { FsProbe } from "../db/fs-kind.ts";
 import { directQuery } from "../read/direct.ts";
-import { cleanup, makeProject, spawnHolder, spawnIdle, type TempProject, writeIntent } from "../read/testkit.ts";
+import { cleanup, makeProject, releaseHolder, spawnHolder, spawnIdle, type TempProject, writeIntent } from "../read/testkit.ts";
 import { openServeEngine, type ServeEngineHooks, type ServeEngineInternals } from "./instance.ts";
 import type { ServeEngine, ServeEngineOptions } from "./types.ts";
 
@@ -581,7 +581,8 @@ describe("handing the file to a writer", () => {
 
   test("a program holding the file without an intent (a GUI): queries wait, then SERVE_UNAVAILABLE naming it; served once it lets go", async () => {
     const p = await seeded();
-    const gui = spawnHolder(p.database, 1500);
+    // Held until the refusal below was seen, however slow the machine.
+    const gui = spawnHolder(p.database, "release");
     await gui.waitFor("held");
     const { e } = await engine(p, { queueMs: 300 });
     expect(e.status()).toMatchObject({ state: "reopening", openConnections: 0 });
@@ -590,6 +591,7 @@ describe("handing the file to a writer", () => {
     expect(err.message).toContain("holds it");
     expect(err.problem.details).toMatchObject({ reason: "unavailable", holder: { pid: gui.pid } });
     expect(err.problem.details?.retryAfterMs).toBeGreaterThan(0);
+    releaseHolder(gui);
     await gui.waitFor("released");
     await until("open", () => e.status().state === "open");
     expect((await e.query(q("SELECT count(*) AS c FROM t"))).rows).toEqual([{ c: 5 }]);

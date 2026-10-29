@@ -87,7 +87,8 @@ function track(proc: ChildProcess): Child {
 }
 
 // A program that is not croft (think DuckDB UI or another app): opens the file read-write, optionally
-// writes a row, holds it for HOLD_MS, then closes and prints "released". The instance stays referenced
+// writes a row, holds it for HOLD_MS (or, with HOLD_MS "release", until it gets SIGUSR2), then closes and prints
+// "released". The instance stays referenced
 // from globalThis: Node collects an unreferenced instance quickly, and that releases the lock early.
 const HOLDER = `const { DuckDBInstance } = require(process.env.DUCKDB_API);
 (async () => {
@@ -95,20 +96,36 @@ const HOLDER = `const { DuckDBInstance } = require(process.env.DUCKDB_API);
   const c = await db.connect();
   globalThis.keep = [db, c];
   if (process.env.INSERT) await c.run(process.env.INSERT);
-  console.log("held");
-  await new Promise((r) => setTimeout(r, Number(process.env.HOLD_MS)));
+  if (process.env.HOLD_MS === "release") {
+    // A signal listener does not keep the process alive; the interval does, until the signal.
+    const alive = setInterval(() => {}, 1000);
+    const released = new Promise((r) => process.once("SIGUSR2", r));
+    console.log("held");
+    await released;
+    clearInterval(alive);
+  } else {
+    console.log("held");
+    await new Promise((r) => setTimeout(r, Number(process.env.HOLD_MS)));
+  }
   c.disconnectSync();
   db.closeSync();
   console.log("released");
   setInterval(() => {}, 1000);
 })().catch((e) => { console.error(e.message); process.exit(1); });`;
 
-/** A child process holding the database read-write for `holdMs`. */
-export function spawnHolder(database: string, holdMs: number, insert?: string): Child {
+/** A child process holding the database read-write for `holdMs`, or, with "release", until `releaseHolder()`: a test
+ *  that waits for something to happen while the file is held then holds it exactly that long, however slow the
+ *  machine is. */
+export function spawnHolder(database: string, holdMs: number | "release", insert?: string): Child {
   return track(spawn(process.execPath, ["-e", HOLDER], {
     env: { ...process.env, DUCKDB_API, DB_PATH: database, HOLD_MS: String(holdMs), INSERT: insert ?? "" },
     stdio: ["ignore", "pipe", "pipe"],
   }));
+}
+
+/** Let go of the file a spawnHolder(…, "release") holds. */
+export function releaseHolder(holder: Child): void {
+  holder.proc.kill("SIGUSR2");
 }
 
 /** A child that only exists (a live PID to own a write intent or a serve.json). */

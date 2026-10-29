@@ -6,7 +6,7 @@ import { CroftError } from "../core/errors.ts";
 import { openMemory, serveResources } from "../db/connect.ts";
 import { cleanup, makeProject, spawnHolder } from "../read/testkit.ts";
 import { QueryWorker, WorkerConflict, WorkerGone, WorkerStopped } from "./query-worker.ts";
-import { answer, type AnswerOptions, Stopped } from "./worker.ts";
+import { answer, type AnswerOptions, peakRss, Stopped } from "./worker.ts";
 
 const workers: QueryWorker[] = [];
 afterAll(async () => {
@@ -25,6 +25,17 @@ async function rejection(p: Promise<unknown>): Promise<Error> {
 
 const opts = (o: Partial<AnswerOptions> = {}): AnswerOptions => ({
   params: [], limit: 10_000, maxRows: 100_000, maxBytes: 64 * 1024 * 1024, timezone: "UTC", protect: [], checkpoint: () => {}, ...o,
+});
+
+test("peakRss: bytes on macOS, KiB elsewhere, never below the resident set now", () => {
+  // macOS: a peak a few pages below the current resident set stays in bytes (it once read as KiB: 1024 times too large).
+  expect(peakRss("darwin", 104_853_504, 104_857_600)).toBe(104_857_600);
+  expect(peakRss("darwin", 209_715_200, 104_857_600)).toBe(209_715_200);
+  expect(peakRss("linux", 204_800, 104_857_600)).toBe(209_715_200);
+  expect(peakRss("linux", 100_000, 104_857_600)).toBe(104_857_600);
+  // This process: a test runner, far below 16 GiB; the old misreading gave about 100 GiB here.
+  expect(peakRss()).toBeGreaterThan(0);
+  expect(peakRss()).toBeLessThan(16 * 1024 ** 3);
 });
 
 describe("answer()", () => {
@@ -125,7 +136,8 @@ describe("QueryWorker", () => {
 
   test("a file another process holds is WorkerConflict naming it; a newer format is DB_NEWER_FORMAT", async () => {
     const p = await makeProject({ seed: ["CREATE TABLE t AS SELECT 1 AS n"] });
-    const holder = spawnHolder(p.database, 3000);
+    // Held until killed below, however long the worker takes to try the file.
+    const holder = spawnHolder(p.database, "release");
     await holder.waitFor("held", 5000);
     const w = QueryWorker.spawn();
     workers.push(w);

@@ -9,10 +9,10 @@ import { exitCodeFor } from "../core/errors.ts";
 import type { PreviewAsset } from "../core/types.ts";
 import { RunsDb } from "../history/runs-db.ts";
 import { ProjectEnv } from "../project/env.ts";
-import { cleanup as cleanupHolders, spawnHolder } from "../read/testkit.ts";
+import { cleanup as cleanupHolders, releaseHolder, spawnHolder } from "../read/testkit.ts";
 import { loadProject } from "../project/root.ts";
 import { capRows, previewDatabasePath, runPreview, type PreviewInput } from "./preview.ts";
-import { cleanupProjects, MAIN, makeProject, writeFiles } from "./testkit.ts";
+import { cleanupProjects, MAIN, makeProject, until, writeFiles } from "./testkit.ts";
 
 // ---------------------------------------------------------------------------------------------------------
 // A mock API: GitHub-like issues (ascending by updated_at, inclusive since) and a per-row "LLM" that counts calls.
@@ -611,15 +611,16 @@ describe("croft preview: locks and interrupts", () => {
     const root = makeProject({ "assets/issues.ts": ISSUES(), "assets/open_issues.sql": OPEN });
     await run(root);
     const project = loadProject({ root });
-    // onWait fires only on a failed attempt after >= 2000 ms of waiting, and attempts are 500-1000 ms apart by then:
-    // hold long enough that one surely lands inside the window.
-    const holder = spawnHolder(project.paths.database, 4000);
+    // onWait fires only on a failed attempt after >= 2000 ms of waiting: held until it has, however slow the machine.
+    const holder = spawnHolder(project.paths.database, "release");
     await holder.waitFor("held");
     const waits: string[] = [];
     const pending = preview(root, ["open_issues"], { onWait: (_h, _ms, what) => waits.push(what) });
     await Bun.sleep(800);
     const intents = join(project.paths.stateDir, "write-intent.d");
     expect(existsSync(intents) ? readdirSync(intents) : []).toEqual([]);
+    await until(() => waits.length > 0, 30_000);
+    releaseHolder(holder);
     const out = await pending;
     expect(waits).toContain("the warehouse");
     expect(byName(out.data.assets, "open_issues")).toMatchObject({ status: "ok", rows: 1 });

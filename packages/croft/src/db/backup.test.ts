@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { RunsDb } from "../history/runs-db.ts";
-import { cleanup as cleanupChildren, spawnHolder, spawnIdle, writeIntent } from "../read/testkit.ts";
+import { cleanup as cleanupChildren, releaseHolder, spawnHolder, spawnIdle, writeIntent } from "../read/testkit.ts";
 import type { SchedulingSetting } from "../schedule/os.ts";
 import {
   BACKUP_MANIFEST, type BackupManifest, BACKUPS_DIR, BACKUPS_KEPT, backupBeforeUpgrade, backupProject, backupsDir, compareEngineVersions,
@@ -485,10 +485,12 @@ describe("backupProject", () => {
 
   test("it takes the file as a writer does: it waits for the holder, then copies what the holder committed", async () => {
     const p = await project({ rows: 2 });
-    const holder = spawnHolder(p.database, 400, "INSERT INTO t VALUES (100), (101), (102)");
+    // Held until the backup has waited a while, however slow the machine: the wait is ours to end.
+    const holder = spawnHolder(p.database, "release", "INSERT INTO t VALUES (100), (101), (102)");
     await holder.waitFor("held");
     const started = Date.now();
     let leasedAt = 0;
+    setTimeout(() => releaseHolder(holder), 300);
     const b = await backupProject(projectOf(p), {
       now: clock, isTTY: false,
       leased: () => {
