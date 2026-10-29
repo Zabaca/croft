@@ -5,7 +5,7 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, utimesSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { DuckDBInstance } from "@duckdb/node-api";
+import { DuckDBInstance, version as duckdbVersion } from "@duckdb/node-api";
 import type { Reason } from "../core/types.ts";
 import { closeAllWarehouses } from "../db/warehouse.ts";
 import { parseChecks } from "../checks/parse.ts";
@@ -142,6 +142,10 @@ describe("dependency order and dispatch by kind", () => {
     const plan = await phase2Plan(root);
     withRuns(root, (db) => {
       for (const s of plan.steps) expect(db.approvedCode(s.asset)).toBe(s.codeHash!);
+      // Each SQL code hash is recorded with its source and engine (run/engine-change.ts); TS ones are not.
+      for (const s of plan.steps) {
+        expect([s.asset, db.codeSource(s.codeHash!)]).toEqual([s.asset, s.sql ? { sourceHash: s.sql.sourceHash, engine: duckdbVersion(), recordedAt: expect.any(String) } : null]);
+      }
       expect(getCatalog(db, "summary")).toMatchObject({ kind: "sql", rows: 1, reads: ["doubled"] });
       expect(db.stepsFor(out.data.runId).map((s) => [s.asset, s.status])).toEqual([
         ["issues", "ok"], ["open_issues", "ok"], ["doubled", "ok"], ["summary", "ok"],

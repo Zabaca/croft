@@ -231,6 +231,25 @@ export function relationNames(ast: unknown): string[] {
   return out;
 }
 
+// ---- Query nodes ------------------------------------------------------------------------------------------
+
+/** The query nodes that only read. DuckDB 2.0 also parses INSERT_, UPDATE_, DELETE_ and COPY_QUERY_NODE in any
+ *  CTE, nested ones included (`WITH x AS (DELETE … RETURNING *) SELECT …`), and runs them: COPY writes files even
+ *  on a READ_ONLY connection. */
+export const QUERY_NODE_TYPES: ReadonlySet<string> = new Set(["SELECT_NODE", "SET_OPERATION_NODE", "RECURSIVE_CTE_NODE"]);
+
+/** The first query node (an object whose `type` ends in `_NODE`) that is not a read, or null. A type croft does
+ *  not know is returned too, so the check fails closed. */
+export function foreignQueryNode(ast: unknown): { type: string; at?: number } | null {
+  let found: { type: string; at?: number } | null = null;
+  walk(ast, (node) => {
+    if (found || typeof node.type !== "string" || !node.type.endsWith("_NODE") || QUERY_NODE_TYPES.has(node.type)) return;
+    const at = location(node);
+    found = { type: node.type, ...(at !== undefined ? { at } : {}) };
+  });
+  return found;
+}
+
 /** Visit every node (object) of the AST, depth first, in the AST's order. */
 export function walk(ast: unknown, visit: (node: AstNode) => void): void {
   const stack: unknown[] = [ast];

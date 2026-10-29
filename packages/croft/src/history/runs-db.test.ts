@@ -459,6 +459,17 @@ describe("approved code (the scheduler hold, §6)", () => {
   });
 });
 
+describe("code sources (run/engine-change.ts)", () => {
+  test("noteCodeSource records the source and engine of a code hash; a second note replaces the first", () => {
+    expect(db.codeSource("c1")).toBeNull();
+    db.noteCodeSource("c1", "s1", "v1.5.5");
+    expect(db.codeSource("c1")).toEqual({ sourceHash: "s1", engine: "v1.5.5", recordedAt: expect.any(String) });
+    db.noteCodeSource("c1", "s1", "v2.0.0");
+    expect(db.codeSource("c1")?.engine).toBe("v2.0.0");
+    expect(db.codeSource("c2")).toBeNull();
+  });
+});
+
 describe("settings and scheduling (§8)", () => {
   test("scheduling is off until set; a setting survives reopening", () => {
     expect(db.getScheduling()).toEqual({ state: "off", via: null });

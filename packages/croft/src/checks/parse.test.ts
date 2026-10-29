@@ -180,7 +180,7 @@ describe("validateChecks: DuckDB's parser, on any connection", () => {
 
   test("valid checks: no problems, no tables needed", async () => {
     const r = parse({ key: ["id"], checks: ["amount >= 0", "state IN ('open','closed')", "id IN (SELECT issue_id FROM issue_triage)", "min_rows(3)"],
-      warnings: ["EXISTS (FROM refunds r WHERE r.order_id = orders.id)", "amount > 0 -- trailing comment", "len(list_filter(tags, t -> t <> '')) > 0"] });
+      warnings: ["EXISTS (FROM refunds r WHERE r.order_id = orders.id)", "amount > 0 -- trailing comment", "len(list_filter(tags, lambda t: t <> '')) > 0"] });
     expect(r.problems).toEqual([]);
     expect(await validateChecks(conn, "orders", r.checks)).toEqual([]);
   });
@@ -221,6 +221,19 @@ describe("validateChecks: DuckDB's parser, on any connection", () => {
     ]) {
       const v = await vet(as(sql));
       expect(v.ok, sql).toBe(false);
+    }
+  });
+
+  test("a subquery whose CTE writes or exports is refused", async () => {
+    // What DuckDB 2.0 parses for `x IN (WITH c AS (DELETE … RETURNING *) SELECT …)`: the CTE's query node writes.
+    const sql = 'SELECT (x IN (WITH c AS (SELECT 1) SELECT * FROM c)) FROM "orders"';
+    const text = String((await conn.runAndReadAll("SELECT json_serialize_sql($1::VARCHAR)::VARCHAR", [sql])).getRowsJS()[0]![0]);
+    for (const type of ["DELETE_QUERY_NODE", "COPY_QUERY_NODE", "SOMETHING_NEW_NODE"]) {
+      let n = 0;
+      const forged = text.replace(/"type":"SELECT_NODE"/g, (m) => (n++ < 2 ? m : `"type":"${type}"`));
+      const v = await vetCheck(async () => forged, "orders", rule("x IN (WITH c AS (SELECT 1) SELECT * FROM c)"));
+      expect(v.ok).toBe(false);
+      expect(v.ok ? "" : v.hint).toContain("a CTE that writes or exports");
     }
   });
 

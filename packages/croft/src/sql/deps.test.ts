@@ -19,7 +19,7 @@ let shadow: DuckDBConnection;
 let front: Awaited<ReturnType<typeof openMemory>>;
 let frontConn: DuckDBConnection;
 beforeAll(async () => {
-  db = await openMemory({ timezone: "UTC" });
+  db = await openMemory({ timezone: "UTC", optimizer: false });
   shadow = await db.connect();
   for (const sql of SHADOW) await shadow.run(sql);
   front = await openMemory({ timezone: "UTC" });
@@ -47,18 +47,18 @@ describe("planScans", () => {
     expect(await planScans(shadow, "SELECT * FROM customers LIMIT 0")).toEqual(["customers"]);
   });
 
-  test("leaves the optimizer as it found it", async () => {
-    expect(await optimizerOn(shadow)).toBe(true);
-    await planScans(shadow, "SELECT * FROM orders");
-    expect(await optimizerOn(shadow)).toBe(true);
-    await planScans(shadow, "SELECT * FROM nope");
-    expect(await optimizerOn(shadow)).toBe(true);
-    await shadow.run("PRAGMA disable_optimizer");
+  test("needs a connection with the optimizer off, on every connection of the instance", async () => {
+    expect(await optimizerOn(shadow)).toBe(false);
+    const second = await db.connect();
+    await second.run("CREATE TEMP TABLE orders (id BIGINT)");
+    expect(await optimizerOn(second)).toBe(false);
+    second.disconnectSync();
+    const on = await openMemory({ timezone: "UTC" });
     try {
-      expect(await planScans(shadow, "SELECT * FROM orders")).toEqual(["orders"]);
-      expect(await optimizerOn(shadow)).toBe(false);
+      const c = await on.connect();
+      await expect(planScans(c, "SELECT 1")).rejects.toMatchObject({ code: "INTERNAL_ERROR" });
     } finally {
-      await shadow.run("PRAGMA enable_optimizer");
+      on.close();
     }
   });
 

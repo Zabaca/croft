@@ -28,6 +28,9 @@ export interface SandboxSpec {
   fileDirs?: string[];      // directories of declared file ingests ("warehouse" only)
   memoryLimit?: string;     // e.g. "4GB"; set before locking (serve)
   threads?: number;
+  /** false: the optimizer is off on every connection (sql/bind.ts's shadow catalog, whose plans sql/deps.ts reads:
+   *  the optimizer prunes scans). Set before locking, since the lock refuses SET enable_optimizer. */
+  optimizer?: false;
 }
 
 /**
@@ -190,7 +193,7 @@ async function scalar(conn: DuckDBConnection, sql: string): Promise<unknown> {
 
 async function applySandbox(conn: DuckDBConnection, spec: SandboxSpec, key: string): Promise<void> {
   const dirs = allowedDirectories(spec);
-  const fingerprint = JSON.stringify([spec.profile, spec.timezone, dirs, spec.memoryLimit ?? null, spec.threads ?? null]);
+  const fingerprint = JSON.stringify([spec.profile, spec.timezone, dirs, spec.memoryLimit ?? null, spec.threads ?? null, spec.optimizer ?? null]);
   const locked = (await scalar(conn, "SELECT current_setting('lock_configuration')")) === true;
   if (locked) {
     if (configured.get(key) !== fingerprint) {
@@ -200,6 +203,8 @@ async function applySandbox(conn: DuckDBConnection, spec: SandboxSpec, key: stri
         details: { expected: fingerprint, actual: configured.get(key) ?? null },
       });
     }
+    // On DuckDB 1.5.5 the optimizer switch is per connection, and PRAGMA disable_optimizer still works once locked.
+    if (spec.optimizer === false) await conn.run("PRAGMA disable_optimizer");
     return;
   }
   try {
@@ -213,6 +218,7 @@ async function applySandbox(conn: DuckDBConnection, spec: SandboxSpec, key: stri
   }
   if (spec.memoryLimit) await conn.run(`SET GLOBAL memory_limit = ${sqlString(spec.memoryLimit)}`);
   if (spec.threads) await conn.run(`SET GLOBAL threads = ${Math.max(1, Math.floor(spec.threads))}`);
+  if (spec.optimizer === false) await conn.run("PRAGMA disable_optimizer");
   await conn.run(`SET allowed_directories = [${dirs.map(sqlString).join(", ")}]`);
   await conn.run("SET enable_external_access = false");
   await conn.run("SET lock_configuration = true");

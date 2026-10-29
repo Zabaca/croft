@@ -112,7 +112,7 @@ describe("QueryWorker", () => {
     await Bun.sleep(100);
     w.interrupt(1);
     expect(await rejection(slow)).toBeInstanceOf(WorkerStopped);
-    const stuck = w.query(2, { sql: "SELECT list_reduce(range(n), (a, b) -> a + b) AS x FROM p", params: [], limit: 10, maxRows: 100, maxBytes: 1 << 20 });
+    const stuck = w.query(2, { sql: "SELECT list_reduce(range(n), lambda a, b: a + b) AS x FROM p", params: [], limit: 10, maxRows: 100, maxBytes: 1 << 20 });
     await Bun.sleep(100);
     const start = Date.now();
     await w.kill();

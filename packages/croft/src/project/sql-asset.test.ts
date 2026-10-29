@@ -6,7 +6,8 @@ import { dirname, join } from "node:path";
 import type { Problem } from "../core/types.ts";
 import { openMemory } from "../db/connect.ts";
 import { assertOneSelect } from "../sql/gate.ts";
-import { lexSql, type LoadedSqlAsset, loadSqlAsset, parseSqlHeader, sqlFingerprint, type SqlHeader } from "./sql-asset.ts";
+import { lexSql } from "../sql/lex.ts";
+import { type LoadedSqlAsset, loadSqlAsset, parseSqlHeader, sqlFingerprint, type SqlHeader } from "./sql-asset.ts";
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), "croft-sql-asset-")));
 let db: Awaited<ReturnType<typeof openMemory>>;
@@ -409,6 +410,19 @@ describe("sqlFingerprint", () => {
     for (let i = 0; i < changed.length; i++) expect([changed[i], hashes[i]]).not.toEqual([changed[i], h]);
     expect(new Set(hashes).size).toBe(changed.length);
     expect(await hash(BASE, "America/Los_Angeles")).not.toBe(h);
+  });
+
+  test("sourceHash is the text as written: any edit changes it, the parse tree does not enter it", async () => {
+    const source = async (text: string, tz = "UTC") => (await load(text, { timezone: tz })).sourceHash;
+    const h = await source(BASE);
+    expect(h).toMatch(/^[0-9a-f]{64}$/);
+    expect(await source(BASE)).toBe(h);
+    for (const other of [`${BASE} `, BASE.replace("SELECT", "select"), BASE.replace("'pro'", "'basic'"), BASE.replace("-- key: id", "-- key: id, product")]) {
+      expect([other, await source(other)]).not.toEqual([other, h]);
+    }
+    expect(await source(BASE, "America/Los_Angeles")).not.toBe(h);
+    // A body that does not parse still has one.
+    expect(await source("SELEC 1")).toMatch(/^[0-9a-f]{64}$/);
   });
 
   test("integers beyond 2^53 stay exact", async () => {
