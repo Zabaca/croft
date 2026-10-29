@@ -110,7 +110,9 @@ export const TABLE_SCAN_MS = 400;
 
 export function defaultDeps(env: Record<string, string | undefined>): DoctorDeps {
   return {
-    bunVersion: Bun.version,
+    // CROFT_BUN_VERSION (tests): the Bun the check sees. CI also runs the newest Bun, which may be newer than
+    // BUN_TESTED; a test of the other checks pins it so a Bun release does not fail it.
+    bunVersion: env.CROFT_BUN_VERSION?.trim() || Bun.version,
     platform: process.platform,
     arch: process.arch,
     croftRoot: SELF_ROOT,

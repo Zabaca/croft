@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { Server } from "bun";
 import { test } from "bun:test";
+import { BUN_FLOOR } from "../../src/cli/version.ts";
 
 /** packages/croft */
 export const PKG = resolve(import.meta.dir, "../..");
@@ -61,6 +62,9 @@ export function baseEnv(extra: Record<string, string> = {}): Record<string, stri
     // The tripwires of tests/preload.ts: no journey installs OS jobs or shows notifications.
     CROFT_FORBID_OS_JOBS: "1",
     CROFT_NOTIFY_DRY: "1",
+    // doctor's Bun line: CI runs the newest Bun too, which may be newer than croft's BUN_TESTED (BUN_UNTESTED).
+    // A journey about the other checks must not fail on a Bun release; the Bun line has unit tests of its own.
+    CROFT_BUN_VERSION: BUN_FLOOR,
     ...extra,
   };
 }
