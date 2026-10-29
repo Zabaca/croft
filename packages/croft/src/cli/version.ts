@@ -8,7 +8,7 @@ export const BUN_FLOOR: string = pkg.engines.bun.replace(/^>=\s*/, "");
 /** The newest Bun this croft version was tested on in CI. CI bumps it when bun@latest passes. A newer Bun
  *  is BUN_UNTESTED, a warning in croft doctor, not an error: parse behavior has changed between Bun
  *  versions before [V]. */
-export const BUN_TESTED = "1.4.3";
+export const BUN_TESTED = "1.4.4";
 
 /** True when version `have` (e.g. "1.3.14", "1.4.0-canary.2") is at least `floor`. */
 export function versionAtLeast(have: string, floor: string): boolean {
