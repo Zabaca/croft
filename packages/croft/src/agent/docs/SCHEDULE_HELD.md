@@ -7,6 +7,10 @@ A file that no longer loads is held too, until it is fixed and run. When croft.j
 (croft docs secrets) that is new or changed since a person last ran an asset that reads secrets, every asset that
 reads secrets is held, since its run would run that command; a run by hand of any one of them releases them all.
 
+A new DuckDB holds nothing: after croft 0.4's upgrade to DuckDB 2.0 every SQL asset's code hash is new, but an asset
+whose file is the one a person ran keeps its approval. The scheduler rebuilds it once and approves the new hash. An
+asset edited since it was last run by hand is held as always.
+
 What to do: check the change, then run it by hand once.
 
 - croft validate --json, then croft preview <asset>: read columns, checks, diff and samples. A preview that

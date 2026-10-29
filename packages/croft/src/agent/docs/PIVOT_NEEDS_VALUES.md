@@ -1,8 +1,9 @@
 # PIVOT_NEEDS_VALUES: a PIVOT that does not list its values
 
 PIVOT example_sales ON region USING sum(amount) makes one column per distinct region, so its columns depend on
-the data: DuckDB runs it as two statements, one to find the values and one to pivot. croft could neither check
-it, nor bind it, nor know the table's columns before it runs, so a PIVOT in an SQL asset lists its values.
+the data: DuckDB looks the values up first, and cannot describe the statement before it runs. croft could neither
+check it, nor bind it, nor know the table's columns, so a PIVOT in an SQL asset lists its values. In croft query
+the same PIVOT is QUERY_NOT_SELECT, with the same fix in its hint.
 
 What to do, either way:
 - List the values the pivot makes columns of:

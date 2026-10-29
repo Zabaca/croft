@@ -6,8 +6,14 @@ project, a global croft, or a teammate's machine ran a newer croft on the same f
 a newer format safely, so croft refuses (retryable is false). The message names both versions (details.formatVersion,
 details.croftVersion, details.duckdbVersion).
 
+details.kind "storage" means DuckDB itself refused the file: a newer DuckDB made it (croft 0.4 runs DuckDB 2.0,
+croft 0.3 ran 1.5.5). details.backup names the newest backup croft made before the upgrade, the warehouse as the
+older DuckDB left it.
+
 Nothing was opened for writing, and nothing was changed.
 
 What to do: use the newer croft, never an older one, on these files. The project pins croft in package.json; ask
 the user to upgrade it there (bun add @zabaca/croft@latest in the project), then croft doctor. croft keeps a backup
-before a newer DuckDB first writes a warehouse (.croft/backups/), so going forward is safe; going back is not.
+before a newer DuckDB first writes a warehouse (.croft/backups/), so going forward is safe; going back is not. To
+go back anyway, ask the user: croft doctor names the backup, and croft 0.3 also refuses runs.sqlite once croft 0.4
+has opened the project.
