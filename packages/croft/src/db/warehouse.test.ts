@@ -571,8 +571,14 @@ describe("aborting a wait (Ctrl-C)", () => {
     const ac = new AbortController();
     let ran = false;
     let finish!: () => void;
-    const holding = w.write("first", () => new Promise<void>((r) => (finish = r)), { runId: "r" });
-    await sleep(50);
+    // The first write's body has started (it holds the lease) before the second is queued, however slow the open.
+    let started!: () => void;
+    const inside = new Promise<void>((r) => (started = r));
+    const holding = w.write("first", () => new Promise<void>((r) => {
+      finish = r;
+      started();
+    }), { runId: "r" });
+    await inside;
     const queued = rejection(w.write("second", async () => {
       ran = true;
     }, { runId: "r", signal: ac.signal }));
