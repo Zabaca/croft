@@ -16,6 +16,9 @@ writes (croft run <asset>).
 - Open warehouse.read.duckdb in the GUI, never warehouse.duckdb. A GUI holding the copy never blocks a run.
 - A GUI keeps seeing the copy it opened; reopen it (or reconnect) to see the newest data.
 - The copy is replaced at every refresh: anything written into it is lost, so treat it as read-only.
+- The copy is in the format of croft's DuckDB (2.0 since croft 0.4). A file croft 0.4 creates opens only in DuckDB
+  2.0 or newer: use a GUI or notebook on DuckDB 2.0. Apps read through @zabaca/croft/read from the project's own
+  croft (its pinned version), never from another croft or DuckDB.
 - A relocated project (a synced folder) keeps the copy next to its database, at the path croft.json's database
   names with .read.duckdb.
 - croft serve answers from it while a run writes, marked stale: true with asOf, the time of the copy.

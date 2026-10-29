@@ -2,7 +2,15 @@
 
 croft status and croft context report an asset whose code changed since its last run: its file, the lib/ code
 it imports, or croft.json's timezone. Whitespace and comments do not count. Its table still holds what the
-older code made. What the next run does depends on the kind of asset:
+older code made.
+
+A new DuckDB alone is not an edit. An SQL asset's code hash is a hash of DuckDB's parse tree, so croft 0.4's
+upgrade to DuckDB 2.0 gave every SQL asset a new one. When the file is the one that was built, the next run rebuilds
+it once ("DuckDB upgraded (1.5.5 → 2.0.0)") and this warning does not appear. A build croft 0.3 recorded counts as
+unedited only when the file is not newer than that build: one checked out again since (git sets the file's time)
+reads as edited, and the next run rebuilds it all the same.
+
+What the next run does depends on the kind of asset:
 
 - An SQL asset or a full-refresh TypeScript transform: the next run rebuilds the whole table with the new code.
   croft run <asset>.

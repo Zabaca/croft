@@ -1,6 +1,6 @@
 {
   "name": "@zabaca/croft",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "The whole data pipeline, in TypeScript: ingest APIs and files, transform with SQL or TypeScript, keep DuckDB tables fresh, and read them from your app.",
   "keywords": ["data-pipeline", "etl", "elt", "duckdb", "typescript", "bun", "ingest", "transform", "scheduler", "claude-code"],
   "homepage": "https://croft.zabaca.com",
