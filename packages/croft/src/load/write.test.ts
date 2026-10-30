@@ -8,7 +8,7 @@ import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/war
 import type { BatchCursor, TypedBatch, WriteTarget } from "./contract.ts";
 import { quoteIdent, readTableSchema } from "./evolve.ts";
 import { tableBatch } from "./table-batch.ts";
-import { type WriteBatchInput, type WriteResult, writeBatch } from "./write.ts";
+import { FALLBACK, type WriteBatchInput, type WriteResult, writeBatch } from "./write.ts";
 
 afterAll(() => closeAllWarehouses());
 
@@ -89,6 +89,15 @@ async function makeBatch(tx: Sql, asset: string, spec: BatchSpec): Promise<Typed
     temp, columns: plans, rows: spec.rows.length, warnings: spec.warnings ?? [],
     cursor: spec.cursor ? { ...spec.cursor, rawTextColumn: rawCol! } : undefined,
   };
+}
+
+/** A typed batch from a SELECT, for batches too large to insert row by row: tableBatch's plans, without one for
+ *  FALLBACK (files.ts adds that column without a plan). */
+async function sqlBatch(tx: Sql, asset: string, select: string): Promise<TypedBatch> {
+  const temp = `batch_${++batchSeq}`;
+  await tx.exec(`CREATE TEMP TABLE ${quoteIdent(temp)} AS SELECT *, row_number() OVER () AS _croft_seq FROM (${select})`);
+  const batch = await tableBatch(tx, { temp, asset });
+  return { ...batch, columns: batch.columns.filter((p) => p.column !== FALLBACK) };
 }
 
 interface LoadOptions extends Omit<WriteBatchInput, "batch" | "target"> {
@@ -449,6 +458,27 @@ describe("replace of files", () => {
     expect(r2.rows).toEqual({ in: 1, added: 0, updated: 1, unchanged: 0, deleted: 0, total: 4 });
     expect(await read(w, `SELECT count(*)::INTEGER AS n FROM sales WHERE order_id = 7`)).toEqual([{ n: 0 }]);
     expect((await read<{ column_name: string }>(w, `DESCRIBE sales`)).map((c) => c.column_name)).not.toContain("_croft_fallback");
+  });
+
+  test("keyed: a reloaded file left with no rows hands its keys to fallback rows, beyond one row group too", async () => {
+    // The write's source table is created in its transaction with the fallback rows, never created empty and then
+    // given them: DuckDB 2.0.0 can read such a table as empty past one row group (duckdb/duckdb#28158), and an
+    // empty source here would delete every row. (The empty CREATE this replaced deduplicated with a window
+    // function, which kept it clear of that bug on 2.0.0 [V], so this test guards the path rather than repro it.)
+    const w = warehouse();
+    const N = 200_000;
+    const rows = (file: string, times: number, fallback?: boolean) =>
+      `SELECT range AS order_id, range::DOUBLE * ${times} AS amount, '${file}' AS _file${fallback === undefined ? "" : `, ${fallback} AS _croft_fallback`} FROM range(${N})`;
+    const write = (select: string, replaceFiles: string[], now: string) => w.write("sales", async (tx) => {
+      const batch = await sqlBatch(tx, "sales", select);
+      return writeBatch(tx, { batch, target: { asset: "sales", write: "merge", key: ["order_id"], runId: `r_${now}`, replaceFiles }, now });
+    }, { runId: `r_${now}` });
+    await write(rows("b.csv", 1), ["b.csv"], T0);
+    await write(rows("a.csv", 2), ["a.csv"], T1);
+    // a.csv is re-exported empty; b.csv, unchanged, is read along for its rows.
+    const r = await write(rows("b.csv", 1, true), ["a.csv"], T2);
+    expect(r.rows).toEqual({ in: 0, added: 0, updated: N, unchanged: 0, deleted: 0, total: N });
+    expect(await read(w, `SELECT count(*) AS n, count(*) FILTER (WHERE _file = 'b.csv' AND amount = order_id) AS b FROM sales`)).toEqual([{ n: N, b: N }]);
   });
 
   test("a reload of a new file with an empty file list deletes nothing", async () => {

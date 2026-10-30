@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
+import { checksHook } from "../checks/run.ts";
 import { CroftError, problem } from "../core/errors.ts";
-import type { AssetKind, Problem } from "../core/types.ts";
+import type { AssetKind, Check, Problem } from "../core/types.ts";
 import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/warehouse.ts";
 import { getCatalog, readCatalogEntry } from "../history/catalog.ts";
 import { openLog } from "../history/logs.ts";
@@ -418,4 +419,64 @@ describe("runSqlStep failures", () => {
     expect(err.code).toBe("INTERRUPTED");
     expect(await columns(e, "x")).toEqual([]);
   });
+});
+
+// DuckDB 2.0.0 read a table created empty in a transaction and then given more than one row group (122,880 rows)
+// from a TEMP table as empty, to joins and ungrouped aggregates, until a reopen (duckdb/duckdb#28158). croft
+// created a SQL transform's table that way, so the row count it recorded was 0 (and the next write, in a new
+// process, an OUT_OF_BAND_CHANGE), its checks passed on no rows, and the SQL downstream in the same run read
+// nothing. A table is now created with its rows (load/write.ts "SQL transforms"); 1,000 rows is one row group.
+describe("a SQL transform's table, new or recreated, holds its rows for everything that reads it", () => {
+  const rule = (sql: string): Check => ({ source: sql, kind: "rule", blocking: true, scope: "batch", sql, reads: [] });
+  const checks = (sql: string) => checksHook([rule(sql)], { file: "assets/stg.sql", previous: null });
+  const T4 = "2026-09-22T14:00:00.000000Z";
+  const T5 = "2026-09-22T15:00:00.000000Z";
+
+  for (const n of [1_000, 200_000]) {
+    test(`${n.toLocaleString("en-US")} rows: the row count, the blocking checks, the SQL downstream and the next write see them all`, async () => {
+      const e = setup();
+      await seed(e, "src", `SELECT range AS id, DATE '2026-01-01' + (range % 30)::INTEGER AS day, range % 7 AS cost FROM range(${n})`, { now: T0, key: ["id"] });
+      const total = Array.from({ length: n }, (_, i) => i % 7).reduce((a, b) => a + b, 0);
+      const sixes = Array.from({ length: n }, (_, i) => i % 7).filter((c) => c === 6).length;
+      const stg = (extra = "") => sqlStep("stg", `SELECT id, day, cost, {'day': day, 'cost': cost} AS detail${extra} FROM src`, { key: ["id"], inputs: ["src"] });
+      const mart = sqlStep("mart", "SELECT count(*) AS n, sum(cost) AS total FROM stg", { inputs: ["stg"] });
+      const rowCount = async () => (await read<{ n: number | bigint }>(e, `SELECT row_count AS n FROM _croft.assets WHERE name = 'stg'`)).map((r) => Number(r.n));
+      const oob = (out: StepOutcome) => out.warnings.filter((w) => w.code === "OUT_OF_BAND_CHANGE");
+
+      // First build: a check that fails on some rows fails, and nothing is written.
+      const refused = await failure(run(e, stg(), { at: T1, checks: checks("cost < 6") }));
+      expect(refused.code).toBe("CHECK_FAILED");
+      expect(refused.problem.details).toMatchObject({ check: "cost < 6", failing: sixes, checked: n });
+      expect(await columns(e, "stg")).toEqual([]);
+      const first = await run(e, stg(), { at: T1, checks: checks("cost <= 6") });
+      expect(first.result.rows).toEqual({ in: n, added: n, updated: 0, unchanged: 0, deleted: 0, total: n });
+      expect(first.result.checks).toEqual([expect.objectContaining({ check: "cost <= 6", ok: true, failing: 0 })]);
+      expect(await rowCount()).toEqual([n]);
+      expect(await columns(e, "stg")).toEqual(["id", "day", "cost", "detail", "_loaded_at"]);
+      // The SQL downstream, in the same process as the write.
+      await run(e, mart, { at: T2 });
+      expect(await read(e, "SELECT n, total::BIGINT AS total FROM mart")).toEqual([{ n, total }]);
+
+      // A recreate (a column added), in a new process as the next run is: the same, and no out-of-band change.
+      await e.warehouse.close();
+      const refused2 = await failure(run(e, stg(", cost * 2 AS twice"), { at: T3, checks: checks("cost < 6") }));
+      expect(refused2.problem.details).toMatchObject({ check: "cost < 6", failing: sixes, checked: n });
+      expect(await columns(e, "stg")).toEqual(["id", "day", "cost", "detail", "_loaded_at"]);
+      const recreated = await run(e, stg(", cost * 2 AS twice"), { at: T3, checks: checks("cost <= 6") });
+      expect(recreated.result.schemaChanges).toEqual([{ kind: "recreate", reason: "shape_changed" }]);
+      expect(recreated.result.rows).toEqual({ in: n, added: n, updated: 0, unchanged: 0, deleted: n, total: n });
+      expect(oob(recreated)).toEqual([]);
+      expect(await rowCount()).toEqual([n]);
+      expect(await read(e, "SELECT count(*) AS n, sum(twice)::BIGINT AS t, count(*) FILTER (WHERE detail.cost = cost) AS s FROM stg")).toEqual([{ n, t: 2 * total, s: n }]);
+      expect(new Set(Object.values(await stamps(e, "stg")))).toEqual(new Set([T3]));
+      await run(e, mart, { at: T4 });
+      expect(await read(e, "SELECT n, total::BIGINT AS total FROM mart")).toEqual([{ n, total }]);
+
+      // The next write after the recreate, in a new process again: a diff into the table, unchanged.
+      await e.warehouse.close();
+      const again = await run(e, stg(", cost * 2 AS twice"), { at: T5 });
+      expect(again.result.rows).toEqual({ in: n, added: 0, updated: 0, unchanged: n, deleted: 0, total: n });
+      expect(oob(again)).toEqual([]);
+    });
+  }
 });
