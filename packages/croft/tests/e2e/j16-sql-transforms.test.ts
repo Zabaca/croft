@@ -20,7 +20,7 @@
 //   up to date by then.
 // Product bugs found on the way are bugTest()s at the bottom.
 import { afterAll, expect, test } from "bun:test";
-import { bugTest, cleanupAll, type Envelope, initProject, ISO_WITH_OFFSET, type Project, RUN_ID, show } from "./harness.ts";
+import { bugTest, cleanupAll, codes, type Envelope, initProject, ISO_WITH_OFFSET, type Project, RUN_ID, show } from "./harness.ts";
 
 afterAll(cleanupAll);
 
@@ -496,3 +496,48 @@ test("journey 16i: a failed step's sample rows are indented under the step in hu
   expect(sampleLines.length, show(r)).toBeGreaterThan(0);
   for (const l of sampleLines) expect(l, show(r)).toMatch(/^ {9,}/);
 }, 60_000);
+
+// Fixed (DuckDB 2.0.0, duckdb/duckdb#28158): croft created a SQL transform's table empty (CREATE ... AS SELECT ...
+// LIMIT 0) and then inserted its rows, in one transaction. Past one row group (122,880 rows), DuckDB 2.0.0 read
+// such a table as empty until it was reopened: the first `croft run src` left mart at 0 rows and a NULL total,
+// recorded stg's row count as 0, and the next run reported OUT_OF_BAND_CHANGE on stg.
+test("journey 16j: a SQL transform of 200,000 rows is whole for the SQL downstream, the catalog and the next run", async () => {
+  const { project: p } = await initProject();
+  p.write("assets/src.ts", `import { ingest } from "@zabaca/croft";
+
+export default ingest({
+  key: "id",
+  async *rows() {
+    for (let start = 0; start < 200_000; start += 10_000) {
+      yield Array.from({ length: 10_000 }, (_, k) => ({ id: start + k, day: \`2026-01-\${String(1 + ((start + k) % 28)).padStart(2, "0")}\`, cost: (start + k) % 7 }));
+    }
+  },
+});
+`);
+  p.write("assets/stg.sql", "-- key: id\nselect id, day, cost from src\n");
+  p.write("assets/mart.sql", "select count(*) as n, sum(cost) as total from stg\n");
+  const mart = () => p.rows("select n, total::BIGINT AS total from mart");
+  const rowCount = async () => (await p.rows("select row_count from _croft.assets where name = 'stg'"))[0]!.row_count;
+
+  const first = await p.json(["run", "src"]);
+  expect(first.code, show(first)).toBe(0);
+  expect(statusOf(first.json)).toEqual({ src: "ok", stg: "ok", mart: "ok" });
+  expect(stepOf(first.json, "stg").rows).toMatchObject({ in: 200_000, added: 200_000, total: 200_000 });
+  expect(await mart()).toEqual([{ n: 200_000, total: 599_994 }]);
+  expect(await rowCount()).toBe(200_000);
+
+  // A recreate (a STRUCT column added), in a new process: no out-of-band change, and the same rows.
+  p.write("assets/stg.sql", "-- key: id\nselect id, day, cost, {'day': day, 'cost': cost} as detail from src\n");
+  const second = await p.json(["run"]);
+  expect(second.code, show(second)).toBe(0);
+  expect(stepOf(second.json, "stg")).toMatchObject({ schemaChanges: [{ kind: "recreate", reason: "shape_changed" }], rows: { added: 200_000, deleted: 200_000, total: 200_000 } });
+  expect(codes(second.json)).not.toContain("OUT_OF_BAND_CHANGE");
+  expect(await rowCount()).toBe(200_000);
+
+  // The next write after the recreate: a diff, with nothing out of band either.
+  p.write("assets/stg.sql", "-- key: id\n-- a comment: the SQL changed, its output did not\nselect id, day, cost, {'day': day, 'cost': cost} as detail from src\n");
+  const third = await p.json(["run", "stg"]);
+  expect(third.code, show(third)).toBe(0);
+  expect(stepOf(third.json, "stg").rows).toMatchObject({ unchanged: 200_000, total: 200_000 });
+  expect(codes(third.json)).not.toContain("OUT_OF_BAND_CHANGE");
+}, 180_000);

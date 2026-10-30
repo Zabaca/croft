@@ -19,6 +19,7 @@
 //                merge:   MERGE with an unchanged-row skip; columns absent from the batch keep their values
 //                replaceFiles: the same diff, restricted to the rows of the reloaded files; with a key, see
 //                "Overlapping files" below
+//                a SQL transform's new or recreated table: one CREATE OR REPLACE ... AS SELECT of its rows
 //   checks       caller's blocking checks; a throw rolls the whole transaction back
 //   state        cursor, _croft.assets, _croft.columns, _croft.writes (with the step attempt) and, for
 //                transforms, _croft.inputs (positions) in the same transaction
@@ -39,11 +40,16 @@
 //
 // SQL transforms (kind "sql", DESIGN.md §5 "Transforms", §7 "SQL transforms"). The SELECT defines the table's
 // shape: its data columns, in order, with the types it gave them (table-batch.ts). The same shape is diffed
-// like any replace; any other shape (a column added, removed, retyped, renamed or moved) recreates the table in
-// one CREATE OR REPLACE ... AS SELECT ... LIMIT 0 (which keeps STRUCT, MAP and other types no pin could spell,
-// and rolls back cleanly [V]), so every row gets the new stamp, and the write reports SchemaChange "recreate".
-// Nothing about the old shape is a drift warning: dropping a column is the SQL's decision. A column's type
-// comes from the SQL, so it is never pending.
+// like any replace. No table, or any other shape (a column added, removed, retyped, renamed or moved), creates
+// the table with its rows in one CREATE OR REPLACE ... AS SELECT <columns>, <stamp> AS _loaded_at FROM <source>
+// ORDER BY _croft_seq (which keeps STRUCT, MAP and other types no pin could spell, and rolls back cleanly [V]),
+// so every row gets the new stamp, and a recreate reports SchemaChange "recreate". It is never an empty CREATE
+// (LIMIT 0) followed by an INSERT: on DuckDB 2.0.0, a table an empty CREATE ... AS SELECT made in a transaction,
+// then given more than one row group (122,880 rows) from a TEMP table, reads as empty to joins and to ungrouped
+// aggregates other than a bare count(*), until a CHECKPOINT or a reopen, so the row count croft recorded, the
+// checks and the downstream SQL of the same run saw no rows [V: 2.0.0, duckdb/duckdb#28158]. Nothing about the
+// old shape is a drift warning: dropping a column is the SQL's decision. A column's type comes from the SQL, so it
+// is never pending.
 //
 // Transform keys. A key is what a transform says identifies a row, and its implied unique(key) is a check: a
 // duplicate key in a SQL or TS transform's batch fails CHECK_FAILED with samples before anything is written.
@@ -237,10 +243,12 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
 
   let evo: EvolveResult;
   let recreated = false;
+  // A SQL transform whose table is created (or recreated) below with its rows, rather than written by apply().
+  let createWithRows = false;
   let pinned: AppliedPins | null = null;
   if (kind === "sql") {
-    // The SELECT defines the table: create it, keep it, or recreate it with the new shape (DDL, before any DML).
-    ({ evo, recreated } = await sqlShape(tx, { ref, db, asset, temp: batch.temp, plans: batch.columns, existed: before.exists }));
+    // The SELECT defines the table: keep it, or create or recreate it with the new shape (with its rows, below).
+    ({ evo, recreated, create: createWithRows } = await sqlShape(tx, { db, asset, temp: batch.temp, plans: batch.columns, existed: before.exists }));
   } else {
     // Drift that needs the table as it was.
     if (before.exists && before.rowCount > 0 && rowsIn >= 100) {
@@ -284,9 +292,15 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
 
   const stampUs = await nextStamp(tx, asset, state, before, input.now);
   const stamp = isoMicros(stampUs);
-  const counts = await apply(tx, { ref, src, n, dataCols, present, target, srcRows, fallbacks, rowsBefore: recreated ? 0 : before.rowCount, stamp });
-  // A recreated table starts empty: every earlier row is gone, and every row of the batch is new.
-  if (recreated) counts.deleted = before.rowCount;
+  let counts: Counts;
+  if (createWithRows) {
+    // A new or recreated table holds only the batch: every row is added, and every earlier row is gone.
+    counts = await createTableWithRows(tx, { ref, src, dataCols, srcRows, stamp });
+    if (recreated) counts.deleted = before.rowCount;
+    evo.columns = (await readTableSchema(tx, asset, db))!;
+  } else {
+    counts = await apply(tx, { ref, src, n, dataCols, present, target, srcRows, fallbacks, rowsBefore: before.rowCount, stamp });
+  }
 
   const after = await tableStats(tx, asset, db);
   const rows = { in: rowsIn, ...counts, total: after.rowCount };
@@ -460,11 +474,12 @@ async function rawColumns(tx: Sql, database: string, table: string): Promise<Rea
 
 /**
  * A SQL transform's table takes the shape of its SELECT: the batch's data columns (those with a plan), in batch
- * order, with their exact types. The same shape keeps the table; none creates it, any other recreates it. Both
- * copy the batch's column definitions (LIMIT 0) and add _loaded_at, so no type is spelled out as text.
+ * order, with their exact types, then _loaded_at. The same shape keeps the table; none creates it, any other
+ * recreates it. Nothing is written here: `create` says the table is to be created with its rows
+ * (createTableWithRows), and until then evo.columns are the batch's columns as the table will have them.
  */
-async function sqlShape(tx: Sql, o: { ref: string; db: string; asset: string; temp: string; plans: ColumnPlan[]; existed: boolean }):
-  Promise<{ evo: EvolveResult; recreated: boolean }> {
+async function sqlShape(tx: Sql, o: { db: string; asset: string; temp: string; plans: ColumnPlan[]; existed: boolean }):
+  Promise<{ evo: EvolveResult; recreated: boolean; create: boolean }> {
   const want = (await rawColumns(tx, "temp", o.temp)).filter((c) => !isReservedColumn(c.name) && o.plans.some((p) => sameName(p.column, c.name)));
   if (o.existed) {
     // Exactly the columns a create would make: the SELECT's, then _loaded_at (a stray _file, or a _loaded_at
@@ -473,14 +488,26 @@ async function sqlShape(tx: Sql, o: { ref: string; db: string; asset: string; te
     const stamp = have.at(-1);
     const same = have.length === want.length + 1 && stamp?.name === RESERVED.loadedAt && normalizeType(stamp.type) === "TIMESTAMPTZ"
       && want.every((c, k) => c.name === have[k]!.name && c.type === have[k]!.type);
-    if (same) return { evo: { created: false, changes: [], columns: (await readTableSchema(tx, o.asset, o.db))! }, recreated: false };
+    if (same) return { evo: { created: false, changes: [], columns: (await readTableSchema(tx, o.asset, o.db))! }, recreated: false, create: false };
   }
-  await tx.exec(`CREATE OR REPLACE TABLE ${o.ref} AS SELECT ${[...want.map((c) => quoteIdent(c.name)), `CAST(NULL AS TIMESTAMPTZ) AS ${quoteIdent(RESERVED.loadedAt)}`].join(", ")}
-    FROM ${tempRef(o.temp)} LIMIT 0`);
-  const columns = (await readTableSchema(tx, o.asset, o.db))!;
+  const batchCols = (await readTableSchema(tx, o.temp, "temp"))!;
+  const columns = [...want.map((c) => batchCols.find((b) => b.name === c.name)!), { name: RESERVED.loadedAt, type: "TIMESTAMPTZ" }];
   return o.existed
-    ? { evo: { created: false, changes: [{ kind: "recreate", reason: "shape_changed" }], columns }, recreated: true }
-    : { evo: { created: true, changes: [], columns }, recreated: false };
+    ? { evo: { created: false, changes: [{ kind: "recreate", reason: "shape_changed" }], columns }, recreated: true, create: true }
+    : { evo: { created: true, changes: [], columns }, recreated: false, create: true };
+}
+
+/**
+ * Create (or replace) a SQL transform's table with its rows in one statement: the source's data columns in
+ * order, each row stamped, inserted in _croft_seq order. The SELECT gives every type, so none is spelled out as
+ * text; never an empty CREATE then an INSERT ("SQL transforms" above).
+ */
+async function createTableWithRows(tx: Sql, o: { ref: string; src: string; dataCols: RealColumn[]; srcRows: number; stamp: string }): Promise<Counts> {
+  await tx.exec(
+    `CREATE OR REPLACE TABLE ${o.ref} AS SELECT ${o.dataCols.length ? `${cols(o.dataCols)}, ` : ""}$1::TIMESTAMPTZ AS ${quoteIdent(RESERVED.loadedAt)}
+     FROM ${tempRef(o.src)} ORDER BY ${quoteIdent(RESERVED.seq)}`,
+    [o.stamp]);
+  return { added: o.srcRows, updated: 0, unchanged: 0, deleted: 0 };
 }
 
 /** Non-reserved columns set in ≥95% of earlier rows and absent from a whole batch of ≥100 rows. */
@@ -597,26 +624,31 @@ async function buildSource(tx: Sql, o: SourceInput): Promise<{ rows: number; fal
   const fileCol = o.dataCols.find((c) => sameName(c.name, RESERVED.file))?.name;
   const withFallback = Boolean(fb && keyed && fileCol && o.replaceFiles?.length);
   const flag = quoteIdent(FALLBACK);
-  await tx.exec(`CREATE OR REPLACE TEMP TABLE ${quoteIdent(o.src)} AS ${withFallback ? `SELECT *, false AS ${flag} FROM (${sql})` : sql}`);
-  let fallbacks = 0;
-  if (withFallback) {
-    const on = (l: string, r: string) => o.key.map((k) => `${l}.${quoteIdent(k)} = ${r}.${quoteIdent(k)}`).join(" AND ");
-    const file = quoteIdent(fileCol!);
-    // One candidate per key whose row belongs to a reloaded file and that no loaded row has: the most recently
-    // loaded file that has it, then the last in read order.
-    const [row] = await tx.all<{ Count: number | bigint }>(
-      `INSERT INTO ${tempRef(o.src)} BY NAME
-       SELECT * EXCLUDE (__croft_at), true AS ${flag} FROM (
-         SELECT a.*, f.loaded_at AS __croft_at FROM (${aligned(fb)}) AS a
-         LEFT JOIN _croft.files AS f ON f.asset = $1 AND f.path = a.${file}
-         WHERE EXISTS (SELECT 1 FROM ${o.ref} AS t WHERE ${on("t", "a")} AND t.${file} IN (${o.replaceFiles!.map(quoteLiteral).join(", ")}))
-           AND NOT EXISTS (SELECT 1 FROM ${tempRef(o.src)} AS s WHERE ${on("s", "a")})
-         QUALIFY row_number() OVER (PARTITION BY ${o.key.map((k) => `a.${quoteIdent(k)}`).join(", ")}
-           ORDER BY f.loaded_at DESC NULLS LAST, a.${quoteIdent(RESERVED.seq)} DESC) = 1)`, [o.asset]);
-    fallbacks = Number(row?.Count ?? 0);
+  if (!withFallback) {
+    await tx.exec(`CREATE OR REPLACE TEMP TABLE ${quoteIdent(o.src)} AS ${sql}`);
+    const [row] = await tx.all<{ n: number | bigint }>(`SELECT count(*) AS n FROM ${tempRef(o.src)}`);
+    return { rows: Number(row!.n), fallbacks: 0 };
   }
-  const [row] = await tx.all<{ n: number | bigint }>(`SELECT count(*) AS n FROM ${tempRef(o.src)}`);
-  return { rows: Number(row!.n), fallbacks };
+  const on = (l: string, r: string) => o.key.map((k) => `${l}.${quoteIdent(k)} = ${r}.${quoteIdent(k)}`).join(" AND ");
+  const file = quoteIdent(fileCol!);
+  // The loaded rows, plus one candidate per key whose row belongs to a reloaded file and that no loaded row has:
+  // the most recently loaded file that has it, then the last in read order. One CREATE, never an INSERT into a
+  // table this transaction created: the loaded rows may be none ("SQL transforms" above, duckdb/duckdb#28158).
+  await tx.exec(
+    `CREATE OR REPLACE TEMP TABLE ${quoteIdent(o.src)} AS
+     WITH __croft_loaded AS (${sql})
+     SELECT *, false AS ${flag} FROM __croft_loaded
+     UNION ALL BY NAME
+     SELECT * EXCLUDE (__croft_at), true AS ${flag} FROM (
+       SELECT a.*, f.loaded_at AS __croft_at FROM (${aligned(fb)}) AS a
+       LEFT JOIN _croft.files AS f ON f.asset = $1 AND f.path = a.${file}
+       WHERE EXISTS (SELECT 1 FROM ${o.ref} AS t WHERE ${on("t", "a")} AND t.${file} IN (${o.replaceFiles!.map(quoteLiteral).join(", ")}))
+         AND NOT EXISTS (SELECT 1 FROM __croft_loaded AS s WHERE ${on("s", "a")})
+       QUALIFY row_number() OVER (PARTITION BY ${o.key.map((k) => `a.${quoteIdent(k)}`).join(", ")}
+         ORDER BY f.loaded_at DESC NULLS LAST, a.${quoteIdent(RESERVED.seq)} DESC) = 1)`, [o.asset]);
+  const [row] = await tx.all<{ n: number | bigint; f: number | bigint }>(
+    `SELECT count(*) AS n, count(*) FILTER (WHERE ${flag}) AS f FROM ${tempRef(o.src)}`);
+  return { rows: Number(row!.n), fallbacks: Number(row!.f) };
 }
 
 /** greatest(now, last stamp + 1 µs) over every stamp croft knows for the table: last_loaded_at, the newest
