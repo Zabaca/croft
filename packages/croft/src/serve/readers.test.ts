@@ -59,11 +59,44 @@ describe("starting", () => {
     expect(statSync(p.project.paths.readCopy).mode & 0o222).toBe(0);
   });
 
-  withExt("without a copy yet it waits for the first run, and picks the copy up within a second", async () => {
+  withExt("with data already built and no copy, croft serve makes the copy itself, in a child, and answers a retryable 503 until then", async () => {
     const p = await project({ copy: false });
+    const made: boolean[] = [];
+    const e = await engine(p, { copyMaker: { onDone: (r) => made.push(r.ok) } });
+    // Start did not wait for the copy: until it exists a query is told to retry.
+    const first = await rejection(ask(e, "SELECT 1"));
+    if (e.status().serverMode?.state !== "open") {
+      expect(first.code).toBe("SERVE_UNAVAILABLE");
+      expect(first.problem.retryable).toBe(true);
+      expect(first.problem.details).toMatchObject({ reason: "making_copy" });
+    }
+    await until("the copy to be made and served", () => e.status().serverMode?.state === "open", 20_000);
+    expect(made).toEqual([true]);
+    expect(await count(e)).toBe(10);
+    expect(statSync(p.project.paths.readCopy).mode & 0o222).toBe(0);
+    expect(e.status().serverMode).toMatchObject({ makingCopy: false });
+    expect((await ask(e, "SELECT count(*) AS n FROM orders")).asOf).toMatch(/^\d{4}-/);
+    // Neither the server nor the child that made the copy holds the live file any more.
+    await seed(p.database, ["INSERT INTO orders VALUES (900, 0)"]);
+  });
+
+  withExt("with no warehouse yet there is no copy to make: DB_NOT_FOUND until a run makes both, and the copy is picked up within a second", async () => {
+    const p = await project({ copy: false });
+    const late = aside(p, "late"); // kept before the warehouse goes
+    rmSync(p.database);
     const e = await engine(p);
     expect((await rejection(ask(e, "SELECT 1"))).code).toBe("DB_NOT_FOUND");
     expect(e.status().serverMode?.state).toBe("waiting");
+    expect(e.status().serverMode?.makingCopy).toBe(false);
+    putCopy(p, late, "2026-10-30T10:00:00Z");
+    await until("the copy to be served", () => e.status().serverMode?.state === "open", 1500);
+    expect(await count(e)).toBe(10);
+  });
+
+  withExt("with the copy maker off, a missing copy is DB_NOT_FOUND and waits for a run", async () => {
+    const p = await project({ copy: false });
+    const e = await engine(p, { copyMaker: false });
+    expect((await rejection(ask(e, "SELECT 1"))).code).toBe("DB_NOT_FOUND");
     putCopy(p, aside(p, "late"), "2026-10-30T10:00:00Z");
     await until("the copy to be served", () => e.status().serverMode?.state === "open", 1500);
     expect(await count(e)).toBe(10);

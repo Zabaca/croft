@@ -19,8 +19,10 @@ turns server mode on is unchanged, and so is one that turns it off again.
 
 - The query envelope's data carries `asOf`, the read copy's time (the checkpoint it was taken at, in the project
   offset). It never carries `stale`: in server mode every answer is from the copy.
-- Before the first run that changes data there is no copy: queries are DB_NOT_FOUND, and croft serve picks the copy up
-  within a second of its appearing.
+- Before the first run that changes data a copy is made by croft serve itself, in a short-lived child process (it never
+  opens the warehouse itself): while it is made queries are a retryable 503 (reason making_copy), and then they are
+  answered. The same child repairs a copy that is behind or whose refresh failed; the old copy answers meanwhile. With no
+  warehouse yet queries are DB_NOT_FOUND until a run creates it.
 - `croft status` and `croft doctor` say the project is in server mode, the copy's as-of time, and whether croft serve is
   running. GET /health carries `serverMode: {state, asOf}`.
 - The app token reads every table of the project, as it always did. Keys for individual people, and DuckDB clients

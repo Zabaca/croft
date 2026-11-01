@@ -24,11 +24,11 @@
 // Queries wait for the replacement up to queueMs and then get a 503; a start that fails for a reason a retry will not fix
 // (a missing extension file, a copy from a newer croft) answers every query with that error until it is fixed.
 //
-// Before the first copy exists (no run has changed data yet) every query is DB_NOT_FOUND and the engine watches for it.
-// A refresh that cannot run (db/copy-policy.ts) leaves the copy where it was.
+// A copy that is missing, behind or failed is made by a child process (copy-maker.ts), not here: this engine never opens the
+// live file. Until a missing copy exists every query is a retryable 503 (DB_NOT_FOUND when there is no warehouse yet).
 //
 // Limits, admission, the deadline and the row and byte limits are the file engine's (queue.ts, worker.ts answer()).
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { formatInstant, now, zonedParts } from "../core/time.ts";
@@ -38,6 +38,7 @@ import { resolveExtensionDir } from "../db/extension-files.ts";
 import { assertSafeFilesystem, type FsProbe, realProbe } from "../db/fs-kind.ts";
 import { loadProject, type Project } from "../project/root.ts";
 import { mapQueryError } from "../read/select.ts";
+import { COPY_CHECK_MS, CopyMaker, type CopyMakerOptions } from "./copy-maker.ts";
 import { restartedError, secs, stopError } from "./errors.ts";
 import { SERVE_DEFAULTS } from "./instance.ts";
 import { Admission, type Flight, type StopReason } from "./queue.ts";
@@ -81,6 +82,9 @@ export interface ReadersEngineInternals {
   workerArgv?: string[];
   /** The wait before the next try after `attempts` failed starts; restartDelayMs by default. */
   restartDelayMs?: (attempts: number) => number;
+  /** Make the copy in a child process when it is missing, behind or failed (serve/copy-maker.ts); on by default. false
+   *  for a test of an engine that must see no copy appear by itself; an object overrides the maker's command and waits. */
+  copyMaker?: boolean | Omit<CopyMakerOptions, "project">;
 }
 
 /** The longest wait between starts: every try checks the pinned extension files again (about 66 MB hashed), so a start
@@ -148,6 +152,9 @@ class ReadersEngine implements ServeEngine {
   private blocked: CroftError | null = null;
   private transition: Promise<void> | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
+  /** Makes the read copy in a child process when it is missing, behind or failed; null when turned off. */
+  private readonly maker: CopyMaker | null;
+  private lastCopyCheck = 0;
   private stopped = false;
   private closing: Promise<void> | null = null;
   private attempts = 0;
@@ -170,6 +177,7 @@ class ReadersEngine implements ServeEngine {
     this.pollMs = o.copyPollMs ?? COPY_POLL_MS;
     this.argv = o.workerArgv;
     this.policy = o.policy;
+    this.maker = o.copyMaker === false ? null : new CopyMaker({ project, ...(typeof o.copyMaker === "object" ? o.copyMaker : {}) });
     this.delayOf = o.restartDelayMs ?? restartDelayMs;
     this.hooks = guarded(o.hooks ?? {});
     this.spec = { profile: "serve", timezone: project.timezone, root: project.root, stateDir: project.paths.stateDir, ...serveResources(), ...o.resources };
@@ -205,6 +213,9 @@ class ReadersEngine implements ServeEngine {
     this.timer = setInterval(() => this.tick(), this.pollMs);
     // The HTTP server keeps croft serve alive; the poll alone never should.
     (this.timer as { unref?: () => void }).unref?.();
+    // A copy that is missing, behind or failed is made now, in a child; start does not wait for it.
+    this.lastCopyCheck = Date.now();
+    this.maker?.check();
   }
 
   /** Set when the warehouse has grown past the copy limit since croft serve started (or the setting changed): refreshes
@@ -229,6 +240,7 @@ class ReadersEngine implements ServeEngine {
         asOf: this.asOf,
         workerPid: this.worker?.pid ?? null,
         swaps: this.swaps,
+        makingCopy: this.maker?.running ?? false,
         restarts: this.restarts,
         copyCost: this.copyCost(),
       },
@@ -296,6 +308,7 @@ class ReadersEngine implements ServeEngine {
       // No grace: the server is going away. Queries that interrupts cannot stop are ended with their process.
       for (const f of [...this.admission.active]) f.stop("stop");
       await this.admission.idle();
+      await this.maker?.stop();
       void this.opening?.kill(); // a start in progress fails and leaves the rest to us
       await this.transition;
       // The readers' process goes first: it is the only thing that holds the copy, and nothing outlives croft serve.
@@ -311,11 +324,17 @@ class ReadersEngine implements ServeEngine {
 
   /** On every poll. Starts at most one transition at a time; each re-checks when it ends. */
   private tick(): void {
-    if (this.stopped || this.transition) return;
+    if (this.stopped) return;
+    if (this.maker && Date.now() - this.lastCopyCheck >= COPY_CHECK_MS) {
+      this.lastCopyCheck = Date.now();
+      this.maker.check();
+    }
+    if (this.transition) return;
     const id = statIdentity(this.copyPath);
     if (!this.worker) {
       if (!id) {
-        if (this.blocked?.code !== "DB_NOT_FOUND") this.block(this.noCopy());
+        const err = this.noCopy();
+        if (this.blocked?.message !== err.message) this.block(err);
         return;
       }
       if (Date.now() < this.retryAt) return;
@@ -481,8 +500,24 @@ class ReadersEngine implements ServeEngine {
     return stopError(reason === "write" ? "stop" : reason, { queryTimeoutMs: this.queryTimeoutMs });
   }
 
-  /** No read copy yet: the first run that changes data makes it. */
+  /**
+   * No read copy yet. Where the warehouse exists, croft serve is making the copy in a child process (serve/copy-maker.ts)
+   * and the query is told to retry (a 503); with no warehouse yet, or the maker off, it is DB_NOT_FOUND until a run makes it.
+   */
   private noCopy(): CroftError {
+    if (this.maker && existsSync(this.project.paths.database)) {
+      const failed = this.maker.lastFailure;
+      return new CroftError("SERVE_UNAVAILABLE", {
+        message: failed
+          ? `the read copy ${this.project.paths.readCopy} does not exist yet, and the last try to make it failed: ${failed}`
+          : `the read copy ${this.project.paths.readCopy} does not exist yet; croft serve is making it from the warehouse`,
+        hint: failed
+          ? "retry after Retry-After; croft doctor and .croft/readcopy.log say what is wrong, and croft serve tries again"
+          : "retry after Retry-After: the copy is ready within seconds for a warehouse of ordinary size",
+        retryable: true,
+        details: { reason: "making_copy", retryAfterMs: SERVE_DEFAULTS.retryAfterMs, readCopy: this.project.paths.readCopy, serverMode: true },
+      });
+    }
     return new CroftError("DB_NOT_FOUND", {
       message: `the read copy ${this.project.paths.readCopy} does not exist yet; in server mode croft serve answers from it`,
       hint: "the copy is made at the end of every run that changes data; run an asset, and croft serve picks the copy up within a second",

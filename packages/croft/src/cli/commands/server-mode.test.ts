@@ -232,7 +232,7 @@ describe("the croft serve banner", () => {
 
   test("before the first copy it says the next run makes it", () => {
     const text = formatBanner({ ...base, serverMode: { readCopy: "warehouse.read.duckdb", asOf: null } }, "UTC");
-    expect(text).toContain("the read copy is not made yet: the next run that changes data makes it");
+    expect(text).toContain("the read copy is not made yet: croft serve is making it, and a run makes it too");
   });
 
   test("without server mode the banner is as it was", () => {

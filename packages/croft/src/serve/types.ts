@@ -101,6 +101,8 @@ export interface ServeEngineStatus {
     /** Set when each refresh is a full copy the project has not accepted (the warehouse grew past 1 GB where the
      *  filesystem cannot clone, D121); null otherwise. The server keeps answering, from a copy that keeps being refreshed. */
     copyCost: { code: string; message: string } | null;
+    /** A child process is making the read copy now (it was missing, behind or failed; serve/copy-maker.ts). */
+    makingCopy: boolean;
   };
 }
 

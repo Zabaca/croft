@@ -150,6 +150,42 @@ describe("journey 32: server mode", () => {
     expect(app(p).rows).toHaveLength(3);
   }, 180_000);
 
+  journey("data already built and no run to come: turn the mode on, start croft serve, and it makes the copy itself and answers", async () => {
+    api.route("/orders", () => json([{ id: 1, amount: 10 }, { id: 2, amount: 20 }]));
+    const { project: p } = await initProject();
+    p.remove("assets/example_sales.ts");
+    p.write("assets/orders.ts", ordersAsset(api.url));
+    const home = { env: { ...schedulerEnv(), CROFT_EXTENSION_DIR: ext.dir } };
+    expect((await p.json(["run"], home)).code).toBe(0);
+    const copy = join(p.root, "warehouse.read.duckdb");
+    expect(existsSync(copy)).toBe(false); // server mode and readCopy were off
+    p.edit("croft.json", '"timezone"', '"serverMode": { "enabled": true }, "timezone"');
+
+    const serve = p.start(["serve", "--port", "0"], home);
+    const file = join(p.stateDir, "serve.json");
+    await until(() => existsSync(file) || serve.proc.exitCode !== null, 30_000);
+    if (!existsSync(file)) throw new Error(`croft serve did not start\n${show(await serve.done)}`);
+    const rec = JSON.parse(readFileSync(file, "utf8")) as ServeRecord;
+    // It started without waiting for the copy. Until there is one a query is told to retry (503); then it is answered.
+    const ask = () => fetch(`${rec.url}/query`, {
+      method: "POST", headers: { Authorization: `Bearer ${rec.token}`, "Content-Type": "application/json" }, body: JSON.stringify({ sql: "select count(*) as n from orders" }),
+    });
+    const seen: number[] = [];
+    const answer = await until(async () => {
+      const r = await ask();
+      seen.push(r.status);
+      return r.status === 200 ? ((await r.json()) as Envelope) : null;
+    }, 60_000, 100);
+    expect(seen.filter((s) => s !== 200 && s !== 503)).toEqual([]);
+    expect(answer.data.rows).toEqual([{ n: 2 }]);
+    expect(answer.data.asOf).toBeString();
+    expect(existsSync(copy)).toBe(true);
+    expect(statSync(copy).mode & 0o222).toBe(0);
+    serve.proc.kill("SIGTERM");
+    const stopped = await serve.done;
+    expect(stopped.code, show(stopped)).toBe(0);
+  }, 180_000);
+
   journey("turned off again, the next refresh writes the copy with the usual permissions", async () => {
     const state = { orders: [{ id: 1, amount: 10 }] };
     api.route("/orders", () => json(state.orders));

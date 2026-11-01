@@ -31,7 +31,8 @@
 // 2 to 10 ms [V: 2.0.0]. A connection's `USE wh` is by name, so it follows the new file; a query that starts meanwhile
 // waits for the swap, and one that fails because it straddled it is run again, once. A query already reading the old
 // file finishes on it. A start or a swap that fails ends this process (the instance is part set up, and is never
-// reused); croft serve starts another with a backoff. The instance stays referenced for the process's whole life:
+// reused); croft serve replaces it (after a backoff for a start, at once for a swap it killed). The instance stays
+// referenced for the process's whole life:
 // Quack's listener, once slice 4 starts one, stops when its instance is collected [V: 2.0.0].
 import type { DuckDBConnection, DuckDBInstance, DuckDBPreparedStatement, DuckDBResult } from "@duckdb/node-api";
 import { chmodSync, existsSync, rmSync } from "node:fs";
