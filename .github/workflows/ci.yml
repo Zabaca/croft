@@ -65,6 +65,29 @@ jobs:
       - name: git identity
         run: git config --global user.email ci@zabaca.com && git config --global user.name "croft ci"
       - run: bun install --frozen-lockfile
+      # The mode tests load DuckDB's real extension files (DESIGN.md D117). They are never committed (over 100 MB per
+      # platform); this step fetches each from DuckDB's official extension repository over HTTPS and checks it against
+      # the checksum croft pins, and the tests fail in CI (CROFT_CI) rather than skip when a file is missing.
+      - name: DuckDB extension files, cached
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/croft/test-extensions
+          key: duckdb-extensions-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('packages/croft/src/db/extension-pins.ts') }}
+      - name: fetch and verify the DuckDB extension files
+        working-directory: packages/croft
+        run: bun scripts/fetch-extensions.ts
+      # The lake profile's tests start Postgres in the foreground, as a child of the test. Never as a service.
+      - name: Postgres for the lake tests
+        working-directory: packages/croft
+        run: |
+          if ! bun scripts/check-mode-tools.ts; then
+            if [ "$RUNNER_OS" = macOS ]; then
+              brew install postgresql@17
+              bun scripts/check-mode-tools.ts
+            else
+              exit 1
+            fi
+          fi
       - name: typecheck
         working-directory: packages/croft
         run: bun run typecheck

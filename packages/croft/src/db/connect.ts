@@ -16,6 +16,7 @@ import { availableParallelism, totalmem } from "node:os";
 import { physicalPath } from "../project/root.ts";
 import { basename, dirname, join, resolve } from "node:path";
 import { CroftError } from "../core/errors.ts";
+import { type ModeSpec, modeDirectories, modePaths, prepareMode } from "./modes.ts";
 
 const DUCKDB_VERSION = version().replace(/^v(?=\d)/, "");
 
@@ -33,6 +34,9 @@ export interface SandboxSpec {
   /** false: the optimizer is off on every connection (sql/bind.ts's shadow catalog, whose plans sql/deps.ts reads:
    *  the optimizer prunes scans). Set globally before locking, since the lock refuses changing it. */
   optimizer?: false;
+  /** A mode (server mode's readers' process, a lake): the extensions it loads, what it attaches and what its lockdown
+   *  lets through besides the profile's folders (db/modes.ts, D117, D118). Absent: today's file, no extension loaded. */
+  mode?: ModeSpec;
 }
 
 /**
@@ -110,7 +114,14 @@ export function allowedDirectories(spec: SandboxSpec): string[] {
       dirs = spec.stateDir ? [spec.stateDir] : [];
       break;
   }
-  return [...new Set(dirs.map(canonicalPath))];
+  // A mode adds its lake's folder: a bucket prefix as written, a local folder (the test lake) canonical like the rest.
+  const modeDirs = modeDirectories(spec.mode).map((d) => (/^[a-z][a-z0-9+.-]*:\/\//i.test(d) ? d : canonicalPath(d)));
+  return [...new Set([...dirs.map(canonicalPath), ...modeDirs])];
+}
+
+/** The single paths a profile may touch besides its folders: the read copy, for the readers' process. */
+export function allowedPaths(spec: SandboxSpec): string[] {
+  return [...new Set(modePaths(spec.mode).map(canonicalPath))];
 }
 
 const sqlString = (s: string) => `'${s.replaceAll("'", "''")}'`;
@@ -200,7 +211,9 @@ async function scalar(conn: DuckDBConnection, sql: string): Promise<unknown> {
 
 async function applySandbox(conn: DuckDBConnection, spec: SandboxSpec, key: string): Promise<void> {
   const dirs = allowedDirectories(spec);
-  const fingerprint = JSON.stringify([spec.profile, spec.timezone, dirs, spec.memoryLimit ?? null, spec.threads ?? null, spec.optimizer ?? null]);
+  const paths = allowedPaths(spec);
+  // No credential goes into the fingerprint: it is printed in an error.
+  const fingerprint = JSON.stringify([spec.profile, spec.timezone, dirs, spec.memoryLimit ?? null, spec.threads ?? null, spec.optimizer ?? null, spec.mode?.kind ?? null, paths]);
   const locked = (await scalar(conn, "SELECT current_setting('lock_configuration')")) === true;
   if (locked) {
     if (configured.get(key) !== fingerprint) {
@@ -225,6 +238,10 @@ async function applySandbox(conn: DuckDBConnection, spec: SandboxSpec, key: stri
   if (spec.threads) await conn.run(`SET GLOBAL threads = ${Math.max(1, Math.floor(spec.threads))}`);
   // A global setting on DuckDB 2.0, so every later connection inherits it; the lock refuses changing it after.
   if (spec.optimizer === false) await conn.run("SET GLOBAL enable_optimizer = false");
+  // A mode loads its extensions, attaches and starts what it serves now: DuckDB refuses each of them once outside
+  // access is off (D118).
+  if (spec.mode) await prepareMode(conn, spec.mode);
+  if (paths.length) await conn.run(`SET allowed_paths = [${paths.map(sqlString).join(", ")}]`);
   await conn.run(`SET allowed_directories = [${dirs.map(sqlString).join(", ")}]`);
   await conn.run("SET enable_external_access = false");
   await conn.run("SET lock_configuration = true");
