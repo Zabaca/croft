@@ -695,7 +695,7 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       if (copy) data.readCopy = copy;
       // What each refresh costs where the filesystem cannot clone (D121), and server mode refused for it.
       const policy = assessCopyPolicy(project, o.copyProbe);
-      if (policy.refused) copyProblems.push(copyCostlyProblem(policy));
+      if (policy.refused) copyProblems.push(copyCostlyProblem(policy, "limit"));
       else if (policy.warn) copyProblems.push(notClonedProblem(policy));
     }
     if (project.config.serverMode.enabled) data.serverMode = { serving: serve !== undefined };

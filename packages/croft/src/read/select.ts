@@ -101,7 +101,7 @@ export async function runSelect(conn: DuckDBConnection, req: SelectRequest, o: {
 
 /**
  * Make an in-process value equal to what JSON.parse(JSON.stringify(value)) yields, so direct mode returns
- * exactly what server mode does: -0 becomes 0, and any bigint (json mode renders none) becomes its digits.
+ * exactly what reading through croft serve does: -0 becomes 0, and any bigint (json mode renders none) becomes its digits.
  * Everything else json mode renders already survives a JSON round trip unchanged. Rendered rows are fresh
  * objects, so they are fixed in place rather than copied.
  */

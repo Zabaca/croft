@@ -28,6 +28,8 @@ export interface ServeHealth {
   queriesToday: number;
   /** Server mode only: answers come from the read copy as of this time (null until the readers' process has one). */
   serverMode?: { state: string; asOf: string | null };
+  /** Set (server mode) when the server answers but something the user should fix makes it a problem: the copy limit. */
+  degraded?: { code: string; message: string };
 }
 
 /**
@@ -96,6 +98,9 @@ export interface ServeEngineStatus {
     /** Refreshed copies taken in, and times the readers' process was started again, since croft serve started. */
     swaps: number;
     restarts: number;
+    /** Set when each refresh is a full copy the project has not accepted (the warehouse grew past 1 GB where the
+     *  filesystem cannot clone, D121); null otherwise. The server keeps answering, from a copy that keeps being refreshed. */
+    copyCost: { code: string; message: string } | null;
   };
 }
 

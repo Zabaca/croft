@@ -584,7 +584,8 @@ async function checkServe(r: Report, d: DoctorDeps, project: Project): Promise<v
     try { at = now(d.env); } catch { at = new Date(); }
     mode = sm.asOf ? ` · server mode, reads the copy as of ${clockText(sm.asOf, project.timezone, at)}` : ` · server mode (${sm.state ?? "starting"}), no copy yet`;
   }
-  r.add("environment", "serve", "ok", `read server on ${where} (pid ${s.pid}) · token in ${shownFile}${queries}${mode}`, undefined,
+  const degraded = (health.degraded as { code?: string } | undefined)?.code;
+  r.add("environment", "serve", degraded ? "warn" : "ok", `read server on ${where} (pid ${s.pid}) · token in ${shownFile}${queries}${mode}${degraded ? ` · degraded: ${degraded} (see the read copy lines)` : ""}`, undefined,
     { running: true, pid: s.pid, url: s.url, queriesToday: health.queriesToday ?? null, ...(sm ? { serverMode: { state: sm.state ?? null, asOf: sm.asOf ?? null } } : {}) });
 }
 
@@ -606,7 +607,7 @@ function checkReadCopy(r: Report, d: DoctorDeps, project: Project): void {
   const policy = assessCopyPolicy(project, d.copyProbe);
   const sm = project.config.serverMode.enabled;
   if (policy.refused) {
-    const refusal = copyCostlyProblem(policy);
+    const refusal = copyCostlyProblem(policy, "limit");
     r.add("environment", "readcopy.cost", "error", refusal.message, refusal,
       { warehouseBytes: policy.bytes, diskBytes: policy.diskBytes, copySeconds: policy.copySeconds });
   } else if (policy.warn) {

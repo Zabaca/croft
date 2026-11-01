@@ -24,7 +24,8 @@
 //             DuckDB would replay it onto the new one (a read-only attach replays a valid WAL in memory too [V: 2.0.0];
 //             only an invalid one is ignored). In server mode (D119) the temporary file is marked read-only (0444)
 //             before the rename, so a query that got past the gate in the readers' process still cannot write over the
-//             copy, and the refresh refuses to run where a full copy would be too costly (db/copy-policy.ts).
+//             copy. A refresh never stops for the copy policy (db/copy-policy.ts): server mode refuses to start where a full
+//             copy would be too costly, but a warehouse that grows past the limit keeps being refreshed and the cost is reported.
 //
 // Errors are logged to <state>/readcopy.log and recorded in the setting (lastError), never thrown: the run has
 // already succeeded, and a copy that missed a refresh only shows older data, which croft serve marks with asOf.
@@ -43,7 +44,6 @@ import { currentIdentity, type ProcessIdentity, recordAlive } from "../core/proc
 import { formatInstant, now, parseInstant, zonedParts } from "../core/time.ts";
 import { RunsDb } from "../history/runs-db.ts";
 import { loadProject, type Project } from "../project/root.ts";
-import { assertCopyPolicy } from "./copy-policy.ts";
 import type { DuckWarehouse } from "./warehouse.ts";
 
 /** The runs.sqlite setting that coordinates refreshes and records the last one. */
@@ -525,9 +525,6 @@ async function refreshOnce(project: Project, o: ReadCopyOptions, round: number):
   let own: DuckWarehouse | null = null;
   try {
     mkdirSync(dir, { recursive: true });
-    // Server mode (D121): where a full copy would be too costly and the project has not accepted it, no refresh runs.
-    // Before the lease, so a refused one holds nothing.
-    if (project.config.serverMode.enabled) assertCopyPolicy(project, { platform: o.platform, cp: o.cp });
     removeTemps(path);
     // DuckDB is imported only here, when a refresh opens the warehouse itself (doctor imports this module).
     const w = o.warehouse ?? (own = (await import("./warehouse.ts")).openWarehouse({

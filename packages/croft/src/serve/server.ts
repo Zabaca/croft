@@ -374,6 +374,7 @@ class Handler {
     return {
       ok: true, pid: process.pid, version: CROFT_VERSION, database: this.o.envelopeMeta().database, writeIntent: s.writeIntent, queriesToday: s.queriesToday,
       ...(s.serverMode ? { serverMode: { state: s.serverMode.state, asOf: s.serverMode.asOf } } : {}),
+      ...(s.serverMode?.copyCost ? { degraded: s.serverMode.copyCost } : {}),
     };
   }
 

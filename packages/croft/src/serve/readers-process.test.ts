@@ -44,8 +44,8 @@ function linkedExtensions(): { dir: string; hide(): void; restore(): void } {
 }
 
 describe("restarting", () => {
-  test("the wait before a start is none the first time, then 250 ms doubling to 5 s", () => {
-    expect([0, 1, 2, 3, 4, 5, 6, 9].map(restartDelayMs)).toEqual([0, 250, 500, 1000, 2000, 4000, 5000, 5000]);
+  test("the wait before a start is none the first time, then 250 ms doubling to 60 s", () => {
+    expect([0, 1, 2, 3, 4, 5, 6, 9].map(restartDelayMs)).toEqual([0, 250, 500, 1000, 2000, 4000, 8000, 60_000]);
   });
 
   withExt("a readers' process that is killed (the OOM killer, a crash) is replaced at once, and queries keep being answered", async () => {

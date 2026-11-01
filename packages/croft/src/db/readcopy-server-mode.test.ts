@@ -1,13 +1,13 @@
 // The read copy in server mode (DESIGN.md D119, D121; option 06, slice 2): the refresh marks its temporary file read-only
-// before the rename, removes a `<copy>.wal` before and after it, and refuses to run where a full copy would be too costly.
+// before the rename, and removes a `<copy>.wal` before and after it. It never stops for the copy policy.
 // With server mode off the copy is written with the usual permissions. The readers' process itself is tested in
 // serve/readers*.test.ts; nothing here needs DuckDB's extension files.
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, truncateSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { cleanup, makeProject, seed, type TempProject } from "../read/testkit.ts";
-import { READ_COPY_LOG, readCopyStatus, refreshReadCopy } from "./readcopy.ts";
+import { readCopyStatus, refreshReadCopy } from "./readcopy.ts";
 import { closeAllWarehouses } from "./warehouse.ts";
 
 const scratch: string[] = [];
@@ -67,14 +67,13 @@ describe("in server mode", () => {
     expect(existsSync(`${copyOf(p)}.wal`)).toBe(false);
   });
 
-  test("where a full copy would be too costly and is not accepted, the refresh does not run, and says why", async () => {
+  test("past the copy limit the refresh carries on: the cost is reported elsewhere, and a running server keeps getting fresh copies", async () => {
     const p = await serverMode();
-    truncateSync(p.database, 1_500_000_000); // a sparse file: the policy reads only the size
+    truncateSync(p.database, 1_500_000_000); // a sparse file: DuckDB reads its header, the policy only the size
     const out = await refresh(p, { platform: "linux", cp: [cpWithoutClone()] });
-    expect(out).toMatchObject({ status: "failed", error: { code: "SERVER_MODE_COPY_COSTLY" } });
-    expect(existsSync(copyOf(p))).toBe(false);
-    expect(readFileSync(join(p.stateDir, READ_COPY_LOG), "utf8")).toContain("SERVER_MODE_COPY_COSTLY");
-    expect(readCopyStatus(p.project).health).toBe("failed");
+    expect(out.status).toBe("refreshed");
+    expect(existsSync(copyOf(p))).toBe(true);
+    expect(readCopyStatus(p.project).health).toBe("ok");
   });
 });
 

@@ -4,7 +4,7 @@
 // the only thing SQL can still make beside the copy is a `<copy>.wal`, which the readers' process removes before it attaches.
 import { afterAll, describe, expect } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { closeAllWarehouses } from "../db/warehouse.ts";
 import { refreshReadCopy } from "../db/readcopy.ts";
@@ -100,6 +100,23 @@ describe("the copy", () => {
     }
     s.stop();
     expect(readFileSync(copy).equals(before)).toBe(true);
+  });
+
+  withExt("a copy that is writable on disk (made while only readCopy was on) is made read-only before it is attached", async () => {
+    const p = await refreshedProject();
+    const copy = p.project.paths.readCopy;
+    chmodSync(copy, 0o644); // what a refresh with server mode off leaves
+    const s = await session(p);
+    expect(statSync(copy).mode & 0o222).toBe(0);
+    if (!isRoot) {
+      // Without that, a detach and a read-write attach worked, and wrote a WAL.
+      expect((await s.run("DETACH wh")).ok).toBe(true);
+      const rw = await s.run(`ATTACH '${copy}' AS wh (READ_WRITE)`);
+      expect(rw.ok).toBe(false);
+      expect((await s.run(`ATTACH '${copy}' AS wh (READ_ONLY)`)).ok).toBe(true);
+    }
+    expect(existsSync(`${copy}.wal`)).toBe(false);
+    s.stop();
   });
 
   withExt("the live file, files/, the state folder and the project's .env are out of reach", async () => {

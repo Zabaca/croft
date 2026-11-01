@@ -20,7 +20,7 @@
 // Killing: a query that interrupts cannot stop, past its deadline, ends with the readers' process (SIGKILL, as the file
 // engine's worker, D76). Every query running there fails with a retryable SERVE_UNAVAILABLE (reason "restarted"), and
 // a new process starts at once. A process that fails to start its mode, or to swap, ends itself and is replaced after a
-// backoff (0, 250 ms, 500 ms, 1 s, ... 5 s): the instance it had is part set up and is never reused (connect.ts marks it).
+// backoff (0, 250 ms, 500 ms, 1 s, ... 60 s): the instance it had is part set up and is never reused (connect.ts marks it).
 // Queries wait for the replacement up to queueMs and then get a 503; a start that fails for a reason a retry will not fix
 // (a missing extension file, a copy from a newer croft) answers every query with that error until it is fixed.
 //
@@ -33,7 +33,7 @@ import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { formatInstant, now, zonedParts } from "../core/time.ts";
 import { canonicalPath, type SandboxSpec, serveResources } from "../db/connect.ts";
-import { assertCopyPolicy, type CloneProbe, type ProbeOptions } from "../db/copy-policy.ts";
+import { assertCopyPolicy, assessCopyPolicy, type CloneProbe, copyCostlyProblem, type ProbeOptions, type ThresholdOption } from "../db/copy-policy.ts";
 import { resolveExtensionDir } from "../db/extension-files.ts";
 import { assertSafeFilesystem, type FsProbe, realProbe } from "../db/fs-kind.ts";
 import { loadProject, type Project } from "../project/root.ts";
@@ -76,16 +76,20 @@ export interface ReadersEngineInternals {
   /** The folder of the pinned extension files; resolveExtensionDir() by default. */
   extensionDir?: string;
   /** How the copy policy tries to clone (db/copy-policy.ts), for tests. */
-  policy?: ProbeOptions & { clone?: CloneProbe };
+  policy?: ProbeOptions & ThresholdOption & { clone?: CloneProbe };
   /** The readers' process command (tests); `bun --no-env-file worker.ts` by default. */
   workerArgv?: string[];
   /** The wait before the next try after `attempts` failed starts; restartDelayMs by default. */
   restartDelayMs?: (attempts: number) => number;
 }
 
+/** The longest wait between starts: every try checks the pinned extension files again (about 66 MB hashed), so a start
+ *  that keeps failing is tried once a minute, not every few seconds. */
+const RESTART_CEILING_MS = 60_000;
+
 /** The wait before starting the readers' process again after `attempts` starts in a row failed: none the first time. */
 export function restartDelayMs(attempts: number): number {
-  return attempts <= 0 ? 0 : Math.min(5000, 250 * 2 ** (attempts - 1));
+  return attempts <= 0 ? 0 : Math.min(RESTART_CEILING_MS, 250 * 2 ** (attempts - 1));
 }
 
 /** A file's identity: replaced (renamed over) means another inode; the rest is defence against a reused one. */
@@ -138,6 +142,7 @@ class ReadersEngine implements ServeEngine {
   private readonly maxQueued: number;
   private readonly pollMs: number;
   private readonly argv: string[] | undefined;
+  private readonly policy: (ProbeOptions & ThresholdOption & { clone?: CloneProbe }) | undefined;
   private readonly delayOf: (attempts: number) => number;
   /** Why queries are refused until something changes (no copy yet; a start that a retry will not fix); null otherwise. */
   private blocked: CroftError | null = null;
@@ -164,6 +169,7 @@ class ReadersEngine implements ServeEngine {
     this.maxQueued = o.maxQueued ?? SERVE_DEFAULTS.maxQueued;
     this.pollMs = o.copyPollMs ?? COPY_POLL_MS;
     this.argv = o.workerArgv;
+    this.policy = o.policy;
     this.delayOf = o.restartDelayMs ?? restartDelayMs;
     this.hooks = guarded(o.hooks ?? {});
     this.spec = { profile: "serve", timezone: project.timezone, root: project.root, stateDir: project.paths.stateDir, ...serveResources(), ...o.resources };
@@ -201,6 +207,14 @@ class ReadersEngine implements ServeEngine {
     (this.timer as { unref?: () => void }).unref?.();
   }
 
+  /** Set when the warehouse has grown past the copy limit since croft serve started (or the setting changed): refreshes
+   *  carry on, so answers keep coming, but each one is a full copy the project has not accepted (D121). A stat and a
+   *  probe that runs once, so it is cheap on every status. */
+  private copyCost(): { code: string; message: string } | null {
+    const policy = assessCopyPolicy(this.project, this.policy);
+    return policy.refused ? { code: "SERVER_MODE_COPY_COSTLY", message: copyCostlyProblem(policy, "limit").message } : null;
+  }
+
   status(): ServeEngineStatus {
     return {
       state: this.state === "open" ? "open" : this.state === "stopped" ? "stopped" : "reopening",
@@ -216,6 +230,7 @@ class ReadersEngine implements ServeEngine {
         workerPid: this.worker?.pid ?? null,
         swaps: this.swaps,
         restarts: this.restarts,
+        copyCost: this.copyCost(),
       },
     };
   }

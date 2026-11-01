@@ -153,12 +153,12 @@ export async function openInstance(path: string, mode: AccessMode, o: { stateDir
   return { instance, path: real };
 }
 
-/** A new in-memory instance. ":memory:" is never shared by the instance cache [V: 2.0.0, two calls gave two instances
- *  with separate catalogs]. The one place an in-memory instance is made: TS transforms, and server mode's readers'
- *  process (serve/worker.ts, D119), whose in-memory database holds nothing of croft's but the lock and what a mode
- *  attaches. */
+/** A new in-memory instance, made with `DuckDBInstance.create` and so never shared (`fromCache(":memory:")` also gave a
+ *  different instance on every call [V: 2.0.0], but create says so). The one place an in-memory instance is made: TS
+ *  transforms, and server mode's readers' process (serve/worker.ts, D119), whose in-memory database holds nothing of
+ *  croft's but the lock and what a mode attaches. */
 export function openMemoryInstance(): Promise<DuckDBInstance> {
-  return DuckDBInstance.fromCache(":memory:", instanceConfig("read_write"));
+  return DuckDBInstance.create(":memory:", instanceConfig("read_write"));
 }
 
 /** A private in-memory database (TS transforms). */

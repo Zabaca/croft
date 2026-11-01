@@ -12,16 +12,17 @@
 import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { connect, openMemoryInstance } from "../db/connect.ts";
-import { readersSpec } from "./worker.ts";
+import { lockCopy, READERS_KEY, readersSpec } from "./worker.ts";
 
 const arg = (n: string) => process.argv[process.argv.indexOf(`--${n}`) + 1]!;
 const copy = arg("copy");
 
+lockCopy(copy); // as the worker does before it attaches
 const instance = await openMemoryInstance();
 const conn = await connect(
   instance,
   readersSpec({ profile: "serve", timezone: "UTC", stateDir: arg("state") }, copy, { extensionDir: arg("ext"), secretDir: join(arg("state"), "readers-secrets") }),
-  copy,
+  READERS_KEY,
 );
 // The instance is referenced for the process's whole life, as the worker's is.
 (globalThis as Record<string, unknown>).__readersSession = [instance, conn];

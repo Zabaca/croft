@@ -123,7 +123,7 @@ describe("croft doctor", () => {
     scratch.push(join(cp, ".."));
     writeFileSync(cp, '#!/bin/sh\nfor a in "$@"; do src="$dst"; dst="$a"; done\nexec /bin/cp "$src" "$dst"\n');
     chmodSync(cp, 0o755);
-    const { data } = await runDoctor(p.root, deps({ copyProbe: { platform: "darwin", cp: [cp] } }));
+    const { data } = await runDoctor(p.root, deps({ copyProbe: { platform: "linux", cp: [cp] } }));
     expect(data.checks.find((c) => c.id === "readcopy.cost")).toBeUndefined();
     expect(formatDoctor(data, [])).toContain("server mode on");
   });

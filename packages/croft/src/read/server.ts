@@ -1,4 +1,4 @@
-// Server mode of @zabaca/croft/read: POST /query to croft serve (DESIGN.md §5 "Server mode, apps and GUIs").
+// Reading through croft serve with @zabaca/croft/read: POST /query to croft serve (DESIGN.md §5 "Server mode, apps and GUIs").
 //
 // - `POST <url>/query` with {sql, params?, limit}, a bearer token and Content-Type: application/json.
 // - The reply is the `query` envelope (§4.3). Rows come back already rendered in json mode, exactly as

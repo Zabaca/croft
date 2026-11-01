@@ -10,14 +10,17 @@
 // (measured on an Apple SSD, APFS); the projects below it are not asked anything.
 //
 // "Can this filesystem clone" is found by trying: a small file in the warehouse's own folder (the copy is made there)
-// is cloned with the platform's strict flag, which fails where cloning is not possible instead of falling back to a copy
-// the way the refresh's `cp` does. Nothing here opens the warehouse: a stat of the file gives its size.
+// is cloned strictly, so that it fails where cloning is not possible instead of falling back to a copy the way the
+// refresh's `cp` does. On macOS `cp -c` is not strict: it exited 0 on a FAT volume, having copied, so the probe uses
+// `copyFileSync` with COPYFILE_FICLONE_FORCE, which is ENOTSUP there [V: Bun 1.3.14, APFS and a FAT disk image]. On Linux
+// it is `cp` with reflink always. Nothing here opens the warehouse: a stat of the file gives its size. The probe runs
+// only for a warehouse of warnBytes or more (under it nothing is said or refused) and once per process per folder, so
+// status, doctor and GET /status do not write a dotfile beside the warehouse on every call.
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { constants, copyFileSync, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { CroftError } from "../core/errors.ts";
+import { CroftError, problem } from "../core/errors.ts";
 import type { Problem } from "../core/types.ts";
-import { problem } from "../core/errors.ts";
 import type { Project } from "../project/root.ts";
 
 export const COPY_POLICY = {
@@ -48,29 +51,42 @@ export interface CloneProbe {
 
 export interface ProbeOptions {
   platform?: NodeJS.Platform;
-  /** Where cp is looked for (tests). */
+  /** Linux: where cp is looked for (tests). */
   cp?: readonly string[];
+  /** macOS: clone one file strictly, throwing where the filesystem cannot (tests). Default: copyFileSync with
+   *  COPYFILE_FICLONE_FORCE. */
+  cloneFile?: (src: string, dst: string) => void;
 }
 
-/** Try to clone a 64 KiB file in `dir` with the platform's strict flag. Never throws; leaves nothing behind. */
+/** Tests: the size above which a copy that cannot be cloned is too costly (COPY_POLICY.thresholdBytes). */
+export interface ThresholdOption { thresholdBytes?: number }
+
+const strictClone = (src: string, dst: string) => copyFileSync(src, dst, constants.COPYFILE_FICLONE_FORCE);
+
+/** Try to clone a 64 KiB file in `dir`, strictly. Never throws; leaves nothing behind. */
 export function probeClone(dir: string, o: ProbeOptions = {}): CloneProbe {
   const platform = o.platform ?? process.platform;
-  const flag = platform === "darwin" ? "-c" : platform === "linux" ? REFLINK_ALWAYS : null;
-  if (!flag) return { canClone: false, method: null, why: `croft clones files on macOS and Linux, not ${platform}` };
-  const cp = (o.cp ?? CP_PATHS).find((p) => existsSync(p));
-  if (!cp) return { canClone: false, method: null, why: "cp was not found" };
+  if (platform !== "darwin" && platform !== "linux") return { canClone: false, method: null, why: `croft clones files on macOS and Linux, not ${platform}` };
+  const cp = platform === "linux" ? (o.cp ?? CP_PATHS).find((p) => existsSync(p)) : null;
+  if (platform === "linux" && !cp) return { canClone: false, method: null, why: "cp was not found" };
   const stem = join(dir, `.croft-clone-probe.${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
   const src = `${stem}.a`;
   const dst = `${stem}.b`;
   try {
     mkdirSync(dir, { recursive: true });
     writeFileSync(src, Buffer.alloc(PROBE_BYTES, 1));
-    const r = spawnSync(cp, [flag, src, dst], { env: { PATH: "/usr/bin:/bin", LC_ALL: "C" }, stdio: ["ignore", "ignore", "pipe"], timeout: 10_000 });
-    if (r.status === 0 && existsSync(dst)) return { canClone: true, method: platform === "darwin" ? "clone" : "reflink", why: null };
+    if (platform === "darwin") {
+      (o.cloneFile ?? strictClone)(src, dst);
+      return { canClone: true, method: "clone", why: null };
+    }
+    const r = spawnSync(cp!, [REFLINK_ALWAYS, src, dst], { env: { PATH: "/usr/bin:/bin", LC_ALL: "C" }, stdio: ["ignore", "ignore", "pipe"], timeout: 10_000 });
+    if (r.status === 0 && existsSync(dst)) return { canClone: true, method: "reflink", why: null };
     const why = String(r.stderr ?? "").trim().split("\n")[0] || (r.error ? r.error.message : `cp exited ${r.status}`);
     return { canClone: false, method: null, why: why.slice(0, 200) };
   } catch (e) {
-    return { canClone: false, method: null, why: String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 200) };
+    const code = (e as NodeJS.ErrnoException)?.code;
+    const text = String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 200);
+    return { canClone: false, method: null, why: code && !text.includes(code) ? `${code}: ${text}` : text };
   } finally {
     rmSync(src, { force: true });
     rmSync(dst, { force: true });
@@ -97,14 +113,28 @@ export interface CopyPolicy {
   warn: boolean;
 }
 
-/** Assess the project's read copy. Spawns one short `cp` and stats the warehouse; opens nothing. */
-export function assessCopyPolicy(project: Project, o: ProbeOptions & { clone?: CloneProbe } = {}): CopyPolicy {
+// The probe's answer per folder, for this process: a filesystem does not change under a running croft. Not used when a
+// test injects its own way of cloning.
+const probed = new Map<string, CloneProbe>();
+
+/** Assess the project's read copy. Stats the warehouse; for one of warnBytes or more it also tries a clone (once per
+ *  process per folder); opens nothing. Under warnBytes nothing is tried: nothing is said or refused there. */
+export function assessCopyPolicy(project: Project, o: ProbeOptions & ThresholdOption & { clone?: CloneProbe } = {}): CopyPolicy {
   let bytes = 0;
   try {
     bytes = statSync(project.paths.database).size;
   } catch {}
-  const clone = o.clone ?? probeClone(dirname(project.paths.readCopy), o);
-  const overThreshold = !clone.canClone && bytes > COPY_POLICY.thresholdBytes;
+  const dir = dirname(project.paths.readCopy);
+  let clone: CloneProbe;
+  if (o.clone) clone = o.clone;
+  else if (bytes < COPY_POLICY.warnBytes) clone = { canClone: true, method: null, why: `not tried: the warehouse is under ${sizeText(COPY_POLICY.warnBytes)}` };
+  else if (o.platform || o.cp || o.cloneFile) clone = probeClone(dir, o);
+  else {
+    const hit = probed.get(dir);
+    clone = hit ?? probeClone(dir);
+    if (!hit) probed.set(dir, clone);
+  }
+  const overThreshold = !clone.canClone && bytes > (o.thresholdBytes ?? COPY_POLICY.thresholdBytes);
   const accepted = project.config.serverMode.acceptFullCopyCost;
   return {
     bytes, clone,
@@ -143,10 +173,18 @@ const ACCEPT_FIX = {
   requiresHuman: true,
 };
 
-/** The problem server mode is refused with (SERVER_MODE_COPY_COSTLY). */
-export function copyCostlyProblem(p: CopyPolicy): Problem {
+/**
+ * The problem server mode is refused with (SERVER_MODE_COPY_COSTLY). `stage` "start" is croft serve not starting. "limit"
+ * is everywhere else, where the project is already past the limit and refreshes carry on regardless (a refresh that
+ * stopped would leave a running croft serve answering older and older data): croft status, croft doctor and the warning
+ * in a run's output.
+ */
+export function copyCostlyProblem(p: CopyPolicy, stage: "start" | "limit" = "start"): Problem {
+  const over = `the warehouse is over ${sizeText(COPY_POLICY.thresholdBytes)} and serverMode.acceptFullCopyCost is not set`;
   return problem("SERVER_MODE_COPY_COSTLY", {
-    message: `server mode is not started: ${copyCostText(p)}, and the warehouse is over ${sizeText(COPY_POLICY.thresholdBytes)}`,
+    message: stage === "start"
+      ? `server mode is not started: ${copyCostText(p)}, and the warehouse is over ${sizeText(COPY_POLICY.thresholdBytes)}`
+      : `server mode is past its limit: ${copyCostText(p)}; ${over}. The copy is still refreshed, and croft serve will not start until the cost is accepted`,
     hint: 'move the project to a filesystem that can clone, or accept the cost: set "serverMode.acceptFullCopyCost" to true in croft.json (ask the user first: it is disk and write time on every run)',
     fix: ACCEPT_FIX,
     retryable: false,
@@ -158,7 +196,7 @@ export function copyCostlyProblem(p: CopyPolicy): Problem {
 }
 
 /** Throw SERVER_MODE_COPY_COSTLY when server mode is on and the policy refuses it. Returns the assessment. */
-export function assertCopyPolicy(project: Project, o: ProbeOptions & { clone?: CloneProbe } = {}): CopyPolicy {
+export function assertCopyPolicy(project: Project, o: ProbeOptions & ThresholdOption & { clone?: CloneProbe } = {}): CopyPolicy {
   const p = assessCopyPolicy(project, o);
   if (p.refused) {
     const { code: _c, severity: _s, docs: _d, ...init } = copyCostlyProblem(p);

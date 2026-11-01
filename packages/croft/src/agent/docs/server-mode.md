@@ -44,7 +44,7 @@ which writes it with the usual permissions.
   detaches the old one and attaches the new one, a few milliseconds, with its connections kept.
 - A query past serve.queryTimeoutMs that interrupts cannot stop ends the readers' process; a new one starts at once.
   Queries running at that moment get a retryable SERVE_UNAVAILABLE (reason "restarted"), which `query()` retries. A
-  process that cannot start ends itself and is started again after a wait (none, then 250 ms doubling to 5 s).
+  process that cannot start ends itself and is started again after a wait (none, then 250 ms doubling to 60 s).
 - Stopping croft serve (Ctrl-C, SIGTERM) ends the readers' process first and exits 0, even with a query running.
 - One refresh per run, at its end, so the copy shows every table at one consistent point. A run that failed partway
   still refreshes the copy when a step committed.

@@ -89,6 +89,7 @@ import { currentDatabase, isReservedColumn, quoteIdent, tableRef } from "../load
 import type { CheckHookResult, WriteBatchInput } from "../load/write.ts";
 import { outsideCapture, setOutputRedactor } from "../core/output.ts";
 import { formatInstant, now as clockNow } from "../core/time.ts";
+import { assessCopyPolicy, type CloneProbe, copyCostlyProblem, type ProbeOptions, type ThresholdOption } from "../db/copy-policy.ts";
 import { refreshReadCopy } from "../db/readcopy.ts";
 import { planWaits, scheduleHeld, secretsCommandHeld, secretsCommandUnapproved } from "../schedule/due.ts";
 import { notifyScheduledFailure, type ScheduledFailure } from "../schedule/notify.ts";
@@ -132,6 +133,8 @@ export const SCHEDULED_LOCK_WAIT_MS = 30 * 60_000;
 /** What happens after a run ends (tests replace them). */
 export interface RunHooks {
   refreshReadCopy?: (root: string) => Promise<unknown>;
+  /** How the copy policy tries to clone (db/copy-policy.ts): tests give a filesystem that cannot. */
+  copyProbe?: ProbeOptions & ThresholdOption & { clone?: CloneProbe };
   notifyScheduledFailure?: (root: string, failure: ScheduledFailure) => Promise<void>;
   /** .croft/types from the catalog mirror the run left (project/types-gen.ts). */
   generateInputTypes?: (root: string, stateDir: string) => unknown;
@@ -723,6 +726,11 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
       if (interrupted && !problems.some((p) => p.code === "INTERRUPTED")) problems.push({ ...(croftError(runSignal.reason) ?? interruptedError()).problem, runId });
       const failed = steps.some((s) => s.status === "failed") || problems.some((p) => p.severity === "error" && p.code !== "CONFIRMATION_REQUIRED");
       const status: RunStatus = interrupted ? "interrupted" : failed ? "failed" : "succeeded";
+      // Server mode past its copy limit (D121): the copy is still refreshed, and every run that changed data says what it costs.
+      if (o.project.config.serverMode.enabled && steps.some((s) => s.status === "ok")) {
+        const policy = assessCopyPolicy(o.project, o.hooks?.copyProbe);
+        if (policy.refused) problems.push({ ...copyCostlyProblem(policy, "limit"), severity: "warning", runId });
+      }
       const clean = dedupe(problems);
       const confirmation = confirms.pending;
       const summary: RunSummary = jsonSafe({

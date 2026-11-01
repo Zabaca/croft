@@ -5,19 +5,22 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeAllWarehouses } from "../db/warehouse.ts";
 import { cleanup, seed, type TempProject } from "../read/testkit.ts";
 import { aside, ask, count, extensionFiles, openEngine, project, putCopy, rejection, replaceCopy, sleep, until } from "./readers-testkit.ts";
 import { openReadersEngine } from "./readers.ts";
+import { type RunningServer, startServer } from "./server.ts";
 import type { ServeEngine } from "./types.ts";
 
 const { ext, withExt } = extensionFiles("readers.test");
 const engines: ServeEngine[] = [];
+const servers: RunningServer[] = [];
 const scratchDirs: string[] = [];
 afterAll(async () => {
+  for (const s of servers) await s.stop(true).catch(() => {});
   for (const e of engines) await e.close().catch(() => {});
   for (const d of scratchDirs) rmSync(d, { recursive: true, force: true });
   await closeAllWarehouses();
@@ -40,6 +43,20 @@ describe("starting", () => {
     await e.close();
     expect(sha(p.database)).toBe(liveBefore);
     expect(sha(p.project.paths.readCopy)).toBe(copyBefore);
+  });
+
+  withExt("a copy that is writable on disk is made read-only when the readers' process attaches it, and again after a swap", async () => {
+    const p = await project({ n: 10 });
+    chmodSync(p.project.paths.readCopy, 0o644);
+    const e = await engine(p);
+    expect(await count(e)).toBe(10);
+    expect(statSync(p.project.paths.readCopy).mode & 0o222).toBe(0);
+    // A refresh with server mode off leaves 0644: the next swap makes it read-only again.
+    const next = aside(p, "writable-next");
+    chmodSync(next, 0o644);
+    renameSync(next, p.project.paths.readCopy);
+    await until("the swap", () => (e.status().serverMode?.swaps ?? 0) === 1);
+    expect(statSync(p.project.paths.readCopy).mode & 0o222).toBe(0);
   });
 
   withExt("without a copy yet it waits for the first run, and picks the copy up within a second", async () => {
@@ -75,6 +92,28 @@ describe("starting", () => {
     const accepted = await project({ n: 10, config: { serverMode: { enabled: true, acceptFullCopyCost: true } } });
     truncateSync(accepted.database, 1_500_000_000);
     if (ext.ready) engines.push(await openReadersEngine({ root: accepted.root, extensionDir: ext.dir, policy, copyPollMs: 25 }));
+  });
+
+  withExt("a warehouse that grows past the copy limit while croft serve runs does not stop it: /status and /health say so", async () => {
+    const policy = { clone: { canClone: false, method: null, why: "no reflink here" }, thresholdBytes: 1_000_000_000_000 };
+    const p = await project({ n: 10 });
+    const e = await engine(p, { policy });
+    const server = startServer({ engine: e, host: "127.0.0.1", port: 0, token: "tok-for-tests", allowOrigins: [], root: p.root, database: "warehouse.duckdb", timezone: "America/Los_Angeles" });
+    servers.push(server);
+    const get = async (path: string) => (await (await fetch(`${server.url}${path}`, { headers: { Authorization: "Bearer tok-for-tests" } })).json()) as Record<string, any>;
+    expect(e.status().serverMode!.copyCost).toBeNull();
+    expect((await get("/health")).degraded).toBeUndefined();
+    policy.thresholdBytes = 1; // the warehouse is now over the limit
+    expect(e.status().serverMode!.copyCost).toMatchObject({ code: "SERVER_MODE_COPY_COSTLY" });
+    const health = await get("/health");
+    expect(health).toMatchObject({ ok: true, degraded: { code: "SERVER_MODE_COPY_COSTLY" }, serverMode: { state: "open" } });
+    expect(health.degraded.message).toContain("serverMode.acceptFullCopyCost");
+    expect((await get("/status")).data.serve.engine.serverMode.copyCost.code).toBe("SERVER_MODE_COPY_COSTLY");
+    // Still answering, and still taking new copies in.
+    expect(await count(e)).toBe(10);
+    await replaceCopy(p, 12, "2026-10-30T11:00:00Z");
+    await until("the swap", () => (e.status().serverMode?.swaps ?? 0) === 1);
+    expect(await count(e)).toBe(12);
   });
 
   withExt("a copy written by a newer croft fails the start with DB_NEWER_FORMAT, as the live file does", async () => {

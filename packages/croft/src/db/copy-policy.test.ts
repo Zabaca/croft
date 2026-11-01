@@ -2,6 +2,7 @@
 // copy, doctor and status say what it costs, and server mode refuses a warehouse over 1 GB unless the project accepts it.
 // The filesystem is simulated by the `cp` the probe runs: a script that refuses the clone flags, or one that accepts them.
 import { afterAll, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -49,10 +50,10 @@ function sized(bytes: number, serverMode: Record<string, unknown> = { enabled: t
 
 const GB = 1_000_000_000;
 const noClone = (platform: NodeJS.Platform = "linux") => ({ platform, cp: [cpWithoutClone()] });
-const clones = (platform: NodeJS.Platform = "darwin") => ({ platform, cp: [cpThatClones()] });
+const clones = (platform: NodeJS.Platform = "linux") => ({ platform, cp: [cpThatClones()], cloneFile: () => {} });
 
 describe("probeClone", () => {
-  test("tries the platform's strict flag on a small file beside the warehouse, and leaves nothing behind", () => {
+  test("tries a strict clone of a small file beside the warehouse (cp reflink always on Linux), and leaves nothing behind", () => {
     const dir = temp();
     expect(probeClone(dir, clones("darwin"))).toEqual({ canClone: true, method: "clone", why: null });
     expect(probeClone(dir, clones("linux"))).toEqual({ canClone: true, method: "reflink", why: null });
@@ -61,13 +62,23 @@ describe("probeClone", () => {
 
   test("a filesystem that refuses the clone says why", () => {
     const dir = temp();
-    for (const platform of ["linux", "darwin"] as const) {
-      const r = probeClone(dir, noClone(platform));
-      expect(r).toMatchObject({ canClone: false, method: null });
-      expect(r.why).toContain("failed to clone");
-    }
+    const linux = probeClone(dir, noClone("linux"));
+    expect(linux).toMatchObject({ canClone: false, method: null });
+    expect(linux.why).toContain("failed to clone");
+    // macOS: copyFileSync with COPYFILE_FICLONE_FORCE throws ENOTSUP on a volume that cannot clone (FAT, exFAT, a share).
+    const fat = probeClone(dir, { platform: "darwin", cloneFile: () => { throw Object.assign(new Error("ENOTSUP: operation not supported on socket, copyfile"), { code: "ENOTSUP" }); } });
+    expect(fat).toMatchObject({ canClone: false, method: null });
+    expect(fat.why).toContain("ENOTSUP");
     expect(readdirSync(dir)).toEqual([]);
   });
+
+  test("macOS does not take a clone that `cp -c` would have made by copying: the probe does not run cp there", () => {
+    const dir = temp();
+    // A cp that always succeeds (as `cp -c` does on FAT, having copied) must not make the probe say yes.
+    const r = probeClone(dir, { platform: "darwin", cp: [cpThatClones()], cloneFile: () => { throw new Error("ENOTSUP"); } });
+    expect(r.canClone).toBe(false);
+  });
+
 
   test("a platform croft does not clone on, a missing cp and a missing folder cannot clone, and never throw", () => {
     const dir = temp();
@@ -83,6 +94,64 @@ describe("probeClone", () => {
     const r = probeClone(dir);
     expect(typeof r.canClone).toBe("boolean");
     expect(readdirSync(dir)).toEqual([]);
+  });
+});
+
+/** A FAT volume (a disk image, mounted in a temp folder), or null where hdiutil is not there or the mount fails. */
+function fatVolume(): { dir: string; detach(): void } | null {
+  if (process.platform !== "darwin") return null;
+  const base = temp();
+  const made = spawnSync("hdiutil", ["create", "-size", "8m", "-fs", "MS-DOS", "-volname", "CROFTFAT", join(base, "fat")], { stdio: "ignore" });
+  if (made.status !== 0) return null;
+  const dir = join(base, "mnt");
+  mkdirSync(dir);
+  const attached = spawnSync("hdiutil", ["attach", join(base, "fat.dmg"), "-nobrowse", "-mountpoint", dir], { stdio: "ignore" });
+  if (attached.status !== 0) return null;
+  return { dir, detach: () => void spawnSync("hdiutil", ["detach", dir, "-force"], { stdio: "ignore" }) };
+}
+
+describe("probeClone on macOS volumes", () => {
+  test("on APFS it clones; on a FAT disk image it does not, where `cp -c` exits 0 having copied", () => {
+    if (process.platform !== "darwin") return;
+    expect(probeClone(temp())).toMatchObject({ canClone: true, method: "clone" });
+    const fat = fatVolume();
+    if (!fat) {
+      console.warn("[copy-policy.test] SKIPPING the FAT volume check: hdiutil could not make or mount a disk image");
+      return;
+    }
+    try {
+      writeFileSync(join(fat.dir, "a"), "x");
+      const plain = spawnSync("/bin/cp", ["-c", join(fat.dir, "a"), join(fat.dir, "b")]);
+      expect(plain.status).toBe(0); // the reason the probe does not use it
+      const r = probeClone(fat.dir);
+      expect(r).toMatchObject({ canClone: false, method: null });
+      expect(r.why).toContain("ENOTSUP");
+      expect(readdirSync(fat.dir).filter((n) => n.startsWith(".croft-clone-probe"))).toEqual([]);
+      // So a warehouse there, over 1 GB, is refused, and one over 100 MB is warned about.
+      const project = sized(1.5 * GB);
+      expect(assessCopyPolicy(project, { clone: probeClone(fat.dir) }).refused).toBe(true);
+    } finally {
+      fat.detach();
+    }
+  });
+});
+
+describe("when the probe runs", () => {
+  test("not at all under 100 MB (nothing is said or refused there), and once per folder per process otherwise", () => {
+    let calls = 0;
+    const counting = { platform: "darwin" as const, cloneFile: () => void calls++ };
+    expect(assessCopyPolicy(sized(COPY_POLICY.warnBytes - 1), counting).clone).toMatchObject({ canClone: true, method: null });
+    expect(calls).toBe(0);
+    expect(assessCopyPolicy(sized(COPY_POLICY.warnBytes), counting).clone.canClone).toBe(true);
+    expect(calls).toBe(1);
+    // Real calls (no injected way of cloning) share one answer per folder: a second assess writes no second dotfile.
+    const project = sized(2 * COPY_POLICY.warnBytes);
+    const dir = join(project.paths.readCopy, "..");
+    const before = readdirSync(dir).length;
+    const first = assessCopyPolicy(project);
+    const second = assessCopyPolicy(project);
+    expect(second.clone).toBe(first.clone);
+    expect(readdirSync(dir).length).toBe(before);
   });
 });
 

@@ -34,7 +34,7 @@
 // reused); croft serve starts another with a backoff. The instance stays referenced for the process's whole life:
 // Quack's listener, once slice 4 starts one, stops when its instance is collected [V: 2.0.0].
 import type { DuckDBConnection, DuckDBInstance, DuckDBPreparedStatement, DuckDBResult } from "@duckdb/node-api";
-import { rmSync } from "node:fs";
+import { chmodSync, existsSync, rmSync } from "node:fs";
 import { CroftError } from "../core/errors.ts";
 import type { Problem, Sql } from "../core/types.ts";
 import { connect, lockConflict, newerStorage, openInstance, openMemoryInstance, type SandboxSpec } from "../db/connect.ts";
@@ -212,6 +212,8 @@ class Host {
   private instance: DuckDBInstance | null = null;
   private spec: SandboxSpec | null = null;
   private path = "";
+  /** The connection factory's key for this instance: the warehouse path, or for the readers' process `:memory:readers`. */
+  private key = "";
   private protect: string[] = [];
   private readonly idle: DuckDBConnection[] = [];
   private readonly all = new Set<DuckDBConnection>();
@@ -265,9 +267,13 @@ class Host {
         this.spec = readersSpec(m.spec, m.path, m.readers);
         this.path = m.path;
         this.protect = m.protect;
-        this.admin = await connect(this.instance, this.spec, this.path); // checks the files, loads, attaches, locks
+        this.key = READERS_KEY;
+        lockCopy(m.path);
+        this.admin = await connect(this.instance, this.spec, this.key); // checks the files, loads, attaches, locks
+        await this.refuseWal(this.admin);
       } else {
         this.instance = (await openInstance(m.path, "read_only")).instance;
+        this.key = m.path;
         this.spec = m.spec;
         this.path = m.path;
         this.protect = m.protect;
@@ -288,6 +294,18 @@ class Host {
     }
   }
 
+  /** A read-only attach makes no WAL. One that is there right after it appeared while the copy was attached, so something
+   *  had it open for writing: detach, and fail (the process ends and is replaced; the new one removes the file first). */
+  private async refuseWal(admin: DuckDBConnection): Promise<void> {
+    if (!existsSync(`${this.path}.wal`)) return;
+    try {
+      await admin.run(`DETACH ${READ_COPY_ALIAS}`);
+    } catch {
+      // The process ends either way.
+    }
+    throw new Error("a WAL appeared beside the read copy while it was being attached, so it is not served");
+  }
+
   /** Take in the refreshed copy: detach the old file and attach the one now at the same path. */
   private async swap(): Promise<void> {
     const admin = this.admin;
@@ -297,8 +315,10 @@ class Host {
     }
     const done = (async () => {
       rmSync(`${this.path}.wal`, { force: true });
+      lockCopy(this.path);
       await admin.run(`DETACH ${READ_COPY_ALIAS}`);
       await admin.run(`ATTACH ${sqlString(this.path)} AS ${READ_COPY_ALIAS} (READ_ONLY)`);
+      await this.refuseWal(admin);
       // A copy a newer croft wrote is refused here as it is when the process opens (DB_NEWER_FORMAT): the process ends,
       // and the one that replaces it reports the same until the copy is one this croft reads.
       const conn = await this.take();
@@ -364,7 +384,7 @@ class Host {
   private async take(): Promise<DuckDBConnection> {
     const reuse = this.idle.pop();
     if (reuse) return reuse;
-    const conn = await connect(this.instance!, this.spec!, this.path);
+    const conn = await connect(this.instance!, this.spec!, this.key);
     if (this.admin) {
       // The readers' process: the copy is the default database, as the live file's own catalog is in file mode.
       try {
@@ -396,6 +416,23 @@ class Host {
 }
 
 const sqlString = (s: string) => `'${s.replaceAll("'", "''")}'`;
+
+/** The connection factory's key for the readers' process's one instance. */
+export const READERS_KEY = ":memory:readers";
+
+/**
+ * Make the copy read-only on disk before it is attached. A refresh in server mode does it, but a copy a project made while
+ * it only had `readCopy` on is 0644, and attached as it is, a read-write `ATTACH` of it inside the process worked and a
+ * valid WAL was left behind. Not the owner, or root (which ignores the mode): nothing changes, and the gate is the only
+ * guard (D119).
+ */
+export function lockCopy(path: string): void {
+  try {
+    chmodSync(path, 0o444);
+  } catch {
+    // Not ours to change.
+  }
+}
 
 /** The sandbox of the readers' process: the serve profile with the `readers` mode, which attaches `copy` read-only and
  *  allows its path and no folder (db/modes.ts). The one place it is built, so a test that opens the same instance to try
