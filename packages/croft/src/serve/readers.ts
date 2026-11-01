@@ -374,7 +374,9 @@ class ReadersEngine implements ServeEngine {
     try {
       await worker.swap();
     } catch {
-      // The process ended itself (it is part set up) or died: exited() starts another.
+      // The process could not take the copy in and is part set up, or it died: it goes now (its answer to the swap has
+      // been read), and exited() starts another. Queries waiting for it are told to retry.
+      void worker.kill();
       return;
     }
     if (this.worker !== worker) return;
@@ -393,7 +395,8 @@ class ReadersEngine implements ServeEngine {
     this.attached = null;
     this.asOf = null;
     this.restarts++;
-    this.attempts = Date.now() - this.openedAt < QUICK_DEATH_MS ? this.attempts + 1 : 0;
+    // A process we ended (a deadline) is replaced at once; one that died by itself soon after it opened counts against the backoff.
+    this.attempts = !w.stoppedByUs && Date.now() - this.openedAt < QUICK_DEATH_MS ? this.attempts + 1 : 0;
     this.retryAt = Date.now() + this.delayOf(this.attempts);
     this.state = "restarting";
     this.admission.pause();

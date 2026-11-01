@@ -12,6 +12,9 @@ export interface ServeJson extends ServeRecord {
   /** ISO-8601 UTC. */
   startedAt: string;
   version: string;
+  /** Present (true) when this server runs in server mode (D119): it holds the read copy and never the live file, so
+   *  croft doctor does not name it as a holder of the warehouse. Absent for the file engine. */
+  serverMode?: true;
 }
 
 /** GET /health */

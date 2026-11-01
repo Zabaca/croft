@@ -470,7 +470,8 @@ async function checkWarehouse(r: Report, d: DoctorDeps, project: Project, bindin
       }
       return m;
     }, { waitMs: d.lockWaitMs, purpose: "doctor" });
-    const serveHolds = serve !== null && serve.alive;
+    // A server in server mode (serve.json says so) holds the read copy, never this file (D119).
+    const serveHolds = serve !== null && serve.alive && serve.raw.serverMode !== true;
     parts.push(serveHolds ? `held read-only by croft's read server (pid ${serve.pid}; steps aside for writes)` : "not held");
     if (meta.format_version) {
       parts.push(`duckdb ${String(meta.duckdb_version ?? "?").replace(/^v/, "")} · croft format ${meta.format_version}`);

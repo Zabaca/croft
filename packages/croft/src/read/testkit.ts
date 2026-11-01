@@ -170,9 +170,10 @@ export function writeIntent(stateDir: string, pid: number, runId = "r_test"): st
 }
 
 /** Write <state>/serve.json for a (live or dead) process. */
-export function writeServeJson(stateDir: string, o: { url: string; token?: string; pid: number; procStart?: string | null; bootId?: string | null }): void {
+export function writeServeJson(stateDir: string, o: { url: string; token?: string; pid: number; procStart?: string | null; bootId?: string | null; serverMode?: true }): void {
   const rec: Record<string, unknown> = { url: o.url, pid: o.pid };
   if (o.token !== undefined) rec.token = o.token;
+  if (o.serverMode) rec.serverMode = true;
   if (o.procStart !== null) rec.procStart = o.procStart ?? procStart(o.pid);
   if (o.bootId !== null) rec.bootId = o.bootId ?? bootId();
   writeFileSync(join(stateDir, "serve.json"), JSON.stringify(rec), { mode: 0o600 });

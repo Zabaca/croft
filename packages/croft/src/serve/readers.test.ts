@@ -160,12 +160,17 @@ describe("the copy is refreshed under the readers", () => {
     expect(failures).toEqual([]);
     expect(e.status().serverMode).toMatchObject({ workerPid: pid, swaps: 3, restarts: 0 });
     expect(await count(e)).toBe(40);
+    expect(e.status().openConnections).toBeGreaterThan(0);
+    // The readers wrote nothing into the copy they served: after they stop, it is the file that was put there.
+    const placed = sha(p.project.paths.readCopy);
+    await e.close();
+    expect(sha(p.project.paths.readCopy)).toBe(placed);
+    expect(existsSync(`${p.project.paths.readCopy}.wal`)).toBe(false);
     // Every client saw the data move on, and only the counts the copies held.
     for (const s of seen) {
       expect([...s].every((n) => [10, 20, 30, 40].includes(n))).toBe(true);
       expect(s.has(40)).toBe(true);
     }
-    expect(e.status().openConnections).toBeGreaterThan(0);
   });
 
   withExt("a refresh that lands while a long query reads the old file lets that query finish on it", async () => {

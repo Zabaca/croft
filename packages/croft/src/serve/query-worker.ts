@@ -139,6 +139,11 @@ export class QueryWorker {
     return this.gone === null;
   }
 
+  /** The engine killed it (kill()), as opposed to it exiting by itself or being killed by something else. */
+  get stoppedByUs(): boolean {
+    return this.killedByUs;
+  }
+
   /** Open the file read-only with the serve sandbox and check its format. Throws a CroftError (DB_NEWER_FORMAT,
    *  CONFIG_INVALID, ...), WorkerConflict (another process holds the file), WorkerGone, or an Error. */
   async open(o: { path: string; spec: SandboxSpec; protect: string[]; readers?: { extensionDir: string; secretDir: string } }): Promise<void> {

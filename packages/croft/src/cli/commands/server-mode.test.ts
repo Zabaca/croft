@@ -7,10 +7,10 @@ import { chmodSync, mkdtempSync, realpathSync, rmSync, truncateSync, utimesSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SELF_ROOT } from "../launcher.ts";
-import { cleanup as cleanupChildren, spawnIdle, writeServeJson } from "../../read/testkit.ts";
+import { cleanup as cleanupChildren, releaseHolder, spawnHolder, spawnIdle, writeServeJson } from "../../read/testkit.ts";
 import { loadProject } from "../../project/root.ts";
 import { defaultDeps, type DoctorDeps, formatDoctor, runDoctor } from "./doctor.ts";
-import { cleanup, cli, makeProject, type TestProject } from "./inspect-testkit.ts";
+import { cleanup, cli, makeProject, seed, type TestProject } from "./inspect-testkit.ts";
 import { formatBanner, type ServeData } from "./serve.ts";
 import { collectStatus, formatStatus } from "./status.ts";
 
@@ -127,6 +127,44 @@ describe("croft doctor", () => {
     expect(data.checks.find((c) => c.id === "readcopy.cost")).toBeUndefined();
     expect(formatDoctor(data, [])).toContain("server mode on");
   });
+
+  test("the warehouse line does not name a server mode croft serve as a holder; it still names a file mode one", async () => {
+    const p = serverProject({ copyAt: "2026-09-24T17:00:00.000Z" });
+    rmSync(p.database); // the fixture's placeholder file; a real warehouse takes its place
+    await seed(p.database, ["CREATE TABLE orders AS SELECT range AS id FROM range(10)"]);
+    const idle = spawnIdle();
+    writeServeJson(p.stateDir, { url: "http://127.0.0.1:1", token: "t", pid: idle.pid, serverMode: true });
+    const inServerMode = (await runDoctor(p.root, deps())).data.checks.find((c) => c.id === "warehouse")!;
+    expect(inServerMode.text).toContain("not held");
+    expect(inServerMode.text).not.toContain("read server");
+    expect(inServerMode.details).toMatchObject({ heldBy: null });
+    // A server of the file engine, which does hold it, is still named.
+    rmSync(join(p.stateDir, "serve.json"));
+    writeServeJson(p.stateDir, { url: "http://127.0.0.1:1", token: "t", pid: idle.pid });
+    const inFileMode = (await runDoctor(p.root, deps())).data.checks.find((c) => c.id === "warehouse")!;
+    expect(inFileMode.text).toContain(`held read-only by croft's read server (pid ${idle.pid}; steps aside for writes)`);
+  });
+
+  test("a lock on the live file is a croft run's or a foreign program's, never croft serve's: it is not the holder in server mode", async () => {
+    const p = serverProject({ copyAt: "2026-09-24T17:00:00.000Z" });
+    rmSync(p.database); // the fixture's placeholder file; a real warehouse takes its place
+    await seed(p.database, ["CREATE TABLE orders AS SELECT range AS id FROM range(10)"]);
+    // croft serve is running (a live process recorded in serve.json), and a program that is not croft holds the file.
+    const idle = spawnIdle();
+    writeServeJson(p.stateDir, { url: "http://127.0.0.1:1", token: "t", pid: idle.pid });
+    const holder = spawnHolder(p.database, "release");
+    await holder.waitFor("held");
+    try {
+      const { data } = await runDoctor(p.root, deps());
+      const w = data.checks.find((c) => c.id === "warehouse")!;
+      expect(w).toMatchObject({ status: "error", code: "DB_HELD_BY_OTHER_PROGRAM", details: { heldBy: { pid: holder.pid } } });
+      expect(w.text).not.toContain("croft serve");
+      expect(w.text).not.toContain(`PID ${idle.pid}`);
+    } finally {
+      releaseHolder(holder);
+      await holder.waitFor("released");
+    }
+  }, 20_000);
 
   test("a project without server mode has no server mode line", async () => {
     const p = serverProject({ serverMode: null, readCopy: true, copyAt: "2026-09-24T17:00:00.000Z" });

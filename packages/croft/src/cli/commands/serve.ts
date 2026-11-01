@@ -137,6 +137,7 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
     writeServeJson(stateDir, {
       url: server.url, host: server.host, port: server.port, token: token.token, pid: id.pid, procStart: id.procStart,
       bootId: id.bootId, startedAt: started.toISOString(), version: CROFT_VERSION,
+      ...(engine.status().serverMode ? { serverMode: true as const } : {}),
     });
     loop = startLoop({
       root: project.root, stateDir, env: tickEnv(ctx.processEnv), intervalMs: deps.tickIntervalMs ?? TICK_INTERVAL_MS,

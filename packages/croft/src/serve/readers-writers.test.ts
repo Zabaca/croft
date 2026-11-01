@@ -7,7 +7,7 @@ import { DuckDBInstance } from "@duckdb/node-api";
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { closeAllWarehouses } from "../db/warehouse.ts";
-import { cleanup, seed, spawnWriter, type TempProject } from "../read/testkit.ts";
+import { cleanup, releaseHolder, seed, spawnHolder, spawnWriter, type TempProject } from "../read/testkit.ts";
 import { ask, count, extensionFiles, openEngine, project, rejection, replaceCopy, until } from "./readers-testkit.ts";
 import { type RunningServer, startServer } from "./server.ts";
 import type { ServeEngine, ServeQueryData } from "./types.ts";
@@ -52,6 +52,19 @@ describe("the live file", () => {
     expect(intents(p)).toEqual([]);
     // The copy has not changed, and neither has what serve answers.
     expect(await count(e)).toBe(10);
+  });
+
+  withExt("a program that is not croft (the DuckDB UI, DBeaver) holding the live file does not stop it either", async () => {
+    const p = await project({ n: 10 });
+    const e = await engine(p);
+    const holder = spawnHolder(p.database, "release");
+    await holder.waitFor("held");
+    const t = performance.now();
+    expect(await count(e)).toBe(10);
+    expect(performance.now() - t).toBeLessThan(CI ? 3000 : 1500);
+    expect(e.status().serverMode).toMatchObject({ state: "open", restarts: 0 });
+    releaseHolder(holder);
+    await holder.waitFor("released");
   });
 
   withExt("a croft writer's lease does not step the server aside: 100 HTTP queries during a 10 s write step all answer from the copy at once", async () => {

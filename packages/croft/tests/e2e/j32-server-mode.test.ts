@@ -104,7 +104,14 @@ describe("journey 32: server mode", () => {
     expect(health).toMatchObject({ ok: true, writeIntent: null, serverMode: { state: "open", asOf: q.data.asOf } });
 
     // doctor and status say what is going on.
-    expect((await p.json(["doctor"], home)).json.data.checks.find((c: Envelope) => c.id === "servermode")).toMatchObject({ status: "ok", details: { serving: true } });
+    const live = await p.json(["doctor"], home);
+    expect(live.json.data.checks.find((c: Envelope) => c.id === "servermode")).toMatchObject({ status: "ok", details: { serving: true } });
+    // croft serve holds only the copy: doctor does not name it as a holder of the warehouse.
+    const warehouse = live.json.data.checks.find((c: Envelope) => c.id === "warehouse");
+    expect(warehouse.text).toContain("not held");
+    expect(warehouse.text).not.toContain("read server");
+    expect(warehouse.details.heldBy).toBeNull();
+    expect(JSON.parse(readFileSync(file, "utf8")).serverMode).toBe(true);
     const status = await p.json(["status"], home);
     expect(status.json.data.serverMode).toEqual({ serving: true });
 
