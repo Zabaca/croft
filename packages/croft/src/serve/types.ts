@@ -12,6 +12,9 @@ export interface ServeJson extends ServeRecord {
   /** ISO-8601 UTC. */
   startedAt: string;
   version: string;
+  /** Present (true) when this server runs in server mode (D119): it holds the read copy and never the live file, so
+   *  croft doctor does not name it as a holder of the warehouse. Absent for the file engine. */
+  serverMode?: true;
 }
 
 /** GET /health */
@@ -23,6 +26,10 @@ export interface ServeHealth {
   /** The live write intent the server stepped aside for, or null. */
   writeIntent: { pid: number; runId: string | null; since: string } | null;
   queriesToday: number;
+  /** Server mode only: answers come from the read copy as of this time (null until the readers' process has one). */
+  serverMode?: { state: string; asOf: string | null };
+  /** Set (server mode) when the server answers but something the user should fix makes it a problem: the copy limit. */
+  degraded?: { code: string; message: string };
 }
 
 /**
@@ -64,9 +71,11 @@ export interface ServeQueryData {
   rows: Record<string, unknown>[];
   rowCount: number;
   tookMs: number;
-  /** Answered from the read copy (readCopy on) while a writer held the live file. Absent for live answers. */
+  /** Answered from the read copy (readCopy on) while a writer held the live file. Absent for live answers, and in
+   *  server mode, where every answer is from the copy and none is "stale". */
   stale?: true;
-  /** With stale: the read copy's mtime (the checkpoint it was taken at), in the project offset. */
+  /** The read copy's mtime (the checkpoint it was taken at), in the project offset: with stale, the copy that answered
+   *  in place of the live file; in server mode (D119) on every answer. */
   asOf?: string;
 }
 
@@ -78,6 +87,23 @@ export interface ServeEngineStatus {
   /** DuckDB connections open right now (0 whenever the file is released). */
   openConnections: number;
   queriesToday: number;
+  /** Server mode only (D119): the readers' engine (serve/readers.ts). `state` is the engine's own: "waiting" for the
+   *  first copy, "starting", "open", "restarting" after a kill, a crash or a failed start, or "stopped". */
+  serverMode?: {
+    state: "waiting" | "starting" | "open" | "restarting" | "stopped";
+    /** The read copy, and its as-of time (in the project offset) as the readers' process has it; null before it opens. */
+    copy: string;
+    asOf: string | null;
+    workerPid: number | null;
+    /** Refreshed copies taken in, and times the readers' process was started again, since croft serve started. */
+    swaps: number;
+    restarts: number;
+    /** Set when each refresh is a full copy the project has not accepted (the warehouse grew past 1 GB where the
+     *  filesystem cannot clone, D121); null otherwise. The server keeps answering, from a copy that keeps being refreshed. */
+    copyCost: { code: string; message: string } | null;
+    /** A child process is making the read copy now (it was missing, behind or failed; serve/copy-maker.ts). */
+    makingCopy: boolean;
+  };
 }
 
 export interface ServeEngineOptions {

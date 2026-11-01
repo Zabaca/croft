@@ -69,7 +69,7 @@ describe("loadProject", () => {
     expect(p.root).toBe(root);
     expect(p.timezone).toBe("Asia/Tokyo");
     expect(p.config).toEqual({
-      database: "warehouse.duckdb", timezone: "Asia/Tokyo", readCopy: false,
+      database: "warehouse.duckdb", timezone: "Asia/Tokyo", readCopy: false, serverMode: { enabled: false, acceptFullCopyCost: false },
       notify: { desktop: true, webhook: null }, concurrency: 4, http: { budgets: {} },
       serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 30000, maxConcurrent: 4, maxBytes: 67108864, maxRows: 100000, allowOrigins: [] },
       stateDir: null, secretsFrom: null,
@@ -264,7 +264,7 @@ describe("croft.json validation messages", () => {
     const [j] = issues('{"timezone": "UTC", "serve": {"prot": 1}}');
     expect(j!.message).toBe('unknown key "serve.prot"; did you mean "serve.port"?');
     const [k] = issues('{"timezone": "UTC", "colour": 1}');
-    expect(k!.message).toBe('unknown key "colour"; croft.json takes "database", "timezone", "readCopy", "notify", "concurrency", "http", "serve", "stateDir", "secretsFrom"');
+    expect(k!.message).toBe('unknown key "colour"; croft.json takes "database", "timezone", "readCopy", "serverMode", "notify", "concurrency", "http", "serve", "stateDir", "secretsFrom"');
   });
 
   test("time zones: misspelled case, a city, and a fixed offset", () => {
@@ -344,6 +344,30 @@ describe("croft.json validation messages", () => {
     }));
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.config.serve.allowOrigins).toEqual(["http://localhost:3000"]);
+  });
+
+  test("serverMode is off by default; turning it on turns the read copy on, whatever readCopy says", () => {
+    const off = parseConfig(JSON.stringify(MIN));
+    expect(off.ok && off.config.serverMode).toEqual({ enabled: false, acceptFullCopyCost: false });
+    expect(off.ok && off.config.readCopy).toBe(false);
+    const on = parseConfig(JSON.stringify({ ...MIN, serverMode: { enabled: true } }));
+    expect(on.ok && on.config.serverMode).toEqual({ enabled: true, acceptFullCopyCost: false });
+    expect(on.ok && on.config.readCopy).toBe(true);
+    const onAndOff = parseConfig(JSON.stringify({ ...MIN, readCopy: false, serverMode: { enabled: true, acceptFullCopyCost: true } }));
+    expect(onAndOff.ok && onAndOff.config.readCopy).toBe(true);
+    expect(onAndOff.ok && onAndOff.config.serverMode.acceptFullCopyCost).toBe(true);
+    // A copy without server mode stays what readCopy says.
+    const copyOnly = parseConfig(JSON.stringify({ ...MIN, readCopy: true }));
+    expect(copyOnly.ok && copyOnly.config.serverMode.enabled).toBe(false);
+  });
+
+  test("serverMode is validated like every setting: types, unknown keys with a did-you-mean", () => {
+    expect(issues(JSON.stringify({ ...MIN, serverMode: true })).map((i) => i.message)).toEqual(['"serverMode" must be an object; found true']);
+    expect(issues(JSON.stringify({ ...MIN, serverMode: { enabled: "yes" } })).map((i) => i.message)).toEqual(['"serverMode.enabled" must be true or false; found "yes"']);
+    const [typo] = issues(JSON.stringify({ ...MIN, serverMode: { enable: true } }));
+    expect(typo!.message).toBe('unknown key "serverMode.enable"; did you mean "serverMode.enabled"?');
+    const [other] = issues(JSON.stringify({ ...MIN, serverMode: { tables: [] } }));
+    expect(other!.message).toBe('unknown key "serverMode.tables"; "serverMode" takes "enabled", "acceptFullCopyCost"');
   });
 
   test("configProblems gives one CONFIG_INVALID per issue", () => {

@@ -7,6 +7,10 @@ details.extension names the extension, details.path where croft looked, and deta
 missing file, "platform" means croft pins no extension for this operating system and CPU (the modes run on macOS
 and on Linux with glibc, on x64 and arm64; Alpine and other musl systems and Windows are not covered).
 
+The extensions folder is $CROFT_EXTENSION_DIR, else ~/.cache/croft/test-extensions (details.path is the file looked
+for). Server mode (croft docs server-mode) reads the same folder, so with "serverMode" on, croft serve does not start
+until the files are there.
+
 The project's data was not touched.
 
 What to do:

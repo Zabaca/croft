@@ -52,6 +52,7 @@ import type { IntentEntry } from "../db/intent.ts";
 import { backoffMs } from "../db/warehouse.ts";
 import { loadProject, type Project } from "../project/root.ts";
 import { mapQueryError } from "../read/select.ts";
+import { restartedError, RETRY_AFTER_MS, secs, stopError } from "./errors.ts";
 import { drain, IntentWatch } from "./handoff.ts";
 import { Admission, type Flight, type StopReason } from "./queue.ts";
 import { QueryWorker, WorkerConflict, WorkerGone, WorkerStopped } from "./query-worker.ts";
@@ -74,7 +75,7 @@ export const SERVE_DEFAULTS = {
   /** How long a worker may take to disconnect its connections before it is killed anyway. */
   disconnectWaitMs: 250,
   /** What a 503 tells the client to wait: a write step usually takes seconds. */
-  retryAfterMs: 1000,
+  retryAfterMs: RETRY_AFTER_MS,
   /** The read copy's worker stays up this long after its last query. */
   copyLingerMs: 100,
 } as const;
@@ -128,8 +129,6 @@ export async function openServeEngine(o: ServeEngineOptions & ServeEngineInterna
   await engine.start();
   return engine;
 }
-
-const secs = (ms: number) => Math.round(ms / 100) / 10;
 
 /** What a file is opened with in a worker. */
 interface OpenSpec { path: string; spec: SandboxSpec; protect: string[] }
@@ -722,12 +721,7 @@ class Engine implements ServeEngine {
 
   /** A query that ran in a worker which went away under it (killed for another, stuck query, or crashed). */
   private restarted(e: WorkerGone | null): CroftError {
-    return new CroftError("SERVE_UNAVAILABLE", {
-      message: "croft's read server restarted its query worker while this query ran (to end another query that interrupts could not stop, or after a crash); it returned nothing",
-      hint: "retry after Retry-After; if it keeps failing, the query itself may be too heavy: filter or aggregate in SQL",
-      retryable: true,
-      details: { reason: "restarted", retryAfterMs: SERVE_DEFAULTS.retryAfterMs, worker: e?.message ?? null },
-    });
+    return restartedError(e);
   }
 
   /** What a stopped query (or a request refused because the server stops) reports. */
@@ -743,26 +737,8 @@ class Engine implements ServeEngine {
           details: { reason: "write", retryAfterMs, graceMs: this.graceMs, writeIntent: i ? this.writeDetails(i) : null },
         });
       }
-      case "timeout":
-        return new CroftError("TIMEOUT", {
-          message: `the query ran longer than serve.queryTimeoutMs (${secs(this.queryTimeoutMs)} s) and was stopped`,
-          hint: "make it cheaper (filter or aggregate in SQL, add a LIMIT), or raise serve.queryTimeoutMs in croft.json",
-          retryable: false,
-          details: { phase: "query", timeoutMs: this.queryTimeoutMs },
-        });
-      case "abort":
-        return new CroftError("INTERRUPTED", {
-          message: "the request went away, so its query was stopped",
-          hint: "nothing to do: the client disconnected or cancelled the request",
-          details: { reason: "abort" },
-        });
-      case "stop":
-        return new CroftError("SERVE_UNAVAILABLE", {
-          message: "croft's read server is stopping; the query was not answered",
-          hint: "retry once croft serve runs again; without it, @zabaca/croft/read reads the file directly",
-          retryable: true,
-          details: { reason: "stopping", retryAfterMs },
-        });
+      default:
+        return stopError(reason, { queryTimeoutMs: this.queryTimeoutMs });
     }
   }
 

@@ -6,6 +6,7 @@
 // scripts/fetch-extensions.ts; how users get them is a later decision (option 06, slice 5).
 import { createHash } from "node:crypto";
 import { closeSync, openSync, readdirSync, readSync, readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import type { Fix } from "../core/types.ts";
@@ -70,6 +71,16 @@ export function hostPlatform(os: string = process.platform, arch: string = proce
     return arch === "x64" ? "linux_amd64" : arch === "arm64" ? "linux_arm64" : null;
   }
   return null;
+}
+
+/**
+ * The folder the modes' extension files are read from in this build: $CROFT_EXTENSION_DIR, else a cache folder
+ * (`$XDG_CACHE_HOME` or `~/.cache`, then `croft/test-extensions`) shared by every project and, for builders, every
+ * worktree: the one scripts/fetch-extensions.ts fills. Server mode (D119) reads it. How a user gets the files without
+ * the croft repository is option 06's slice 5, which replaces this default.
+ */
+export function resolveExtensionDir(env: NodeJS.ProcessEnv = process.env): string {
+  return env.CROFT_EXTENSION_DIR || join(env.XDG_CACHE_HOME || join(homedir(), ".cache"), "croft", "test-extensions");
 }
 
 /** Where `name` lives under an extension folder: `<dir>/v<duckdb>/<platform>/<file>.duckdb_extension`, DuckDB's own layout. */

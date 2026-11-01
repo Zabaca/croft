@@ -17,6 +17,10 @@ export interface NotifyConfig { desktop: boolean; webhook: string | null }
 export interface ServeConfig {
   port: number; host: string; queryTimeoutMs: number; maxConcurrent: number; maxBytes: number; maxRows: number; allowOrigins: string[];
 }
+/** Server mode (option 06, D119): croft serve answers from a readers' process on the read copy and never opens the live
+ *  file. `enabled` turns the read copy on too. `acceptFullCopyCost` accepts a plain copy of a warehouse over 1 GB at every
+ *  refresh on a filesystem that cannot clone (db/copy-policy.ts); without it, server mode refuses that combination. */
+export interface ServerModeConfig { enabled: boolean; acceptFullCopyCost: boolean }
 /** Where secrets come from besides the shell and .env (§9.8 "Secrets", D108): a command whose output is dotenv. */
 export interface SecretsFrom { command: string[] }
 /** A request budget for one host (http.budgets, D104): at most this many requests ctx.http sends to it in any
@@ -29,7 +33,9 @@ export interface HttpConfig {
 export interface CroftConfig {
   database: string;                  // as written: relative to the root, or absolute after relocation
   timezone: string;
+  /** The read copy is kept: `readCopy` in croft.json, or on whenever server mode is (the copy is what it serves). */
   readCopy: boolean;
+  serverMode: ServerModeConfig;
   notify: NotifyConfig;
   concurrency: number;               // parallel extractions in one run
   http: HttpConfig;
@@ -41,6 +47,7 @@ export interface CroftConfig {
 export const DEFAULTS = {
   database: "warehouse.duckdb",
   readCopy: false,
+  serverMode: { enabled: false, acceptFullCopyCost: false },
   notify: { desktop: true, webhook: null },
   concurrency: 4,
   http: { budgets: {} },
@@ -52,6 +59,8 @@ export const CONFIG_KEYS: { key: string; type: string; default: string; descript
   { key: "database", type: "string", default: `"${DEFAULTS.database}"`, description: "the DuckDB file, relative to the project folder (absolute after relocation)" },
   { key: "timezone", type: "string", default: "(required)", description: "IANA zone for schedules, ::DATE and JSON timestamps, e.g. \"America/Los_Angeles\"; changing it rebuilds every transform" },
   { key: "readCopy", type: "boolean", default: "false", description: "keep warehouse.read.duckdb, a copy for GUIs and notebooks, refreshed after runs" },
+  { key: "serverMode.enabled", type: "boolean", default: "false", description: "server mode: croft serve answers apps from a readers' process on the read copy and never opens the warehouse file; turns the read copy on, read-only on disk (croft docs server-mode)" },
+  { key: "serverMode.acceptFullCopyCost", type: "boolean", default: "false", description: "accept that every refresh of the read copy is a full copy of a warehouse over 1 GB (the filesystem cannot clone it); without this, server mode refuses to start there" },
   { key: "notify.desktop", type: "boolean", default: "true", description: "desktop notification when a scheduled run fails" },
   { key: "notify.webhook", type: "string | null", default: "null", description: "http(s) URL that receives the failure envelope of a scheduled run" },
   { key: "concurrency", type: "integer", default: String(DEFAULTS.concurrency), description: "extractions that run at the same time in one run (1-64)" },
@@ -67,7 +76,8 @@ export const CONFIG_KEYS: { key: string; type: string; default: string; descript
   { key: "secretsFrom.command", type: "string[]", default: "null", description: "a command, run from the project folder without a shell, that prints the secrets the shell and .env lack as KEY=value lines, e.g. [\"sops\", \"-d\", \"--output-type\", \"dotenv\", \"secrets.enc.yaml\"] (croft docs secrets)" },
 ];
 
-const TOP_KEYS = ["$schema", "database", "timezone", "readCopy", "notify", "concurrency", "http", "serve", "stateDir", "secretsFrom"];
+const TOP_KEYS = ["$schema", "database", "timezone", "readCopy", "serverMode", "notify", "concurrency", "http", "serve", "stateDir", "secretsFrom"];
+const SERVER_MODE_KEYS = ["enabled", "acceptFullCopyCost"];
 const NOTIFY_KEYS = ["desktop", "webhook"];
 const HTTP_KEYS = ["budgets"];
 const BUDGET_KEYS = ["perMinute", "perHour", "perDay"];
@@ -197,6 +207,14 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined, p
   const readCopy = bool(raw, "readCopy", "readCopy", DEFAULTS.readCopy);
   const concurrency = int(raw, "concurrency", "concurrency", DEFAULTS.concurrency, 1, 64);
 
+  // serverMode (D119): off unless the project turns it on, and turning it on turns the read copy on.
+  const sm = obj("serverMode", "serverMode");
+  unknownKeys(sm, SERVER_MODE_KEYS, "serverMode");
+  const serverMode: ServerModeConfig = {
+    enabled: bool(sm, "serverMode.enabled", "enabled", DEFAULTS.serverMode.enabled),
+    acceptFullCopyCost: bool(sm, "serverMode.acceptFullCopyCost", "acceptFullCopyCost", DEFAULTS.serverMode.acceptFullCopyCost),
+  };
+
   // notify
   const n = obj("notify", "notify");
   unknownKeys(n, NOTIFY_KEYS, "notify");
@@ -305,7 +323,7 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined, p
   }
 
   if (issues.length) return { ok: false, issues };
-  return { ok: true, config: { database, timezone, readCopy, notify: { desktop, webhook }, concurrency, http: { budgets }, serve, stateDir, secretsFrom } };
+  return { ok: true, config: { database, timezone, readCopy: readCopy || serverMode.enabled, serverMode, notify: { desktop, webhook }, concurrency, http: { budgets }, serve, stateDir, secretsFrom } };
 }
 
 /**

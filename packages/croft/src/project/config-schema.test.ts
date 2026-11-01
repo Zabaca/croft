@@ -73,6 +73,7 @@ const VALID: unknown[] = [
   { ...tz, secretsFrom: { command: ["sops", "-d", "--output-type", "dotenv", "secrets.enc.yaml"] } },
   { ...tz, secretsFrom: { command: ["/opt/homebrew/bin/sops"] } }, { ...tz, secretsFrom: null },
   { ...tz, http: {} }, { ...tz, http: { budgets: {} } },
+  { ...tz, serverMode: {} }, { ...tz, serverMode: { enabled: true } }, { ...tz, serverMode: { enabled: true, acceptFullCopyCost: true }, readCopy: false },
   { ...tz, http: { budgets: { "api.example.com": { perHour: 50, perDay: 125 }, "127.0.0.1:8080": { perMinute: 1 }, "[::1]:9000": { perDay: 1_000_000_000 } } } },
 ];
 const INVALID: unknown[] = [
@@ -87,6 +88,8 @@ const INVALID: unknown[] = [
   { ...tz, databse: "x.duckdb" },
   { ...tz, schedule: "daily" },
   { ...tz, readCopy: "true" },
+  { ...tz, serverMode: true }, { ...tz, serverMode: [] }, { ...tz, serverMode: { enabled: "true" } }, { ...tz, serverMode: { acceptFullCopyCost: 1 } },
+  { ...tz, serverMode: { enable: true } }, { ...tz, serverMode: { tables: ["orders"] } },
   { ...tz, concurrency: 0 }, { ...tz, concurrency: 65 }, { ...tz, concurrency: 1.5 }, { ...tz, concurrency: "4" },
   { ...tz, notify: [] }, { ...tz, notify: true },
   { ...tz, notify: { desktop: "yes" } },

@@ -1,16 +1,9 @@
 // Where croft's tests (and scripts/fetch-extensions.ts) find the pinned DuckDB extension files (DESIGN.md D117).
 // Test support, left out of the published package (package.json "files"); the files are never committed.
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { DUCKDB_VERSION } from "./extension-names.ts";
 import { type ExtensionName } from "./extension-names.ts";
-import { extensionPath, hostPlatform, verifyExtension } from "./extension-files.ts";
-
-/** The folder tests read: $CROFT_EXTENSION_DIR, else a cache shared by every worktree. */
-export function testExtensionDir(): string {
-  return process.env.CROFT_EXTENSION_DIR ?? join(process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache"), "croft", "test-extensions");
-}
+import { extensionPath, hostPlatform, resolveExtensionDir, verifyExtension } from "./extension-files.ts";
 
 /** Whether this is CI (the workflow sets CROFT_CI): a test that needs the files must fail there, never skip. */
 export const IN_CI = process.env.CROFT_CI === "1";
@@ -21,7 +14,7 @@ export const IN_CI = process.env.CROFT_CI === "1";
  * cannot pass by skipping.
  */
 export function extensionsReady(names: readonly ExtensionName[]): { ready: boolean; dir: string; skipReason: string } {
-  const dir = testExtensionDir();
+  const dir = resolveExtensionDir();
   const platform = hostPlatform();
   const fillWith = `bun packages/croft/scripts/fetch-extensions.ts "${dir}"`;
   const reason = (what: string) => `${what} (${DUCKDB_VERSION}); fill it with: ${fillWith}`;

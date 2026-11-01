@@ -85,6 +85,7 @@ export class QueryWorker {
   private readonly proc: Subprocess<"ignore", "ignore", "pipe"> | null;
   private readonly queries = new Map<number, Waiting<WorkerAnswer>>();
   private opening: Waiting<void> | null = null;
+  private swapWait: Waiting<void> | null = null;
   private disconnecting: Waiting<number>[] = [];
   private readyWait!: Waiting<void>;
   private gone: WorkerGone | null = null;
@@ -118,6 +119,8 @@ export class QueryWorker {
       this.readyWait.reject(this.gone);
       this.opening?.reject(this.gone);
       this.opening = null;
+      this.swapWait?.reject(this.gone);
+      this.swapWait = null;
       for (const w of this.queries.values()) w.reject(this.gone);
       this.queries.clear();
       for (const w of this.disconnecting.splice(0)) w.resolve(0);
@@ -136,13 +139,28 @@ export class QueryWorker {
     return this.gone === null;
   }
 
+  /** The engine killed it (kill()), as opposed to it exiting by itself or being killed by something else. */
+  get stoppedByUs(): boolean {
+    return this.killedByUs;
+  }
+
   /** Open the file read-only with the serve sandbox and check its format. Throws a CroftError (DB_NEWER_FORMAT,
    *  CONFIG_INVALID, ...), WorkerConflict (another process holds the file), WorkerGone, or an Error. */
-  async open(o: { path: string; spec: SandboxSpec; protect: string[] }): Promise<void> {
+  async open(o: { path: string; spec: SandboxSpec; protect: string[]; readers?: { extensionDir: string; secretDir: string } }): Promise<void> {
     await this.ready;
     if (this.opening) throw new Error("the query worker is already opening a database");
     const p = new Promise<void>((resolve, reject) => (this.opening = { resolve, reject }));
     this.post({ op: "open", ...o });
+    return p;
+  }
+
+  /** Server mode: the readers' process takes in the copy now at its path (detach, attach). Resolves when queries read
+   *  the new file; rejects with the error that made the process end itself (it is gone, or about to be). */
+  swap(): Promise<void> {
+    if (this.gone) return Promise.reject(this.gone);
+    if (this.swapWait) return Promise.reject(new Error("the readers' process is already swapping the copy"));
+    const p = new Promise<void>((resolve, reject) => (this.swapWait = { resolve, reject }));
+    this.post({ op: "swap" });
     return p;
   }
 
@@ -203,6 +221,15 @@ export class QueryWorker {
       case "open_failed":
         this.opening?.reject(fromWire(m.error));
         this.opening = null;
+        return;
+      case "swapped":
+        this.conns = m.conns;
+        this.swapWait?.resolve();
+        this.swapWait = null;
+        return;
+      case "swap_failed":
+        this.swapWait?.reject(fromWire(m.error));
+        this.swapWait = null;
         return;
       case "answer":
       case "failed": {

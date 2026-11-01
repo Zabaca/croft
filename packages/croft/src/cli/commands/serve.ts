@@ -23,7 +23,7 @@ import type { Project } from "../../project/root.ts";
 import { liveServer } from "../../read/locate.ts";
 import type { SchedulingSetting } from "../../schedule/os.ts";
 import { isLoopbackHost, isUnspecifiedHost, resolveToken, type ServeToken, urlHost } from "../../serve/auth.ts";
-import { openServeEngine } from "../../serve/instance.ts";
+import { openEngine } from "../../serve/open.ts";
 import { type LoopEvent, type SchedulerLoop, startLoop, TICK_INTERVAL_MS, tickEnv, type TickSpawner } from "../../serve/loop.ts";
 import {
   alreadyServing, removeServeJson, type RunningServer, type ServerOptions, serveJsonPath, startServer, writeServeJson,
@@ -54,6 +54,9 @@ export interface ServeData {
   scheduling: { state: SchedulingSetting["state"]; via: SchedulingSetting["via"]; pausedUntil: string | null; tickEveryMs: number };
   /** Set once it stopped. */
   stopped: { signal: string; at: string } | null;
+  /** Only with serverMode on (D119): croft serve answers from this read copy (relative to the project when inside it),
+   *  as of this time (null until the first copy exists), and never opens the warehouse file. */
+  serverMode?: { readCopy: string; asOf: string | null };
 }
 
 /** What tests replace. Everything defaults to the real thing. */
@@ -123,7 +126,7 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
 
   const started = ctx.now();
   try {
-    engine = await (deps.openEngine ?? openServeEngine)({ root: project.root, maxConcurrent: cfg.maxConcurrent, queryTimeoutMs: cfg.queryTimeoutMs });
+    engine = await (deps.openEngine ?? openEngine)({ root: project.root, maxConcurrent: cfg.maxConcurrent, queryTimeoutMs: cfg.queryTimeoutMs });
     server = (deps.listen ?? startServer)({
       engine, host, port, token: token.token, allowOrigins: cfg.allowOrigins, root: project.root,
       database: project.databaseLabel, timezone: project.timezone, startedAt: formatInstant(started, project.timezone),
@@ -134,6 +137,7 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
     writeServeJson(stateDir, {
       url: server.url, host: server.host, port: server.port, token: token.token, pid: id.pid, procStart: id.procStart,
       bootId: id.bootId, startedAt: started.toISOString(), version: CROFT_VERSION,
+      ...(engine.status().serverMode ? { serverMode: true as const } : {}),
     });
     loop = startLoop({
       root: project.root, stateDir, env: tickEnv(ctx.processEnv), intervalMs: deps.tickIntervalMs ?? TICK_INTERVAL_MS,
@@ -146,6 +150,7 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
       token: { source: token.source, from: token.from ?? null, file: shownPath(project, serveJsonPath(stateDir)) },
       scheduling: { state: scheduling.state, via: scheduling.via, pausedUntil: scheduling.pausedUntil ?? null, tickEveryMs: deps.tickIntervalMs ?? TICK_INTERVAL_MS },
       stopped: null,
+      ...(project.config.serverMode.enabled ? { serverMode: { readCopy: shownPath(project, project.paths.readCopy), asOf: engine.status().serverMode?.asOf ?? null } } : {}),
     };
     announce(ctx, data);
     deps.onStarted?.(data);
@@ -197,7 +202,12 @@ function loopLogger(ctx: Ctx): (e: LoopEvent) => void {
 
 /** DESIGN.md §4.2. */
 export function formatBanner(d: ServeData, timezone: string, now: Date = new Date()): string {
-  const lines = [`croft serve · ${d.url} · database ${d.database} (read-only, steps aside for writes)`];
+  const lines = [d.serverMode
+    ? `croft serve · ${d.url} · server mode: answers from ${d.serverMode.readCopy}, never opens ${d.database}`
+    : `croft serve · ${d.url} · database ${d.database} (read-only, steps aside for writes)`];
+  if (d.serverMode) {
+    lines.push(`the read copy is ${d.serverMode.asOf ? `as of ${localTime(d.serverMode.asOf, timezone, now)}` : "not made yet: croft serve is making it, and a run makes it too"}; every answer says as of when, and runs never wait for croft serve`);
+  }
   if (!d.loopback) {
     const bound = `${urlHost(d.host)}:${d.port}`;
     const proxyHost = isLoopbackHost(d.host) || isUnspecifiedHost(d.host) ? `127.0.0.1:${d.port}` : bound;

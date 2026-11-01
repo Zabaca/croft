@@ -22,5 +22,9 @@ writes (croft run <asset>).
 - A relocated project (a synced folder) keeps the copy next to its database, at the path croft.json's database
   names with .read.duckdb.
 - croft serve answers from it while a run writes, marked stale: true with asOf, the time of the copy.
+- In server mode ("serverMode": { "enabled": true }, croft docs server-mode) the copy is always on and read-only on
+  disk: GUIs must open it read-only (ATTACH ... (READ_ONLY), or the tool's read-only connection setting). Where the
+  filesystem cannot clone, every refresh is a full copy: croft doctor warns with its disk and time, and server mode
+  refuses a warehouse over 1 GB there unless serverMode.acceptFullCopyCost is set (SERVER_MODE_COPY_COSTLY).
 - A refresh that fails never fails the run: the reason is in .croft/readcopy.log, and the copy keeps its older
   data until the next run refreshes it.

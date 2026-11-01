@@ -56,6 +56,7 @@ import { CroftError, problem } from "../../core/errors.ts";
 import { formatInstant, parseInstant } from "../../core/time.ts";
 import { recordAlive } from "../../core/proc.ts";
 import type { AssetKind, Problem, Reason } from "../../core/types.ts";
+import { assessCopyPolicy, type CloneProbe, copyCostlyProblem, notClonedProblem, type ProbeOptions } from "../../db/copy-policy.ts";
 import { readCopyStatus, readCopyView, type ReadCopyView, readCopyWords } from "../../db/readcopy.ts";
 import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
 import { type DriftEntry, driftNote, recentDrift } from "../../history/drift.ts";
@@ -146,6 +147,9 @@ export interface StatusData {
   serve?: { url: string; pid: number };
   /** With readCopy on: the read copy, and how current it is (health). */
   readCopy?: ReadCopyView;
+  /** With serverMode on (D119): croft serve answers from the read copy, shown above as of when; `serving` is whether
+   *  croft serve runs now (apps read the file directly while it does not). */
+  serverMode?: { serving: boolean };
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -529,6 +533,8 @@ export interface StatusDeps {
   scheduleView?: ScheduleViewFn;
   /** ~/.croft, for SCHEDULER_STALE's diagnosis (the registry, the job, tick.log); croftHome() by default. */
   home?: CroftHome;
+  /** How the read copy's clone is tried (db/copy-policy.ts): tests give a cp that cannot clone. Default: the real cp. */
+  copyProbe?: ProbeOptions & { clone?: CloneProbe };
 }
 
 /** The scheduler's view by asset while scheduling is on or paused; a warning instead when it cannot be read. */
@@ -683,12 +689,18 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
     };
     const serve = serveOf(project.paths.stateDir);
     if (serve) data.serve = serve;
+    const copyProblems: Problem[] = [];
     if (project.config.readCopy) {
       const copy = readCopyView(readCopyStatus(project, db ?? undefined), tz);
       if (copy) data.readCopy = copy;
+      // What each refresh costs where the filesystem cannot clone (D121), and server mode refused for it.
+      const policy = assessCopyPolicy(project, o.copyProbe);
+      if (policy.refused) copyProblems.push(copyCostlyProblem(policy, "limit"));
+      else if (policy.warn) copyProblems.push(notClonedProblem(policy));
     }
+    if (project.config.serverMode.enabled) data.serverMode = { serving: serve !== undefined };
     // resolveProject's problems are discovery's (all of them: no selectors) and CYCLE.
-    const problems = [...(missing ? [missing] : []), ...(resolved ? resolved.problems : discovery.problems), ...resolution.problems, ...renamed, ...configChanges];
+    const problems = [...(missing ? [missing] : []), ...(resolved ? resolved.problems : discovery.problems), ...resolution.problems, ...renamed, ...configChanges, ...copyProblems];
     // The scheduler: stale (the diagnosis reads files only: no launchctl or crontab here), then the held assets.
     const schedulingProblems: Problem[] = [];
     if (rec.stale) {
@@ -965,7 +977,10 @@ function readCopyLines(d: StatusData, now: Date, tz: string, o: { root?: string;
   if (!d.readCopy) return [];
   const root = o.root ?? "";
   const w = readCopyWords(d.readCopy, { root, database: o.database ?? "", tz, now });
-  return [`Read copy ${w.text}`, ...(w.hint ? [`  hint: ${w.hint}`] : [])];
+  const mode = d.serverMode
+    ? [`Server mode on · ${d.serverMode.serving ? "croft serve answers from the read copy" : "croft serve is not running: apps read the warehouse file directly"}`]
+    : [];
+  return [...mode, `Read copy ${w.text}`, ...(w.hint ? [`  hint: ${w.hint}`] : [])];
 }
 
 function schedulingLine(d: StatusData, now: Date, tz: string): string {

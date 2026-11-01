@@ -22,10 +22,24 @@
 // It exits by itself when croft serve goes away (the IPC channel disconnects, or it is reparented), so a worker
 // never outlives its server holding the file. Terminal signals (Ctrl-C reaches the whole process group) are
 // ignored: croft serve decides when its queries end.
+//
+// Server mode (D119) runs the same worker as the readers' process: `open` with `readers` makes an in-memory
+// instance (never the live file), loads quack and httpfs by path, attaches the read copy READ_ONLY as `wh`, and
+// locks it down to the copy's path (db/modes.ts, kind "readers"). Every connection then runs `USE wh`, so the gate and
+// the queries see the copy exactly as they see the live file in file mode. `swap` takes a refreshed copy in: it
+// removes any `<copy>.wal` (a valid one would be replayed onto the new copy), DETACHes `wh` and ATTACHes the new file,
+// 2 to 10 ms [V: 2.0.0]. A connection's `USE wh` is by name, so it follows the new file; a query that starts meanwhile
+// waits for the swap, and one that fails because it straddled it is run again, once. A query already reading the old
+// file finishes on it. A start or a swap that fails ends this process (the instance is part set up, and is never
+// reused); croft serve replaces it (after a backoff for a start, at once for a swap it killed). The instance stays
+// referenced for the process's whole life:
+// Quack's listener, once slice 4 starts one, stops when its instance is collected [V: 2.0.0].
 import type { DuckDBConnection, DuckDBInstance, DuckDBPreparedStatement, DuckDBResult } from "@duckdb/node-api";
+import { chmodSync, existsSync, rmSync } from "node:fs";
 import { CroftError } from "../core/errors.ts";
 import type { Problem, Sql } from "../core/types.ts";
-import { connect, lockConflict, openInstance, type SandboxSpec } from "../db/connect.ts";
+import { connect, lockConflict, newerStorage, openInstance, openMemoryInstance, type SandboxSpec } from "../db/connect.ts";
+import { READ_COPY_ALIAS } from "../db/modes.ts";
 import { checkFormat } from "../db/state.ts";
 import { type ColumnInfo, renderRows, renderValueRows, resultShape, typeName } from "../db/values.ts";
 import { mapQueryError, toDuck, wireSafe } from "../read/select.ts";
@@ -34,7 +48,11 @@ import { assertOneSelect } from "../sql/gate.ts";
 
 /** Messages croft serve sends. */
 export type ToWorker =
-  | { op: "open"; path: string; spec: SandboxSpec; protect: string[] }
+  /** `path` is the warehouse, or with `readers` the read copy (server mode: the readers' process, an in-memory
+   *  instance with the copy attached read-only; the folders are the extension files' and the secret folder's). */
+  | { op: "open"; path: string; spec: SandboxSpec; protect: string[]; readers?: { extensionDir: string; secretDir: string } }
+  /** Server mode: the copy at `path` was replaced; detach the old file and attach the new one. */
+  | { op: "swap" }
   | { op: "query"; id: number; sql: string; params: unknown[]; limit: number; maxRows: number; maxBytes: number }
   /** Interrupt query `id` (repeated every 20 ms while it runs); ignored once it has settled. */
   | { op: "interrupt"; id: number }
@@ -56,6 +74,9 @@ export type FromWorker =
   | { op: "ready"; pid: number }
   | { op: "opened"; conns: number }
   | { op: "open_failed"; error: WireError }
+  | { op: "swapped"; conns: number }
+  /** The swap failed: this process is part set up and exits at once; croft serve starts another. */
+  | { op: "swap_failed"; error: WireError }
   | { op: "answer"; id: number; conns: number; peakRss: number; columns: ColumnInfo[]; rowsJson: string; rowCount: number }
   | { op: "failed"; id: number; conns: number; peakRss: number; error: WireError }
   | { op: "disconnected"; conns: number };
@@ -192,18 +213,30 @@ class Host {
   private instance: DuckDBInstance | null = null;
   private spec: SandboxSpec | null = null;
   private path = "";
+  /** The connection factory's key for this instance: the warehouse path, or for the readers' process `:memory:readers`. */
+  private key = "";
   private protect: string[] = [];
   private readonly idle: DuckDBConnection[] = [];
   private readonly all = new Set<DuckDBConnection>();
   /** Queries running, by the engine's id: their connection once they have one, and whether they were stopped. */
   private readonly running = new Map<number, { conn: DuckDBConnection | null; stopped: boolean }>();
+  /** The readers' process (server mode): the connection that started the mode and swaps the copy. It never runs
+   *  `USE wh` and is not one of the pooled connections; null in file mode. */
+  private admin: DuckDBConnection | null = null;
+  /** The swap in progress, if any: a query starting meanwhile waits for it. */
+  private swapping: Promise<void> | null = null;
+  /** Swaps completed. A query that fails with another count than it started with straddled one. */
+  private epoch = 0;
 
-  constructor(private readonly send: (m: FromWorker) => void) {}
+  constructor(private readonly send: (m: FromWorker) => void, private readonly exit: () => void = () => {}) {}
 
   handle(m: ToWorker): void {
     switch (m.op) {
       case "open":
         void this.open(m);
+        return;
+      case "swap":
+        void this.swap();
         return;
       case "query":
         // Registered before anything awaits, so an interrupt that follows at once finds it.
@@ -227,10 +260,25 @@ class Host {
   private async open(m: Extract<ToWorker, { op: "open" }>): Promise<void> {
     try {
       if (this.instance) throw new Error("this worker already has a database open");
-      this.instance = (await openInstance(m.path, "read_only")).instance;
-      this.spec = m.spec;
-      this.path = m.path;
-      this.protect = m.protect;
+      if (m.readers) {
+        // Server mode: an in-memory instance, the copy attached read-only by the mode. A valid `<copy>.wal` SQL left
+        // beside it would be replayed in memory by the attach, so none is there when it attaches.
+        rmSync(`${m.path}.wal`, { force: true });
+        this.instance = await openMemoryInstance();
+        this.spec = readersSpec(m.spec, m.path, m.readers);
+        this.path = m.path;
+        this.protect = m.protect;
+        this.key = READERS_KEY;
+        lockCopy(m.path);
+        this.admin = await connect(this.instance, this.spec, this.key); // checks the files, loads, attaches, locks
+        await this.refuseWal(this.admin);
+      } else {
+        this.instance = (await openInstance(m.path, "read_only")).instance;
+        this.key = m.path;
+        this.spec = m.spec;
+        this.path = m.path;
+        this.protect = m.protect;
+      }
       // Refuse a database from a newer croft before serving it (DB_NEWER_FORMAT), as every croft read does.
       const conn = await this.take();
       try {
@@ -240,8 +288,57 @@ class Host {
       }
       this.send({ op: "opened", conns: this.all.size });
     } catch (e) {
-      // The instance, if it opened, stays as it is: the engine kills this worker.
-      this.send({ op: "open_failed", error: toWire(e) });
+      // The instance, if it opened, stays as it is: the engine kills this worker. A readers' process also ends itself,
+      // since the instance is part set up and is never reused.
+      this.send({ op: "open_failed", error: toWire(m.readers ? readersOpenError(e, m.path) : e) });
+      if (m.readers) this.exit();
+    }
+  }
+
+  /** A read-only attach makes no WAL. One that is there right after it appeared while the copy was attached, so something
+   *  had it open for writing: detach, and fail (the process ends and is replaced; the new one removes the file first). */
+  private async refuseWal(admin: DuckDBConnection): Promise<void> {
+    if (!existsSync(`${this.path}.wal`)) return;
+    try {
+      await admin.run(`DETACH ${READ_COPY_ALIAS}`);
+    } catch {
+      // The process ends either way.
+    }
+    throw new Error("a WAL appeared beside the read copy while it was being attached, so it is not served");
+  }
+
+  /** Take in the refreshed copy: detach the old file and attach the one now at the same path. */
+  private async swap(): Promise<void> {
+    const admin = this.admin;
+    if (!admin) {
+      this.send({ op: "swap_failed", error: toWire(new Error("this worker is not a readers' process")) });
+      return;
+    }
+    const done = (async () => {
+      rmSync(`${this.path}.wal`, { force: true });
+      lockCopy(this.path);
+      await admin.run(`DETACH ${READ_COPY_ALIAS}`);
+      await admin.run(`ATTACH ${sqlString(this.path)} AS ${READ_COPY_ALIAS} (READ_ONLY)`);
+      await this.refuseWal(admin);
+      // A copy a newer croft wrote is refused here as it is when the process opens (DB_NEWER_FORMAT): the process ends,
+      // and the one that replaces it reports the same until the copy is one this croft reads.
+      const conn = await this.take();
+      try {
+        await checkFormat(sqlOn(conn, this.spec!.timezone));
+      } finally {
+        this.give(conn);
+      }
+      this.epoch++;
+    })();
+    this.swapping = done.catch(() => {});
+    try {
+      await done;
+      this.send({ op: "swapped", conns: this.all.size });
+    } catch (e) {
+      this.send({ op: "swap_failed", error: toWire(readersOpenError(e, this.path)) });
+      this.exit();
+    } finally {
+      this.swapping = null;
     }
   }
 
@@ -251,15 +348,30 @@ class Host {
     let reply: FromWorker;
     try {
       if (!this.instance || !this.spec) throw new Error("the query worker has no database open");
-      conn = await this.take();
-      q.conn = conn;
-      if (q.stopped) conn.interrupt();
-      const a = await answer(conn, m.sql, {
-        params: m.params, limit: m.limit, maxRows: m.maxRows, maxBytes: m.maxBytes, timezone: this.spec.timezone, protect: this.protect,
-        checkpoint: () => {
-          if (q.stopped) throw new Stopped();
-        },
-      });
+      let a: Answer | null = null;
+      for (let attempt = 0; a === null; attempt++) {
+        const epoch = this.epoch;
+        try {
+          // A swap in progress is waited for: between its DETACH and its ATTACH there is no `wh` to read.
+          if (this.swapping) await this.swapping;
+          conn = await this.take();
+          q.conn = conn;
+          if (q.stopped) conn.interrupt();
+          a = await answer(conn, m.sql, {
+            params: m.params, limit: m.limit, maxRows: m.maxRows, maxBytes: m.maxBytes, timezone: this.spec.timezone, protect: this.protect,
+            checkpoint: () => {
+              if (q.stopped) throw new Stopped();
+            },
+          });
+        } catch (e) {
+          // A query that straddled a swap may have bound to the file just detached, and read nothing: it runs again, once.
+          if (attempt > 0 || !this.admin || q.stopped) throw e;
+          if (this.swapping) await this.swapping;
+          if (this.epoch === epoch) throw e;
+          if (conn) this.give(conn);
+          conn = null;
+        }
+      }
       reply = { op: "answer", id: m.id, conns: 0, peakRss: 0, ...a };
     } catch (e) {
       reply = { op: "failed", id: m.id, conns: 0, peakRss: 0, error: q.stopped ? { kind: "stopped" } : toWire(e) };
@@ -273,7 +385,16 @@ class Host {
   private async take(): Promise<DuckDBConnection> {
     const reuse = this.idle.pop();
     if (reuse) return reuse;
-    const conn = await connect(this.instance!, this.spec!, this.path);
+    const conn = await connect(this.instance!, this.spec!, this.key);
+    if (this.admin) {
+      // The readers' process: the copy is the default database, as the live file's own catalog is in file mode.
+      try {
+        await conn.run(`USE ${READ_COPY_ALIAS}`);
+      } catch (e) {
+        conn.disconnectSync();
+        throw e;
+      }
+    }
     this.all.add(conn);
     return conn;
   }
@@ -293,6 +414,42 @@ class Host {
       }
     }
   }
+}
+
+const sqlString = (s: string) => `'${s.replaceAll("'", "''")}'`;
+
+/** The connection factory's key for the readers' process's one instance. */
+export const READERS_KEY = ":memory:readers";
+
+/**
+ * Make the copy read-only on disk before it is attached. A refresh in server mode does it, but a copy a project made while
+ * it only had `readCopy` on is 0644, and attached as it is, a read-write `ATTACH` of it inside the process worked and a
+ * valid WAL was left behind. Not the owner, or root (which ignores the mode): nothing changes, and the gate is the only
+ * guard (D119).
+ */
+export function lockCopy(path: string): void {
+  try {
+    chmodSync(path, 0o444);
+  } catch {
+    // Not ours to change.
+  }
+}
+
+/** The sandbox of the readers' process: the serve profile with the `readers` mode, which attaches `copy` read-only and
+ *  allows its path and no folder (db/modes.ts). The one place it is built, so a test that opens the same instance to try
+ *  SQL past the gate (serve/readers-session-testkit.ts) cannot drift from the worker. */
+export function readersSpec(spec: SandboxSpec, copy: string, r: { extensionDir: string; secretDir: string }): SandboxSpec {
+  return { ...spec, mode: { kind: "readers", extensionDir: r.extensionDir, secretDir: r.secretDir, copy } };
+}
+
+/**
+ * Why a readers' process could not start or swap, as the error to report. A copy a newer DuckDB wrote is DB_NEWER_FORMAT,
+ * as for the live file (the mode's attach reports it as INTERNAL_ERROR with DuckDB's first line in details.duckdb).
+ */
+function readersOpenError(e: unknown, copy: string): unknown {
+  const detail = e instanceof CroftError ? e.problem.details?.duckdb : undefined;
+  const newer = newerStorage(typeof detail === "string" ? new Error(detail) : e, { database: copy });
+  return newer ?? e;
 }
 
 /** A minimal Sql over one connection, for db/state.ts's format check. */
@@ -328,7 +485,9 @@ function main(): void {
     } catch {
       die(); // the channel is gone
     }
-  });
+  }, () => setTimeout(die, 200)); // a readers' process that failed to start or swap: its answer is on the way first
+  // The instance is referenced for this process's whole life (Quack's listener stops when its instance is collected).
+  (globalThis as Record<string, unknown>).__croftWorkerHost = host;
   process.on("message", (m) => host.handle(m as ToWorker));
   send({ op: "ready", pid: process.pid } satisfies FromWorker);
 }

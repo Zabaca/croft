@@ -5,6 +5,10 @@ aside whenever a croft run writes (queries wait for the write, up to 10 s), so a
 runs no asset code itself. While scheduling is on, it starts a scheduler tick every minute, which makes it
 the one command to keep running on a server, in a container or on WSL (croft docs scheduling).
 
+With "serverMode": { "enabled": true } in croft.json it does not step aside at all: it never opens the warehouse
+file and answers every query from the read copy, which each run that changes data refreshes (croft docs
+server-mode). Reading through croft serve, as described here, is the same in both.
+
 ## Starting it (the user does)
 
 croft serve runs until it is stopped, so an agent never starts it in its own shell: ask the user to run it in
@@ -50,7 +54,7 @@ Every request needs Authorization: Bearer <token>.
 
   POST /query   {"sql": "...", "params": [...], "limit": 1000}   the croft query envelope
   GET  /status  the server and its database connection
-  GET  /health  {ok, pid, version, database, writeIntent, queriesToday}
+  GET  /health  {ok, pid, version, database, writeIntent, queriesToday} (server mode adds serverMode: {state, asOf})
 
 ## Errors
 
