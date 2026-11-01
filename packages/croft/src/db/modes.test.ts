@@ -487,7 +487,7 @@ describe("a mode that does not fit its profile, differs from the instance, or fa
     expect(id(base)).not.toContain("KEYID1234");
   });
 
-  withExt("a mode that fails after it started marks its key failed: a retry and a no-mode connect are CroftErrors (must-fix 2)", async () => {
+  withExt("a mode that fails after it started marks its instance failed: a retry and a no-mode connect on it are CroftErrors, a new instance on the same key works", async () => {
     const p = await project();
     const instance = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
     cleanup.push(() => instance.closeSync());
@@ -505,9 +505,28 @@ describe("a mode that does not fit its profile, differs from the instance, or fa
       expect(caught).toBeInstanceOf(CroftError);
       expect((caught as CroftError).message).toContain("part set up");
     }
-    // A fresh instance and key work.
-    const fresh = await open(lakeTestSpec(p, "write"));
-    expect(await rows(fresh, `SELECT count(*) FROM duckdb_databases() WHERE database_name = '${LAKE_ALIAS}'`)).toEqual([[1n]]);
+    // The failed instance stays refused, and a new instance on the same key (callers key by the warehouse path) works
+    // once what failed is fixed, as after a catalog that was unreachable for a moment.
+    await expect(connect(instance, lakeTestSpec(p, "write"), key)).rejects.toBeInstanceOf(CroftError);
+    instance.closeSync();
+    const second = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
+    cleanup.push(() => second.closeSync());
+    const c = await connect(second, lakeTestSpec(p, "write"), key);
+    cleanup.push(() => c.disconnectSync());
+    expect(await rows(c, `SELECT count(*) FROM duckdb_databases() WHERE database_name = '${LAKE_ALIAS}'`)).toEqual([[1n]]);
+    // And a real attach failure (a catalog folder that is missing), retried on a new instance with the folder back.
+    const key2 = `:memory:blip${++seq}`;
+    const first = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
+    cleanup.push(() => first.closeSync());
+    const gone = join(p.root, "no-such-folder", "meta.sqlite");
+    await expect(connect(first, lakeTestSpec(p, "write", undefined, { catalog: gone }), key2)).rejects.toMatchObject({ problem: { code: "LAKE_ATTACH_FAILED", retryable: true } });
+    await expect(connect(first, lakeTestSpec(p, "write"), key2)).rejects.toBeInstanceOf(CroftError);
+    first.closeSync();
+    const retry = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
+    cleanup.push(() => retry.closeSync());
+    const rc = await connect(retry, lakeTestSpec(p, "write"), key2);
+    cleanup.push(() => rc.disconnectSync());
+    expect(await rows(rc, `SELECT count(*) FROM duckdb_databases() WHERE database_name = '${LAKE_ALIAS}'`)).toEqual([[1n]]);
   });
 
   withExt("a file problem is found before anything starts, so it leaves the instance clean and a retry works", async () => {
@@ -830,13 +849,14 @@ describe("no code path installs an extension or reaches DuckDB's repository (acc
     const offenders: string[] = [];
     // The SQL statement anywhere in a string (also after a `;`), upper or lower case; a lower-case template that is only
     // `install ${name}`. Not the English verb in a hint ("install X, or write its absolute path").
-    const statement = /(^|;)\s*(FORCE\s+)?INSTALL\b/;
+    // At the start of a string only upper case is the SQL statement (lower case is the English verb in a hint); after a `;` either case is.
+    const startsWithStatement = /^\s*(FORCE\s+)?INSTALL\b/;
     const statementOnly = /^\s*(force\s+)?install\s+X\s*(from\s+X)?\s*;?\s*$/i;
     const knownName = /\binstall\s+(httpfs|quack|ducklake|postgres|sqlite|parquet|json|icu)\b/i;
     for (const file of sourceFiles(SRC)) {
       const text = readFileSync(file, "utf8");
       for (const s of sourceStrings(file, text)) {
-        if (statement.test(s.text) || statementOnly.test(s.text) || knownName.test(s.text) || /install_extension|\bFROM\s+community\b/i.test(s.text)) offenders.push(`${file}:${s.line}: ${s.text.slice(0, 80)}`);
+        if (startsWithStatement.test(s.text) || /;\s*(FORCE\s+)?INSTALL\b/i.test(s.text) || statementOnly.test(s.text) || knownName.test(s.text) || /install_extension|\bFROM\s+community\b/i.test(s.text)) offenders.push(`${file}:${s.line}: ${s.text.slice(0, 80)}`);
         if (/extensions\.duckdb\.org|custom_extension_repository|autoinstall_known_extensions\s*=\s*true|autoload_known_extensions\s*=\s*true/i.test(s.text)) offenders.push(`${file}:${s.line}: ${s.text.slice(0, 80)}`);
       }
       // The options as object properties or assignments: { autoinstall_known_extensions: "true" } and friends.

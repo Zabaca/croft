@@ -181,9 +181,11 @@ let memorySeq = 0;
 const configured = new Map<string, string>();
 // A digest of the credentials a mode instance was opened with, compared and never printed.
 const configuredCredentials = new Map<string, string>();
-// Keys whose mode started and then failed: the instance is part set up (extensions loaded, secrets in memory, a
+// Instances whose mode started and then failed: the instance is part set up (extensions loaded, secrets in memory, a
 // database attached, a listener running) and unlocked, so no later connect may use it or lock it as something else.
-const failedKeys = new Map<string, string>();
+// The mark is on the instance, not its key: callers key by the warehouse path, and a new instance on the same path
+// after a failed start (a catalog that was unreachable for a moment) must work.
+const failedInstances = new WeakMap<DuckDBInstance, string>();
 const configuring = new Map<string, Promise<unknown>>();
 
 /**
@@ -195,7 +197,7 @@ export async function connect(instance: DuckDBInstance, spec: SandboxSpec, key: 
   try {
     // Serialize per instance: two first connections must not both try to configure it.
     const prev = configuring.get(key) ?? Promise.resolve();
-    const mine = prev.catch(() => {}).then(() => applySandbox(conn, spec, key));
+    const mine = prev.catch(() => {}).then(() => applySandbox(instance, conn, spec, key));
     configuring.set(key, mine);
     try {
       await mine;
@@ -214,11 +216,11 @@ async function scalar(conn: DuckDBConnection, sql: string): Promise<unknown> {
   return reader.getRowsJS()[0]?.[0];
 }
 
-async function applySandbox(conn: DuckDBConnection, spec: SandboxSpec, key: string): Promise<void> {
-  const failedWith = failedKeys.get(key);
+async function applySandbox(instance: DuckDBInstance, conn: DuckDBConnection, spec: SandboxSpec, key: string): Promise<void> {
+  const failedWith = failedInstances.get(instance);
   if (failedWith !== undefined) {
     throw new CroftError("INTERNAL_ERROR", {
-      message: `the database ${key} was left part set up by a mode that failed to start (${failedWith}), so it cannot be used`,
+      message: `the database ${key} was left part set up by a mode that failed to start (${failedWith}), so this instance cannot be used`,
       hint: "open a new DuckDB instance; report this croft bug if a caller reused this one",
     });
   }
@@ -255,7 +257,7 @@ async function applySandbox(conn: DuckDBConnection, spec: SandboxSpec, key: stri
   // A mode loads its extensions, attaches and starts what it serves now: DuckDB refuses each of them once outside
   // access is off (D118). The check has no effect on the instance, so a refusal (a missing file, a profile the mode
   // does not fit) leaves it clean and a retry can succeed. Once the mode starts, any failure leaves the instance part
-  // set up, and the key is marked failed.
+  // set up, and the instance is marked failed.
   const files = spec.mode ? checkMode(spec.mode, spec.profile) : null;
   try {
     if (spec.mode) await startMode(conn, spec.mode, files!);
@@ -264,7 +266,7 @@ async function applySandbox(conn: DuckDBConnection, spec: SandboxSpec, key: stri
     await conn.run("SET enable_external_access = false");
     await conn.run("SET lock_configuration = true");
   } catch (e) {
-    if (spec.mode) failedKeys.set(key, e instanceof CroftError ? e.code : "error");
+    if (spec.mode) failedInstances.set(instance, e instanceof CroftError ? e.code : "error");
     throw e;
   }
   configured.set(key, fingerprint);

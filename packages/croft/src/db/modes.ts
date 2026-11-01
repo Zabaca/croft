@@ -176,7 +176,7 @@ async function attempt(conn: DuckDBConnection, sql: string, fail: (e: unknown) =
 /**
  * Steps 2 to 5, on the instance's first connection, after checkMode. A failure here leaves the instance part set up
  * (extensions loaded, secrets in memory, a database attached, a listener running); the caller must not use it again.
- * connect.ts marks its key failed, so every later connect to it is a CroftError.
+ * connect.ts marks the instance failed, so every later connect on it is a CroftError (a new instance, on the same key, works).
  */
 export async function startMode(conn: DuckDBConnection, mode: ModeSpec, files: Map<ExtensionName, string>): Promise<void> {
   const secrets = modeSecrets(mode);

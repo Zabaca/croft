@@ -87,11 +87,14 @@ jobs:
               brew install postgresql@17
               bun scripts/check-mode-tools.ts
             else
-              # A Linux image without Postgres (the arm image may lack it). Debian starts the service on install; a
-              # CI VM is thrown away, but stop it so only the test's own foreground Postgres runs.
+              # A Linux image without Postgres (the arm image may lack it). Debian starts a service on install; a
+              # policy-rc.d that refuses (exit 101) keeps it from ever starting, so only the test's own foreground
+              # Postgres runs.
+              printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+              sudo chmod +x /usr/sbin/policy-rc.d
               sudo apt-get update
               sudo apt-get install -y --no-install-recommends postgresql
-              sudo systemctl stop postgresql || true
+              sudo rm -f /usr/sbin/policy-rc.d
               bun scripts/check-mode-tools.ts
             fi
           fi
