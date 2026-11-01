@@ -5,15 +5,19 @@
 // The order, fixed, because DuckDB refuses to load an extension or attach a remote database once outside access is
 // off, and Quack's server reads DuckDB's default secret folder (in the user's home) unless it is pointed elsewhere
 // first [V: 2.0.0, option 06's spikes]:
-//   1. check every pinned file; nothing loads unless all of them check
+//   1. check the mode against its profile and check every pinned file; nothing loads unless all of them check
+//      (checkMode: no effect on the instance, so a refusal here leaves it clean)
 //   2. load the extensions, by absolute path
 //   3. point DuckDB's secret folder into croft's state folder
 //   4. create the named secrets and attach what the mode attaches
 //   5. run the caller's `prepare` (register hooks, start the Quack listener)
 //   6. lock (connect.ts)
 import type { DuckDBConnection } from "@duckdb/node-api";
-import { mkdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, mkdirSync } from "node:fs";
 import { CroftError } from "../core/errors.ts";
+import type { Fix } from "../core/types.ts";
+import type { Profile } from "./connect.ts";
 import { type ExtensionName } from "./extension-names.ts";
 import { verifyExtensions } from "./extension-files.ts";
 
@@ -121,52 +125,100 @@ export function modePaths(mode: ModeSpec | undefined): string[] {
   return mode?.kind === "readers" ? [mode.copy] : [];
 }
 
-/** Steps 1 to 5 above, on the instance's first connection. A failure leaves nothing half loaded for the caller to use. */
-export async function prepareMode(conn: DuckDBConnection, mode: ModeSpec): Promise<void> {
+/** The local-folder profiles each mode may run under: the readers' processes and the test lake reach no folder but their own. */
+export const MODE_PROFILES: Readonly<Record<ModeKind, readonly Profile[]>> = {
+  readers: ["serve"],
+  "lake-readers": ["serve"],
+  "lake-test": ["serve"],
+  lake: ["warehouse", "query", "serve", "memory"],
+};
+
+/** Everything about a mode that is not a secret, as the sandbox fingerprint holds it: two requests that differ in any of it must not share an instance. */
+export function modeIdentity(mode: ModeSpec): unknown {
+  const base = { kind: mode.kind, extensionDir: mode.extensionDir, secretDir: mode.secretDir };
+  if (mode.kind === "readers") return { ...base, copy: mode.copy };
+  if (mode.kind === "lake-test") return { ...base, catalog: mode.lake.catalog.path, dataPath: mode.lake.dataPath, access: mode.lake.access };
+  const { catalog, data, access } = mode.lake;
+  return { ...base, catalog: [catalog.host, catalog.port, catalog.database, catalog.user], data: [data.path, data.endpoint ?? null, data.region ?? null, data.urlStyle ?? null, data.useSsl ?? null], access };
+}
+
+/** A digest of the mode's credentials, compared but never printed: a different password or key is a different instance. */
+export function modeCredentialDigest(mode: ModeSpec): string {
+  return createHash("sha256").update(JSON.stringify(modeSecrets(mode))).digest("hex");
+}
+
+/**
+ * Steps 0 and 1: the mode fits its profile and every file checks. Touches nothing, so a refusal leaves the instance as it
+ * was and a retry can succeed. Returns the verified files.
+ */
+export function checkMode(mode: ModeSpec, profile: Profile): Map<ExtensionName, string> {
+  if (!MODE_PROFILES[mode.kind].includes(profile)) {
+    throw new CroftError("INTERNAL_ERROR", {
+      message: `the ${mode.kind} mode runs under the ${MODE_PROFILES[mode.kind].join(" or ")} profile, not ${profile}`,
+      hint: "report this croft bug",
+    });
+  }
   if (mode.kind === "lake-readers" && mode.lake.access !== "read") {
     throw new CroftError("INTERNAL_ERROR", { message: "a lake behind croft serve is attached read-only", hint: "report this croft bug" });
   }
-  // 1. Every file checks before the first loads.
-  const names = MODE_EXTENSIONS[mode.kind];
-  const files = verifyExtensions(mode.extensionDir, names);
+  return verifyExtensions(mode.extensionDir, MODE_EXTENSIONS[mode.kind]);
+}
+
+const LOAD_FIX: Fix = {
+  kind: "manual",
+  description: "run croft doctor to check that the DuckDB library is the version croft pins, and reinstall the project's dependencies if it is not; if DuckDB still refuses, report it with details.duckdb",
+};
+
+async function attempt(conn: DuckDBConnection, sql: string, fail: (e: unknown) => unknown): Promise<void> {
+  try { await conn.run(sql); } catch (e) { throw fail(e); }
+}
+
+/**
+ * Steps 2 to 5, on the instance's first connection, after checkMode. A failure here leaves the instance part set up
+ * (extensions loaded, secrets in memory, a database attached, a listener running); the caller must not use it again.
+ * connect.ts marks its key failed, so every later connect to it is a CroftError.
+ */
+export async function startMode(conn: DuckDBConnection, mode: ModeSpec, files: Map<ExtensionName, string>): Promise<void> {
   const secrets = modeSecrets(mode);
-  const run = async (sql: string, fail: (e: unknown) => CroftError) => {
-    try { await conn.run(sql); } catch (e) { throw fail(e); }
-  };
   // 2. Load by absolute path.
-  for (const name of names) {
-    await run(`LOAD ${q(files.get(name)!)}`, (e) => new CroftError("EXTENSION_LOAD_FAILED", {
+  for (const name of MODE_EXTENSIONS[mode.kind]) {
+    await attempt(conn, `LOAD ${q(files.get(name)!)}`, (e) => new CroftError("EXTENSION_LOAD_FAILED", {
       message: `DuckDB would not load the ${name} extension`,
-      hint: "the file passed its checksum, so this is DuckDB refusing it; report this croft bug",
+      hint: "the file passed its checksum, so this is DuckDB refusing it",
+      fix: LOAD_FIX,
       retryable: false,
       details: { extension: name, duckdb: scrub(firstLine(e), secrets) },
     }));
   }
-  // 3. The secret folder, in the state folder, before anything (Quack's listener) reads secrets.
+  // 3. The secret folder, in the state folder, before anything (Quack's listener) reads secrets. mkdir leaves an existing
+  // folder's mode as it was, so set it.
   mkdirSync(mode.secretDir, { recursive: true, mode: 0o700 });
+  chmodSync(mode.secretDir, 0o700);
   await conn.run(`SET secret_directory = ${q(mode.secretDir)}`);
   // 4. What the mode attaches.
   if (mode.kind === "readers") {
-    await run(`ATTACH ${q(mode.copy)} AS ${READ_COPY_ALIAS} (READ_ONLY)`, (e) => new CroftError("INTERNAL_ERROR", {
+    await attempt(conn, `ATTACH ${q(mode.copy)} AS ${READ_COPY_ALIAS} (READ_ONLY)`, (e) => new CroftError("INTERNAL_ERROR", {
       message: `the readers' process could not attach the read copy ${mode.copy}`,
       hint: "report this croft bug",
       details: { duckdb: firstLine(e) },
     }));
   } else if (mode.kind === "lake-test") {
     const { catalog, dataPath, access } = mode.lake;
-    await run(`ATTACH ${q(`ducklake:sqlite:${catalog.path}`)} AS ${LAKE_ALIAS} (DATA_PATH ${q(dataPath)}${access === "read" ? ", READ_ONLY" : ""})`, (e) => lakeFailure(e, secrets));
+    await attempt(conn, `ATTACH ${q(`ducklake:sqlite:${catalog.path}`)} AS ${LAKE_ALIAS} (DATA_PATH ${q(dataPath)}${access === "read" ? ", READ_ONLY" : ""})`, (e) => lakeFailure(e, secrets));
   } else {
     await attachLake(conn, mode.lake, secrets);
   }
-  // 5. Hooks and the listener.
-  if (mode.prepare) await mode.prepare(conn);
+  // 5. Hooks and the listener. What the caller's code throws is scrubbed of the mode's credentials like everything else.
+  if (mode.prepare) {
+    try { await mode.prepare(conn); } catch (e) { throw scrubThrown(e, secrets); }
+  }
 }
 
 /** Create the lake's two named secrets and attach it; the password and keys are in the statements below and nowhere else. */
 async function attachLake(conn: DuckDBConnection, lake: LakeSpec, secrets: string[]): Promise<void> {
   const { catalog, data, access } = lake;
   const fail = (e: unknown) => lakeFailure(e, secrets);
-  await run1(conn, `CREATE OR REPLACE TEMPORARY SECRET ${LAKE_CATALOG_SECRET} (TYPE postgres, HOST ${q(catalog.host)}, PORT ${Math.trunc(catalog.port)}, DATABASE ${q(catalog.database)}, USER ${q(catalog.user)}, PASSWORD ${q(catalog.password)})`, fail);
+  await attempt(conn, `CREATE OR REPLACE TEMPORARY SECRET ${LAKE_CATALOG_SECRET} (TYPE postgres, HOST ${q(catalog.host)}, PORT ${Math.trunc(catalog.port)}, DATABASE ${q(catalog.database)}, USER ${q(catalog.user)}, PASSWORD ${q(catalog.password)})`, fail);
   const opts = [
     "TYPE s3", `KEY_ID ${q(data.keyId)}`, `SECRET ${q(data.secretKey)}`, `SCOPE ${q(data.path)}`,
     ...(data.sessionToken ? [`SESSION_TOKEN ${q(data.sessionToken)}`] : []),
@@ -175,12 +227,8 @@ async function attachLake(conn: DuckDBConnection, lake: LakeSpec, secrets: strin
     `URL_STYLE ${q(data.urlStyle ?? "path")}`,
     `USE_SSL ${data.useSsl === false ? "false" : "true"}`,
   ];
-  await run1(conn, `CREATE OR REPLACE TEMPORARY SECRET ${LAKE_BUCKET_SECRET} (${opts.join(", ")})`, fail);
-  await run1(conn, `ATTACH 'ducklake:postgres:' AS ${LAKE_ALIAS} (DATA_PATH ${q(data.path)}, META_SECRET ${LAKE_CATALOG_SECRET}${access === "read" ? ", READ_ONLY" : ""})`, fail);
-}
-
-async function run1(conn: DuckDBConnection, sql: string, fail: (e: unknown) => CroftError): Promise<void> {
-  try { await conn.run(sql); } catch (e) { throw fail(e); }
+  await attempt(conn, `CREATE OR REPLACE TEMPORARY SECRET ${LAKE_BUCKET_SECRET} (${opts.join(", ")})`, fail);
+  await attempt(conn, `ATTACH 'ducklake:postgres:' AS ${LAKE_ALIAS} (DATA_PATH ${q(data.path)}, META_SECRET ${LAKE_CATALOG_SECRET}${access === "read" ? ", READ_ONLY" : ""})`, fail);
 }
 
 function firstLine(e: unknown): string {
@@ -199,13 +247,31 @@ function lakeFailure(e: unknown, secrets: readonly string[]): CroftError {
   });
 }
 
-/** For callers that run a query on a lake instance: DuckDB's error with the mode's credentials taken out of its text. */
-export function scrubError(e: unknown, mode: ModeSpec | undefined): Error {
-  const secrets = mode ? modeSecrets(mode) : [];
-  if (!secrets.length || !(e instanceof Error)) return e instanceof Error ? e : new Error(String(e));
+/**
+ * An error with the credentials taken out of every string in it. A CroftError keeps its code and fix; a plain Error keeps
+ * its name. Wiring this into the query paths that run on a lake instance is option 07, slice 2.
+ */
+export function scrubThrown(e: unknown, secrets: readonly string[]): Error {
+  if (!(e instanceof Error)) return new Error(scrub(String(e), secrets));
+  if (!secrets.length) return e;
+  if (e instanceof CroftError) {
+    const walk = (v: unknown): unknown => {
+      if (typeof v === "string") return scrub(v, secrets);
+      if (Array.isArray(v)) return v.map(walk);
+      if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)]));
+      return v;
+    };
+    const { severity: _s, code: _c, docs: _d, ...init } = walk(e.problem) as CroftError["problem"];
+    return new CroftError(e.code, init);
+  }
   const clean = new Error(scrub(e.message, secrets));
   clean.name = e.name;
   return clean;
+}
+
+/** For callers that run a query on a lake instance: DuckDB's error with the mode's credentials taken out of its text. */
+export function scrubError(e: unknown, mode: ModeSpec | undefined): Error {
+  return scrubThrown(e, mode ? modeSecrets(mode) : []);
 }
 
 /**

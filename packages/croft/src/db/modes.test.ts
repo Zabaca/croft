@@ -5,7 +5,7 @@
 // starts (Postgres, the S3-compatible store, the Quack listener) is a child process of the test, killed in teardown.
 import { afterAll, describe, expect, test } from "bun:test";
 import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { CroftError } from "../core/errors.ts";
@@ -13,7 +13,7 @@ import { connect, instanceConfig, type SandboxSpec } from "./connect.ts";
 import { extensionsReady, IN_CI } from "./extension-dir-testkit.ts";
 import { extensionPath, hostPlatform, verifyExtension } from "./extension-files.ts";
 import { DUCKDB_VERSION, type ExtensionName } from "./extension-names.ts";
-import { LAKE_ALIAS, type LakeSpec, MODE_EXTENSIONS, type ModeSpec, READ_COPY_ALIAS, scrub, scrubError, startQuackListener } from "./modes.ts";
+import { LAKE_ALIAS, type LakeSpec, MODE_EXTENSIONS, modeCredentialDigest, modeIdentity, type ModeSpec, READ_COPY_ALIAS, scrub, scrubError, scrubThrown, startQuackListener } from "./modes.ts";
 import { freePort, postgresBin, readListening, startPostgres, startS3, track, type TestPostgres, type TestS3 } from "./mode-testkit.ts";
 
 const ALL: ExtensionName[] = ["quack", "httpfs", "ducklake", "postgres", "sqlite"];
@@ -125,6 +125,30 @@ const readers = (p: Project, extra: Partial<Extract<ModeSpec, { kind: "readers" 
   mode: { kind: "readers", extensionDir: ext.dir, secretDir: p.secrets, copy: p.copy, ...extra },
 });
 
+/** The test lake: a SQLite catalog in the state folder and a local data folder. Under the serve profile, as the mode requires. */
+function lakeTestSpec(p: Project, access: "write" | "read" = "write", prepare?: (c: DuckDBConnection) => Promise<void>, over: Record<string, string> = {}): SandboxSpec {
+  mkdirSync(join(p.root, "lake-data"), { recursive: true });
+  return {
+    profile: "serve", timezone: "UTC",
+    mode: {
+      kind: "lake-test", extensionDir: ext.dir, secretDir: p.secrets, prepare,
+      lake: { catalog: { kind: "sqlite", path: over.catalog ?? join(p.state, "meta.sqlite") }, dataPath: over.dataPath ?? join(p.root, "lake-data") + "/", access },
+    },
+  };
+}
+
+/** A readers' process with a Quack listener, as a child of the test (quack-listener-testkit.ts), killed in teardown. */
+async function listenerChild(p: Project, token = "tok-modes-1"): Promise<{ port: number; token: string; stop: () => Promise<void> }> {
+  const port = freePort();
+  const child = Bun.spawn([process.execPath, join(import.meta.dir, "quack-listener-testkit.ts"), "--ext", ext.dir, "--state", p.state, "--copy", p.copy, "--port", String(port), "--token", token, "--tables", "t"], {
+    stdout: "pipe", stderr: "inherit", env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
+  });
+  const stop = track(child);
+  cleanup.push(stop);
+  await readListening(child);
+  return { port, token, stop };
+}
+
 /** What the lockdown refuses on every profile, once locked. `have`: the mode's extensions, so one it lacks can be tried. */
 async function expectLocked(c: DuckDBConnection, have: readonly ExtensionName[]): Promise<void> {
   expect(await error(c, "SET threads = 1")).toContain("the configuration has been locked");
@@ -209,7 +233,7 @@ describe("a file that is not the pinned file loads nothing (acceptance 3)", () =
     expect(e).toBeInstanceOf(CroftError);
     expect(e.code).toBe("EXTENSION_MISSING");
     expect(e.problem.hint.length).toBeGreaterThan(10);
-    expect(e.problem.fix).toMatchObject({ kind: "command" });
+    expect(e.problem.fix).toMatchObject({ kind: "manual" });
     expect(e.problem.details).toMatchObject({ kind: "file", extension: "httpfs" });
     expect(await loadedNames(conn)).toEqual([]);
   });
@@ -351,15 +375,9 @@ describe("readers profile (server mode)", () => {
     }
   });
 
-  withExt("the listener starts before the lock, a client reads the copy over Quack, and the lock then refuses a second listener (acceptance 2)", async () => {
+  withExt("the listener starts before the lock, a client reads the copy over Quack, and the lock then refuses a second listener and a remote attach (acceptance 2)", async () => {
     const p = await project();
-    const port = freePort();
-    const child = Bun.spawn([process.execPath, join(import.meta.dir, "quack-listener-testkit.ts"), "--ext", ext.dir, "--state", p.state, "--copy", p.copy, "--port", String(port), "--token", "tok-modes-1", "--tables", "t"], {
-      stdout: "pipe", stderr: "inherit", env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
-    });
-    const stopChild = track(child);
-    cleanup.push(stopChild);
-    await readListening(child);
+    const { port, token, stop } = await listenerChild(p);
 
     const client = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
     const cc = await client.connect();
@@ -369,15 +387,20 @@ describe("readers profile (server mode)", () => {
     });
     for (const n of ["httpfs", "quack"] as const) await cc.run(`LOAD '${verifyExtension(ext.dir, n)}'`);
     expect(await error(cc, `ATTACH 'quack:localhost:${port}' AS bad (TOKEN 'wrong-token')`)).toMatch(/Authentication failed|authentication/i);
-    await cc.run(`ATTACH 'quack:localhost:${port}' AS r (TOKEN 'tok-modes-1')`);
+    await cc.run(`ATTACH 'quack:localhost:${port}' AS r (TOKEN '${token}')`);
     expect(await rows(cc, "SELECT count(*), sum(a) FROM r.t")).toEqual([[5n, 10n]]);
 
-    // In this process, the same profile locks with the listener already started; a second one is refused afterwards.
+    // In this process, the same profile locks with the listener already started; a second one is refused afterwards,
+    // and so is attaching a remote Quack server, with a valid token, even though quack is loaded.
     const c = await open(readers(p));
     const late = freePort();
     await error(c, `SELECT * FROM quack_serve('quack:localhost:${late}', token = 'x', create_secret_if_not_exists = false)`);
     expect(await notListening(late)).toBe(true);
-    await stopChild();
+    await error(c, `ATTACH 'quack:localhost:${port}' AS remote (TOKEN '${token}')`);
+    await error(c, `ATTACH 'quack:localhost:${port}' AS remote2 (TYPE quack, TOKEN '${token}')`);
+    // Refused, not merely failed late: the plain client above attached the same server with the same token.
+    expect(await rows(c, "SELECT database_name FROM duckdb_databases() WHERE database_name LIKE 'remote%'")).toEqual([]);
+    await stop();
   });
 
   withExt("startQuackListener before the lock works from prepare, and not after it", async () => {
@@ -390,18 +413,142 @@ describe("readers profile (server mode)", () => {
     await error(c, `SELECT * FROM quack_serve('quack:localhost:${late}', token = 'x', create_secret_if_not_exists = false)`);
     expect(await notListening(late)).toBe(true);
     expect(await notListening(port)).toBe(false);
+    // The listener used secrets before the lock, so unlike a readers' instance without one, a temporary secret can still
+    // be made afterwards (DESIGN.md §5); the gate, not the lock, keeps user SQL from it.
+    await c.run("CREATE TEMPORARY SECRET after_lock (TYPE s3, KEY_ID 'a', SECRET 'b')");
     await c.run(`SELECT * FROM quack_stop('quack:localhost:${port}')`).catch(() => {});
   });
 });
 
+describe("a mode that does not fit its profile, differs from the instance, or fails to start", () => {
+  withExt("readers under a profile with local folders is refused, and the instance stays clean (should-fix 1)", async () => {
+    const p = await project();
+    const instance = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
+    cleanup.push(() => instance.closeSync());
+    const bad: SandboxSpec = { profile: "warehouse", timezone: "UTC", root: p.root, stateDir: p.state, mode: readers(p).mode! };
+    let caught: unknown;
+    try {
+      await connect(instance, bad, `:memory:fit${seq}`);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(CroftError);
+    expect((caught as CroftError).message).toContain("serve profile");
+    // Nothing was loaded or attached, so the right profile still works on the same instance and key.
+    const c = await connect(instance, readers(p), `:memory:fit${seq}`);
+    cleanup.push(() => c.disconnectSync());
+    expect(await error(c, `SELECT * FROM read_text('${p.secrets}/probe.txt')`)).toContain("Permission Error");
+    // The lake test profile and lake-readers are the same: serve only.
+    const other = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
+    cleanup.push(() => other.closeSync());
+    await expect(connect(other, { ...lakeTestSpec(p), profile: "warehouse", root: p.root, stateDir: p.state }, `:memory:fit2${seq}`)).rejects.toBeInstanceOf(CroftError);
+  });
+
+  withExt("the lake test profile reaches its own folder only: not the state folder, files/, or the project", async () => {
+    const p = await project();
+    const c = await open(lakeTestSpec(p));
+    for (const sql of [
+      `SELECT * FROM read_text('${p.secrets}/probe.txt')`,
+      `SELECT * FROM read_csv('${p.root}/files/a.csv')`,
+      `SELECT * FROM read_text('${p.root}/.env')`,
+      `ATTACH '${p.state}/other.duckdb' AS other`,
+    ]) expect(await error(c, sql), sql).toContain("Permission Error");
+  });
+
+  withExt("one key, a different access or catalog or credentials: a CroftError, never the first request's connection (must-fix 1)", async () => {
+    const p = await project();
+    const instance = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
+    cleanup.push(() => instance.closeSync());
+    const key = `:memory:fp${++seq}`;
+    const w = await connect(instance, lakeTestSpec(p, "write"), key);
+    cleanup.push(() => w.disconnectSync());
+    await w.run(`CREATE TABLE ${LAKE_ALIAS}.t AS SELECT 1 a`);
+    // The same spec again is fine; a read-only request on the writer's instance is not.
+    const again = await connect(instance, lakeTestSpec(p, "write"), key);
+    again.disconnectSync();
+    await expect(connect(instance, lakeTestSpec(p, "read"), key)).rejects.toBeInstanceOf(CroftError);
+    await expect(connect(instance, lakeTestSpec(p, "write", undefined, { catalog: join(p.state, "other.sqlite") }), key)).rejects.toBeInstanceOf(CroftError);
+    await expect(connect(instance, lakeTestSpec(p, "write", undefined, { dataPath: join(p.root, "elsewhere") + "/" }), key)).rejects.toBeInstanceOf(CroftError);
+  });
+
+  test("the identity and credential digest tell two lakes apart without printing a secret", () => {
+    const lake = (o: { access?: "write" | "read"; host?: string; port?: number; database?: string; user?: string; password?: string; keyId?: string }): ModeSpec => ({
+      kind: "lake", extensionDir: "/e", secretDir: "/s",
+      lake: { catalog: { kind: "postgres", host: o.host ?? "h", port: o.port ?? 5432, database: o.database ?? "d", user: o.user ?? "u", password: o.password ?? "pw-one-1234" }, data: { path: "s3://b/f/", keyId: o.keyId ?? "KEYID1234", secretKey: "sk-one-5678" }, access: o.access ?? "write" },
+    });
+    const id = (m: ModeSpec) => JSON.stringify(modeIdentity(m));
+    const base = lake({});
+    for (const other of [lake({ access: "read" }), lake({ host: "h2" }), lake({ port: 5433 }), lake({ database: "d2" }), lake({ user: "u2" })]) expect(id(other)).not.toBe(id(base));
+    expect(id(lake({ password: "pw-two-9999" }))).toBe(id(base));
+    expect(modeCredentialDigest(lake({ password: "pw-two-9999" }))).not.toBe(modeCredentialDigest(base));
+    expect(modeCredentialDigest(lake({ keyId: "KEYID9999" }))).not.toBe(modeCredentialDigest(base));
+    expect(id(base) + modeCredentialDigest(base)).not.toContain("pw-one-1234");
+    expect(id(base)).not.toContain("sk-one-5678");
+    expect(id(base)).not.toContain("KEYID1234");
+  });
+
+  withExt("a mode that fails after it started marks its key failed: a retry and a no-mode connect are CroftErrors (must-fix 2)", async () => {
+    const p = await project();
+    const instance = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
+    cleanup.push(() => instance.closeSync());
+    const key = `:memory:half${++seq}`;
+    const boom = async () => { throw new Error("listener port busy"); };
+    await expect(connect(instance, lakeTestSpec(p, "write", boom), key)).rejects.toThrow("listener port busy");
+    // The instance now has extensions loaded and the lake attached, unlocked. A retry must not run on it.
+    for (const spec of [lakeTestSpec(p, "write"), { profile: "warehouse" as const, timezone: "UTC", root: p.root, stateDir: p.state }]) {
+      let caught: unknown;
+      try {
+        await connect(instance, spec, key);
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(CroftError);
+      expect((caught as CroftError).message).toContain("part set up");
+    }
+    // A fresh instance and key work.
+    const fresh = await open(lakeTestSpec(p, "write"));
+    expect(await rows(fresh, `SELECT count(*) FROM duckdb_databases() WHERE database_name = '${LAKE_ALIAS}'`)).toEqual([[1n]]);
+  });
+
+  withExt("a file problem is found before anything starts, so it leaves the instance clean and a retry works", async () => {
+    const p = await project();
+    const instance = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
+    cleanup.push(() => instance.closeSync());
+    const key = `:memory:clean${++seq}`;
+    const empty = mkdtempSync(join(tmpdir(), "croft-extdir-empty-"));
+    cleanup.push(() => rmSync(empty, { recursive: true, force: true }));
+    const spec = lakeTestSpec(p);
+    await expect(connect(instance, { ...spec, mode: { ...spec.mode!, extensionDir: empty } }, key)).rejects.toMatchObject({ problem: { code: "EXTENSION_MISSING" } });
+    const c = await connect(instance, lakeTestSpec(p), key);
+    cleanup.push(() => c.disconnectSync());
+    await c.run(`CREATE TABLE ${LAKE_ALIAS}.t AS SELECT 1 a`);
+  });
+
+  withExt("the secret folder is 0700 even when it already existed with another mode", async () => {
+    const p = await project();
+    chmodSync(p.secrets, 0o755);
+    await open(readers(p));
+    expect(statSync(p.secrets).mode & 0o777).toBe(0o700);
+  });
+
+  test("scrubThrown takes credentials out of a CroftError's every string and keeps its code and fix", () => {
+    const e = new CroftError("LAKE_ATTACH_FAILED", {
+      message: "failed with hunter2-secret", hint: "try key KEYID-9876", retryable: true,
+      fix: { kind: "manual", description: "use hunter2-secret" }, details: { nested: { text: "password=hunter2-secret" }, list: ["KEYID-9876"] },
+    });
+    const clean = scrubThrown(e, ["hunter2-secret", "KEYID-9876"]) as CroftError;
+    expect(clean).toBeInstanceOf(CroftError);
+    expect(clean.code).toBe("LAKE_ATTACH_FAILED");
+    expect(clean.problem.retryable).toBe(true);
+    expect(JSON.stringify(clean.problem) + clean.message).not.toMatch(/hunter2-secret|KEYID-9876/);
+    const plain = scrubThrown(new TypeError("boom hunter2-secret"), ["hunter2-secret"]);
+    expect(plain.message).toBe("boom [redacted]");
+    expect(plain.name).toBe("TypeError");
+  });
+});
+
 describe("lake test profile (a SQLite catalog and a local folder)", () => {
-  function lakeTest(p: Project, access: "write" | "read" = "write"): SandboxSpec {
-    mkdirSync(join(p.root, "lake-data"), { recursive: true });
-    return {
-      profile: "warehouse", timezone: "UTC", root: p.root, stateDir: p.state,
-      mode: { kind: "lake-test", extensionDir: ext.dir, secretDir: p.secrets, lake: { catalog: { kind: "sqlite", path: join(p.state, "meta.sqlite") }, dataPath: join(p.root, "lake-data") + "/", access } },
-    };
-  }
+  const lakeTest = lakeTestSpec;
 
   withExt("loads ducklake and sqlite only; the lake's folder works, everything else is refused (acceptance 5)", async () => {
     const p = await project();
@@ -426,8 +573,8 @@ describe("lake test profile (a SQLite catalog and a local folder)", () => {
       "ATTACH 'dbname=x host=127.0.0.1' AS pg (TYPE postgres)",
     ]) expect(await error(c, sql), sql).toMatch(/Permission Error|Loading external extensions is disabled/);
     expect(existsSync(join(p.root, "lake-data-2", "x.parquet"))).toBe(false);
-    // A local attach inside what the profile allows still works (the trash does this, §5).
-    await c.run(`ATTACH '${p.state}/trash.duckdb' AS trash`);
+    // A local attach inside what the profile allows (here its own folder) still works (the trash does this, §5).
+    await c.run(`ATTACH '${p.root}/lake-data/trash.duckdb' AS trash`);
     await c.run("CREATE TABLE trash.z AS SELECT 1 a");
     await c.run("DETACH trash");
   });
@@ -533,6 +680,7 @@ describe("lake profile (a Postgres catalog and a bucket folder)", () => {
     const w = await open(spec(p, l.spec()));
     await w.run(`CREATE TABLE ${LAKE_ALIAS}.t AS SELECT range AS a FROM range(100)`);
     const port = freePort();
+    const remote = await listenerChild(p);
     const rd = l.spec({ access: "read", reader: true });
     const c = await open({
       profile: "serve", timezone: "UTC",
@@ -543,6 +691,9 @@ describe("lake profile (a Postgres catalog and a bucket folder)", () => {
     expect(await rows(c, `SELECT count(*) FROM ${LAKE_ALIAS}.t`)).toEqual([[100n]]);
     expect(await error(c, `INSERT INTO ${LAKE_ALIAS}.t VALUES (1)`)).toMatch(/read-only|read only/i);
     await expectLocked(c, ["postgres", "ducklake", "httpfs", "quack"]);
+    // A remote Quack server, with a valid token, cannot be attached once locked, though quack is loaded (acceptance 2).
+    await error(c, `ATTACH 'quack:localhost:${remote.port}' AS remote (TOKEN '${remote.token}')`);
+    expect(await rows(c, "SELECT database_name FROM duckdb_databases() WHERE database_name LIKE 'remote%'")).toEqual([]);
     for (const sql of [
       `COPY (SELECT 1 a) TO 's3://lake/elsewhere/x.parquet'`,
       "SELECT * FROM read_text('/etc/hosts')",
@@ -550,6 +701,29 @@ describe("lake profile (a Postgres catalog and a bucket folder)", () => {
       `ATTACH '${p.live}' AS live`,
     ]) expect(await error(c, sql), sql).toMatch(/Permission Error/);
     await c.run(`SELECT * FROM quack_stop('quack:localhost:${port}')`).catch(() => {});
+    await remote.stop();
+  });
+
+  withPg("an error from the caller's prepare is scrubbed of the lake's credentials (should-fix 6)", async () => {
+    const p = await project();
+    const l = await lake();
+    const w = await open(spec(p, l.spec()));
+    await w.run(`CREATE TABLE ${LAKE_ALIAS}.t AS SELECT 1 a`);
+    const lk = l.spec({ access: "read", reader: true });
+    const instance = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
+    cleanup.push(() => instance.closeSync());
+    let caught: unknown;
+    try {
+      await connect(instance, {
+        profile: "serve", timezone: "UTC",
+        mode: { kind: "lake-readers", extensionDir: ext.dir, secretDir: p.secrets, lake: { ...lk, access: "read" }, prepare: async () => { throw new Error(`listener failed for ${READER.password} and ${KEYS.ro.id}`); } },
+      }, `:memory:ps${++seq}`);
+    } catch (e) {
+      caught = e;
+    }
+    expect((caught as Error).message).toContain("listener failed");
+    expect((caught as Error).message).not.toContain(READER.password);
+    expect((caught as Error).message).not.toContain(KEYS.ro.id);
   });
 
   test("lake-readers refuses a read-write lake: a reader never attaches with the writer's login", async () => {
@@ -650,15 +824,32 @@ describe("lake profile (a Postgres catalog and a bucket folder)", () => {
 });
 
 describe("no code path installs an extension or reaches DuckDB's repository (acceptance 7)", () => {
-  test("no source string issues INSTALL or names an extension repository", async () => {
+  test("no source issues INSTALL, names an extension repository, or turns auto-install on", async () => {
     const { sourceFiles, SRC, sourceStrings } = await import("../agent/contract-testkit.ts");
+    const ts = (await import("typescript")).default;
     const offenders: string[] = [];
+    // The SQL statement anywhere in a string (also after a `;`), upper or lower case; a lower-case template that is only
+    // `install ${name}`. Not the English verb in a hint ("install X, or write its absolute path").
+    const statement = /(^|;)\s*(FORCE\s+)?INSTALL\b/;
+    const statementOnly = /^\s*(force\s+)?install\s+X\s*(from\s+X)?\s*;?\s*$/i;
+    const knownName = /\binstall\s+(httpfs|quack|ducklake|postgres|sqlite|parquet|json|icu)\b/i;
     for (const file of sourceFiles(SRC)) {
-      for (const s of sourceStrings(file, readFileSync(file, "utf8"))) {
-        // The SQL statement, upper case, or lower case followed by something DuckDB can install; not the English verb.
-        if (/^\s*(FORCE\s+)?INSTALL\b/.test(s.text) || /^\s*(force\s+)?install\s+(httpfs|quack|ducklake|postgres|sqlite|parquet|json|icu|'|")/i.test(s.text) || /install_extension|\bFROM\s+community\b/i.test(s.text)) offenders.push(`${file}:${s.line}: ${s.text.slice(0, 80)}`);
+      const text = readFileSync(file, "utf8");
+      for (const s of sourceStrings(file, text)) {
+        if (statement.test(s.text) || statementOnly.test(s.text) || knownName.test(s.text) || /install_extension|\bFROM\s+community\b/i.test(s.text)) offenders.push(`${file}:${s.line}: ${s.text.slice(0, 80)}`);
         if (/extensions\.duckdb\.org|custom_extension_repository|autoinstall_known_extensions\s*=\s*true|autoload_known_extensions\s*=\s*true/i.test(s.text)) offenders.push(`${file}:${s.line}: ${s.text.slice(0, 80)}`);
       }
+      // The options as object properties or assignments: { autoinstall_known_extensions: "true" } and friends.
+      const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+      const visit = (n: import("typescript").Node): void => {
+        if (ts.isPropertyAssignment(n) && /^(autoinstall_known_extensions|autoload_known_extensions|allow_community_extensions)$/.test(n.name.getText(sf).replace(/["'`]/g, ""))) {
+          const v = n.initializer;
+          const on = v.kind === ts.SyntaxKind.TrueKeyword || ((ts.isStringLiteral(v) || ts.isNoSubstitutionTemplateLiteral(v)) && /^(true|1|on)$/i.test(v.text));
+          if (on) offenders.push(`${file}:${sf.getLineAndCharacterOfPosition(n.getStart()).line + 1}: ${n.getText(sf)}`);
+        }
+        ts.forEachChild(n, visit);
+      };
+      visit(sf);
     }
     expect(offenders).toEqual([]);
   });

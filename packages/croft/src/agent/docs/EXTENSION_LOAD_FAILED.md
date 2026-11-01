@@ -3,7 +3,9 @@
 A croft mode checked every extension file against the checksum it pins, and then DuckDB itself refused to load one.
 The file is the right one, so this is not a damaged or replaced file: it is a mismatch between the file and the
 DuckDB library croft runs on, or a problem in the machine that loading cannot get past. details.extension names the
-extension and details.duckdb holds DuckDB's first line of explanation. Nothing of the mode was started.
+extension and details.duckdb holds DuckDB's first line of explanation. The DuckDB instance that was being set up may
+hold extensions loaded before this one, so croft does not use it again: every later attempt on it fails, and the
+mode starts again only on a new instance.
 
 The project's data was not touched.
 

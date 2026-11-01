@@ -8,7 +8,8 @@ details.built holds what the file's footer says, and details.platform and detail
 The project's data was not touched.
 
 What to do:
-- Replace the file with the one pinned for this DuckDB version and platform. The fix command fills the extensions
-  folder from DuckDB's official extension repository and checks each file against the pinned checksum.
+- Replace the file with the one pinned for this DuckDB version and platform. The fix says how: the croft repository's
+  scripts/fetch-extensions.ts fills the extensions folder from DuckDB's official extension repository and checks
+  each file against the pinned checksum. (How a user gets the files without the repository is not built yet.)
 - A folder shared between machines of different kinds needs one file per platform: croft looks under
   v<DuckDB version>/<platform>/ in the folder, so a copy made on another machine usually landed in the wrong place.

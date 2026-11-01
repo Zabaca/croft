@@ -66,7 +66,10 @@ export async function startPostgres(): Promise<TestPostgres> {
   const password = "pg-admin-pw-for-tests";
   writeFileSync(join(dir, "pw"), password);
   const init = Bun.spawnSync([join(bin, "initdb"), "-D", data, "-U", "postgres", "--auth=scram-sha-256", `--pwfile=${join(dir, "pw")}`, "-E", "UTF8"], { stdout: "ignore", stderr: "pipe" });
-  if (init.exitCode !== 0) throw new Error(`initdb failed: ${init.stderr.toString()}`);
+  if (init.exitCode !== 0) {
+    rmSync(dir, { recursive: true, force: true });
+    throw new Error(`initdb failed: ${init.stderr.toString()}`);
+  }
   const port = freePort();
   // -k points the unix socket at the temporary folder, so nothing is left in /tmp or the system socket folder.
   const child = Bun.spawn([join(bin, "postgres"), "-D", data, "-p", String(port), "-k", dir, "-c", "listen_addresses=127.0.0.1", "-c", "fsync=off", "-c", "max_connections=60"], { stdout: "ignore", stderr: "ignore" });
@@ -79,7 +82,11 @@ export async function startPostgres(): Promise<TestPostgres> {
   };
   for (let i = 0; i < 100; i++) {
     try { if ((await sql("select 1")) === "1") break; } catch { /* not up yet */ }
-    if (i === 99) { await stop(child); throw new Error("postgres did not start"); }
+    if (i === 99) {
+      await stop(child);
+      rmSync(dir, { recursive: true, force: true });
+      throw new Error("postgres did not start");
+    }
     await Bun.sleep(100);
   }
   return {

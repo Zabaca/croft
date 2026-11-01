@@ -71,10 +71,12 @@ jobs:
       - name: DuckDB extension files, cached
         uses: actions/cache@v4
         with:
-          path: ~/.cache/croft/test-extensions
+          path: ${{ runner.temp }}/croft-extensions
           key: duckdb-extensions-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('packages/croft/src/db/extension-pins.ts') }}
       - name: fetch and verify the DuckDB extension files
         working-directory: packages/croft
+        env:
+          CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
         run: bun scripts/fetch-extensions.ts
       # The lake profile's tests start Postgres in the foreground, as a child of the test. Never as a service.
       - name: Postgres for the lake tests
@@ -85,7 +87,12 @@ jobs:
               brew install postgresql@17
               bun scripts/check-mode-tools.ts
             else
-              exit 1
+              # A Linux image without Postgres (the arm image may lack it). Debian starts the service on install; a
+              # CI VM is thrown away, but stop it so only the test's own foreground Postgres runs.
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends postgresql
+              sudo systemctl stop postgresql || true
+              bun scripts/check-mode-tools.ts
             fi
           fi
       - name: typecheck
@@ -95,6 +102,7 @@ jobs:
         working-directory: packages/croft
         env:
           CROFT_CI: "1"
+          CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
         run: bun test
 
   # Smoke: Alpine (musl) installs and prints its version, and a fresh project runs its example and answers a query.

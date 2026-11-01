@@ -5,17 +5,70 @@
 // extension-pins.ts. Where the files come from is the caller's `dir`: this slice's tests and builders fill one with
 // scripts/fetch-extensions.ts; how users get them is a later decision (option 06, slice 5).
 import { createHash } from "node:crypto";
-import { closeSync, openSync, readSync, readFileSync, statSync } from "node:fs";
+import { closeSync, openSync, readdirSync, readSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import type { Fix } from "../core/types.ts";
 import { DUCKDB_VERSION, EXTENSIONS, type ExtensionName, PLATFORMS, type Platform } from "./extension-names.ts";
 import { EXTENSION_PINS } from "./extension-pins.ts";
 
-/** DuckDB's platform name for this machine, or null where croft pins nothing (musl, Windows). */
-export function hostPlatform(os: string = process.platform, arch: string = process.arch): Platform | null {
+/** What detectMusl looks at; tests stub it. */
+export interface LibcProbe {
+  /** The first bytes of the running executable (its ELF header holds the dynamic loader's path), or null. */
+  head(): Buffer | null;
+  /** The names in /lib and /lib64. */
+  loaders(): string[];
+}
+
+const realProbe: LibcProbe = {
+  head() {
+    try {
+      const fd = openSync(process.execPath, "r");
+      try {
+        const buf = Buffer.alloc(4096);
+        const n = readSync(fd, buf, 0, buf.length, 0);
+        return buf.subarray(0, n);
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      return null;
+    }
+  },
+  loaders() {
+    const out: string[] = [];
+    for (const dir of ["/lib", "/lib64", "/usr/lib"]) {
+      try { out.push(...readdirSync(dir)); } catch { /* absent */ }
+    }
+    return out;
+  },
+};
+
+/**
+ * Whether this Linux uses musl (Alpine) rather than glibc. DuckDB's musl extension builds are different files and croft
+ * pins none, so a musl machine is an unpinned platform. The running executable names its dynamic loader in its ELF
+ * header (`/lib/ld-musl-x86_64.so.1` or `/lib64/ld-linux-x86-64.so.2`), which is what decides; when it cannot be read,
+ * a musl loader on disk with no glibc loader beside it does.
+ */
+export function detectMusl(probe: LibcProbe = realProbe): boolean {
+  const head = probe.head()?.toString("latin1") ?? "";
+  if (head.includes("ld-musl")) return true;
+  if (head.includes("ld-linux")) return false;
+  const loaders = probe.loaders();
+  return loaders.some((n) => n.startsWith("ld-musl-")) && !loaders.some((n) => n.startsWith("ld-linux"));
+}
+
+let muslOfThisMachine: boolean | undefined;
+/** detectMusl for this machine, read once. */
+const hostIsMusl = (): boolean => (muslOfThisMachine ??= detectMusl());
+
+/** DuckDB's platform name for this machine, or null where croft pins nothing (musl, Windows, other CPUs). */
+export function hostPlatform(os: string = process.platform, arch: string = process.arch, musl: () => boolean = hostIsMusl): Platform | null {
   if (os === "darwin") return arch === "arm64" ? "osx_arm64" : arch === "x64" ? "osx_amd64" : null;
-  if (os === "linux") return arch === "x64" ? "linux_amd64" : arch === "arm64" ? "linux_arm64" : null;
+  if (os === "linux") {
+    if (musl()) return null;
+    return arch === "x64" ? "linux_amd64" : arch === "arm64" ? "linux_arm64" : null;
+  }
   return null;
 }
 
@@ -47,21 +100,28 @@ export function readFooter(path: string): ExtensionFooter | null {
   }
 }
 
-// Files already verified in this process, by identity, so opening several instances hashes each file once.
+// Files already verified in this process, by identity (size, mtime, ctime, inode), so opening several instances hashes each file once.
 const verified = new Map<string, string>();
 
+// How a user gets the files is not built yet (option 06, slice 5), so the fix points at the croft repository's script.
 const FIX: Fix = {
-  kind: "command",
-  description: "fill the extensions folder with DuckDB's pinned files (from the croft repository), checked against the pinned checksums",
-  command: "bun scripts/fetch-extensions.ts <folder>",
+  kind: "manual",
+  description: "fill the extensions folder with DuckDB's pinned files using scripts/fetch-extensions.ts from the croft repository; it checks each file against the pinned checksum before writing it",
+};
+
+const PLATFORM_FIX: Fix = {
+  kind: "manual",
+  description: "run the mode on macOS, or on Linux with glibc, on an x64 or arm64 CPU; ask the user, since croft cannot change the machine",
+  requiresHuman: true,
 };
 
 /** Check one pinned file and return its absolute path; throws a CroftError with a stable code when it is not the pinned file. */
 export function verifyExtension(dir: string, name: ExtensionName, platform: Platform | null = hostPlatform()): string {
   if (!platform) {
     throw new CroftError("EXTENSION_MISSING", {
-      message: `croft pins no ${name} extension for ${process.platform} ${process.arch}`,
-      hint: `croft's modes run on macOS and Linux (glibc) on x64 and arm64: ${PLATFORMS.join(", ")}`,
+      message: `croft pins no ${name} extension for ${process.platform} ${process.arch}${process.platform === "linux" && hostIsMusl() ? " (musl)" : ""}`,
+      hint: `croft's modes run on macOS and Linux with glibc, on x64 and arm64: ${PLATFORMS.join(", ")}`,
+      fix: PLATFORM_FIX,
       retryable: false,
       details: { kind: "platform", extension: name, os: process.platform, arch: process.arch },
     });
@@ -80,7 +140,7 @@ export function verifyExtension(dir: string, name: ExtensionName, platform: Plat
     });
   }
   const pin = EXTENSION_PINS[platform][name];
-  const identity = `${path}\0${st.size}\0${st.mtimeMs}\0${st.ino}`;
+  const identity = `${path}\0${st.size}\0${st.mtimeMs}\0${st.ctimeMs}\0${st.ino}`;
   if (verified.get(path) === identity) return path;
   const sha256 = st.size === pin.bytes ? createHash("sha256").update(readFileSync(path)).digest("hex") : null;
   if (sha256 === pin.sha256) {
