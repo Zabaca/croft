@@ -23,7 +23,7 @@ import type { Project } from "../../project/root.ts";
 import { liveServer } from "../../read/locate.ts";
 import type { SchedulingSetting } from "../../schedule/os.ts";
 import { isLoopbackHost, isUnspecifiedHost, resolveToken, type ServeToken, urlHost } from "../../serve/auth.ts";
-import { openServeEngine } from "../../serve/instance.ts";
+import { openEngine } from "../../serve/open.ts";
 import { type LoopEvent, type SchedulerLoop, startLoop, TICK_INTERVAL_MS, tickEnv, type TickSpawner } from "../../serve/loop.ts";
 import {
   alreadyServing, removeServeJson, type RunningServer, type ServerOptions, serveJsonPath, startServer, writeServeJson,
@@ -123,7 +123,7 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
 
   const started = ctx.now();
   try {
-    engine = await (deps.openEngine ?? openServeEngine)({ root: project.root, maxConcurrent: cfg.maxConcurrent, queryTimeoutMs: cfg.queryTimeoutMs });
+    engine = await (deps.openEngine ?? openEngine)({ root: project.root, maxConcurrent: cfg.maxConcurrent, queryTimeoutMs: cfg.queryTimeoutMs });
     server = (deps.listen ?? startServer)({
       engine, host, port, token: token.token, allowOrigins: cfg.allowOrigins, root: project.root,
       database: project.databaseLabel, timezone: project.timezone, startedAt: formatInstant(started, project.timezone),

@@ -153,9 +153,17 @@ export async function openInstance(path: string, mode: AccessMode, o: { stateDir
   return { instance, path: real };
 }
 
-/** A private in-memory database (TS transforms). ":memory:" is never shared by the instance cache. */
+/** A new in-memory instance. ":memory:" is never shared by the instance cache [V: 2.0.0, two calls gave two instances
+ *  with separate catalogs]. The one place an in-memory instance is made: TS transforms, and server mode's readers'
+ *  process (serve/worker.ts, D119), whose in-memory database holds nothing of croft's but the lock and what a mode
+ *  attaches. */
+export function openMemoryInstance(): Promise<DuckDBInstance> {
+  return DuckDBInstance.fromCache(":memory:", instanceConfig("read_write"));
+}
+
+/** A private in-memory database (TS transforms). */
 export async function openMemory(spec: Omit<SandboxSpec, "profile">): Promise<{ instance: DuckDBInstance; connect(): Promise<DuckDBConnection>; close(): void }> {
-  const instance = await DuckDBInstance.fromCache(":memory:", instanceConfig("read_write"));
+  const instance = await openMemoryInstance();
   const key = `:memory:${++memorySeq}`;
   const full: SandboxSpec = { ...spec, profile: "memory" };
   const open = new Set<DuckDBConnection>();

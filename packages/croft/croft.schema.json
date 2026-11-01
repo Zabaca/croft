@@ -26,6 +26,23 @@
       "type": "boolean",
       "default": false
     },
+    "serverMode": {
+      "description": "server mode: croft serve answers from a readers' process on the read copy (croft docs server-mode)",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "server mode: croft serve answers apps from a readers' process on the read copy and never opens the warehouse file; turns the read copy on, read-only on disk (croft docs server-mode)",
+          "type": "boolean",
+          "default": false
+        },
+        "acceptFullCopyCost": {
+          "description": "accept that every refresh of the read copy is a full copy of a warehouse over 1 GB (the filesystem cannot clone it); without this, server mode refuses to start there",
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
     "notify": {
       "description": "what happens when a scheduled run fails",
       "type": "object",

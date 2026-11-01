@@ -23,6 +23,8 @@ export interface ServeHealth {
   /** The live write intent the server stepped aside for, or null. */
   writeIntent: { pid: number; runId: string | null; since: string } | null;
   queriesToday: number;
+  /** Server mode only: answers come from the read copy as of this time (null until the readers' process has one). */
+  serverMode?: { state: string; asOf: string | null };
 }
 
 /**
@@ -64,9 +66,11 @@ export interface ServeQueryData {
   rows: Record<string, unknown>[];
   rowCount: number;
   tookMs: number;
-  /** Answered from the read copy (readCopy on) while a writer held the live file. Absent for live answers. */
+  /** Answered from the read copy (readCopy on) while a writer held the live file. Absent for live answers, and in
+   *  server mode, where every answer is from the copy and none is "stale". */
   stale?: true;
-  /** With stale: the read copy's mtime (the checkpoint it was taken at), in the project offset. */
+  /** The read copy's mtime (the checkpoint it was taken at), in the project offset: with stale, the copy that answered
+   *  in place of the live file; in server mode (D119) on every answer. */
   asOf?: string;
 }
 
@@ -78,6 +82,18 @@ export interface ServeEngineStatus {
   /** DuckDB connections open right now (0 whenever the file is released). */
   openConnections: number;
   queriesToday: number;
+  /** Server mode only (D119): the readers' engine (serve/readers.ts). `state` is the engine's own: "waiting" for the
+   *  first copy, "starting", "open", "restarting" after a kill, a crash or a failed start, or "stopped". */
+  serverMode?: {
+    state: "waiting" | "starting" | "open" | "restarting" | "stopped";
+    /** The read copy, and its as-of time (in the project offset) as the readers' process has it; null before it opens. */
+    copy: string;
+    asOf: string | null;
+    workerPid: number | null;
+    /** Refreshed copies taken in, and times the readers' process was started again, since croft serve started. */
+    swaps: number;
+    restarts: number;
+  };
 }
 
 export interface ServeEngineOptions {

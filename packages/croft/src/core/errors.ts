@@ -99,6 +99,7 @@ export const CODES = {
   EXTENSION_WRONG_BUILD: { category: "environment", severity: "error", exit: 2 },
   EXTENSION_LOAD_FAILED: { category: "environment", severity: "error", exit: 2 },
   LAKE_ATTACH_FAILED: { category: "environment", severity: "error", exit: 2 },
+  SERVER_MODE_COPY_COSTLY: { category: "environment", severity: "error", exit: 2 },
   CLAUDE_FILES_OUTDATED: { category: "environment", severity: "warning", exit: 0 },
   SCHEDULER_STALE: { category: "environment", severity: "warning", exit: 0 },
   PROJECT_NOT_WRITABLE: { category: "environment", severity: "error", exit: 2 },
@@ -131,6 +132,7 @@ export const CODES = {
   BUN_UNTESTED: { category: "warning", severity: "warning", exit: 0 },
   DB_ON_SYNCED_FOLDER: { category: "warning", severity: "warning", exit: 0 },
   TZDATA_MISMATCH: { category: "warning", severity: "warning", exit: 0 },
+  READ_COPY_NOT_CLONED: { category: "warning", severity: "warning", exit: 0 },
 } as const satisfies Record<string, CodeInfo>;
 
 export type Code = keyof typeof CODES;

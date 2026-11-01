@@ -4,7 +4,7 @@
 //
 //   bun scripts/fetch-extensions.ts [folder] [--all-platforms] [--only quack,httpfs]
 //
-// The folder is, in order: the argument, $CROFT_EXTENSION_DIR, then testExtensionDir() (a cache under $XDG_CACHE_HOME
+// The folder is, in order: the argument, $CROFT_EXTENSION_DIR, then resolveExtensionDir() (a cache under $XDG_CACHE_HOME
 // or ~/.cache, shared by every worktree). It downloads from DuckDB's official extension repository over HTTPS (a
 // machine's proxy may refuse plain HTTP), unpacks, and writes a file only once its checksum matches. A file already
 // there and correct is left alone. Exit 1 on any mismatch, with nothing written for it.
@@ -15,14 +15,14 @@ import { gunzipSync } from "node:zlib";
 import { extensionPath, hostPlatform, verifyExtension } from "../src/db/extension-files.ts";
 import { DUCKDB_VERSION, EXTENSIONS, type ExtensionName, PLATFORMS, type Platform } from "../src/db/extension-names.ts";
 import { EXTENSION_PINS } from "../src/db/extension-pins.ts";
-import { testExtensionDir } from "../src/db/extension-dir-testkit.ts";
+import { resolveExtensionDir } from "../src/db/extension-files.ts";
 
 const REPO = "https://extensions.duckdb.org";
 const args = process.argv.slice(2);
 const flag = (n: string) => args.includes(n);
 const only = args.find((a) => a.startsWith("--only="))?.slice(7).split(",") ?? (args.includes("--only") ? args[args.indexOf("--only") + 1]!.split(",") : null);
 const positional = args.filter((a, i) => !a.startsWith("--") && args[i - 1] !== "--only");
-const dir = positional[0] ?? process.env.CROFT_EXTENSION_DIR ?? testExtensionDir();
+const dir = positional[0] ?? process.env.CROFT_EXTENSION_DIR ?? resolveExtensionDir();
 
 const platforms: readonly Platform[] = flag("--all-platforms") ? PLATFORMS : [hostPlatform() ?? fail(`croft pins no extensions for ${process.platform} ${process.arch}`)];
 const names = (Object.keys(EXTENSIONS) as ExtensionName[]).filter((n) => !only || only.includes(n));

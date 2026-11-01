@@ -21,7 +21,10 @@
 //   rename    the temporary file gets the checkpoint's time as its mtime (croft serve's `asOf`) and is renamed
 //             over the copy, so a reader never sees a half file and one holding the old copy keeps reading it
 //             (POSIX rename; the read copy is POSIX-only in v1). A WAL a GUI left next to the old copy goes first:
-//             DuckDB would replay it onto the new one.
+//             DuckDB would replay it onto the new one (a read-only attach replays a valid WAL in memory too [V: 2.0.0];
+//             only an invalid one is ignored). In server mode (D119) the temporary file is marked read-only (0444)
+//             before the rename, so a query that got past the gate in the readers' process still cannot write over the
+//             copy, and the refresh refuses to run where a full copy would be too costly (db/copy-policy.ts).
 //
 // Errors are logged to <state>/readcopy.log and recorded in the setting (lastError), never thrown: the run has
 // already succeeded, and a copy that missed a refresh only shows older data, which croft serve marks with asOf.
@@ -33,13 +36,14 @@
 //             and this module imports DuckDB only when it refreshes, so doctor can import it before the binding
 //             check.
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, utimesSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, utimesSync } from "node:fs";
 import { basename, dirname, join, relative, sep } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { currentIdentity, type ProcessIdentity, recordAlive } from "../core/proc.ts";
 import { formatInstant, now, parseInstant, zonedParts } from "../core/time.ts";
 import { RunsDb } from "../history/runs-db.ts";
 import { loadProject, type Project } from "../project/root.ts";
+import { assertCopyPolicy } from "./copy-policy.ts";
 import type { DuckWarehouse } from "./warehouse.ts";
 
 /** The runs.sqlite setting that coordinates refreshes and records the last one. */
@@ -521,6 +525,9 @@ async function refreshOnce(project: Project, o: ReadCopyOptions, round: number):
   let own: DuckWarehouse | null = null;
   try {
     mkdirSync(dir, { recursive: true });
+    // Server mode (D121): where a full copy would be too costly and the project has not accepted it, no refresh runs.
+    // Before the lease, so a refused one holds nothing.
+    if (project.config.serverMode.enabled) assertCopyPolicy(project, { platform: o.platform, cp: o.cp });
     removeTemps(path);
     // DuckDB is imported only here, when a refresh opens the warehouse itself (doctor imports this module).
     const w = o.warehouse ?? (own = (await import("./warehouse.ts")).openWarehouse({
@@ -544,8 +551,15 @@ async function refreshOnce(project: Project, o: ReadCopyOptions, round: number):
     own = null;
     await o.hooks?.beforeRename?.({ tmp, path, at: Date.now() });
     utimesSync(tmp, leased.at, leased.at);
+    // Server mode: read-only on disk before it is a copy anyone attaches (D119). The rename needs the folder, not the file.
+    if (project.config.serverMode.enabled) chmodSync(tmp, 0o444);
     rmSync(`${path}.wal`, { force: true });
     renameSync(tmp, path);
+    // SQL in the readers' process can create `<copy>.wal` (the sandbox lets a database's own WAL through), and a valid
+    // WAL is replayed by the next attach: one that appeared since the first removal goes too. The readers' process
+    // removes any again right before it attaches. Only in server mode: there the copy is read-only on disk, so no tool
+    // holds a live WAL of its own beside it; with a plain read copy a GUI may.
+    if (project.config.serverMode.enabled) rmSync(`${path}.wal`, { force: true });
     return {
       status: "refreshed", path, method: leased.method, asOf: formatInstant(leased.at, project.timezone), heldMs: leased.heldMs,
       rounds: round, refreshedAt: leased.at.toISOString(),

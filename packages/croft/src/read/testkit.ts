@@ -123,6 +123,32 @@ export function spawnHolder(database: string, holdMs: number | "release", insert
   }));
 }
 
+// A croft writer in a child process: warehouse.ts's write lease (the write intent first, then the lock, then the linger),
+// held for `holdMs` after it prints "acquired", with one row added to a `log` table. It prints "released" when it is done.
+const WRITER = `
+const { openWarehouse } = await import(process.env.CROFT_WAREHOUSE_TS);
+const [path, root, stateDir, label, holdMs] = process.argv.slice(2);
+const w = openWarehouse({ path, mode: "read_write", timezone: "UTC", root, stateDir, isTTY: false, waits: { offTtyMs: 20000 }, runId: label });
+await w.write(label, async (tx) => {
+  console.log("acquired");
+  await tx.exec("CREATE TABLE IF NOT EXISTS log (who VARCHAR)");
+  await tx.exec("INSERT INTO log VALUES ($1)", [label]);
+  await new Promise((r) => setTimeout(r, Number(holdMs)));
+}, { runId: label });
+await w.close();
+console.log("released");
+`;
+
+/** A croft writer child (see WRITER) on a temp project's warehouse: it holds the write lease for `holdMs`. */
+export function spawnWriter(p: Pick<TempProject, "database" | "root" | "stateDir">, label: string, holdMs: number): Child {
+  const script = join(p.root, `writer-${label}.mjs`);
+  writeFileSync(script, WRITER);
+  return track(spawn(process.execPath, [script, p.database, p.root, p.stateDir, label, String(holdMs)], {
+    env: { ...process.env, CROFT_WAREHOUSE_TS: fileURLToPath(new URL("../db/warehouse.ts", import.meta.url)) },
+    stdio: ["ignore", "pipe", "pipe"],
+  }));
+}
+
 /** Let go of the file a spawnHolder(…, "release") holds. */
 export function releaseHolder(holder: Child): void {
   holder.proc.kill("SIGUSR2");
