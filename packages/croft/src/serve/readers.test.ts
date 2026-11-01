@@ -5,7 +5,8 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, readFileSync, renameSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeAllWarehouses } from "../db/warehouse.ts";
 import { cleanup, seed, type TempProject } from "../read/testkit.ts";
@@ -15,8 +16,10 @@ import type { ServeEngine } from "./types.ts";
 
 const { ext, withExt } = extensionFiles("readers.test");
 const engines: ServeEngine[] = [];
+const scratchDirs: string[] = [];
 afterAll(async () => {
   for (const e of engines) await e.close().catch(() => {});
+  for (const d of scratchDirs) rmSync(d, { recursive: true, force: true });
   await closeAllWarehouses();
   cleanup();
 });
@@ -54,6 +57,24 @@ describe("starting", () => {
     const err = await rejection(openReadersEngine({ root: p.root, extensionDir: join(p.root, "no-extensions"), copyPollMs: 25 }));
     expect(err.code).toBe("EXTENSION_MISSING");
     expect(err.problem.details).toMatchObject({ kind: "file" });
+  });
+
+  test("where the copy cannot be cloned and the warehouse is over 1 GB, croft serve does not start, unless the project accepts the cost", async () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "croft-cp-")));
+    scratchDirs.push(dir);
+    const cp = join(dir, "cp");
+    writeFileSync(cp, '#!/bin/sh\nfor a in "$@"; do case "$a" in -c|--reflink=always) exit 1;; esac; done\nexec /bin/cp "$@"\n');
+    chmodSync(cp, 0o755);
+    const policy = { platform: "linux" as const, cp: [cp] };
+    const p = await project({ n: 10 });
+    truncateSync(p.database, 1_500_000_000); // a sparse file: the policy reads only the size
+    const err = await rejection(openReadersEngine({ root: p.root, extensionDir: ext.dir, policy }));
+    expect(err.code).toBe("SERVER_MODE_COPY_COSTLY");
+    expect(err.problem.hint).toContain("serverMode.acceptFullCopyCost");
+    // The same warehouse with the cost accepted is not refused by the policy (it then starts, if the extension files are there).
+    const accepted = await project({ n: 10, config: { serverMode: { enabled: true, acceptFullCopyCost: true } } });
+    truncateSync(accepted.database, 1_500_000_000);
+    if (ext.ready) engines.push(await openReadersEngine({ root: accepted.root, extensionDir: ext.dir, policy, copyPollMs: 25 }));
   });
 
   withExt("a copy written by a newer croft fails the start with DB_NEWER_FORMAT, as the live file does", async () => {

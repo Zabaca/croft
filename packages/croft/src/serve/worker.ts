@@ -299,6 +299,14 @@ class Host {
       rmSync(`${this.path}.wal`, { force: true });
       await admin.run(`DETACH ${READ_COPY_ALIAS}`);
       await admin.run(`ATTACH ${sqlString(this.path)} AS ${READ_COPY_ALIAS} (READ_ONLY)`);
+      // A copy a newer croft wrote is refused here as it is when the process opens (DB_NEWER_FORMAT): the process ends,
+      // and the one that replaces it reports the same until the copy is one this croft reads.
+      const conn = await this.take();
+      try {
+        await checkFormat(sqlOn(conn, this.spec!.timezone));
+      } finally {
+        this.give(conn);
+      }
       this.epoch++;
     })();
     this.swapping = done.catch(() => {});

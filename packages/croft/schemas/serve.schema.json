@@ -140,6 +140,25 @@
                 }
               ]
             },
+            "serverMode": {
+              "type": "object",
+              "properties": {
+                "readCopy": {
+                  "type": "string"
+                },
+                "asOf": {
+                  "type": [
+                    "null",
+                    "string"
+                  ]
+                }
+              },
+              "required": [
+                "readCopy",
+                "asOf"
+              ],
+              "additionalProperties": false
+            },
             "redactedValues": {
               "const": true
             }

@@ -68,6 +68,18 @@
             "readCopy": {
               "$ref": "#/$defs/ReadCopyView"
             },
+            "serverMode": {
+              "type": "object",
+              "properties": {
+                "serving": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "serving"
+              ],
+              "additionalProperties": false
+            },
             "redactedValues": {
               "const": true
             }

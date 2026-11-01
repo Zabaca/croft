@@ -10,6 +10,10 @@ file.
 - A croft run is writing: croft serve steps aside while a run holds the file, and queries wait up to 10 s. For
   long writes, a larger { timeoutMs } in the app waits them out, and "readCopy": true in croft.json lets croft
   serve answer from the read copy meanwhile (stale: true, asOf; croft docs read-copy).
+- In server mode (croft docs server-mode) a run never makes the server busy. A 503 there means the readers' process
+  was restarted (reason "restarted": a query past its deadline, a crash, or a refresh the process could not take in),
+  is not up yet, or every slot is taken; the retry finds the replacement within a second or so. If it persists,
+  croft doctor and the server's terminal say why (a missing extension file, a copy from a newer croft).
 - Every query slot is taken: serve.maxConcurrent queries run at once (4 by default) and the rest queue. Slow
   queries hold their slot up to serve.queryTimeoutMs.
 
