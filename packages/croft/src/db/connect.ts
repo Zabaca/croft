@@ -16,6 +16,7 @@ import { availableParallelism, totalmem } from "node:os";
 import { physicalPath } from "../project/root.ts";
 import { basename, dirname, join, resolve } from "node:path";
 import { CroftError } from "../core/errors.ts";
+import { checkMode, type ModeSpec, modeCredentialDigest, modeDirectories, modeIdentity, modePaths, startMode } from "./modes.ts";
 
 const DUCKDB_VERSION = version().replace(/^v(?=\d)/, "");
 
@@ -33,6 +34,9 @@ export interface SandboxSpec {
   /** false: the optimizer is off on every connection (sql/bind.ts's shadow catalog, whose plans sql/deps.ts reads:
    *  the optimizer prunes scans). Set globally before locking, since the lock refuses changing it. */
   optimizer?: false;
+  /** A mode (server mode's readers' process, a lake): the extensions it loads, what it attaches and what its lockdown
+   *  lets through besides the profile's folders (db/modes.ts, D117, D118). Absent: today's file, no extension loaded. */
+  mode?: ModeSpec;
 }
 
 /**
@@ -110,7 +114,14 @@ export function allowedDirectories(spec: SandboxSpec): string[] {
       dirs = spec.stateDir ? [spec.stateDir] : [];
       break;
   }
-  return [...new Set(dirs.map(canonicalPath))];
+  // A mode adds its lake's folder: a bucket prefix as written, a local folder (the test lake) canonical like the rest.
+  const modeDirs = modeDirectories(spec.mode).map((d) => (/^[a-z][a-z0-9+.-]*:\/\//i.test(d) ? d : canonicalPath(d)));
+  return [...new Set([...dirs.map(canonicalPath), ...modeDirs])];
+}
+
+/** The single paths a profile may touch besides its folders: the read copy, for the readers' process. */
+export function allowedPaths(spec: SandboxSpec): string[] {
+  return [...new Set(modePaths(spec.mode).map(canonicalPath))];
 }
 
 const sqlString = (s: string) => `'${s.replaceAll("'", "''")}'`;
@@ -168,6 +179,13 @@ let memorySeq = 0;
 // Fingerprint of the sandbox applied to each instance (by canonical path), to catch a second profile
 // being applied to an already-locked instance in the same process.
 const configured = new Map<string, string>();
+// A digest of the credentials a mode instance was opened with, compared and never printed.
+const configuredCredentials = new Map<string, string>();
+// Instances whose mode started and then failed: the instance is part set up (extensions loaded, secrets in memory, a
+// database attached, a listener running) and unlocked, so no later connect may use it or lock it as something else.
+// The mark is on the instance, not its key: callers key by the warehouse path, and a new instance on the same path
+// after a failed start (a catalog that was unreachable for a moment) must work.
+const failedInstances = new WeakMap<DuckDBInstance, string>();
 const configuring = new Map<string, Promise<unknown>>();
 
 /**
@@ -179,7 +197,7 @@ export async function connect(instance: DuckDBInstance, spec: SandboxSpec, key: 
   try {
     // Serialize per instance: two first connections must not both try to configure it.
     const prev = configuring.get(key) ?? Promise.resolve();
-    const mine = prev.catch(() => {}).then(() => applySandbox(conn, spec, key));
+    const mine = prev.catch(() => {}).then(() => applySandbox(instance, conn, spec, key));
     configuring.set(key, mine);
     try {
       await mine;
@@ -198,16 +216,27 @@ async function scalar(conn: DuckDBConnection, sql: string): Promise<unknown> {
   return reader.getRowsJS()[0]?.[0];
 }
 
-async function applySandbox(conn: DuckDBConnection, spec: SandboxSpec, key: string): Promise<void> {
+async function applySandbox(instance: DuckDBInstance, conn: DuckDBConnection, spec: SandboxSpec, key: string): Promise<void> {
+  const failedWith = failedInstances.get(instance);
+  if (failedWith !== undefined) {
+    throw new CroftError("INTERNAL_ERROR", {
+      message: `the database ${key} was left part set up by a mode that failed to start (${failedWith}), so this instance cannot be used`,
+      hint: "open a new DuckDB instance; report this croft bug if a caller reused this one",
+    });
+  }
   const dirs = allowedDirectories(spec);
-  const fingerprint = JSON.stringify([spec.profile, spec.timezone, dirs, spec.memoryLimit ?? null, spec.threads ?? null, spec.optimizer ?? null]);
+  const paths = allowedPaths(spec);
+  // The mode's identity (kind, access, catalog and bucket, folders) is in the fingerprint, so a read-only request never
+  // gets an instance locked for writing; its credentials are compared by digest. Neither is a secret in the error.
+  const fingerprint = JSON.stringify([spec.profile, spec.timezone, dirs, spec.memoryLimit ?? null, spec.threads ?? null, spec.optimizer ?? null, spec.mode ? modeIdentity(spec.mode) : null, paths]);
+  const credentials = spec.mode ? modeCredentialDigest(spec.mode) : null;
   const locked = (await scalar(conn, "SELECT current_setting('lock_configuration')")) === true;
   if (locked) {
-    if (configured.get(key) !== fingerprint) {
+    if (configured.get(key) !== fingerprint || (configuredCredentials.get(key) ?? null) !== credentials) {
       throw new CroftError("INTERNAL_ERROR", {
         message: `the database ${key} is already open in this process with a different sandbox`,
         hint: "report this croft bug",
-        details: { expected: fingerprint, actual: configured.get(key) ?? null },
+        details: { expected: fingerprint, actual: configured.get(key) ?? null, sameCredentials: (configuredCredentials.get(key) ?? null) === credentials },
       });
     }
     return;
@@ -225,10 +254,23 @@ async function applySandbox(conn: DuckDBConnection, spec: SandboxSpec, key: stri
   if (spec.threads) await conn.run(`SET GLOBAL threads = ${Math.max(1, Math.floor(spec.threads))}`);
   // A global setting on DuckDB 2.0, so every later connection inherits it; the lock refuses changing it after.
   if (spec.optimizer === false) await conn.run("SET GLOBAL enable_optimizer = false");
-  await conn.run(`SET allowed_directories = [${dirs.map(sqlString).join(", ")}]`);
-  await conn.run("SET enable_external_access = false");
-  await conn.run("SET lock_configuration = true");
+  // A mode loads its extensions, attaches and starts what it serves now: DuckDB refuses each of them once outside
+  // access is off (D118). The check has no effect on the instance, so a refusal (a missing file, a profile the mode
+  // does not fit) leaves it clean and a retry can succeed. Once the mode starts, any failure leaves the instance part
+  // set up, and the instance is marked failed.
+  const files = spec.mode ? checkMode(spec.mode, spec.profile) : null;
+  try {
+    if (spec.mode) await startMode(conn, spec.mode, files!);
+    if (paths.length) await conn.run(`SET allowed_paths = [${paths.map(sqlString).join(", ")}]`);
+    await conn.run(`SET allowed_directories = [${dirs.map(sqlString).join(", ")}]`);
+    await conn.run("SET enable_external_access = false");
+    await conn.run("SET lock_configuration = true");
+  } catch (e) {
+    if (spec.mode) failedInstances.set(instance, e instanceof CroftError ? e.code : "error");
+    throw e;
+  }
   configured.set(key, fingerprint);
+  if (credentials !== null) configuredCredentials.set(key, credentials);
 }
 
 /** The sandbox fingerprint recorded for an instance key; for tests and diagnostics. */
