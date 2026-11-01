@@ -133,7 +133,7 @@ describe("probeClone on macOS volumes", () => {
     } finally {
       fat.detach();
     }
-  });
+  }, 60_000); // hdiutil makes, mounts and detaches an image: seconds on a runner
 });
 
 describe("when the probe runs", () => {

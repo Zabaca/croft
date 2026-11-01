@@ -1,7 +1,7 @@
 // Shared fixtures for the server-mode tests (readers*.test.ts, DESIGN.md D119): a server-mode project whose read copy
 // is made the way a refresh leaves it, and an engine over it. Test support, left out of the published package
 // (package.json "files").
-import { test } from "bun:test";
+import { setDefaultTimeout, test } from "bun:test";
 import { chmodSync, copyFileSync, renameSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
@@ -9,6 +9,10 @@ import { extensionsReady } from "../db/extension-dir-testkit.ts";
 import { makeProject, seed, type TempProject } from "../read/testkit.ts";
 import { openReadersEngine, type ReadersEngineInternals } from "./readers.ts";
 import type { ServeEngine, ServeEngineOptions } from "./types.ts";
+
+// These tests start real processes and run CPU-bound queries: seconds on a CI runner, where the 5 s default timed one out
+// (the long-query test, PR 10). Every file that imports this kit gets the same 60 s as tests/preload.ts.
+setDefaultTimeout(60_000);
 
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 

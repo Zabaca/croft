@@ -245,16 +245,21 @@ describe("the copy is refreshed under the readers", () => {
     }
   });
 
-  withExt("a refresh that lands while a long query reads the old file lets that query finish on it", async () => {
+  // A CPU-bound query of about 2 s here and 4 s or more on a CI runner: the explicit timeout is for the runner, and the test
+  // asserts order, not speed (the swap and the next query come while the long one is still running).
+  withExt("a refresh that lands while a long query reads the old file lets that query finish on it, and the swap does not wait for it", async () => {
     const p = await project({ n: 10 });
     const e = await engine(p);
-    const long = ask(e, "SELECT count(*) AS n FROM range(40000000) a, range(30) b WHERE (a.range + b.range) % 7 = 0");
+    let finished = false;
+    const long = ask(e, "SELECT count(*) AS n FROM range(25000000) a, range(30) b WHERE (a.range + b.range) % 7 = 0").finally(() => (finished = true));
     await sleep(100);
     await replaceCopy(p, 25, "2026-10-30T11:00:00Z");
     await until("the swap", () => (e.status().serverMode?.swaps ?? 0) === 1);
-    expect(Number((await long).rows[0]!.n)).toBeGreaterThan(0);
-    expect(await count(e)).toBe(25);
-  });
+    expect(finished).toBe(false); // the swap did not wait for the query
+    expect(await count(e)).toBe(25); // and a query after it reads the new copy at once
+    expect(finished).toBe(false);
+    expect(Number((await long).rows[0]!.n)).toBeGreaterThan(0); // the long one finishes on the old file
+  }, 60_000);
 
   withExt("a valid <copy>.wal left beside a refreshed copy is not replayed: the readers see the copy, and the file is gone", async () => {
     const p = await project({ n: 10 });

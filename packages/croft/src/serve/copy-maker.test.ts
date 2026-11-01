@@ -1,13 +1,14 @@
 // Making the read copy for croft serve in server mode (serve/copy-maker.ts, DESIGN.md D119): when it is missing, behind or
 // failed, a short-lived child refreshes it, once at a time, with a wait after a failure; the server itself opens nothing.
 // Nothing here needs DuckDB's extension files.
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { existsSync, rmSync, statSync, utimesSync } from "node:fs";
 import { RunsDb } from "../history/runs-db.ts";
 import { readCopyStatus } from "../db/readcopy.ts";
 import { cleanup, makeProject, type TempProject } from "../read/testkit.ts";
 import { CopyMaker } from "./copy-maker.ts";
 
+setDefaultTimeout(60_000); // as readers-testkit.ts: real child processes
 const makers: CopyMaker[] = [];
 afterAll(async () => {
   for (const m of makers) await m.stop();
