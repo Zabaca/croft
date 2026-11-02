@@ -11,11 +11,11 @@
 //     and zstd show by file name in all four Linux files. zlib shows by its inflate banner and message in httpfs only.
 //   - A library is listed for an extension if any of the four platforms' files of it shows the library (the union), because a
 //     package's notice has to cover the file of every platform it is installed on.
-// Where the 16 files show nothing for a component below, `found` says so and why it is listed (TDigest).
 // The license texts are the projects' own files, fetched once from the tags named in `source` and kept in scripts/notices/.
 // `used` is the license the code is taken under where the project offers a choice. Nothing here has been reviewed by a lawyer.
-// scripts/check-notices.ts scans the files for every marker and fails the add-on build when one shows a component that is not
-// listed here for that extension, or a DuckDB-vendored namespace that has no component.
+// scripts/check-notices.ts fails the add-on build when a file shows a component that is not listed here for its extension: by a
+// marker, by a DuckDB-vendored namespace that has no component, or (Linux files) by a compiled source-file name that no listed
+// component and no part of DuckDB's own tree owns.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,8 +34,8 @@ export interface Component {
   /** The extensions whose files contain it, on any platform. */
   in: readonly ExtensionName[];
   found: string;
-  /** What shows it in a file, as a regular expression over the file's bytes read as Latin-1. null: it has never been seen. */
-  marker: RegExp | null;
+  /** What shows it in a file, as a regular expression over the file's bytes read as Latin-1. */
+  marker: RegExp;
 }
 
 const ALL: readonly ExtensionName[] = ["httpfs", "quack", "ducklake", "postgres"];
@@ -101,9 +101,6 @@ export const COMPONENTS: readonly Component[] = [
   { id: "nanoarrow", name: "Apache Arrow nanoarrow (DuckDB's ADBC copy)", offered: "Apache-2.0", used: "Apache-2.0", files: ["nanoarrow.txt", "nanoarrow-notice.txt"], in: ALL,
     source: "https://raw.githubusercontent.com/apache/arrow-nanoarrow/main/LICENSE.txt (DuckDB's tree keeps no license file for src/common/adbc/nanoarrow; the version is not known)",
     found: "ub_duckdb_adbc_nanoarrow.cpp, all four Linux files; not in the macOS builds", marker: /nanoarrow/ },
-  { id: "tdigest", name: "t-digest (C++)", offered: "Apache-2.0", used: "Apache-2.0", files: ["duckdb-tdigest.txt", "duckdb-tdigest-notices.txt"], in: ALL, source: `${DUCKDB}/tdigest/LICENSE`,
-    found: "NOT FOUND in any of the 16 files (no duckdb_tdigest namespace, no t_digest symbol or file name; the earlier matches were OpenSSL's set_digest and DuckDB's GetDigestSize); listed because the review of a8a789c reported it in the Linux files",
-    marker: /duckdb_tdigest|t_digest\.hpp|TDigest/ },
 ];
 
 /** Namespaces DuckDB itself puts in its own `duckdb_` names that are not a vendored library. */

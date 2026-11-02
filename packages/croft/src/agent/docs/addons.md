@@ -63,9 +63,10 @@ All four also contain parts of the third-party sources in DuckDB's own tree. The
 macOS builds (jemalloc, FSST, nanoarrow, SkipList, FastPFor), and every one seen on any platform has its notice in each
 package: Mbed TLS, RE2, {fmt}, yyjson, jaro_winkler, moodycamel's queue, fast_float, utf8proc, Zstandard, hyperloglog, miniz,
 jemalloc, FSST, SkipList, FastPFor and nanoarrow, cpp-httplib (httpfs, quack) and pdqsort, vergesort and ska_sort (quack,
-ducklake, postgres). The notice of t-digest is there too although no file was found to contain it. The notices are kept
-complete by a check that the add-on build runs on all 16 files (`scripts/check-notices.ts`): it fails when a file shows a
-component the package does not list. This was read from the binaries and DuckDB's source tree by a person with tools, not
+ducklake, postgres). The notices are kept complete by a check that the add-on build runs on all 16 files
+(`scripts/check-notices.ts`): it fails when a file shows a component the package does not list, by a marker, by a vendored
+namespace, or, on Linux, by the name of a source file that no listed project and nothing in DuckDB's own tree owns. The
+macOS files are stripped of source names, so there only markers and namespaces can show a library. This was read from the binaries and DuckDB's source tree by a person with tools, not
 by a lawyer.
 
 ## Publishing the add-ons (for croft's maintainers)

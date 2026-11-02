@@ -12,6 +12,7 @@ import { DUCKDB_VERSION, type ExtensionName, PLATFORMS } from "../src/db/extensi
 import { EXTENSION_PINS } from "../src/db/extension-pins.ts";
 import { assertPinned, oversize, packageDir, planPackages, writePackages } from "../scripts/addon-packages.ts";
 import { checkBytes, checkNotices, componentsIn, namespacesIn } from "../scripts/check-notices.ts";
+import { elfSourceFiles } from "../scripts/elf-files.ts";
 import { COMPONENTS, componentsFor, licenseFor, noticesFor } from "../scripts/notices.ts";
 import { extensionsReady } from "../src/db/extension-dir-testkit.ts";
 
@@ -135,16 +136,15 @@ describe("third-party notices", () => {
     expect(ids("httpfs")).not.toContain("libpq");
   });
 
-  test("what the Linux builds compile in beyond the macOS ones, as the review read it with nm -a, is listed for every extension: jemalloc, FSST, nanoarrow, SkipList, fastpforlib, hyperloglog, miniz, zstd, TDigest", () => {
+  test("what the Linux builds compile in beyond the macOS ones, as the review read it with nm -a, is listed for every extension: jemalloc, FSST, nanoarrow, SkipList, fastpforlib, hyperloglog, miniz, zstd", () => {
     for (const e of SHIPPED_EXTENSIONS) {
       const ids = componentsFor(e).map((c) => c.id);
-      for (const id of ["jemalloc", "fsst", "nanoarrow", "skiplist", "fastpforlib", "hyperloglog", "miniz", "zstd", "tdigest", "mbedtls", "re2"]) expect(ids, `${e}: ${id}`).toContain(id);
+      for (const id of ["jemalloc", "fsst", "nanoarrow", "skiplist", "fastpforlib", "hyperloglog", "miniz", "zstd", "mbedtls", "re2"]) expect(ids, `${e}: ${id}`).toContain(id);
     }
     expect(componentsFor("httpfs").map((c) => c.id)).toContain("zlib");
     for (const e of ["quack", "ducklake", "postgres"] as const) expect(componentsFor(e).map((c) => c.id), e).not.toContain("zlib");
     // The Apache NOTICE files travel with the licenses that ask for it.
     expect(noticesFor("quack", "linux-x64")).toContain("Apache Arrow nanoarrow\nCopyright 2023 The Apache Software Foundation");
-    expect(noticesFor("quack", "linux-x64")).toContain("t-digest was originally authored by Ted Dunning");
     expect(noticesFor("quack", "linux-x64")).toContain("Jason Evans");
   });
 
@@ -209,19 +209,96 @@ describe("the notices stay complete (scripts/check-notices.ts)", () => {
     expect(componentsIn(bytes("nothing to see", "GetDigestSize", "set_digest")).size).toBe(0);
   });
 
-  test("every component but TDigest has a marker, and a marker that never matches is only allowed for a component that says it was never seen", () => {
-    for (const c of COMPONENTS) {
-      if (c.id === "tdigest") expect(c.found, c.id).toContain("NOT FOUND");
-      else expect(c.marker, c.id).not.toBeNull();
-    }
+  test("t-digest is not shipped: no file has it, so no package carries its license", () => {
+    expect(COMPONENTS.map((c) => c.id)).not.toContain("tdigest");
+    for (const e of SHIPPED_EXTENSIONS) expect(noticesFor(e, "linux-x64").toLowerCase()).not.toContain("t-digest");
+  });
+
+  /** A little-endian ELF64 object whose symbol table has one file entry per name, which is all elfSourceFiles reads. */
+  function elf(names: string[]): Buffer {
+    const strtab = Buffer.from(`\0${names.join("\0")}\0`, "latin1");
+    const symtab = Buffer.alloc(24 * (names.length + 1));
+    let at = 1;
+    names.forEach((n, i) => {
+      symtab.writeUInt32LE(at, 24 * (i + 1));
+      symtab[24 * (i + 1) + 4] = 4; // STT_FILE
+      at += n.length + 1;
+    });
+    const header = Buffer.alloc(64);
+    header.write("\x7fELF", 0, "latin1");
+    header[4] = 2; // ELFCLASS64
+    header[5] = 1; // little-endian
+    const shoff = 64 + strtab.length + symtab.length;
+    header.writeBigUInt64LE(BigInt(shoff), 0x28);
+    header.writeUInt16LE(64, 0x3a);
+    header.writeUInt16LE(3, 0x3c);
+    const sections = Buffer.alloc(64 * 3);
+    const set = (i: number, type: number, offset: number, size: number, link: number, entsize: number) => {
+      sections.writeUInt32LE(type, 64 * i + 4);
+      sections.writeBigUInt64LE(BigInt(offset), 64 * i + 0x18);
+      sections.writeBigUInt64LE(BigInt(size), 64 * i + 0x20);
+      sections.writeUInt32LE(link, 64 * i + 0x28);
+      sections.writeBigUInt64LE(BigInt(entsize), 64 * i + 0x38);
+    };
+    set(1, 2, 64 + strtab.length, symtab.length, 2, 24); // .symtab, linked to section 2
+    set(2, 3, 64, strtab.length, 0, 0); // .strtab
+    return Buffer.concat([header, strtab, symtab, sections]);
+  }
+
+  test("the ELF reader returns the file entries of the symbol table, and null for what is not a little-endian ELF64", () => {
+    expect(elfSourceFiles(elf(["a.c", "b/c.cpp"]))?.sort()).toEqual(["a.c", "b/c.cpp"]);
+    expect(elfSourceFiles(Buffer.from("not an elf file at all, and long enough to be read as a header".padEnd(80)))).toBeNull();
+    expect(elfSourceFiles(Buffer.alloc(10))).toBeNull();
+  });
+
+  test("a Linux file compiled from a source file nobody owns is a finding, however the library hides: no namespace, no marker, no banner", () => {
+    const f = checkBytes(elf(["ub_duckdb_main.cpp", "ducklake_extension.cpp", "newlib_core.c", "brand_new_codec.cpp"]), "ducklake", "linux_amd64");
+    expect(f.sources).toEqual(["brand_new_codec.cpp (nobody owns it)", "newlib_core.c (nobody owns it)"]);
+    expect(f.missing).toEqual([]);
+    expect(f.unknown).toEqual([]);
+    // The extension's own sources are only its own: ducklake's file in a quack package is nobody's here.
+    expect(checkBytes(elf(["ducklake_extension.cpp"]), "quack", "linux_arm64").sources).toEqual([expect.stringContaining("ducklake_extension.cpp (owned by ext:ducklake")]);
+  });
+
+  test("the libraries the last review found by file name, jemalloc, FSST, nanoarrow, SkipList, fastpforlib and zlib, are findings when their package does not list them", () => {
+    const names = ["jemalloc.c", "arena.c", "hpa.c", "libfsst.cpp", "ub_duckdb_adbc_nanoarrow.cpp", "SkipList.cpp", "bitpacking.cpp", "inflate.c", "inftrees.c"];
+    const without = componentsFor("httpfs").map((c) => c.id).filter((id) => !["jemalloc", "fsst", "nanoarrow", "skiplist", "fastpforlib", "zlib"].includes(id));
+    const f = checkBytes(elf(names), "httpfs", "linux_amd64", without);
+    // bitpacking.cpp is also the name of a file in DuckDB's own tree, so by name alone it is DuckDB's; the marker catches it (below).
+    expect(f.sources.map((x) => x.split(" ")[0]).sort()).toEqual(names.filter((n) => n !== "bitpacking.cpp").sort());
+    expect(f.missing).toContain("fastpforlib");
+    for (const x of f.sources) expect(x).toContain("not listed for httpfs");
+    // With the real list the same file is covered.
+    expect(checkBytes(elf(names), "httpfs", "linux_amd64").sources).toEqual([]);
+    expect(checkBytes(elf(names), "httpfs", "linux_amd64").missing).toEqual([]);
+    // A name two projects share is accepted when either is allowed: bitpacking.cpp is DuckDB's and fastpforlib's.
+    expect(checkBytes(elf(["bitpacking.cpp"]), "quack", "linux_amd64", []).sources).toEqual([]);
+  });
+
+  test("a Linux file whose symbol table cannot be read fails closed, and a macOS file is left to the markers", () => {
+    expect(checkBytes(Buffer.from("PQconnectdb"), "postgres", "linux_amd64").sources).toEqual(["the ELF symbol table cannot be read, so the source files cannot be checked"]);
+    expect(checkBytes(Buffer.from("not an elf"), "postgres", "osx_arm64").sources).toEqual([]);
+  });
+
+  test("the owner map is built from the tags the files were built from, and for this DuckDB", () => {
+    const map = JSON.parse(readFileSync(resolve(import.meta.dir, "../scripts/notices/source-owners.json"), "utf8")) as { duckdb: string; refs: Record<string, string>; owners: Record<string, string[]> };
+    expect(map.duckdb).toBe(DUCKDB_VERSION);
+    expect(map.refs.duckdb).toBe(`v${DUCKDB_VERSION}`);
+    expect(map.refs["ext:quack"]).toContain("f96420ed46aee9c42064bdb99ddfd1230d6c0086");
+    // Every component the notices list that has source files has an owner entry of that name.
+    for (const id of ["jemalloc", "fsst", "skiplist", "fastpforlib", "nanoarrow", "openssl", "curl", "zlib", "libpq", "croaring", "zstd", "mbedtls"]) expect(map.owners[id]?.length, id).toBeGreaterThan(0);
+    expect(map.owners.jemalloc).toContain("arena.c");
+    expect(map.owners.fsst).toContain("libfsst.cpp");
   });
 
   const real = extensionsReady(["quack", "httpfs", "ducklake", "postgres"]);
-  (real.ready ? test : test.skip)("this machine's four real files are covered, and every component listed is one of the files shows except TDigest", () => {
+  (real.ready ? test : test.skip)("this machine's four real files are covered, and every component listed is one the files show", () => {
     const r = checkNotices(real.dir, [hostPlatform()!]);
     expect(r.checked).toBe(4);
     expect(r.findings).toEqual([]);
-    for (const ids of Object.values(r.listedButNotSeen)) expect(ids.filter((id) => id !== "tdigest")).not.toContain("openssl");
+    // What only the Linux builds compile in is not in this machine's file when it is a macOS one; nothing else may be unseen.
+    const linuxOnly = ["zstd", "miniz", "jemalloc", "fsst", "skiplist", "fastpforlib", "nanoarrow", "hyperloglog", "zlib"];
+    for (const [e, ids] of Object.entries(r.listedButNotSeen)) expect(ids.filter((id) => !linuxOnly.includes(id)), e).toEqual([]);
   });
 });
 
