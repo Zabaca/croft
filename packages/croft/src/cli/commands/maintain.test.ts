@@ -244,6 +244,24 @@ describe("croft maintain", () => {
     expect((await exec(["query", "select count(*)::INT as n from orders"])).json.data.rows).toEqual([{ n: 20 }]);
   }, 120_000);
 
+  maybe("the detached child the tick starts is a real croft maintain: it decides for itself, runs its pass, records it and ends", async () => {
+    const l = await lakeProject("local", { extensionDir: ready.dir });
+    const { spawnDetachedMaintain } = await import("../../run/detach.ts");
+    const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", CROFT_TEST_HARNESS: "1", ...l.env, CROFT_NOW: iso(Date.now() + 25 * HOUR) };
+    // The run that built the lake stamped it; CROFT_NOW puts the child 25 hours on, so a pass is due.
+    const pid = spawnDetachedMaintain({ root: l.p.root, stateDir: l.p.stateDir, env });
+    expect(pid).toBeGreaterThan(0);
+    const log = join(l.p.stateDir, "logs", "maintain.log");
+    const until = Date.now() + 90_000;
+    const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    while (alive() && Date.now() < until) await Bun.sleep(100);
+    expect(alive(), "the child ended by itself").toBe(false);
+    expect(await Bun.file(log).text()).toContain("Lake maintenance done");
+    const status = await cli(["status", "--json"], { cwd: l.p.root, env: { ...l.env, CROFT_NOW: iso(Date.now() + 25 * HOUR) } });
+    await closeAllWarehouses();
+    expect(status.json.data.lake.maintenance.lastPass).toMatchObject({ ok: true });
+  }, 180_000);
+
   maybe("the scheduler's tick starts the lake's maintenance when one is due, once, and never runs it itself", async () => {
     const l = await lakeProject("local", { extensionDir: ready.dir });
     const { RunsDb } = await import("../../history/runs-db.ts");

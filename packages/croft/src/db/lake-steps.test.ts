@@ -307,7 +307,7 @@ describe("what croft never runs on a lake", () => {
       }
     };
     walk(src);
-    const surprising = hits.filter((h) => !/^db\/(backup|readcopy)\.ts: /.test(h) && !/^db\/warehouse\.ts: /.test(h) && !/^db\/lake-maintenance\.ts: /.test(h));
+    const surprising = hits.filter((h) => !/^db\/(backup|readcopy)\.ts: /.test(h) && !/^db\/warehouse\.ts: /.test(h) && !/^db\/lake-maintenance\.ts: /.test(h) && !/^cli\/commands\/maintain\.ts: /.test(h));
     expect(surprising).toEqual([]);
   }, 60_000);
 });

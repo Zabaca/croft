@@ -7,6 +7,7 @@
 //   c. delete, then restore from the local trash, returns the rows exactly (acceptance 9);
 //   d. rename moves a table and its bookkeeping;
 //   e. preview builds the SQL asset's next version in the preview database without touching the lake;
+//   g. croft backup copies the lake (slice 3);
 //   f. the same fixtures in a file and in a lake give the same tables, row counts and bookkeeping counts (acceptance 2).
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readdirSync } from "node:fs";
@@ -148,11 +149,13 @@ for (const kind of ["local", "postgres"] as const) {
       expect((await run(p, ["query", "select odd from odd"])).json.data.rows).toEqual([{ odd: "a" }]);
     }, 180_000);
 
-    test("g. croft backup says it does not cover a lake yet, and copies nothing", async () => {
+    test("g. croft backup copies a lake: its catalog, its folder, the run history and the trash (slice 3; db/lake-backup.test.ts puts one back)", async () => {
       const b = await run(p, ["backup"]);
-      expect(b.code, show(b)).toBe(2);
-      expect(b.json.problems[0]).toMatchObject({ code: "LAKE_UNSUPPORTED", effect: "nothing was copied" });
-      expect(existsSync(join(p.stateDir, "backups"))).toBe(false);
+      expect(b.code, show(b)).toBe(0);
+      expect(b.json.data.lake).toMatchObject({ kind, catalog: { file: kind === "local" ? "catalog.sqlite" : "catalog.dump" }, data: { dir: "lake-data" } });
+      expect(existsSync(join(b.json.data.path, b.json.data.lake.catalog.file))).toBe(true);
+      expect(existsSync(join(b.json.data.path, "runs.sqlite"))).toBe(true);
+      expect(existsSync(join(b.json.data.path, "backup.json"))).toBe(true);
     }, 120_000);
 
     // Full refresh in a lake (D146): a SQL transform whose SELECT keeps its shape is rewritten in place, as a file's is, so its table is one
