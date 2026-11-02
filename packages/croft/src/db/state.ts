@@ -3,6 +3,7 @@
 import pkg from "../../package.json" with { type: "json" };
 import { CroftError } from "../core/errors.ts";
 import type { Sql } from "../core/types.ts";
+import { type BookkeepingKind, defaultBookkeeping, fileDdl, kindOfObjects, logDdl, remember, STATE_TABLE_NAMES, type StateTableName, stateObjects } from "./bookkeeping.ts";
 
 /** Version of the _croft schema. A database with a larger number was written by a newer croft.
  *  2: _croft.writes.attempt (the step attempt that committed, so reconcile() can tell retries apart).
@@ -11,28 +12,9 @@ import type { Sql } from "../core/types.ts";
 export const FORMAT_VERSION = 3;
 export const CROFT_VERSION: string = pkg.version;
 
-// Exactly the DDL of DESIGN.md §5, made idempotent. Each entry is one statement (the Sql wrapper
-// prepares one statement per call).
-export const STATE_DDL: readonly string[] = [
-  `CREATE SCHEMA IF NOT EXISTS _croft`,
-  `CREATE TABLE IF NOT EXISTS _croft.meta (key VARCHAR PRIMARY KEY, value VARCHAR)`,
-  `CREATE TABLE IF NOT EXISTS _croft.assets (name VARCHAR PRIMARY KEY, kind VARCHAR,
-    write_mode VARCHAR, key_columns VARCHAR[], code_hash VARCHAR, behavior_hash VARCHAR,
-    cursor_value VARCHAR, cursor_type VARCHAR, cursor_unit VARCHAR,
-    last_loaded_at TIMESTAMPTZ, last_replaced_at TIMESTAMPTZ,
-    row_count BIGINT, max_loaded_at TIMESTAMPTZ, updated_at TIMESTAMPTZ)`,
-  `CREATE TABLE IF NOT EXISTS _croft.columns (asset VARCHAR, name VARCHAR, type VARCHAR, source_name VARCHAR, format VARCHAR,
-    pinned BOOLEAN, pending BOOLEAN, kinds VARCHAR[], present_last_batch BOOLEAN, added_at TIMESTAMPTZ,
-    PRIMARY KEY (asset, name))`,
-  `CREATE TABLE IF NOT EXISTS _croft.inputs (asset VARCHAR, input VARCHAR, seen_loaded_at TIMESTAMPTZ, seen_key JSON,
-    input_last_loaded_at TIMESTAMPTZ, PRIMARY KEY (asset, input))`,
-  `CREATE TABLE IF NOT EXISTS _croft.files (asset VARCHAR, path VARCHAR, size BIGINT, mtime TIMESTAMPTZ, etag VARCHAR,
-    sha256 VARCHAR, loaded_at TIMESTAMPTZ, PRIMARY KEY (asset, path))`,
-  `CREATE TABLE IF NOT EXISTS _croft.writes (asset VARCHAR, loaded_at TIMESTAMPTZ, run_id VARCHAR, mode VARCHAR,
-    rows_in BIGINT, added BIGINT, updated BIGINT, unchanged BIGINT, deleted BIGINT,
-    cursor_before VARCHAR, cursor_after VARCHAR, since_used VARCHAR, inputs JSON,
-    schema_changes JSON, code_hash VARCHAR, attempt INTEGER, PRIMARY KEY (asset, loaded_at))`,
-];
+// The file adapter's DDL (db/bookkeeping.ts holds the table specs, shared with the log adapter), each entry one
+// statement (the Sql wrapper prepares one statement per call).
+export const STATE_DDL: readonly string[] = [`CREATE SCHEMA IF NOT EXISTS _croft`, ...fileDdl()];
 
 /** Columns added after format 1, for databases created before them. STATE_DDL already has them, last, so a
  *  migrated table has the same column order as a new one. */
@@ -41,7 +23,8 @@ export const STATE_COLUMNS_ADDED: readonly { table: string; column: string; ddl:
   { table: "inputs", column: "input_last_loaded_at", ddl: `ALTER TABLE _croft.inputs ADD COLUMN input_last_loaded_at TIMESTAMPTZ` },
 ];
 
-export const STATE_TABLES = ["meta", "assets", "columns", "inputs", "files", "writes"] as const;
+/** The bookkeeping tables by name; in the log adapter all but meta are views over `<name>_log`. */
+export const STATE_TABLES: readonly StateTableName[] = STATE_TABLE_NAMES;
 
 export interface Meta { format_version?: string; duckdb_version?: string; croft_version?: string; [key: string]: string | undefined }
 
@@ -84,24 +67,37 @@ export async function checkFormat(db: Sql): Promise<Meta> {
  * format_version, duckdb_version and croft_version. Idempotent; run it inside a write lease. DDL runs before
  * the meta upsert (DML), and an ALTER runs only while its column is missing, so it respects the DDL-before-DML
  * rule even when called twice in one transaction around writes to _croft.
+ *
+ * Which adapter the tables follow (db/bookkeeping.ts) is decided by what is already there; only a database with no
+ * bookkeeping yet takes `o.bookkeeping`, else defaultBookkeeping(). The log adapter records `bookkeeping = log` in meta.
  */
-export async function ensureState(tx: Sql, o: { croftVersion?: string } = {}): Promise<Meta> {
+export async function ensureState(tx: Sql, o: { croftVersion?: string; bookkeeping?: BookkeepingKind } = {}): Promise<Meta> {
   const before = await readMeta(tx);
   assertFormat(before);
-  for (const ddl of STATE_DDL) await tx.exec(ddl);
-  const have = new Set((await tx.all<{ t: string; c: string }>(
-    `SELECT table_name t, column_name c FROM duckdb_columns() WHERE database_name = current_database() AND schema_name = '_croft'`,
-  )).map((r) => `${r.t}.${r.c}`));
-  for (const add of STATE_COLUMNS_ADDED) if (!have.has(`${add.table}.${add.column}`)) await tx.exec(add.ddl);
+  const names = await stateObjects(tx);
+  const kind = kindOfObjects(names) ?? o.bookkeeping ?? defaultBookkeeping();
+  if (kind === "log") {
+    // Only what is missing: an existing lake pays no catalog write for CREATE ... IF NOT EXISTS.
+    if (!names.size) await tx.exec(`CREATE SCHEMA IF NOT EXISTS _croft`);
+    for (const { name, ddl } of logDdl()) if (!names.has(name)) await tx.exec(ddl);
+  } else {
+    for (const ddl of STATE_DDL) await tx.exec(ddl);
+    const have = new Set((await tx.all<{ t: string; c: string }>(
+      `SELECT table_name t, column_name c FROM duckdb_columns() WHERE database_name = current_database() AND schema_name = '_croft'`,
+    )).map((r) => `${r.t}.${r.c}`));
+    for (const add of STATE_COLUMNS_ADDED) if (!have.has(`${add.table}.${add.column}`)) await tx.exec(add.ddl);
+  }
+  const bk = remember(tx, kind);
   const [{ v } = { v: "" }] = await tx.all<{ v: string }>(`SELECT version() v`);
   const want: Meta = {
     format_version: String(Math.max(FORMAT_VERSION, Number(before.format_version ?? 0))),
     duckdb_version: v,
     croft_version: o.croftVersion ?? CROFT_VERSION,
+    ...(kind === "log" ? { bookkeeping: "log" } : {}),
   };
   for (const [key, value] of Object.entries(want)) {
     if (before[key] === value) continue;
-    await tx.exec(`INSERT OR REPLACE INTO _croft.meta (key, value) VALUES ($1, $2)`, [key, value]);
+    await bk.upsert("meta", { key: "$1", value: "$2" }, [key, value]);
   }
   return { ...before, ...want };
 }

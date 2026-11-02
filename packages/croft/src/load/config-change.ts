@@ -52,6 +52,7 @@ import { CroftError, type ProblemInit, problem } from "../core/errors.ts";
 import type { ColumnPlan, Confirmation, Fix, Impact, Problem, SchemaChange, Sql, StepResult, WriteMode } from "../core/types.ts";
 import { now as clockNow, toEpochMicros } from "../core/time.ts";
 import { canonicalPath } from "../db/connect.ts";
+import { bookkeepingOf } from "../db/bookkeeping.ts";
 import { hasState } from "../db/state.ts";
 import { baseFrom, type CatalogBase, getCatalog, putCatalog, readCatalogEntry } from "../history/catalog.ts";
 import type { IngestInput, IngestOutcome } from "../run/ingest.ts";
@@ -490,18 +491,19 @@ export async function applyConfigChange(tx: Sql, o: ConfigChangeInput): Promise<
   for (const v of [s?.ll, s?.lr, stats.maxLoadedAtUs]) if (v !== null && v !== undefined && BigInt(v) + 1n > stamp) stamp = BigInt(v) + 1n;
   const at = isoMicros(stamp);
   const max = stats.maxLoadedAtUs === null ? null : isoMicros(stats.maxLoadedAtUs);
+  const bk = await bookkeepingOf(tx);
   if (o.convert) {
-    await tx.exec(
-      `UPDATE _croft.assets SET write_mode = $2, key_columns = CAST($3::JSON AS VARCHAR[]), behavior_hash = $4, row_count = $5,
-         max_loaded_at = $6::TIMESTAMPTZ, last_replaced_at = $7::TIMESTAMPTZ, updated_at = $7::TIMESTAMPTZ WHERE name = $1`,
-      [o.asset, o.convert.write, json(o.convert.key), o.convert.behaviorHash, stats.rowCount, max, at]);
+    await bk.update("assets", {
+      write_mode: "$2", key_columns: "CAST($3::JSON AS VARCHAR[])", behavior_hash: "$4", row_count: "$5",
+      max_loaded_at: "$6::TIMESTAMPTZ", last_replaced_at: "$7::TIMESTAMPTZ", updated_at: "$7::TIMESTAMPTZ",
+    }, "name = $1", [o.asset, o.convert.write, json(o.convert.key), o.convert.behaviorHash, stats.rowCount, max, at]);
   } else {
-    await tx.exec(
-      `UPDATE _croft.assets SET row_count = $2, max_loaded_at = $3::TIMESTAMPTZ, last_replaced_at = $4::TIMESTAMPTZ, updated_at = $4::TIMESTAMPTZ WHERE name = $1`,
-      [o.asset, stats.rowCount, max, at]);
+    await bk.update("assets", {
+      row_count: "$2", max_loaded_at: "$3::TIMESTAMPTZ", last_replaced_at: "$4::TIMESTAMPTZ", updated_at: "$4::TIMESTAMPTZ",
+    }, "name = $1", [o.asset, stats.rowCount, max, at]);
   }
   for (const c of o.pins) {
-    await tx.exec(`UPDATE _croft.columns SET type = $3, pinned = true, pending = false WHERE asset = $1 AND lower(name) = lower($2)`, [o.asset, c.column, c.to]);
+    await bk.update("columns", { type: "$3", pinned: "true", pending: "false" }, "asset = $1 AND lower(name) = lower($2)", [o.asset, c.column, c.to]);
   }
   return { removed, changes, outOfBand: oob?.problem ?? null };
 }

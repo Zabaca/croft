@@ -19,6 +19,7 @@
 // those by comparing the table with a fresh build.
 import { problem } from "../core/errors.ts";
 import type { Problem, Sql } from "../core/types.ts";
+import { stateObjects } from "../db/bookkeeping.ts";
 import { hasState } from "../db/state.ts";
 import { currentDatabase } from "../load/evolve.ts";
 import { detectOutOfBand, detectTableModified, type OutOfBand, tableStats, type TableStats } from "./guards.ts";
@@ -106,8 +107,7 @@ export async function scanTables(sql: Sql, o: { budgetMs?: number } = {}): Promi
   const none: TableScan = { checked: 0, skipped: 0, findings: [] };
   if (!(await hasState(sql))) return none;
   // A database from a croft that wrote _croft.meta only (or a hand-made one) has nothing to compare.
-  const have = new Set((await sql.all<{ t: string }>(
-    `SELECT table_name AS t FROM duckdb_tables() WHERE database_name = current_database() AND schema_name = '_croft'`)).map((r) => r.t));
+  const have = await stateObjects(sql);
   if (!have.has("assets")) return none;
   const start = Date.now();
   const db = await currentDatabase(sql);

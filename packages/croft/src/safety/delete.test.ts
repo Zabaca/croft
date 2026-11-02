@@ -9,6 +9,7 @@ import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/war
 import { deleteImpact, deleteTable, deleteWhere, downstreamOf, replacedStamp } from "./delete.ts";
 import { detectOutOfBand } from "./guards.ts";
 import { listTrash } from "./trash.ts";
+import { seedState } from "../db/bookkeeping-testkit.ts";
 
 const dirs: string[] = [];
 afterAll(async () => {
@@ -44,12 +45,12 @@ async function seed(w: DuckWarehouse): Promise<void> {
     await tx.exec(`CREATE TABLE orders AS SELECT range AS id, range * 10 AS amount, TIMESTAMPTZ '2026-09-20 10:00:00+00' + range * INTERVAL 1 HOUR AS _loaded_at FROM range(5)`);
     await tx.exec(`CREATE TABLE daily AS SELECT 1 AS n`);
     await tx.exec(`CREATE TABLE other AS SELECT 1 AS n`);
-    await tx.exec(`INSERT INTO _croft.assets (name, kind, write_mode, key_columns, row_count, last_loaded_at, max_loaded_at)
+    await seedState(tx, `INSERT INTO _croft.assets (name, kind, write_mode, key_columns, row_count, last_loaded_at, max_loaded_at)
       VALUES ('orders', 'ingest', 'merge', ['id'], 5, '2026-09-20 14:00:00+00', '2026-09-20 14:00:00+00'),
              ('daily', 'sql', 'replace', [], 1, '2026-09-20 15:00:00+00', NULL)`);
-    await tx.exec(`INSERT INTO _croft.columns (asset, name, type) VALUES ('orders', 'id', 'BIGINT'), ('orders', 'amount', 'BIGINT'), ('daily', 'n', 'INTEGER')`);
-    await tx.exec(`INSERT INTO _croft.writes (asset, loaded_at, run_id, mode) VALUES ('orders', '2026-09-20 14:00:00+00', 'r_0920_0700_aaaa', 'merge')`);
-    await tx.exec(`INSERT INTO _croft.inputs (asset, input, seen_loaded_at, input_last_loaded_at) VALUES
+    await seedState(tx, `INSERT INTO _croft.columns (asset, name, type) VALUES ('orders', 'id', 'BIGINT'), ('orders', 'amount', 'BIGINT'), ('daily', 'n', 'INTEGER')`);
+    await seedState(tx, `INSERT INTO _croft.writes (asset, loaded_at, run_id, mode) VALUES ('orders', '2026-09-20 14:00:00+00', 'r_0920_0700_aaaa', 'merge')`);
+    await seedState(tx, `INSERT INTO _croft.inputs (asset, input, seen_loaded_at, input_last_loaded_at) VALUES
       ('daily', 'orders', '2026-09-20 14:00:00+00', '2026-09-25 00:00:00+00'), ('report', 'daily', NULL, NULL), ('report', 'report', NULL, NULL)`);
   }, { runId: "r_seed" });
 }
@@ -301,7 +302,7 @@ describe("tableGeneration", () => {
     await seed(w);
     const g1 = (await deleteImpact(w, "orders", null)).generation;
     expect(g1).not.toBeNull();
-    await w.write("x", (tx) => tx.exec(`UPDATE _croft.assets SET last_replaced_at = '2026-09-21 00:00:00+00' WHERE name = 'orders'`), { runId: "r_x" });
+    await w.write("x", (tx) => seedState(tx, `UPDATE _croft.assets SET last_replaced_at = '2026-09-21 00:00:00+00' WHERE name = 'orders'`), { runId: "r_x" });
     expect((await deleteImpact(w, "orders", null)).generation).not.toBe(g1);
     expect((await deleteImpact(w, "other", null)).generation).toBeNull();
   });

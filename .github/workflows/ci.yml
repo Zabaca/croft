@@ -108,6 +108,16 @@ jobs:
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
         # --timeout: the default timeout tests/preload.ts sets reaches the first test file of a run only (DESIGN.md §10 "Test strategy").
         run: bun test --timeout 60000
+      # The whole suite again with croft's bookkeeping kept as a lake keeps it, an append-only log on a plain DuckDB file
+      # (DESIGN.md D-L1): no Postgres, no lake. One job is enough, since the log is the same on every platform.
+      - name: test, bookkeeping as a log
+        if: matrix.os == 'ubuntu-24.04' && matrix.bun == '1.3.14'
+        working-directory: packages/croft
+        env:
+          CROFT_CI: "1"
+          CROFT_BOOKKEEPING: log
+          CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
+        run: bun test --timeout 60000
 
   # Smoke: Alpine (musl) installs and prints its version, and a fresh project runs its example and answers a query.
   alpine:

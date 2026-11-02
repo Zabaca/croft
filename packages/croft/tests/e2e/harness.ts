@@ -65,6 +65,8 @@ export function baseEnv(extra: Record<string, string> = {}): Record<string, stri
     // doctor's Bun line: CI runs the newest Bun too, which may be newer than croft's BUN_TESTED (BUN_UNTESTED).
     // A journey about the other checks must not fail on a Bun release; the Bun line has unit tests of its own.
     CROFT_BUN_VERSION: BUN_FLOOR,
+    // The suite also runs on the log adapter (db/bookkeeping-testkit.ts); every croft a journey spawns follows.
+    ...(process.env.CROFT_BOOKKEEPING ? { CROFT_BOOKKEEPING: process.env.CROFT_BOOKKEEPING } : {}),
     ...extra,
   };
 }

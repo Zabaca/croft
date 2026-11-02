@@ -10,6 +10,7 @@ import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/war
 import { loadProject } from "../project/root.ts";
 import { cleanupProjects, makeProject, runIn } from "../run/testkit.ts";
 import { changeWords, checkOutOfBand, outOfBandProblem, scanTables } from "./out-of-band.ts";
+import { seedState } from "../db/bookkeeping-testkit.ts";
 
 afterEach(() => closeAllWarehouses());
 afterAll(() => cleanupProjects());
@@ -30,8 +31,8 @@ async function setup(w: DuckWarehouse): Promise<void> {
     for (const [name, rows] of [["t", 2], ["u", 1], ["v", 1]] as const) {
       await tx.exec(`CREATE TABLE ${name} (id BIGINT, _loaded_at TIMESTAMPTZ)`);
       await tx.exec(`INSERT INTO ${name} SELECT range + 1, '${T}'::TIMESTAMPTZ FROM range(${rows})`);
-      await tx.exec(`INSERT INTO _croft.assets (name, row_count, max_loaded_at) VALUES ('${name}', ${rows}, '${T}')`);
-      await tx.exec(`INSERT INTO _croft.columns (asset, name, type) VALUES ('${name}', 'id', 'BIGINT'), ('${name}', '_loaded_at', 'TIMESTAMPTZ')`);
+      await seedState(tx, `INSERT INTO _croft.assets (name, row_count, max_loaded_at) VALUES ('${name}', ${rows}, '${T}')`);
+      await seedState(tx, `INSERT INTO _croft.columns (asset, name, type) VALUES ('${name}', 'id', 'BIGINT'), ('${name}', '_loaded_at', 'TIMESTAMPTZ')`);
     }
     await tx.exec(`CREATE TABLE w AS SELECT 1 AS a`);
   }, { runId: "setup" });

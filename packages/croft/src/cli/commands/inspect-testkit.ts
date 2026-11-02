@@ -6,7 +6,8 @@ import { DuckDBInstance } from "@duckdb/node-api";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { FORMAT_VERSION, STATE_DDL } from "../../db/state.ts";
+import { seedState, sqlOver, stateDdl } from "../../db/bookkeeping-testkit.ts";
+import { FORMAT_VERSION } from "../../db/state.ts";
 import { closeAllWarehouses } from "../../db/warehouse.ts";
 import { type CatalogAsset, putCatalog } from "../../history/catalog.ts";
 import { RunsDb } from "../../history/runs-db.ts";
@@ -48,7 +49,8 @@ export async function seed(database: string, statements: string[]): Promise<void
   const db = await DuckDBInstance.create(database, { access_mode: "READ_WRITE" });
   const c = await db.connect();
   try {
-    for (const s of statements) await c.run(s);
+    const sql = sqlOver(c);
+    for (const s of statements) await seedState(sql, s);
   } finally {
     c.disconnectSync();
     db.closeSync();
@@ -56,7 +58,7 @@ export async function seed(database: string, statements: string[]): Promise<void
 }
 
 /** The _croft schema as croft creates it, at format 2. */
-export const STATE: string[] = [...STATE_DDL, `INSERT INTO _croft.meta VALUES ('format_version', '${FORMAT_VERSION}'), ('croft_version', 'test')`];
+export const STATE: string[] = [...stateDdl(), `INSERT INTO _croft.meta VALUES ('format_version', '${FORMAT_VERSION}'), ('croft_version', 'test')`];
 
 export const ISSUES_TS = `import { ingest } from "@zabaca/croft";
 export default ingest({

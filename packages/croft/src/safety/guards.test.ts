@@ -7,6 +7,7 @@ import { ensureState } from "../db/state.ts";
 import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/warehouse.ts";
 import { assertNoShrink, compareSchema, detectOutOfBand, detectTableModified, diffSchema, isoMicros, markOutOfBand, readStoredColumns,
   shrinkGuardDisabled, tableStats, wouldShrink } from "./guards.ts";
+import { seedState } from "../db/bookkeeping-testkit.ts";
 
 afterAll(() => closeAllWarehouses());
 
@@ -72,7 +73,7 @@ describe("out-of-band changes", () => {
       await ensureState(tx);
       await tx.exec(`CREATE TABLE t (id BIGINT, _loaded_at TIMESTAMPTZ)`);
       await tx.exec(`INSERT INTO t VALUES (1, '2026-09-22T10:00:00Z'), (2, '2026-09-22T10:00:00.000001Z')`);
-      await tx.exec(`INSERT INTO _croft.assets (name, row_count, max_loaded_at) VALUES ('t', 2, '2026-09-22T10:00:00.000001Z')`);
+      await seedState(tx, `INSERT INTO _croft.assets (name, row_count, max_loaded_at) VALUES ('t', 2, '2026-09-22T10:00:00.000001Z')`);
     }, { runId: "r" });
   }
   const detect = (w: DuckWarehouse) => w.read((db) => detectOutOfBand(db, "t"), { purpose: "t" });
@@ -142,7 +143,7 @@ describe("TABLE_MODIFIED_OUTSIDE_CROFT", () => {
     await w.write("setup", async (tx) => {
       await ensureState(tx);
       await tx.exec(`CREATE TABLE t (id BIGINT, amount DOUBLE, _loaded_at TIMESTAMPTZ)`);
-      await tx.exec(`INSERT INTO _croft.columns (asset, name, type, kinds, added_at) VALUES ('t', 'id', 'BIGINT', ['integer'], now()), ('t', 'amount', 'DOUBLE', [], now())`);
+      await seedState(tx, `INSERT INTO _croft.columns (asset, name, type, kinds, added_at) VALUES ('t', 'id', 'BIGINT', ['integer'], now()), ('t', 'amount', 'DOUBLE', [], now())`);
     }, { runId: "r" });
     expect(await w.read((db) => detectTableModified(db, "t"), { purpose: "t" })).toBeNull();
     expect((await w.read((db) => readStoredColumns(db, "t"), { purpose: "t" })).map((c) => [c.name, c.type, c.kinds])).toEqual([

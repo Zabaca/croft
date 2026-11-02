@@ -9,6 +9,7 @@ import { deleteTable, deleteWhere } from "./delete.ts";
 import { detectOutOfBand } from "./guards.ts";
 import { listVersions, restoreImpact, restoreVersion } from "./restore.ts";
 import { listTrash, type TrashEntry, trashStamp, trashTable } from "./trash.ts";
+import { seedState } from "../db/bookkeeping-testkit.ts";
 
 const dirs: string[] = [];
 afterAll(async () => {
@@ -33,11 +34,11 @@ async function seed(w: DuckWarehouse): Promise<void> {
     await tx.exec(`CREATE TABLE orders AS SELECT range AS id, range * 10 AS amount, (range * 170141183460469231731687303715884105)::HUGEINT AS h,
       ('{"n":' || range || '}')::JSON AS j, TIMESTAMPTZ '2026-09-20 10:00:00+00' + range * INTERVAL 1 HOUR AS _loaded_at FROM range(5)`);
     await tx.exec(`CREATE TABLE daily AS SELECT 1 AS n`);
-    await tx.exec(`INSERT INTO _croft.assets (name, kind, write_mode, key_columns, cursor_value, row_count, last_loaded_at, max_loaded_at)
+    await seedState(tx, `INSERT INTO _croft.assets (name, kind, write_mode, key_columns, cursor_value, row_count, last_loaded_at, max_loaded_at)
       VALUES ('orders', 'ingest', 'merge', ['id'], '4', 5, '2026-09-20 14:00:00+00', '2026-09-20 14:00:00+00')`);
-    await tx.exec(`INSERT INTO _croft.columns (asset, name, type) VALUES ('orders', 'id', 'BIGINT'), ('orders', 'amount', 'BIGINT')`);
-    await tx.exec(`INSERT INTO _croft.writes (asset, loaded_at, run_id, mode) VALUES ('orders', '2026-09-20 14:00:00+00', 'r_0920_0700_aaaa', 'merge')`);
-    await tx.exec(`INSERT INTO _croft.inputs (asset, input, seen_loaded_at, input_last_loaded_at) VALUES ('daily', 'orders', '2026-09-20 14:00:00+00', '2026-09-20 14:00:00+00')`);
+    await seedState(tx, `INSERT INTO _croft.columns (asset, name, type) VALUES ('orders', 'id', 'BIGINT'), ('orders', 'amount', 'BIGINT')`);
+    await seedState(tx, `INSERT INTO _croft.writes (asset, loaded_at, run_id, mode) VALUES ('orders', '2026-09-20 14:00:00+00', 'r_0920_0700_aaaa', 'merge')`);
+    await seedState(tx, `INSERT INTO _croft.inputs (asset, input, seen_loaded_at, input_last_loaded_at) VALUES ('daily', 'orders', '2026-09-20 14:00:00+00', '2026-09-20 14:00:00+00')`);
   }, { runId: "r_seed" });
 }
 
@@ -75,9 +76,9 @@ describe("restoreVersion: a whole-table version", () => {
     await w.write("shrink", async (tx) => {
       await tx.exec(`ALTER TABLE orders ADD COLUMN extra VARCHAR`);
       await tx.exec(`DELETE FROM orders WHERE id >= 2`);
-      await tx.exec(`UPDATE _croft.assets SET cursor_value = '9', row_count = 2, last_loaded_at = '2026-09-21 12:00:00+00' WHERE name = 'orders'`);
-      await tx.exec(`INSERT INTO _croft.writes (asset, loaded_at, run_id, mode) VALUES ('orders', '2026-09-21 12:00:00+00', 'r_0921_1200_bbbb', 'replace')`);
-      await tx.exec(`UPDATE _croft.inputs SET input_last_loaded_at = '2026-09-21 12:00:00+00' WHERE asset = 'daily'`);
+      await seedState(tx, `UPDATE _croft.assets SET cursor_value = '9', row_count = 2, last_loaded_at = '2026-09-21 12:00:00+00' WHERE name = 'orders'`);
+      await seedState(tx, `INSERT INTO _croft.writes (asset, loaded_at, run_id, mode) VALUES ('orders', '2026-09-21 12:00:00+00', 'r_0921_1200_bbbb', 'replace')`);
+      await seedState(tx, `UPDATE _croft.inputs SET input_last_loaded_at = '2026-09-21 12:00:00+00' WHERE asset = 'daily'`);
     }, { runId: "r_shrink" });
 
     expect(await restoreImpact(w, v1)).toMatchObject({ asset: "orders", kind: "table", rows: 5, skipped: 0, currentRows: 2, downstream: ["daily"] });
@@ -176,7 +177,7 @@ describe("restoreVersion: a rows version whose delete never happened (R41-10)", 
     await w.write("seed", async (tx) => {
       await ensureState(tx);
       await tx.exec(`CREATE TABLE events AS SELECT range AS n, 'e' || range AS v FROM range(10)`);
-      await tx.exec(`INSERT INTO _croft.assets (name, kind, write_mode, key_columns, row_count) VALUES ('events', 'ingest', 'append', [], 10)`);
+      await seedState(tx, `INSERT INTO _croft.assets (name, kind, write_mode, key_columns, row_count) VALUES ('events', 'ingest', 'append', [], 10)`);
     }, { runId: "r_seed" });
     const v = (await trashTable(w, "events", `delete --where "n < 3" (r_0921_1000_dddd)`, { now: T1, where: "n < 3", pending: true }))!;
     return { w, state, v: listTrash(state, "events").find((e) => e.path === v.path)! };

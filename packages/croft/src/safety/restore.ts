@@ -23,6 +23,7 @@ import { existsSync } from "node:fs";
 import { CroftError } from "../core/errors.ts";
 import { now as clockNow } from "../core/time.ts";
 import type { Problem, Sql } from "../core/types.ts";
+import { bookkeepingOf } from "../db/bookkeeping.ts";
 import { ensureState, hasState } from "../db/state.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
 import { quoteIdent, readTableSchema } from "../load/evolve.ts";
@@ -277,6 +278,7 @@ export async function restoreVersion(warehouse: DuckWarehouse, version: TrashEnt
     await sql.exec("BEGIN TRANSACTION");
     try {
       await ensureState(sql);
+      const bk = await bookkeepingOf(sql);
       const stamp = await replacedStamp(sql, asset, at, alias);
       const src = `${quoteIdent(alias)}.main.${quoteIdent(asset)}`;
       let rows: number;
@@ -286,9 +288,9 @@ export async function restoreVersion(warehouse: DuckWarehouse, version: TrashEnt
         await sql.exec(`CREATE OR REPLACE TABLE main.${quoteIdent(asset)} AS SELECT * FROM ${src}`);
         for (const table of STATE_TABLES) {
           const col = table === "assets" ? "name" : "asset";
-          await sql.exec(`DELETE FROM _croft.${table} WHERE ${col} = $1`, [asset]);
+          await bk.remove(table, `${col} = $1`, [asset]);
           if (await hasTable(sql, alias, "_croft", table)) {
-            await sql.exec(`INSERT INTO _croft.${table} BY NAME SELECT * FROM ${quoteIdent(alias)}._croft.${table} WHERE ${col} = $1`, [asset]);
+            await bk.insertSelect(table, `SELECT * FROM ${quoteIdent(alias)}._croft.${table} WHERE ${col} = $1`, [asset]);
           }
         }
         rows = await count(sql, `main.${quoteIdent(asset)}`);
@@ -310,9 +312,8 @@ export async function restoreVersion(warehouse: DuckWarehouse, version: TrashEnt
         }
       }
       const stats = await tableStats(sql, asset);
-      await sql.exec(
-        `UPDATE _croft.assets SET row_count = $2, max_loaded_at = $3::TIMESTAMPTZ, last_replaced_at = $4::TIMESTAMPTZ, updated_at = $5::TIMESTAMPTZ
-         WHERE name = $1`,
+      await bk.update(
+        "assets", { row_count: "$2", max_loaded_at: "$3::TIMESTAMPTZ", last_replaced_at: "$4::TIMESTAMPTZ", updated_at: "$5::TIMESTAMPTZ" }, "name = $1",
         [asset, stats.rowCount, stats.maxLoadedAtUs === null ? null : isoMicros(stats.maxLoadedAtUs), isoMicros(stamp), at.toISOString()],
       );
       await sql.exec("COMMIT");

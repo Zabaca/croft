@@ -26,6 +26,7 @@ import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { now as clockNow } from "../core/time.ts";
 import type { Sql } from "../core/types.ts";
+import { stateObjects } from "../db/bookkeeping.ts";
 import { CROFT_VERSION } from "../db/state.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
 import type { RunsDb } from "../history/runs-db.ts";
@@ -119,8 +120,7 @@ export async function trashTable(warehouse: DuckWarehouse, asset: string, reason
         const filter = where === null ? "" : ` WHERE (\n${where}\n)`;
         await sql.exec(`CREATE TABLE ${t}.main.${quoteIdent(asset)} AS SELECT * FROM ${quoteIdent(db)}.main.${quoteIdent(asset)}${filter}`);
         await sql.exec(`CREATE SCHEMA ${t}._croft`);
-        const have = new Set((await sql.all<{ t: string }>(
-          `SELECT table_name AS t FROM duckdb_tables() WHERE database_name = $1 AND schema_name = '_croft'`, [db])).map((r) => r.t));
+        const have = await stateObjects(sql);
         for (const table of STATE_TABLES) {
           if (!have.has(table)) continue;
           const col = table === "assets" ? "name" : "asset";

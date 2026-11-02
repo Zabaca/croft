@@ -57,6 +57,7 @@
 import { CroftError, problem } from "../core/errors.ts";
 import type { AssetKind, ColumnPlan, CursorType, Problem, SchemaChange, Sql, StepResult, ValueKind } from "../core/types.ts";
 import { type InstantInput, now as clockNow, toEpochMicros } from "../core/time.ts";
+import { bookkeepingOf } from "../db/bookkeeping.ts";
 import { ensureState } from "../db/state.ts";
 import { assertNoShrink, type ExtractInfo, isoMicros, readStoredColumns, type StoredColumn, tableStats,
   compareSchema } from "../safety/guards.ts";
@@ -134,6 +135,9 @@ export interface WriteBatchInput {
   /** Transforms: each input's position, upserted into _croft.inputs in this transaction, so a position commits
    *  with the rows it produced and never without them. */
   positions?: InputPosition[];
+  /** How a keyed merge counts what it changed; default defaultCounting(). Tests and the
+   *  merge benchmark name one to compare the two. */
+  counting?: Counting;
   /** The step attempt this write belongs to (runs.sqlite steps.attempt), for _croft.writes.attempt. reconcile()
    *  counts a crashed step's commits by it, so chunks an earlier failed attempt committed are not its own. */
   attempt?: number;
@@ -299,7 +303,8 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
     if (recreated) counts.deleted = before.rowCount;
     evo.columns = (await readTableSchema(tx, asset, db))!;
   } else {
-    counts = await apply(tx, { ref, src, n, dataCols, present, target, srcRows, fallbacks, rowsBefore: before.rowCount, stamp });
+    counts = await apply(tx, { ref, src, n, dataCols, present, target, srcRows, fallbacks, rowsBefore: before.rowCount, stamp,
+      counting: input.counting ?? defaultCounting() });
   }
 
   const after = await tableStats(tx, asset, db);
@@ -343,33 +348,30 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
 
   const changed = counts.added + counts.updated + counts.deleted > 0;
   const us = (v: bigint | null) => (v === null ? null : isoMicros(v));
-  await tx.exec(
-    `INSERT OR REPLACE INTO _croft.assets (name, kind, write_mode, key_columns, code_hash, behavior_hash, cursor_value, cursor_type,
-       cursor_unit, last_loaded_at, last_replaced_at, row_count, max_loaded_at, updated_at)
-     VALUES ($1, $2, $3, CAST($4::JSON AS VARCHAR[]), $5, $6, $7, $8, $9, $10::TIMESTAMPTZ, $11::TIMESTAMPTZ, $12, $13::TIMESTAMPTZ, $14::TIMESTAMPTZ)`,
-    [asset, kind, target.write, json(target.key), input.codeHash ?? state?.code_hash ?? null,
-      input.behaviorHash ?? state?.behavior_hash ?? null, cursorValue, cursorType, cursorUnit,
-      changed ? stamp : us(state?.last_loaded_us ?? null), oob || pinned?.replaced ? stamp : us(state?.last_replaced_us ?? null),
-      after.rowCount, us(after.maxLoadedAtUs), stamp],
-  );
+  const bk = await bookkeepingOf(tx);
+  await bk.upsert("assets", {
+    name: "$1", kind: "$2", write_mode: "$3", key_columns: "CAST($4::JSON AS VARCHAR[])", code_hash: "$5", behavior_hash: "$6",
+    cursor_value: "$7", cursor_type: "$8", cursor_unit: "$9", last_loaded_at: "$10::TIMESTAMPTZ", last_replaced_at: "$11::TIMESTAMPTZ",
+    row_count: "$12", max_loaded_at: "$13::TIMESTAMPTZ", updated_at: "$14::TIMESTAMPTZ",
+  }, [asset, kind, target.write, json(target.key), input.codeHash ?? state?.code_hash ?? null,
+    input.behaviorHash ?? state?.behavior_hash ?? null, cursorValue, cursorType, cursorUnit,
+    changed ? stamp : us(state?.last_loaded_us ?? null), oob || pinned?.replaced ? stamp : us(state?.last_replaced_us ?? null),
+    after.rowCount, us(after.maxLoadedAtUs), stamp]);
   await writeColumns(tx, {
     asset, columns: evo.columns, plans: batch.columns, stored: recreated ? [] : stored, present, pins: input.pins, formats: input.formats, stamp,
     typedBySql: kind === "sql",
   });
-  await tx.exec(
-    `INSERT INTO _croft.writes (asset, loaded_at, run_id, mode, rows_in, added, updated, unchanged, deleted, cursor_before, cursor_after,
-       since_used, inputs, schema_changes, code_hash, attempt)
-     VALUES ($1, $2::TIMESTAMPTZ, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::JSON, $14::JSON, $15, $16::INTEGER)`,
-    [asset, stamp, target.runId, target.write, rowsIn, counts.added, counts.updated, counts.unchanged, counts.deleted,
-      state?.cursor_value ?? null, cursorValue, input.sinceUsed === undefined ? null : String(input.sinceUsed),
-      input.inputs === undefined ? null : json(input.inputs), json(evo.changes), input.codeHash ?? null, input.attempt ?? null],
-  );
+  await bk.insert("writes", {
+    asset: "$1", loaded_at: "$2::TIMESTAMPTZ", run_id: "$3", mode: "$4", rows_in: "$5", added: "$6", updated: "$7", unchanged: "$8",
+    deleted: "$9", cursor_before: "$10", cursor_after: "$11", since_used: "$12", inputs: "$13::JSON", schema_changes: "$14::JSON",
+    code_hash: "$15", attempt: "$16::INTEGER",
+  }, [asset, stamp, target.runId, target.write, rowsIn, counts.added, counts.updated, counts.unchanged, counts.deleted,
+    state?.cursor_value ?? null, cursorValue, input.sinceUsed === undefined ? null : String(input.sinceUsed),
+    input.inputs === undefined ? null : json(input.inputs), json(evo.changes), input.codeHash ?? null, input.attempt ?? null]);
   for (const p of input.positions ?? []) {
-    await tx.exec(
-      `INSERT OR REPLACE INTO _croft.inputs (asset, input, seen_loaded_at, seen_key, input_last_loaded_at)
-       VALUES ($1, $2, $3::TIMESTAMPTZ, $4::JSON, $5::TIMESTAMPTZ)`,
-      [asset, p.input, p.seenLoadedAt, p.seenKey === null || p.seenKey === undefined ? null : exactJson(p.seenKey), p.inputLastLoadedAt ?? null],
-    );
+    await bk.upsert("inputs", {
+      asset: "$1", input: "$2", seen_loaded_at: "$3::TIMESTAMPTZ", seen_key: "$4::JSON", input_last_loaded_at: "$5::TIMESTAMPTZ",
+    }, [asset, p.input, p.seenLoadedAt, p.seenKey === null || p.seenKey === undefined ? null : exactJson(p.seenKey), p.inputLastLoadedAt ?? null]);
   }
   for (const t of [src, `__croft_w${n}_old`, `__croft_w${n}_new`, `__croft_w${n}_pair`]) await tx.exec(`DROP TABLE IF EXISTS ${tempRef(t)}`);
 
@@ -666,6 +668,8 @@ interface ApplyInput {
   ref: string; src: string; n: number; dataCols: RealColumn[]; present: Set<string>; target: WriteTarget;
   /** Rows in src, and how many of them are fallback rows (keyed file reloads only). */
   srcRows: number; fallbacks: number; rowsBefore: number; stamp: string;
+  /** How a keyed merge counts (Counting). */
+  counting: Counting;
 }
 type Counts = { added: number; updated: number; unchanged: number; deleted: number };
 
@@ -706,6 +710,27 @@ async function emptyBatch(tx: Sql, o: ApplyInput): Promise<Counts> {
   return { added: 0, updated: 0, unchanged: 0, deleted: Number(row?.Count ?? 0) };
 }
 
+/** How a keyed write counts what it changed (DESIGN.md D-L2). "classify": the rows are classified against the table
+ *  first (added, updated, unchanged, and for a replace the table rows no row of the batch matches), then the added rows are
+ *  inserted, only the updated ones merged and the unmatched ones deleted; no statement returns anything, which is all a
+ *  lake can do (DuckLake refuses RETURNING on MERGE). It is the path of every write, in a file as in a lake: on the merge
+ *  benchmark it costs at most 11% of the whole write step (scripts/bench-merge.ts), under the 15% the option allowed, so a
+ *  run reports the same numbers in both modes from one path. "returning": the previous way, one MERGE whose returned actions
+ *  are counted; nothing selects it but the benchmark and the tests that hold the two to the same numbers. */
+export type Counting = "classify" | "returning";
+
+let forced: Counting | null = null;
+/** Make every keyed write count one way (null: the default, "classify"). For the tests that hold the two ways to the same
+ *  numbers, and the merge benchmark. */
+export function forceCounting(c: Counting | null): void {
+  forced = c;
+}
+
+/** The counting a write uses when its caller names none. */
+export function defaultCounting(): Counting {
+  return forced ?? "classify";
+}
+
 /** MERGE by key. replace: every column is compared and set (absent → NULL) and unmatched table rows are
  *  deleted; merge: only columns present in the batch are compared and set. A fallback row (keyed file reload)
  *  always matches a row of a reloaded file and replaces it in full: the row is that other file's now. */
@@ -715,27 +740,89 @@ async function mergeByKey(tx: Sql, o: ApplyInput): Promise<Counts> {
   const valueCols = o.dataCols.filter((c) => !isKey(c.name) && (target.write === "replace" || o.present.has(lower(c.name))));
   const stampCol = quoteIdent(RESERVED.loadedAt);
   const on = target.key.map((k) => `t.${quoteIdent(k)} = s.${quoteIdent(k)}`).join(" AND ");
-  const clauses: string[] = [];
+  const differs = valueCols.length ? valueCols.map((c) => `t.${quoteIdent(c.name)} IS DISTINCT FROM s.${quoteIdent(c.name)}`).join(" OR ") : null;
   const setOf = (list: RealColumn[]) => list.map((c) => `${quoteIdent(c.name)} = s.${quoteIdent(c.name)}`).join(", ");
-  if (o.fallbacks > 0) {
-    // The first WHEN whose condition holds applies [V]. Its _file always differs (a reloaded file's row).
-    clauses.push(`WHEN MATCHED AND s.${quoteIdent(FALLBACK)} THEN UPDATE SET ${setOf(o.dataCols.filter((c) => !isKey(c.name)))}, ${stampCol} = $1::TIMESTAMPTZ`);
+  const fb = quoteIdent(FALLBACK);
+  const scopeOf = (alias: string) => fileScope(target, alias);
+  const scope = scopeOf("t.");
+  // The first WHEN whose condition holds applies [V]. A fallback row's _file always differs (a reloaded file's row).
+  const matched: string[] = [];
+  if (o.fallbacks > 0) matched.push(`WHEN MATCHED AND s.${fb} THEN UPDATE SET ${setOf(o.dataCols.filter((c) => !isKey(c.name)))}, ${stampCol} = $1::TIMESTAMPTZ`);
+  const insert = `WHEN NOT MATCHED${o.fallbacks > 0 ? ` AND NOT s.${fb}` : ""} THEN INSERT (${cols(o.dataCols)}, ${stampCol}) VALUES (${cols(o.dataCols, "s.")}, $1::TIMESTAMPTZ)`;
+
+  if (o.counting === "returning") {
+    const clauses = [...matched];
+    if (differs) clauses.push(`WHEN MATCHED AND (${differs}) THEN UPDATE SET ${setOf(valueCols)}, ${stampCol} = $1::TIMESTAMPTZ`);
+    clauses.push(insert);
+    if (scope) clauses.push(`WHEN NOT MATCHED BY SOURCE AND ${scope} THEN DELETE`);
+    else if (target.write === "replace") clauses.push(`WHEN NOT MATCHED BY SOURCE THEN DELETE`);
+    // MERGE cannot sit in a subquery or CTE [V], so the actions come back one row per changed row; unchanged
+    // rows are not returned, which keeps this proportional to what was written.
+    const actions = await tx.all<{ a: string }>(
+      `MERGE INTO ${o.ref} AS t USING ${tempRef(o.src)} AS s ON (${on}) ${clauses.join(" ")} RETURNING merge_action AS a`, [o.stamp]);
+    const c = { INSERT: 0, UPDATE: 0, DELETE: 0 } as Record<string, number>;
+    for (const r of actions) c[r.a] = (c[r.a] ?? 0) + 1;
+    const added = c.INSERT!, updated = c.UPDATE!, deleted = c.DELETE!;
+    return { added, updated, deleted, unchanged: Math.max(0, o.srcRows - added - updated) };
   }
-  if (valueCols.length) {
-    const differs = valueCols.map((c) => `t.${quoteIdent(c.name)} IS DISTINCT FROM s.${quoteIdent(c.name)}`).join(" OR ");
-    clauses.push(`WHEN MATCHED AND (${differs}) THEN UPDATE SET ${setOf(valueCols)}, ${stampCol} = $1::TIMESTAMPTZ`);
+
+  // Classify first. Per row of the batch: is there a table row with its key, and does it differ. A fallback row that
+  // matches replaces the row whatever it holds; one that matches nothing is not inserted and is counted as neither.
+  // The aliases are not t and s: a correlated name like s.id would read as the field id of a STRUCT column named s.
+  const cls = `__croft_w${o.n}_cls`;
+  const action = quoteIdent("__croft_action");
+  const seqCol = quoteIdent(RESERVED.seq);
+  // The classification keeps no copy of the rows, only which row (its _croft_seq, unique in the source) is what.
+  const rowsOf = (what: string) => `SELECT __s.* FROM ${tempRef(o.src)} AS __s JOIN ${tempRef(cls)} AS __c ON __c.${seqCol} = __s.${seqCol} WHERE __c.${action} ${what}`;
+  const onTS = (t: string, s: string) => target.key.map((k) => `${t}.${quoteIdent(k)} = ${s}.${quoteIdent(k)}`).join(" AND ");
+  const differsTS = valueCols.length ? valueCols.map((c) => `__t.${quoteIdent(c.name)} IS DISTINCT FROM __s.${quoteIdent(c.name)}`).join(" OR ") : null;
+  const exists = (extra: string) => `EXISTS (SELECT 1 FROM ${o.ref} AS __t WHERE ${onTS("__t", "__s")}${extra})`;
+  // One LEFT JOIN decides all of it, when each key is in the table once (always, for a table croft keeps by key). A key
+  // twice would put its batch row in twice; that is seen from the row count, and the rows are classified again, one
+  // EXISTS at a time, which is slower and exact.
+  const classify = async (join: boolean): Promise<{ n: number; added: number; updated: number }> => {
+    const matchedWhen = join ? `__t.${quoteIdent(target.key[0]!)} IS NOT NULL` : exists("");
+    const kind = [
+      o.fallbacks > 0 ? `WHEN __s.${fb} THEN CASE WHEN ${matchedWhen} THEN 'updated' ELSE 'skipped' END` : null,
+      `WHEN NOT (${matchedWhen}) THEN 'added'`,
+      differsTS ? `WHEN ${join ? `(${differsTS})` : exists(` AND (${differsTS})`)} THEN 'updated'` : null,
+      `ELSE 'unchanged'`,
+    ].filter((x): x is string => x !== null);
+    await tx.exec(`CREATE OR REPLACE TEMP TABLE ${quoteIdent(cls)} AS SELECT __s.${seqCol} AS ${seqCol}, CASE ${kind.join(" ")} END AS ${action}
+      FROM ${tempRef(o.src)} AS __s${join ? ` LEFT JOIN ${o.ref} AS __t ON ${onTS("__t", "__s")}` : ""}`);
+    const [r] = await tx.all<{ n: number | bigint; added: number | bigint; updated: number | bigint }>(
+      `SELECT count(*) AS n, count(*) FILTER (WHERE ${action} = 'added') AS added, count(*) FILTER (WHERE ${action} = 'updated') AS updated FROM ${tempRef(cls)}`);
+    return { n: Number(r!.n), added: Number(r!.added), updated: Number(r!.updated) };
+  };
+  let seen = await classify(true);
+  if (seen.n !== o.srcRows) seen = await classify(false);
+  const { added, updated } = seen;
+  // New keys are plain inserts, no probe of the table; changed ones are a MERGE of just those rows (the one statement a lake
+  // is known to take for it). Every matched row left is one the classification found different, so it is set unconditionally.
+  if (added > 0) {
+    await tx.exec(
+      `INSERT INTO ${o.ref} (${cols(o.dataCols)}, ${stampCol}) SELECT ${cols(o.dataCols)}, $1::TIMESTAMPTZ FROM (${rowsOf("= 'added'")})`, [o.stamp]);
   }
-  clauses.push(`WHEN NOT MATCHED${o.fallbacks > 0 ? ` AND NOT s.${quoteIdent(FALLBACK)}` : ""} THEN INSERT (${cols(o.dataCols)}, ${stampCol}) VALUES (${cols(o.dataCols, "s.")}, $1::TIMESTAMPTZ)`);
-  const scope = fileScope(target, "t.");
-  if (scope) clauses.push(`WHEN NOT MATCHED BY SOURCE AND ${scope} THEN DELETE`);
-  else if (target.write === "replace") clauses.push(`WHEN NOT MATCHED BY SOURCE THEN DELETE`);
-  // MERGE cannot sit in a subquery or CTE [V], so the actions come back one row per changed row; unchanged
-  // rows are not returned, which keeps this proportional to what was written.
-  const actions = await tx.all<{ a: string }>(
-    `MERGE INTO ${o.ref} AS t USING ${tempRef(o.src)} AS s ON (${on}) ${clauses.join(" ")} RETURNING merge_action AS a`, [o.stamp]);
-  const c = { INSERT: 0, UPDATE: 0, DELETE: 0 } as Record<string, number>;
-  for (const r of actions) c[r.a] = (c[r.a] ?? 0) + 1;
-  const added = c.INSERT!, updated = c.UPDATE!, deleted = c.DELETE!;
+  if (updated > 0) {
+    // One UPDATE action to a MERGE, which is all DuckLake takes [V: 2.0.0 "MERGE INTO with DuckLake only supports a single
+    // UPDATE/DELETE action currently"]: a fallback row (it replaces the row in full) and an ordinary changed row are two.
+    const merge = async (rows: string, set: RealColumn[]) => {
+      if (!set.length) return;
+      await tx.exec(
+        `MERGE INTO ${o.ref} AS t USING (${rowsOf("= 'updated'")}${rows}) AS s ON (${on})
+         WHEN MATCHED THEN UPDATE SET ${setOf(set)}, ${stampCol} = $1::TIMESTAMPTZ`, [o.stamp]);
+    };
+    if (o.fallbacks > 0) await merge(` AND ${fb}`, o.dataCols.filter((c) => !isKey(c.name)));
+    await merge(o.fallbacks > 0 ? ` AND NOT ${fb}` : "", valueCols);
+  }
+  let deleted = 0;
+  if (scope || target.write === "replace") {
+    // The table rows (of the reloaded files, for a file reload) that no row of the batch has the key of.
+    const [d] = await tx.all<{ Count: number | bigint }>(
+      `DELETE FROM ${o.ref} AS __t WHERE ${(scopeOf("__t.")) ?? "true"} AND NOT EXISTS (SELECT 1 FROM ${tempRef(o.src)} AS __s WHERE ${onTS("__t", "__s")})`);
+    deleted = Number(d?.Count ?? 0);
+  }
+  await tx.exec(`DROP TABLE IF EXISTS ${tempRef(cls)}`);
   return { added, updated, deleted, unchanged: Math.max(0, o.srcRows - added - updated) };
 }
 
@@ -785,8 +872,8 @@ interface ColumnsInput {
 /** Make _croft.columns describe the table as it now is: one row per non-reserved column. */
 async function writeColumns(tx: Sql, o: ColumnsInput): Promise<void> {
   const real = o.columns.filter((c) => !isReservedColumn(c.name));
-  await tx.exec(`DELETE FROM _croft.columns WHERE asset = $1 AND NOT list_contains(CAST($2::JSON AS VARCHAR[]), name)`,
-    [o.asset, json(real.map((c) => c.name))]);
+  const bk = await bookkeepingOf(tx);
+  await bk.remove("columns", `asset = $1 AND NOT list_contains(CAST($2::JSON AS VARCHAR[]), name)`, [o.asset, json(real.map((c) => c.name))]);
   const find = <T>(rec: Record<string, T> | undefined, name: string): T | undefined =>
     rec ? Object.entries(rec).find(([k]) => sameName(k, name))?.[1] : undefined;
   for (const col of real) {
@@ -800,11 +887,10 @@ async function writeColumns(tx: Sql, o: ColumnsInput): Promise<void> {
     const pending = !o.typedBySql && !pinned && (had ? had.pending === true : plan !== undefined) && !nonNull;
     const kinds = [...new Set([...(had?.kinds ?? []), ...incoming.filter((k) => k !== "null")])];
     const format = find(o.formats, col.name) ?? pin?.format ?? had?.format ?? null;
-    await tx.exec(
-      `INSERT OR REPLACE INTO _croft.columns (asset, name, type, source_name, format, pinned, pending, kinds, present_last_batch, added_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, CAST($8::JSON AS VARCHAR[]), $9, $10::TIMESTAMPTZ)`,
-      [o.asset, col.name, col.type, plan?.sourceName ?? had?.source_name ?? col.name, format, pinned, pending, json(kinds),
-        o.present.has(lower(col.name)), had?.added_at ?? o.stamp],
-    );
+    await bk.upsert("columns", {
+      asset: "$1", name: "$2", type: "$3", source_name: "$4", format: "$5", pinned: "$6", pending: "$7",
+      kinds: "CAST($8::JSON AS VARCHAR[])", present_last_batch: "$9", added_at: "$10::TIMESTAMPTZ",
+    }, [o.asset, col.name, col.type, plan?.sourceName ?? had?.source_name ?? col.name, format, pinned, pending, json(kinds),
+      o.present.has(lower(col.name)), had?.added_at ?? o.stamp]);
   }
 }

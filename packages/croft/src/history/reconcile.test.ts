@@ -15,6 +15,7 @@ import { type CatalogAsset, getCatalog, putCatalog } from "./catalog.ts";
 import { acquire, holderOf, listLeases } from "./leases.ts";
 import { reconcile } from "./reconcile.ts";
 import { RunsDb } from "./runs-db.ts";
+import { seedState } from "../db/bookkeeping-testkit.ts";
 
 afterAll(() => closeAllWarehouses());
 
@@ -470,10 +471,10 @@ describe("reconcile against a real warehouse", () => {
     const later = new Date(Date.now() + 3_600_000).toISOString();
     await w.write("seed", async (tx) => {
       await ensureState(tx);
-      await tx.exec(row, ["orders", "2001-01-01T00:00:00Z", run.id, 500, 1]);
-      await tx.exec(row, ["orders", later, run.id, 20, 2]);
-      await tx.exec(legacyRow, ["customers", "2001-01-01T00:00:00Z", run.id, 9]);   // before its step started
-      await tx.exec(legacyRow, ["refs", later, run.id, 4]);
+      await seedState(tx, row, ["orders", "2001-01-01T00:00:00Z", run.id, 500, 1]);
+      await seedState(tx, row, ["orders", later, run.id, 20, 2]);
+      await seedState(tx, legacyRow, ["customers", "2001-01-01T00:00:00Z", run.id, 9]);   // before its step started
+      await seedState(tx, legacyRow, ["refs", later, run.id, 4]);
     }, { runId: "seed" });
     const r = await reconcile({ db, warehouse: w });
     expect(r.problems).toEqual([]);
@@ -511,13 +512,13 @@ describe("reconcile against a real warehouse", () => {
     const later = (s: number) => new Date(Date.now() + 3_600_000 + s * 1000).toISOString();
     await w.write("seed", async (tx) => {
       await ensureState(tx);
-      await tx.exec(`INSERT INTO _croft.assets (name, kind, write_mode, key_columns, cursor_value, cursor_type, row_count)
+      await seedState(tx, `INSERT INTO _croft.assets (name, kind, write_mode, key_columns, cursor_value, cursor_type, row_count)
         VALUES ('events', 'ingest', 'merge', ['id'], '2026-09-01T00:00:04Z', 'timestamp', 4)`);
-      await tx.exec(row, ["events", later(1), partial, 2, 1]);
-      await tx.exec(row, ["events", later(2), partial, 2, 1]);
-      await tx.exec(row, ["events", later(3), ended, 2, 1]);
-      await tx.exec(row, ["events", later(4), ended, 2, 1]);
-      await tx.exec(row, ["events", later(5), whole, 4, 1]);
+      await seedState(tx, row, ["events", later(1), partial, 2, 1]);
+      await seedState(tx, row, ["events", later(2), partial, 2, 1]);
+      await seedState(tx, row, ["events", later(3), ended, 2, 1]);
+      await seedState(tx, row, ["events", later(4), ended, 2, 1]);
+      await seedState(tx, row, ["events", later(5), whole, 4, 1]);
     }, { runId: "seed" });
     const r = await reconcile({ db, warehouse: w });
     expect(r.recovered).toHaveLength(3);
@@ -538,7 +539,7 @@ describe("reconcile against a real warehouse", () => {
       await tx.exec(`CREATE TABLE _croft.writes (asset VARCHAR, loaded_at TIMESTAMPTZ, run_id VARCHAR, mode VARCHAR,
         rows_in BIGINT, added BIGINT, updated BIGINT, unchanged BIGINT, deleted BIGINT, cursor_before VARCHAR,
         cursor_after VARCHAR, since_used VARCHAR, inputs JSON, schema_changes JSON, code_hash VARCHAR, PRIMARY KEY (asset, loaded_at))`);
-      await tx.exec(legacyRow, ["orders", new Date(Date.now() + 60_000).toISOString(), run.id, 3]);
+      await seedState(tx, legacyRow, ["orders", new Date(Date.now() + 60_000).toISOString(), run.id, 3]);
     }, { runId: "seed" });
     const r = await reconcile({ db, warehouse: w });
     expect(r.problems).toEqual([]);

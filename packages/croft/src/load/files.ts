@@ -53,6 +53,7 @@ import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } 
 import { CroftError, problem } from "../core/errors.ts";
 import type { Fix, Problem, Sql, ValueKind } from "../core/types.ts";
 import { canonicalPath, openMemory } from "../db/connect.ts";
+import { bookkeepingOf, stateObjects } from "../db/bookkeeping.ts";
 import { ensureState } from "../db/state.ts";
 import { LeaseSql } from "../db/warehouse.ts";
 import { excerpt, parseRetryAfter } from "../http/http.ts";
@@ -1825,9 +1826,7 @@ async function duplicateRows(tx: Sql, extract: FileExtract, batch: TypedBatch): 
 // _croft.files
 
 async function filesTableExists(sql: Sql): Promise<boolean> {
-  const [r] = await sql.all<{ n: number }>(
-    `SELECT count(*)::INTEGER AS n FROM duckdb_tables() WHERE database_name = current_database() AND schema_name = '_croft' AND table_name = 'files'`);
-  return Number(r?.n ?? 0) > 0;
+  return (await stateObjects(sql)).has("files");
 }
 
 /** The asset's _croft.files rows (empty before the first load). Usable from a read lease. */
@@ -1846,21 +1845,22 @@ export async function readKnownFiles(sql: Sql, asset: string): Promise<KnownFile
  */
 export async function recordFiles(tx: Sql, asset: string, extract: FileExtract, loadedAt: string): Promise<void> {
   if (!(await filesTableExists(tx))) await ensureState(tx);
+  const bk = await bookkeepingOf(tx);
   const loaded = new Set(extract.load);
   for (const f of extract.files) {
     if (f.status === "gone") continue;
     if (loaded.has(f.path)) {
-      await tx.exec(
-        `INSERT OR REPLACE INTO _croft.files (asset, path, size, mtime, etag, sha256, loaded_at) VALUES ($1, $2, $3, $4::TIMESTAMPTZ, $5, $6, $7::TIMESTAMPTZ)`,
-        [asset, f.path, f.size, f.mtime, f.etag, f.sha256, loadedAt]);
+      await bk.upsert("files", {
+        asset: "$1", path: "$2", size: "$3", mtime: "$4::TIMESTAMPTZ", etag: "$5", sha256: "$6", loaded_at: "$7::TIMESTAMPTZ",
+      }, [asset, f.path, f.size, f.mtime, f.etag, f.sha256, loadedAt]);
     } else {
-      await tx.exec(`UPDATE _croft.files SET size = $3, mtime = $4::TIMESTAMPTZ, etag = $5, sha256 = $6 WHERE asset = $1 AND path = $2`,
+      await bk.update("files", { size: "$3", mtime: "$4::TIMESTAMPTZ", etag: "$5", sha256: "$6" }, "asset = $1 AND path = $2",
         [asset, f.path, f.size, f.mtime, f.etag, f.sha256]);
     }
   }
   if (!extract.incremental) {
     const keep = extract.files.filter((f) => f.status !== "gone").map((f) => f.path);
-    await tx.exec(`DELETE FROM _croft.files WHERE asset = $1 AND NOT list_contains(CAST($2::JSON AS VARCHAR[]), path)`, [asset, JSON.stringify(keep)]);
+    await bk.remove("files", `asset = $1 AND NOT list_contains(CAST($2::JSON AS VARCHAR[]), path)`, [asset, JSON.stringify(keep)]);
   }
 }
 

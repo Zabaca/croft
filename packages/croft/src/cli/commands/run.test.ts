@@ -12,6 +12,7 @@ import { eventsPath, runExample } from "../../run/runner.ts";
 import { Confirmations } from "../../safety/confirm.ts";
 import { listTrash } from "../../safety/trash.ts";
 import { cleanupProjects, cli, cliEnv, keysetIssues, makeProject, mockApi, PKG, simpleGet, slowPages, startCli, until } from "../../run/testkit.ts";
+import { seedState, sqlOver } from "../../db/bookkeeping-testkit.ts";
 import { main } from "../main.ts";
 import type { StepResult } from "../../core/types.ts";
 import { formatRun, progressLine, userArgs } from "./run.ts";
@@ -447,7 +448,7 @@ describe("--rebuild through the CLI", () => {
     const db = await DuckDBInstance.create(join(root, "warehouse.duckdb"), { access_mode: "READ_WRITE" });
     const c = await db.connect();
     try {
-      await c.run(`UPDATE _croft.assets SET last_replaced_at = now() WHERE name = 'issues'`);
+      await seedState(sqlOver(c), `UPDATE _croft.assets SET last_replaced_at = now() WHERE name = 'issues'`);
     } finally {
       c.disconnectSync();
       db.closeSync();

@@ -49,6 +49,7 @@ import type { DuckDBConnection } from "@duckdb/node-api";
 import { CroftError, isCode, problem } from "../core/errors.ts";
 import { now as clockNow } from "../core/time.ts";
 import type { LockHolder, Problem, Sql } from "../core/types.ts";
+import { type StateTableName, bookkeepingOf } from "../db/bookkeeping.ts";
 import { newerStorage } from "../db/connect.ts";
 import type { DuckWarehouse, LeaseSql } from "../db/warehouse.ts";
 import type { CatalogAsset } from "../history/catalog.ts";
@@ -839,7 +840,7 @@ export function unfinishedRename(stateDir: string, asset: string): CroftError | 
 // Applying
 
 /** _croft tables and the column that names the asset. `inputs` also names it as an input (below). */
-const STATE_MOVES: readonly [table: string, column: string][] = [
+const STATE_MOVES: readonly [table: StateTableName, column: string][] = [
   ["assets", "name"], ["columns", "asset"], ["inputs", "asset"], ["files", "asset"], ["writes", "asset"],
 ];
 
@@ -896,10 +897,9 @@ async function renameInWarehouse(w: DuckWarehouse, runs: RunsDb, plan: RenamePla
         const [s = { f: 0, t: 0 }] = await tx.all<{ f: number; t: number }>(
           `SELECT count(*) FILTER (WHERE name = $1)::INTEGER AS f, count(*) FILTER (WHERE name = $2)::INTEGER AS t FROM _croft.assets`, [from, to]);
         if (s.t > 0 && (s.f > 0 || !resume)) throw nameTaken(to, "croft state (a table recorded in _croft.assets)");
-        for (const [table, column] of STATE_MOVES) {
-          await tx.exec(`UPDATE _croft.${table} SET ${column} = $2 WHERE ${column} = $1`, [from, to]);
-        }
-        await tx.exec(`UPDATE _croft.inputs SET input = $2 WHERE input = $1`, [from, to]);
+        const bk = await bookkeepingOf(tx);
+        for (const [table, column] of STATE_MOVES) await bk.rekey(table, column, from, to);
+        await bk.rekey("inputs", "input", from, to);
       }
       let rows: number | null = null;
       if (fromRel === "table" || toRel === "table") {

@@ -6,6 +6,7 @@ import { DuckDBInstance } from "@duckdb/node-api";
 import { ensureState } from "../db/state.ts";
 import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/warehouse.ts";
 import { listTrash, plannedTrashPath, pruneTrash, TRASH_RETENTION, trashStamp, trashTable } from "./trash.ts";
+import { seedState } from "../db/bookkeeping-testkit.ts";
 
 const dirs: string[] = [];
 afterAll(async () => {
@@ -42,8 +43,8 @@ describe("trashTable", () => {
       await ensureState(tx);
       await tx.exec(`CREATE TABLE zones (h HUGEINT, j JSON, t TIMESTAMPTZ, d DECIMAL(18,3), _loaded_at TIMESTAMPTZ)`);
       await tx.exec(`INSERT INTO zones VALUES (170141183460469231731687303715884105727, '{"a":[1,2]}', '2024-01-01 00:00:00.123456+00', 12.345, now()), (1, NULL, NULL, 0.001, now())`);
-      await tx.exec(`INSERT INTO _croft.assets (name, kind, write_mode, row_count) VALUES ('zones', 'ingest', 'replace', 2), ('other', 'ingest', 'replace', 9)`);
-      await tx.exec(`INSERT INTO _croft.columns (asset, name, type) VALUES ('zones', 'h', 'HUGEINT'), ('other', 'x', 'BIGINT')`);
+      await seedState(tx, `INSERT INTO _croft.assets (name, kind, write_mode, row_count) VALUES ('zones', 'ingest', 'replace', 2), ('other', 'ingest', 'replace', 9)`);
+      await seedState(tx, `INSERT INTO _croft.columns (asset, name, type) VALUES ('zones', 'h', 'HUGEINT'), ('other', 'x', 'BIGINT')`);
     }, { runId: "r_seed" });
     const at = new Date("2026-09-22T18:40:00.123Z");
     const e = (await trashTable(w, "zones", "run --allow-shrink (r_0922_1140_a1b2)", { runId: "r_0922_1140_a1b2", now: at }))!;
@@ -103,7 +104,7 @@ describe("trashTable", () => {
     await w.write("seed", async (tx) => {
       await ensureState(tx);
       await tx.exec(`CREATE TABLE orders AS SELECT range AS id, range * 10 AS amount FROM range(5)`);
-      await tx.exec(`INSERT INTO _croft.assets (name, kind, row_count) VALUES ('orders', 'ingest', 5)`);
+      await seedState(tx, `INSERT INTO _croft.assets (name, kind, row_count) VALUES ('orders', 'ingest', 5)`);
     }, { runId: "r_seed" });
     const e = (await trashTable(w, "orders", "delete --where (r_0922_1140_a1b2)", { where: "amount >= 30", now: new Date("2026-09-22T18:40:00Z") }))!;
     expect(e).toMatchObject({ asset: "orders", rows: 2, kind: "rows", where: "amount >= 30" });

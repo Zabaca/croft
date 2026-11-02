@@ -16,6 +16,7 @@ import { secretsCommandHash } from "../project/env.ts";
 import { dueWork, FACTS_SETTING, scheduleView } from "../schedule/due.ts";
 import type { ScheduledFailure } from "../schedule/notify.ts";
 import { planRun } from "./plan.ts";
+import { seedState, sqlOver } from "../db/bookkeeping-testkit.ts";
 import { type RunnerOptions, SCHEDULED_LOCK_WAIT_MS } from "./runner.ts";
 import { cleanupProjects, cli, cliEnv, keysetIssues, makeProject, mockApi, runIn, simpleGet } from "./testkit.ts";
 
@@ -568,7 +569,7 @@ describe("a DuckDB upgrade (run/engine-change.ts)", () => {
     const { DuckDBInstance } = await import("@duckdb/node-api");
     const instance = await DuckDBInstance.create(loadProject({ root }).paths.database);
     const conn = await instance.connect();
-    await conn.run("UPDATE _croft.assets SET code_hash = $1 WHERE name = $2", [old, asset]);
+    await seedState(sqlOver(conn), "UPDATE _croft.assets SET code_hash = $1 WHERE name = $2", [old, asset]);
     conn.closeSync();
     instance.closeSync();
     return current;

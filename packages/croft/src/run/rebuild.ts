@@ -53,6 +53,7 @@ import { existsSync, rmSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { CroftError, problem } from "../core/errors.ts";
 import type { Confirmation, Impact, Problem, Sql, StepResult } from "../core/types.ts";
+import { bookkeepingOf } from "../db/bookkeeping.ts";
 import { hasState } from "../db/state.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
 import type { LogWriter } from "../history/logs.ts";
@@ -373,7 +374,7 @@ export class Rebuilds {
           }
           // What read the old table is stale now, even when the refetch wrote nothing (§5 input_replaced).
           const stamp = await replacedStamp(tx, asset, o.now);
-          await tx.exec(`UPDATE _croft.assets SET last_replaced_at = $2::TIMESTAMPTZ WHERE name = $1`, [asset, isoMicros(stamp)]);
+          await (await bookkeepingOf(tx)).update("assets", { last_replaced_at: "$2::TIMESTAMPTZ" }, "name = $1", [asset, isoMicros(stamp)]);
           return warning;
         },
         committed: () => {
@@ -470,8 +471,9 @@ export async function resetAsset(warehouse: DuckWarehouse, asset: string, o: { r
 export async function resetInTx(tx: Sql, asset: string): Promise<void> {
   await tx.exec(`DROP TABLE IF EXISTS ${tableRef(await currentDatabase(tx), asset)}`);
   if (!(await hasState(tx))) return;
-  await tx.exec(`DELETE FROM _croft.assets WHERE name = $1`, [asset]);
-  for (const table of ["columns", "files", "inputs"]) await tx.exec(`DELETE FROM _croft.${table} WHERE asset = $1`, [asset]);
+  const bk = await bookkeepingOf(tx);
+  await bk.remove("assets", `name = $1`, [asset]);
+  for (const table of ["columns", "files", "inputs"] as const) await bk.remove(table, `asset = $1`, [asset]);
 }
 
 const count = (n: number) => n.toLocaleString("en-US");

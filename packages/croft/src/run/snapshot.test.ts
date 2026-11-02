@@ -12,6 +12,7 @@ import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/war
 import {
   afterPosition, countAfter, INPUT_FILES, OwnTableQuery, readInputFacts, SNAPSHOT_FILE, snapshotColumnsSql, snapshotInput, snapshotTable,
 } from "./snapshot.ts";
+import { seedState } from "../db/bookkeeping-testkit.ts";
 
 const dirs: string[] = [];
 afterAll(async () => {
@@ -150,7 +151,7 @@ describe("TS transform input snapshots (§3e)", () => {
       // Inserted out of order: the snapshot orders them.
       await tx.exec(`INSERT INTO ev VALUES
         (10, 'b', ${HUGE}, '${S1}'), (9, 'a', -${HUGE}, '${S1}'), (100, 'a', 1, '${S1}'), (3, 'z', 2, '${S2}'), (1, 'b', 3, '${S2}')`);
-      await tx.exec(`INSERT INTO _croft.assets (name, kind, key_columns, last_loaded_at, row_count)
+      await seedState(tx, `INSERT INTO _croft.assets (name, kind, key_columns, last_loaded_at, row_count)
         VALUES ('ev', 'ingest', CAST($1::JSON AS VARCHAR[]), '${S2}', 5)`, [JSON.stringify(key ?? [])]);
     }, { runId: "r_test" });
   }
@@ -206,7 +207,7 @@ describe("TS transform input snapshots (§3e)", () => {
       await tx.exec(`CREATE TABLE big (h HUGEINT, title VARCHAR, _loaded_at TIMESTAMPTZ)`);
       // In text order ("10" < "100" < "2" < "9"), all at one stamp.
       await tx.exec(`INSERT INTO big VALUES (10, 'a', '${S1}'), (100, 'b', '${S1}'), (2, 'c', '${S1}'), (9, 'd', '${S1}'), (-${HUGE}, 'e', '${S1}')`);
-      await tx.exec(`INSERT INTO _croft.assets (name, kind, key_columns, last_loaded_at, row_count) VALUES ('big', 'ingest', ['h'], '${S1}', 5)`);
+      await seedState(tx, `INSERT INTO _croft.assets (name, kind, key_columns, last_loaded_at, row_count) VALUES ('big', 'ingest', ['h'], '${S1}', 5)`);
     }, { runId: "r_test" });
     const dir = join(state, "staging", "r1", "t", "in", "big");
     const ids = async (o: { kind: "all" | "new"; after?: { stamp: string; key: string[] }; limit?: number }) =>
@@ -223,7 +224,7 @@ describe("TS transform input snapshots (§3e)", () => {
     const { w } = warehouse();
     await input(w);
     expect((await w.read((db) => readInputFacts(db, "ev")))!.version).toBe(S2);
-    await w.write("oob", (tx) => tx.exec(`UPDATE _croft.assets SET last_replaced_at = '2026-03-02T00:00:00Z' WHERE name = 'ev'`), { runId: "r_test" });
+    await w.write("oob", (tx) => seedState(tx, `UPDATE _croft.assets SET last_replaced_at = '2026-03-02T00:00:00Z' WHERE name = 'ev'`), { runId: "r_test" });
     const facts = (await w.read((db) => readInputFacts(db, "ev")))!;
     expect(facts.lastLoadedAt).toBe(S2);
     expect(facts.version).toBe("2026-03-02T00:00:00.000000Z");

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { ensureState } from "../db/state.ts";
 import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/warehouse.ts";
 import { baseFrom, readCatalogEntry } from "./catalog.ts";
+import { LOG_ADAPTER, seedState } from "../db/bookkeeping-testkit.ts";
 
 afterAll(() => closeAllWarehouses());
 
@@ -23,8 +24,8 @@ describe("readCatalogEntry: what a transform has seen of its inputs", () => {
     await w.write("seed", async (tx) => {
       await ensureState(tx);
       await tx.exec(`CREATE TABLE triage (issue_id BIGINT, priority VARCHAR, _loaded_at TIMESTAMPTZ)`);
-      await tx.exec(TRIAGE);
-      await tx.exec(`INSERT INTO _croft.inputs VALUES ('triage', 'issues', '2026-09-22T09:00:00.000001Z', '[18446744073709551621]', NULL),
+      await seedState(tx, TRIAGE);
+      await seedState(tx, `INSERT INTO _croft.inputs VALUES ('triage', 'issues', '2026-09-22T09:00:00.000001Z', '[18446744073709551621]', NULL),
         ('triage', 'labels', '2026-09-22T08:00:00Z', NULL, '2026-09-22T08:00:00Z'), ('other', 'issues', '2026-09-22T07:00:00Z', NULL, NULL)`);
     }, { runId: "r" });
     const entry = await w.read((sql) => readCatalogEntry(sql, { asset: "triage", kind: "ts", behavior: "b", cursorField: null, lastRunId: "r", reads: ["issues", "labels"] }), { purpose: "t" });
@@ -41,7 +42,7 @@ describe("readCatalogEntry: what a transform has seen of its inputs", () => {
     const w = warehouse();
     await w.write("seed", async (tx) => {
       await ensureState(tx);
-      await tx.exec(TRIAGE);
+      await seedState(tx, TRIAGE);
     }, { runId: "r" });
     const entry = await w.read((sql) => readCatalogEntry(sql, { asset: "triage", behavior: "b", cursorField: null, lastRunId: null }), { purpose: "t" });
     expect(entry).not.toBeNull();
@@ -49,14 +50,14 @@ describe("readCatalogEntry: what a transform has seen of its inputs", () => {
     expect("reads" in entry!).toBe(false);
   });
 
-  test("a format-2 database (no input_last_loaded_at yet) reads under a read lease, as not read in full", async () => {
+  test.skipIf(LOG_ADAPTER)("a format-2 database (no input_last_loaded_at yet) reads under a read lease, as not read in full", async () => {
     const w = warehouse();
     await w.write("seed", async (tx) => {
       await ensureState(tx);
       await tx.exec(`DROP TABLE _croft.inputs`);
       await tx.exec(`CREATE TABLE _croft.inputs (asset VARCHAR, input VARCHAR, seen_loaded_at TIMESTAMPTZ, seen_key JSON, PRIMARY KEY (asset, input))`);
-      await tx.exec(TRIAGE);
-      await tx.exec(`INSERT INTO _croft.inputs VALUES ('triage', 'issues', '2026-09-22T09:00:00Z', NULL)`);
+      await seedState(tx, TRIAGE);
+      await seedState(tx, `INSERT INTO _croft.inputs VALUES ('triage', 'issues', '2026-09-22T09:00:00Z', NULL)`);
     }, { runId: "r" });
     const entry = await w.read((sql) => readCatalogEntry(sql, { asset: "triage", behavior: "b", cursorField: null, lastRunId: null }), { purpose: "t" });
     expect(entry!.inputsSeen).toEqual({ issues: { seenLoadedAt: "2026-09-22T09:00:00.000000Z", seenKey: null, inputLastLoadedAt: null } });
