@@ -193,6 +193,10 @@ describe("what is installed and what to run", () => {
     expect(e.problem.details).toMatchObject({ source: "cache" });
     expect(e.problem.fix).toMatchObject({ kind: "command", command: expect.stringContaining("bun add @zabaca/croft-addon-server@") });
     expect(e.problem.hint).toContain("builders' cache");
+    // And the report says the add-on is not installed, and offers its command.
+    const view = inspectAddons(["server"], search).views[0]!;
+    expect(view).toMatchObject({ ok: false, installed: false });
+    expect(view.install).toContain("bun add @zabaca/croft-addon-server@");
     expect(e.problem.hint).toContain("bun add @zabaca/croft-addon-server@");
     // A mode with no add-on (the lake test mode's sqlite) can only be told to fill the folder.
     const lone = caught(() => verifyModeExtension("sqlite", null, { ...search, env: { ...env } }));

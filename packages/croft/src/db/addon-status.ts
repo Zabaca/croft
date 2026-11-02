@@ -43,9 +43,13 @@ export function inspectAddons(addons: readonly AddonName[], s: ExtensionSearch =
       ok: failures.length === 0,
       // Installed: every file is there (a wrong one is there: that is another failure), or the add-on's own package was found and
       // a file for this machine did not come with it. Nothing is installed where files are missing and no package says otherwise:
-      // an unpinned platform, an empty folder, one file found alone that another add-on shares.
+      // an unpinned platform, an empty folder, a wrong file in the builders' cache, one file found alone that another add-on shares.
       installed: failures.some((f) => (f.problem.details as { installed?: boolean } | undefined)?.installed === true)
-        || failures.every((f) => ["checksum", "build"].includes((f.problem.details as { kind?: string } | undefined)?.kind ?? "")),
+        || failures.every((f) => {
+          const d = f.problem.details as { kind?: string; source?: string } | undefined;
+          // A wrong file is there, but not in the builders' cache: that is not where a user installs an add-on.
+          return ["checksum", "build"].includes(d?.kind ?? "") && d?.source !== "cache";
+        }),
       // The command is offered where it can help: not on a platform with no files, and not while a folder is the only place looked.
       install: platform && !folderInForce(s) ? installCommand(addon, s.from) : null,
       extensions,

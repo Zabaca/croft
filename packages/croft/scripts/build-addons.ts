@@ -8,14 +8,16 @@
 // hold the pinned file. --out is outside the workspace on purpose (a package.json under packages/ would join the workspace).
 // With --pack the tarballs go to <out>/tarballs and <out>/summary.json lists each one's name, version, size and sha256, in the order
 // to publish (extension packages first, then the add-ons that depend on them), and the installed size of each add-on per platform.
-// Exit 1 when a tarball is over --max-mb (default 50), a figure chosen far below what npm has been seen to accept (D135).
+// Exit 1 when a tarball is over --max-mb (default 50), a figure chosen far below what npm has been seen to accept (D135), or when a
+// file shows a third-party component that scripts/notices.ts does not list for its extension (scripts/check-notices.ts, D135).
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { ADDON_NAMES, ADDON_VERSION, addonPackage, extensionPackage, extensionsOf, PLATFORM_NPM } from "../src/db/addons.ts";
+import { ADDON_NAMES, ADDON_VERSION, addonPackage, extensionPackage, extensionsOf, PLATFORM_NPM, SHIPPED_EXTENSIONS } from "../src/db/addons.ts";
 import { DUCKDB_VERSION, PLATFORMS } from "../src/db/extension-names.ts";
 import { oversize, packageDir, type PlannedPackage, writePackages } from "./addon-packages.ts";
+import { checkNotices, describe } from "./check-notices.ts";
 
 const args = process.argv.slice(2);
 const flag = (n: string) => args.includes(n);
@@ -34,6 +36,11 @@ const out = resolve(outArg);
 const maxMb = Number(value("--max-mb") ?? "50");
 if (!(maxMb > 0)) fail("--max-mb must be a positive number");
 const maxBytes = Math.round(maxMb * 1_000_000);
+
+// The notices must cover what the files contain (scripts/check-notices.ts): a build whose files show a component with no notice stops here.
+const notices = checkNotices(resolve(source));
+if (notices.findings.length) fail(`the notices do not cover the extension files:\n  ${describe(notices.findings).join("\n  ")}\nadd the component to scripts/notices.ts, with its license text in scripts/notices/`);
+if (notices.checked !== PLATFORMS.length * SHIPPED_EXTENSIONS.length) fail(`only ${notices.checked} of ${PLATFORMS.length * SHIPPED_EXTENSIONS.length} extension files are in ${source}, so the notices cannot be checked against all of them`);
 
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });

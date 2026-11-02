@@ -48,18 +48,25 @@ each extension's `source`: "addon", "dir" or "cache"), `croft doctor --json` an 
 
 Each extension file is DuckDB's own build and is under DuckDB's MIT license (`LICENSE` in its package). The files link other
 projects' code statically, so each extension package also carries `THIRD_PARTY_NOTICES.txt` with those projects' licenses,
-and a `license` field that names them all as an SPDX expression. What was found in the files themselves:
+and a `license` field that names them all as an SPDX expression. What was found in the files themselves (read with `strings`,
+`nm` and a scan of the bytes, on the macOS and Linux files of all four extensions; a project is listed if any platform's
+file shows it):
 
 | Extension | Linked, besides DuckDB's own sources |
 |---|---|
-| httpfs | OpenSSL 3.6.0 (Apache-2.0), libcurl 8.21.0 (curl) |
+| httpfs | OpenSSL 3.6.0 (Apache-2.0), libcurl 8.21.0 (curl), zlib 1.3.2 (Zlib) |
 | quack | OpenSSL 3.6.0 (Apache-2.0) |
 | postgres | libpq 18 (PostgreSQL), OpenSSL 3.6.0 (Apache-2.0) |
 | ducklake | CRoaring (Apache-2.0 OR MIT, taken under Apache-2.0) |
 
-All four also contain parts of the third-party sources in DuckDB's own tree (Mbed TLS, RE2, {fmt}, yyjson, utf8proc, Zstandard
-and others), whose notices are in the same file. This was read from the binaries and DuckDB's source tree by a person with
-tools, not by a lawyer.
+All four also contain parts of the third-party sources in DuckDB's own tree. The Linux builds compile in more of them than the
+macOS builds (jemalloc, FSST, nanoarrow, SkipList, FastPFor), and every one seen on any platform has its notice in each
+package: Mbed TLS, RE2, {fmt}, yyjson, jaro_winkler, moodycamel's queue, fast_float, utf8proc, Zstandard, hyperloglog, miniz,
+jemalloc, FSST, SkipList, FastPFor and nanoarrow, cpp-httplib (httpfs, quack) and pdqsort, vergesort and ska_sort (quack,
+ducklake, postgres). The notice of t-digest is there too although no file was found to contain it. The notices are kept
+complete by a check that the add-on build runs on all 16 files (`scripts/check-notices.ts`): it fails when a file shows a
+component the package does not list. This was read from the binaries and DuckDB's source tree by a person with tools, not
+by a lawyer.
 
 ## Publishing the add-ons (for croft's maintainers)
 

@@ -7,11 +7,13 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { ADDON_VERSION, addonPackage, extensionPackage, extensionsOf, PLATFORM_NPM, SHIPPED_EXTENSIONS } from "../src/db/addons.ts";
-import { extensionPath } from "../src/db/extension-files.ts";
+import { extensionPath, hostPlatform } from "../src/db/extension-files.ts";
 import { DUCKDB_VERSION, type ExtensionName, PLATFORMS } from "../src/db/extension-names.ts";
 import { EXTENSION_PINS } from "../src/db/extension-pins.ts";
 import { assertPinned, oversize, packageDir, planPackages, writePackages } from "../scripts/addon-packages.ts";
+import { checkBytes, checkNotices, componentsIn, namespacesIn } from "../scripts/check-notices.ts";
 import { COMPONENTS, componentsFor, licenseFor, noticesFor } from "../scripts/notices.ts";
+import { extensionsReady } from "../src/db/extension-dir-testkit.ts";
 
 const PKG = resolve(import.meta.dir, "..");
 const NPM = Bun.which("npm");
@@ -115,8 +117,7 @@ describe("third-party notices", () => {
 
   test("every component has its license file, which names the project it is for, and its source", () => {
     for (const c of COMPONENTS) {
-      const text = readFileSync(join(dir, c.file), "utf8");
-      expect(text.length, c.id).toBeGreaterThan(100);
+      for (const f of c.files) expect(readFileSync(join(dir, f), "utf8").length, `${c.id}: ${f}`).toBeGreaterThan(100);
       expect(c.source, c.id).toMatch(/^https:\/\/raw\.githubusercontent\.com\//);
       expect(c.found.length, c.id).toBeGreaterThan(5);
     }
@@ -134,10 +135,26 @@ describe("third-party notices", () => {
     expect(ids("httpfs")).not.toContain("libpq");
   });
 
+  test("what the Linux builds compile in beyond the macOS ones, as the review read it with nm -a, is listed for every extension: jemalloc, FSST, nanoarrow, SkipList, fastpforlib, hyperloglog, miniz, zstd, TDigest", () => {
+    for (const e of SHIPPED_EXTENSIONS) {
+      const ids = componentsFor(e).map((c) => c.id);
+      for (const id of ["jemalloc", "fsst", "nanoarrow", "skiplist", "fastpforlib", "hyperloglog", "miniz", "zstd", "tdigest", "mbedtls", "re2"]) expect(ids, `${e}: ${id}`).toContain(id);
+    }
+    expect(componentsFor("httpfs").map((c) => c.id)).toContain("zlib");
+    for (const e of ["quack", "ducklake", "postgres"] as const) expect(componentsFor(e).map((c) => c.id), e).not.toContain("zlib");
+    // The Apache NOTICE files travel with the licenses that ask for it.
+    expect(noticesFor("quack", "linux-x64")).toContain("Apache Arrow nanoarrow\nCopyright 2023 The Apache Software Foundation");
+    expect(noticesFor("quack", "linux-x64")).toContain("t-digest was originally authored by Ted Dunning");
+    expect(noticesFor("quack", "linux-x64")).toContain("Jason Evans");
+  });
+
   test("the SPDX expression of each package names every license taken, MIT first, once each", () => {
     expect(licenseFor("httpfs")).toContain("curl");
     expect(licenseFor("postgres")).toContain("PostgreSQL");
     expect(licenseFor("postgres")).not.toContain("curl");
+    for (const e of SHIPPED_EXTENSIONS) for (const id of ["BSD-2-Clause", "BSD-3-Clause", "Apache-2.0", "Zlib"]) expect(licenseFor(e), `${e}: ${id}`).toContain(id);
+    expect(licenseFor("httpfs")).not.toContain("BSL-1.0");
+    for (const e of ["quack", "ducklake", "postgres"] as const) expect(licenseFor(e), e).toContain("BSL-1.0");
     for (const e of SHIPPED_EXTENSIONS) {
       const l = licenseFor(e);
       expect(l.startsWith("MIT AND "), e).toBe(true);
@@ -159,6 +176,52 @@ describe("third-party notices", () => {
     expect(noticesFor("ducklake", "linux-arm64")).toContain("CRoaring");
     expect(noticesFor("ducklake", "linux-arm64")).not.toContain("OpenSSL 3.6.0");
     for (const e of SHIPPED_EXTENSIONS) expect(noticesFor(e, "darwin-x64"), e).not.toContain("\u2014");
+  });
+});
+
+describe("the notices stay complete (scripts/check-notices.ts)", () => {
+  const bytes = (...parts: string[]) => Buffer.from(parts.join("\0"), "latin1");
+
+  test("a marker for a component the extension's package does not list is a finding", () => {
+    // httpfs does not list libpq; a file that shows PQconnectdb is missing its notice.
+    const f = checkBytes(bytes("PQconnectdb", "OpenSSL 3.6.0 1 Oct 2025"), "httpfs", "linux_amd64");
+    expect(f.missing).toEqual(["libpq"]);
+    expect(f.unknown).toEqual([]);
+    // The same bytes in postgres's file are covered.
+    expect(checkBytes(bytes("PQconnectdb", "OpenSSL 3.6.0 1 Oct 2025"), "postgres", "linux_amd64").missing).toEqual([]);
+    // A component added to DuckDB's build shows by its marker too: roaring in a quack file.
+    expect(checkBytes(bytes("roaring_bitmap_add"), "quack", "osx_arm64").missing).toEqual(["croaring"]);
+  });
+
+  test("a vendored namespace no component covers is a finding, and the covered and core ones are not", () => {
+    const mangled = (name: string) => `N${name.length}${name}E`;
+    const f = checkBytes(bytes(mangled("duckdb_newlib"), mangled("duckdb_mbedtls"), mangled("duckdb_v2_extension_input"), mangled("duckdb_httplib_openssl")), "quack", "linux_arm64");
+    expect(f.unknown).toEqual(["duckdb_newlib"]);
+    expect(namespacesIn(bytes(mangled("duckdb_re2"), "duckdb_extension_load")).has("duckdb_re2")).toBe(true);
+    expect(namespacesIn(bytes("duckdb_extension_load", "3duckdb_x")).size).toBe(0);
+  });
+
+  test("the markers find what they were chosen for", () => {
+    expect([...componentsIn(bytes("jemalloc.c", "libfsst.cpp", "SkipList.cpp", "ub_duckdb_adbc_nanoarrow.cpp", "bitpacking.cpp"))].sort())
+      .toEqual(["fastpforlib", "fsst", "jemalloc", "nanoarrow", "skiplist"]);
+    expect([...componentsIn(bytes("inflate 1.3.2 Copyright 1995-2026 Mark Adler", "invalid distance too far back"))]).toEqual(["zlib"]);
+    expect([...componentsIn(bytes("CLIENT libcurl 8.21.0"))]).toEqual(["curl"]);
+    expect(componentsIn(bytes("nothing to see", "GetDigestSize", "set_digest")).size).toBe(0);
+  });
+
+  test("every component but TDigest has a marker, and a marker that never matches is only allowed for a component that says it was never seen", () => {
+    for (const c of COMPONENTS) {
+      if (c.id === "tdigest") expect(c.found, c.id).toContain("NOT FOUND");
+      else expect(c.marker, c.id).not.toBeNull();
+    }
+  });
+
+  const real = extensionsReady(["quack", "httpfs", "ducklake", "postgres"]);
+  (real.ready ? test : test.skip)("this machine's four real files are covered, and every component listed is one of the files shows except TDigest", () => {
+    const r = checkNotices(real.dir, [hostPlatform()!]);
+    expect(r.checked).toBe(4);
+    expect(r.findings).toEqual([]);
+    for (const ids of Object.values(r.listedButNotSeen)) expect(ids.filter((id) => id !== "tdigest")).not.toContain("openssl");
   });
 });
 
