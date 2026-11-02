@@ -25,6 +25,10 @@
 //   - a table outside the main schema or in another catalog (`_croft.assets`, `warehouse.main.orders`,
 //     `information_schema.tables`): croft cannot order the asset after it, or must not let checks read it;
 //   - table functions that read files or run SQL given as a string, functions with side effects, parameters.
+//   What these narrowings do not say is the gate's, not this file's: the probe also goes through the gate's synchronous
+//   decision (sql/gate-core.ts decide(), D123) with a policy that lets a check read no file, so a query node that
+//   writes, write_log() and setval() are refused by the one function every path to user SQL shares, and a rule added
+//   to the gate binds checks too.
 //   checks/run.ts repeats this vetting on the write transaction before it evaluates a rule, so a check that
 //   skipped validate is still never concatenated into anything unvetted.
 //
@@ -34,14 +38,14 @@
 //   rule               the expression as written, trimmed (a trailing `--` comment is allowed: croft puts the
 //                      expression on its own lines)
 import type { DuckDBConnection } from "@duckdb/node-api";
-import { problem } from "../core/errors.ts";
+import { CroftError, problem } from "../core/errors.ts";
 import type { Check, Problem } from "../core/types.ts";
 import { quoteIdent } from "../load/evolve.ts";
 import { editDistance } from "../project/suggest.ts";
 import {
-  arrowLambdas, asciiLower, type AstNode, collect, finiteJson, foreignQueryNode, literal, looksLikePath, relationNames, TABLE_ARGUMENT_FUNCTIONS, tableArguments, walk,
+  arrowLambdas, asciiLower, type AstNode, collect, finiteJson, literal, looksLikePath, relationNames, TABLE_ARGUMENT_FUNCTIONS, tableArguments, walk,
 } from "../sql/ast.ts";
-import { TABLE_FUNCTIONS } from "../sql/gate.ts";
+import { decide, PathPolicy, TABLE_FUNCTIONS } from "../sql/gate-core.ts";
 
 export interface ParseChecksInput {
   asset: string;
@@ -143,9 +147,11 @@ export async function vetCheck(serialize: (sql: string) => Promise<string>, asse
   const lexical = lexicalProblem(c.sql);
   if (lexical) return bad(lexical.why, lexical.hint);
   let parsed: { error?: boolean; error_message?: string; statements?: { node?: AstNode; named_param_map?: unknown }[] };
+  let text: string;
   try {
+    text = await serialize(probeSql(asset, c.sql));
     // finiteJson: a DOUBLE constant beyond range (`amount < 1e400`) comes back as a bare Infinity.
-    parsed = JSON.parse(finiteJson(await serialize(probeSql(asset, c.sql)))) as typeof parsed;
+    parsed = JSON.parse(finiteJson(text)) as typeof parsed;
   } catch (e) {
     return bad(`could not be parsed: ${firstLine(e)}`);
   }
@@ -168,11 +174,6 @@ export async function vetCheck(serialize: (sql: string) => Promise<string>, asse
       hint: arrow.to ? `write it as ${arrow.to}` : "write the lambda as lambda x: <expression>",
       ...(arrow.text && arrow.to ? { fix: { from: arrow.text, to: arrow.to } } : {}),
     };
-  }
-  const foreign = foreignQueryNode(node);
-  if (foreign) {
-    return bad(`holds a ${foreign.type.replace(/_QUERY_NODE$|_NODE$/, "").replace(/_/g, " ")} statement; a check only reads`,
-      "a CTE that writes or exports (INSERT, UPDATE, DELETE or COPY inside WITH) is not a read; write one SQL expression");
   }
   for (const u of collect(node).uses) {
     if (u.kind === "relation") {
@@ -206,8 +207,13 @@ export async function vetCheck(serialize: (sql: string) => Promise<string>, asse
         }
       }
     }
-    if (u.kind === "scalar" && asciiLower(u.name) === "write_log") return bad("calls write_log(), which writes to DuckDB's log", "remove it");
-    if (u.kind === "scalar" && asciiLower(u.name) === "setval") return bad("calls setval(), which changes a sequence", "remove it");
+  }
+  // The gate's decision, last: what the loop above lets through must also be a read the gate allows.
+  try {
+    decide({ sql: probe, parsed: text, options: { profile: "memory" }, paths: PathPolicy.none() });
+  } catch (e) {
+    if (e instanceof CroftError) return bad(e.message, e.problem.hint);
+    throw e;
   }
   const self = asciiLower(asset);
   return { ok: true, reads: relationNames(node).filter((t) => t !== self) };

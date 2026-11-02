@@ -219,7 +219,7 @@ describe("the croft serve banner", () => {
     url: "http://127.0.0.1:7447", host: "127.0.0.1", port: 7447, pid: 4121, loopback: true, database: "warehouse.duckdb",
     startedAt: "2026-09-24T10:00:00-07:00", version: "0.1.0",
     token: { source: "generated", from: null, file: ".croft/serve.json" },
-    scheduling: { state: "on", via: "serve", pausedUntil: null, tickEveryMs: 60_000 }, stopped: null,
+    scheduling: { state: "on", via: "serve", pausedUntil: null, tickEveryMs: 60_000 }, keys: { count: 0, sharedTables: [] }, stopped: null,
   };
 
   test("in server mode it says what it answers from and that it never opens the warehouse", () => {

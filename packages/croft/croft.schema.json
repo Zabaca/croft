@@ -163,6 +163,15 @@
             "pattern": "^https?://(\\[[0-9A-Fa-f:.]+\\]|[^/?#\\s:\\[\\]]+)(:[0-9]{1,5})?$"
           },
           "default": []
+        },
+        "sharedTables": {
+          "description": "the tables a key may read, by asset name, e.g. [\"orders\", \"customers\"]; none by default, and with none every key's query is refused (croft docs keys)",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "default": []
         }
       }
     },

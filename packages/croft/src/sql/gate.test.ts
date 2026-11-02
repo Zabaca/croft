@@ -6,7 +6,8 @@ import { CroftError } from "../core/errors.ts";
 import { connect, instanceConfig, openMemory } from "../db/connect.ts";
 import { closeAllWarehouses, openWarehouse } from "../db/warehouse.ts";
 import { cleanup, makeProject, seed, spawnHolder, type TempProject } from "../read/testkit.ts";
-import { assertOneSelect, findFunctions, type GateOptions, lineColumn, TABLE_FUNCTIONS } from "./gate.ts";
+import { assertOneSelect } from "./gate.ts";
+import { findFunctions, type GateOptions, lineColumn, TABLE_FUNCTIONS } from "./gate-core.ts";
 
 let db: Awaited<ReturnType<typeof openMemory>>;
 let conn: DuckDBConnection;

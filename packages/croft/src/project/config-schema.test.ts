@@ -67,7 +67,7 @@ const VALID: unknown[] = [
   { ...tz, database: "~/.local/share/croft/sales-1a2b3c4d/warehouse.duckdb" },
   { ...tz, readCopy: true, concurrency: 1, notify: { desktop: false, webhook: null } },
   { ...tz, concurrency: 64, notify: { webhook: "https://hooks.slack.com/services/T0/B0/x" } },
-  { ...tz, serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 100, maxConcurrent: 64, maxBytes: 1024, maxRows: 1, allowOrigins: ["http://localhost:3000", "https://app.example.com"] } },
+  { ...tz, serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 100, maxConcurrent: 64, maxBytes: 1024, maxRows: 1, allowOrigins: ["http://localhost:3000", "https://app.example.com"], sharedTables: ["orders", "customers_2"] } },
   { ...tz, serve: { port: 1, host: "0.0.0.0", queryTimeoutMs: 3_600_000, maxConcurrent: 1, maxBytes: Number.MAX_SAFE_INTEGER, maxRows: 10_000_000, allowOrigins: [] } },
   { ...tz, serve: { port: 65535 }, notify: {}, stateDir: null },
   { ...tz, secretsFrom: { command: ["sops", "-d", "--output-type", "dotenv", "secrets.enc.yaml"] } },
@@ -104,6 +104,8 @@ const INVALID: unknown[] = [
   { ...tz, serve: { allowOrigins: "*" } }, { ...tz, serve: { allowOrigins: ["*"] } },
   { ...tz, serve: { allowOrigins: ["http://localhost:3000/app"] } }, { ...tz, serve: { allowOrigins: [3000] } },
   { ...tz, serve: { allowOrigins: ["localhost:3000"] } },
+  { ...tz, serve: { sharedTables: "orders" } }, { ...tz, serve: { sharedTables: [3] } }, { ...tz, serve: { sharedTables: ["Orders"] } },
+  { ...tz, serve: { sharedTables: ["_croft"] } }, { ...tz, serve: { sharedTables: ["main.orders"] } }, { ...tz, serve: { sharedTables: [""] } },
   { ...tz, serve: { tls: true } },
   { ...tz, stateDir: "" }, { ...tz, stateDir: 5 },
   { ...tz, secretsFrom: "sops -d secrets.yaml" }, { ...tz, secretsFrom: {} }, { ...tz, secretsFrom: { command: [] } },
@@ -125,6 +127,7 @@ const SCHEMA_ACCEPTS_VALIDATOR_REJECTS: unknown[] = [
   { timezone: "america/los_angeles" },                                // not the canonical spelling
   { ...tz, serve: { allowOrigins: ["http://LOCALHOST:3000"] } },      // origins must be written normalized
   { ...tz, serve: { allowOrigins: ["http://localhost:80"] } },
+  { ...tz, serve: { sharedTables: ["orders", "orders"] } },            // a table listed twice
   { ...tz, secretsFrom: { command: ["sops -d secrets.yaml"] } },        // a command line in one string: no shell splits it
 ];
 

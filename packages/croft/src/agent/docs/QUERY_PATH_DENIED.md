@@ -4,7 +4,9 @@ croft runs every SQL it is given in a sandbox. Where SQL may read files:
 - croft query: only files under the project's files/ folder, named by a quoted path (read_csv('files/orders.csv')).
   A path built at run time (a column, a concatenation, a parameter) is refused, because croft checks each path
   before DuckDB opens it.
-- croft serve and @zabaca/croft/read: tables only; no file at all.
+- croft serve and @zabaca/croft/read: tables only; no file at all. A key (croft docs keys) reads the project's shared
+  tables only (serve.sharedTables in croft.json): any other table is refused in the words for a table that does not
+  exist, whether or not it does.
 - ctx.query in asset code: the tables it may read, never a file. SQL assets and checks never read files either
   (SQL_READS_FILES, CHECK_INVALID).
 The warehouse file, the preview database, .croft/ (runs.sqlite, serve.json) and .env are never readable from SQL.

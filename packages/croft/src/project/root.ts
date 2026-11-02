@@ -16,6 +16,8 @@ export const CONFIG_FILE = "croft.json";
 export interface NotifyConfig { desktop: boolean; webhook: string | null }
 export interface ServeConfig {
   port: number; host: string; queryTimeoutMs: number; maxConcurrent: number; maxBytes: number; maxRows: number; allowOrigins: string[];
+  /** The tables a key may read (D122), by name; none by default, and with none every key query is refused. */
+  sharedTables: string[];
 }
 /** Server mode (option 06, D119): croft serve answers from a readers' process on the read copy and never opens the live
  *  file. `enabled` turns the read copy on too. `acceptFullCopyCost` accepts a plain copy of a warehouse over 1 GB at every
@@ -51,7 +53,7 @@ export const DEFAULTS = {
   notify: { desktop: true, webhook: null },
   concurrency: 4,
   http: { budgets: {} },
-  serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 30_000, maxConcurrent: 4, maxBytes: 64 * 1024 * 1024, maxRows: 100_000, allowOrigins: [] },
+  serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 30_000, maxConcurrent: 4, maxBytes: 64 * 1024 * 1024, maxRows: 100_000, allowOrigins: [], sharedTables: [] },
 } as const;
 
 /** One line per key, for `croft docs config`. */
@@ -72,16 +74,19 @@ export const CONFIG_KEYS: { key: string; type: string; default: string; descript
   { key: "serve.maxBytes", type: "integer", default: String(DEFAULTS.serve.maxBytes), description: "largest result in bytes; bigger results fail with QUERY_TOO_MANY_ROWS" },
   { key: "serve.maxRows", type: "integer", default: String(DEFAULTS.serve.maxRows), description: "most rows one answer carries, whatever limit asks; more fail with QUERY_TOO_MANY_ROWS" },
   { key: "serve.allowOrigins", type: "string[]", default: "[]", description: "browser origins allowed to call the read server, e.g. \"http://localhost:3000\"" },
+  { key: "serve.sharedTables", type: "string[]", default: "[]", description: "the tables a key may read, by asset name, e.g. [\"orders\", \"customers\"]; none by default, and with none every key's query is refused (croft docs keys)" },
   { key: "stateDir", type: "string", default: "\".croft\"", description: "state folder; croft sets it when it moves state off a synced folder" },
   { key: "secretsFrom.command", type: "string[]", default: "null", description: "a command, run from the project folder without a shell, that prints the secrets the shell and .env lack as KEY=value lines, e.g. [\"sops\", \"-d\", \"--output-type\", \"dotenv\", \"secrets.enc.yaml\"] (croft docs secrets)" },
 ];
 
 const TOP_KEYS = ["$schema", "database", "timezone", "readCopy", "serverMode", "notify", "concurrency", "http", "serve", "stateDir", "secretsFrom"];
 const SERVER_MODE_KEYS = ["enabled", "acceptFullCopyCost"];
+/** A shared table is an asset's table: the asset naming rule (project/discover.ts NAME_PATTERN). */
+const SHARED_TABLE = /^[a-z][a-z0-9_]*$/;
 const NOTIFY_KEYS = ["desktop", "webhook"];
 const HTTP_KEYS = ["budgets"];
 const BUDGET_KEYS = ["perMinute", "perHour", "perDay"];
-const SERVE_KEYS = ["port", "host", "queryTimeoutMs", "maxConcurrent", "maxBytes", "maxRows", "allowOrigins"];
+const SERVE_KEYS = ["port", "host", "queryTimeoutMs", "maxConcurrent", "maxBytes", "maxRows", "allowOrigins", "sharedTables"];
 const SECRETS_FROM_KEYS = ["command"];
 
 export interface ConfigIssue {
@@ -272,7 +277,23 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined, p
     maxBytes: int(s, "serve.maxBytes", "maxBytes", DEFAULTS.serve.maxBytes, 1024, Number.MAX_SAFE_INTEGER),
     maxRows: int(s, "serve.maxRows", "maxRows", DEFAULTS.serve.maxRows, 1, 10_000_000),
     allowOrigins: [],
+    sharedTables: [],
   };
+  if (s.sharedTables !== undefined) {
+    if (!Array.isArray(s.sharedTables)) {
+      add("serve.sharedTables", `"serve.sharedTables" must be a list of table names like ["orders", "customers"]; found ${show(s.sharedTables)}`, "write it as a JSON array of asset names");
+    } else {
+      s.sharedTables.forEach((t: unknown, i: number) => {
+        const path = joinPath("serve.sharedTables", i);
+        if (typeof t !== "string" || !SHARED_TABLE.test(t)) {
+          const fixed = typeof t === "string" ? t.trim().toLowerCase().replace(/[^a-z0-9_]/g, "_") : "";
+          add(path, `"${path}" must be the name of a table croft builds (lower case letters, digits and underscores, starting with a letter); found ${show(t)}`,
+            SHARED_TABLE.test(fixed) ? `use "${fixed}", or list the asset's name as it is in assets/` : "list the assets whose tables keys may read, by asset name");
+        } else if (serve.sharedTables.includes(t)) add(path, `"${path}" lists ${show(t)} twice`, "list each table once");
+        else serve.sharedTables.push(t);
+      });
+    }
+  }
   if (s.allowOrigins !== undefined) {
     if (!Array.isArray(s.allowOrigins)) {
       add("serve.allowOrigins", `"serve.allowOrigins" must be a list of origins like ["http://localhost:3000"]; found ${show(s.allowOrigins)}`, "write it as a JSON array of strings");

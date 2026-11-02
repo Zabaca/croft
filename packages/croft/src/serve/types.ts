@@ -61,8 +61,17 @@ export interface ServeQuery {
   sql: string;
   params: unknown[];
   limit: number;
+  /** A key's query (D122): who asks, and the only tables the query may name. Absent for the app token, which reads every
+   *  table. An empty `tables` shares nothing, and the engine refuses the query (SERVE_NO_SHARED_TABLES). */
+  scope?: KeyScope;
   /** The request went away: stop waiting or interrupt. */
   signal?: AbortSignal;
+}
+
+/** What a key may read: its name, for the log, and the tables the project shares with keys. */
+export interface KeyScope {
+  key: string;
+  tables: readonly string[];
 }
 
 /** The `data` of the query envelope the read client expects (read/server.ts rowsFrom). */
@@ -77,6 +86,9 @@ export interface ServeQueryData {
   /** The read copy's mtime (the checkpoint it was taken at), in the project offset: with stale, the copy that answered
    *  in place of the live file; in server mode (D119) on every answer. */
   asOf?: string;
+  /** The project's tables the query read, ASCII-lowercased. For the log line of a key query: server.ts takes it out before
+   *  the envelope is made, so it never reaches a client. */
+  tables?: string[];
 }
 
 export interface ServeEngineStatus {

@@ -176,13 +176,13 @@ const schedule = lazyCommand({
 
 const serve = lazyCommand({
   name: "serve",
-  summary: "a read-only HTTP query server for apps that steps aside for every write, with the scheduler built in",
-  usage: "croft serve [--host 127.0.0.1] [--port 7447]",
+  summary: "a read-only HTTP query server for apps that steps aside for every write, with the scheduler built in; serve key manages a key per person",
+  usage: "croft serve [--host 127.0.0.1] [--port 7447] | croft serve key add <name> | croft serve key list | croft serve key remove <name>",
   options: {
     host: { type: "string", value: "<host>", description: "the address to listen on (default 127.0.0.1; anything else needs an HTTPS proxy in front)" },
     port: { type: "string", value: "<port>", description: "the port to listen on (default 7447)" },
   },
-  maxPositionals: 0,
+  maxPositionals: 3,
 }, async () => (await import("./serve.ts")).serve);
 
 const tick = lazyCommand({

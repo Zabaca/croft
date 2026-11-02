@@ -10,7 +10,8 @@
 // under a TABLE_FUNCTION node's `function` key; a constant is `literal: {kind, text}` (STRING, INTEGER,
 // NUMERIC, BOOLEAN, NULL_LITERAL), the text as written; a CTE's name is a key of its query node's cte_map.map; a
 // DuckDB position is query_location, a UTF-8 byte offset; `SHOW t` is a SHOW_REF with show_type SHOW and no
-// query, SHOW TABLES and the like are SHOW_SPECIAL; `current_date` and the other clock keywords are COLUMN_REF
+// query, SHOW TABLES and the like are SHOW_SPECIAL, `SHOW TABLES FROM s` is a SHOW_REF with show_type SHOW_FROM, no table
+// name and the schema in schema_name (collect() reports it as the show use `__show_from`); `current_date` and the other clock keywords are COLUMN_REF
 // nodes, not functions.
 //
 // CTE scopes, as DuckDB 2.0.0 binds them (ast.test.ts checks every case against the unoptimized plan): the CTEs
@@ -156,6 +157,8 @@ export function collect(ast: unknown): { uses: Use[]; ctes: Set<string> } {
         uses.push({ kind: "relation", catalog, schema, name: rec.table_name, at: location(rec), cte: hidden(catalog, schema, rec.table_name) });
       } else uses.push({ kind: "show", name: rec.table_name.replace(/^"(.*)"$/, "$1") });
     }
+    // `SHOW TABLES FROM _croft` (show_type SHOW_FROM, no table name): lists another schema's or database's tables.
+    if (rec.type === "SHOW_REF" && rec.show_type === "SHOW_FROM") uses.push({ kind: "show", name: "__show_from" });
     const map = (rec.cte_map as { map?: unknown } | undefined)?.map;
     const listed: string[] = [];
     if (Array.isArray(map)) for (const e of map) if (typeof e?.key === "string") listed.push(asciiLower(e.key));

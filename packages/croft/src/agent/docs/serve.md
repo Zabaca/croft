@@ -56,6 +56,10 @@ Every request needs Authorization: Bearer <token>.
   GET  /status  the server and its database connection
   GET  /health  {ok, pid, version, database, writeIntent, queriesToday} (server mode adds serverMode: {state, asOf})
 
+The bearer is the app token, which reads every table, or, on POST /query only, a person's key, which reads the
+tables named in serve.sharedTables and nothing else (croft docs keys). croft serve key add|list|remove <name> manage
+the keys; adding one is on the skill's "Ask the user first" list.
+
 ## Errors
 
 - SERVE_UNAUTHORIZED: a missing or wrong token (401), or a Host or Origin the server refuses (403). Never

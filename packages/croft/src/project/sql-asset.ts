@@ -24,7 +24,8 @@ import { dollarTag, lexSql, PIVOT_WORDS, type PivotWithoutValues, pivotWithoutVa
 import {
   type ArrowLambda, arrowLambdas, asciiLower, type AstNode, byteOffset, catalogPrefixes, charIndex, collect, finiteJson, literal, looksLikePath, positional, relationNames, stringOf, volatileUses, walk,
 } from "../sql/ast.ts";
-import { assertOneSelect, lineColumn, type SelectAst, TABLE_FUNCTIONS } from "../sql/gate.ts";
+import { assertOneSelect } from "../sql/gate.ts";
+import { lineColumn, type SelectAst, TABLE_FUNCTIONS } from "../sql/gate-core.ts";
 import { type DiscoveredAsset, suggestName } from "./discover.ts";
 import { didYouMean } from "./suggest.ts";
 

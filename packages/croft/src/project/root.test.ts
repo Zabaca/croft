@@ -71,7 +71,7 @@ describe("loadProject", () => {
     expect(p.config).toEqual({
       database: "warehouse.duckdb", timezone: "Asia/Tokyo", readCopy: false, serverMode: { enabled: false, acceptFullCopyCost: false },
       notify: { desktop: true, webhook: null }, concurrency: 4, http: { budgets: {} },
-      serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 30000, maxConcurrent: 4, maxBytes: 67108864, maxRows: 100000, allowOrigins: [] },
+      serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 30000, maxConcurrent: 4, maxBytes: 67108864, maxRows: 100000, allowOrigins: [], sharedTables: [] },
       stateDir: null, secretsFrom: null,
     });
     expect(p.paths).toEqual({
@@ -319,6 +319,20 @@ describe("croft.json validation messages", () => {
       '"serve.allowOrigins[1]" must be an origin like "http://localhost:3000"; found "*"',
     ]);
     expect(origins[0]!.fix).toMatchObject({ replace: { to: '"http://localhost:3000"' } });
+  });
+
+  test("serve.sharedTables: asset names, each once; none by default (D122)", () => {
+    const none = parseConfig(JSON.stringify(MIN));
+    expect(none.ok && none.config.serve.sharedTables).toEqual([]);
+    const some = parseConfig(JSON.stringify({ ...MIN, serve: { sharedTables: ["orders", "customers_2"] } }));
+    expect(some.ok && some.config.serve.sharedTables).toEqual(["orders", "customers_2"]);
+    const at = (v: unknown) => issues(JSON.stringify({ ...MIN, serve: { sharedTables: v } }));
+    expect(at("orders").map((i) => i.message)).toEqual(['"serve.sharedTables" must be a list of table names like ["orders", "customers"]; found "orders"']);
+    const bad = at(["Orders", 3, "_croft", "orders", "orders"]);
+    expect(bad.map((i) => i.path)).toEqual(["serve.sharedTables[0]", "serve.sharedTables[1]", "serve.sharedTables[2]", "serve.sharedTables[4]"]);
+    expect(bad[0]!.message).toContain("must be the name of a table croft builds");
+    expect(bad[0]!.hint).toContain('use "orders"');
+    expect(bad[3]!.message).toContain('lists "orders" twice');
   });
 
   test("secretsFrom: a command as a list of strings, never a shell line (D108)", () => {

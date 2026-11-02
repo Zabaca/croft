@@ -54,7 +54,7 @@ import { noteEngineChange, noteTimeZoneChange } from "../run/staleness.ts";
 import { parseSchedule, type Schedule } from "../schedule/types.ts";
 import { finiteJson } from "../sql/ast.ts";
 import { type BindResult, ShadowCatalog } from "../sql/bind.ts";
-import type { SelectAst } from "../sql/gate.ts";
+import type { SelectAst } from "../sql/gate-core.ts";
 import { type DiscoveredAsset, discoverAssets } from "./discover.ts";
 import { ProjectEnv } from "./env.ts";
 import { buildGraph, type Graph } from "./graph.ts";

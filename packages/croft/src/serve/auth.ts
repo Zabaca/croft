@@ -82,10 +82,45 @@ export function checkToken(expected: string, authorization: string | null): Refu
       message: given === null
         ? "croft serve requires a bearer token (Authorization: Bearer <token>), and this request has none"
         : "croft serve rejected the bearer token of this request",
-      hint: "send Authorization: Bearer <token>, with the token in the project's .croft/serve.json or the server's CROFT_SERVE_TOKEN",
+      hint: "send Authorization: Bearer <token>, with the token in the project's .croft/serve.json or the server's CROFT_SERVE_TOKEN, or a key made with croft serve key add",
       fix: { kind: "manual", description: "give the client the server's token (query() reads it from { token } or CROFT_SERVE_TOKEN)" },
       retryable: false,
       details: { status: 401, reason: given === null ? "missing_token" : "wrong_token" },
+    }),
+  };
+}
+
+/** Who a request is: the app token (reads every table, and /status and /health), or a person's key by name (reads the shared
+ *  tables over POST /query, and nothing else). */
+export type Principal = { kind: "token" } | { kind: "key"; name: string };
+
+/** What the server asks to recognise a key: serve/keys.ts KeyStore. Asked on every request. */
+export interface KeyVerifier {
+  verify(given: string | null): string | null;
+}
+
+/**
+ * The principal of a request, or its 401. The app token is compared first, in constant time; anything else is looked up as
+ * a key, on every request, so a key removed since the last one is refused at once (D122).
+ */
+export function authenticate(expected: string, keys: KeyVerifier | null, authorization: string | null): { principal: Principal } | Refusal {
+  const given = bearerToken(authorization);
+  if (tokenMatches(expected, given)) return { principal: { kind: "token" } };
+  const name = keys?.verify(given) ?? null;
+  if (name !== null) return { principal: { kind: "key", name } };
+  return checkToken(expected, authorization)!; // not the token, so this is its 401
+}
+
+/** The 403 for a key on an endpoint other than /query: keys read shared tables and nothing else. */
+export function keyScopeRefusal(path: string): Refusal {
+  return {
+    status: 403,
+    problem: problem("SERVE_UNAUTHORIZED", {
+      message: `a key can query the shared tables (POST /query) and nothing else; ${path.slice(0, 100)} needs the app token`,
+      hint: "use the app token for /status and /health; keys are for people reading the shared tables",
+      fix: { kind: "manual", description: "send this request with the app token, not a key" },
+      retryable: false,
+      details: { status: 403, reason: "key_scope" },
     }),
   };
 }

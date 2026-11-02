@@ -49,12 +49,15 @@ export interface WorkerQuery {
   limit: number;
   maxRows: number;
   maxBytes: number;
+  /** A key's query: the tables it may name (D122). Absent for the app token. */
+  shared?: string[];
 }
 
 export interface WorkerAnswer {
   columns: ColumnInfo[];
   rowsJson: string;
   rowCount: number;
+  tables: string[];
 }
 
 export interface SpawnOptions {
@@ -146,7 +149,7 @@ export class QueryWorker {
 
   /** Open the file read-only with the serve sandbox and check its format. Throws a CroftError (DB_NEWER_FORMAT,
    *  CONFIG_INVALID, ...), WorkerConflict (another process holds the file), WorkerGone, or an Error. */
-  async open(o: { path: string; spec: SandboxSpec; protect: string[]; readers?: { extensionDir: string; secretDir: string } }): Promise<void> {
+  async open(o: { path: string; spec: SandboxSpec; protect: string[]; readers?: { extensionDir: string; secretDir: string; shared: string[] } }): Promise<void> {
     await this.ready;
     if (this.opening) throw new Error("the query worker is already opening a database");
     const p = new Promise<void>((resolve, reject) => (this.opening = { resolve, reject }));
@@ -238,7 +241,7 @@ export class QueryWorker {
         const w = this.queries.get(m.id);
         if (!w) return;
         this.queries.delete(m.id);
-        if (m.op === "answer") w.resolve({ columns: m.columns, rowsJson: m.rowsJson, rowCount: m.rowCount });
+        if (m.op === "answer") w.resolve({ columns: m.columns, rowsJson: m.rowsJson, rowCount: m.rowCount, tables: m.tables });
         else w.reject(fromWire(m.error));
         return;
       }

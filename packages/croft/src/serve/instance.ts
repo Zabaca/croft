@@ -52,7 +52,7 @@ import type { IntentEntry } from "../db/intent.ts";
 import { backoffMs } from "../db/warehouse.ts";
 import { loadProject, type Project } from "../project/root.ts";
 import { mapQueryError } from "../read/select.ts";
-import { restartedError, RETRY_AFTER_MS, secs, stopError } from "./errors.ts";
+import { noSharedTables, restartedError, RETRY_AFTER_MS, secs, stopError } from "./errors.ts";
 import { drain, IntentWatch } from "./handoff.ts";
 import { Admission, type Flight, type StopReason } from "./queue.ts";
 import { QueryWorker, WorkerConflict, WorkerGone, WorkerStopped } from "./query-worker.ts";
@@ -379,6 +379,7 @@ class Engine implements ServeEngine {
         hint: "send {sql, params?, limit?} with limit a whole number, such as 10000",
       });
     }
+    if (q.scope && q.scope.tables.length === 0) throw noSharedTables();
     if (this.stopped) throw this.stopError("stop");
     // A file that cannot be opened fails at once, unless a writer is about to change that (the first run).
     if (this.blocked && this.state === "reopening" && !this.intent) throw this.blocked;
@@ -474,9 +475,11 @@ class Engine implements ServeEngine {
     const id = ++this.seq;
     flight.attach({ interrupt: () => worker.interrupt(id), abandon: () => void worker.kill() });
     flight.checkpoint();
-    const a = await worker.query(id, { sql: q.sql, params: q.params, limit: q.limit, maxRows: this.maxRows, maxBytes: this.maxBytes });
+    const a = await worker.query(id, {
+      sql: q.sql, params: q.params, limit: q.limit, maxRows: this.maxRows, maxBytes: this.maxBytes, ...(q.scope ? { shared: [...q.scope.tables] } : {}),
+    });
     const rows = JSON.parse(a.rowsJson) as ServeQueryData["rows"];
-    return { columns: a.columns, rows, rowCount: a.rowCount, tookMs: Math.round(performance.now() - arrived) };
+    return { columns: a.columns, rows, rowCount: a.rowCount, tookMs: Math.round(performance.now() - arrived), ...(q.scope ? { tables: a.tables } : {}) };
   }
 
   /** What a failed query reports: why it was stopped, if it was; the worker going away under it; or its own error. */

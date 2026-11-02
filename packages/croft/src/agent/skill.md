@@ -39,6 +39,7 @@ croft status                # failed, stale, held, never run, edited since its l
 - Columns named like SQL keywords must be quoted: `"order"`.
 - Apps read with `import { query } from "@zabaca/croft/read"`; `query<"x">(sql)` types the rows as table x's (croft docs serve). It talks to `croft serve` when one is running (found via CROFT_URL or .croft/serve.json), otherwise opens the file briefly. Never open the .duckdb files directly.
 - `croft serve` runs until stopped: ask the user to start it in their own terminal instead of running it in your shell.
+- A person who needs to read tables gets a key of their own (croft docs keys): the user names the tables to share in `serve.sharedTables`, then `croft serve key add <name>` prints the key once (`data.key` with `--json`; hand it to the user, never paste it elsewhere), `key list` shows who has one, `key remove <name>` takes access away at once.
 - For a GUI (DuckDB UI, DBeaver), set "readCopy": true in croft.json and open warehouse.read.duckdb, never warehouse.duckdb. With `"serverMode"` on (croft docs server-mode) the copy is read-only on disk: open it read-only.
 
 ## APIs
@@ -59,6 +60,7 @@ croft status                # failed, stale, held, never run, edited since its l
 - Raising `confirmAbove` of a transform that makes requests (more paid calls would run without asking).
 - Renaming or deleting files in assets/ (use `croft rename`); `croft schedule on|off|pause`.
 - `croft serve` (it runs scheduled work unattended, and a `--host` other than 127.0.0.1 exposes data beyond this machine).
+- `croft serve key add <name>` and naming tables in `serve.sharedTables`: they give a person access to data. Show which tables the key will read. `croft serve key remove` and `key list` need no asking.
 - Turning `"serverMode"` on or off in croft.json (apps then read the read copy, as of the last run), and `serverMode.acceptFullCopyCost` (disk and write time at every run).
 - Deleting .croft/ or warehouse*.duckdb, or `git clean -X` (the trash and backups live in .croft/).
 - Weakening or deleting a failing check.

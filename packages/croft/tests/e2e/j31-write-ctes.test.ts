@@ -2,8 +2,8 @@
 // DuckDB 2.0 parses `WITH x AS (DELETE … RETURNING *) SELECT …` and `WITH x AS (COPY … TO …) SELECT …` as one
 // SELECT, and runs them; COPY writes files even on a READ_ONLY connection. Each statement of the battery goes
 // through every way croft runs user SQL: croft query, an SQL asset (validate and run), a `-- check:` rule, a TS
-// transform's check, `croft delete --where`, croft serve over HTTP and ctx.query. Each is refused, no file appears,
-// the warehouse's WAL is as it was and the table keeps its rows.
+// transform's check, `croft delete --where`, croft serve over HTTP (with the app token and with a person's key, D122) and
+// ctx.query. Each is refused, no file appears, the warehouse's WAL is as it was and the table keeps its rows.
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -145,22 +145,30 @@ export default transform({ inputs: ["orders"], async *rows(ctx) { yield* await c
   }
 }, 180_000);
 
-test("croft serve refuses it over HTTP", async () => {
+test("croft serve refuses it over HTTP, with the app token and with a key", async () => {
   const t = targets();
+  // A key reads orders: the project shares it, and a person has a key made by the command (D122).
+  const config = JSON.parse(readFileSync(join(p.root, "croft.json"), "utf8")) as Record<string, unknown>;
+  p.write("croft.json", JSON.stringify({ ...config, serve: { sharedTables: ["orders"] } }, null, 2));
+  const made = await p.json(["serve", "key", "add", "alice"]);
+  expect(made.code, show(made)).toBe(0);
+  const key = (made.json as unknown as { data: { key: string } }).data.key;
   const server = p.start(["serve", "--port", "0"]);
   const file = join(p.stateDir, "serve.json");
   try {
     await until(() => existsSync(file) || server.proc.exitCode !== null, 30_000);
     if (!existsSync(file)) throw new Error(`croft serve did not start\n${show(await server.done)}`);
     const rec = JSON.parse(readFileSync(file, "utf8")) as { url: string; token: string };
-    for (const sql of battery((n) => t[n]!)) {
-      const before = fingerprint();
-      const res = await fetch(`${rec.url}/query`, {
-        method: "POST", headers: { Authorization: `Bearer ${rec.token}`, "Content-Type": "application/json" }, body: JSON.stringify({ sql }),
-      });
-      const body = (await res.json()) as Envelope;
-      expect([sql, res.status >= 400, refused(body)], JSON.stringify(body)).toEqual([sql, true, true]);
-      await unchanged(before, sql);
+    for (const bearer of [rec.token, key]) {
+      for (const sql of battery((n) => t[n]!)) {
+        const before = fingerprint();
+        const res = await fetch(`${rec.url}/query`, {
+          method: "POST", headers: { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json" }, body: JSON.stringify({ sql }),
+        });
+        const body = (await res.json()) as Envelope;
+        expect([sql, res.status >= 400, refused(body)], JSON.stringify(body)).toEqual([sql, true, true]);
+        await unchanged(before, sql);
+      }
     }
   } finally {
     server.proc.kill();

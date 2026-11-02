@@ -39,21 +39,22 @@ import { chmodSync, existsSync, rmSync } from "node:fs";
 import { CroftError } from "../core/errors.ts";
 import type { Problem, Sql } from "../core/types.ts";
 import { connect, lockConflict, newerStorage, openInstance, openMemoryInstance, type SandboxSpec } from "../db/connect.ts";
-import { READ_COPY_ALIAS } from "../db/modes.ts";
+import { READ_COPY_ALIAS, READERS_VIEWS_DB } from "../db/modes.ts";
 import { checkFormat } from "../db/state.ts";
 import { type ColumnInfo, renderRows, renderValueRows, resultShape, typeName } from "../db/values.ts";
 import { mapQueryError, toDuck, wireSafe } from "../read/select.ts";
 import { tooManyRows } from "../read/wire.ts";
-import { assertOneSelect } from "../sql/gate.ts";
+import type { CatalogSnapshot } from "../sql/gate-core.ts";
+import { gateSelect, loadCatalog } from "../sql/gate.ts";
 
 /** Messages croft serve sends. */
 export type ToWorker =
   /** `path` is the warehouse, or with `readers` the read copy (server mode: the readers' process, an in-memory
    *  instance with the copy attached read-only; the folders are the extension files' and the secret folder's). */
-  | { op: "open"; path: string; spec: SandboxSpec; protect: string[]; readers?: { extensionDir: string; secretDir: string } }
+  | { op: "open"; path: string; spec: SandboxSpec; protect: string[]; readers?: { extensionDir: string; secretDir: string; shared: string[] } }
   /** Server mode: the copy at `path` was replaced; detach the old file and attach the new one. */
   | { op: "swap" }
-  | { op: "query"; id: number; sql: string; params: unknown[]; limit: number; maxRows: number; maxBytes: number }
+  | { op: "query"; id: number; sql: string; params: unknown[]; limit: number; maxRows: number; maxBytes: number; shared?: string[] }
   /** Interrupt query `id` (repeated every 20 ms while it runs); ignored once it has settled. */
   | { op: "interrupt"; id: number }
   /** Disconnect every connection: the file is about to be released (the engine then kills this process). */
@@ -77,7 +78,7 @@ export type FromWorker =
   | { op: "swapped"; conns: number }
   /** The swap failed: this process is part set up and exits at once; croft serve starts another. */
   | { op: "swap_failed"; error: WireError }
-  | { op: "answer"; id: number; conns: number; peakRss: number; columns: ColumnInfo[]; rowsJson: string; rowCount: number }
+  | { op: "answer"; id: number; conns: number; peakRss: number; columns: ColumnInfo[]; rowsJson: string; rowCount: number; tables: string[] }
   | { op: "failed"; id: number; conns: number; peakRss: number; error: WireError }
   | { op: "disconnected"; conns: number };
 
@@ -93,6 +94,10 @@ export interface AnswerOptions {
   timezone: string;
   /** Paths the gate refuses besides the database's own files (the state folder). */
   protect: string[];
+  /** A key's query (D122): the tables the project shares, the only ones it may name. Undefined for the app token. */
+  shared?: readonly string[];
+  /** The catalog snapshot of the connection's file, when the caller has one (the gate fetches its own otherwise). */
+  catalog?: CatalogSnapshot;
   /** Throws when the query was stopped; called between DuckDB steps and chunks. */
   checkpoint(): void;
 }
@@ -102,6 +107,8 @@ export interface Answer {
   /** The rows as a JSON array, in the §4.3 json rendering (-0 as 0). */
   rowsJson: string;
   rowCount: number;
+  /** The project's tables the query read, ASCII-lowercased: what a key query's log line names. */
+  tables: string[];
 }
 
 /** Thrown by an AnswerOptions.checkpoint when the query was stopped. */
@@ -118,11 +125,14 @@ export class Stopped extends Error {
  */
 export async function answer(conn: DuckDBConnection, sql: string, o: AnswerOptions): Promise<Answer> {
   o.checkpoint();
-  await assertOneSelect(conn, sql, { profile: "serve", protect: o.protect });
+  const verdict = await gateSelect(conn, sql, {
+    profile: "serve", protect: o.protect, ...(o.shared !== undefined ? { shared: o.shared } : {}), ...(o.catalog ? { catalog: o.catalog } : {}),
+  });
   o.checkpoint();
   let stmt: DuckDBPreparedStatement;
   try {
-    stmt = await conn.prepare(sql);
+    // The gate's SQL: the query as written, except a key's SHOW TABLES, which lists the shared tables only.
+    stmt = await conn.prepare(verdict.sql);
   } catch (e) {
     throw mapQueryError(e, "serve");
   }
@@ -154,7 +164,7 @@ export async function answer(conn: DuckDBConnection, sql: string, o: AnswerOptio
       }
     }
     finished = true;
-    return { columns, rowsJson: `[${parts.join(",")}]`, rowCount: rows };
+    return { columns, rowsJson: `[${parts.join(",")}]`, rowCount: rows, tables: verdict.tables };
   } catch (e) {
     throw mapQueryError(e, "serve");
   } finally {
@@ -227,6 +237,14 @@ class Host {
   private swapping: Promise<void> | null = null;
   /** Swaps completed. A query that fails with another count than it started with straddled one. */
   private epoch = 0;
+  /** The tables the project shares with keys, and which of them have a view in the readers' in-memory database now. */
+  private shared: string[] = [];
+  private views: string[] = [];
+  /** Catalog snapshots, one per way of reading the file (the app token's `wh`, a key's views, the live file), each good for
+   *  the epoch it was loaded in: the file cannot change under a worker, and a swap moves the epoch on. */
+  private readonly catalogs = new Map<string, { epoch: number; snapshot: Promise<CatalogSnapshot> }>();
+  /** The database each readers' connection works in (`USE`). */
+  private readonly using = new WeakMap<DuckDBConnection, string>();
 
   constructor(private readonly send: (m: FromWorker) => void, private readonly exit: () => void = () => {}) {}
 
@@ -272,6 +290,8 @@ class Host {
         lockCopy(m.path);
         this.admin = await connect(this.instance, this.spec, this.key); // checks the files, loads, attaches, locks
         await this.refuseWal(this.admin);
+        this.shared = m.readers.shared;
+        await this.makeViews(this.admin);
       } else {
         this.instance = (await openInstance(m.path, "read_only")).instance;
         this.key = m.path;
@@ -320,6 +340,7 @@ class Host {
       await admin.run(`DETACH ${READ_COPY_ALIAS}`);
       await admin.run(`ATTACH ${sqlString(this.path)} AS ${READ_COPY_ALIAS} (READ_ONLY)`);
       await this.refuseWal(admin);
+      await this.makeViews(admin);
       // A copy a newer croft wrote is refused here as it is when the process opens (DB_NEWER_FORMAT): the process ends,
       // and the one that replaces it reports the same until the copy is one this croft reads.
       const conn = await this.take();
@@ -349,16 +370,20 @@ class Host {
     try {
       if (!this.instance || !this.spec) throw new Error("the query worker has no database open");
       let a: Answer | null = null;
+      // A key's query works in the views of the shared tables; the app token's on the copy itself.
+      const scoped = m.shared !== undefined;
+      const db = scoped ? READERS_VIEWS_DB : READ_COPY_ALIAS;
       for (let attempt = 0; a === null; attempt++) {
         const epoch = this.epoch;
         try {
           // A swap in progress is waited for: between its DETACH and its ATTACH there is no `wh` to read.
           if (this.swapping) await this.swapping;
-          conn = await this.take();
+          conn = await this.take(db);
           q.conn = conn;
           if (q.stopped) conn.interrupt();
           a = await answer(conn, m.sql, {
             params: m.params, limit: m.limit, maxRows: m.maxRows, maxBytes: m.maxBytes, timezone: this.spec.timezone, protect: this.protect,
+            ...(m.shared !== undefined ? { shared: m.shared } : {}), catalog: await this.catalogFor(conn, this.admin ? db : this.key, () => q.stopped),
             checkpoint: () => {
               if (q.stopped) throw new Stopped();
             },
@@ -382,21 +407,70 @@ class Host {
     this.send({ ...reply, conns: this.all.size, peakRss: peakRss() });
   }
 
-  private async take(): Promise<DuckDBConnection> {
+  /** A connection, working in `db` when this is the readers' process (the copy for the app token, the views for a key). */
+  private async take(db: string = READ_COPY_ALIAS): Promise<DuckDBConnection> {
     const reuse = this.idle.pop();
-    if (reuse) return reuse;
-    const conn = await connect(this.instance!, this.spec!, this.key);
-    if (this.admin) {
+    const conn = reuse ?? await connect(this.instance!, this.spec!, this.key);
+    if (this.admin && this.using.get(conn) !== db) {
       // The readers' process: the copy is the default database, as the live file's own catalog is in file mode.
       try {
-        await conn.run(`USE ${READ_COPY_ALIAS}`);
+        await conn.run(`USE ${db}`);
+        this.using.set(conn, db);
       } catch (e) {
         conn.disconnectSync();
+        this.all.delete(conn);
         throw e;
       }
     }
     this.all.add(conn);
     return conn;
+  }
+
+  /**
+   * The catalog snapshot for queries on `conn`, loaded once per epoch for `via` (the gate's input, sql/gate-core.ts). The
+   * query that loads it may be stopped (its deadline, its client going away) and take the load down with it, so a query
+   * that waited on a load that failed loads once with its own connection, unless it was stopped itself.
+   */
+  private async catalogFor(conn: DuckDBConnection, via: string, stopped: () => boolean): Promise<CatalogSnapshot> {
+    for (let attempt = 0; ; attempt++) {
+      const hit = this.catalogs.get(via);
+      let entry = hit && hit.epoch === this.epoch ? hit : null;
+      if (!entry) {
+        const made = { epoch: this.epoch, snapshot: loadCatalog(conn) };
+        made.snapshot.catch(() => {
+          if (this.catalogs.get(via) === made) this.catalogs.delete(via);
+        });
+        this.catalogs.set(via, made);
+        entry = made;
+      }
+      try {
+        return await entry.snapshot;
+      } catch (e) {
+        if (attempt > 0 || stopped()) throw e;
+      }
+    }
+  }
+
+  /**
+   * One view in the readers' in-memory database for each shared table the copy has: `CREATE VIEW memory.main.t AS SELECT *
+   * FROM wh.main.t`. A key's connection works in that database, so the names it can type are those views, and a hidden
+   * table is not a name there at all (the gate's catalog snapshot says the same, D123). Views from before a swap are
+   * dropped first, and made again from the new copy; a shared table the copy lacks has no view. DDL in the in-memory
+   * database is not refused by the lock [V: 2.0.0].
+   */
+  private async makeViews(admin: DuckDBConnection): Promise<void> {
+    for (const name of this.views) await admin.run(`DROP VIEW IF EXISTS ${READERS_VIEWS_DB}.main.${quote(name)}`);
+    this.views = [];
+    if (!this.shared.length) return;
+    const reader = await admin.runAndReadAll(
+      `SELECT table_name FROM duckdb_tables() WHERE database_name = ${sqlString(READ_COPY_ALIAS)} AND schema_name = 'main' AND NOT temporary`);
+    const have = new Map(reader.getRowsJS().map((r) => [String(r[0]).replace(/[A-Z]/g, (c) => c.toLowerCase()), String(r[0])] as const));
+    for (const name of this.shared) {
+      const actual = have.get(name);
+      if (actual === undefined) continue;
+      await admin.run(`CREATE VIEW ${READERS_VIEWS_DB}.main.${quote(name)} AS SELECT * FROM ${READ_COPY_ALIAS}.main.${quote(actual)}`);
+      this.views.push(name);
+    }
   }
 
   private give(conn: DuckDBConnection): void {
@@ -417,6 +491,7 @@ class Host {
 }
 
 const sqlString = (s: string) => `'${s.replaceAll("'", "''")}'`;
+const quote = (s: string) => `"${s.replaceAll('"', '""')}"`;
 
 /** The connection factory's key for the readers' process's one instance. */
 export const READERS_KEY = ":memory:readers";
