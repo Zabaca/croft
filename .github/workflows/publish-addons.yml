@@ -1,0 +1,134 @@
+# Builds, and only when told to, publishes the add-on packages that carry DuckDB's extension files to the projects that turn a
+# mode on (DESIGN.md D132, D133): @zabaca/croft-addon-server, @zabaca/croft-addon-lake and one @zabaca/croft-ext-<extension>-<platform>
+# package for each of quack, httpfs, ducklake and postgres on macOS and Linux (arm64 and x64), 18 in all. Each publish is James's word.
+#
+# THE ONLY TRIGGER is a manual run (workflow_dispatch). No tag, push or pull request starts it, so the `croft-v*` tag that releases
+# @zabaca/croft (publish-npm.yml) does not touch these packages, and a release of croft does not need a release of them. A run does
+# nothing outward-facing unless all of these hold:
+#   - `publish` is set to "publish" (the default only builds, packs and measures);
+#   - `confirm` is exactly "publish croft add-ons <version>", with <version> the one in the `version` input;
+#   - `version` is the version packages/croft/src/db/addons.ts says (ADDON_VERSION), so a run cannot publish a number the code does not name;
+#   - the run is on main;
+#   - the `npm-addons` environment's approval, if the repository has put required reviewers on it (a person approves in GitHub before
+#     the publish job starts). Nothing in this file creates that rule; add it on GitHub if a second hand on the button is wanted.
+#
+# Trusted publishing, as for @zabaca/croft: no npm token. Each package names this repository and this workflow file as its trusted
+# publisher on npmjs.com. npm cannot set that up for a package that does not exist yet, and a first publish cannot use it, so the first
+# version of each of the 18 packages has to be published once by hand from a machine logged in to npm (the tarballs this workflow's
+# build job uploads are the files to publish, checked and sized), and the trusted publisher added to each afterwards (`npm trust github`).
+# Until then this workflow's publish job fails at the first package, having published nothing.
+#
+# Two jobs, so what is published is byte for byte what was measured: `build` fetches DuckDB's files for all four platforms, checks each
+# against the checksum croft pins, writes and packs the packages, refuses any tarball over the size limit, and `publish` uploads those
+# tarballs. A package already on npm at this version is skipped, so a run that stopped part way can be run again.
+name: publish-addons
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The add-on version to build (must equal ADDON_VERSION in packages/croft/src/db/addons.ts)"
+        required: true
+        type: string
+      publish:
+        description: "build-only: build, pack and measure, publish nothing. publish: also publish to npm (needs the confirmation below)"
+        required: true
+        type: choice
+        options: ["build-only", "publish"]
+        default: "build-only"
+      confirm:
+        description: 'To publish, type exactly: publish croft add-ons <version>'
+        required: false
+        type: string
+concurrency: publish-addons
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - run: bun install --frozen-lockfile
+      - name: the version asked for is the version in the code
+        working-directory: packages/croft
+        env:
+          ASKED: ${{ inputs.version }}
+        run: |
+          IN_CODE=$(sed -n 's/^export const ADDON_VERSION = "\(.*\)";$/\1/p' src/db/addons.ts)
+          if [ -z "${IN_CODE}" ] || [ "${ASKED}" != "${IN_CODE}" ]; then
+            echo "::error::asked for ${ASKED}, but src/db/addons.ts says ADDON_VERSION is '${IN_CODE}'"
+            exit 1
+          fi
+      - name: the packaging tests
+        working-directory: packages/croft
+        run: bun test --timeout 60000 tests/addons.test.ts src/db/addons.test.ts
+      - name: DuckDB extension files for every platform, cached
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/croft-extensions-all
+          key: duckdb-extensions-all-${{ hashFiles('packages/croft/src/db/extension-pins.ts') }}
+      - name: fetch and verify the DuckDB extension files
+        working-directory: packages/croft
+        run: bun scripts/fetch-extensions.ts "${RUNNER_TEMP}/croft-extensions-all" --all-platforms --only quack,httpfs,ducklake,postgres
+      - name: write, pack and measure the packages
+        working-directory: packages/croft
+        run: bun scripts/build-addons.ts --source "${RUNNER_TEMP}/croft-extensions-all" --out "${RUNNER_TEMP}/addons" --pack --max-mb 50
+      - name: sizes, for the pull request and the release notes
+        run: |
+          {
+            echo "### Add-on packages, version ${{ inputs.version }}"
+            echo
+            echo "| package | packed | unpacked |"
+            echo "|---|---|---|"
+            jq -r '.packages[] | "| \(.name) | \((.packedBytes / 1000000 * 10 | round) / 10) MB | \((.unpackedBytes / 1000000 * 10 | round) / 10) MB |"' "${RUNNER_TEMP}/addons/summary.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: addons
+          path: |
+            ${{ runner.temp }}/addons/tarballs/*.tgz
+            ${{ runner.temp }}/addons/summary.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/main' && inputs.publish == 'publish' && inputs.confirm == format('publish croft add-ons {0}', inputs.version)
+    runs-on: ubuntu-24.04
+    environment: npm-addons
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: addons
+          path: ${{ runner.temp }}/addons
+      # No registry-url: it would write an .npmrc that expects a token.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: an npm that speaks OIDC
+        run: npm install -g npm@^11.5.1 && npm --version
+      # In the order the build chose: every extension package before the add-on that depends on it. Published as the tarballs were
+      # measured, never rebuilt here.
+      - name: publish, skipping what is already on npm
+        run: |
+          set -eu
+          cd "${RUNNER_TEMP}/addons"
+          for name in $(jq -r '.order[]' summary.json); do
+            version=$(jq -r --arg n "$name" '.packages[] | select(.name == $n) | .version' summary.json)
+            tarball=$(jq -r --arg n "$name" '.packages[] | select(.name == $n) | .tarball' summary.json | xargs -n1 basename)
+            if npm view "${name}@${version}" version >/dev/null 2>&1; then
+              echo "${name}@${version} is already on npm; skipping"
+              continue
+            fi
+            echo "publishing ${name}@${version}"
+            npm publish --access public --loglevel verbose "tarballs/${tarball}"
+          done
