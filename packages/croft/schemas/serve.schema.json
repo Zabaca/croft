@@ -185,6 +185,30 @@
               ],
               "additionalProperties": false
             },
+            "quack": {
+              "type": "object",
+              "properties": {
+                "uri": {
+                  "type": "string"
+                },
+                "loopback": {
+                  "type": "boolean"
+                },
+                "attach": {
+                  "type": "string"
+                },
+                "asOfView": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "uri",
+                "loopback",
+                "attach",
+                "asOfView"
+              ],
+              "additionalProperties": false
+            },
             "redactedValues": {
               "const": true
             }
@@ -235,6 +259,9 @@
             "file": {
               "type": "string"
             },
+            "quack": {
+              "$ref": "#/$defs/QuackConnect"
+            },
             "redactedValues": {
               "const": true
             }
@@ -276,6 +303,9 @@
             },
             "file": {
               "type": "string"
+            },
+            "quack": {
+              "$ref": "#/$defs/QuackConnect"
             },
             "redactedValues": {
               "const": true
@@ -576,6 +606,36 @@
         "message",
         "hint",
         "docs"
+      ],
+      "additionalProperties": false
+    },
+    "QuackConnect": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "loopback": {
+          "type": "boolean"
+        },
+        "attach": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "asOfView": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri",
+        "loopback",
+        "attach",
+        "asOfView"
       ],
       "additionalProperties": false
     },

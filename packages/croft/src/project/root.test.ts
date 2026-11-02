@@ -69,7 +69,7 @@ describe("loadProject", () => {
     expect(p.root).toBe(root);
     expect(p.timezone).toBe("Asia/Tokyo");
     expect(p.config).toEqual({
-      database: "warehouse.duckdb", timezone: "Asia/Tokyo", readCopy: false, serverMode: { enabled: false, acceptFullCopyCost: false },
+      database: "warehouse.duckdb", timezone: "Asia/Tokyo", readCopy: false, serverMode: { enabled: false, acceptFullCopyCost: false, quackHost: "127.0.0.1", quackPort: 9494 },
       notify: { desktop: true, webhook: null }, concurrency: 4, http: { budgets: {} },
       serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 30000, maxConcurrent: 4, maxBytes: 67108864, maxRows: 100000, allowOrigins: [], sharedTables: [] },
       stateDir: null, secretsFrom: null,
@@ -362,10 +362,10 @@ describe("croft.json validation messages", () => {
 
   test("serverMode is off by default; turning it on turns the read copy on, whatever readCopy says", () => {
     const off = parseConfig(JSON.stringify(MIN));
-    expect(off.ok && off.config.serverMode).toEqual({ enabled: false, acceptFullCopyCost: false });
+    expect(off.ok && off.config.serverMode).toEqual({ enabled: false, acceptFullCopyCost: false, quackHost: "127.0.0.1", quackPort: 9494 });
     expect(off.ok && off.config.readCopy).toBe(false);
     const on = parseConfig(JSON.stringify({ ...MIN, serverMode: { enabled: true } }));
-    expect(on.ok && on.config.serverMode).toEqual({ enabled: true, acceptFullCopyCost: false });
+    expect(on.ok && on.config.serverMode).toEqual({ enabled: true, acceptFullCopyCost: false, quackHost: "127.0.0.1", quackPort: 9494 });
     expect(on.ok && on.config.readCopy).toBe(true);
     const onAndOff = parseConfig(JSON.stringify({ ...MIN, readCopy: false, serverMode: { enabled: true, acceptFullCopyCost: true } }));
     expect(onAndOff.ok && onAndOff.config.readCopy).toBe(true);
@@ -381,7 +381,17 @@ describe("croft.json validation messages", () => {
     const [typo] = issues(JSON.stringify({ ...MIN, serverMode: { enable: true } }));
     expect(typo!.message).toBe('unknown key "serverMode.enable"; did you mean "serverMode.enabled"?');
     const [other] = issues(JSON.stringify({ ...MIN, serverMode: { tables: [] } }));
-    expect(other!.message).toBe('unknown key "serverMode.tables"; "serverMode" takes "enabled", "acceptFullCopyCost"');
+    expect(other!.message).toBe('unknown key "serverMode.tables"; "serverMode" takes "enabled", "acceptFullCopyCost", "quackHost", "quackPort"');
+  });
+
+  test("serverMode.quackHost and quackPort: where croft serve listens for DuckDB clients (D125); 0 picks a free port", () => {
+    const set = parseConfig(JSON.stringify({ ...MIN, serverMode: { enabled: true, quackHost: " 0.0.0.0 ", quackPort: 0 } }));
+    expect(set.ok && [set.config.serverMode.quackHost, set.config.serverMode.quackPort]).toEqual(["0.0.0.0", 0]);
+    expect(issues(JSON.stringify({ ...MIN, serverMode: { quackPort: 65536 } })).map((i) => i.message)).toEqual(['"serverMode.quackPort" must be a whole number from 0 to 65535; found 65536']);
+    expect(issues(JSON.stringify({ ...MIN, serverMode: { quackPort: "9494" } }))[0]!.fix).toMatchObject({ kind: "edit", replace: { from: '"9494"', to: "9494" } });
+    expect(issues(JSON.stringify({ ...MIN, serverMode: { quackHost: "" } })).map((i) => i.message)).toEqual(['"serverMode.quackHost" must be a non-empty string; found ""']);
+    const [bad] = issues(JSON.stringify({ ...MIN, serverMode: { quackHost: "http://host" } }));
+    expect(bad!.message).toBe('"serverMode.quackHost" must be an address to listen on; found "http://host"');
   });
 
   test("configProblems gives one CONFIG_INVALID per issue", () => {

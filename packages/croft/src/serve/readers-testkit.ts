@@ -50,7 +50,9 @@ const ORDERS = (n: number) => `CREATE TABLE orders AS SELECT range AS id, range 
 /** A server-mode project (a warehouse of `n` orders) whose read copy is that warehouse as of `asOf`: a whole file renamed
  *  into place, read-only (db/readcopy.ts does the same). */
 export async function project(o: { n?: number; asOf?: string; copy?: boolean; config?: Record<string, unknown>; also?: string[] } = {}): Promise<TempProject> {
-  const p = await makeProject({ config: { serverMode: { enabled: true }, ...o.config }, seed: [ORDERS(o.n ?? 10), ...(o.also ?? [])] });
+  // Quack listens on a free port (quackPort 0) so no two engines of a test file, or two files, fight for 9494 (D125).
+  const serverMode = { enabled: true, quackPort: 0, ...(o.config?.serverMode as Record<string, unknown> | undefined) };
+  const p = await makeProject({ config: { ...o.config, serverMode }, seed: [ORDERS(o.n ?? 10), ...(o.also ?? [])] });
   if (o.copy !== false) putCopy(p, aside(p, "template"), o.asOf ?? "2026-10-30T10:00:00Z");
   return p;
 }

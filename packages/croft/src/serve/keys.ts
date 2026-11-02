@@ -117,6 +117,8 @@ export class KeyStore {
   private keys: StoredKey[] = [];
   private seen: Identity | null = null;
   private seenOnce = false;
+  private polled = false;
+  private polledIdentity: Identity | null = null;
   private used: Used | null = null;
   private dirty = false;
   private lastFlush = 0;
@@ -200,6 +202,30 @@ export class KeyStore {
     }
     if (name !== null) this.touch(name);
     return name;
+  }
+
+  /**
+   * The keys as the readers' process holds them (name and digest, never a key), when the keys file changed since the last
+   * call; null when it did not. The first call returns the list. A Quack session outlives a request, so the process cannot
+   * look at the file on every request as verify() does: croft serve calls this on its poll (every 250 ms) and sends the
+   * list over when it comes back (D126). Like verify(), it fails closed: a file that is missing or cannot be read is no keys.
+   */
+  changes(): { name: string; hash: string }[] | null {
+    const id = identityOf(this.path);
+    if (this.polled && same(id, this.polledIdentity)) return null;
+    this.polled = true;
+    this.polledIdentity = id;
+    try {
+      return id ? this.read().map((k) => ({ name: k.name, hash: k.hash })) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Note that the key named `name` was used just now, for a use verify() did not see (a Quack session, D125). Never throws. */
+  noteUsed(name: string): void {
+    this.refresh();
+    this.touch(name);
   }
 
   /** Write the last-used times now. croft serve calls it as it stops. Never throws. */

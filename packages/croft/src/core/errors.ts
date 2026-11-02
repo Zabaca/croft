@@ -103,6 +103,7 @@ export const CODES = {
   EXTENSION_LOAD_FAILED: { category: "environment", severity: "error", exit: 2 },
   LAKE_ATTACH_FAILED: { category: "environment", severity: "error", exit: 2 },
   SERVER_MODE_COPY_COSTLY: { category: "environment", severity: "error", exit: 2 },
+  QUACK_LISTEN_FAILED: { category: "environment", severity: "error", exit: 2 },
   SERVE_KEYS_UNREADABLE: { category: "environment", severity: "error", exit: 2 },
   CLAUDE_FILES_OUTDATED: { category: "environment", severity: "warning", exit: 0 },
   SCHEDULER_STALE: { category: "environment", severity: "warning", exit: 0 },

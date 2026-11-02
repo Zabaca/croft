@@ -39,6 +39,8 @@ import { assertSafeFilesystem, type FsProbe, realProbe } from "../db/fs-kind.ts"
 import { loadProject, type Project } from "../project/root.ts";
 import { mapQueryError } from "../read/select.ts";
 import { COPY_CHECK_MS, CopyMaker, type CopyMakerOptions } from "./copy-maker.ts";
+import { KeyStore } from "./keys.ts";
+import type { QuackKey } from "./quack-access.ts";
 import { noSharedTables, restartedError, secs, stopError } from "./errors.ts";
 import { SERVE_DEFAULTS } from "./instance.ts";
 import { Admission, type Flight, type StopReason } from "./queue.ts";
@@ -58,6 +60,10 @@ export interface ReadersEngineHooks {
   swapped?(e: { asOf: string; ms: number; at: number }): void;
   /** The readers' process exited (killed for a deadline, crashed, or failed to start). */
   exited?(e: { pid: number; at: number }): void;
+  /** A Quack query ran past the deadline; the process is being killed (D127). */
+  quackOverdue?(e: { pid: number; ms: number; at: number }): void;
+  /** The keys the process accepts over Quack were sent again (the keys file changed, D126). */
+  keysSent?(e: { names: string[]; at: number }): void;
   /** A query ended (answered or not) on the process `workerPid`. */
   queryEnded?(e: { workerPid: number; workerPeakRss: number; at: number }): void;
 }
@@ -76,6 +82,9 @@ export interface ReadersEngineInternals {
   copyPollMs?: number;
   /** The folder of the pinned extension files; resolveExtensionDir() by default. */
   extensionDir?: string;
+  /** Where the readers' process listens for DuckDB clients (serverMode.quackHost and quackPort by default); false: nowhere,
+   *  for a test that wants no listener. */
+  quack?: false | { host: string; port: number };
   /** How the copy policy tries to clone (db/copy-policy.ts), for tests. */
   policy?: ProbeOptions & ThresholdOption & { clone?: CloneProbe };
   /** The readers' process command (tests); `bun --no-env-file worker.ts` by default. */
@@ -148,6 +157,13 @@ class ReadersEngine implements ServeEngine {
   private readonly argv: string[] | undefined;
   private readonly policy: (ProbeOptions & ThresholdOption & { clone?: CloneProbe }) | undefined;
   private readonly delayOf: (attempts: number) => number;
+  private readonly quackAt: { host: string; port: number } | null;
+  private readonly onQuack: ServeEngineOptions["onQuack"];
+  /** Reads the keys file for the Quack hooks (D126); the engine never writes it. */
+  private readonly keyStore: KeyStore;
+  /** The keys last read, which a process opens with and is sent again when the file changes. */
+  private keys: QuackKey[] = [];
+  private quackUri: string | null = null;
   /** Why queries are refused until something changes (no copy yet; a start that a retry will not fix); null otherwise. */
   private blocked: CroftError | null = null;
   private transition: Promise<void> | null = null;
@@ -179,6 +195,10 @@ class ReadersEngine implements ServeEngine {
     this.policy = o.policy;
     this.maker = o.copyMaker === false ? null : new CopyMaker({ project, ...(typeof o.copyMaker === "object" ? o.copyMaker : {}) });
     this.delayOf = o.restartDelayMs ?? restartDelayMs;
+    const sm = project.config.serverMode;
+    this.quackAt = o.quack === false ? null : (o.quack ?? { host: sm.quackHost, port: sm.quackPort });
+    this.onQuack = o.onQuack;
+    this.keyStore = new KeyStore(project.paths.stateDir);
     this.hooks = guarded(o.hooks ?? {});
     this.spec = { profile: "serve", timezone: project.timezone, root: project.root, stateDir: project.paths.stateDir, ...serveResources(), ...o.resources };
     this.protect = [project.paths.stateDir];
@@ -243,6 +263,7 @@ class ReadersEngine implements ServeEngine {
         makingCopy: this.maker?.running ?? false,
         restarts: this.restarts,
         copyCost: this.copyCost(),
+        quack: this.quackUri ? { uri: this.quackUri } : null,
       },
     };
   }
@@ -335,6 +356,7 @@ class ReadersEngine implements ServeEngine {
       this.lastCopyCheck = Date.now();
       this.maker.check();
     }
+    this.sendKeys();
     if (this.transition) return;
     const id = statIdentity(this.copyPath);
     if (!this.worker) {
@@ -350,6 +372,22 @@ class ReadersEngine implements ServeEngine {
     if (id && this.attached && !sameIdentity(id, this.attached)) this.begin(this.swap(id));
   }
 
+  /** Read the keys file when it changed since the last look: the new list, or null. A Quack session outlives a request, so the
+   *  readers' process checks every query against its list, and a removed key stops working within a poll (D126). */
+  private readKeys(): QuackKey[] | null {
+    const changed = this.keyStore.changes();
+    if (changed) this.keys = changed;
+    return changed;
+  }
+
+  /** Tell the readers' process the keys, when they changed. */
+  private sendKeys(): void {
+    const changed = this.readKeys();
+    if (!changed || !this.worker) return; // a process that opens next starts with the list
+    this.worker.setKeys(changed);
+    this.hooks.keysSent?.({ names: changed.map((k) => k.name), at: Date.now() });
+  }
+
   private begin(p: Promise<void>): void {
     this.transition = p
       .catch(() => {}) // every failure is recorded (blocked, or a restart) by the transition itself
@@ -363,12 +401,27 @@ class ReadersEngine implements ServeEngine {
    *  reports it; later ones are recorded by reopen). */
   private async open(id: CopyIdentity): Promise<void> {
     this.state = this.restarts > 0 || this.attempts > 0 ? "restarting" : "starting";
-    const worker = QueryWorker.spawn({ onExit: (w) => this.exited(w), ...(this.argv ? { argv: this.argv } : {}) });
+    const worker: QueryWorker = QueryWorker.spawn({
+      onExit: (w) => this.exited(w),
+      onQuack: (e) => this.onQuack?.(e),
+      onOverdue: (o) => {
+        // Quack has no server-side cancel [V: 2.0.0]: the process ends, every session on it with it, and clients attach again (D127).
+        this.hooks.quackOverdue?.({ pid: worker.pid, ms: o.ms, at: Date.now() });
+        void worker.kill();
+      },
+      ...(this.argv ? { argv: this.argv } : {}),
+    });
     this.opening = worker;
+    const asOf = formatInstant(Math.round(id.mtimeMs), this.project.timezone);
+    this.readKeys(); // the process opens with the keys as they are now
+    let opened: Awaited<ReturnType<QueryWorker["open"]>>;
     try {
-      await worker.open({
+      opened = await worker.open({
         path: this.copyPath, spec: this.spec, protect: this.protect,
-        readers: { extensionDir: this.extensionDir, secretDir: this.secretDir, shared: [...this.project.config.serve.sharedTables] },
+        readers: {
+          extensionDir: this.extensionDir, secretDir: this.secretDir, shared: [...this.project.config.serve.sharedTables], asOf,
+          ...(this.quackAt ? { quack: { ...this.quackAt, queryTimeoutMs: this.queryTimeoutMs, keys: this.keys } } : {}),
+        },
       });
     } catch (e) {
       this.opening = null;
@@ -382,7 +435,9 @@ class ReadersEngine implements ServeEngine {
     }
     this.worker = worker;
     this.attached = id;
-    this.asOf = formatInstant(Math.round(id.mtimeMs), this.project.timezone);
+    this.asOf = asOf;
+    this.quackUri = opened.quack?.uri ?? null;
+    worker.setKeys(this.keys); // a change while it opened was read but not sent
     this.state = "open";
     this.blocked = null;
     this.openedAt = Date.now();
@@ -415,7 +470,7 @@ class ReadersEngine implements ServeEngine {
     if (!worker) return;
     const started = performance.now();
     try {
-      await worker.swap();
+      await worker.swap(formatInstant(Math.round(id.mtimeMs), this.project.timezone));
     } catch {
       // The process could not take the copy in and is part set up, or it died: it goes now (its answer to the swap has
       // been read), and exited() starts another. Queries waiting for it are told to retry.
@@ -437,6 +492,7 @@ class ReadersEngine implements ServeEngine {
     this.worker = null;
     this.attached = null;
     this.asOf = null;
+    this.quackUri = null;
     this.restarts++;
     // A process we ended (a deadline) is replaced at once; one that died by itself soon after it opened counts against the backoff.
     this.attempts = !w.stoppedByUs && Date.now() - this.openedAt < QUICK_DEATH_MS ? this.attempts + 1 : 0;

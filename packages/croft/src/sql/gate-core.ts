@@ -115,6 +115,9 @@ const SCALAR_DENIED = new Set(["write_log", "setval"]);
 // getenv is not a function of DuckDB 2.0.0 (the engine says so), but it reads the server's environment where a build has it
 // (the first Quack spike's attack list names it), so it is refused by name before it can ever be bound.
 const SERVE_SCALAR_DENIED = new Set(["current_setting", "getvariable", "getenv", "sleep_ms"]);
+// croft's own hooks (the readers' process registers croft_authn, croft_authz and croft_authz_js, D125) and Quack's helper
+// functions are not for a caller's SQL: the serve profile refuses every scalar named for either.
+const SERVE_INTERNAL_SCALAR = /^(croft|quack)_/;
 // SHOW forms that are not DESCRIBE: they list names, never paths. `__show_from` is SHOW TABLES FROM <schema or database>
 // (ast.ts collect()), which lists another schema's tables.
 const SHOW_LISTS = new Set(["tables", "databases", "variables", "__show_tables_expanded", "__show_from"]);
@@ -495,7 +498,7 @@ class Checker {
 
   private scalar(name: string, at?: number): void {
     const n = lower(name);
-    if (this.serve && (SCALAR_DENIED.has(n) || SERVE_SCALAR_DENIED.has(n))) throw this.serveDenied(`${name}()`, at);
+    if (this.serve && (SCALAR_DENIED.has(n) || SERVE_SCALAR_DENIED.has(n) || SERVE_INTERNAL_SCALAR.test(n))) throw this.serveDenied(`${name}()`, at);
     if (n === "setval") throw this.notSelect(`${name}() changes a sequence; croft runs read-only SELECTs`, "remove it", at);
     if (SCALAR_DENIED.has(n)) {
       throw this.notSelect(`${name}() writes to DuckDB's log; croft runs read-only SELECTs`, "remove it; croft keeps its own logs", at);
@@ -583,7 +586,7 @@ class Checker {
     return { file: this.o.file, line: pos ? pos.line + (this.o.lineOffset ?? 0) : undefined, column: pos?.column };
   }
 
-  private serveDenied(what: string, at?: number, why = "is not available over HTTP; the read server reads the project's tables only",
+  private serveDenied(what: string, at?: number, why = "is not available to a remote query; croft's read server reads the project's tables only",
     hint = "query the project's tables by name; files come in through file ingests"): CroftError {
     return new CroftError("QUERY_PATH_DENIED", { message: `${what} ${why}`, hint, ...this.where(at) });
   }

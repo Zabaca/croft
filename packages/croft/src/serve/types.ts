@@ -1,6 +1,7 @@
 // croft serve's record and wire types (DESIGN.md §5 "Server mode"). serve.json is what the read client
 // (read/locate.ts readServeRecord) finds the server by; it is written 0600 because it holds the token.
 import type { ServeRecord } from "../read/locate.ts";
+import type { QuackEvent } from "./quack-access.ts";
 
 /** <state>/serve.json, written by croft serve at start and removed when it stops. A superset of ServeRecord. */
 export interface ServeJson extends ServeRecord {
@@ -15,6 +16,10 @@ export interface ServeJson extends ServeRecord {
   /** Present (true) when this server runs in server mode (D119): it holds the read copy and never the live file, so
    *  croft doctor does not name it as a holder of the warehouse. Absent for the file engine. */
   serverMode?: true;
+  /** Server mode (D125): where DuckDB clients attach over Quack, as it was bound when croft serve started. A port of 0
+   *  becomes the one picked; the readers' process keeps the port while it lives, but a replacement started after a kill
+   *  picks again when the setting is 0. */
+  quack?: { uri: string };
 }
 
 /** GET /health */
@@ -115,6 +120,9 @@ export interface ServeEngineStatus {
     copyCost: { code: string; message: string } | null;
     /** A child process is making the read copy now (it was missing, behind or failed; serve/copy-maker.ts). */
     makingCopy: boolean;
+    /** Where DuckDB clients attach over Quack (`quack:127.0.0.1:9494`), once the readers' process listens; null otherwise
+     *  (before it opens, or with the listener turned off for a test). */
+    quack: { uri: string } | null;
   };
 }
 
@@ -137,4 +145,7 @@ export interface ServeEngineOptions {
   maxRows?: number;
   /** A stopped query that has not settled this long after its first interrupt is ended by killing its worker. Default 500. */
   killAfterMs?: number;
+  /** Server mode (D125): told of every Quack sign-in and every Quack query, answered or refused, for croft serve's log line
+   *  and a key's last-used time. */
+  onQuack?: (e: QuackEvent) => void;
 }
