@@ -26,10 +26,11 @@
 // Server mode (D119) runs the same worker as the readers' process: `open` with `readers` makes an in-memory
 // instance (never the live file), loads quack and httpfs by path, attaches the read copy READ_ONLY as `wh`, and
 // locks it down to the copy's path (db/modes.ts, kind "readers"). Every connection then runs `USE wh`, so the gate and
-// the queries see the copy exactly as they see the live file in file mode. `swap` takes a refreshed copy in: it
-// removes any `<copy>.wal` (a valid one would be replayed onto the new copy), DETACHes `wh` and ATTACHes the new file,
-// 2 to 10 ms [V: 2.0.0]. A connection's `USE wh` is by name, so it follows the new file; a query that starts meanwhile
-// waits for the swap, and one that fails because it straddled it is run again, once. A query already reading the old
+// the queries see the copy exactly as they see the live file in file mode. `swap` takes a refreshed copy in without a gap
+// (D129): it removes any `<copy>.wal` (a valid one would be replayed onto the new copy), attaches the new file under the other
+// of two names (`wh`, `wh2`) beside the old one, points the views at it in one transaction, switches the app token's
+// connections to the new name as they are taken, and then detaches the old file. A query that fails because it straddled
+// the switch is run again, once. A query already reading the old
 // file finishes on it. A start or a swap that fails ends this process (the instance is part set up, and is never
 // reused); croft serve replaces it (after a backoff for a start, at once for a swap it killed). The instance stays
 // referenced for the process's whole life:
@@ -262,6 +263,8 @@ class Host {
   private swapping: Promise<void> | null = null;
   /** Swaps completed. A query that fails with another count than it started with straddled one. */
   private epoch = 0;
+  /** The name the read copy is attached under now: `wh`, or `wh2` after a swap (D129). */
+  private alias = READ_COPY_ALIAS;
   /** The tables the project shares with keys, and which of them have a view in the readers' in-memory database now. */
   private shared: string[] = [];
   private views: string[] = [];
@@ -327,9 +330,9 @@ class Host {
         this.key = READERS_KEY;
         lockCopy(m.path);
         this.admin = await connect(this.instance, this.spec, this.key); // checks the files, loads, attaches, locks
-        await this.refuseWal(this.admin);
+        await this.refuseWal(this.admin, this.alias);
         this.shared = m.readers.shared;
-        await this.makeViews(this.admin, m.readers.asOf);
+        await this.makeViews(this.admin, m.readers.asOf, this.alias);
         if (this.quack) {
           await this.quack.refresh(this.admin, this.views);
           // The deadline's look at the running queries has a connection of its own: the admin one is busy swapping.
@@ -360,17 +363,23 @@ class Host {
 
   /** A read-only attach makes no WAL. One that is there right after it appeared while the copy was attached, so something
    *  had it open for writing: detach, and fail (the process ends and is replaced; the new one removes the file first). */
-  private async refuseWal(admin: DuckDBConnection): Promise<void> {
+  private async refuseWal(admin: DuckDBConnection, alias: string): Promise<void> {
     if (!existsSync(`${this.path}.wal`)) return;
     try {
-      await admin.run(`DETACH ${READ_COPY_ALIAS}`);
+      await admin.run(`DETACH ${alias}`);
     } catch {
       // The process ends either way.
     }
     throw new Error("a WAL appeared beside the read copy while it was being attached, so it is not served");
   }
 
-  /** Take in the refreshed copy: detach the old file and attach the one now at the same path. */
+  /**
+   * Take in the refreshed copy without a gap (D129). The new file is attached under the other of two names (`wh`, `wh2`) while
+   * the old one is still attached [V: 2.0.0: the same path attaches twice under two names, and each reads its own file after
+   * a rename]; its format is checked; the views of the shared tables and the as-of view are pointed at it in one transaction,
+   * so a Quack session sees the old copy or the new one and never neither; the app token's connections switch to the new
+   * name as they are taken; and only then is the old one detached. A query already reading the old file finishes on it.
+   */
   private async swap(asOf: string): Promise<void> {
     const admin = this.admin;
     if (!admin) {
@@ -380,20 +389,23 @@ class Host {
     const done = (async () => {
       rmSync(`${this.path}.wal`, { force: true });
       lockCopy(this.path);
-      await admin.run(`DETACH ${READ_COPY_ALIAS}`);
-      await admin.run(`ATTACH ${sqlString(this.path)} AS ${READ_COPY_ALIAS} (READ_ONLY)`);
-      await this.refuseWal(admin);
-      await this.makeViews(admin, asOf);
-      await this.quack?.refresh(admin, this.views);
+      const old = this.alias;
+      const next = old === READ_COPY_ALIAS ? SECOND_COPY_ALIAS : READ_COPY_ALIAS;
+      await admin.run(`ATTACH ${sqlString(this.path)} AS ${next} (READ_ONLY)`);
+      await this.refuseWal(admin, next);
       // A copy a newer croft wrote is refused here as it is when the process opens (DB_NEWER_FORMAT): the process ends,
       // and the one that replaces it reports the same until the copy is one this croft reads.
-      const conn = await this.take();
+      const conn = await this.take(next);
       try {
         await checkFormat(sqlOn(conn, this.spec!.timezone));
       } finally {
         this.give(conn);
       }
+      await this.makeViews(admin, asOf, next);
+      await this.quack?.refresh(admin, this.views);
+      this.alias = next;
       this.epoch++;
+      await admin.run(`DETACH ${old}`);
     })();
     this.swapping = done.catch(() => {});
     try {
@@ -416,11 +428,12 @@ class Host {
       let a: Answer | null = null;
       // A key's query works in the views of the shared tables; the app token's on the copy itself.
       const scoped = m.shared !== undefined;
-      const db = scoped ? READERS_VIEWS_DB : READ_COPY_ALIAS;
       for (let attempt = 0; a === null; attempt++) {
         const epoch = this.epoch;
+        // The copy is attached under one of two names, and a swap moves it to the other (D129).
+        const db = scoped ? READERS_VIEWS_DB : this.alias;
         try {
-          // A swap in progress is waited for: between its DETACH and its ATTACH there is no `wh` to read.
+          // A swap in progress is waited for: the app token's connections move to the new name when it is done.
           if (this.swapping) await this.swapping;
           conn = await this.take(db);
           q.conn = conn;
@@ -452,7 +465,7 @@ class Host {
   }
 
   /** A connection, working in `db` when this is the readers' process (the copy for the app token, the views for a key). */
-  private async take(db: string = READ_COPY_ALIAS): Promise<DuckDBConnection> {
+  private async take(db: string = this.alias): Promise<DuckDBConnection> {
     const reuse = this.idle.pop();
     const conn = reuse ?? await connect(this.instance!, this.spec!, this.key);
     if (this.admin && this.using.get(conn) !== db) {
@@ -506,21 +519,32 @@ class Host {
    * The as-of view, `_croft_as_of`, holds one row, the copy's as-of time (`asOf`, in the project offset), for a DuckDB client
    * to read; its name starts with an underscore, which no asset's name can. It is not in `views`, which are the shared tables.
    */
-  private async makeViews(admin: DuckDBConnection, asOf: string): Promise<void> {
+  private async makeViews(admin: DuckDBConnection, asOf: string, alias: string): Promise<void> {
     const next: string[] = [];
-    if (this.shared.length) {
-      const reader = await admin.runAndReadAll(
-        `SELECT table_name FROM duckdb_tables() WHERE database_name = ${sqlString(READ_COPY_ALIAS)} AND schema_name = 'main' AND NOT temporary`);
-      const have = new Map(reader.getRowsJS().map((r) => [String(r[0]).replace(/[A-Z]/g, (c) => c.toLowerCase()), String(r[0])] as const));
+    const reader = this.shared.length
+      ? await admin.runAndReadAll(`SELECT table_name FROM duckdb_tables() WHERE database_name = ${sqlString(alias)} AND schema_name = 'main' AND NOT temporary`)
+      : null;
+    const have = new Map((reader?.getRowsJS() ?? []).map((r) => [String(r[0]).replace(/[A-Z]/g, (c) => c.toLowerCase()), String(r[0])] as const));
+    // One transaction: the views change together, so a session's query sees the old copy's or the new one's, never a name gone.
+    await admin.run("BEGIN TRANSACTION");
+    try {
       for (const name of this.shared) {
         const actual = have.get(name);
         if (actual === undefined) continue;
-        await admin.run(`CREATE OR REPLACE VIEW ${READERS_VIEWS_DB}.main.${quote(name)} AS SELECT * FROM ${READ_COPY_ALIAS}.main.${quote(actual)}`);
+        await admin.run(`CREATE OR REPLACE VIEW ${READERS_VIEWS_DB}.main.${quote(name)} AS SELECT * FROM ${alias}.main.${quote(actual)}`);
         next.push(name);
       }
+      await admin.run(`CREATE OR REPLACE VIEW ${READERS_VIEWS_DB}.main.${AS_OF_VIEW} AS SELECT ${sqlString(asOf)}::TIMESTAMPTZ AS as_of`);
+      for (const name of this.views) if (!next.includes(name)) await admin.run(`DROP VIEW IF EXISTS ${READERS_VIEWS_DB}.main.${quote(name)}`);
+      await admin.run("COMMIT");
+    } catch (e) {
+      try {
+        await admin.run("ROLLBACK");
+      } catch {
+        // The process ends either way.
+      }
+      throw e;
     }
-    await admin.run(`CREATE OR REPLACE VIEW ${READERS_VIEWS_DB}.main.${AS_OF_VIEW} AS SELECT ${sqlString(asOf)}::TIMESTAMPTZ AS as_of`);
-    for (const name of this.views) if (!next.includes(name)) await admin.run(`DROP VIEW IF EXISTS ${READERS_VIEWS_DB}.main.${quote(name)}`);
     this.views = next;
   }
 
@@ -543,6 +567,9 @@ class Host {
 
 const sqlString = (s: string) => `'${s.replaceAll("'", "''")}'`;
 const quote = (s: string) => `"${s.replaceAll('"', '""')}"`;
+
+/** The other name the read copy is attached under (D129): a swap attaches the new file under the name the old one does not have. */
+const SECOND_COPY_ALIAS = "wh2";
 
 /** The connection factory's key for the readers' process's one instance. */
 export const READERS_KEY = ":memory:readers";

@@ -154,13 +154,29 @@ export const REACHING_OUT: readonly Attack[] = [
   a("SHOW TABLES inside a query", "SELECT name FROM (SHOW TABLES)"),
 ];
 
-/** Each attack as written, with a catalog function's name in a comment after it, in a line comment after it, and (for a
- *  SELECT) in a string literal in front: the ways the first Quack spike's catalog allowance was bypassed. */
+/** Each attack as written, and again with a catalog function's name in a comment after it, in a line comment after it, and in a
+ *  string literal: the ways the first Quack spike's catalog allowance was bypassed. Every attack gets a literal-bearing form,
+ *  whatever it is. A SELECT carries it as a column in front. Any attack that has a string literal of its own (a path, an
+ *  ATTACH target) carries the name inside that literal. An INSERT, UPDATE or DELETE carries it in a WITH in front. Every
+ *  other statement (DROP, CREATE, SET, PRAGMA, a SELECT that is several statements, ...) is paired with a SELECT of the literal
+ *  before it and after it. */
 export function variants(attack: Attack): Attack[] {
   const out = [attack, a(`${attack.label}, with a catalog function in a comment`, `${attack.sql} /* duckdb_tables( */`)];
   if (!attack.sql.includes("--")) out.push(a(`${attack.label}, after a line comment`, `${attack.sql} -- duckdb_schemas(`));
+  const lit = "'duckdb_tables()'";
+  if (attack.sql.trim() === "") return out;
+  const plain = out.length;
   if (/^SELECT\s/i.test(attack.sql) && !attack.sql.includes(";")) {
-    out.push(a(`${attack.label}, with a catalog function in a string`, attack.sql.replace(/^SELECT\s/i, "SELECT 'duckdb_tables()' AS x, ")));
+    out.push(a(`${attack.label}, with a catalog function in a string`, attack.sql.replace(/^SELECT\s/i, `SELECT ${lit} AS x, `)));
+  }
+  const own = /'([^']*)'/.exec(attack.sql);
+  if (own) out.push(a(`${attack.label}, with a catalog function inside its own string literal`, attack.sql.replace(own[0], `'duckdb_tables()${own[1]}'`)));
+  if (/^(INSERT|UPDATE|DELETE)\b/i.test(attack.sql)) {
+    out.push(a(`${attack.label}, behind a WITH that holds a string literal`, `WITH c AS (SELECT ${lit} AS x) ${attack.sql}`));
+  }
+  if (out.length === plain) {
+    out.push(a(`${attack.label}, after a statement with a string literal`, `SELECT ${lit}; ${attack.sql}`));
+    out.push(a(`${attack.label}, before a statement with a string literal`, `${attack.sql}; SELECT ${lit}`));
   }
   return out;
 }

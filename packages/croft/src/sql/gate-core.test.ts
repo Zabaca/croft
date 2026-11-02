@@ -6,7 +6,9 @@ import type { DuckDBConnection } from "@duckdb/node-api";
 import { CroftError } from "../core/errors.ts";
 import { openMemory } from "../db/connect.ts";
 import { cleanup } from "../read/testkit.ts";
-import { absentFor, ALL_ATTACKS, ALLOWED, CTE_SHAPES, HIDDEN_NAMES, SHARED, WAREHOUSE_SQL } from "./attack-testkit.ts";
+import {
+  absentFor, ALL_ATTACKS, ALLOWED, CTE_SHAPES, HIDDEN_NAMES, HIDDEN_TABLES, NOT_A_READ, REACHING_OUT, SHARED, variants, WAREHOUSE_SQL,
+} from "./attack-testkit.ts";
 import {
   type CatalogSnapshot, catalogOf, decide, type GateInputs, type GateOptions, type GateVerdict, restrictCatalog,
 } from "./gate-core.ts";
@@ -103,6 +105,25 @@ describe("decide() is synchronous: everything it needs is given", () => {
       }
     }
   }, 60_000);
+});
+
+describe("the attack list's variants", () => {
+  test("every attack has a form with a catalog function's name inside a string literal, and one in a comment, whatever kind of statement it is", () => {
+    const literal = /'[^']*duckdb_tables\(\)[^']*'/;
+    const missing: string[] = [];
+    for (const base of [...HIDDEN_TABLES, ...NOT_A_READ, ...REACHING_OUT]) {
+      if (base.sql.trim() === "") continue; // nothing to carry a literal
+      const forms = variants(base);
+      if (!forms.some((v) => literal.test(v.sql.replaceAll(/\/\*.*?\*\//g, "")))) missing.push(base.sql);
+      if (!forms.some((v) => v.sql.includes("/* duckdb_tables( */"))) missing.push(`comment: ${base.sql}`);
+    }
+    expect(missing).toEqual([]);
+    // ...for the statements that write, the ones the first Quack spike let through: INSERT, UPDATE, DELETE, DROP, CREATE, COPY, ATTACH, SET.
+    for (const word of ["INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "COPY", "ATTACH", "SET", "INSTALL", "LOAD", "PRAGMA", "CALL", "EXPORT"]) {
+      const some = ALL_ATTACKS.filter((x) => x.sql.toUpperCase().includes(word) && literal.test(x.sql.replaceAll(/\/\*.*?\*\//g, "")));
+      expect(some.length, word).toBeGreaterThan(0);
+    }
+  });
 });
 
 describe("a key's scope: the attack list", () => {

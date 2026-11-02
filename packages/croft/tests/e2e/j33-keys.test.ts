@@ -165,13 +165,14 @@ async function journey(): Promise<void> {
   for (const k of [alice, bob]) expect(bytes.includes(k), "a key is in a file").toBe(false);
 }
 
-/** Without server mode (D128): the key is made, the real server refuses it with a 403 that names what to turn on, and the token reads on. */
+/** Without server mode (D128): the key is made, the real server refuses it with a 403 that names what to turn on, and the token reads on.
+ *  Then server mode is turned on, and the same key, not made again, reads the shared table. */
 async function refused(): Promise<void> {
   api.route("/orders", () => json([{ id: 1, amount: 10 }]));
   const { project: p } = await initProject();
   p.remove("assets/example_sales.ts");
   p.write("assets/orders.ts", asset(api.url, "/orders"));
-  const home = { env: schedulerEnv() };
+  const home = { env: { ...schedulerEnv(), CROFT_EXTENSION_DIR: ext.dir } };
   p.edit("croft.json", '"timezone"', '"serve": { "sharedTables": ["orders"] }, "timezone"');
   expect((await p.json(["run"], home)).code).toBe(0);
   const added = await p.json(["serve", "key", "add", "alice"], home);
@@ -188,9 +189,6 @@ async function refused(): Promise<void> {
     expect(own.status, JSON.stringify(own.body)).toBe(403);
     expect(own.body.problems[0]).toMatchObject({ code: "SERVE_KEY_NEEDS_SERVER_MODE" });
     expect((await ask(rec, rec.token, "select id from orders")).body.data.rows).toEqual([{ id: 1 }]);
-    const removed = await p.json(["serve", "key", "remove", "alice"], home);
-    expect(removed.code, show(removed)).toBe(0);
-    expect((await ask(rec, key, "select id from orders")).status).toBe(401);
     serve.proc.kill("SIGINT");
     const stopped = await serve.done;
     expect(stopped.code, show(stopped)).toBe(0);
@@ -201,6 +199,35 @@ async function refused(): Promise<void> {
     if (serve.proc.exitCode === null) {
       serve.proc.kill("SIGKILL");
       await serve.done;
+    }
+  }
+  if (!ext.ready) return; // the rest needs server mode's extension files; CI has them
+
+  // Server mode is turned on. The same key, not made again, reads the shared table, and a removed key is a 401 as ever.
+  p.edit("croft.json", '"serve": {', '"serverMode": { "enabled": true, "quackPort": 0 }, "serve": {');
+  const listed = await p.json(["serve", "key", "list"], home);
+  expect(listed.json.data).toMatchObject({ serverMode: true, keys: [{ name: "alice" }] });
+  const on = p.start(["serve", "--port", "0"], home);
+  try {
+    await until(() => existsSync(file) || on.proc.exitCode !== null, 30_000);
+    if (!existsSync(file)) throw new Error(`croft serve did not start\n${show(await on.done)}`);
+    const rec = JSON.parse(readFileSync(file, "utf8")) as ServeRecord;
+    await until(async () => (await ask(rec, rec.token, "select 1 as one")).status === 200, 60_000); // the read copy is made by croft serve
+    const own = await ask(rec, key, "select id, amount from orders");
+    expect(own.status, JSON.stringify(own.body)).toBe(200);
+    expect(own.body.data.rows).toEqual([{ id: 1, amount: 10 }]);
+    expect((await ask(rec, key, "select card from payments")).status).toBe(400);
+    const removed = await p.json(["serve", "key", "remove", "alice"], home);
+    expect(removed.code, show(removed)).toBe(0);
+    expect((await ask(rec, key, "select id from orders")).status).toBe(401);
+    on.proc.kill("SIGINT");
+    const done = await on.done;
+    expect(done.code, show(done)).toBe(0);
+    expect(done.stdout + done.stderr).not.toContain(key);
+  } finally {
+    if (on.proc.exitCode === null) {
+      on.proc.kill("SIGKILL");
+      await on.done;
     }
   }
 }

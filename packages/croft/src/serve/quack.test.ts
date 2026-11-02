@@ -288,41 +288,59 @@ describe("the time limit", () => {
 });
 
 describe("a refreshed copy", () => {
-  withExt("is swapped in under open sessions: they keep reading, and across three refreshes each answer is one whole copy's", async () => {
+  withExt("is swapped in without a gap: across 20 refreshes under steady load from two DuckDB clients and the HTTP API, no query fails and each answer is one whole copy's (D129)", async () => {
     const r = await rig();
     const alice = await r.key("alice");
     const readers = [await person(r, alice), await person(r, alice)];
     let stop = false;
     const failures: string[] = [];
-    const seen = [new Set<string>(), new Set<string>()];
+    const counts = [20];
+    const seen = [new Set<string>(), new Set<string>(), new Set<string>(), new Set<string>()];
     const loop = async (i: number) => {
       while (!stop) {
         const a = await readers[i]!.run(i === 0 ? "SELECT count(*) AS n FROM r.orders" : "SELECT count(*) AS n FROM r.orders o JOIN r.orders p ON o.id = p.id");
         if (a.ok) seen[i]!.add(String(a.rows[0]!.n));
         else failures.push(a.error.split("\n")[0]!);
-        await Bun.sleep(3);
+        await Bun.sleep(1);
       }
     };
-    const running = [loop(0), loop(1)];
+    // The HTTP API through the same process: the app token on the copy itself, a key on the views.
+    const http = async (i: number) => {
+      const scope = i === 3 ? { key: "alice", tables: [...SHARED] } : undefined;
+      while (!stop) {
+        try {
+          const a = await r.e.query({ sql: "SELECT count(*) AS n FROM orders", params: [], limit: 10, ...(scope ? { scope } : {}) });
+          seen[i]!.add(String(a.rows[0]!.n));
+        } catch (e) {
+          failures.push(`http ${i}: ${(e as Error).message.split("\n")[0]}`);
+        }
+        await Bun.sleep(1);
+      }
+    };
+    const running = [loop(0), loop(1), http(2), http(3)];
     await Bun.sleep(200);
     const pid = r.e.status().serverMode!.workerPid;
-    for (const [step, n] of [30, 40, 50].entries()) {
-      await replaceCopy(r.p, n, `2026-10-30T1${step + 1}:00:00Z`);
+    const SWAPS = 20;
+    for (let step = 0; step < SWAPS; step++) {
+      const n = 21 + step;
+      counts.push(n);
+      await replaceCopy(r.p, n, `2026-10-30T11:${String(step).padStart(2, "0")}:00Z`);
       await until(`swap ${step + 1}`, () => (r.e.status().serverMode?.swaps ?? 0) === step + 1);
-      await Bun.sleep(150);
+      await Bun.sleep(60);
     }
     stop = true;
     await Promise.all(running);
-    expect(r.e.status().serverMode).toMatchObject({ workerPid: pid, swaps: 3, restarts: 0 });
+    expect(r.e.status().serverMode).toMatchObject({ workerPid: pid, swaps: SWAPS, restarts: 0 });
+    const last = String(counts.at(-1));
     for (const s of seen) {
-      expect([...s].every((n) => ["20", "30", "40", "50"].includes(n))).toBe(true);
-      expect(s.has("50")).toBe(true);
+      expect([...s].every((n) => counts.map(String).includes(n))).toBe(true);
+      expect(s.has(last)).toBe(true);
+      expect(s.size).toBeGreaterThan(5); // the loops really ran across the swaps
     }
-    // A query that arrives in the few milliseconds between the old copy being detached and the new one attached can fail with a
-    // catalog error (the docs say to run it again); none returns another answer, and no session is dropped.
-    expect(failures.filter((f) => !/^Catalog Error: Table with name "wh\.main\.\w+" does not exist/.test(f))).toEqual([]);
-    for (const c of readers) expect(await c.rows("SELECT count(*) AS n FROM r.orders")).toEqual([{ n: "50" }]);
-  }, 120_000);
+    // Not one failure: the new copy is attached beside the old, the views move to it in one transaction, and only then is the old detached.
+    expect(failures).toEqual([]);
+    for (const c of readers) expect(await c.rows("SELECT count(*) AS n FROM r.orders")).toEqual([{ n: last }]);
+  }, 180_000);
 });
 
 describe("behind a reverse proxy", () => {
