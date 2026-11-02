@@ -225,23 +225,41 @@ export function machineId(): string {
   return machine;
 }
 
+/** How long a LAKE_OTHER_WRITER warning stays after the other machine's write (or the write that found it), whatever this machine writes meanwhile. */
+export const OTHER_WRITER_WARNING_DAYS = 7;
+const WARNING_MS = OTHER_WRITER_WARNING_DAYS * 86_400_000;
+
 /**
- * What a machine's row of _croft.meta holds (`writer.<machine>`): the machine, the host's name, when, which run and which croft, and, when
- * the write found that another machine had written since this machine's one before (or, for its first, at all), that machine's record.
- * `crossed` stays until this machine's next write finds nothing of the kind, so `croft doctor` can say it after the machine has written
- * again over it.
+ * What a machine's row of _croft.meta holds (`writer.<machine>`): the machine, the host's name, when, which run and which croft, and a
+ * counter `n`. The counter is what orders the machines' writes: one more than the largest any record holds, read and written in the
+ * write's own transaction, so it follows the lake's commit order and not any machine's clock (a clock that runs behind would order its
+ * machine before the one it wrote after). `at` is for people to read, and for how long a warning stays.
+ *
+ * `crossed` is set when the write found another machine's record with a larger counter than this machine's one before it (or this machine
+ * had none), and carried over by this machine's later writes until the warning's days are over, counted from the other machine's `at` or
+ * from the write that found it (`seen`), whichever is later: a clean write of this machine's own does not clear it.
  */
-export interface WriterRecord { machine: string; host: string; at: string; run: string | null; croft: string; crossed: Crossing | null }
-export interface Crossing { machine: string; host: string; at: string; run: string | null }
+export interface WriterRecord { machine: string; host: string; at: string; run: string | null; croft: string; n: number; crossed: Crossing | null }
+export interface Crossing { machine: string; host: string; at: string; run: string | null; seen: string }
+
+const staysAt = (c: Crossing, nowMs: number): boolean => {
+  const since = Math.max(Date.parse(c.at) || 0, Date.parse(c.seen) || 0);
+  return nowMs - since < WARNING_MS;
+};
+
+const machinesIn = (rows: readonly { key: string; value: string | undefined }[]): WriterRecord[] =>
+  rows.flatMap((r) => (r.key.startsWith(WRITER_PREFIX) ? [parseWriter(r.value)] : [])).filter((r): r is WriterRecord => r !== null);
 
 /** This machine's record for a write at `at`, given the rows of meta that are machines' records (`key`, `value`). */
-export function writerRecord(runId: string | null, at: Date = new Date(), others: readonly { key: string; value: string }[] = []): WriterRecord {
+export function writerRecord(runId: string | null, at: Date = new Date(), rows: readonly { key: string; value: string }[] = []): WriterRecord {
   const me = machineId();
-  const records = others.flatMap((r) => (r.key.startsWith(WRITER_PREFIX) ? [parseWriter(r.value)] : [])).filter((r): r is WriterRecord => r !== null);
+  const records = machinesIn(rows);
   const mine = records.find((r) => r.machine === me);
-  const newest = records.filter((r) => r.machine !== me).sort((a, b) => (a.at < b.at ? 1 : -1))[0];
-  const crossed = newest && (!mine || newest.at > mine.at) ? { machine: newest.machine, host: newest.host, at: newest.at, run: newest.run } : null;
-  return { machine: me, host: hostname(), at: at.toISOString(), run: runId, croft: CROFT_VERSION, crossed };
+  const newest = records.filter((r) => r.machine !== me).sort((a, b) => b.n - a.n)[0];
+  const n = Math.max(0, ...records.map((r) => r.n)) + 1;
+  const found = newest && (!mine || newest.n > mine.n) ? { machine: newest.machine, host: newest.host, at: newest.at, run: newest.run, seen: at.toISOString() } : null;
+  const crossed = found ?? (mine?.crossed && staysAt(mine.crossed, at.getTime()) ? mine.crossed : null);
+  return { machine: me, host: hostname(), at: at.toISOString(), run: runId, croft: CROFT_VERSION, n, crossed };
 }
 
 /** The record in meta text, or null when it is not one. */
@@ -251,25 +269,29 @@ export function parseWriter(value: string | undefined | null): WriterRecord | nu
     const v = JSON.parse(value) as Partial<WriterRecord>;
     if (typeof v.machine !== "string" || typeof v.at !== "string") return null;
     const c = v.crossed;
-    const crossed = c && typeof c.machine === "string" && typeof c.at === "string" ? { machine: c.machine, host: c.host ?? "", at: c.at, run: c.run ?? null } : null;
-    return { machine: v.machine, host: v.host ?? "", at: v.at, run: v.run ?? null, croft: v.croft ?? "", crossed };
+    const crossed = c && typeof c.machine === "string" && typeof c.at === "string"
+      ? { machine: c.machine, host: c.host ?? "", at: c.at, run: c.run ?? null, seen: typeof c.seen === "string" ? c.seen : c.at } : null;
+    return { machine: v.machine, host: v.host ?? "", at: v.at, run: v.run ?? null, croft: v.croft ?? "", n: typeof v.n === "number" ? v.n : 0, crossed };
   } catch {
     return null;
   }
 }
 
 /**
- * What `croft doctor` makes of the machines' records in meta, for the machine it runs on. Another machine has written since this one's
- * last write when its record is newer than this one's, or when this machine's own record says its last write found one. A machine that has
- * never written is not a competing writer, so it is told who wrote and nothing else.
+ * What `croft doctor` makes of the machines' records in meta, for the machine it runs on, at `nowMs`. Another machine has written since this
+ * one's last write when its counter is larger than this one's (until this machine writes again), and a crossing this machine's last write
+ * found stays for OTHER_WRITER_WARNING_DAYS from the other machine's write or from the write that found it. A machine that has never
+ * written is not a competing writer, so it is told who wrote and nothing else.
  */
-export function writerReport(meta: Readonly<Record<string, string | undefined>>): { mine: WriterRecord | null; others: WriterRecord[]; crossing: Crossing | null } {
-  const records = Object.entries(meta).flatMap(([k, v]) => (k.startsWith(WRITER_PREFIX) ? [parseWriter(v)] : [])).filter((r): r is WriterRecord => r !== null);
+export function writerReport(meta: Readonly<Record<string, string | undefined>>, nowMs: number = Date.now()): { mine: WriterRecord | null; others: WriterRecord[]; crossing: Crossing | null } {
+  const records = machinesIn(Object.entries(meta).map(([key, value]) => ({ key, value })));
   const me = machineId();
   const mine = records.find((r) => r.machine === me) ?? null;
-  const others = records.filter((r) => r.machine !== me).sort((a, b) => (a.at < b.at ? 1 : -1));
-  const newer = mine ? others.find((o) => o.at > mine.at) : undefined;
-  const crossing = mine ? (newer ? { machine: newer.machine, host: newer.host, at: newer.at, run: newer.run } : mine.crossed) : null;
+  const others = records.filter((r) => r.machine !== me).sort((a, b) => b.n - a.n);
+  const newer = mine ? others.find((o) => o.n > mine.n) : undefined;
+  const crossing: Crossing | null = !mine ? null
+    : newer ? { machine: newer.machine, host: newer.host, at: newer.at, run: newer.run, seen: newer.at }
+    : mine.crossed && staysAt(mine.crossed, nowMs) ? mine.crossed : null;
   return { mine, others, crossing };
 }
 
@@ -322,7 +344,13 @@ export class LakeWriteLock {
       if (o.signal?.aborted) throw o.aborted();
       if (this.tryTake(o.runId ?? null, o.asset, o.label)) return () => this.release();
       const holder = this.holder();
-      if (!holder) continue; // it was stale, or went while we looked: try at once
+      if (!holder) {
+        // It went while we looked, or was stale and was reclaimed: try at once. But a lock that is still there with no live holder was
+        // not removed (another reclaimer holds the reclaim lock, or the holder and the reclaimer both died): wait a moment, not a spin
+        // that starts `ps` for every turn, until the reclaim lock goes stale.
+        if (existsSync(this.dir)) await sleepAbortable(50 + Math.round(Math.random() * 50), o.signal);
+        continue;
+      }
       const waited = Date.now() - started;
       if (!told && waited >= (o.noticeAfterMs ?? 2000)) {
         told = true;

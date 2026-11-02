@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
-import { isCommitFailure, isConflict, isConnectionError, lakeRefusedColumns, LakeWriteLock, machineId, newCommitTag, parseWriter, refuseLakeTypes, writerRecord } from "./lake.ts";
+import { isCommitFailure, isConflict, isConnectionError, lakeRefusedColumns, LakeWriteLock, machineId, newCommitTag, parseWriter, refuseLakeTypes, writerRecord, writerReport } from "./lake.ts";
 
 const made: string[] = [];
 afterAll(() => {
@@ -105,6 +105,25 @@ describe("which machine wrote", () => {
       if (before === undefined) delete process.env.CROFT_MACHINE_ID;
       else process.env.CROFT_MACHINE_ID = before;
     }
+    // The counter orders the machines' writes whatever their clocks say, and a crossing stays 7 days.
+    const me = machineId();
+    const DAY = 86_400_000;
+    const t = Date.parse("2026-11-02T12:00:00.000Z");
+    const row = (machine: string, n: number, at: number, crossed: unknown = null) => ({ key: `writer.${machine}`, value: JSON.stringify({ machine, host: machine, at: new Date(at).toISOString(), run: null, croft: "x", n, crossed }) });
+    const behind = writerRecord("r", new Date(t), [row(me, 1, t), row("other", 2, t - 3 * DAY)]); // the other wrote after, by a clock three days behind
+    expect(behind.n).toBe(3);
+    expect(behind.crossed).toMatchObject({ machine: "other", at: new Date(t - 3 * DAY).toISOString() });
+    expect(writerRecord("r", new Date(t), [row(me, 5, t), row("other", 2, t + DAY)]).crossed).toBeNull(); // ahead by the clock, before by the lake's order
+    expect(writerRecord("r", new Date(t), []).n).toBe(1);
+    expect(writerRecord("r", new Date(t), [row("other", 7, t - DAY)]).crossed).toMatchObject({ machine: "other" }); // a machine's first write
+    const meta = (n: number, crossed: unknown) => Object.fromEntries([row(me, n, t, crossed), row("other", 2, t - 3 * DAY)].map((r) => [r.key, r.value]));
+    expect(writerReport(meta(1, null), t).crossing).toMatchObject({ machine: "other" }); // written since: by the counter
+    const found = { machine: "other", host: "other", at: new Date(t - 3 * DAY).toISOString(), run: null, seen: new Date(t).toISOString() };
+    expect(writerReport(meta(3, found), t + 6 * DAY).crossing).toMatchObject({ machine: "other" }); // kept after this machine wrote over it
+    expect(writerReport(meta(3, found), t + 8 * DAY).crossing).toBeNull(); // 7 days after the write that found it
+    expect(writerRecord("r", new Date(t + 2 * DAY), [row(me, 3, t, found), row("other", 2, t - 3 * DAY)]).crossed).toMatchObject({ machine: "other" }); // carried by a clean write
+    expect(writerRecord("r", new Date(t + 8 * DAY), [row(me, 3, t, found), row("other", 2, t - 3 * DAY)]).crossed).toBeNull();
+    expect(writerReport({ [`writer.other`]: row("other", 2, t).value }, t).crossing).toBeNull(); // this machine never wrote
     expect(parseWriter("not json")).toBeNull();
     expect(parseWriter(undefined)).toBeNull();
     expect(parseWriter('{"x":1}')).toBeNull();
@@ -225,6 +244,28 @@ describe("croft's lock on the writes of a machine", () => {
     expect(again.holder()).toBeNull(); // the stale reclaim lock is cleared by this try ...
     expect(again.holder()).toBeNull(); // ... and the dead holder is reclaimed by the next
     expect(existsSync(lockDir)).toBe(false);
+  });
+
+  test("a dead holder that a reclaim cannot remove (another reclaimer's lock is fresh) is waited on, not spun on", async () => {
+    const dir = folder();
+    const lockDir = join(dir, "lake-write.lock");
+    mkdirSync(lockDir);
+    writeFileSync(join(lockDir, "holder.json"), JSON.stringify({ pid: 2_147_483_000, procStart: "never", bootId: "never", runId: "r_dead", label: "x", since: "2026-11-01T00:00:00.000Z" }));
+    mkdirSync(`${lockDir}.reclaim`); // a reclaimer that is at it (or died a moment ago): this one's reclaim removes nothing
+    class Counting extends LakeWriteLock {
+      looks = 0;
+      override holder() {
+        this.looks++;
+        return super.holder();
+      }
+    }
+    const lock = new Counting(dir);
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 600);
+    const err = await lock.acquire({ waitMs: 20_000, label: "w", signal: ac.signal, busy, aborted }).catch((e: unknown) => e);
+    expect((err as CroftError).code).toBe("INTERRUPTED");
+    expect(lock.looks).toBeLessThan(40); // a spin would have looked thousands of times, starting `ps` each
+    expect(lock.looks).toBeGreaterThan(1);
   });
 
   test("a lock folder whose taker died before it wrote its name is stale after a while, not at once", async () => {

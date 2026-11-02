@@ -68,6 +68,16 @@ describe("a warehouse that is a lake", () => {
     expect(await count(r)).toBe(10);
   }, 60_000);
 
+  maybe("a write that commits with no _croft state of its own is given it, and recorded like the rest", async () => {
+    const { w, r } = await fresh();
+    await w.write("make t", (tx) => tx.exec("CREATE TABLE t (a INTEGER)"), { runId: "r1" }); // a body that made no state
+    const meta = await r.read((db) => db.all<{ key: string; value: string }>("SELECT key, value FROM _croft.meta ORDER BY key"), { purpose: "test" });
+    expect(meta.map((m) => m.key).filter((k) => !k.startsWith("writer."))).toEqual(expect.arrayContaining(["bookkeeping", "format_version"]));
+    const writers = meta.filter((m) => m.key.startsWith("writer."));
+    expect(writers.length).toBe(1);
+    expect(JSON.parse(writers[0]!.value)).toMatchObject({ run: "r1", n: 1, crossed: null });
+  }, 60_000);
+
   maybe("a lake nobody has written is DB_NOT_FOUND for a reader, and the writer makes it", async () => {
     const { w, r } = await fresh();
     const err = await r.read(async () => 1, { purpose: "test" }).catch((e: unknown) => e);

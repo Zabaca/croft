@@ -37,7 +37,8 @@ import {
   isCommitFailure, isConflict, isConnectionError, LAKE_RETRY, type LakeConnection, lakeBackoffMs, landedTag, LakeWriteLock, newCommitTag, WRITER_PREFIX, writerKey, writerRecord,
 } from "./lake.ts";
 import { LAKE_ALIAS, modeSecrets, scrubThrown } from "./modes.ts";
-import { checkFormat, hasState } from "./state.ts";
+import { now as clockNow } from "../core/time.ts";
+import { checkFormat, ensureState, hasState } from "./state.ts";
 import { TxGuard } from "./tx-guard.ts";
 import { type ColumnInfo, type RenderContext, type RenderMode, renderRows, resultColumns } from "./values.ts";
 
@@ -651,9 +652,10 @@ export class DuckWarehouse implements Warehouse {
    * It is a row every write of the machine updates, so two attempts of one step that overlap conflict on it instead of both landing.
    */
   private async recordWriter(tx: LeaseSql, runId: string | undefined): Promise<void> {
-    if (!(await hasState(tx))) return;
+    // A write that commits with no _croft state (a body that made none) gets it here, so it is recorded like the rest.
+    if (!(await hasState(tx))) await ensureState(tx, { bookkeeping: "log" });
     const rows = await tx.all<{ key: string; value: string }>(`SELECT key, value FROM _croft.meta WHERE key LIKE '${WRITER_PREFIX}%'`);
-    const record = writerRecord(runId ?? null, new Date(), rows);
+    const record = writerRecord(runId ?? null, clockNow(), rows);
     await (await bookkeepingOf(tx)).upsert("meta", { key: "$1", value: "$2" }, [writerKey(record.machine), JSON.stringify(record)]);
   }
 

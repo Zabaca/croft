@@ -5,20 +5,21 @@
 //   bun scripts/fetch-old-duckdb.ts <folder>
 //
 // It installs @duckdb/node-api at the exact version into <folder>/node (bun install, with a package.json it writes) and downloads ducklake,
-// httpfs and postgres_scanner for this platform from DuckDB's official extension repository over HTTPS into <folder>/ext. Unlike
-// fetch-extensions.ts these files are not checked against a pinned checksum (croft pins only the version it runs on); the test only reads
-// with them. It prints the two variables the test looks for:
+// httpfs and postgres_scanner for this platform from DuckDB's official extension repository over HTTPS into <folder>/ext, writing each only
+// once its sha256 matches src/db/old-extension-pins.ts (a file already there is checked the same way). It prints the two variables the test
+// looks for:
 //
 //   CROFT_TEST_OLD_DUCKDB=<folder>/node CROFT_TEST_OLD_EXTENSIONS=<folder>/ext bun test src/db/lake-reader-recipe.test.ts
-import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { hostPlatform } from "../src/db/extension-files.ts";
+import { OLD_DUCKDB_VERSION, OLD_EXTENSION_PINS, OLD_NODE_API } from "../src/db/old-extension-pins.ts";
 
-const NODE_API = "1.5.5-r.5";
-const DUCKDB = "v1.5.5";
 const REPO = "https://extensions.duckdb.org";
 const NAMES = ["ducklake", "httpfs", "postgres_scanner"] as const;
+const sha = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
 const folder = process.argv[2] ? resolve(process.argv[2]) : null;
 if (!folder) {
@@ -33,7 +34,7 @@ if (!platform) {
 
 const node = join(folder, "node");
 mkdirSync(node, { recursive: true });
-writeFileSync(join(node, "package.json"), `${JSON.stringify({ name: "old-duckdb", private: true, dependencies: { "@duckdb/node-api": NODE_API } }, null, 2)}\n`);
+writeFileSync(join(node, "package.json"), `${JSON.stringify({ name: "old-duckdb", private: true, dependencies: { "@duckdb/node-api": OLD_NODE_API } }, null, 2)}\n`);
 const install = Bun.spawnSync([process.execPath, "install"], { cwd: node, stdout: "inherit", stderr: "inherit" });
 if (install.exitCode !== 0) {
   console.error("fetch-old-duckdb: bun install failed");
@@ -44,17 +45,22 @@ const ext = join(folder, "ext");
 mkdirSync(ext, { recursive: true });
 for (const name of NAMES) {
   const path = join(ext, `${name}.duckdb_extension`);
-  if (existsSync(path)) {
+  const want = OLD_EXTENSION_PINS[platform][name].sha256;
+  if (existsSync(path) && sha(readFileSync(path)) === want) {
     console.log(`ok       ${name} (already there)`);
     continue;
   }
-  const url = `${REPO}/${DUCKDB}/${platform}/${name}.duckdb_extension.gz`;
+  const url = `${REPO}/${OLD_DUCKDB_VERSION}/${platform}/${name}.duckdb_extension.gz`;
   const res = await fetch(url);
   if (!res.ok) {
     console.error(`FAILED   ${name}: ${url} answered HTTP ${res.status}`);
     process.exit(1);
   }
   const bytes = gunzipSync(Buffer.from(await res.arrayBuffer()));
+  if (sha(bytes) !== want) {
+    console.error(`MISMATCH ${platform}/${name}: the repository's file has sha256 ${sha(bytes)}, croft pins ${want}; nothing written`);
+    process.exit(1);
+  }
   const tmp = `${path}.part-${process.pid}`;
   try {
     writeFileSync(tmp, bytes);

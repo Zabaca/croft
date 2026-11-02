@@ -568,7 +568,7 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
       return m;
     }, { waitMs: d.lockWaitMs, purpose: "doctor" });
     const parts = [label, meta.format_version ? `croft format ${meta.format_version}${meta.bookkeeping ? ` (${meta.bookkeeping})` : ""} · duckdb ${String(meta.duckdb_version ?? "?").replace(/^v/, "")}` : "no croft state yet"];
-    const { mine, others, crossing } = writerReport(meta);
+    const { mine, others, crossing } = writerReport(meta, now(d.env).getTime());
     Object.assign(details, { meta, writer: mine, otherWriters: others });
     const when = (at: string) => { try { return clockText(at, project.timezone, now(d.env)); } catch { return at; } };
     if (crossing) {

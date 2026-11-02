@@ -293,7 +293,7 @@ jobs:
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
         run: |
           bun scripts/fetch-old-duckdb.ts "$RUNNER_TEMP/old-duckdb"
-          CROFT_TEST_OLD_DUCKDB="$RUNNER_TEMP/old-duckdb/node" CROFT_TEST_OLD_EXTENSIONS="$RUNNER_TEMP/old-duckdb/ext" bun test --timeout 60000 src/db/lake-reader-recipe.test.ts
+          CROFT_TEST_OLD_DUCKDB="$RUNNER_TEMP/old-duckdb/node" CROFT_TEST_OLD_EXTENSIONS="$RUNNER_TEMP/old-duckdb/ext" bun test --timeout 60000 src/db/lake-reader-recipe.test.ts src/db/old-extension-pins.test.ts
 
   # Smoke: Alpine (musl) installs and prints its version, and a fresh project runs its example and answers a query.
   alpine:

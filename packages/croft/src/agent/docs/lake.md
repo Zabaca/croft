@@ -51,8 +51,10 @@ One machine writes a lake, one write at a time. croft takes a lock of its own on
 in place of the file's lock: a second `croft run` waits for the first, then gets DB_BUSY naming the holder; a writer
 that was killed is reclaimed by the next. Every write records which machine made it (`_croft.meta`, one row `writer.<machine>` each),
 and `croft doctor` warns with LAKE_OTHER_WRITER when another machine has written since this machine's last write. Writing from two machines is not
-supported: they would not know of each other's runs. Every machine keeps a record of its own, so one machine's write does
-not hide another's. A machine is told apart by the platform's machine id; where that changes at every start (some
+supported: they would not know of each other's runs. Every machine keeps a record of its own, ordered by a counter that follows the
+lake's commit order (never by a machine's clock, which may run behind), so one machine's write does not hide another's.
+The warning stays for 7 days after the other machine's write (or after the write of this machine that found it), however
+many clean writes this machine makes meanwhile, and names the other machine and when it wrote. A machine is told apart by the platform's machine id; where that changes at every start (some
 containers), set CROFT_MACHINE_ID to a fixed name in the environment that runs croft. Two copies of one project folder on
 one machine are one machine to croft: they share the id, and neither the lock nor the warning tells them apart.
 
