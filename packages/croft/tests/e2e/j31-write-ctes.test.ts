@@ -2,14 +2,18 @@
 // DuckDB 2.0 parses `WITH x AS (DELETE … RETURNING *) SELECT …` and `WITH x AS (COPY … TO …) SELECT …` as one
 // SELECT, and runs them; COPY writes files even on a READ_ONLY connection. Each statement of the battery goes
 // through every way croft runs user SQL: croft query, an SQL asset (validate and run), a `-- check:` rule, a TS
-// transform's check, `croft delete --where`, croft serve over HTTP (with the app token and with a person's key, D122) and
-// ctx.query. Each is refused, no file appears, the warehouse's WAL is as it was and the table keeps its rows.
+// transform's check, `croft delete --where`, croft serve over HTTP (with the app token, and with a person's key, which works only in
+// server mode, D122, D128) and ctx.query. Each is refused, no file appears, the warehouse's WAL is as it was and the table keeps its rows.
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { extensionsReady } from "../../src/db/extension-dir-testkit.ts";
 import { cleanupAll, codes, type Envelope, initProject, type Project, show, tempDir, until } from "./harness.ts";
 
 afterAll(cleanupAll);
+
+const ext = extensionsReady(["quack", "httpfs"]);
+if (!ext.ready) console.warn(`[j31-write-ctes] SKIPPING the server-mode HTTP run, where a key can be tried: ${ext.skipReason}`);
 
 const ORDERS = `import { ingest } from "@zabaca/croft";
 
@@ -145,21 +149,32 @@ export default transform({ inputs: ["orders"], async *rows(ctx) { yield* await c
   }
 }, 180_000);
 
-test("croft serve refuses it over HTTP, with the app token and with a key", async () => {
+/** croft serve's HTTP API refuses the battery. A key works only in server mode (D128), so only there is it tried. */
+async function serveRefuses(serverMode: boolean): Promise<void> {
   const t = targets();
-  // A key reads orders: the project shares it, and a person has a key made by the command (D122).
   const config = JSON.parse(readFileSync(join(p.root, "croft.json"), "utf8")) as Record<string, unknown>;
-  p.write("croft.json", JSON.stringify({ ...config, serve: { sharedTables: ["orders"] } }, null, 2));
-  const made = await p.json(["serve", "key", "add", "alice"]);
-  expect(made.code, show(made)).toBe(0);
-  const key = (made.json as unknown as { data: { key: string } }).data.key;
-  const server = p.start(["serve", "--port", "0"]);
+  p.write("croft.json", JSON.stringify({ ...config, serve: { sharedTables: ["orders"] }, ...(serverMode ? { serverMode: { enabled: true, quackPort: 0 } } : {}) }, null, 2));
+  const env = { CROFT_EXTENSION_DIR: ext.dir };
+  let key: string | null = null;
+  if (serverMode) {
+    // A key reads orders: the project shares it, and a person has a key made by the command (D122).
+    const made = await p.json(["serve", "key", "add", "alice"], { env });
+    expect(made.code, show(made)).toBe(0);
+    key = (made.json as unknown as { data: { key: string } }).data.key;
+  }
+  const server = p.start(["serve", "--port", "0"], { env });
   const file = join(p.stateDir, "serve.json");
   try {
     await until(() => existsSync(file) || server.proc.exitCode !== null, 30_000);
     if (!existsSync(file)) throw new Error(`croft serve did not start\n${show(await server.done)}`);
     const rec = JSON.parse(readFileSync(file, "utf8")) as { url: string; token: string };
-    for (const bearer of [rec.token, key]) {
+    // In server mode the read copy is made by croft serve itself, in a child; until it is there a query is a retryable 503.
+    if (serverMode) {
+      await until(async () => (await fetch(`${rec.url}/query`, {
+        method: "POST", headers: { Authorization: `Bearer ${rec.token}`, "Content-Type": "application/json" }, body: JSON.stringify({ sql: "SELECT 1" }),
+      })).status === 200, 60_000);
+    }
+    for (const bearer of key ? [rec.token, key] : [rec.token]) {
       for (const sql of battery((n) => t[n]!)) {
         const before = fingerprint();
         const res = await fetch(`${rec.url}/query`, {
@@ -174,4 +189,7 @@ test("croft serve refuses it over HTTP, with the app token and with a key", asyn
     server.proc.kill();
     await server.done;
   }
-}, 180_000);
+}
+
+test("croft serve refuses it over HTTP, with the app token", () => serveRefuses(false), 180_000);
+(ext.ready ? test : test.skip)("croft serve in server mode refuses it over HTTP, with the app token and with a key", () => serveRefuses(true), 180_000);
