@@ -59,6 +59,7 @@ import type { AddonView, AssetKind, Problem, Reason } from "../../core/types.ts"
 import { addonLine, addonsNeeded, inspectAddons } from "../../db/addon-status.ts";
 import type { ExtensionSearch } from "../../db/extension-files.ts";
 import { assessCopyPolicy, type CloneProbe, copyCostlyProblem, notClonedProblem, type ProbeOptions } from "../../db/copy-policy.ts";
+import { type MaintenanceView, maintenanceView, readState } from "../../db/lake-maintenance-state.ts";
 import { readCopyStatus, readCopyView, type ReadCopyView, readCopyWords } from "../../db/readcopy.ts";
 import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
 import { type DriftEntry, driftNote, recentDrift } from "../../history/drift.ts";
@@ -75,7 +76,7 @@ import { editedProblem, engineChangeOf, staleReasons, type StaleView } from "../
 import type { AssetScheduleView, HoldCode } from "../../schedule/due.ts";
 import { croftHome, type CroftHome } from "../../schedule/home.ts";
 import type { CommandImpl, CommandResult, Ctx, Next } from "../command.ts";
-import { formatCount, table } from "../render.ts";
+import { formatCount, formatDuration, table } from "../render.ts";
 import {
   clockText, defaultScheduleView, fireText, heldProblem, HUMAN_HOLDS, logTailLines, nextFireOf, resumeCommand, type Scheduling, SCHEDULING_OFF,
   schedulingJson, schedulingOf, type SchedulingRecord, type ScheduleViewFn, staleProblem,
@@ -164,6 +165,8 @@ export interface StatusData {
     /** The lake's folder: `s3://bucket/folder/`, or the local data folder. It holds nothing but the lake. */
     folder: string;
     addons: AddonView[];
+    /** The lake's maintenance (D150), from runs.sqlite alone: whether croft runs it, the last pass, the next, and the last failure. */
+    maintenance: MaintenanceView;
   };
 }
 
@@ -725,10 +728,20 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       }
       const lake = project.config.lake;
       if (lake) {
+        const view = maintenanceView(db ? readState(db) : null, lake.maintenance, now);
         data.lake = {
           kind: lake.kind, folder: lake.kind === "postgres" ? bucketPath(lake.bucket) : lake.dataPath,
-          addons: addons.views.filter((v) => v.addon === "lake"),
+          addons: addons.views.filter((v) => v.addon === "lake"), maintenance: { ...view, lastOkAt: zoned(view.lastOkAt, tz), lastAttemptAt: zoned(view.lastAttemptAt, tz), nextDueAt: zoned(view.nextDueAt, tz),
+            lastError: view.lastError ? { ...view.lastError, at: zoned(view.lastError.at, tz)! } : null },
         };
+        // A pass that failed is a warning here, not an unhealthy lake: the data is as the last run left it, and the pass is tried again.
+        if (view.lastError) {
+          addonProblems.push({ ...problem("LAKE_MAINTENANCE_FAILED", {
+            message: `the lake's last maintenance pass failed${view.lastError.step ? ` at the ${view.lastError.step} step` : ""}: ${view.lastError.message}`,
+            hint: "the lake is usable and nothing was lost; croft tries again within the hour, or croft maintain now (croft docs LAKE_MAINTENANCE_FAILED)",
+            retryable: true,
+          }), severity: "warning" });
+        }
       }
       addonProblems.push(...addons.problems);
     }
@@ -1011,7 +1024,7 @@ export function formatStatus(d: StatusData, now: Date, o: { tz?: string; problem
 /** "Read copy warehouse.read.duckdb · as of 11:58 (2 min ago)", and for a warning its hint on the next line. */
 function readCopyLines(d: StatusData, now: Date, tz: string, o: { root?: string; database?: string }): string[] {
   // A lake has no read copy: its line is the add-on's, when that is not whole (the lake cannot be opened without it).
-  if (d.lake && !d.readCopy) return d.lake.addons.filter((a) => !a.ok).map((a) => `Lake mode · ${addonLine(a)}`);
+  if (d.lake && !d.readCopy) return [...d.lake.addons.filter((a) => !a.ok).map((a) => `Lake mode · ${addonLine(a)}`), maintenanceLine(d.lake.maintenance, now)];
   if (!d.readCopy) return [];
   const root = o.root ?? "";
   const w = readCopyWords(d.readCopy, { root, database: o.database ?? "", tz, now });
@@ -1022,6 +1035,23 @@ function readCopyLines(d: StatusData, now: Date, tz: string, o: { root?: string;
     ]
     : [];
   return [...mode, `Read copy ${w.text}`, ...(w.hint ? [`  hint: ${w.hint}`] : [])];
+}
+
+/** "Lake maintenance · last pass 3 h ago (482 snapshots expired; 849 → 367) · next due in 21 h", or why there is none. */
+function maintenanceLine(m: MaintenanceView, now: Date): string {
+  if (!m.enabled) return "Lake maintenance · off (lake.maintenance.enabled is false); croft maintain runs a pass by hand";
+  const parts = ["Lake maintenance"];
+  if (m.lastError) parts.push(`the last pass failed ${m.lastAttemptAt ? ago(m.lastAttemptAt, now) : ""}${m.lastError.step ? ` at the ${m.lastError.step} step` : ""}`.trim());
+  else if (m.lastPass && m.lastOkAt) parts.push(`last pass ${ago(m.lastOkAt, now)} (${formatCount(m.lastPass.expired)} snapshots expired; ${formatCount(m.lastPass.before.snapshots)} → ${formatCount(m.lastPass.after.snapshots)})`);
+  else parts.push("no pass yet");
+  if (m.nextDueAt) parts.push(Date.parse(m.nextDueAt) <= now.getTime() ? "next due now" : `next due ${until(m.nextDueAt, now)}`);
+  return parts.join(" · ");
+}
+
+/** "in 21 h" for a later time. */
+function until(at: string, now: Date): string {
+  const ms = Date.parse(at) - now.getTime();
+  return `in ${formatDuration(Math.max(0, ms))}`;
 }
 
 function schedulingLine(d: StatusData, now: Date, tz: string): string {

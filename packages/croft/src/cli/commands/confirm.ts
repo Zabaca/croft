@@ -29,7 +29,7 @@ import { openRunsDb } from "./status.ts";
 
 /** The commands that carry out a confirmation: they read the token from dispatchOf(ctx) and spend it where
  *  they act. rename needs no confirmation (§6). */
-export const CONFIRMABLE = new Set<string>(["run", "delete", "restore"]);
+export const CONFIRMABLE = new Set<string>(["run", "delete", "restore", "maintain"]);
 
 export type ConfirmOutcome = "used" | "not_needed" | "unused" | "running";
 
@@ -131,7 +131,7 @@ function confirmations<T>(ctx: Ctx, token: string, fn: (c: Confirmations) => T):
  *  trash): the destructive part, which must have spent the token. */
 function destructiveStepRan(result: CommandResult | undefined): boolean {
   const data = result?.data as { steps?: unknown; status?: unknown; trashed?: unknown } | null | undefined;
-  if (data?.status === "deleted" || data?.status === "restored" || (typeof data?.trashed === "object" && data.trashed !== null)) return true;
+  if (data?.status === "deleted" || data?.status === "restored" || data?.status === "orphans_deleted" || (typeof data?.trashed === "object" && data.trashed !== null)) return true;
   const steps = data?.steps;
   return Array.isArray(steps) && steps.some((s) => typeof s === "object" && s !== null && "trashed" in s && !!s.trashed);
 }

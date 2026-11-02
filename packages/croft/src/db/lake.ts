@@ -307,6 +307,8 @@ export function writerReport(meta: Readonly<Record<string, string | undefined>>,
 interface LockRecord { pid: number; procStart: string; bootId: string; runId: string | null; asset?: string; label: string; since: string }
 
 const LOCK_FOLDER = "lake-write.lock";
+/** The label a lake maintenance pass takes the lock with (db/lake-pass.ts): the holder is then told as `maintenance`, not as a write. */
+export const MAINTENANCE_LOCK_LABEL = "lake maintenance";
 /** A lock folder whose holder file never appeared (its taker died between the mkdir and the write) is stale after this long. */
 const HOLDERLESS_STALE_MS = 10_000;
 /** The lock a reclaimer holds while it removes a dead holder's lock is stale after this long. */
@@ -334,7 +336,10 @@ export class LakeWriteLock {
       this.reclaim(rec);
       return null;
     }
-    return { pid: rec.pid, program: "croft", ...(rec.runId ? { runId: rec.runId } : {}), ...(rec.asset ? { asset: rec.asset } : {}), action: "write", since: rec.since };
+    return {
+      pid: rec.pid, program: "croft", ...(rec.runId ? { runId: rec.runId } : {}), ...(rec.asset ? { asset: rec.asset } : {}),
+      action: rec.label === MAINTENANCE_LOCK_LABEL ? "maintenance" : "write", since: rec.since,
+    };
   }
 
   /**
@@ -456,4 +461,37 @@ function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
     const timer = setTimeout(done, Math.max(1, ms));
     signal?.addEventListener("abort", done, { once: true });
   });
+}
+
+// ---- A backup copying the bucket ---------------------------------------------------------------------------------
+
+const BACKUP_MARKER = "lake-backup.json";
+
+interface BackupMarker { pid: number; procStart: string; bootId: string; since: string }
+
+/**
+ * `croft backup` of a lake takes the catalog's dump under croft's lock on the lake's writes, then lets writes go on while it copies the
+ * bucket (a slow copy must not hold up runs). A write only adds files, but a maintenance pass deletes them, and the dump names files the
+ * pass may free; so while a backup copies, this marker in the state folder keeps this machine's passes from running (db/lake-pass.ts). A
+ * marker whose process is gone is no marker. Returns what removes it.
+ */
+export function markBackupRunning(stateDir: string): () => void {
+  const id = currentIdentity();
+  mkdirSync(stateDir, { recursive: true });
+  const file = join(stateDir, BACKUP_MARKER);
+  const rec: BackupMarker = { pid: id.pid, procStart: id.procStart, bootId: id.bootId, since: new Date().toISOString() };
+  writeFileSync(`${file}.${id.pid}.tmp`, JSON.stringify(rec));
+  renameSync(`${file}.${id.pid}.tmp`, file);
+  return () => rmSync(file, { force: true });
+}
+
+/** The backup that is copying this lake's bucket now, or null. */
+export function backupRunning(stateDir: string): { pid: number; since: string } | null {
+  try {
+    const rec = JSON.parse(readFileSync(join(stateDir, BACKUP_MARKER), "utf8")) as Partial<BackupMarker>;
+    if (typeof rec.pid !== "number" || typeof rec.procStart !== "string" || typeof rec.bootId !== "string") return null;
+    return recordAlive({ pid: rec.pid, procStart: rec.procStart, bootId: rec.bootId }) ? { pid: rec.pid, since: String(rec.since ?? "") } : null;
+  } catch {
+    return null;
+  }
 }

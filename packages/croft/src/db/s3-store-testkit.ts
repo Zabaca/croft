@@ -35,6 +35,13 @@ const etag = (b: Uint8Array) => `"${createHash("md5").update(b).digest("hex")}"`
 
 const uploads = new Map<string, Map<number, Uint8Array>>();
 
+// Faults a test asks for over HTTP (POST /__control?failDeletes=N&status=500, GET /__control for the counts; no key needed, the
+// store is on 127.0.0.1 and a child of the test): the next N requests that delete objects (a bulk delete or a single one) answer
+// `status` and delete nothing, as R2 answered HTTP 500 to bulk deletes on a real lake. Counts say how many deletes were asked for
+// and how many objects went.
+const faults = { failDeletes: 0, status: 500 };
+const counts = { deleteRequests: 0, failedDeletes: 0, objectsDeleted: 0 };
+
 function listFiles(dir: string): string[] {
   if (!existsSync(dir)) return [];
   const out: string[] = [];
@@ -52,6 +59,22 @@ const server = Bun.serve({
   async fetch(req) {
     const url = new URL(req.url);
     const m = req.method;
+    if (url.pathname === "/__control") {
+      if (m === "POST") {
+        faults.failDeletes = Number(url.searchParams.get("failDeletes") ?? faults.failDeletes);
+        faults.status = Number(url.searchParams.get("status") ?? faults.status);
+      }
+      return new Response(JSON.stringify({ ...faults, ...counts }), { headers: { "content-type": "application/json" } });
+    }
+    const deleting = (m === "POST" && url.searchParams.has("delete")) || m === "DELETE";
+    if (deleting && !url.searchParams.has("uploadId")) {
+      counts.deleteRequests++;
+      if (faults.failDeletes > 0) {
+        faults.failDeletes--;
+        counts.failedDeletes++;
+        return err(faults.status, faults.status >= 500 ? "InternalError" : "SlowDown", "We encountered an internal error. Please try again.");
+      }
+    }
     const credential = /Credential=([^/,\s]+)\//.exec(req.headers.get("authorization") ?? "")?.[1];
     if (!credential || !keys.has(credential)) {
       return err(403, "InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", `<AWSAccessKeyId>${esc(credential ?? "")}</AWSAccessKeyId>`);
@@ -69,7 +92,11 @@ const server = Bun.serve({
       if (m === "GET") {
         const prefix = url.searchParams.get("prefix") ?? "";
         const delimiter = url.searchParams.get("delimiter");
-        const all = listFiles(join(root, bucket)).map((f) => relative(join(root, bucket), f)).filter((k) => k.startsWith(prefix)).sort();
+        const maxKeys = Math.max(1, Number(url.searchParams.get("max-keys") ?? 1000));
+        const after = url.searchParams.get("continuation-token") ?? url.searchParams.get("start-after") ?? "";
+        const everything = listFiles(join(root, bucket)).map((f) => relative(join(root, bucket), f)).filter((k) => k.startsWith(prefix)).sort();
+        const all = everything.filter((k) => k > after).slice(0, maxKeys);
+        const truncated = everything.filter((k) => k > after).length > all.length;
         const contents: string[] = [];
         const prefixes = new Set<string>();
         for (const k of all) {
@@ -81,12 +108,13 @@ const server = Bun.serve({
             contents.push(`<Contents><Key>${esc(k)}</Key><LastModified>${st.mtime.toISOString()}</LastModified><ETag>"x"</ETag><Size>${st.size}</Size><StorageClass>STANDARD</StorageClass></Contents>`);
           }
         }
-        return xml(200, `<ListBucketResult><Name>${bucket}</Name><Prefix>${esc(prefix)}</Prefix><KeyCount>${contents.length}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>${contents.join("")}${[...prefixes].map((p) => `<CommonPrefixes><Prefix>${esc(p)}</Prefix></CommonPrefixes>`).join("")}</ListBucketResult>`);
+        return xml(200, `<ListBucketResult><Name>${bucket}</Name><Prefix>${esc(prefix)}</Prefix><KeyCount>${contents.length}</KeyCount><MaxKeys>${maxKeys}</MaxKeys><IsTruncated>${truncated}</IsTruncated>${truncated ? `<NextContinuationToken>${esc(all[all.length - 1]!)}</NextContinuationToken>` : ""}${contents.join("")}${[...prefixes].map((p) => `<CommonPrefixes><Prefix>${esc(p)}</Prefix></CommonPrefixes>`).join("")}</ListBucketResult>`);
       }
       if (m === "POST" && url.searchParams.has("delete")) {
         const body = await req.text();
         const gone = [...body.matchAll(/<Key>([^<]*)<\/Key>/g)].map((x) => x[1]!);
         for (const k of gone) rmSync(join(root, bucket, k), { force: true });
+        counts.objectsDeleted += gone.length;
         return xml(200, `<DeleteResult>${gone.map((k) => `<Deleted><Key>${k}</Key></Deleted>`).join("")}</DeleteResult>`);
       }
       return err(400, "InvalidRequest", "unsupported bucket request");
@@ -121,6 +149,7 @@ const server = Bun.serve({
       return new Response("", { status: 200, headers: { etag: etag(body) } });
     }
     if (m === "DELETE") {
+      counts.objectsDeleted++;
       rmSync(file, { force: true });
       return new Response(null, { status: 204 });
     }

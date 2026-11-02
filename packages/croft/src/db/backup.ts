@@ -252,7 +252,7 @@ function earlierWriters(stateDir: string): IntentEntry[] {
   });
 }
 
-function aborted(signal: AbortSignal, what: string): CroftError {
+export function aborted(signal: AbortSignal, what: string): CroftError {
   const r = signal.reason as { name?: unknown; problem?: unknown } | undefined;
   if (r instanceof CroftError || (r && r.name === "CroftError" && r.problem)) return r as CroftError;
   return new CroftError("INTERRUPTED", { message: `interrupted while ${what}`, hint: "nothing was written; run it again" });
@@ -311,7 +311,7 @@ async function copyInto(src: string, dst: string, o: BackupOptions): Promise<Clo
 
 /** Clone `src` to `dst` in a child process: the platform's clone command, then a plain copy. `recursive`: `src` is a
  *  folder, copied whole (cp -R; macOS clones each file with -c, GNU cp with reflink=auto). */
-async function cloneFile(src: string, dst: string, o: Pick<BackupOptions, "cp" | "platform" | "signal">, recursive = false): Promise<CloneMethod> {
+export async function cloneFile(src: string, dst: string, o: Pick<BackupOptions, "cp" | "platform" | "signal">, recursive = false): Promise<CloneMethod> {
   const cps = o.cp ?? CP_PATHS;
   const cp = cps.find((p) => existsSync(p));
   if (!cp) throw new Error(`cp was not found (looked for ${cps.join(", ")})`);
@@ -422,9 +422,9 @@ function alive(pid: number): boolean {
 /** The file in a project backup that says what it holds; written last, so a folder without it is no backup. */
 export const BACKUP_MANIFEST = "backup.json";
 /** The name a project backup is built under until it is complete: then <pid>-<its final name>. */
-const PARTIAL_PREFIX = ".croft-partial-";
+export const PARTIAL_PREFIX = ".croft-partial-";
 /** safety/trash.ts TRASH_DIR, named here: that module loads what doctor, which imports this one, must not. */
-const TRASH_FOLDER = "trash";
+export const TRASH_FOLDER = "trash";
 
 export interface ProjectBackupOptions {
   /** The folder the backup's own folder is made in; default <state>/backups. Created when missing. */
@@ -481,6 +481,8 @@ export interface ProjectBackup {
   heldMs: number;
   duckdb: string;
   formatVersion: string | null;
+  /** A lake project's backup (D151): `warehouse` is then the catalog's dump, and this says what else it holds. Absent for a file. */
+  lake?: import("./lake-backup.ts").LakeBackupInfo;
 }
 
 /** Back up the project's data, the warehouse, runs.sqlite and the trash as one moment, to a new folder. */
@@ -580,7 +582,7 @@ export async function backupProject(project: Pick<Project, "root" | "timezone" |
 }
 
 /** The folder to make the backup in. Inside the state folder only its backups/ will do: the rest is what is copied. */
-function destination(dir: string, stateDir: string): string {
+export function destination(dir: string, stateDir: string): string {
   const at = physicalPath(dir).path;
   const state = physicalPath(stateDir).path;
   const backups = join(state, BACKUPS_DIR);
@@ -603,7 +605,7 @@ function destination(dir: string, stateDir: string): string {
   return at;
 }
 
-function ensureDir(dir: string): string {
+export function ensureDir(dir: string): string {
   try {
     mkdirSync(dir, { recursive: true });
   } catch (e) {
@@ -612,7 +614,7 @@ function ensureDir(dir: string): string {
   return dir;
 }
 
-function notWritten(dir: string, e: unknown): CroftError {
+export function notWritten(dir: string, e: unknown): CroftError {
   const why = String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 300);
   const errno = (e as NodeJS.ErrnoException)?.code;
   return new CroftError("PROJECT_NOT_WRITABLE", {
@@ -625,7 +627,7 @@ function notWritten(dir: string, e: unknown): CroftError {
 }
 
 /** runs.sqlite as of now, written whole by SQLite itself: a read transaction, so its writers are not held up. */
-function vacuumInto(stateDir: string, to: string): void {
+export function vacuumInto(stateDir: string, to: string): void {
   const db = RunsDb.open(stateDir);
   try {
     db.sqlite.run("VACUUM INTO ?", [to]);
@@ -635,7 +637,7 @@ function vacuumInto(stateDir: string, to: string): void {
 }
 
 /** Whether the trash holds any version (a folder per asset, each with <time>.duckdb files). */
-function hasVersions(trash: string): boolean {
+export function hasVersions(trash: string): boolean {
   try {
     return readdirSync(trash, { recursive: true }).some((f) => String(f).endsWith(".duckdb"));
   } catch {
@@ -644,7 +646,7 @@ function hasVersions(trash: string): boolean {
 }
 
 /** Every file under `dir`, relative to it with / separators, and its size (a stat each). */
-function listFiles(dir: string): BackupFile[] {
+export function listFiles(dir: string): BackupFile[] {
   const out: BackupFile[] = [];
   for (const f of readdirSync(dir, { recursive: true }).map(String).sort()) {
     const st = statSync(join(dir, f));
@@ -654,7 +656,7 @@ function listFiles(dir: string): BackupFile[] {
 }
 
 /** `name` in `dir`, or name-2, name-3… when it is taken: a backup never replaces another. */
-function freeName(dir: string, name: string): string {
+export function freeName(dir: string, name: string): string {
   for (let i = 1; ; i++) {
     const path = join(dir, i === 1 ? name : `${name}-${i}`);
     if (!existsSync(path)) return path;
@@ -662,12 +664,12 @@ function freeName(dir: string, name: string): string {
 }
 
 /** A project folder's name as part of a file name. */
-function nameSafe(name: string): string {
+export function nameSafe(name: string): string {
   return name.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^[._]+/, "") || "croft";
 }
 
 /** Remove the partial backups of processes that are gone (a backup killed halfway). */
-function removePartials(dir: string): void {
+export function removePartials(dir: string): void {
   let names: string[];
   try {
     names = readdirSync(dir);

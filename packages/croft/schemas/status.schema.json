@@ -104,12 +104,16 @@
                   "items": {
                     "$ref": "#/$defs/AddonView"
                   }
+                },
+                "maintenance": {
+                  "$ref": "#/$defs/MaintenanceView"
                 }
               },
               "required": [
                 "kind",
                 "folder",
-                "addons"
+                "addons",
+                "maintenance"
               ],
               "additionalProperties": false
             },
@@ -441,6 +445,9 @@
         },
         "estimatedRequests": {
           "type": "number"
+        },
+        "unit": {
+          "const": "file"
         }
       },
       "required": [
@@ -448,6 +455,56 @@
         "action",
         "rows",
         "downstream"
+      ],
+      "additionalProperties": false
+    },
+    "LakeStats": {
+      "type": "object",
+      "properties": {
+        "snapshots": {
+          "type": "number"
+        },
+        "dataFiles": {
+          "type": "number"
+        },
+        "liveFiles": {
+          "type": "number"
+        },
+        "liveBytes": {
+          "type": "number"
+        },
+        "deleteFiles": {
+          "type": "number"
+        },
+        "inlinedTables": {
+          "type": "number"
+        },
+        "pendingDeletion": {
+          "type": "number"
+        },
+        "oldestSnapshotAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "newestSnapshotAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        }
+      },
+      "required": [
+        "snapshots",
+        "dataFiles",
+        "liveFiles",
+        "liveBytes",
+        "deleteFiles",
+        "inlinedTables",
+        "pendingDeletion",
+        "oldestSnapshotAt",
+        "newestSnapshotAt"
       ],
       "additionalProperties": false
     },
@@ -475,6 +532,118 @@
         "at",
         "status",
         "code"
+      ],
+      "additionalProperties": false
+    },
+    "MaintenanceView": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "everyHours": {
+          "type": "number"
+        },
+        "lastOkAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "lastAttemptAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "nextDueAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "lastPass": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "ok": {
+                  "type": "boolean"
+                },
+                "tookMs": {
+                  "type": "number"
+                },
+                "expired": {
+                  "type": "number"
+                },
+                "before": {
+                  "$ref": "#/$defs/LakeStats"
+                },
+                "after": {
+                  "$ref": "#/$defs/LakeStats"
+                }
+              },
+              "required": [
+                "ok",
+                "tookMs",
+                "expired",
+                "before",
+                "after"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lastError": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "at": {
+                  "type": "string"
+                },
+                "step": {
+                  "enum": [
+                    "cleanup",
+                    "expire",
+                    "flush",
+                    "merge",
+                    "rewrite",
+                    null
+                  ]
+                },
+                "code": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "at",
+                "step",
+                "code",
+                "message"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "enabled",
+        "everyHours",
+        "lastOkAt",
+        "lastAttemptAt",
+        "nextDueAt",
+        "lastPass",
+        "lastError"
       ],
       "additionalProperties": false
     },

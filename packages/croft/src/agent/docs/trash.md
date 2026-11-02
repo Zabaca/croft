@@ -72,6 +72,15 @@ CONFIRMATION_STALE and changes nothing; run the command again for a new token. A
 and consent is for one action: once one token carries a command out, every other token for the same command is
 spent too, and a token minted before the table was written, rebuilt or restored is stale.
 
+## In a lake
+
+The trash is the same local files, on the writing machine. A lake also keeps its own history, a second way back:
+every snapshot of the last 30 days and each table's 5 newest versions can be read as they were (`SELECT ... FROM t AT
+(VERSION => <n>)` in DuckDB; croft docs lake). The lake's maintenance (croft maintain, run by croft itself) expires
+snapshots only outside that promise. A trashed version in a lake records the lake's snapshot it was taken from
+(lakeSnapshot in its sidecar), and that snapshot is kept for as long as the version is in the trash. The maintenance
+also prunes the trash by the same rule, so the lake and the trash let a version go together.
+
 ## Backups before an engine upgrade
 
 When a croft upgrade brings a newer DuckDB, croft copies warehouse.duckdb (and warehouse.duckdb.wal, when there is

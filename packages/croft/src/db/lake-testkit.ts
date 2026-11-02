@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { extensionsReady, IN_CI } from "./extension-dir-testkit.ts";
 import type { LakeConnection } from "./lake.ts";
 import type { ModeSpec } from "./modes.ts";
+import type { DuckWarehouse } from "./warehouse.ts";
 import { postgresBin, startPostgres, startS3, type TestPostgres, type TestS3 } from "./mode-testkit.ts";
 
 export const WRITER_LOGIN = { user: "lakew", password: "test-writer-password" };
@@ -122,6 +123,136 @@ export function rigConnection(rig: LakeRig, lake: RigLake, o: { stateDir: string
     },
   });
   return { label: `lake s3://${lake.bucket}/${lake.folder}/`, kind: "postgres", secretDir: join(o.stateDir, "lake-secrets"), secretNames: [], mode };
+}
+
+/** A local lake (a SQLite catalog and a folder in `dir`) as a warehouse opens it, with no project. For tests of the warehouse itself. */
+export function localLakeConnection(o: { dir: string; stateDir: string; extensionDir: string }): LakeConnection {
+  const secretDir = join(o.stateDir, "lake-secrets");
+  mkdirSync(join(o.dir, "data"), { recursive: true });
+  const mode = (access: "write" | "read"): ModeSpec => ({
+    kind: "lake-local", extensionDir: o.extensionDir, secretDir,
+    lake: { catalog: { kind: "sqlite", path: join(o.dir, "catalog.sqlite") }, dataPath: `${join(o.dir, "data")}/`, access },
+  });
+  return { label: `lake ${o.dir}`, kind: "local", secretDir, secretNames: [], mode };
+}
+
+/**
+ * The clock of a lake's snapshots, for tests that need weeks to pass. DuckLake stamps a snapshot with the time of its commit, which a test
+ * cannot move, and the promise of the lake's maintenance is about their age (30 days); so a test says, after each step, "the snapshots made
+ * since I last said were made at this time", and the catalog's own record is changed to match (a test of croft's maintenance with a
+ * CROFT_NOW as the project's clock). Nothing here is croft's own code path.
+ */
+export interface LakeClock {
+  /** The id of the newest snapshot. */
+  newest(): Promise<number>;
+  /** The snapshots made since the last call (or all of them, the first time) were made at `at`. Returns the newest snapshot's id. */
+  mark(at: Date): Promise<number>;
+  /** Snapshot `id` was made at `at`, whatever was said before. */
+  setTime(id: number, at: Date): Promise<void>;
+  /** Another tool set an option on the lake (its own set_option call, which croft's code never runs): written into the catalog. */
+  setOption(name: string, value: string): Promise<void>;
+}
+
+const stamp = (at: Date): string => at.toISOString().replace("T", " ").replace("Z", "+00");
+
+function clockOver(run: (sql: string) => Promise<string>): LakeClock {
+  let watermark = -1;
+  const newest = async (): Promise<number> => Number(await run("SELECT max(snapshot_id) FROM ducklake_snapshot"));
+  return {
+    newest,
+    async mark(at) {
+      const top = await newest();
+      await run(`UPDATE ducklake_snapshot SET snapshot_time = '${stamp(at)}' WHERE snapshot_id > ${watermark} AND snapshot_id <= ${top}`);
+      watermark = top;
+      return top;
+    },
+    async setTime(id, at) {
+      await run(`UPDATE ducklake_snapshot SET snapshot_time = '${stamp(at)}' WHERE snapshot_id = ${id}`);
+    },
+    async setOption(name, value) {
+      await run(`INSERT INTO ducklake_metadata (key, value) VALUES ('${name}', '${value}')`);
+    },
+  };
+}
+
+/** The clock of a local lake: its SQLite catalog. */
+export function sqliteLakeClock(catalogPath: string): LakeClock {
+  return clockOver(async (sql) => {
+    const { Database } = await import("bun:sqlite");
+    const db = new Database(catalogPath);
+    try {
+      db.exec("PRAGMA busy_timeout = 10000");
+      if (/^\s*select/i.test(sql)) return String(Object.values((db.query(sql).get() as Record<string, unknown> | null) ?? {})[0] ?? "");
+      db.exec(sql);
+      return "";
+    } finally {
+      db.close();
+    }
+  });
+}
+
+/** The clock of a Postgres lake: its catalog database, as the test's superuser. */
+export function postgresLakeClock(rig: Pick<LakeRig, "pg">, db: string): LakeClock {
+  return clockOver((sql) => rig.pg.sql(sql, db));
+}
+
+export type TestLakeKind = "local" | "postgres";
+
+/** A lake with a writing warehouse, a read-only one, and the clock of its snapshots, with no project around it. */
+export interface TestLake {
+  kind: TestLakeKind;
+  w: DuckWarehouse;
+  r: DuckWarehouse;
+  clock: LakeClock;
+  conn: LakeConnection;
+  root: string;
+  stateDir: string;
+  /** The folder on disk that holds the lake's data files (the local lake's, or the store's folder for the lake's bucket folder). */
+  dataDir: string;
+  /** Postgres: the catalog's database. */
+  db?: string;
+  /** Postgres: the store, for faults. */
+  s3?: TestS3;
+  close(): Promise<void>;
+}
+
+/**
+ * A new lake of `kind` in a new folder. A Postgres lake needs the rig (`startLakeRig`); a local one only the extension files. Its warehouses are
+ * registered under paths of their own, so one process holds many lakes.
+ */
+export async function openTestLake(kind: TestLakeKind, o: { extensionDir: string; rig?: LakeRig; waits?: Partial<{ offTtyMs: number }>; stateDir?: string }): Promise<TestLake> {
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { openWarehouse } = await import("./warehouse.ts");
+  const root = mkdtempSync(join(tmpdir(), "croft-testlake-"));
+  const stateDir = o.stateDir ?? join(root, ".croft");
+  mkdirSync(stateDir, { recursive: true });
+  let conn: LakeConnection;
+  let clock: LakeClock;
+  let dataDir: string;
+  let db: string | undefined;
+  if (kind === "local") {
+    conn = localLakeConnection({ dir: join(root, "lake"), stateDir, extensionDir: o.extensionDir });
+    clock = sqliteLakeClock(join(root, "lake", "catalog.sqlite"));
+    dataDir = join(root, "lake", "data");
+  } else {
+    if (!o.rig) throw new Error("a Postgres test lake needs the rig");
+    const lake = await o.rig.lake();
+    conn = rigConnection(o.rig, lake, { stateDir, extensionDir: o.extensionDir });
+    clock = postgresLakeClock(o.rig, lake.db);
+    dataDir = lake.files;
+    db = lake.db;
+  }
+  const base = { path: join(root, "w.duckdb"), timezone: "UTC", root, stateDir, lake: conn, isTTY: false, register: false };
+  const w = openWarehouse({ ...base, mode: "read_write", ...(o.waits ? { waits: o.waits } : {}) });
+  const r = openWarehouse({ ...base, path: join(root, "r.duckdb"), mode: "read_only", profile: "query" });
+  return {
+    kind, w, r, clock, conn, root, stateDir, dataDir, ...(db ? { db } : {}), ...(o.rig ? { s3: o.rig.s3 } : {}),
+    async close() {
+      await w.close();
+      await r.close();
+    },
+  };
 }
 
 /** The `lake` block of a local lake (a SQLite catalog and a folder), both under `lake/` in the project. */

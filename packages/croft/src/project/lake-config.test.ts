@@ -45,6 +45,7 @@ describe("a shared lake", () => {
         writer: { user: "croft_writer", passwordSecret: "LAKE_WRITER_PASSWORD" }, reader: { user: "croft_reader", passwordSecret: "LAKE_READER_PASSWORD" } },
       bucket: { name: "my-bucket", folder: "croft/orders/", urlStyle: "path", useSsl: true,
         writer: { keyIdSecret: "LAKE_WRITER_KEY_ID", secretKeySecret: "LAKE_WRITER_KEY" }, reader: { keyIdSecret: "LAKE_READER_KEY_ID", secretKeySecret: "LAKE_READER_KEY" } },
+      maintenance: { enabled: true, everyHours: 24 },
     });
     const lake = r.config.lake!;
     expect(bucketPath((lake as unknown as { bucket: never }).bucket)).toBe("s3://my-bucket/croft/orders/");
@@ -108,6 +109,29 @@ describe("a shared lake", () => {
   });
 });
 
+describe("a lake's maintenance setting (D150)", () => {
+  const maint = (m: unknown) => {
+    const r = validateConfig({ ...tz, lake: { ...shared(), maintenance: m } });
+    return r.ok ? r.config.lake?.maintenance : r.issues.map((i) => i.message);
+  };
+
+  test("is on, every 24 hours, unless the project says otherwise", () => {
+    expect(maint(undefined)).toEqual({ enabled: true, everyHours: 24 });
+    expect(maint({})).toEqual({ enabled: true, everyHours: 24 });
+    expect(maint({ enabled: false })).toEqual({ enabled: false, everyHours: 24 });
+    expect(maint({ everyHours: 6 })).toEqual({ enabled: true, everyHours: 6 });
+  });
+
+  test("what a pass keeps is not a setting, and a wrong value names its key", () => {
+    const m = (v: unknown) => (maint(v) as string[]).join(" | ");
+    expect(m({ keepDays: 7 })).toContain("keepDays");
+    expect(m({ everyHours: 0 })).toContain("lake.maintenance.everyHours");
+    expect(m({ everyHours: 721 })).toContain("lake.maintenance.everyHours");
+    expect(m({ enabled: "yes" })).toContain("lake.maintenance.enabled");
+    expect(m("daily")).toContain('"lake.maintenance" must be an object');
+  });
+});
+
 describe("a local lake", () => {
   test("is croft's own tests' alone: croft.json refuses it without the harness mark, as the log switch needs one (D137)", () => {
     const mark = process.env.CROFT_TEST_HARNESS;
@@ -125,7 +149,7 @@ describe("a local lake", () => {
 
   test("is a SQLite catalog and a folder, both as written", () => {
     const r = validateConfig({ ...tz, lake: local });
-    expect(r.ok && r.config.lake).toEqual({ kind: "local", catalog: { path: "lake/catalog.sqlite" }, dataPath: "lake/data" });
+    expect(r.ok && r.config.lake).toEqual({ kind: "local", catalog: { path: "lake/catalog.sqlite" }, dataPath: "lake/data", maintenance: { enabled: true, everyHours: 24 } });
     const root = "/p/proj";
     expect(localLakePaths(r.ok && r.config.lake?.kind === "local" ? r.config.lake : (null as never), root)).toEqual({ catalog: "/p/proj/lake/catalog.sqlite", data: "/p/proj/lake/data" });
     expect(lakeLabel(r.ok ? r.config.lake! : (null as never), root)).toBe("lake lake/catalog.sqlite");

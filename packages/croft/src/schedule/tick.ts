@@ -64,6 +64,15 @@ export const spawnDueRun: RunSpawner = async (r) => {
   });
 };
 
+/** Starts the lake's maintenance (`croft maintain --due`), detached; throws when it cannot. */
+export type MaintenanceSpawner = (r: { root: string; stateDir: string; env: Record<string, string | undefined> }) => Promise<void>;
+
+/** run/detach.ts spawnDetachedMaintain, loaded only when a pass is due. */
+export const spawnLakeMaintenance: MaintenanceSpawner = async (r) => {
+  const { spawnDetachedMaintain } = await import("../run/detach.ts");
+  spawnDetachedMaintain({ root: r.root, stateDir: r.stateDir, env: r.env, execPath: process.execPath });
+};
+
 export interface TickInput {
   project: Project;
   /** The environment of the runs it starts (the tick's own, given to them explicitly). */
@@ -71,6 +80,8 @@ export interface TickInput {
   /** CROFT_NOW-aware. */
   now: Date;
   spawn?: RunSpawner;
+  /** Starts the lake's maintenance when one is due (default: a detached `croft maintain --due`). */
+  maintain?: MaintenanceSpawner;
   /** This tick's process (tests run two in one process). */
   identity?: ProcessIdentity;
   /** Whether a recorded process still runs (the tick singleton, leases, runs a tick started). */
@@ -171,8 +182,10 @@ export async function projectTick(i: TickInput): Promise<TickOutcome> {
         runs.setSetting(SPAWNED_SETTING, noted);
         runs.setSetting(FAILED_STARTS_SETTING, failedStarts);
       });
+      // A lake that is due for its maintenance gets it started here, beside the runs: never inline (a tick only plans and spawns).
+      const maintenance = await startLakeMaintenance(project, runs, now, i.maintain ?? spawnLakeMaintenance, env, problems);
       return {
-        result: result({ heartbeatAt, spawned: started, held: work.held, importedAssetCode: work.imported }),
+        result: result({ heartbeatAt, spawned: started, held: work.held, importedAssetCode: work.imported, ...(maintenance ? { maintenance: true as const } : {}) }),
         problems,
       };
     } finally {
@@ -180,6 +193,31 @@ export async function projectTick(i: TickInput): Promise<TickOutcome> {
     }
   } finally {
     runs.close();
+  }
+}
+
+/**
+ * Start the lake's maintenance if the project has a lake, maintenance is on and a pass is due (db/lake-pass.ts maintenanceDue, from
+ * runs.sqlite alone: no DuckDB here). The tick notes it before it starts the child, so the next minute's tick does not start a second while
+ * the first is starting; the child's own claim keeps two from running at once. A spawn that fails is a warning of this tick, not its failure.
+ */
+async function startLakeMaintenance(project: Project, runs: RunsDb, now: Date, spawn: MaintenanceSpawner, env: Record<string, string | undefined>, problems: Problem[]): Promise<boolean> {
+  const lake = project.config.lake;
+  if (!lake || !lake.maintenance.enabled) return false;
+  const { ensureState, maintenanceDue, noteSpawned } = await import("../db/lake-maintenance-state.ts");
+  const state = ensureState(runs, now);
+  if (!maintenanceDue(state, lake.maintenance, now).due) return false;
+  noteSpawned(runs, now);
+  try {
+    await spawn({ root: project.root, stateDir: project.paths.stateDir, env: { ...env, [CONFIRM_GRANT_ENV]: undefined } });
+    return true;
+  } catch (e) {
+    problems.push(new CroftError("INTERNAL_ERROR", {
+      message: `the scheduler could not start the lake's maintenance: ${(e as Error)?.message ?? String(e)}`,
+      hint: "check that Bun and the project's croft are installed (croft doctor); croft tries again at the next tick",
+      effect: "the lake's maintenance waits",
+    }).problem);
+    return false;
   }
 }
 

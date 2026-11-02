@@ -79,5 +79,7 @@ export interface TickResult {
   held: { asset: string; code: string; reason: string }[];
   /** Whether asset code was imported (it is not when nothing is due and no file changed). */
   importedAssetCode: boolean;
+  /** Set when this tick started the lake's maintenance (a detached `croft maintain --due`; D150). Absent otherwise. */
+  maintenance?: true;
   tookMs: number;
 }

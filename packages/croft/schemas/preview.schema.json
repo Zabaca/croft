@@ -251,6 +251,9 @@
         },
         "estimatedRequests": {
           "type": "number"
+        },
+        "unit": {
+          "const": "file"
         }
       },
       "required": [

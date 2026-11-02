@@ -584,6 +584,7 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
       parts.push(mine ? `last written ${when(mine.at)} by this machine` : newest ? `last written ${when(newest.at)} by ${newest.host || newest.machine}; this machine has not written it` : "no write recorded yet");
       r.add("environment", "warehouse", "ok", parts.join(" · "), undefined, details);
     }
+    if (meta.format_version) await checkLakeMaintenance(r, d, project, w);
   } catch (e) {
     if (!(e instanceof CroftError)) {
       const first = String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 200);
@@ -599,6 +600,57 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
     }
   } finally {
     await w?.close();
+  }
+}
+
+/**
+ * The lake's maintenance line (D150; option 07, slice 3): when the last pass worked, and what the lake holds now (snapshots, files,
+ * the tables that keep small inserts inside the catalog, and files freed but not yet deleted). A pass that failed is
+ * LAKE_MAINTENANCE_FAILED, a warning; and an age-based expiry set on the lake by anyone is LAKE_EXPIRY_OPTION, a warning, since a
+ * CHECKPOINT by that tool would expire versions the trash promises (croft's own pass expires by an explicit list and ignores it).
+ */
+async function checkLakeMaintenance(r: Report, d: DoctorDeps, project: Project, w: import("../../db/warehouse.ts").DuckWarehouse): Promise<void> {
+  const lake = project.config.lake!;
+  const { lakeStats, ageBasedExpiryOptions } = await import("../../db/lake-maintenance.ts");
+  const { maintenanceView, readState } = await import("../../db/lake-maintenance-state.ts");
+  const at = now(d.env);
+  let seen;
+  try {
+    seen = await w.read(async (db) => ({ stats: await lakeStats(db), options: await ageBasedExpiryOptions(db) }), { waitMs: d.lockWaitMs, purpose: "doctor" });
+  } catch (e) {
+    const first = String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 200);
+    r.add("environment", "lake.maintenance", "info", `maintenance: the lake's counts could not be read (${first})`);
+    return;
+  }
+  let state = null;
+  if (existsSync(join(project.paths.stateDir, RUNS_DB_FILE))) {
+    const runs = RunsDb.open(project.paths.stateDir);
+    try {
+      state = readState(runs);
+    } finally {
+      runs.close();
+    }
+  }
+  const view = maintenanceView(state, lake.maintenance, at);
+  const s = seen.stats;
+  const held = `${formatCount(s.snapshots)} snapshots · ${formatCount(s.dataFiles)} files (${formatCount(s.liveFiles)} read now, ${formatBytes(s.liveBytes)}) · ${formatCount(s.inlinedTables)} tables of rows kept in the catalog · ${formatCount(s.pendingDeletion)} files waiting for deletion`;
+  const last = !view.enabled ? "off (lake.maintenance.enabled is false; croft maintain runs a pass by hand)"
+    : view.lastOkAt ? `every ${view.everyHours} h; last pass that worked ${agoText(view.lastOkAt, at)}`
+      : `every ${view.everyHours} h; no pass yet${view.nextDueAt ? ` (the first is due ${Date.parse(view.nextDueAt) <= at.getTime() ? "now" : `at ${clockText(view.nextDueAt, project.timezone, at)}`})` : ""}`;
+  const details = { ...view, lake: s, expiryOptions: seen.options };
+  if (view.lastError) {
+    const p = { ...problem("LAKE_MAINTENANCE_FAILED", {
+      message: `the last maintenance pass failed${view.lastError.step ? ` at the ${view.lastError.step} step` : ""} ${agoText(view.lastError.at, at)}: ${view.lastError.message}`,
+      hint: "the lake is usable and nothing was lost; croft tries again within the hour, or croft maintain now (croft docs LAKE_MAINTENANCE_FAILED)", retryable: true,
+    }), severity: "warning" as const };
+    r.add("environment", "lake.maintenance", "warn", `maintenance: ${last} · ${p.message} · ${held}`, p, details);
+  } else {
+    r.add("environment", "lake.maintenance", "ok", `maintenance: ${last} · ${held}`, undefined, details);
+  }
+  if (seen.options.length) {
+    const { expiryOptionProblem } = await import("./maintain.ts");
+    const p = expiryOptionProblem(seen.options);
+    r.add("environment", "lake.expiry", "warn", p.message, p, { options: seen.options });
   }
 }
 

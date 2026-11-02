@@ -27,6 +27,7 @@ import { CroftError } from "../core/errors.ts";
 import { now as clockNow } from "../core/time.ts";
 import type { Sql } from "../core/types.ts";
 import { ASSET_TABLES, assetColumn, stateObjects } from "../db/bookkeeping.ts";
+import { LAKE_ALIAS } from "../db/modes.ts";
 import { CROFT_VERSION } from "../db/state.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
 import type { RunsDb } from "../history/runs-db.ts";
@@ -56,6 +57,10 @@ export interface TrashEntry {
   kind: TrashKind;
   /** The predicate of a "rows" version; null for a whole table. */
   where: string | null;
+  /** In a lake: the id of the lake's snapshot the version was taken from. The lake's maintenance keeps that snapshot for as long as
+   *  the version is in the trash (db/lake-maintenance.ts), so the lake itself can still be read as it was when the version was trashed
+   *  (a table read AT a VERSION), a second way back beside the trash file. Absent for a file warehouse and for older versions. */
+  lakeSnapshot?: number;
   /** false: a "rows" version whose delete was never recorded as done (it stopped between the two commits, or was
    *  refused), or a version with no sidecar (a crash right after the trash commit). Absent otherwise. */
   applied?: false;
@@ -110,6 +115,9 @@ export async function trashTable(warehouse: DuckWarehouse, asset: string, reason
     const db = await currentDatabase(sql);
     const columns = await readTableSchema(sql, asset, db);
     if (!columns) return null;
+    // In a lake the version is also the lake as it is now: the snapshot is noted, so maintenance keeps it while the version is here.
+    // This machine's writers are held off by the lock this write holds, so the snapshot is the one the copy below reads.
+    const lakeSnapshot = warehouse.isLake ? await currentSnapshot(sql) : null;
     await sql.exec(`ATTACH ${quoteLiteral(path)} AS ${quoteIdent(alias)}`);
     try {
       await sql.exec("BEGIN TRANSACTION");
@@ -130,7 +138,7 @@ export async function trashTable(warehouse: DuckWarehouse, asset: string, reason
         [asset, reason, o.runId ?? null, at.toISOString(), CROFT_VERSION, kind, where]);
         const [row] = await sql.all<{ n: number | bigint }>(`SELECT count(*) AS n FROM ${t}.main.${quoteIdent(asset)}`);
         await sql.exec("COMMIT");
-        return { rows: Number(row?.n ?? 0) };
+        return { rows: Number(row?.n ?? 0), lakeSnapshot };
       } catch (e) {
         try {
           await sql.exec("ROLLBACK");
@@ -144,7 +152,8 @@ export async function trashTable(warehouse: DuckWarehouse, asset: string, reason
   if (!entry) return null;
   const out: TrashEntry = {
     asset, path, trashedAt: at.toISOString(), reason, runId: o.runId ?? null, rows: entry.rows,
-    bytes: fileSize(path), croftVersion: CROFT_VERSION, kind, where, ...(o.pending ? { applied: false as const } : {}),
+    bytes: fileSize(path), croftVersion: CROFT_VERSION, kind, where, ...(entry.lakeSnapshot !== null ? { lakeSnapshot: entry.lakeSnapshot } : {}),
+    ...(o.pending ? { applied: false as const } : {}),
   };
   const meta = join(dir, `${stamp}.json`);
   writeFileSync(`${meta}.tmp`, JSON.stringify(out, null, 1));
@@ -155,6 +164,16 @@ export async function trashTable(warehouse: DuckWarehouse, asset: string, reason
     // Housekeeping only: croft doctor or the next trash of this asset tries again.
   }
   return out;
+}
+
+/** The id of the lake's current snapshot, or null when it cannot be read (the version is then simply not pinned). */
+async function currentSnapshot(sql: Sql): Promise<number | null> {
+  try {
+    const [row] = await sql.all<{ id: number | bigint }>(`SELECT id FROM ${LAKE_ALIAS}.current_snapshot()`);
+    return row ? Number(row.id) : null;
+  } catch {
+    return null;
+  }
 }
 
 function fileSize(path: string): number {
@@ -198,6 +217,7 @@ export function listTrash(stateDir: string, asset?: string): TrashEntry[] {
         reason: meta.reason ?? "unknown", runId: meta.runId ?? null, rows: meta.rows ?? 0, bytes: fileSize(path),
         croftVersion: meta.croftVersion ?? "unknown", kind: meta.kind === "rows" ? "rows" : "table",
         where: meta.kind === "rows" && typeof meta.where === "string" ? meta.where : null,
+        ...(typeof meta.lakeSnapshot === "number" ? { lakeSnapshot: meta.lakeSnapshot } : {}),
         ...(!sidecar || meta.applied === false ? { applied: false as const } : {}),
       });
     }
@@ -287,6 +307,12 @@ export function pruneTrash(stateDir: string, o: { asset?: string; now?: Date; ke
     }
   }
   return pruned;
+}
+
+/** The lake snapshots the trash pins: those its versions were taken from (TrashEntry.lakeSnapshot). A version the pruning has removed pins
+ *  nothing, so the lake's maintenance, which asks after pruning the trash, lets the snapshot go with it. */
+export function pinnedSnapshots(stateDir: string): number[] {
+  return [...new Set(listTrash(stateDir).flatMap((e) => (e.lakeSnapshot !== undefined ? [e.lakeSnapshot] : [])))].sort((a, b) => a - b);
 }
 
 /** Where the next trash file of an asset would go (for a confirmation's impact; the stamp is a guess). */

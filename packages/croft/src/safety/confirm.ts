@@ -72,7 +72,7 @@ function notFound(token: string): CroftError {
 function summarize(i: Impact): string {
   const reqs = i.estimatedRequests !== undefined ? `, ~${i.estimatedRequests} requests` : "";
   const down = i.downstream.length ? `; then ${i.downstream.join(", ")}` : "";
-  return `${i.action} ${i.asset}: ${i.rows} rows${reqs}${down}`;
+  return `${i.action} ${i.asset}: ${i.rows} ${i.unit ?? "row"}s${reqs}${down}`;
 }
 
 export class Confirmations {
@@ -203,7 +203,7 @@ export class Confirmations {
       superseded: `confirmation ${row.token} no longer applies: ${by ? `${by} carried out the same command (${row.command})` : "the same command was carried out (confirmed on a terminal)"}${row.used_at ? ` at ${row.used_at}` : ""}`,
       expired: `confirmation ${row.token} expired at ${row.expires_at} (tokens last 15 minutes)`,
       impact_changed: same
-        ? `the impact changed since it was shown: the table was written or replaced since (now ${summarize(current!)})`
+        ? `the impact changed since it was shown: ${previous.unit === "file" ? "the files are not the ones that were listed" : "the table was written or replaced since"} (now ${summarize(current!)})`
         : `the impact changed since it was shown: now ${current ? summarize(current) : "?"} (was ${summarize(previous)})`,
     }[reason];
     return new CroftError("CONFIRMATION_STALE", {

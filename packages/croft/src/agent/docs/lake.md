@@ -6,8 +6,8 @@ The data then outlives the machine, and readers never wait for a run: everyone r
 committed while the writer works on the next. It is opt-in, and a project that never names a lake is the file it was:
 nothing is loaded, nothing changes.
 
-You use croft as before: `croft run`, `query`, `status`, `describe`, `delete`, `restore`, `rename`, `preview`, the
-scheduler, `croft serve`. Writes stay all-or-nothing with their bookkeeping, checks run before saving, and the trash
+You use croft as before: `croft run`, `query`, `status`, `describe`, `delete`, `restore`, `rename`, `preview`, `backup`,
+the scheduler, `croft serve`; and `croft maintain` for the lake's housekeeping. Writes stay all-or-nothing with their bookkeeping, checks run before saving, and the trash
 stays on the writing machine as local files. What lake mode adds is a setup that is more than "a first warehouse in
 minutes": a Postgres, a bucket folder, two logins and two bucket keys. Turning it on is the user's decision.
 
@@ -62,6 +62,57 @@ A lost connection is mended by croft: a read whose catalog connection dropped is
 as a whole after croft checks by the tag its commit carries whether the commit landed (a landed commit is never run
 again). What is left is LAKE_CONNECTION_LOST or LAKE_COMMIT_UNCERTAIN.
 
+## Maintenance: croft keeps the lake short, and keeps the trash's promise
+
+DuckLake never deletes an old data file by itself. Every commit is a snapshot, a write of a few rows is kept inside the
+catalog, and a replaced file stays until a snapshot expiry and a cleanup say so: a simulated week of hourly runs over
+five assets left 849 snapshots, 841 files, 176 tables of rows kept in the catalog and a 12 MB catalog. So croft runs the
+lake's maintenance itself, one step at a time, in this order:
+
+  flush     the rows DuckLake kept inside the catalog become files
+  expire    the snapshots outside the promise go, by an explicit list croft computes
+  merge     small files become fewer, larger ones (every version still reads back)
+  rewrite   files that are mostly deleted rows are rewritten
+  cleanup   the files nothing refers to are deleted at once (DuckLake waits 2 days by default)
+
+What a pass keeps is the trash's promise (croft docs trash), and it is not a setting: every snapshot of the last 30
+days, the newest snapshot before them (the state when the window began), each asset's 5 newest versions however old (a
+version is a snapshot in which the asset's table changed), and every snapshot the trash pins (the one a trashed version
+was taken from). Everything else is expired. Nothing the promise keeps is ever deleted: a kept version reads back
+exactly (`SELECT ... FROM t AT (VERSION => 41)`, with the number from `FROM lake.snapshots()`), and a version outside
+both limits is gone.
+
+When it runs: after a run, and from the scheduler's tick, once the last pass that worked is `lake.maintenance.everyHours`
+old (24; an hour after a pass that failed). A lake croft has not seen before is stamped when it is first looked at, so
+a new lake is not maintained on its first day. `lake.maintenance.enabled: false` stops this, and `croft maintain` still
+runs a pass by hand. A pass takes croft's lock on the lake's writes for its whole body: it never runs while a write holds
+the lock, and a write waits for it (a pass takes seconds; a long one shows in the wait's message). A pass that fails
+never fails a run: the failure shows in `croft status` and `croft doctor` (LAKE_MAINTENANCE_FAILED, a warning) and croft
+tries again within the hour. A store that answers HTTP 500, or a connection that drops, is tried again four times first.
+
+  croft maintain               a pass now, whatever the interval; --json has each step, the lake's counts before and after
+  croft maintain --dry-run     what a pass would expire and keep, from the read-only login; nothing changes
+  croft maintain --orphans     the files in the lake's folder that the lake does not own and that are a day old: listed,
+                               and deleted only through croft confirm, for exactly that list
+
+`croft maintain` removes nothing the promise keeps, so it needs no confirmation. Deleting files that are not the lake's
+own does, because croft cannot vouch for them: a pass never does it, and they are gone for good.
+
+croft never calls CHECKPOINT on a lake and never sets an option on one (a test holds both, and the warehouse refuses the
+statements). CHECKPOINT runs DuckLake's maintenance from the lake's stored options, so an age-based expiry set by anyone
+would expire a snapshot the trash pinned, and it deletes any file in the folder that is not the lake's. `croft doctor`
+warns with LAKE_EXPIRY_OPTION when an age-based expiry is set on the lake; croft's own pass ignores it.
+
+`croft doctor` and `croft status` show when maintenance last worked and what the lake holds: snapshots, files, the
+tables that keep small inserts inside the catalog, and files freed but not yet deleted.
+
+## Backups of a lake
+
+`croft backup` of a lake copies the catalog with pg_dump (as the read-only login) and mirrors the bucket folder (with
+the read-only key), taken as one moment, with run history and the trash (croft docs backup). It needs the Postgres client
+tools on the machine (LAKE_BACKUP_TOOL_MISSING says how to get them). Writes wait for the catalog's dump, which takes
+seconds, and carry on while the folder is copied; a backup that is copying keeps this machine's maintenance from running.
+
 ## Reading
 
 - `croft query`, `status`, `describe`, `context`, `doctor`: as before.
@@ -92,7 +143,7 @@ USE lake;
 ```
 
   They then query the tables, and `FROM lake.snapshots()` or `SELECT ... FROM t AT (VERSION => <n>)` show the lake as it
-  was. An attempt to write a table, or a file in the bucket, is refused (by the attach, by the store, by Postgres).
+  was, for every version the maintenance keeps (30 days, and each table's 5 newest versions). An attempt to write a table, or a file in the bucket, is refused (by the attach, by the store, by Postgres).
   Never give an analyst the writer's login or key, and never put a password in the ATTACH text: it shows in errors and
   in `duckdb_databases()`.
 
@@ -110,14 +161,10 @@ LAKE_TYPE_UNSUPPORTED and the cast that fixes it (`CAST(col AS VARCHAR)`).
 
 ## Not in this release
 
-- Maintenance. croft does not yet expire snapshots, merge small files or clean up, so a lake grows with every run (and
-  the catalog holds small tables' rows inline). Do not run CHECKPOINT on a lake yourself and do not set an expiry option
-  on it: CHECKPOINT runs DuckLake's maintenance from the lake's stored options, and an age-based expiry would delete
-  versions the trash promises to keep. croft will run each maintenance step itself.
-- `croft backup` (LAKE_UNSUPPORTED): back the lake up with the tools of whoever runs the Postgres and the bucket.
 - Moving an existing project's file into a lake, and server mode over a lake.
 - A lake on one machine with no Postgres (a SQLite catalog and a folder). It exists for croft's own tests, and croft.json refuses it
   otherwise; it may be offered later as its own decision.
 
 Codes: LAKE_ATTACH_FAILED, LAKE_CONNECTION_LOST, LAKE_COMMIT_UNCERTAIN, LAKE_TYPE_UNSUPPORTED, LAKE_DIRECT_READ,
-LAKE_UNSUPPORTED, LAKE_OTHER_WRITER (croft docs <CODE>), and EXTENSION_MISSING when the add-on is not installed.
+LAKE_UNSUPPORTED, LAKE_OTHER_WRITER, LAKE_MAINTENANCE_FAILED, LAKE_EXPIRY_OPTION, LAKE_BACKUP_FAILED,
+LAKE_BACKUP_TOOL_MISSING, MAINTAIN_NEEDS_LAKE (croft docs <CODE>), and EXTENSION_MISSING when the add-on is not installed.

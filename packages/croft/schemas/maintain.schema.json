@@ -1,0 +1,763 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "croft maintain --json",
+  "description": "The envelope croft maintain --json prints on stdout (DESIGN.md §4.3). data is null when the command failed before it had any.",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "command": {
+      "const": "maintain"
+    },
+    "croftVersion": {
+      "type": "string"
+    },
+    "database": {
+      "type": "string"
+    },
+    "timezone": {
+      "type": "string"
+    },
+    "durationMs": {
+      "type": "number"
+    },
+    "data": {
+      "anyOf": [
+        {
+          "title": "MaintainData",
+          "type": "object",
+          "properties": {
+            "lake": {
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "backup_running",
+                "busy",
+                "declined",
+                "failed",
+                "needs_confirmation",
+                "no_lake",
+                "not_due",
+                "orphans",
+                "orphans_deleted",
+                "planned",
+                "ran",
+                "running"
+              ]
+            },
+            "report": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PassReport"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "plan": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/MaintenancePlan"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "orphans": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "files": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "deleted": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "files",
+                    "deleted"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "auto": {
+              "$ref": "#/$defs/MaintenanceView"
+            },
+            "redactedValues": {
+              "const": true
+            }
+          },
+          "required": [
+            "lake",
+            "status",
+            "report",
+            "plan",
+            "orphans",
+            "auto"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "problems": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Problem"
+      }
+    },
+    "next": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "reason"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "confirmation": {
+      "$ref": "#/$defs/Confirmation"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "ok",
+    "command",
+    "croftVersion",
+    "database",
+    "timezone",
+    "durationMs",
+    "data",
+    "problems",
+    "next"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "Confirmation": {
+      "type": "object",
+      "properties": {
+        "token": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "impact": {
+          "$ref": "#/$defs/Impact"
+        }
+      },
+      "required": [
+        "token",
+        "expiresAt",
+        "command",
+        "impact"
+      ],
+      "additionalProperties": false
+    },
+    "ExpiryOption": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "additionalProperties": false
+    },
+    "Fix": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "command"
+            },
+            "description": {
+              "type": "string"
+            },
+            "command": {
+              "type": "string"
+            },
+            "requiresHuman": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "description",
+            "command"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "edit"
+            },
+            "description": {
+              "type": "string"
+            },
+            "file": {
+              "type": "string"
+            },
+            "line": {
+              "type": "number"
+            },
+            "replace": {
+              "type": "object",
+              "properties": {
+                "from": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "from",
+                "to"
+              ],
+              "additionalProperties": false
+            },
+            "insert": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "description",
+            "file"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "manual"
+            },
+            "description": {
+              "type": "string"
+            },
+            "requiresHuman": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "description"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Impact": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        },
+        "rows": {
+          "type": "number"
+        },
+        "bytes": {
+          "type": "number"
+        },
+        "trashPath": {
+          "type": "string"
+        },
+        "downstream": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "estimatedRequests": {
+          "type": "number"
+        },
+        "unit": {
+          "const": "file"
+        }
+      },
+      "required": [
+        "asset",
+        "action",
+        "rows",
+        "downstream"
+      ],
+      "additionalProperties": false
+    },
+    "LakeStats": {
+      "type": "object",
+      "properties": {
+        "snapshots": {
+          "type": "number"
+        },
+        "dataFiles": {
+          "type": "number"
+        },
+        "liveFiles": {
+          "type": "number"
+        },
+        "liveBytes": {
+          "type": "number"
+        },
+        "deleteFiles": {
+          "type": "number"
+        },
+        "inlinedTables": {
+          "type": "number"
+        },
+        "pendingDeletion": {
+          "type": "number"
+        },
+        "oldestSnapshotAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "newestSnapshotAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        }
+      },
+      "required": [
+        "snapshots",
+        "dataFiles",
+        "liveFiles",
+        "liveBytes",
+        "deleteFiles",
+        "inlinedTables",
+        "pendingDeletion",
+        "oldestSnapshotAt",
+        "newestSnapshotAt"
+      ],
+      "additionalProperties": false
+    },
+    "MaintenancePlan": {
+      "type": "object",
+      "properties": {
+        "stats": {
+          "$ref": "#/$defs/LakeStats"
+        },
+        "expire": {
+          "type": "number"
+        },
+        "total": {
+          "type": "number"
+        },
+        "kept": {
+          "type": "number"
+        },
+        "because": {
+          "type": "object",
+          "properties": {
+            "window": {
+              "type": "number"
+            },
+            "windowStart": {
+              "type": "number"
+            },
+            "versions": {
+              "type": "number"
+            },
+            "pinned": {
+              "type": "number"
+            },
+            "latest": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "window",
+            "windowStart",
+            "versions",
+            "pinned",
+            "latest"
+          ],
+          "additionalProperties": false
+        },
+        "assets": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number"
+          }
+        },
+        "pins": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        },
+        "expiryOptions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExpiryOption"
+          }
+        }
+      },
+      "required": [
+        "stats",
+        "expire",
+        "total",
+        "kept",
+        "because",
+        "assets",
+        "pins",
+        "expiryOptions"
+      ],
+      "additionalProperties": false
+    },
+    "MaintenanceView": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "everyHours": {
+          "type": "number"
+        },
+        "lastOkAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "lastAttemptAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "nextDueAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "lastPass": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "ok": {
+                  "type": "boolean"
+                },
+                "tookMs": {
+                  "type": "number"
+                },
+                "expired": {
+                  "type": "number"
+                },
+                "before": {
+                  "$ref": "#/$defs/LakeStats"
+                },
+                "after": {
+                  "$ref": "#/$defs/LakeStats"
+                }
+              },
+              "required": [
+                "ok",
+                "tookMs",
+                "expired",
+                "before",
+                "after"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lastError": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "at": {
+                  "type": "string"
+                },
+                "step": {
+                  "enum": [
+                    "cleanup",
+                    "expire",
+                    "flush",
+                    "merge",
+                    "rewrite",
+                    null
+                  ]
+                },
+                "code": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "at",
+                "step",
+                "code",
+                "message"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "enabled",
+        "everyHours",
+        "lastOkAt",
+        "lastAttemptAt",
+        "nextDueAt",
+        "lastPass",
+        "lastError"
+      ],
+      "additionalProperties": false
+    },
+    "PassReport": {
+      "type": "object",
+      "properties": {
+        "startedAt": {
+          "type": "string"
+        },
+        "tookMs": {
+          "type": "number"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StepReport"
+          }
+        },
+        "before": {
+          "$ref": "#/$defs/LakeStats"
+        },
+        "after": {
+          "$ref": "#/$defs/LakeStats"
+        },
+        "plan": {
+          "type": "object",
+          "properties": {
+            "kept": {
+              "type": "number"
+            },
+            "total": {
+              "type": "number"
+            },
+            "because": {
+              "type": "object",
+              "properties": {
+                "window": {
+                  "type": "number"
+                },
+                "windowStart": {
+                  "type": "number"
+                },
+                "versions": {
+                  "type": "number"
+                },
+                "pinned": {
+                  "type": "number"
+                },
+                "latest": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "window",
+                "windowStart",
+                "versions",
+                "pinned",
+                "latest"
+              ],
+              "additionalProperties": false
+            },
+            "assets": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "number"
+              }
+            },
+            "expired": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "kept",
+            "total",
+            "because",
+            "assets",
+            "expired"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "startedAt",
+        "tookMs",
+        "ok",
+        "steps",
+        "before",
+        "after",
+        "plan"
+      ],
+      "additionalProperties": false
+    },
+    "Problem": {
+      "type": "object",
+      "properties": {
+        "severity": {
+          "enum": [
+            "error",
+            "info",
+            "warning"
+          ]
+        },
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "docs": {
+          "type": "string"
+        },
+        "asset": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "number"
+        },
+        "column": {
+          "type": "number"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "fix": {
+          "$ref": "#/$defs/Fix"
+        },
+        "effect": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "details": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "severity",
+        "code",
+        "message",
+        "hint",
+        "docs"
+      ],
+      "additionalProperties": false
+    },
+    "StepReport": {
+      "type": "object",
+      "properties": {
+        "step": {
+          "enum": [
+            "cleanup",
+            "expire",
+            "flush",
+            "merge",
+            "rewrite"
+          ]
+        },
+        "status": {
+          "enum": [
+            "failed",
+            "ok",
+            "skipped"
+          ]
+        },
+        "tookMs": {
+          "type": "number"
+        },
+        "attempts": {
+          "type": "number"
+        },
+        "did": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number"
+          }
+        },
+        "error": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "step",
+        "status",
+        "tookMs",
+        "attempts",
+        "did"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

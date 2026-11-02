@@ -62,7 +62,9 @@ export interface Problem {
   fix?: Fix; effect?: string; retryable?: boolean; details?: Record<string, unknown>;
 }
 export interface Impact { asset: string; action: string; rows: number; bytes?: number; trashPath?: string;
-  downstream: string[]; estimatedRequests?: number }
+  downstream: string[]; estimatedRequests?: number;
+  /** What `rows` counts, when it is not rows: "file" for the files croft maintain --orphans would delete from a lake's folder. */
+  unit?: "file" }
 export interface Confirmation { token: string; expiresAt: string; command: string; impact: Impact }
 export interface Envelope<T> { schemaVersion: 1; ok: boolean; command: string; croftVersion: string;
   database: string; timezone: string; durationMs: number; data: T; problems: Problem[];

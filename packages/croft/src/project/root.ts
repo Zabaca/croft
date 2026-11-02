@@ -107,6 +107,8 @@ export const CONFIG_KEYS: { key: string; type: string; default: string; descript
   { key: "lake.bucket.reader.secretKeySecret", type: "string", default: "(required, postgres)", description: "the NAME of the secret that holds the read-only bucket key's secret" },
   { key: "lake.bucket.reader.sessionTokenSecret", type: "string", default: "(none)", description: "the NAME of the secret that holds the read-only key's session token, when the key is temporary" },
   { key: "lake.dataPath", type: "string", default: "(required, sqlite)", description: "a local lake's folder for its Parquet files, relative to the project folder, e.g. \"lake/data\"; it holds nothing else" },
+  { key: "lake.maintenance.enabled", type: "boolean", default: "true", description: "lake mode: croft runs the lake's maintenance by itself (flush, expire, merge, rewrite, clean up) after a run and from the scheduler; false leaves it to croft maintain by hand" },
+  { key: "lake.maintenance.everyHours", type: "integer", default: "24", description: "lake mode: how many hours after the last pass the next one is due (1 to 720); what a pass keeps is the trash's promise, 30 days or 5 versions per asset, and is not a setting" },
   { key: "notify.desktop", type: "boolean", default: "true", description: "desktop notification when a scheduled run fails" },
   { key: "notify.webhook", type: "string | null", default: "null", description: "http(s) URL that receives the failure envelope of a scheduled run" },
   { key: "concurrency", type: "integer", default: String(DEFAULTS.concurrency), description: "extractions that run at the same time in one run (1-64)" },
