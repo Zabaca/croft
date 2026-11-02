@@ -6,7 +6,7 @@ import type { DuckDBConnection } from "@duckdb/node-api";
 import { CroftError } from "../core/errors.ts";
 import { openMemory } from "../db/connect.ts";
 import { cleanup } from "../read/testkit.ts";
-import { ALL_ATTACKS, ALLOWED, SHARED, WAREHOUSE_SQL } from "./attack-testkit.ts";
+import { absentFor, ALL_ATTACKS, ALLOWED, CTE_SHAPES, HIDDEN_NAMES, SHARED, WAREHOUSE_SQL } from "./attack-testkit.ts";
 import {
   type CatalogSnapshot, catalogOf, decide, type GateInputs, type GateOptions, type GateVerdict, restrictCatalog,
 } from "./gate-core.ts";
@@ -144,6 +144,40 @@ describe("a key's scope: the attack list", () => {
     expect(JSON.stringify(real)).not.toMatch(/payments|secrets|_croft|Did you mean/);
     expect(real.hint).toContain("this key may read: customers, orders");
   });
+
+  test("a CTE named after a hidden table is judged exactly like one named after nothing: same verdict, same words, same position", async () => {
+    const same = (text: string, name: string) => text.replace(new RegExp(name, "gi"), "<name>");
+    let allowed = 0;
+    let refusedCount = 0;
+    for (const hidden of HIDDEN_NAMES) {
+      const absent = absentFor(hidden);
+      for (const shape of CTE_SHAPES) {
+        const a = await decision(shape.sql(hidden), KEY);
+        const b = await decision(shape.sql(absent), KEY);
+        const what = `${shape.label}: ${shape.sql(hidden)}`;
+        expect(refused(a), what).toBe(refused(b));
+        if (refused(a) && refused(b)) {
+          refusedCount++;
+          expect(a.code, what).toBe(b.code);
+          expect(same(a.message, hidden), what).toBe(same(b.message, absent));
+          expect(same(a.problem.hint, hidden), what).toBe(same(b.problem.hint, absent));
+          expect([a.problem.line, a.problem.column], what).toEqual([b.problem.line, b.problem.column]);
+          expect(JSON.stringify(a.problem.details ?? null), what).toBe(JSON.stringify(b.problem.details ?? null));
+        } else {
+          allowed++;
+          const x = a as GateVerdict;
+          const y = b as GateVerdict;
+          expect(x.tables, what).toEqual(y.tables);
+          expect(same(x.sql, hidden), what).toBe(same(y.sql, absent));
+        }
+      }
+    }
+    // Both outcomes occur: a CTE that reads nothing hidden is allowed, one that reads the table itself is refused.
+    expect(allowed).toBeGreaterThan(10);
+    expect(refusedCount).toBeGreaterThan(5);
+    // A CTE named after a name that DuckDB provides is still refused, for everyone alike.
+    expect(refused(await decision("WITH duckdb_tables AS (SELECT 1 AS x) SELECT * FROM duckdb_tables", KEY))).toBe(true);
+  }, 60_000);
 
   test("SHOW TABLES lists the shared tables the warehouse has, and only those", async () => {
     const d = (await decision("SHOW TABLES", KEY)) as GateVerdict;

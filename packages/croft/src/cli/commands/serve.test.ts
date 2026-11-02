@@ -234,7 +234,7 @@ describe("--json", () => {
     const env = JSON.parse(out[0]!);
     expect(env).toMatchObject({
       schemaVersion: 1, ok: true, command: "serve",
-      data: { url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/), pid: process.pid, loopback: true, token: { source: "generated", file: ".croft/serve.json" }, scheduling: { state: "off" }, keys: { count: 0, sharedTables: [] } },
+      data: { url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/), pid: process.pid, loopback: true, token: { source: "generated", file: ".croft/serve.json" }, scheduling: { state: "off" }, keys: { count: 0, sharedTables: [], unknownTables: [] } },
     });
     expect(JSON.stringify(env)).not.toContain(JSON.parse(readFileSync(join(p.stateDir, "serve.json"), "utf8")).token);
     fire("SIGTERM");
@@ -310,7 +310,7 @@ describe("the banner", () => {
     url: "http://127.0.0.1:7447", host: "127.0.0.1", port: 7447, pid: 4121, loopback: true, database: "warehouse.duckdb",
     startedAt: "2026-09-24T10:00:00-07:00", version: "0.1.0",
     token: { source: "generated", from: null, file: ".croft/serve.json" },
-    scheduling: { state: "on", via: "serve", pausedUntil: null, tickEveryMs: 60_000 }, keys: { count: 0, sharedTables: [] }, stopped: null,
+    scheduling: { state: "on", via: "serve", pausedUntil: null, tickEveryMs: 60_000 }, keys: { count: 0, sharedTables: [], unknownTables: [] }, stopped: null,
   };
 
   test("DESIGN.md §4.2", () => {
@@ -352,7 +352,7 @@ describe("keys on a running server (D122)", () => {
     shareOrders(p.root);
     const s = await start(["--port", "0"], { root: p.root });
     const d = s.started!;
-    expect(d.keys).toEqual({ count: 0, sharedTables: ["orders", "customers"] });
+    expect(d.keys).toEqual({ count: 0, sharedTables: ["orders", "customers"], unknownTables: ["orders", "customers"] }); // no asset makes them in this fixture
     const made = (await cli(["serve", "key", "add", "alice", "--json"], { cwd: p.root })).json as { data: { key: string } };
     const key = made.data.key;
     const ok = await post(d.url, key, "SELECT secret_looking_column FROM orders");
@@ -378,6 +378,14 @@ describe("keys on a running server (D122)", () => {
     expect(r.stderr).not.toContain("secret_looking_column");
     // Stopping wrote the last time the key was used, which croft serve key list shows.
     expect(existsSync(join(p.stateDir, "serve-keys-used.json"))).toBe(true);
+  });
+
+  test("the banner names a shared table that no asset makes", async () => {
+    const p = makeProject({ files: { "assets/orders.sql": "SELECT 1 AS id\n" } });
+    writeFileSync(join(p.root, "croft.json"), JSON.stringify({ database: "warehouse.duckdb", timezone: "America/Los_Angeles", serve: { sharedTables: ["orders", "custmers"] } }));
+    const s = await start(["--port", "0"], { root: p.root });
+    s.fire("SIGINT");
+    expect((await s.done).stdout).toContain("serve.sharedTables names no asset called custmers (a typo?): a key cannot read it");
   });
 
   test("the banner says how many keys there are and what they read, and warns when no table is shared", async () => {

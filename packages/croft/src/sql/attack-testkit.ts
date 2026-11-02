@@ -42,7 +42,6 @@ export const HIDDEN_TABLES: readonly Attack[] = [
   a("in a lateral join", "SELECT * FROM orders, LATERAL (SELECT * FROM payments) AS l"),
   a("in a union", "SELECT note FROM orders UNION ALL SELECT note FROM payments"),
   a("behind a CTE of the same name", "WITH payments AS (SELECT * FROM payments) SELECT * FROM payments"),
-  a("a CTE that takes a hidden table's name", "WITH payments AS (SELECT 1 AS a) SELECT a FROM payments"),
   a("by catalog and schema", "SELECT * FROM memory.main.payments"),
   a("by schema", "SELECT * FROM main.payments"),
   a("by another catalog", "SELECT * FROM other.main.payments"),
@@ -176,3 +175,30 @@ export const ALLOWED: readonly Attack[] = [
   a("SUMMARIZE of a shared table", "SUMMARIZE customers"),
   a("SHOW TABLES", "SHOW TABLES"),
 ];
+
+/**
+ * Queries that name a CTE after a table, in every shape a CTE takes. For a key, a table that is hidden and a name that does not
+ * exist must be treated exactly alike, so each query is sent twice, once with a hidden table's name and once with a name no table
+ * has, and the two answers must be the same in everything but that name: the same status, the same problem and words, the same
+ * rows. (A CTE named after a hidden table was once refused while one named after nothing was allowed, which let a key list the
+ * project's table names one guess at a time.)
+ */
+export const CTE_SHAPES: readonly { label: string; sql: (name: string) => string }[] = [
+  { label: "a CTE named after it, then selected", sql: (n) => `WITH ${n} AS (SELECT 1 AS x) SELECT * FROM ${n}` },
+  { label: "a CTE that selects from the table of its own name", sql: (n) => `WITH ${n} AS (SELECT * FROM ${n}) SELECT * FROM ${n}` },
+  { label: "nested in another CTE", sql: (n) => `WITH a AS (WITH ${n} AS (SELECT 1 AS x) SELECT * FROM ${n}) SELECT * FROM a` },
+  { label: "recursive", sql: (n) => `WITH RECURSIVE ${n}(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM ${n} WHERE x < 3) SELECT * FROM ${n}` },
+  { label: "in a scalar subquery", sql: (n) => `SELECT (WITH ${n} AS (SELECT 1 AS x) SELECT max(x) FROM ${n}) AS m` },
+  { label: "read by a later CTE", sql: (n) => `WITH ${n} AS (SELECT 1 AS x), b AS (SELECT * FROM ${n}) SELECT * FROM b` },
+  { label: "read by an earlier CTE, which cannot see it", sql: (n) => `WITH b AS (SELECT * FROM ${n}), ${n} AS (SELECT 1 AS x) SELECT * FROM b` },
+  { label: "beside the table itself", sql: (n) => `WITH ${n} AS (SELECT 1 AS x) SELECT x FROM ${n} UNION ALL SELECT id FROM main.${n}` },
+  { label: "in a derived table, with the table outside it", sql: (n) => `SELECT * FROM (WITH ${n} AS (SELECT 1 AS x) SELECT * FROM ${n}) AS q, ${n}` },
+  { label: "with the case changed", sql: (n) => `WITH ${n.toUpperCase()} AS (SELECT 1 AS x) SELECT * FROM ${n}` },
+  { label: "quoted", sql: (n) => `WITH "${n}" AS (SELECT 1 AS x) SELECT * FROM "${n}"` },
+  { label: "unused", sql: (n) => `WITH ${n} AS (SELECT 1 AS x) SELECT 2 AS y` },
+  { label: "joined to a shared table", sql: (n) => `WITH ${n} AS (SELECT 1 AS id) SELECT count(*) AS c FROM orders o JOIN ${n} ON o.id = ${n}.id` },
+];
+
+/** The hidden tables the pairs use, and for each a name of the same length that no table has (so positions in a message match). */
+export const HIDDEN_NAMES = ["payments", "secrets"] as const;
+export const absentFor = (hidden: string): string => "z".repeat(hidden.length);

@@ -23,8 +23,8 @@ describe("croft serve key add", () => {
     expect(r.exit).toBe(0);
     expect(r.json).toMatchObject({ ok: true, command: "serve", problems: [] });
     const d = (r.json as { data: Record<string, unknown> }).data;
-    expect(Object.keys(d)).toEqual(["action", "name", "key", "createdAt", "sharedTables", "file"]);
-    expect(d).toMatchObject({ action: "add", name: "alice", createdAt: "2026-11-01T10:00:00-08:00", sharedTables: ["orders", "customers"], file: ".croft/serve-keys.json" });
+    expect(Object.keys(d)).toEqual(["action", "name", "key", "createdAt", "sharedTables", "unknownTables", "file"]);
+    expect(d).toMatchObject({ action: "add", name: "alice", createdAt: "2026-11-01T10:00:00-08:00", sharedTables: ["orders", "customers"], unknownTables: ["orders", "customers"], file: ".croft/serve-keys.json" });
     expect(d.key).toMatch(new RegExp(`^${KEY.source}$`));
     // The key opens exactly one door: the one the server checks.
     expect(new KeyStore(p.stateDir).verify(d.key as string)).toBe("alice");
@@ -91,6 +91,22 @@ describe("croft serve key add", () => {
   });
 });
 
+describe("a shared table that no asset makes", () => {
+  test("is named where a typo would otherwise go unnoticed: key add, key list and the banner's data; a real asset is not", async () => {
+    const p = makeProject({ files: { "assets/orders.sql": "SELECT 1 AS id\n" } });
+    share(p.root, ["orders", "custmers"]);
+    const added = await cli(["serve", "key", "add", "alice"], { cwd: p.root });
+    expect(added.stdout).toContain("serve.sharedTables names no asset called custmers (a typo?): a key cannot read it");
+    expect(added.stdout).not.toContain("called orders");
+    const json = await cli(["serve", "key", "list", "--json"], { cwd: p.root });
+    expect((json.json as { data: { unknownTables: string[] } }).data.unknownTables).toEqual(["custmers"]);
+    expect((await cli(["serve", "key", "list"], { cwd: p.root })).stdout).toContain("names no asset called custmers");
+    share(p.root, ["orders"]);
+    expect(((await cli(["serve", "key", "list", "--json"], { cwd: p.root })).json as { data: { unknownTables: string[] } }).data.unknownTables).toEqual([]);
+    expect((await cli(["serve", "key", "list"], { cwd: p.root })).stdout).not.toContain("typo");
+  });
+});
+
 describe("croft serve key list", () => {
   test("golden --json: names, when each was made and last used, in the project offset; never a key", async () => {
     const p = makeProject();
@@ -110,6 +126,7 @@ describe("croft serve key list", () => {
         { name: "bob", createdAt: "2026-11-01T11:30:00-08:00", lastUsedAt: null },
       ],
       sharedTables: ["orders"],
+      unknownTables: ["orders"], // this project has no assets: nothing makes the table
       file: ".croft/serve-keys.json",
     });
     expect(r.stdout).not.toContain(a.data.key);

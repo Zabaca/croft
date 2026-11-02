@@ -10,8 +10,8 @@
 // - the catalog snapshot, for the serve profile: the tables and views a caller may name and the built-in names a CTE may not
 //   take. One snapshot per attached file, taken when the file is attached (a worker's file cannot change while it holds it,
 //   and the readers' process takes a new one at every swap);
-// - the path policy, for the profiles that read files: the folders a path may name and the files it may never name, already
-//   resolved. One per instance. Globs are expanded before the decision (the only step that needs DuckDB, `glob()`), and
+// - the path policy, for a query that names a path (never the serve profile's): the folders a path may name and the files it
+//   may never name, already resolved. Globs are expanded before the decision (the only step that needs DuckDB, `glob()`), and
 //   their matches are passed in; the serve profile allows no path, so it expands nothing.
 //
 // A statement is exactly one SELECT (or DESCRIBE, SUMMARIZE, SHOW), and every query node is a read. The gate then walks the
@@ -166,13 +166,15 @@ export function parseSerialized(text: string): Serialized {
 /**
  * The tables and views a query may name, as the connection that runs it sees them. `current` is its default database;
  * `userTables` and `views` are the names (ASCII-lowercased) in that database's main schema (temporary objects left out);
- * `others` are the names of built-in or foreign views reachable unqualified, which a CTE may not take.
+ * `others` are the names of built-in or foreign objects reachable unqualified, which a CTE may not take; `builtin` is the part
+ * of them that DuckDB itself provides (the system catalog's views, which everyone sees).
  */
 export interface CatalogSnapshot {
   current: string;
   userTables: ReadonlySet<string>;
   views: ReadonlySet<string>;
   others: ReadonlySet<string>;
+  builtin: ReadonlySet<string>;
 }
 
 /** One row of duckdb_tables() or duckdb_views(), as loadCatalog (sql/gate.ts) reads it. */
@@ -193,33 +195,37 @@ export function catalogOf(rows: readonly CatalogRow[], current: string): Catalog
   const userTables = new Set<string>();
   const views = new Set<string>();
   const others = new Set<string>();
+  const builtin = new Set<string>();
   for (const r of rows) {
     const name = asciiLower(r.name);
+    if ((r.database === "system" || r.database === "temp") && (r.schema === "main" || r.schema === "pg_catalog")) builtin.add(name);
     const mine = r.schema === "main" && r.database === r.current && !r.temporary;
     if (r.kind === "table" && mine) userTables.add(name);
     else if (r.kind === "view" && mine && !r.internal) views.add(name);
     if (r.kind === "table" && mine) continue;
     if (r.schema === "main" || r.schema === "pg_catalog") others.add(name); // reachable unqualified
   }
-  return { current: asciiLower(current), userTables, views, others };
+  return { current: asciiLower(current), userTables, views, others, builtin };
 }
 
 /**
  * What a key may name: the shared tables the catalog has, as tables or as views. A key's connection in the readers'
  * process (D123) has croft's own views of the shared tables as its default database; in a warehouse, the shared names are
  * tables. A name that is shared but absent is not here, so it is refused like any other.
+ *
+ * The names a CTE may not take are DuckDB's own built-in ones, which everyone sees, and no others. A table hidden from the key
+ * must not be told apart from one that does not exist, and a CTE named after it is the one place a name could be: refusing
+ * `WITH payments AS (SELECT 1) SELECT * FROM payments` because payments exists, and allowing it for a name that does not,
+ * lets a key list the project's table names one guess at a time (the reviewer's finding on D122). So a CTE's name is judged
+ * the same whether or not a hidden table has it. What keeps such a CTE from reaching the hidden table is the walk's reading of
+ * CTE scopes, which ast.test.ts holds to DuckDB's own plans; and in server mode a key's connection works in a database where
+ * a hidden table has no name at all.
  */
 export function restrictCatalog(c: CatalogSnapshot, shared: readonly string[]): CatalogSnapshot {
   const want = new Set(shared.map(asciiLower));
   const visible = new Set<string>();
-  const others = new Set(c.others);
-  for (const n of [...c.userTables, ...c.views]) {
-    // A CTE may not take the name of a table that is hidden from the key either: were croft's reading of a scope ever to
-    // differ from DuckDB's, the name would reach that table.
-    if (want.has(n)) visible.add(n);
-    else others.add(n);
-  }
-  return { ...c, userTables: visible, views: new Set(), others };
+  for (const n of [...c.userTables, ...c.views]) if (want.has(n)) visible.add(n);
+  return { ...c, userTables: visible, views: new Set(), others: c.builtin };
 }
 
 /** The result of expanding a glob in a path (`glob()`), or why it could not be. */
@@ -627,8 +633,8 @@ export interface PathSettings {
 }
 
 /**
- * Where a query may read files on one connection, and what it must never touch: resolved once per instance, then
- * consulted without DuckDB. The file system is read (stat, readlink) when a path is checked, just before DuckDB opens it.
+ * Where a query may read files on one connection, and what it must never touch: resolved from the connection's settings
+ * and attached databases, then consulted without DuckDB. The file system is read (stat, readlink) when a path is checked, just before DuckDB opens it.
  */
 export class PathPolicy {
   private constructor(

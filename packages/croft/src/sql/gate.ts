@@ -8,9 +8,10 @@
 // - for the profiles that read files, the path policy (loadPathPolicy) and the matches of every glob a query's paths hold
 //   (`glob()`), so that decide() never has to ask DuckDB.
 //
-// A caller that runs many queries on one attached file (croft serve's workers) loads the catalog snapshot and the path
-// policy once and passes them in; the file cannot change under them until it is swapped. Everyone else lets gateSelect()
-// fetch them for the one query.
+// A caller that runs many queries on one attached file (croft serve's workers) loads the catalog snapshot once and passes it
+// in; the file cannot change under it until it is swapped. Everyone else lets gateSelect() fetch it for the one query. The
+// path policy is fetched only for a query that names a path, once per query: the serve profile names none, so the workers
+// never load one, and the paths that do (croft query, SQL assets, ctx.query) run one query per connection.
 // It uses no Bun-only APIs, so read.ts can import it.
 import type { DuckDBConnection } from "@duckdb/node-api";
 import { CroftError } from "../core/errors.ts";
@@ -23,7 +24,6 @@ import {
 /** What a caller may hand the gate so that it need not fetch it again: see the head of this file. */
 export interface GateKnowns {
   catalog?: CatalogSnapshot;
-  paths?: PathPolicy;
 }
 
 /**
@@ -44,14 +44,14 @@ export async function gateSelect(conn: DuckDBConnection, sql: string, o: GateOpt
   const s = parseSerialized(parsed);
   const stmt = !s.error && s.statements?.length === 1 ? s.statements[0]! : null;
   let catalog = o.catalog;
-  let paths = o.paths;
+  let paths: PathPolicy | undefined;
   const globs = new Map<string, GlobExpansion>();
   if (stmt) {
     if (o.profile === "serve") catalog ??= await loadCatalog(conn);
     else {
       const raws = pathLiterals(stmt, o.profile);
       if (raws.length) {
-        paths ??= await loadPathPolicy(conn, o);
+        paths = await loadPathPolicy(conn, o);
         for (const raw of raws) if (!globs.has(raw) && paths.hasGlob(raw)) globs.set(raw, await expandGlob(conn, raw, o.profile));
       }
     }
@@ -80,8 +80,8 @@ export async function loadCatalog(conn: DuckDBConnection): Promise<CatalogSnapsh
 }
 
 /** Where the connection lets a query read files, and which files it must never name: its sandbox settings and attached
- *  databases (and `o.protect`, such as the state folder), resolved. One query; take it once per instance. */
-export async function loadPathPolicy(conn: DuckDBConnection, o: { protect?: string[] } = {}): Promise<PathPolicy> {
+ *  databases (and `o.protect`, such as the state folder), resolved. One query. */
+async function loadPathPolicy(conn: DuckDBConnection, o: { protect?: string[] } = {}): Promise<PathPolicy> {
   const reader = await conn.runAndReadAll(`SELECT
     current_setting('enable_external_access') AS external,
     current_setting('allowed_directories') AS dirs,

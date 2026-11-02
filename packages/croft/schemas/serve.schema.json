@@ -128,11 +128,18 @@
                   "items": {
                     "type": "string"
                   }
+                },
+                "unknownTables": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
                 }
               },
               "required": [
                 "count",
-                "sharedTables"
+                "sharedTables",
+                "unknownTables"
               ],
               "additionalProperties": false
             },
@@ -219,6 +226,12 @@
                 "type": "string"
               }
             },
+            "unknownTables": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "file": {
               "type": "string"
             },
@@ -232,6 +245,7 @@
             "key",
             "createdAt",
             "sharedTables",
+            "unknownTables",
             "file"
           ],
           "additionalProperties": false
@@ -254,6 +268,12 @@
                 "type": "string"
               }
             },
+            "unknownTables": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "file": {
               "type": "string"
             },
@@ -265,6 +285,7 @@
             "action",
             "keys",
             "sharedTables",
+            "unknownTables",
             "file"
           ],
           "additionalProperties": false

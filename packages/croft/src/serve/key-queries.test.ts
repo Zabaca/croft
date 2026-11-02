@@ -8,7 +8,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { makeProject, seed, spawnIdle, writeIntent } from "../read/testkit.ts";
-import { ALL_ATTACKS, ALLOWED, HIDDEN_TABLES, NOT_A_READ, REACHING_OUT, SHARED, WAREHOUSE_SQL } from "../sql/attack-testkit.ts";
+import { absentFor, ALL_ATTACKS, ALLOWED, CTE_SHAPES, HIDDEN_NAMES, HIDDEN_TABLES, NOT_A_READ, REACHING_OUT, SHARED, WAREHOUSE_SQL } from "../sql/attack-testkit.ts";
 import { openServeEngine } from "./instance.ts";
 import { type Rig, Rigs, TOKEN, aside } from "./key-rig-testkit.ts";
 import { extensionFiles, openEngine, project as readersProject, putCopy, replaceCopy, until } from "./readers-testkit.ts";
@@ -91,6 +91,27 @@ for (const kind of KINDS) {
       expect(words(real, "payments")).toEqual(words(absent, "no_such_table"));
       expect(JSON.stringify(real.json)).not.toMatch(/secrets|_croft|Did you mean/);
     }, 60_000);
+
+    kind.run("a CTE named after a hidden table gets the same answer as one named after nothing: status, words, position and rows", async () => {
+      const same = (v: unknown, name: string) => JSON.stringify(v).replace(new RegExp(name, "gi"), "<name>");
+      const strip = (j: any) => ({ ...j, durationMs: 0, data: j.data && { ...j.data, tookMs: 0 } });
+      let ok = 0;
+      let refused = 0;
+      for (const hidden of HIDDEN_NAMES) {
+        const absent = absentFor(hidden);
+        for (const shape of CTE_SHAPES) {
+          const a = await r.call(alice, shape.sql(hidden));
+          const b = await r.call(alice, shape.sql(absent));
+          const what = `${shape.label}: ${shape.sql(hidden)}`;
+          expect(a.status, what).toBe(b.status);
+          expect(same(strip(a.json), hidden), what).toBe(same(strip(b.json), absent));
+          if (a.status === 200) ok++;
+          else refused++;
+        }
+      }
+      expect(ok).toBeGreaterThan(10);
+      expect(refused).toBeGreaterThan(5);
+    }, 120_000);
 
     kind.run("the whole attack list is refused with a key, written plainly and with a catalog function in a comment, a string and a line comment; nothing is written", async () => {
       const before = listing(r.p.root);

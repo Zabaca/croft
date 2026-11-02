@@ -4,7 +4,7 @@
 // write intent, lease, checkpoint, clone and rename as a run's, coalesced with a run's refresh through runs.sqlite, so
 // the two cannot race. It prints one JSON line (the outcome) and exits 0, or 1 when the refresh failed.
 //
-// How it ends (D122): croft serve decides, and never by SIGKILL first, since the refresh may be checkpointing the live warehouse.
+// How it ends (D124): croft serve decides, and never by SIGKILL first, since the refresh may be checkpointing the live warehouse.
 // - SIGTERM, SIGINT and SIGHUP (croft serve stopping, or Ctrl-C reaching the whole process group) are caught: the refresh in hand
 //   is finished, its outcome printed, and the process exits. croft serve sends SIGKILL only after a grace period.
 // - If croft serve itself is killed (SIGKILL cannot be caught), this process finds out within half a second, from its parent

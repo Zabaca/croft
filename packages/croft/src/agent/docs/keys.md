@@ -14,7 +14,8 @@ first" list: show them which tables the key will read, and wait for a yes. Remov
 
      "serve": { "sharedTables": ["orders", "customers"] }
 
-   croft serve reads croft.json when it starts: after changing the list, the user restarts croft serve.
+   croft serve reads croft.json when it starts: after changing the list, the user restarts croft serve. A name no
+   asset makes (a typo) shares nothing; croft serve key add and list, and croft serve's banner, name it.
 2. The user starts croft serve in their own terminal (croft docs serve). Keys are made and removed whether or not
    it runs.
 3. Make a key for one person:

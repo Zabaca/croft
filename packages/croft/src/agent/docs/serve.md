@@ -63,7 +63,10 @@ the keys; adding one is on the skill's "Ask the user first" list.
 ## Errors
 
 - SERVE_UNAUTHORIZED: a missing or wrong token (401), or a Host or Origin the server refuses (403). Never
-  retried; the app needs the token of the server it talks to.
+  retried; the app needs the token of the server it talks to. A key that was removed is a 401 too; a key sent to
+  /status or /health, which need the app token, is a 403.
+- SERVE_NO_SHARED_TABLES: a key's query while serve.sharedTables in croft.json names no table (403). The user
+  names the tables people may read, and restarts croft serve (croft docs keys).
 - SERVE_UNAVAILABLE: the server did not answer, or stayed busy (503 with Retry-After), for the whole timeoutMs
   (10 s by default). A long write step can cause it; "readCopy": true lets the server answer from the read copy
   meanwhile, marked stale: true with asOf (croft docs read-copy).

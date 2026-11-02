@@ -7,6 +7,8 @@
 // - remove <name>: the key is refused on its next request. Taking access away needs no asking.
 // All three work with croft serve running or not, and with --json: croft serve reads the keys file on every request
 // (serve/keys.ts), so a key added or removed here is honoured by a running server at once, with no restart.
+import { existsSync } from "node:fs";
+import { basename, extname } from "node:path";
 import { CroftError } from "../../core/errors.ts";
 import { formatInstant } from "../../core/time.ts";
 import type { Project } from "../../project/root.ts";
@@ -33,13 +35,31 @@ export type ServeKeyData =
     createdAt: string;
     /** The tables it reads (serve.sharedTables); empty means every query of it is refused until the project names some. */
     sharedTables: string[];
+    /** Entries of sharedTables that no asset of the project makes (a typo, or an asset not written yet): a key cannot read them. */
+    unknownTables: string[];
     /** The keys file, relative to the project when inside it: only the key's hash is kept there. */
     file: string;
   }
-  | { action: "list"; keys: ServeKeyInfo[]; sharedTables: string[]; file: string }
+  | { action: "list"; keys: ServeKeyInfo[]; sharedTables: string[]; unknownTables: string[]; file: string }
   | { action: "remove"; name: string; createdAt: string; lastUsedAt: string | null; remaining: number };
 
 const ACTIONS = ["add", "list", "remove"] as const;
+
+/**
+ * The entries of serve.sharedTables that no asset file makes: asset names are the files' names under assets/, so a typo in the
+ * list shares nothing, and without this nobody would be told (a name that is an asset not yet run is a table that does not
+ * exist yet, and is not named here).
+ */
+export function unknownSharedTables(project: Project): string[] {
+  const dir = project.paths.assetsDir;
+  const names = new Set<string>();
+  if (existsSync(dir)) {
+    for (const f of new Bun.Glob("**/*.{ts,sql}").scanSync({ cwd: dir, onlyFiles: true })) {
+      if (!f.endsWith(".d.ts")) names.add(basename(f, extname(f)));
+    }
+  }
+  return project.config.serve.sharedTables.filter((t) => !names.has(t));
+}
 
 /** `croft serve key <action> [name]`: the positionals after `key`. */
 export function runKey(ctx: Ctx, rest: readonly string[]): CommandResult<ServeKeyData> {
@@ -62,14 +82,15 @@ export function runKey(ctx: Ctx, rest: readonly string[]): CommandResult<ServeKe
   const store = new KeyStore(project.paths.stateDir, { now: () => ctx.now() });
   const file = shown(project, store.path);
   const sharedTables = [...project.config.serve.sharedTables];
+  const unknownTables = unknownSharedTables(project);
   if (action === "list") {
-    return { data: { action: "list", keys: store.list().map((k) => view(k, project)), sharedTables, file }, problems: [], next: [] };
+    return { data: { action: "list", keys: store.list().map((k) => view(k, project)), sharedTables, unknownTables, file }, problems: [], next: [] };
   }
   const name = names[0]!;
   if (action === "add") {
     const made = store.add(name);
     return {
-      data: { action: "add", name, key: made.key, createdAt: formatInstant(new Date(made.info.createdAt), project.timezone), sharedTables, file },
+      data: { action: "add", name, key: made.key, createdAt: formatInstant(new Date(made.info.createdAt), project.timezone), sharedTables, unknownTables, file },
       problems: [], next: [],
     };
   }
@@ -92,6 +113,11 @@ function shown(project: Project, path: string): string {
   return path.startsWith(`${project.root}/`) ? path.slice(project.root.length + 1) : path;
 }
 
+/** The warning for entries of serve.sharedTables that no asset makes, as lines (none when there are none). */
+export function unknownLine(unknown: readonly string[]): string[] {
+  return unknown.length ? [`serve.sharedTables names no asset called ${unknown.join(", ")} (a typo?): a key cannot read ${unknown.length === 1 ? "it" : "them"}`] : [];
+}
+
 /** The human text of a key command. */
 export function formatKey(d: ServeKeyData): string {
   if (d.action === "add") {
@@ -104,6 +130,7 @@ export function formatKey(d: ServeKeyData): string {
       `  ${d.key}`,
       "",
       reads,
+      ...unknownLine(d.unknownTables),
       "Send it as Authorization: Bearer <key> to croft serve's POST /query, or give it to query() as { token }.",
       `Removing it is one command: croft serve key remove ${d.name}`,
     ].join("\n");
@@ -112,7 +139,7 @@ export function formatKey(d: ServeKeyData): string {
     if (!d.keys.length) return `no keys yet; croft serve key add <name> makes one${d.sharedTables.length ? "" : " (and serve.sharedTables in croft.json names the tables it reads)"}`;
     const t = table(["name", "made", "last used"], d.keys.map((k) => [k.name, k.createdAt, k.lastUsedAt ?? "never"]));
     const reads = d.sharedTables.length ? `keys read: ${d.sharedTables.join(", ")}` : "serve.sharedTables names no table, so every key query is refused";
-    return `${t.text}\n${reads}`;
+    return [t.text, reads, ...unknownLine(d.unknownTables)].join("\n");
   }
   return `removed the key for ${d.name} (made ${d.createdAt}); it is refused on its next request, croft serve running or not. ${d.remaining} key${d.remaining === 1 ? "" : "s"} left`;
 }
