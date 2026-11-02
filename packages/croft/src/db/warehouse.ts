@@ -13,6 +13,15 @@
 // - An optional AbortSignal ends a wait at once (Ctrl-C during a lock wait of up to 10 min): the lock wait,
 //   and a write queued behind another write of this process. It never cuts a lease that already holds the
 //   file; the body decides what an abort means there (run/ingest.ts refuses further statements).
+//
+// A warehouse that is a lake (WarehouseOptions.lake; option 07, D138 to D144) is the same object with another store under it. There is no
+// file: the instance is an in-memory one that attaches the lake when its first connection is made and is then locked, and it stays open
+// for the life of the command (a re-attach after the lock is refused), so nothing lingers and nothing is closed after a lease. Every
+// connection works in the lake (`USE lake`), so the tables, the views and `current_database()` read as they do in a file. There is no
+// file lock and no write intent; the lock on writes is croft's own (db/lake.ts LakeWriteLock), one write at a time on this machine, and
+// croft serve never steps aside. A read whose catalog connection dropped is tried again; a write is tried again as a whole, after its
+// commit is checked by the tag it carries (a commit may have landed without its answer reaching us); every error that leaves a lease has
+// the lake's credentials taken out of it.
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
@@ -21,9 +30,14 @@ import { type DuckDBConnection, type DuckDBInstance, type DuckDBResultReader, ty
 import { CroftError } from "../core/errors.ts";
 import type { LockHolder, Sql, Warehouse } from "../core/types.ts";
 import type { Row } from "../types.ts";
-import { type AccessMode, canonicalPath, connect, type LockConflict, lockConflict, openInstance, type SandboxSpec } from "./connect.ts";
+import { type AccessMode, canonicalPath, connect, type LockConflict, lockConflict, openInstance, openMemoryInstance, type SandboxSpec } from "./connect.ts";
+import { bookkeepingOf, seqResetSql } from "./bookkeeping.ts";
 import * as intents from "./intent.ts";
-import { checkFormat } from "./state.ts";
+import {
+  commitLanded, isCommitFailure, isConflict, isConnectionError, LAKE_RETRY, type LakeConnection, lakeBackoffMs, LakeWriteLock, newCommitTag, WRITER_KEY, writerRecord,
+} from "./lake.ts";
+import { LAKE_ALIAS, modeSecrets, scrubThrown } from "./modes.ts";
+import { checkFormat, hasState } from "./state.ts";
 import { TxGuard } from "./tx-guard.ts";
 import { type ColumnInfo, type RenderContext, type RenderMode, renderRows, resultColumns } from "./values.ts";
 
@@ -61,6 +75,12 @@ export interface WarehouseOptions {
   label?: string;
   /** The DuckDB engine this process runs, for the pre-upgrade backup (db/backup.ts); default version(). Tests inject it. */
   engineVersion?: string;
+  /** The project's lake (db/lake.ts lakeConnection): the warehouse is a DuckLake, and `path` only names it (nothing is opened there).
+   *  `mode: "read_write"` attaches with the writer's login and key, `"read_only"` with the read-only ones, read-only. */
+  lake?: LakeConnection;
+  /** Tests only: runs right after a lake write's COMMIT returned, and may throw what a connection that dropped at that moment would
+   *  (the commit landed and its answer did not), which is the one case of an unknown outcome a test cannot otherwise make happen. */
+  afterLakeCommit?: () => void | Promise<void>;
 }
 
 export interface WriteOptions {
@@ -206,8 +226,13 @@ export class DuckWarehouse implements Warehouse {
   readonly path: string;
   readonly mode: AccessMode;
   private readonly o: WarehouseOptions;
-  private readonly spec: SandboxSpec;
+  /** The sandbox every connection gets. A lake's has its mode too, which holds credentials and is made when the instance opens. */
+  private spec: SandboxSpec;
   private readonly stateDir: string;
+  /** Lake mode: the project's lake, the lock on its writes, and the key the connection factory knows this instance by. */
+  private readonly lake: LakeConnection | null;
+  private readonly writeLock: LakeWriteLock | null;
+  private readonly key: string;
   private instance: DuckDBInstance | null = null;
   private opening: Promise<DuckDBInstance> | null = null;
   private leases = 0;
@@ -229,6 +254,14 @@ export class DuckWarehouse implements Warehouse {
       profile: o.profile ?? "warehouse", timezone: o.timezone, root: o.root, stateDir: this.stateDir,
       fileDirs: o.fileDirs, memoryLimit: o.memoryLimit, threads: o.threads,
     };
+    this.lake = o.lake ?? null;
+    this.writeLock = this.lake ? new LakeWriteLock(this.stateDir) : null;
+    this.key = this.lake ? `lake:${this.path}` : this.path;
+  }
+
+  /** Whether this warehouse is a lake. */
+  get isLake(): boolean {
+    return this.lake !== null;
   }
 
   /** The options this warehouse was created with. */
@@ -255,6 +288,7 @@ export class DuckWarehouse implements Warehouse {
     const run = async () => {
       started = true;
       return this.lease("write", o?.waitMs, async (conn) => {
+        if (this.lake) return this.lakeWrite(conn, label, fn, o);
         if (o?.transaction === false) return fn(new LeaseSql(conn, this.renderCtx(), null));
         // DuckDB names a file database after its stem, so `warehouse.t` means main.t in warehouse.duckdb.
         const tx = new LeaseSql(conn, this.renderCtx(), new TxGuard({ database: basename(this.path, extname(this.path)) }));
@@ -300,6 +334,13 @@ export class DuckWarehouse implements Warehouse {
    */
   async holder(): Promise<LockHolder | null> {
     if (this.waitingOn) return this.waitingOn;
+    // A lake has no file for a reader to be kept out of: the only holder is the machine's writer, by croft's own lock.
+    if (this.lake) {
+      const h = this.writeLock!.holder();
+      if (!h) return null;
+      const extra = h.pid !== null && this.o.lookupHolder ? await this.o.lookupHolder(h.pid) : null;
+      return extra ? { ...h, ...extra } : h;
+    }
     if (this.instance) return { pid: process.pid, program: "croft (this process)" };
     const other = intents.liveIntents(this.stateDir, { excludeSelf: true })[0];
     if (other) return { pid: other.pid, program: "croft", runId: other.runId ?? undefined, action: "write", since: other.since };
@@ -327,7 +368,7 @@ export class DuckWarehouse implements Warehouse {
 
   /** How messages name the file (WarehouseOptions.label). */
   private get label(): string {
-    return this.o.label ?? "the warehouse";
+    return this.o.label ?? (this.lake ? "the lake" : "the warehouse");
   }
 
   private renderCtx(): RenderContext {
@@ -350,7 +391,8 @@ export class DuckWarehouse implements Warehouse {
     let conn: DuckDBConnection | undefined;
     try {
       const instance = await this.ensureOpen(kind, waitMs ?? this.waitCap(kind), runId, signal);
-      conn = await connect(instance, this.spec, this.path);
+      if (this.lake) return await this.inLake(kind, instance, body, signal, (c) => { conn = c; });
+      conn = await connect(instance, this.spec, this.key);
       this.conns.add(conn);
       if (!this.formatChecked) {
         // Refuse a database from a newer croft before touching it (DB_NEWER_FORMAT); once per process.
@@ -390,10 +432,185 @@ export class DuckWarehouse implements Warehouse {
   }
 
   private get usesIntent(): boolean {
-    return this.mode === "read_write" && this.o.writeIntent !== false;
+    return this.mode === "read_write" && this.o.writeIntent !== false && !this.lake;
+  }
+
+  /**
+   * A lake's instance: an in-memory DuckDB that attaches the lake on its first connection (db/connect.ts, db/modes.ts) with the login and
+   * key for this process's access, and is then locked. It has no file to lock, so there is no write intent, no wait and no pre-upgrade
+   * backup. The mode, which holds the credentials, is made here, so a missing secret is SECRET_MISSING before anything is attached.
+   */
+  private async openLake(): Promise<DuckDBInstance> {
+    this.spec = { ...this.spec, mode: this.lake!.mode(this.mode === "read_write" ? "write" : "read") };
+    const instance = await openMemoryInstance();
+    this.instance = instance;
+    registerExitHook();
+    return instance;
+  }
+
+  /** Close an instance whose mode failed to start: it is part set up and never reused, so the next lease opens a new one. */
+  private dropInstance(instance: DuckDBInstance): void {
+    if (this.instance !== instance) return;
+    for (const c of this.conns) {
+      try { c.disconnectSync(); } catch { /* gone */ }
+    }
+    this.conns.clear();
+    try { instance.closeSync(); } catch { /* gone */ }
+    this.instance = null;
+    this.formatChecked = false;
+  }
+
+  /** The lake's error with its credentials taken out: the password, the key id and secret and the session token. */
+  private scrub(e: unknown): unknown {
+    return this.spec.mode ? scrubThrown(e, modeSecrets(this.spec.mode)) : e;
+  }
+
+  /**
+   * A lease on the lake: a connection (the first one attaches the lake, retried when the catalog was unreachable for a moment), working in
+   * the lake, and the body. A read whose catalog or store connection dropped is tried again; a write does its own retrying
+   * (lakeWrite), because it must check its commit first. Every error that leaves is scrubbed.
+   */
+  private async inLake<T>(kind: "read" | "write", first: DuckDBInstance, body: (conn: DuckDBConnection) => Promise<T>, signal: AbortSignal | undefined,
+    give: (conn: DuckDBConnection) => void): Promise<T> {
+    let instance = first;
+    let conn: DuckDBConnection | undefined;
+    for (let attempt = 0; !conn; attempt++) {
+      try {
+        conn = await connect(instance, this.spec, this.key);
+      } catch (e) {
+        this.dropInstance(instance);
+        const details = e instanceof CroftError && e.code === "LAKE_ATTACH_FAILED" ? e.problem.details : undefined;
+        if (details?.notCreated) {
+          throw new CroftError("DB_NOT_FOUND", {
+            message: `${this.label} does not exist yet: nothing has written to it`,
+            hint: "the machine that writes creates the lake with its first run: croft run",
+            fix: { kind: "command", description: "build the assets, which creates the lake", command: "croft run" },
+            details: { database: this.lake!.label, notCreated: true },
+          });
+        }
+        if (details && typeof details.duckdb === "string" && isConnectionError(details.duckdb) && attempt < LAKE_RETRY.connection) {
+          await sleep(lakeBackoffMs(attempt));
+          if (signal?.aborted) throw waitAborted(signal);
+          instance = await this.openLake();
+          continue;
+        }
+        throw this.scrub(e);
+      }
+    }
+    give(conn);
+    this.conns.add(conn);
+    await conn.run(`USE ${LAKE_ALIAS}`);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        if (!this.formatChecked) {
+          // Refuse a lake from a newer croft before touching it (DB_NEWER_FORMAT); once per process.
+          await checkFormat(new LeaseSql(conn, this.renderCtx(), null));
+          this.formatChecked = true;
+        }
+        return await body(conn);
+      } catch (e) {
+        if (kind === "read" && isConnectionError(e)) {
+          if (attempt < LAKE_RETRY.connection) {
+            try { await conn.run("ROLLBACK"); } catch { /* none open */ }
+            await sleep(lakeBackoffMs(attempt));
+            continue;
+          }
+          throw this.scrub(this.lost(e));
+        }
+        throw this.scrub(e);
+      }
+    }
+  }
+
+  /** The catalog or the store could not be reached, however it was tried. */
+  private lost(e: unknown): CroftError {
+    return new CroftError("LAKE_CONNECTION_LOST", {
+      message: `croft lost its connection to the lake (${this.lake!.label}) and could not get it back: ${(e instanceof Error ? e.message : String(e)).split("\n")[0]!.slice(0, 300)}`,
+      hint: "check that the catalog and the bucket are up and reachable from this machine, then run the command again; nothing partial was written",
+      retryable: true,
+      details: { database: this.lake!.label },
+    });
+  }
+
+  /**
+   * One write step on the lake: croft's lock first (one write at a time on this machine), then the body in a transaction, tagged with a
+   * token the snapshot it commits carries. When the connection to the catalog dropped, or the commit's outcome is not known, the tag says
+   * whether the commit landed: if it did, the write is done and its result is returned; if not, the whole step is run again, once for a
+   * dropped connection and a few times for a conflict, in a new transaction. A step is never run again after its commit landed.
+   */
+  private async lakeWrite<T>(conn: DuckDBConnection, label: string, fn: (tx: LeaseSql) => Promise<T>, o: WriteOptions | undefined): Promise<T> {
+    const release = await this.writeLock!.acquire({
+      waitMs: o?.waitMs ?? this.waitCap("write"), runId: o?.runId ?? null, ...(o?.asset ? { asset: o.asset } : {}), label, ...(o?.signal ? { signal: o.signal } : {}),
+      noticeAfterMs: this.o.noticeAfterMs ?? 2000, onWait: (h, ms) => this.o.onWait?.(h, ms),
+      busy: (h, waited) => this.busyError(h ?? { pid: null, program: "croft" }, true, waited, "write"),
+      aborted: () => waitAborted(o!.signal!),
+    });
+    try {
+      if (o?.transaction === false) return await fn(new LeaseSql(conn, this.renderCtx(), null));
+      const tagged = (tag: string) => `CALL ${LAKE_ALIAS}.set_commit_message('croft', '${tag}')`;
+      for (let attempt = 0; ; attempt++) {
+        const tag = newCommitTag();
+        const tx = new LeaseSql(conn, this.renderCtx(), new TxGuard({ database: LAKE_ALIAS }));
+        let result: T | undefined;
+        let ran = false;
+        await conn.run("BEGIN TRANSACTION");
+        try {
+          // The numbers the log adapter kept (D145) are this transaction's: forget those of an earlier one, or of a rolled-back one.
+          for (const reset of seqResetSql()) await conn.run(reset);
+          result = await fn(tx);
+          ran = true;
+          if (tx.failed) {
+            // The body went on after a statement DuckDB refused: the transaction is aborted, and COMMIT would silently write nothing.
+            throw new CroftError("INTERNAL_ERROR", {
+              message: `write "${label}" went on after a statement failed (${tx.failed.message.split("\n")[0]}); nothing was committed`,
+              hint: "report this croft bug",
+            });
+          }
+          await this.recordWriter(tx, o?.runId);
+          await conn.run(tagged(tag));
+          await conn.run("COMMIT");
+          await this.o.afterLakeCommit?.();
+          return result as T;
+        } catch (e) {
+          try {
+            await conn.run("ROLLBACK");
+          } catch {} // already rolled back by a failed COMMIT
+          const lostConnection = isConnectionError(e);
+          const unsure = ran && (isCommitFailure(e) || lostConnection);
+          const conflict = isConflict(e) && !lostConnection;
+          if (!lostConnection && !unsure && !conflict) throw e;
+          if (unsure) {
+            let landed: boolean;
+            try {
+              landed = await commitLanded(new LeaseSql(conn, this.renderCtx(), null), tag);
+            } catch (check) {
+              throw new CroftError("LAKE_COMMIT_UNCERTAIN", {
+                message: `write "${label}" was committing when croft lost its connection to the lake, and croft could not find out whether it landed: ${(check instanceof Error ? check.message : String(check)).split("\n")[0]!.slice(0, 200)}`,
+                hint: "check the lake before running again: croft status shows what the last run wrote; a run that did not land is safe to run again",
+                retryable: true,
+                details: { database: this.lake!.label, step: label },
+              });
+            }
+            if (landed) return result as T;
+          }
+          if (attempt + 1 >= (conflict ? LAKE_RETRY.conflict : LAKE_RETRY.connection)) throw lostConnection || unsure ? this.lost(e) : e;
+          await sleep(lakeBackoffMs(attempt));
+          if (o?.signal?.aborted) throw waitAborted(o.signal);
+        }
+      }
+    } finally {
+      release();
+    }
+  }
+
+  /** Which machine wrote, in the same transaction as the write: a row of _croft.meta that croft doctor compares with its own machine. */
+  private async recordWriter(tx: LeaseSql, runId: string | undefined): Promise<void> {
+    if (!(await hasState(tx))) return;
+    await (await bookkeepingOf(tx)).upsert("meta", { key: "$1", value: "$2" }, [WRITER_KEY, JSON.stringify(writerRecord(runId ?? null))]);
   }
 
   private async open(kind: "read" | "write", waitMs: number, runId?: string, signal?: AbortSignal): Promise<DuckDBInstance> {
+    if (this.lake) return this.openLake();
     if (this.mode === "read_only" && !existsSync(this.path)) {
       throw new CroftError("DB_NOT_FOUND", {
         message: `${this.label} ${this.path} does not exist yet`,
@@ -497,6 +714,11 @@ export class DuckWarehouse implements Warehouse {
 
   private scheduleClose(): void {
     if (this.closeTimer) clearTimeout(this.closeTimer);
+    // A lake's instance lives as long as the command: nothing is locked by it, and a re-attach after its lock is refused.
+    if (this.lake) {
+      for (const r of this.idle.splice(0)) r();
+      return;
+    }
     this.closeTimer = setTimeout(() => this.closeNow(), this.o.lingerMs ?? 100);
     // Do not keep the process alive for the linger; the exit hook closes the file.
     (this.closeTimer as { unref?: () => void }).unref?.();

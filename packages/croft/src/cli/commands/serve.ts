@@ -154,7 +154,7 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
   const started = ctx.now();
   try {
     engine = await (deps.openEngine ?? openEngine)({
-      root: project.root, maxConcurrent: cfg.maxConcurrent, queryTimeoutMs: cfg.queryTimeoutMs,
+      root: project.root, maxConcurrent: cfg.maxConcurrent, queryTimeoutMs: cfg.queryTimeoutMs, env: ctx.env,
       // Quack's hooks run in the readers' process, which cannot write the log or the last-used time: it reports, and this writes.
       onQuack: (e) => onQuack(ctx, keys, e, project.timezone),
     });

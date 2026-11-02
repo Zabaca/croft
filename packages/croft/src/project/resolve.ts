@@ -58,7 +58,7 @@ import type { SelectAst } from "../sql/gate-core.ts";
 import { type DiscoveredAsset, discoverAssets } from "./discover.ts";
 import { ProjectEnv } from "./env.ts";
 import { buildGraph, type Graph } from "./graph.ts";
-import { loadProject } from "./root.ts";
+import { hasLake, loadProject } from "./root.ts";
 import { type LoadedSqlAsset, loadSqlAsset, sqlFingerprint } from "./sql-asset.ts";
 import { didYouMean } from "./suggest.ts";
 import { bundleTs, fingerprintOf, type LoadedTsAsset, loadTsAsset, normalizeBundle, type TsAssetSpec, tsFingerprint } from "./ts-asset.ts";
@@ -86,6 +86,9 @@ export interface ResolveInput {
   /** A scheduled run: import a TS asset only when its bundle's code hash is `approved(asset)`; resolve any other
    *  without its code (ResolvedAsset.notImported), from `known(asset)` or its text. Absent: import as usual. */
   importApproved?: ApprovedImports;
+  /** The project keeps its warehouse in a lake: the gate refuses what reaches past the tables (sql/gate-core.ts LAKE_REFUSED_FUNCTIONS).
+   *  Default: found from croft.json at `root`. */
+  lake?: boolean;
 }
 
 export interface ResolvedProject {
@@ -173,7 +176,9 @@ export interface ResolvedAsset {
  * named file's discovery problem) for a selector that names nothing; never throws for a problem with an asset,
  * which lands in that asset's `problems`.
  */
-export async function resolveProject(i: ResolveInput): Promise<ResolvedProject> {
+export async function resolveProject(input: ResolveInput): Promise<ResolvedProject> {
+  // A lake project's SQL and checks are also kept from the lake's catalog, credentials and storage (D140).
+  const i: ResolveInput = input.lake === undefined ? { ...input, lake: hasLake(input.root) } : input;
   const discovery = await discoverAssets(i.root);
   const names = discovery.assets.map((a) => a.name);
   const selectors = i.selectors ?? [];
@@ -499,7 +504,7 @@ function notImported(a: DiscoveredAsset, codeHash: string | undefined,
 
 async function resolveAsset(a: DiscoveredAsset, i: ResolveInput, names: readonly string[], connection: () => Promise<DuckDBConnection>): Promise<ResolvedAsset> {
   if (a.kind === "sql") {
-    const sql = await loadSqlAsset(a, { root: i.root, timezone: i.timezone, conn: await connection(), assetNames: names });
+    const sql = await loadSqlAsset(a, { root: i.root, timezone: i.timezone, conn: await connection(), assetNames: names, ...(i.lake ? { lake: true } : {}) });
     const key = sql.header.key;
     const out: ResolvedAsset = {
       ...base(a, "sql"), sql, inputs: [...sql.astInputs], key,
@@ -508,7 +513,7 @@ async function resolveAsset(a: DiscoveredAsset, i: ResolveInput, names: readonly
       ...(sql.header.description ? { description: sql.header.description } : {}),
       problems: [...sql.problems],
     };
-    return withChecks(out, sql.header, connection);
+    return withChecks(out, sql.header, connection, i.lake === true);
   }
 
   const cursorType = i.cursorTypes?.[a.name];
@@ -549,7 +554,7 @@ async function resolveAsset(a: DiscoveredAsset, i: ResolveInput, names: readonly
     ...(spec.confirmAbove !== undefined ? { confirmAbove: spec.confirmAbove } : {}),
     ...(spec.schedule !== undefined ? scheduleOf(spec.schedule) : {}),
   };
-  return withChecks(out, { key: spec.key, checks: spec.checks, warnings: spec.warnings }, connection);
+  return withChecks(out, { key: spec.key, checks: spec.checks, warnings: spec.warnings }, connection, i.lake === true);
 }
 
 /** The parsed schedule of an ingest whose spec has one (it parsed when ts-asset.ts validated it). */
@@ -561,10 +566,10 @@ function scheduleOf(text: string): { schedule?: Schedule } {
 /** Parse and vet the asset's checks and warnings; orderAfter becomes its inputs plus the tables its blocking checks
  *  read (a warning never blocks, so what it reads does not order the steps). */
 async function withChecks(out: ResolvedAsset, c: { key: readonly string[]; checks: readonly string[]; warnings: readonly string[] },
-  connection: () => Promise<DuckDBConnection>): Promise<ResolvedAsset> {
+  connection: () => Promise<DuckDBConnection>, lake: boolean): Promise<ResolvedAsset> {
   const parsed = parseChecks({ asset: out.name, file: out.file, key: c.key, checks: c.checks, warnings: c.warnings });
   const vetted = parsed.checks.length
-    ? await analyzeChecks(await connection(), out.name, parsed.checks, { file: out.file })
+    ? await analyzeChecks(await connection(), out.name, parsed.checks, { file: out.file, lake })
     : { checks: [] as Check[], problems: [] as Problem[] };
   out.checks = vetted.checks;
   out.problems.push(...parsed.problems, ...vetted.problems);

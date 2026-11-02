@@ -31,7 +31,7 @@ import type { Problem, Warehouse } from "../core/types.ts";
 import { intentDir } from "../db/intent.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
 import { newRunId, RunsDb } from "../history/runs-db.ts";
-import type { Project } from "../project/root.ts";
+import { type Project, warehouseExists } from "../project/root.ts";
 import { CONFIRM_GRANT_ENV } from "../safety/confirm.ts";
 import {
   type Alive, clockWords, dueWork, type FactsResolver, FAILED_STARTS_SETTING, type FailedStart, type FireTimes, RETRY_BACKOFF_MS,
@@ -208,13 +208,15 @@ async function reconcileTick(project: Project, runs: RunsDb, notify: NonNullable
   let opened: DuckWarehouse | undefined;
   const warehouse: Warehouse = {
     async read(fn, o) {
-      if (!existsSync(project.paths.database)) {
+      if (!warehouseExists(project)) {
         throw new CroftError("DB_NOT_FOUND", { message: `${project.databaseLabel} does not exist yet`, hint: "croft run builds it" });
       }
       const { openWarehouse } = await import("../db/warehouse.ts");
+      const { lakeOption } = await import("../db/lake.ts");
+      const { ProjectEnv } = await import("../project/env.ts");
       opened ??= openWarehouse({
         path: project.paths.database, mode: "read_only", timezone: project.timezone, root: project.root,
-        stateDir: project.paths.stateDir, register: false, isTTY: false,
+        stateDir: project.paths.stateDir, ...lakeOption(project, ProjectEnv.load(project.root)), register: false, isTTY: false,
       });
       return opened.read(fn, { purpose: o?.purpose ?? "reconcile", waitMs: Math.min(o?.waitMs ?? TICK_DB_WAIT_MS, TICK_DB_WAIT_MS) });
     },

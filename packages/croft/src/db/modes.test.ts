@@ -131,7 +131,7 @@ function lakeTestSpec(p: Project, access: "write" | "read" = "write", prepare?: 
   return {
     profile: "serve", timezone: "UTC",
     mode: {
-      kind: "lake-test", extensionDir: ext.dir, secretDir: p.secrets, prepare,
+      kind: "lake-local", extensionDir: ext.dir, secretDir: p.secrets, prepare,
       lake: { catalog: { kind: "sqlite", path: over.catalog ?? join(p.state, "meta.sqlite") }, dataPath: over.dataPath ?? join(p.root, "lake-data") + "/", access },
     },
   };
@@ -167,8 +167,8 @@ describe("the pinned list", () => {
     expect(MODE_EXTENSIONS.readers).toEqual(["httpfs", "quack"]);
     expect(MODE_EXTENSIONS.lake).toEqual(["httpfs", "postgres", "ducklake"]);
     expect(MODE_EXTENSIONS["lake-readers"]).toEqual(["httpfs", "postgres", "ducklake", "quack"]);
-    expect(MODE_EXTENSIONS["lake-test"]).toEqual(["sqlite", "ducklake"]);
-    for (const [kind, names] of Object.entries(MODE_EXTENSIONS)) if (kind !== "lake-test") expect(names, kind).not.toContain("sqlite");
+    expect(MODE_EXTENSIONS["lake-local"]).toEqual(["sqlite", "ducklake"]);
+    for (const [kind, names] of Object.entries(MODE_EXTENSIONS)) if (kind !== "lake-local") expect(names, kind).not.toContain("sqlite");
   });
 
   withExt("with no mode, no extension is loaded (acceptance 1)", async () => {
@@ -206,13 +206,13 @@ describe("a file that is not the pinned file loads nothing (acceptance 3)", () =
     writeFileSync(to, Buffer.concat([Buffer.alloc(2048, 1), footer]));
   }
 
-  async function failure(dir: string, kind: "readers" | "lake-test"): Promise<{ error: CroftError; conn: DuckDBConnection }> {
+  async function failure(dir: string, kind: "readers" | "lake-local"): Promise<{ error: CroftError; conn: DuckDBConnection }> {
     const p = await project();
     const instance = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
     cleanup.push(() => instance.closeSync());
     const spec: SandboxSpec = kind === "readers"
       ? readers(p, { extensionDir: dir })
-      : { profile: "serve", timezone: "UTC", mode: { kind: "lake-test", extensionDir: dir, secretDir: p.secrets, lake: { catalog: { kind: "sqlite", path: join(p.state, "meta.sqlite") }, dataPath: join(p.state, "lake") + "/", access: "write" } } };
+      : { profile: "serve", timezone: "UTC", mode: { kind: "lake-local", extensionDir: dir, secretDir: p.secrets, lake: { catalog: { kind: "sqlite", path: join(p.state, "meta.sqlite") }, dataPath: join(p.state, "lake") + "/", access: "write" } } };
     try {
       await connect(instance, spec, `:memory:bad${++seq}`);
     } catch (e) {
@@ -239,13 +239,13 @@ describe("a file that is not the pinned file loads nothing (acceptance 3)", () =
   });
 
   withExt("a checksum mismatch: EXTENSION_CHECKSUM_MISMATCH, and the files before it are not loaded either", async () => {
-    // lake-test loads sqlite first, then ducklake: damage ducklake, the second, and prove sqlite did not load.
+    // lake-local loads sqlite first, then ducklake: damage ducklake, the second, and prove sqlite did not load.
     const dir = folderWith("ducklake", (real, to) => {
       const bytes = readFileSync(real);
       bytes[Math.floor(bytes.length / 2)]! ^= 0xff; // one flipped byte, same size, same footer
       writeFileSync(to, bytes);
     });
-    const { error: e, conn } = await failure(dir, "lake-test");
+    const { error: e, conn } = await failure(dir, "lake-local");
     expect(e.code).toBe("EXTENSION_CHECKSUM_MISMATCH");
     expect(e.problem.details).toMatchObject({ extension: "ducklake" });
     expect(e.problem.fix).toBeDefined();
@@ -438,10 +438,15 @@ describe("a mode that does not fit its profile, differs from the instance, or fa
     const c = await connect(instance, readers(p), `:memory:fit${seq}`);
     cleanup.push(() => c.disconnectSync());
     expect(await error(c, `SELECT * FROM read_text('${p.secrets}/probe.txt')`)).toContain("Permission Error");
-    // The lake test profile and lake-readers are the same: serve only.
+    // lake-readers runs under the serve profile only; a lake behind a project's commands (Postgres and a bucket, or a local one) runs under any.
     const other = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
     cleanup.push(() => other.closeSync());
-    await expect(connect(other, { ...lakeTestSpec(p), profile: "warehouse", root: p.root, stateDir: p.state }, `:memory:fit2${seq}`)).rejects.toBeInstanceOf(CroftError);
+    await expect(connect(other, { ...lakeTestSpec(p), profile: "warehouse", root: p.root, stateDir: p.state }, `:memory:fit2${seq}`)).resolves.toBeDefined();
+    const third = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
+    cleanup.push(() => third.closeSync());
+    const readersOnAFile = { profile: "warehouse" as const, timezone: "UTC", root: p.root, stateDir: p.state, mode: { kind: "lake-readers" as const, extensionDir: ext.dir, secretDir: p.secrets,
+      lake: { catalog: { kind: "postgres" as const, host: "127.0.0.1", port: 1, database: "d", user: "u", password: "p" }, data: { path: "s3://lake/x/", keyId: "k", secretKey: "s" }, access: "read" as const } } };
+    await expect(connect(third, readersOnAFile, `:memory:fit3${seq}`)).rejects.toBeInstanceOf(CroftError);
   });
 
   withExt("the lake test profile reaches its own folder only: not the state folder, files/, or the project", async () => {

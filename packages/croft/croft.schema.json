@@ -68,6 +68,175 @@
         }
       }
     },
+    "lake": {
+      "description": "lake mode: keep the warehouse in a DuckLake instead of the file. A shared lake is a Postgres catalog and an S3-compatible bucket; a local one (development) is a SQLite catalog and a folder (croft docs lake)",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["catalog"],
+      "properties": {
+        "catalog": {
+          "description": "where the lake keeps its table list",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": {
+              "description": "lake mode: keep the warehouse in a DuckLake. \"postgres\" is a shared lake (a Postgres catalog and a bucket); \"sqlite\" is a local one for development (croft docs lake)",
+              "type": "string",
+              "enum": ["postgres", "sqlite"]
+            },
+            "host": {
+              "description": "the Postgres server that holds the lake's catalog, e.g. \"db.example.com\"",
+              "type": "string",
+              "pattern": "^[^\\s/?#@:]+$|^\\[[0-9A-Fa-f:.]+\\]$"
+            },
+            "port": {
+              "description": "the Postgres server's port",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535,
+              "default": 5432
+            },
+            "database": {
+              "description": "the Postgres database that holds the lake's catalog and nothing else",
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_$-]*$"
+            },
+            "writer": {
+              "description": "the login croft writes the catalog with",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["user", "passwordSecret"],
+              "properties": {
+                "user": {
+                  "description": "the login croft writes the catalog with",
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_$.-]*$"
+                },
+                "passwordSecret": {
+                  "description": "the NAME of the secret (.env, the shell or secretsFrom) that holds the writer login's password",
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                }
+              }
+            },
+            "reader": {
+              "description": "the read-only login that croft serve and every command that only reads use; it must differ from the writer's",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["user", "passwordSecret"],
+              "properties": {
+                "user": {
+                  "description": "the read-only login that croft serve and every command that only reads use; it must differ from the writer's",
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_$.-]*$"
+                },
+                "passwordSecret": {
+                  "description": "the NAME of the secret that holds the read-only login's password",
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                }
+              }
+            },
+            "path": {
+              "description": "a local lake's SQLite catalog file, relative to the project folder, e.g. \"lake/catalog.sqlite\"",
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "bucket": {
+          "description": "the S3-compatible bucket and folder that hold the lake's Parquet files (a lake with a Postgres catalog)",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "folder", "writer", "reader"],
+          "properties": {
+            "name": {
+              "description": "the S3-compatible bucket that holds the lake's Parquet files",
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+            },
+            "folder": {
+              "description": "a folder of the bucket that holds NOTHING BUT this lake: DuckLake's own cleanup deletes files in it that it does not recognise",
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*/?$"
+            },
+            "endpoint": {
+              "description": "host[:port] of the S3-compatible store, without a scheme, e.g. \"abc123.r2.cloudflarestorage.com\"",
+              "type": "string",
+              "pattern": "^[^\\s/?#@]+$"
+            },
+            "region": {
+              "description": "the store's region name, e.g. \"us-east-1\" or \"auto\"",
+              "type": "string",
+              "pattern": "^[A-Za-z0-9-]{1,30}$"
+            },
+            "urlStyle": {
+              "description": "how the store's addresses are written",
+              "type": "string",
+              "enum": ["path", "vhost"],
+              "default": "path"
+            },
+            "useSsl": {
+              "description": "reach the store over HTTPS; false only for a store on this machine",
+              "type": "boolean",
+              "default": true
+            },
+            "writer": {
+              "description": "the bucket key croft writes with, by the names of the secrets that hold it",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["keyIdSecret", "secretKeySecret"],
+              "properties": {
+                "keyIdSecret": {
+                  "description": "the NAME of the secret that holds the writer bucket key's id",
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                },
+                "secretKeySecret": {
+                  "description": "the NAME of the secret that holds the writer bucket key's secret",
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                },
+                "sessionTokenSecret": {
+                  "description": "the NAME of the secret that holds the writer key's session token, when the key is temporary",
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                }
+              }
+            },
+            "reader": {
+              "description": "the read-only bucket key every command that only reads uses, and croft serve, by the names of the secrets that hold it",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["keyIdSecret", "secretKeySecret"],
+              "properties": {
+                "keyIdSecret": {
+                  "description": "the NAME of the secret that holds the read-only bucket key's id",
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                },
+                "secretKeySecret": {
+                  "description": "the NAME of the secret that holds the read-only bucket key's secret",
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                },
+                "sessionTokenSecret": {
+                  "description": "the NAME of the secret that holds the read-only key's session token, when the key is temporary",
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                }
+              }
+            }
+          }
+        },
+        "dataPath": {
+          "description": "a local lake's folder for its Parquet files, relative to the project folder, e.g. \"lake/data\"; it holds nothing else",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
     "notify": {
       "description": "what happens when a scheduled run fails",
       "type": "object",

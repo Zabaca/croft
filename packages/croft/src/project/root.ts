@@ -9,7 +9,10 @@ import { CroftError, problem } from "../core/errors.ts";
 import { checkTimeZone, systemTimeZone } from "../core/time.ts";
 import type { Fix, Problem } from "../core/types.ts";
 import { joinPath, scanJson, type JsonPosition } from "./json-locate.ts";
+import { type LakeConfig, lakeLabel, lakeLocationIssues, validateLake } from "./lake-config.ts";
 import { didYouMean } from "./suggest.ts";
+
+export { type LakeConfig } from "./lake-config.ts";
 
 export const CONFIG_FILE = "croft.json";
 
@@ -51,6 +54,8 @@ export interface CroftConfig {
   /** The read copy is kept: `readCopy` in croft.json, or on whenever server mode is (the copy is what it serves). */
   readCopy: boolean;
   serverMode: ServerModeConfig;
+  /** Lake mode (option 07, D138): the warehouse is a DuckLake, not `database`. Null: the file, as ever. */
+  lake: LakeConfig | null;
   notify: NotifyConfig;
   concurrency: number;               // parallel extractions in one run
   http: HttpConfig;
@@ -80,6 +85,28 @@ export const CONFIG_KEYS: { key: string; type: string; default: string; descript
   { key: "serverMode.quackPort", type: "integer", default: String(DEFAULTS.serverMode.quackPort), description: "the port for Quack; 0 picks a free one and the banner says which" },
   { key: "serverMode.quackPlaintextOnNetwork", type: "boolean", default: "false", description: "accept that a quackHost other than loopback carries keys and queries in plaintext, behind an HTTPS reverse proxy of your own; without this croft serve refuses to start with such an address (ask the user first)" },
   { key: "serverMode.quackMaxConcurrent", type: "integer", default: String(DEFAULTS.serverMode.quackMaxConcurrent), description: "Quack queries running at once, over all sessions; past it a query is refused with a retryable answer (1-64)" },
+  { key: "lake.catalog.kind", type: "\"postgres\" | \"sqlite\"", default: "(none: no lake)", description: "lake mode: keep the warehouse in a DuckLake. \"postgres\" is a shared lake (a Postgres catalog and a bucket); \"sqlite\" is a local one for development (croft docs lake)" },
+  { key: "lake.catalog.host", type: "string", default: "(required, postgres)", description: "the Postgres server that holds the lake's catalog, e.g. \"db.example.com\"" },
+  { key: "lake.catalog.port", type: "integer", default: "5432", description: "the Postgres server's port" },
+  { key: "lake.catalog.database", type: "string", default: "(required, postgres)", description: "the Postgres database that holds the lake's catalog and nothing else" },
+  { key: "lake.catalog.writer.user", type: "string", default: "(required, postgres)", description: "the login croft writes the catalog with" },
+  { key: "lake.catalog.writer.passwordSecret", type: "string", default: "(required, postgres)", description: "the NAME of the secret (.env, the shell or secretsFrom) that holds the writer login's password" },
+  { key: "lake.catalog.reader.user", type: "string", default: "(required, postgres)", description: "the read-only login that croft serve and every command that only reads use; it must differ from the writer's" },
+  { key: "lake.catalog.reader.passwordSecret", type: "string", default: "(required, postgres)", description: "the NAME of the secret that holds the read-only login's password" },
+  { key: "lake.catalog.path", type: "string", default: "(required, sqlite)", description: "a local lake's SQLite catalog file, relative to the project folder, e.g. \"lake/catalog.sqlite\"" },
+  { key: "lake.bucket.name", type: "string", default: "(required, postgres)", description: "the S3-compatible bucket that holds the lake's Parquet files" },
+  { key: "lake.bucket.folder", type: "string", default: "(required, postgres)", description: "a folder of the bucket that holds NOTHING BUT this lake: DuckLake's own cleanup deletes files in it that it does not recognise" },
+  { key: "lake.bucket.endpoint", type: "string", default: "(AWS)", description: "host[:port] of the S3-compatible store, without a scheme, e.g. \"abc123.r2.cloudflarestorage.com\"" },
+  { key: "lake.bucket.region", type: "string", default: "(the store's default)", description: "the store's region name, e.g. \"us-east-1\" or \"auto\"" },
+  { key: "lake.bucket.urlStyle", type: "\"path\" | \"vhost\"", default: "\"path\"", description: "how the store's addresses are written" },
+  { key: "lake.bucket.useSsl", type: "boolean", default: "true", description: "reach the store over HTTPS; false only for a store on this machine" },
+  { key: "lake.bucket.writer.keyIdSecret", type: "string", default: "(required, postgres)", description: "the NAME of the secret that holds the writer bucket key's id" },
+  { key: "lake.bucket.writer.secretKeySecret", type: "string", default: "(required, postgres)", description: "the NAME of the secret that holds the writer bucket key's secret" },
+  { key: "lake.bucket.writer.sessionTokenSecret", type: "string", default: "(none)", description: "the NAME of the secret that holds the writer key's session token, when the key is temporary" },
+  { key: "lake.bucket.reader.keyIdSecret", type: "string", default: "(required, postgres)", description: "the NAME of the secret that holds the read-only bucket key's id" },
+  { key: "lake.bucket.reader.secretKeySecret", type: "string", default: "(required, postgres)", description: "the NAME of the secret that holds the read-only bucket key's secret" },
+  { key: "lake.bucket.reader.sessionTokenSecret", type: "string", default: "(none)", description: "the NAME of the secret that holds the read-only key's session token, when the key is temporary" },
+  { key: "lake.dataPath", type: "string", default: "(required, sqlite)", description: "a local lake's folder for its Parquet files, relative to the project folder, e.g. \"lake/data\"; it holds nothing else" },
   { key: "notify.desktop", type: "boolean", default: "true", description: "desktop notification when a scheduled run fails" },
   { key: "notify.webhook", type: "string | null", default: "null", description: "http(s) URL that receives the failure envelope of a scheduled run" },
   { key: "concurrency", type: "integer", default: String(DEFAULTS.concurrency), description: "extractions that run at the same time in one run (1-64)" },
@@ -96,7 +123,7 @@ export const CONFIG_KEYS: { key: string; type: string; default: string; descript
   { key: "secretsFrom.command", type: "string[]", default: "null", description: "a command, run from the project folder without a shell, that prints the secrets the shell and .env lack as KEY=value lines, e.g. [\"sops\", \"-d\", \"--output-type\", \"dotenv\", \"secrets.enc.yaml\"] (croft docs secrets)" },
 ];
 
-const TOP_KEYS = ["$schema", "database", "timezone", "readCopy", "serverMode", "notify", "concurrency", "http", "serve", "stateDir", "secretsFrom"];
+const TOP_KEYS = ["$schema", "database", "timezone", "readCopy", "serverMode", "lake", "notify", "concurrency", "http", "serve", "stateDir", "secretsFrom"];
 const SERVER_MODE_KEYS = ["enabled", "acceptFullCopyCost", "quackHost", "quackPort", "quackPlaintextOnNetwork", "quackMaxConcurrent"];
 /** A shared table is an asset's table: the asset naming rule (project/discover.ts NAME_PATTERN). */
 const SHARED_TABLE = /^[a-z][a-z0-9_]*$/;
@@ -134,8 +161,22 @@ export function parseConfig(text: string, place?: ConfigPlace): ConfigResult {
   return validateConfig(raw, (path) => scan.paths.get(path), place);
 }
 
+/**
+ * The `lake` block every project gets under croft's own test harness when CROFT_TEST_LAKE=local is set (together with CROFT_TEST_HARNESS=1, which
+ * tests/preload.ts sets for the test process and the e2e harness gives every croft it spawns): a local lake under `lake/` in the project. It lets the
+ * journeys of the suite run with the warehouse in a lake, the way CROFT_BOOKKEEPING=log lets them run on the log (db/bookkeeping.ts). Honoured only
+ * for a croft.json with no `lake` of its own, and only with the harness mark, so a user who sets the variable alone gets nothing.
+ */
+export function testHarnessLake(env: NodeJS.ProcessEnv = process.env): Record<string, unknown> | undefined {
+  return env.CROFT_TEST_LAKE === "local" && env.CROFT_TEST_HARNESS === "1"
+    ? { catalog: { kind: "sqlite", path: "lake/catalog.sqlite" }, dataPath: "lake/data" }
+    : undefined;
+}
+
 /** Validate a parsed croft.json, collecting every issue rather than stopping at the first. */
 export function validateConfig(raw: unknown, locate: Locate = () => undefined, place?: ConfigPlace): ConfigResult {
+  const harnessLake = isPlainObject(raw) && raw.lake === undefined ? testHarnessLake() : undefined;
+  if (harnessLake) raw = { ...(raw as Record<string, unknown>), lake: harnessLake };
   const issues: ConfigIssue[] = [];
   const add = (path: string, message: string, hint: string, fix?: Fix) => {
     const at = locate(path);
@@ -243,6 +284,19 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined, p
   if (sm.quackHost !== undefined && /[\s/?#@]/.test(serverMode.quackHost)) {
     add("serverMode.quackHost", `"serverMode.quackHost" must be an address to listen on; found ${show(sm.quackHost)}`,
       'leave it out to listen on 127.0.0.1 (this machine only); otherwise give an address of this machine like "0.0.0.0" and put an HTTPS reverse proxy in front');
+  }
+
+  // lake (D138): a DuckLake instead of the file. Off unless the project names one.
+  const lake = validateLake(raw.lake, { add, unknownKeys, str, bool, int, show, count: () => issues.length });
+  if (raw.lake !== undefined) {
+    if (serverMode.enabled) {
+      add("serverMode.enabled", `"serverMode.enabled" cannot be on in a project with a lake yet: server mode over a lake is a later part of lake mode`,
+        'turn "serverMode" off, or remove "lake"; croft serve still reads a lake without it');
+    }
+    if (raw.readCopy === true) {
+      add("readCopy", `"readCopy" does not apply to a lake: readers attach the lake itself and always see its last snapshot`,
+        'remove "readCopy" from croft.json');
+    }
   }
 
   // notify
@@ -365,11 +419,11 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined, p
   }
 
   if (place && !issues.length) {
-    for (const i of locationIssues(database, stateDir, place)) add(i.path, i.message, i.hint);
+    for (const i of locationIssues(database, stateDir, place, lake)) add(i.path, i.message, i.hint);
   }
 
   if (issues.length) return { ok: false, issues };
-  return { ok: true, config: { database, timezone, readCopy: readCopy || serverMode.enabled, serverMode, notify: { desktop, webhook }, concurrency, http: { budgets }, serve, stateDir, secretsFrom } };
+  return { ok: true, config: { database, timezone, readCopy: readCopy || serverMode.enabled, serverMode, lake, notify: { desktop, webhook }, concurrency, http: { budgets }, serve, stateDir, secretsFrom } };
 }
 
 /**
@@ -378,16 +432,19 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined, p
  * everything under stateDir, and `croft query` everything under files/. §2 relocation writes both keys, so
  * this is the last check before a bad value reaches DuckDB. Paths are resolved without opening anything.
  */
-function locationIssues(database: string, stateDir: string | null, place: ConfigPlace): { path: string; message: string; hint: string }[] {
+function locationIssues(database: string, stateDir: string | null, place: ConfigPlace, lake: LakeConfig | null = null): { path: string; message: string; hint: string }[] {
   const home = place.home ?? homedir();
   const paths = resolvePaths(place.root, { database, stateDir } as CroftConfig, home);
+  const lakeIssues = lake ? lakeLocationIssues(lake, {
+    root: place.root, home, real: (p) => physicalPath(p).path, filesDir: paths.filesDir, assetsDir: paths.assetsDir, libDir: paths.libDir, stateDir: paths.stateDir,
+  }) : [];
   const real = (p: string) => physicalPath(p).path;
   const inside = (p: string, dir: string) => p === dir || p.startsWith(dir.endsWith(sep) ? dir : dir + sep);
   const root = real(place.root);
   const db = real(paths.database);
   const state = real(paths.stateDir);
   const folders = [["files/", paths.filesDir], ["assets/", paths.assetsDir], ["lib/", paths.libDir]].map(([name, p]) => [name!, real(p!)] as const);
-  const out: { path: string; message: string; hint: string }[] = [];
+  const out: { path: string; message: string; hint: string }[] = [...lakeIssues];
   const fixState = 'remove "stateDir" to use .croft/ in the project folder, or name a folder of its own such as "~/.local/share/croft/<project>/.croft"';
   if (stateDir !== null) {
     const found = `"stateDir" is ${show(stateDir)}`;
@@ -488,6 +545,26 @@ export interface Project {
   relocated: boolean;                // database or state lives outside the project folder
 }
 
+/**
+ * Whether there is a warehouse to open. A project with a file: the file is there. A lake project: always, because the lake is
+ * attached on demand and a lake nobody has written yet is DB_NOT_FOUND when a reader opens it (db/warehouse.ts), exactly where a
+ * missing file is for a project with one. So a caller that asks this and then opens the warehouse needs the same handling for both.
+ */
+export function warehouseExists(project: Project): boolean {
+  return project.config.lake !== null || isFile(project.paths.database);
+}
+
+/** Whether the project at `root` names a lake, read from its croft.json without validating the rest (false when it cannot be read). For
+ *  callers that are given a root and no loaded project, such as the resolver, which gates an asset's SQL differently in a lake (D140). */
+export function hasLake(root: string): boolean {
+  try {
+    const r = parseConfig(readFileSync(join(root, CONFIG_FILE), "utf8"));
+    return r.ok && r.config.lake !== null;
+  } catch {
+    return false;
+  }
+}
+
 export function resolvePaths(root: string, config: CroftConfig, home = homedir()): ProjectPaths {
   const database = resolve(root, expandHome(config.database, home));
   return {
@@ -513,7 +590,7 @@ export function loadProject(opts: { cwd?: string; root?: string; home?: string }
   const inside = (p: string) => p === root || p.startsWith(root + sep);
   return {
     root, config, paths, timezone: config.timezone,
-    databaseLabel: inside(paths.database) ? relative(root, paths.database) : paths.database,
+    databaseLabel: config.lake ? lakeLabel(config.lake, root, opts.home) : inside(paths.database) ? relative(root, paths.database) : paths.database,
     relocated: !inside(paths.database) || !inside(paths.stateDir),
   };
 }

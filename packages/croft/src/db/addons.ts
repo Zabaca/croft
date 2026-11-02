@@ -29,12 +29,14 @@ export const ADDON_NAMES = Object.keys(ADDONS) as AddonName[];
 /** The extensions an add-on carries, in load order. */
 export const extensionsOf = (a: AddonName): readonly ExtensionName[] => ADDONS[a].extensions;
 
-/** The add-ons a mode's extensions come from. The lake test mode loads sqlite, which only croft's own suite needs, from a folder. */
+/** The add-ons a mode's extensions come from. A local lake (a SQLite catalog and a local folder) is lake mode too, so it needs the lake
+ *  add-on, whose ducklake it loads; sqlite ships in no add-on (it is for croft's own suite and local development) and is looked for in a
+ *  folder, then the builders' cache (extension-files.ts). */
 export const MODE_ADDONS: Readonly<Record<ModeKind, readonly AddonName[]>> = {
   readers: ["server"],
   lake: ["lake"],
   "lake-readers": ["server", "lake"],
-  "lake-test": [],
+  "lake-local": ["lake"],
 };
 
 /** The npm names for each platform: the `os`, `cpu` and, on Linux, `libc` fields that make a package install only where it runs. */

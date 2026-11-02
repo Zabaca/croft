@@ -62,7 +62,7 @@ import { checkOutOfBand } from "../safety/out-of-band.ts";
 import { plannedTrashPath, trashFailed, trashTable, type TrashEntry } from "../safety/trash.ts";
 import { castExpr, lossExpr } from "./cast.ts";
 import { RESERVED } from "./contract.ts";
-import { currentDatabase, isReservedColumn, normalizeType, quoteIdent, type RealColumn, readTableSchema, safeType, tableRef } from "./evolve.ts";
+import { currentDatabase, isReservedColumn, normalizeType, quoteIdent, type RealColumn, readTableSchema, retypeColumns, safeType, tableRef } from "./evolve.ts";
 import { normalizePins, type Pin, pinFor, typeFamily } from "./types.ts";
 
 type Pins = Record<string, { type: string; format?: string }>;
@@ -300,9 +300,12 @@ export async function planPinChanges(sql: Sql, o: PinPlanInput): Promise<PinChan
   return out;
 }
 
-async function retype(tx: Sql, ref: string, c: PinChange): Promise<void> {
-  const { cast } = retypeExprs(c.column, c.from, c.to, c.format);
-  await tx.exec(`ALTER TABLE ${ref} ALTER COLUMN ${quoteIdent(c.column)} SET DATA TYPE ${c.to} USING ${cast}`);
+/** The pins' retypes, all of a table's together (in a lake they are one rewrite; load/evolve.ts retypeColumns). */
+async function retypeAll(tx: Sql, at: { ref: string; table: string; db: string }, found: readonly PinChange[]): Promise<void> {
+  await retypeColumns(tx, {
+    ...at,
+    changes: found.map((c) => ({ column: c.column, from: c.from, to: c.to, using: retypeExprs(c.column, c.from, c.to, c.format).cast })),
+  });
 }
 
 /** How a sample reads in a message: text quoted, NULL as NULL. */
@@ -363,11 +366,12 @@ export async function applyPinChanges(tx: Sql, o: ApplyPinsInput): Promise<Appli
   if (found.length === 0) return { plans: o.plans, changes: [], warnings: [], replaced: false };
   const lossy = found.filter((c) => c.changed > 0);
   if (lossy.length) throw new CroftError("PIN_CHANGES_DATA", pinChangesData(o, lossy, "nothing was written"));
-  const ref = tableRef(await currentDatabase(tx), o.asset);
+  const db = await currentDatabase(tx);
+  const ref = tableRef(db, o.asset);
   const changes: SchemaChange[] = [];
   const warnings: Problem[] = [];
+  await retypeAll(tx, { ref, table: o.asset, db }, found);
   for (const c of found) {
-    await retype(tx, ref, c);
     if (c.pending || c.nonNull === 0) {
       changes.push({ kind: "retype_pending", column: c.column, to: c.to });
       continue;
@@ -460,10 +464,8 @@ export async function applyConfigChange(tx: Sql, o: ConfigChangeInput): Promise<
   const ref = tableRef(db, o.asset);
   const oob = await checkOutOfBand(tx, o.asset);
   const changes: SchemaChange[] = [];
-  for (const c of o.pins) {
-    await retype(tx, ref, c);
-    changes.push({ kind: "widen", column: c.column, from: c.from, to: c.to });
-  }
+  await retypeAll(tx, { ref, table: o.asset, db }, o.pins);
+  for (const c of o.pins) changes.push({ kind: "widen", column: c.column, from: c.from, to: c.to });
   let removed = 0;
   if (o.convert) {
     const columns = (await readTableSchema(tx, o.asset, db)) ?? [];

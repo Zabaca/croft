@@ -28,6 +28,7 @@ import { CroftError } from "../core/errors.ts";
 import { now as clockNow, toEpochMicros } from "../core/time.ts";
 import type { AssetKind, Problem, Sql } from "../core/types.ts";
 import { bookkeepingOf } from "../db/bookkeeping.ts";
+import { inLake } from "../db/bookkeeping.ts";
 import { hasState } from "../db/state.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
 import { quoteIdent, readTableSchema } from "../load/evolve.ts";
@@ -111,7 +112,7 @@ export async function countWhere(sql: Sql, asset: string, where: string): Promis
   if (!text) throw whereError(asset, where, "is empty");
   const serialize = async (statement: string) =>
     String((await sql.all<{ j: string }>(`SELECT json_serialize_sql($1::VARCHAR)::VARCHAR AS j`, [statement]))[0]?.j ?? "{}");
-  const vetted = await vetCheck(serialize, asset, { source: text, kind: "rule", blocking: true, scope: "table", sql: text, reads: [] });
+  const vetted = await vetCheck(serialize, asset, { source: text, kind: "rule", blocking: true, scope: "table", sql: text, reads: [] }, { lake: await inLake(sql) });
   if (!vetted.ok) throw whereError(asset, where, vetted.why.replace(/\ba check\b/g, "--where").replace(/\bchecks\b/g, "--where"));
   const ast = JSON.parse(finiteJson(await serialize(`SELECT (\n${text}\n) FROM ${quoteIdent(asset)}`))) as unknown;
   const random = volatileUses(ast).map((u) => u.shown).filter((s) => RANDOM_FUNCTIONS.has(s.replace(/\(\)$/, "")));

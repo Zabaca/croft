@@ -12,6 +12,7 @@
 // from user config and end up inside DDL.
 import { CroftError } from "../core/errors.ts";
 import type { ColumnPlan, SchemaChange, Sql } from "../core/types.ts";
+import { inLake } from "../db/bookkeeping.ts";
 import { RESERVED } from "./contract.ts";
 
 /** A column as the database reports it, with the type normalized (see normalizeType). */
@@ -70,7 +71,8 @@ export function safeType(type: string, column: string): string {
   return t;
 }
 
-const sameName = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+const lower = (s: string) => s.toLowerCase();
+const sameName = (a: string, b: string) => lower(a) === lower(b);
 
 /** The name of the database the connection writes (the warehouse's catalog). */
 export async function currentDatabase(sql: Sql): Promise<string> {
@@ -104,6 +106,66 @@ export async function readTableSchema(sql: Sql, table: string, database?: string
   );
   if (rows.length === 0) return null;
   return rows.map((r) => ({ name: r.name, type: normalizeType(r.type) }));
+}
+
+/**
+ * The column type changes DuckLake takes with ALTER ... TYPE: its widening promotions, which are exactly the widenings croft makes (§7,
+ * load/types.ts widenTarget). Any other change (a pending placeholder that received values, a pin that retypes a stored column) is refused
+ * by a lake ("only widening type promotions are allowed") [V: 2.0.0, DuckLake 1.0], and is made by rewriting the table instead.
+ */
+const LAKE_PROMOTIONS: Readonly<Record<string, readonly string[]>> = {
+  INTEGER: ["BIGINT", "HUGEINT", "DOUBLE"],
+  BIGINT: ["HUGEINT", "DOUBLE"],
+  HUGEINT: ["DOUBLE"],
+  DATE: ["TIMESTAMP", "TIMESTAMPTZ"],
+  TIMESTAMP: ["TIMESTAMPTZ"],
+};
+
+/** One column's type change: `using` is the pin's cast of the stored values, where there is one. */
+export interface Retype { column: string; from: string; to: string; using?: string }
+
+/** Whether a lake takes this change as a plain ALTER (a widening promotion, with no cast of its own); every other change is a rewrite there. */
+export const lakePromotes = (c: Retype): boolean => c.using === undefined && LAKE_PROMOTIONS[c.from]?.includes(c.to) === true;
+
+/**
+ * Change the type of columns of the table `ref` (db.main.<table>), the whole table being `table` in database `db`, together. In a file each is
+ * ALTER COLUMN ... TYPE (with `using` when there is one). In a lake, when any of them is a change its ALTER does not take, they are all made by
+ * one rewrite in the same transaction: CREATE OR REPLACE TABLE ... AS SELECT the same columns in the same order, each changed one by its cast.
+ * The table keeps its name, its columns and their order and every row; it is a new table to the lake (a version of the old one stays readable
+ * as of the earlier snapshots). One, and first: DuckLake 2.0.0 cannot
+ * read a table back in a transaction that changed it ("Table 0 does not exist" after an ALTER, a missing data file after a rewrite) [V: 2.0.0,
+ * DuckLake 1.0, probed in the transaction with 2 and with 50 rows], so a rewrite is the first change to a table in its write, and a second
+ * one is refused here with a croft code instead of that. An ALTER after the rewrite is fine.
+ */
+export async function retypeColumns(tx: Sql, o: { ref: string; table: string; db: string; changes: readonly Retype[] }): Promise<void> {
+  if (o.changes.length === 0) return;
+  const lake = await inLake(tx);
+  if (!lake || o.changes.every(lakePromotes)) {
+    for (const c of o.changes) {
+      await tx.exec(c.using === undefined
+        ? `ALTER TABLE ${o.ref} ALTER COLUMN ${quoteIdent(c.column)} TYPE ${c.to}`
+        : `ALTER TABLE ${o.ref} ALTER COLUMN ${quoteIdent(c.column)} SET DATA TYPE ${c.to} USING ${c.using}`);
+    }
+    return;
+  }
+  const columns = await readTableSchema(tx, o.table, o.db);
+  if (!columns) throw new CroftError("INTERNAL_ERROR", { message: `cannot retype ${o.changes[0]!.column}: ${o.table} does not exist`, hint: "report this croft bug" });
+  const select = columns.map((c) => {
+    const change = o.changes.find((x) => sameName(x.column, c.name));
+    return change ? `${change.using ?? `CAST(${quoteIdent(c.name)} AS ${change.to})`} AS ${quoteIdent(c.name)}` : quoteIdent(c.name);
+  });
+  try {
+    await tx.exec(`CREATE OR REPLACE TABLE ${o.ref} AS SELECT ${select.join(", ")} FROM ${o.ref}`);
+  } catch (e) {
+    if (!/Table \d+ does not exist|Cannot open file|NoSuchKey|HTTP 404/.test(e instanceof Error ? e.message : String(e))) throw e;
+    throw new CroftError("LAKE_UNSUPPORTED", {
+      message: `${o.table} cannot be retyped (${o.changes.map((c) => `${c.column} to ${c.to}`).join(", ")}) in the same write that already changed it: a lake rewrites a table for this change, and cannot do it after another change to the table`,
+      hint: "make one change at a time: run once with the pin or the new data that retypes the column, then again with the other change",
+      fix: { kind: "manual", description: "split the change over two runs; nothing was written by this one", requiresHuman: false },
+      effect: "nothing was written",
+      details: { table: o.table, columns: o.changes.map((c) => c.column) },
+    });
+  }
 }
 
 export interface EvolveInput {
@@ -193,9 +255,35 @@ export async function evolveTable(tx: Sql, input: EvolveInput): Promise<EvolveRe
     real.push({ name: column, type });
     changes.push({ kind: "add_column", column, type });
   };
+  // A pending placeholder retypes only when it holds nothing; "add" lands here when the column already exists (state lost, or added outside
+  // croft), and only an all-NULL column may retype.
+  const requireEmpty = async (plan: ColumnPlan, have: RealColumn, want: string) => {
+    const n = await nonNullCount(have.name);
+    if (n > 0) {
+      throw conflict(plan, `column ${have.name} already holds ${n} non-NULL ${have.type} values; croft will not retype it to ${want}`, { tableType: have.type, wanted: want, nonNull: n });
+    }
+  };
+  // In a lake the changes its ALTER does not take are made first and together, by one rewrite of the table (retypeColumns says why); the loop
+  // below then finds them done. The loop's own ALTERs (promotions, new columns) come after, which a lake takes.
+  const rewritten = new Set<string>();
+  if (await inLake(tx)) {
+    const todo: Retype[] = [];
+    for (const plan of plans) {
+      const have = realCol(plan.column);
+      const want = wantedType(plan, batchCol(plan.column), have);
+      if (!have || !want || have.type === want) continue;
+      if (plan.decision === "retype_pending" || plan.decision === "add") await requireEmpty(plan, have, want);
+      else if (plan.decision !== "widen") continue; // the loop below refuses it
+      const change = { column: have.name, from: have.type, to: want };
+      if (!lakePromotes(change)) todo.push(change);
+    }
+    await retypeColumns(tx, { ref, table: input.table, db, changes: todo });
+    for (const c of todo) rewritten.add(lower(c.column));
+  }
   const retype = async (column: string, type: string) => {
-    await tx.exec(`ALTER TABLE ${ref} ALTER COLUMN ${quoteIdent(column)} TYPE ${type}`);
-    real.find((c) => sameName(c.name, column))!.type = type;
+    const col = real.find((c) => sameName(c.name, column))!;
+    if (!rewritten.has(lower(column))) await retypeColumns(tx, { ref, table: input.table, db, changes: [{ column, from: col.type, to: type }] });
+    col.type = type;
   };
 
   for (const plan of plans) {
@@ -218,12 +306,8 @@ export async function evolveTable(tx: Sql, input: EvolveInput): Promise<EvolveRe
       }
       case "retype_pending":
       case "add": {
-        // A pending placeholder holds only NULLs, so any type change is free. "add" lands here when the
-        // column already exists (state lost, or added outside croft); only an all-NULL column may retype.
-        const n = await nonNullCount(have.name);
-        if (n > 0) {
-          throw conflict(plan, `column ${have.name} already holds ${n} non-NULL ${have.type} values; croft will not retype it to ${want}`, { tableType: have.type, wanted: want, nonNull: n });
-        }
+        // A pending placeholder holds only NULLs, so any type change is free.
+        await requireEmpty(plan, have, want);
         await retype(have.name, want);
         changes.push({ kind: "retype_pending", column: have.name, to: want });
         break;

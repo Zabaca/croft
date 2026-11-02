@@ -16,6 +16,7 @@ import type { Server } from "bun";
 import { test } from "bun:test";
 import { BUN_FLOOR } from "../../src/cli/version.ts";
 import { bookkeepingEnv } from "../../src/db/bookkeeping-testkit.ts";
+import { resolveExtensionDir } from "../../src/db/extension-files.ts";
 
 /** packages/croft */
 export const PKG = resolve(import.meta.dir, "../..");
@@ -68,6 +69,12 @@ export function baseEnv(extra: Record<string, string> = {}): Record<string, stri
     CROFT_BUN_VERSION: BUN_FLOOR,
     // The suite also runs on the log adapter; every croft a journey spawns follows.
     ...bookkeepingEnv(),
+    // And with every project's warehouse in a local lake (CROFT_E2E_LAKE=local): the child croft is given the harness's lake switch
+    // (project/root.ts testHarnessLake), so a journey that is not about the file itself runs unchanged on a lake. Only the children get it:
+    // this process's own projects are the file's.
+    ...(process.env.CROFT_E2E_LAKE === "local"
+      ? { CROFT_TEST_LAKE: "local", CROFT_TEST_HARNESS: "1", CROFT_EXTENSION_DIR: resolveExtensionDir(process.env) } // a child's HOME may be a fake one: name the folder
+      : {}),
     ...extra,
   };
 }

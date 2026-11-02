@@ -160,7 +160,7 @@ async function lakeSection(log: (s?: string) => void): Promise<void> {
     const instance = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
     const conn = await connect(instance, {
       profile: "serve", timezone: "UTC",
-      mode: { kind: "lake-test", extensionDir: ext.dir, secretDir: join(root, "secrets"), lake: { catalog: { kind: "sqlite", path: join(root, "meta.sqlite") }, dataPath: join(root, "data") + "/", access: "write" } },
+      mode: { kind: "lake-local", extensionDir: ext.dir, secretDir: join(root, "secrets"), lake: { catalog: { kind: "sqlite", path: join(root, "meta.sqlite") }, dataPath: join(root, "data") + "/", access: "write" } },
     }, `:memory:bench-lake-${Math.random()}`);
     await conn.run("USE lake");
     return { sql: new LeaseSql(conn, { mode: "ts", timezone: "UTC" }, null), conn, close: () => { conn.disconnectSync(); instance.closeSync(); rmSync(root, { recursive: true, force: true }); } };

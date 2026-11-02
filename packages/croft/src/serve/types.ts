@@ -1,5 +1,6 @@
 // croft serve's record and wire types (DESIGN.md §5 "Server mode"). serve.json is what the read client
 // (read/locate.ts readServeRecord) finds the server by; it is written 0600 because it holds the token.
+import type { ProjectEnv } from "../project/env.ts";
 import type { ServeRecord } from "../read/locate.ts";
 import type { QuackEvent } from "./quack-access.ts";
 
@@ -105,6 +106,9 @@ export interface ServeEngineStatus {
   /** DuckDB connections open right now (0 whenever the file is released). */
   openConnections: number;
   queriesToday: number;
+  /** A lake project's engine (D143, serve/lake-engine.ts): the lake it reads, the process that reads it and how often that was started
+   *  again. It never steps aside, so `state` is "open" whenever the process is. */
+  lake?: { label: string; workerPid: number | null; restarts: number };
   /** Server mode only (D119): the readers' engine (serve/readers.ts). `state` is the engine's own: "waiting" for the
    *  first copy, "starting", "open", "restarting" after a kill, a crash or a failed start, or "stopped". */
   serverMode?: {
@@ -149,4 +153,6 @@ export interface ServeEngineOptions {
   /** Server mode (D125): told of every Quack sign-in and every Quack query, answered or refused, for croft serve's log line
    *  and a key's last-used time. */
   onQuack?: (e: QuackEvent) => void;
+  /** The project's secrets, for the read-only login and bucket key of a lake project (D143); .env and the shell by default. */
+  env?: ProjectEnv;
 }

@@ -53,8 +53,9 @@ export interface LakeSpec {
   access: "write" | "read";
 }
 
-/** The lake test profile: a SQLite catalog file and a local data folder in place of Postgres and the bucket. Test suite only. */
-export interface LakeTestSpec {
+/** A local lake: a SQLite catalog file and a local data folder in place of Postgres and the bucket. For croft's own suite and
+ *  for local development on one machine (option 07, slice 2); a shared lake is Postgres and a bucket. */
+export interface LakeLocalSpec {
   catalog: { kind: "sqlite"; path: string };
   /** A local folder, with a trailing slash. */
   dataPath: string;
@@ -79,10 +80,10 @@ export interface ReadersMode extends ModeBase { kind: "readers"; copy: string }
 export interface LakeMode extends ModeBase { kind: "lake"; lake: LakeSpec }
 /** Server mode over a lake: the lake attached read-only, plus quack for the listener. */
 export interface LakeReadersMode extends ModeBase { kind: "lake-readers"; lake: LakeSpec & { access: "read" } }
-/** croft's own lake tests: ducklake and sqlite over local files. */
-export interface LakeTestMode extends ModeBase { kind: "lake-test"; lake: LakeTestSpec }
+/** A local lake: ducklake and sqlite over local files. */
+export interface LakeLocalMode extends ModeBase { kind: "lake-local"; lake: LakeLocalSpec }
 
-export type ModeSpec = ReadersMode | LakeMode | LakeReadersMode | LakeTestMode;
+export type ModeSpec = ReadersMode | LakeMode | LakeReadersMode | LakeLocalMode;
 export type ModeKind = ModeSpec["kind"];
 
 /** What each mode loads, in load order. The file profile loads nothing. */
@@ -90,7 +91,7 @@ export const MODE_EXTENSIONS: Readonly<Record<ModeKind, readonly ExtensionName[]
   readers: ["httpfs", "quack"],
   lake: ["httpfs", "postgres", "ducklake"],
   "lake-readers": ["httpfs", "postgres", "ducklake", "quack"],
-  "lake-test": ["sqlite", "ducklake"],
+  "lake-local": ["sqlite", "ducklake"],
 };
 
 /** The alias a mode's attached database gets: the read copy, or the lake. */
@@ -100,6 +101,10 @@ export const READ_COPY_ALIAS = "wh";
  *  views (D122); a Quack session always starts here too, and no setting changes that (slice 4). */
 export const READERS_VIEWS_DB = "memory";
 export const LAKE_ALIAS = "lake";
+/** The DuckLake format croft creates a lake at and attaches with (D137). DuckDB 2.0 creates 1.1 by default, which DuckDB 1.5.x
+ *  cannot read; 1.0 can be read by both (the lake spike, 2026-11-01). Passed on every attach, so a catalog at another version is
+ *  refused with DuckDB's own words instead of being migrated, and AUTOMATIC_MIGRATION is never given. */
+export const DUCKLAKE_FORMAT = "1.0";
 /** The named secrets (temporary, in memory) that carry the lake's credentials. */
 export const LAKE_CATALOG_SECRET = "croft_lake_catalog";
 export const LAKE_BUCKET_SECRET = "croft_lake_bucket";
@@ -108,7 +113,7 @@ const q = (s: string) => `'${s.replaceAll("'", "''")}'`;
 
 /** Every credential a mode holds; none may appear in any output, log, error or problem. */
 export function modeSecrets(mode: ModeSpec): string[] {
-  if (mode.kind === "readers" || mode.kind === "lake-test") return [];
+  if (mode.kind === "readers" || mode.kind === "lake-local") return [];
   const { catalog, data } = mode.lake;
   return [catalog.password, data.keyId, data.secretKey, data.sessionToken].filter((s): s is string => !!s);
 }
@@ -124,7 +129,7 @@ export function scrub(text: string, secrets: readonly string[]): string {
 export function modeDirectories(mode: ModeSpec | undefined): string[] {
   if (!mode) return [];
   if (mode.kind === "lake" || mode.kind === "lake-readers") return [mode.lake.data.path];
-  if (mode.kind === "lake-test") return [mode.lake.dataPath];
+  if (mode.kind === "lake-local") return [mode.lake.dataPath];
   return [];
 }
 
@@ -133,11 +138,13 @@ export function modePaths(mode: ModeSpec | undefined): string[] {
   return mode?.kind === "readers" ? [mode.copy] : [];
 }
 
-/** The local-folder profiles each mode may run under: the readers' processes and the test lake reach no folder but their own. */
+/** The local-folder profiles each mode may run under: the readers' processes reach no folder but their own. A lake behind a
+ *  project's commands (Postgres and a bucket, or a local one) runs under any of the four, so a writing command keeps files/ and
+ *  the state folder. */
 export const MODE_PROFILES: Readonly<Record<ModeKind, readonly Profile[]>> = {
   readers: ["serve"],
   "lake-readers": ["serve"],
-  "lake-test": ["serve"],
+  "lake-local": ["warehouse", "query", "serve", "memory"],
   lake: ["warehouse", "query", "serve", "memory"],
 };
 
@@ -145,7 +152,7 @@ export const MODE_PROFILES: Readonly<Record<ModeKind, readonly Profile[]>> = {
 export function modeIdentity(mode: ModeSpec): unknown {
   const base = { kind: mode.kind, extensionDir: mode.extensionDir ?? null, projectRoot: mode.projectRoot ?? null, secretDir: mode.secretDir };
   if (mode.kind === "readers") return { ...base, copy: mode.copy };
-  if (mode.kind === "lake-test") return { ...base, catalog: mode.lake.catalog.path, dataPath: mode.lake.dataPath, access: mode.lake.access };
+  if (mode.kind === "lake-local") return { ...base, catalog: mode.lake.catalog.path, dataPath: mode.lake.dataPath, access: mode.lake.access };
   const { catalog, data, access } = mode.lake;
   return { ...base, catalog: [catalog.host, catalog.port, catalog.database, catalog.user], data: [data.path, data.endpoint ?? null, data.region ?? null, data.urlStyle ?? null, data.useSsl ?? null], access };
 }
@@ -202,9 +209,12 @@ export async function startMode(conn: DuckDBConnection, mode: ModeSpec, files: M
     }));
   }
   // 3. The secret folder, in the state folder, before anything (Quack's listener) reads secrets. mkdir leaves an existing
-  // folder's mode as it was, so set it.
-  mkdirSync(mode.secretDir, { recursive: true, mode: 0o700 });
-  chmodSync(mode.secretDir, 0o700);
+  // folder's mode as it was, so set it. A lake's secrets are all temporary (nothing is written to the folder), so it is only pointed at, and a
+  // command that merely reads (doctor, status) leaves no folder behind; DuckDB makes one if a persistent secret is ever created there.
+  if (mode.kind !== "lake" && mode.kind !== "lake-local") {
+    mkdirSync(mode.secretDir, { recursive: true, mode: 0o700 });
+    chmodSync(mode.secretDir, 0o700);
+  }
   await conn.run(`SET secret_directory = ${q(mode.secretDir)}`);
   // 4. What the mode attaches.
   if (mode.kind === "readers") {
@@ -213,9 +223,9 @@ export async function startMode(conn: DuckDBConnection, mode: ModeSpec, files: M
       hint: "report this croft bug",
       details: { duckdb: firstLine(e) },
     }));
-  } else if (mode.kind === "lake-test") {
+  } else if (mode.kind === "lake-local") {
     const { catalog, dataPath, access } = mode.lake;
-    await attempt(conn, `ATTACH ${q(`ducklake:sqlite:${catalog.path}`)} AS ${LAKE_ALIAS} (DATA_PATH ${q(dataPath)}${access === "read" ? ", READ_ONLY" : ""})`, (e) => lakeFailure(e, secrets));
+    await attempt(conn, `ATTACH ${q(`ducklake:sqlite:${catalog.path}`)} AS ${LAKE_ALIAS} (DATA_PATH ${q(dataPath)}, DUCKLAKE_VERSION ${q(DUCKLAKE_FORMAT)}${access === "read" ? ", READ_ONLY" : ""})`, (e) => lakeFailure(e, secrets, access));
   } else {
     await attachLake(conn, mode.lake, secrets);
   }
@@ -228,7 +238,7 @@ export async function startMode(conn: DuckDBConnection, mode: ModeSpec, files: M
 /** Create the lake's two named secrets and attach it; the password and keys are in the statements below and nowhere else. */
 async function attachLake(conn: DuckDBConnection, lake: LakeSpec, secrets: string[]): Promise<void> {
   const { catalog, data, access } = lake;
-  const fail = (e: unknown) => lakeFailure(e, secrets);
+  const fail = (e: unknown) => lakeFailure(e, secrets, access);
   await attempt(conn, `CREATE OR REPLACE TEMPORARY SECRET ${LAKE_CATALOG_SECRET} (TYPE postgres, HOST ${q(catalog.host)}, PORT ${Math.trunc(catalog.port)}, DATABASE ${q(catalog.database)}, USER ${q(catalog.user)}, PASSWORD ${q(catalog.password)})`, fail);
   const opts = [
     "TYPE s3", `KEY_ID ${q(data.keyId)}`, `SECRET ${q(data.secretKey)}`, `SCOPE ${q(data.path)}`,
@@ -239,22 +249,36 @@ async function attachLake(conn: DuckDBConnection, lake: LakeSpec, secrets: strin
     `USE_SSL ${data.useSsl === false ? "false" : "true"}`,
   ];
   await attempt(conn, `CREATE OR REPLACE TEMPORARY SECRET ${LAKE_BUCKET_SECRET} (${opts.join(", ")})`, fail);
-  await attempt(conn, `ATTACH 'ducklake:postgres:' AS ${LAKE_ALIAS} (DATA_PATH ${q(data.path)}, META_SECRET ${LAKE_CATALOG_SECRET}${access === "read" ? ", READ_ONLY" : ""})`, fail);
+  await attempt(conn, `ATTACH 'ducklake:postgres:' AS ${LAKE_ALIAS} (DATA_PATH ${q(data.path)}, META_SECRET ${LAKE_CATALOG_SECRET}, DUCKLAKE_VERSION ${q(DUCKLAKE_FORMAT)}${access === "read" ? ", READ_ONLY" : ""})`, fail);
 }
 
 function firstLine(e: unknown): string {
   return (e instanceof Error ? e.message : String(e)).split("\n")[0]!;
 }
 
+/** A read-only attach to a lake nobody has created yet: DuckLake will not create one for a reader (`does not exist - and creating a
+ *  new DuckLake is explicitly disabled`), and SQLite cannot open a catalog file that is not there. */
+const NOT_CREATED = /Existing DuckLake .* does not exist|creating a new DuckLake is explicitly disabled|unable to open database file/i;
+
+/** A refusal that trying again will not change: the login or the key is wrong, or the database or role it names is not there. A catalog that
+ *  is down or unreachable is not one of these: that is mended by waiting. */
+export const REFUSED = /password authentication failed|authentication failed|no pg_hba|role "[^"]*" does not exist|database "[^"]*" does not exist|InvalidAccessKeyId|SignatureDoesNotMatch|AccessDenied|HTTP 40[13]/i;
+
 /** DuckDB's refusal to attach a lake, with every credential taken out of the text. */
-function lakeFailure(e: unknown, secrets: readonly string[]): CroftError {
+function lakeFailure(e: unknown, secrets: readonly string[], access?: "write" | "read"): CroftError {
   const raw = e instanceof Error ? e.message : String(e);
   const detail = scrub(raw.split("\n")[0]!, secrets);
+  const notCreated = access === "read" && NOT_CREATED.test(raw);
+  const refused = REFUSED.test(raw);
   return new CroftError("LAKE_ATTACH_FAILED", {
     message: `croft could not attach the lake: ${detail}`,
-    hint: "check the catalog's host, port, database and login, and the bucket's endpoint and key, in the project's settings and secrets",
-    retryable: true,
-    details: { duckdb: detail },
+    hint: notCreated
+      ? "the lake does not exist yet: the machine that writes creates it with its first run (croft run), then readers can attach"
+      : refused
+        ? "the catalog or the store refused the login or the key: ask the user to check the secrets the lake block names (croft docs LAKE_ATTACH_FAILED); trying again will not help"
+        : "check the catalog's host, port, database and login, and the bucket's endpoint and key, in the project's settings and secrets",
+    retryable: !notCreated && !refused,
+    details: { duckdb: detail, ...(notCreated ? { notCreated: true } : {}), ...(refused ? { refused: true } : {}) },
   });
 }
 

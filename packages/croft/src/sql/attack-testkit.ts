@@ -161,6 +161,55 @@ export const REACHING_OUT: readonly Attack[] = [
   a("SHOW TABLES inside a query", "SELECT name FROM (SHOW TABLES)"),
 ];
 
+/**
+ * What a lake project's SQL must not reach (option 07, slice 2; DESIGN.md D140): the catalog database behind the lake, the credentials
+ * the instance holds, and the bucket's own files. Every one is refused by `croft query`, in an SQL asset, in a check and over HTTP
+ * (the serve gate's allowlist refuses all of it already); in a project with a file most of them are not refused, which is the point of
+ * the lake flag. `lake` is the lake's name (the alias croft attaches it under), `bucket` the lake's folder as `s3://bucket/folder/`.
+ */
+export function lakeAttacks(bucket: string, lake = "lake"): readonly Attack[] {
+  const meta = `__ducklake_metadata_${lake}`;
+  return [
+    a("postgres_query on the catalog", `SELECT * FROM postgres_query('${meta}', 'SELECT count(*) FROM ducklake_snapshot')`),
+    a("postgres_query on the catalog, positional", `SELECT * FROM postgres_query('${meta}', 'SELECT 1') AS q`),
+    a("postgres_execute on the catalog", `SELECT * FROM postgres_execute('${meta}', 'DROP TABLE ducklake_snapshot')`),
+    a("CALL postgres_execute", `CALL postgres_execute('${meta}', 'SELECT 1')`),
+    a("postgres_scan of the catalog", `SELECT * FROM postgres_scan('dbname=x', 'public', 'ducklake_snapshot')`),
+    a("duckdb_secrets()", "SELECT * FROM duckdb_secrets()"),
+    a("duckdb_secrets() for its key id", "SELECT name, type, secret_string FROM duckdb_secrets()"),
+    a("duckdb_secrets without parentheses", "FROM duckdb_secrets"),
+    a("duckdb_secrets, qualified", "SELECT * FROM system.main.duckdb_secrets()"),
+    a("which_secret", `SELECT * FROM which_secret('${bucket}x.parquet', 's3')`),
+    a("duckdb_databases()", "SELECT * FROM duckdb_databases()"),
+    a("duckdb_databases without parentheses", "FROM duckdb_databases"),
+    a("duckdb_databases in a CTE", "WITH d AS (SELECT * FROM duckdb_databases()) SELECT * FROM d"),
+    a("duckdb_databases in a subquery", "SELECT (SELECT count(*) FROM duckdb_databases()) AS n"),
+    a("the metadata catalog", `SELECT * FROM ${meta}.ducklake_snapshot`),
+    a("the metadata catalog, with its schema", `SELECT * FROM ${meta}.main.ducklake_snapshot`),
+    a("the metadata catalog, quoted with changed case", `SELECT * FROM "${meta.toUpperCase()}".ducklake_snapshot`),
+    a("the metadata catalog in a subquery", `SELECT * FROM orders WHERE id IN (SELECT snapshot_id FROM ${meta}.ducklake_snapshot)`),
+    a("the metadata catalog in a CTE", `WITH s AS (SELECT * FROM ${meta}.ducklake_snapshot) SELECT * FROM s`),
+    a("the metadata catalog joined", `SELECT * FROM orders JOIN ${meta}.ducklake_snapshot ON true`),
+    a("the metadata catalog by DESCRIBE", `DESCRIBE ${meta}.ducklake_snapshot`),
+    a("ducklake_list_files", `SELECT * FROM ducklake_list_files('${lake}', 'orders')`),
+    a("ducklake_snapshots", `SELECT * FROM ducklake_snapshots('${lake}')`),
+    a("the lake's snapshots", `SELECT * FROM ${lake}.snapshots()`),
+    a("read_parquet of the bucket", `SELECT * FROM read_parquet('${bucket}**/*.parquet')`),
+    a("read_parquet of one file", `SELECT * FROM read_parquet('${bucket}main/orders/ducklake-0.parquet')`),
+    a("read_parquet of a list", `SELECT * FROM read_parquet(['${bucket}a.parquet', '${bucket}b.parquet'])`),
+    a("parquet_scan of the bucket", `SELECT * FROM parquet_scan('${bucket}**/*.parquet')`),
+    a("parquet_metadata of the bucket", `SELECT * FROM parquet_metadata('${bucket}**/*.parquet')`),
+    a("read_csv of the bucket", `SELECT * FROM read_csv('${bucket}x.csv')`),
+    a("read_json of the bucket", `SELECT * FROM read_json('${bucket}x.json')`),
+    a("read_text of the bucket", `SELECT * FROM read_text('${bucket}x')`),
+    a("read_blob of the bucket", `SELECT * FROM read_blob('${bucket}x')`),
+    a("glob of the bucket", `SELECT * FROM glob('${bucket}*')`),
+    a("the bucket as a table", `SELECT * FROM '${bucket}main/orders/x.parquet'`),
+    a("another bucket", "SELECT * FROM read_parquet('s3://other/x.parquet')"),
+    a("the bucket by a path that is not a literal", `SELECT * FROM read_parquet('${bucket}' || '**/*.parquet')`),
+  ];
+}
+
 /** Each attack as written, and again with a catalog function's name in a comment after it, in a line comment after it, and in a
  *  string literal: the ways the first Quack spike's catalog allowance was bypassed. Every attack gets a literal-bearing form,
  *  whatever it is. A SELECT carries it as a column in front. Any attack that has a string literal of its own (a path, an

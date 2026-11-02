@@ -62,6 +62,7 @@ croft status                # failed, stale, held, never run, edited since its l
 - `croft serve` (it runs scheduled work unattended, and a `--host` other than 127.0.0.1 exposes data beyond this machine).
 - `croft serve key add <name>` and naming tables in `serve.sharedTables`: they give a person access to data. Show which tables the key will read. `croft serve key remove` and `key list` need no asking.
 - Turning `"serverMode"` on or off in croft.json (apps then read the read copy, as of the last run, and DuckDB 2.0 clients with a key can attach over Quack; turning it on also needs the server add-on installed, the `bun add` command `croft validate` prints when it is missing, croft docs addons), `serverMode.acceptFullCopyCost` (disk and write time at every run), and `serverMode.quackPlaintextOnNetwork` (it lets Quack listen beyond this machine, in plaintext, behind a proxy of the user's own).
+- Adding or changing a `"lake"` block in croft.json (the warehouse then lives in a catalog and a bucket folder that someone else runs, with two logins and two keys named by secret names; it needs the lake add-on, the `bun add` command `croft validate` prints, croft docs lake). One machine writes a lake. Never make a Postgres, a bucket or a key yourself, never put a secret's value in croft.json, never run CHECKPOINT or set an expiry on a lake, and never put anything else in its folder (DuckLake's cleanup deletes it).
 - Deleting .croft/ or warehouse*.duckdb, or `git clean -X` (the trash and backups live in .croft/).
 - Weakening or deleting a failing check.
 
@@ -83,6 +84,9 @@ croft status                # failed, stale, held, never run, edited since its l
   check with `croft secrets --json`. Never read .env.
 - Warehouse file missing (DB_NOT_FOUND in status): ask the user where it went before running anything; a run
   builds a new, empty one and refetches from the sources.
+- Lake (croft docs lake): LAKE_CONNECTION_LOST or LAKE_ATTACH_FAILED are about the catalog or the bucket, not the project: check
+  `croft doctor`, tell the user, run again when they are reachable. LAKE_COMMIT_UNCERTAIN: look at `croft status` before running
+  again. LAKE_OTHER_WRITER: tell the user; do not run from this machine until they decide which machine writes.
 - Backup: croft backup (into .croft/backups/), or croft backup <folder> on another disk; safe while croft serve
   runs. Never copy warehouse*.duckdb by hand. Putting a backup back replaces data: ask the user (croft docs backup).
 

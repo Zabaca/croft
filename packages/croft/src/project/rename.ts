@@ -51,11 +51,13 @@ import { now as clockNow } from "../core/time.ts";
 import type { LockHolder, Problem, Sql } from "../core/types.ts";
 import { type StateTableName, bookkeepingOf } from "../db/bookkeeping.ts";
 import { newerStorage } from "../db/connect.ts";
+import { lakeOption } from "../db/lake.ts";
 import type { DuckWarehouse, LeaseSql } from "../db/warehouse.ts";
 import type { CatalogAsset } from "../history/catalog.ts";
 import { newRunId, RUNS_DB_FILE, RunsDb } from "../history/runs-db.ts";
 import { type DiscoveredAsset, discoverAssets, nameProblem, sqlKeywordNames } from "./discover.ts";
-import { loadProject, type Project } from "./root.ts";
+import { ProjectEnv } from "./env.ts";
+import { loadProject, type Project, warehouseExists } from "./root.ts";
 import { lexSql } from "../sql/lex.ts";
 import { parseSqlHeader } from "./sql-asset.ts";
 import { didYouMean } from "./suggest.ts";
@@ -146,6 +148,8 @@ export type RenamePoint = "rename_before_commit" | "rename_after_commit" | "rena
 export interface ApplyRenameOptions {
   /** The project, when the caller has it loaded. */
   project?: Project;
+  /** The project's secrets, for a lake's credentials; .env and the shell by default. */
+  env?: ProjectEnv;
   /** The clock for runs.sqlite (CROFT_NOW). */
   now?: () => Date;
   /** stdin and stdout are a terminal: the longer lock waits. */
@@ -1212,10 +1216,11 @@ export async function applyRename(root: string, plan: RenamePlan, o: ApplyRename
   let journaled = false;
   try {
     const problems: Problem[] = [];
-    const hasDb = existsSync(database);
+    const hasDb = warehouseExists(project);
     if (hasDb) {
       warehouse = openWarehouse({
         path: database, mode: "read_write", timezone: project.timezone, root: project.root, stateDir, isTTY: o.interactive === true,
+        ...lakeOption(project, o.env ?? ProjectEnv.load(project.root)),
         lookupHolder: (pid) => {
           const h = runs.getLockHolder();
           return h && h.pid === pid ? h : null;

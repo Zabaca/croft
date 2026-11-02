@@ -41,7 +41,7 @@ export const rename: CommandImpl<RenameData> = {
     const plan = await planRename(project.root, from, to, { project });
     const fault = ctx.processEnv.CROFT_FAULT;
     const result = await applyRename(project.root, plan, {
-      project, now: () => ctx.now(), interactive: ctx.isTTY.stdin && ctx.isTTY.stdout,
+      project, env: ctx.env, now: () => ctx.now(), interactive: ctx.isTTY.stdin && ctx.isTTY.stdout,
       ...(fault ? { fault } : {}),
       onWait: (h) => ctx.render.progress(`waiting for the warehouse: ${holderWords(h)} holds it`),
     });

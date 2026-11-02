@@ -246,14 +246,16 @@ describe("croft docs pages", () => {
 });
 
 /** A fenced template in a docs page: ```ts whose first line is `// assets/<name>.ts`, or ```sql whose first
- *  line is `-- assets/<name>.sql`. Pages use no other fences, so every fenced block is checked. */
+ *  line is `-- assets/<name>.sql`. Pages use no other fences, so every fenced block is checked, except one whose
+ *  fence says more than the language (```sql postgres-admin): a block another test runs, such as `croft docs lake`'s recipe. */
 interface Template { page: string; lang: "ts" | "sql"; name: string; code: string }
 
 async function docsTemplates(): Promise<Template[]> {
   const out: Template[] = [];
   for (const p of await allDocs()) {
-    for (const m of p.page.matchAll(/```([a-z]*)\n([\s\S]*?)```/g)) {
+    for (const m of p.page.matchAll(/^```([^\n]*)\n([\s\S]*?)^```[ \t]*$/gm)) {
       const [, lang, code] = m as unknown as [string, string, string];
+      if (lang.includes(" ")) continue;
       const name = (lang === "ts" ? /^\/\/ assets\/([a-z][a-z0-9_]*)\.ts\b/ : /^-- assets\/([a-z][a-z0-9_]*)\.sql\b/).exec(code)?.[1];
       if ((lang !== "ts" && lang !== "sql") || !name) throw new Error(`croft docs ${p.name}: a \`\`\`${lang} block that is not a template: ${code.slice(0, 80)}`);
       out.push({ page: p.name, lang, name, code });

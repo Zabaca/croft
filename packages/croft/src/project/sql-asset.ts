@@ -251,6 +251,8 @@ export interface SqlAssetOptions {
   conn: DuckDBConnection;
   /** Every asset name in the project: which relations are assets, and did-you-mean suggestions. */
   assetNames: readonly string[];
+  /** The project keeps its warehouse in a lake: the gate also refuses what reaches past the tables (D140). */
+  lake?: boolean;
 }
 
 /** Read, parse and check one SQL asset. Never throws for a problem with the asset: it lands in `problems`. */
@@ -304,7 +306,7 @@ export async function loadSqlAsset(a: Pick<DiscoveredAsset, "name" | "file" | "p
   // 4. The gate. A file read was reported above; the gate would only add its verdict on the path.
   if (!readsFiles) {
     try {
-      const gated = await assertOneSelect(o.conn, parsed.body, { notSelectCode: "SQL_NOT_SELECT", file, lineOffset: parsed.header.lines });
+      const gated = await assertOneSelect(o.conn, parsed.body, { notSelectCode: "SQL_NOT_SELECT", file, lineOffset: parsed.header.lines, ...(o.lake ? { lake: true } : {}) });
       out.codeHash = sqlFingerprint(ast ?? gated, parsed.header, o.timezone);
       if (!ast) out.astInputs = relationNames(gated);
     } catch (e) {

@@ -13,12 +13,22 @@
 // and restore copying rows out and back (option 07's lake spike, follow-up f2). `seq` and `closed` may be NULL for a row
 // somebody inserted by hand: NULL sorts last, so any row croft writes is newer.
 //
-// A statement of the log adapter that writes reads the highest `seq` in a subquery of its own. Two writers could pick
-// the same number only for different keys, because writes to one asset are already one at a time (the asset leases).
+// In a file a statement of the log adapter that writes reads the highest `seq` in a subquery of its own. In a lake it reads it once per
+// transaction and table, into a variable of the connection (`croft_seq_<table>`), and numbers the rows from that: a lake's catalog is a
+// network away, and the subquery was four or five round trips for each of the dozen bookkeeping rows of a write (D145). Two writers could
+// pick the same number only for different keys, because writes to one asset are already one at a time (the asset leases), and a variable
+// belongs to the connection, so every wrapper around the transaction's `Sql` sees the same one; the write path resets them as it begins.
 import { CroftError } from "../core/errors.ts";
 import type { Sql } from "../core/types.ts";
 
 export type BookkeepingKind = "file" | "log";
+
+/** Whether the connection's current database is a DuckLake: the warehouse of a lake project (db/modes.ts attaches it as `lake` and
+ *  every connection works in it). Asked of the database itself, so it holds through any wrapper around the connection. */
+export async function inLake(db: Sql): Promise<boolean> {
+  const rows = await db.all<{ t: string }>(`SELECT type AS t FROM duckdb_databases() WHERE database_name = current_database()`);
+  return rows[0]?.t === "ducklake";
+}
 
 /** A column list ("name VARCHAR, ...") and the columns that make a row's identity, per bookkeeping table. */
 export const STATE_SPECS = {
@@ -172,13 +182,40 @@ function onlyUsed(texts: string[], params: unknown[]): { texts: string[]; params
   return { texts: out, params: order.map((n) => params[n - 1]) };
 }
 
+/** The connection variable that holds the highest `seq` of a log table inside a lake transaction. */
+const seqVariable = (table: StateTableName) => `croft_seq_${table}`;
+
+/** The statements that forget the numbers a lake transaction kept: run on a connection as a write transaction begins, since a variable
+ *  outlives the transaction (and a rolled-back one), and another process may have written the log since. Local to the connection. */
+export function seqResetSql(): string[] {
+  return ASSET_TABLES.map((t) => `RESET VARIABLE ${seqVariable(t)}`);
+}
+
 class LogBookkeeping implements Bookkeeping {
   readonly kind = "log" as const;
+  private perTx: boolean | undefined;
   constructor(private readonly tx: Sql) {}
 
-  /** The number after the highest one in the log, for one row; plus row_number() OVER () for a statement's several. */
-  private next(table: StateTableName): string {
-    return `(SELECT coalesce(max(seq), 0) FROM ${logOf(table)})`;
+  /** The highest number in the log, as an expression: the subquery in a file; in a lake the connection's variable, read from the log once
+   *  per transaction. Plus 1 for one row, plus row_number() OVER () for a statement's several. */
+  private async high(table: StateTableName): Promise<string> {
+    this.perTx ??= await inLake(this.tx);
+    if (!this.perTx) return `(SELECT coalesce(max(seq), 0) FROM ${logOf(table)})`;
+    const v = seqVariable(table);
+    const [kept] = await this.tx.all<{ v: number | bigint | null }>(`SELECT getvariable('${v}') AS v`);
+    if (kept?.v === null || kept?.v === undefined) await this.tx.exec(`SET VARIABLE ${v} = (SELECT coalesce(max(seq), 0) FROM ${logOf(table)})`);
+    return `getvariable('${v}')`;
+  }
+
+  /** Write the rows of one INSERT, numbered from `high`; in a lake the variable moves on by the rows written. */
+  private async append(table: StateTableName, text: (high: string) => string, params: unknown[]): Promise<void> {
+    const high = await this.high(table);
+    if (!this.perTx) {
+      await this.tx.exec(text(high), params);
+      return;
+    }
+    const [done] = await this.tx.all<{ Count: number | bigint }>(text(high), params);
+    await this.tx.exec(`SET VARIABLE ${seqVariable(table)} = getvariable('${seqVariable(table)}') + ${Number(done?.Count ?? 0)}`);
   }
 
   async upsert(table: StateTableName, row: Record<string, string>, params: unknown[] = []): Promise<void> {
@@ -191,8 +228,7 @@ class LogBookkeeping implements Bookkeeping {
          WHEN NOT MATCHED THEN INSERT (${cols(row)}) VALUES (${Object.keys(row).map((c) => `s.${c}`).join(", ")})`, params);
       return;
     }
-    await this.tx.exec(
-      `INSERT INTO ${logOf(table)} (${cols(row)}, seq, closed) VALUES (${vals(row)}, ${this.next(table)} + 1, false)`, params);
+    await this.append(table, (high) => `INSERT INTO ${logOf(table)} (${cols(row)}, seq, closed) VALUES (${vals(row)}, ${high} + 1, false)`, params);
   }
 
   /** What a primary key would have said. The checks are made before the write, because the view over a log shows one row
@@ -218,15 +254,15 @@ class LogBookkeeping implements Bookkeeping {
   }
 
   async update(table: StateTableName, set: Record<string, string>, where: string, params: unknown[] = []): Promise<void> {
-    await this.tx.exec(
+    await this.append(table, (high) =>
       `INSERT INTO ${logOf(table)} BY NAME SELECT * REPLACE (${Object.entries(set).map(([c, e]) => `${e} AS ${c}`).join(", ")}),
-         ${this.next(table)} + row_number() OVER () AS seq, false AS closed
+         ${high} + row_number() OVER () AS seq, false AS closed
        FROM _croft.${table} WHERE ${where}`, params);
   }
 
   async remove(table: StateTableName, where: string, params: unknown[] = []): Promise<void> {
-    await this.tx.exec(
-      `INSERT INTO ${logOf(table)} BY NAME SELECT *, ${this.next(table)} + row_number() OVER () AS seq, true AS closed
+    await this.append(table, (high) =>
+      `INSERT INTO ${logOf(table)} BY NAME SELECT *, ${high} + row_number() OVER () AS seq, true AS closed
        FROM _croft.${table} WHERE ${where}`, params);
   }
 
@@ -250,8 +286,8 @@ class LogBookkeeping implements Bookkeeping {
     const [twice] = await this.tx.all<{ n: number | bigint }>(
       `SELECT count(*) AS n FROM (SELECT 1 FROM (${select}) AS s GROUP BY ${key.map((k) => `s.${k}`).join(", ")} HAVING count(*) > 1)`, params);
     if (Number(twice?.n ?? 0) > 0) throw this.duplicate(table, "was given a key twice");
-    await this.tx.exec(
-      `INSERT INTO ${logOf(table)} BY NAME SELECT s.*, ${this.next(table)} + row_number() OVER () AS seq, false AS closed FROM (${select}) AS s`, params);
+    await this.append(table, (high) =>
+      `INSERT INTO ${logOf(table)} BY NAME SELECT s.*, ${high} + row_number() OVER () AS seq, false AS closed FROM (${select}) AS s`, params);
   }
 }
 

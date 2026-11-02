@@ -35,6 +35,7 @@
 import { CroftError, problem } from "../core/errors.ts";
 import { formatInstant } from "../core/time.ts";
 import type { Check, Problem, Sql } from "../core/types.ts";
+import { inLake } from "../db/bookkeeping.ts";
 import type { CheckContext, CheckHookResult, WriteBatchInput } from "../load/write.ts";
 import { quoteIdent, quoteLiteral } from "../load/evolve.ts";
 import type { Row } from "../types.ts";
@@ -206,7 +207,7 @@ async function evaluate(sql: Sql, t: Target, c: Check, whole: boolean, counts: C
       if (!cols) throw invalid(t, c, "names no columns croft can read");
       fails = `(${cols.map((k) => `${quoteIdent(k)} IS NULL`).join(" OR ")})`;
     } else if (c.kind === "rule") {
-      const v = await vetCheck((text) => serializeOn(sql, text), t.asset, c);
+      const v = await vetCheck((text) => serializeOn(sql, text), t.asset, c, { lake: await inLake(sql) });
       if (!v.ok) throw invalid(t, c, v.why, v.hint);
       // NULL passes: NOT (NULL) is NULL, which WHERE drops.
       fails = `NOT (\n${c.sql}\n)`;

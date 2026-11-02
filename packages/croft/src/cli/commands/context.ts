@@ -30,6 +30,7 @@ import { hasState } from "../../db/state.ts";
 import type { CatalogAsset } from "../../history/catalog.ts";
 import { driftChange } from "../../history/drift.ts";
 import { FAILED_STATUSES } from "../../history/runs-db.ts";
+import { warehouseExists } from "../../project/root.ts";
 import { didYouMean } from "../../project/suggest.ts";
 import { croftHome } from "../../schedule/home.ts";
 import type { Row } from "../../types.ts";
@@ -123,7 +124,7 @@ function changeEntry(asset: string, at: string, runId: string | null, c: Record<
  *  through `report`, and context goes on without it. */
 async function warehouseChanges(ctx: Parameters<CommandImpl["run"]>[0], since: Date, report: (p: Problem) => void): Promise<SchemaChangeEntry[] | null> {
   const project = ctx.project;
-  if (!existsSync(project.paths.database)) return [];
+  if (!warehouseExists(project)) return [];
   if (liveIntents(project.paths.stateDir, { excludeSelf: true }).length > 0) return null;
   try {
     return await readOnlyWarehouse(ctx, project).read(async (db) => {

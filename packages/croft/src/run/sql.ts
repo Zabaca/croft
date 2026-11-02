@@ -25,6 +25,7 @@ import { CroftError, isCode } from "../core/errors.ts";
 import { formatInstant } from "../core/time.ts";
 import type { Problem, Sql, StepResult } from "../core/types.ts";
 import { bookkeepingOf } from "../db/bookkeeping.ts";
+import { inLake } from "../db/bookkeeping.ts";
 import { hasState } from "../db/state.ts";
 import { putCatalog, readCatalogEntry } from "../history/catalog.ts";
 import { RESERVED } from "../load/contract.ts";
@@ -33,6 +34,7 @@ import { tableBatch } from "../load/table-batch.ts";
 import { type CheckHookResult, type InputPosition, writeBatch, type WriteBatchInput, type WriteResult } from "../load/write.ts";
 import { isoMicros } from "../safety/guards.ts";
 import { type AssetErrorOptions, mapAssetError } from "../sql/bind.ts";
+import { assertOneSelect } from "../sql/gate.ts";
 import { abortable, abortReason, createdTable, croftError, FAIRNESS_YIELD_MS, fault } from "./ingest.ts";
 import { behaviorWords, type PlannedStep } from "./plan.ts";
 import type { StepInput, StepOutcome } from "./step.ts";
@@ -94,6 +96,10 @@ export async function runSqlStep(i: StepInput): Promise<StepOutcome> {
     runs.setLockHolder({ runId, asset, action: "write" });
     try {
       const tx = abortable(raw, signal, asset);
+      // In a lake the body runs on the connection that has the lake attached, with its credentials and catalog behind it: the gate that
+      // vetted the file when it loaded is asked again here, so a body that got past a stale load (or a caller that forgot to say "lake")
+      // still cannot reach past the tables (D140).
+      if (await inLake(tx)) await assertOneSelect(raw.connection, where.body, { notSelectCode: "SQL_NOT_SELECT", file: step.file, lineOffset: where.lineOffset, lake: true });
       const inputs = await readInputs(tx, asset, listed);
       await materialize(tx, step, where);
       const batch = await tableBatch(tx, { temp: NEXT_TABLE, asset });

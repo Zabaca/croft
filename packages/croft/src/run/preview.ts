@@ -61,6 +61,7 @@ import type { IngestContext, Row, RowsIngest } from "../types.ts";
 import { canonicalPath } from "../db/connect.ts";
 import { bookkeepingOf } from "../db/bookkeeping.ts";
 import { ensureState, hasState } from "../db/state.ts";
+import { lakeOption } from "../db/lake.ts";
 import { type DuckWarehouse, type LeaseSql, openWarehouse, type WarehouseOptions } from "../db/warehouse.ts";
 import type { CatalogAsset } from "../history/catalog.ts";
 import { putCatalog } from "../history/catalog.ts";
@@ -69,7 +70,7 @@ import { newRunId, RunsDb } from "../history/runs-db.ts";
 import { requestBudget } from "../http/budget.ts";
 import { isReservedColumn, normalizeType, quoteIdent, quoteLiteral } from "../load/evolve.ts";
 import { type ProjectEnv, secretsCommandHash } from "../project/env.ts";
-import type { Project } from "../project/root.ts";
+import { type Project, warehouseExists } from "../project/root.ts";
 import { generateInputTypes } from "../project/types-gen.ts";
 import { isoMicros, wouldShrink } from "../safety/guards.ts";
 import { windowOf } from "./dry-run.ts";
@@ -215,9 +216,10 @@ export async function runPreview(i: PreviewInput): Promise<PreviewOutcome> {
     waits: { ttyWriteMs: 60_000 },
     ...(i.onWait ? { onWait: (h: LockHolder, ms: number) => i.onWait!(h, ms, "the preview database") } : {}),
   });
-  const live = existsSync(project.paths.database)
+  const live = warehouseExists(project)
     ? openWarehouse({
       path: project.paths.database, mode: "read_only", timezone: tz, root: project.root, stateDir, isTTY: i.interactive === true,
+      ...lakeOption(project, env),
       ...(i.onWait ? { onWait: (h: LockHolder, ms: number) => i.onWait!(h, ms, "the warehouse") } : {}),
       ...(i.lookupHolder ? { lookupHolder: i.lookupHolder } : {}),
     })
@@ -337,6 +339,8 @@ async function snapshotLive(live: DuckWarehouse | null, names: readonly string[]
   const out: LiveSnapshot = { at: null, tables: new Map(), state: {} };
   if (!live || names.length === 0) return out;
   const base = canonicalPath(dir);
+  // A lake nobody has written yet is no live warehouse, as a file that is not there is none: nothing to copy, and the preview builds from nothing.
+  const notCreated = (e: unknown) => e instanceof CroftError && e.code === "DB_NOT_FOUND" && e.problem.details?.notCreated === true;
   return live.read(async (db) => {
     out.at = now();
     const tmp = join(base, "_tmp");
@@ -360,7 +364,10 @@ async function snapshotLive(live: DuckWarehouse | null, names: readonly string[]
       }
     }
     return out;
-  }, { purpose: "snapshot the tables a preview reads", ...(signal ? { signal } : {}) });
+  }, { purpose: "snapshot the tables a preview reads", ...(signal ? { signal } : {}) }).catch((e: unknown) => {
+    if (notCreated(e)) return { at: null, tables: new Map(), state: {} } as LiveSnapshot;
+    throw e;
+  });
 }
 
 /** A view that reads a snapshot back with the live column types (HUGEINT was stored as text, ENUM and BIT as

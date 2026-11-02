@@ -13,9 +13,10 @@ import { type ExtensionSearch, hostPlatform, verifyModeExtension } from "./exten
 /** The views, and one problem for each add-on that is not whole (its details.addon names it). */
 export interface AddonReport { views: AddonView[]; problems: Problem[] }
 
-/** The add-ons a project's settings need: server mode needs the server add-on. Lake mode's setting adds its own line here when it exists. */
-export function addonsNeeded(config: { serverMode: { enabled: boolean } }): AddonName[] {
-  return config.serverMode.enabled ? ["server"] : [];
+/** The add-ons a project's settings need: server mode needs the server add-on, lake mode (a `lake` block, shared or local) the lake
+ *  add-on. Neither: none, and a project that names no mode installs and loads nothing. */
+export function addonsNeeded(config: { serverMode: { enabled: boolean }; lake?: unknown }): AddonName[] {
+  return [...(config.serverMode.enabled ? ["server" as const] : []), ...(config.lake ? ["lake" as const] : [])];
 }
 
 /**

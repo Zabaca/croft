@@ -59,7 +59,24 @@ export interface GateOptions {
   /** A key's query: the tables the project shares (serve.sharedTables). With the serve profile, any other table is refused
    *  as if it did not exist. An empty list shares nothing: every table is refused. */
   shared?: readonly string[];
+  /** The SQL runs against a lake (option 07, D140): everything that reaches past the tables is refused too, whatever the profile
+   *  (see LAKE_REFUSED). gateSelect() finds it out from the connection when the caller does not say. */
+  lake?: boolean;
 }
+
+/**
+ * What user SQL may not reach in a lake project (D140), whichever way it asks. A lake instance attaches before its lock, so these still run
+ * on it afterwards [V: 2.0.0, option 07's spike]: `postgres_query` and `postgres_execute` ran raw SQL against the catalog database (so SQL
+ * could have rewritten the lake), `duckdb_secrets()` shows the bucket key's id and `duckdb_databases()` the catalogs, and the lake's
+ * metadata catalog is a database of its own (`__ducklake_metadata_<name>`) with every table of the catalog in it. The bucket's own files
+ * are the path policy's: a path that is not local is refused. The serve profile's allowlist already refuses all of this; it is
+ * the profiles that read files (croft query, SQL assets, checks, ctx.query) that need the list.
+ */
+export const LAKE_REFUSED_FUNCTIONS: ReadonlySet<string> = new Set(["duckdb_secrets", "duckdb_databases", "which_secret"]);
+/** Table functions of the extensions a lake loads (postgres, sqlite, ducklake): none is on the allowlist, and in a lake project they say why. */
+const LAKE_EXTENSION_FUNCTION = /^(postgres_|sqlite_|ducklake_)/;
+/** A catalog name that is the lake's own bookkeeping: DuckLake attaches its metadata database as `__ducklake_metadata_<alias>`. */
+const LAKE_METADATA_CATALOG = /^__ducklake_metadata_/;
 
 /** The parsed statement, as json_serialize_sql returns it (the `statements[0]` object). */
 export type SelectAst = { node: Record<string, unknown>; named_param_map?: unknown } & Record<string, unknown>;
@@ -511,6 +528,7 @@ class Checker {
       if (kind === "serve") return;
       throw this.serveDenied(`${name}()`, at);
     }
+    if (this.o.lake && (LAKE_REFUSED_FUNCTIONS.has(lower(name)) || LAKE_EXTENSION_FUNCTION.test(lower(name)))) throw this.lakeDenied(`${name}()`, at);
     switch (kind) {
       case "serve":
       case "local":
@@ -541,6 +559,11 @@ class Checker {
 
   private relation(u: Extract<Use, { kind: "relation" }>): void {
     const shown = [u.catalog, u.schema, u.name].filter(Boolean).join(".");
+    // The lake's metadata catalog by any spelling of its name (case, quotes), and DuckDB's built-in views of the same things.
+    if (this.o.lake && !this.serve && (LAKE_METADATA_CATALOG.test(lower(u.catalog)) || LAKE_METADATA_CATALOG.test(lower(u.schema)) || LAKE_METADATA_CATALOG.test(lower(u.name))
+      || LAKE_REFUSED_FUNCTIONS.has(lower(u.name)))) {
+      throw this.lakeDenied(shown, u.at);
+    }
     if (looksLikePath(u.name)) {
       // `FROM 'files/x.csv'`: DuckDB reads the file through a replacement scan (or attaches a .duckdb file).
       if (this.serve) throw this.serveDenied(shown, u.at, "is a file; the read server reads the project's tables only");
@@ -589,6 +612,15 @@ class Checker {
   private serveDenied(what: string, at?: number, why = "is not available to a remote query; croft's read server reads the project's tables only",
     hint = "query the project's tables by name; files come in through file ingests"): CroftError {
     return new CroftError("QUERY_PATH_DENIED", { message: `${what} ${why}`, hint, ...this.where(at) });
+  }
+
+  /** A lake project's SQL asked for the catalog's database, a credential or an extension's raw access: QUERY_PATH_DENIED, as for a file. */
+  private lakeDenied(what: string, at?: number): CroftError {
+    return new CroftError("QUERY_PATH_DENIED", {
+      message: `${what} reaches past the lake's tables (its catalog, its credentials or its storage), which SQL may not touch`,
+      hint: "query the project's tables by name; croft reads and writes the lake itself",
+      ...this.where(at),
+    });
   }
 
   private notSelect(message: string, hint: string, at?: number): CroftError {
@@ -680,6 +712,23 @@ export class PathPolicy {
     if (!/[*?[]/.test(local)) return this.checkOne(raw, local, deny);
     if (!expansion) throw deny(`cannot check the files ${raw} matches: the pattern was not expanded`, "name the files without a pattern");
     if ("failed" in expansion) throw deny(expansion.failed.message, expansion.failed.hint);
+    // A pattern that starts inside a protected folder is refused whatever it matches (a lake's data folder holds only folders at
+    // its top, so `lake/data/*` matches no file, and listing it is still not SQL's to do).
+    const dir = local.slice(0, local.search(/[*?[]/));
+    const base = dir.slice(0, dir.lastIndexOf("/") + 1);
+    if (base !== "") {
+      const abs = isAbsolute(base) ? base : `${process.cwd()}${sep}${base}`;
+      let real: string | null = null;
+      try {
+        real = lower(physicalPath(abs).path);
+      } catch {
+        // checked by its matches below
+      }
+      if (real !== null && this.protectedPaths.some((p) => within(real!, p))) {
+        throw deny(`cannot read ${raw}: it starts in a folder croft must never open this way (the open database, a lake's files, or croft's state)`,
+          "query the warehouse's tables by name; croft never reads its own files through SQL");
+      }
+    }
     for (const m of expansion.files) {
       const p = this.localPath(m);
       if (p === null) throw deny(`cannot read ${m} (matched by ${raw}): croft reads local files only`, "narrow the pattern");

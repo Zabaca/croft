@@ -6,6 +6,7 @@
 // backup back is manual (`croft docs backup`), since `croft restore` is the trash's. Spec in commands/index.ts.
 import { existsSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
+import { CroftError } from "../../core/errors.ts";
 import type { LockHolder } from "../../core/types.ts";
 import { backupProject, type ProjectBackup } from "../../db/backup.ts";
 import { RUNS_DB_FILE, RunsDb } from "../../history/runs-db.ts";
@@ -19,6 +20,17 @@ export type BackupData = ProjectBackup;
 export const backup: CommandImpl<BackupData> = {
   async run(ctx) {
     const project = ctx.project;
+    // A lake is a catalog and a bucket, not a file to clone: its backup (a dump of the catalog and a copy of the folder) is a later part
+    // of lake mode (option 07, slice 3). Refused before anything is opened.
+    if (project.config.lake) {
+      throw new CroftError("LAKE_UNSUPPORTED", {
+        message: "croft backup does not cover a lake yet: the warehouse is a catalog and a bucket folder, not one file",
+        hint: "back the lake up with the tools of whoever runs the Postgres and the bucket (a dump of the catalog database and a copy of the bucket folder); the trash in .croft/trash keeps working",
+        fix: { kind: "manual", description: "ask the user how the lake is backed up; croft cannot do it yet", requiresHuman: true },
+        effect: "nothing was copied",
+        details: { command: "backup", lake: project.config.lake.kind },
+      });
+    }
     const stateDir = project.paths.stateDir;
     const dir = ctx.positionals[0];
     // A writer that sees registered waiters yields between its steps (§5 "Fairness"); runs.sqlite is not created here.

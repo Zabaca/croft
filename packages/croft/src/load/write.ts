@@ -62,6 +62,8 @@ import { CroftError, problem } from "../core/errors.ts";
 import type { AssetKind, ColumnPlan, CursorType, Problem, SchemaChange, Sql, StepResult, ValueKind } from "../core/types.ts";
 import { type InstantInput, now as clockNow, toEpochMicros } from "../core/time.ts";
 import { bookkeepingOf } from "../db/bookkeeping.ts";
+import { refuseLakeTypes } from "../db/lake.ts";
+import { inLake } from "../db/bookkeeping.ts";
 import { ensureState } from "../db/state.ts";
 import { assertNoShrink, type ExtractInfo, isoMicros, readStoredColumns, type StoredColumn, tableStats,
   compareSchema } from "../safety/guards.ts";
@@ -226,6 +228,8 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
   const batchCols = await readTableSchema(tx, batch.temp, "temp");
   if (!batchCols) throw new CroftError("INTERNAL_ERROR", { message: `the batch table ${batch.temp} does not exist`, hint: "report this croft bug", asset });
   const inBatch = (name: string) => batchCols.find((c) => sameName(c.name, name));
+  // A lake cannot store an ENUM, a UNION or a VARINT: refused here, before anything is written, with the cast that fixes it (D142).
+  if (await inLake(tx)) refuseLakeTypes(asset, batchCols, input.file);
   if (!inBatch(RESERVED.seq)) {
     throw new CroftError("INTERNAL_ERROR", { message: `the batch table ${batch.temp} has no ${RESERVED.seq} column`, hint: "report this croft bug", asset });
   }

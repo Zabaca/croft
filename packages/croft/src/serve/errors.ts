@@ -12,7 +12,7 @@ export const RETRY_AFTER_MS = 1000;
 export const secs = (ms: number) => Math.round(ms / 100) / 10;
 
 /** What a query that ran in a worker which went away under it reports (killed to end another, stuck query, or crashed). */
-export function restartedError(e: WorkerGone | null, what: "query worker" | "readers' process" = "query worker"): CroftError {
+export function restartedError(e: WorkerGone | null, what: "query worker" | "readers' process" | "lake process" = "query worker"): CroftError {
   return new CroftError("SERVE_UNAVAILABLE", {
     message: `croft's read server restarted its ${what} while this query ran (to end another query that interrupts could not stop, or after a crash); it returned nothing`,
     hint: "retry after Retry-After; if it keeps failing, the query itself may be too heavy: filter or aggregate in SQL",

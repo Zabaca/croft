@@ -23,6 +23,13 @@
 // never outlives its server holding the file. Terminal signals (Ctrl-C reaches the whole process group) are
 // ignored: croft serve decides when its queries end.
 //
+// A lake project (option 07, D143) opens the worker with `lake`: `spec.mode` is the lake attached read-only (the read-only catalog login and
+// bucket key, which this process is sent over the IPC channel and no one else holds), `path` only names the lake, and the instance is an
+// in-memory one that attaches it before the lock, like the readers' process. Every connection runs `USE lake`. There is no file to hold, so
+// nothing here is ever killed to give one up. The lake changes under it whenever a run commits, so the catalog snapshot the gate reads is
+// taken for each query rather than kept, and a query whose catalog connection dropped is run again, once. Every error that leaves is
+// scrubbed of the lake's credentials.
+//
 // Server mode (D119) runs the same worker as the readers' process: `open` with `readers` makes an in-memory
 // instance (never the live file), loads quack and httpfs by path, attaches the read copy READ_ONLY as `wh`, and
 // locks it down to the copy's path (db/modes.ts, kind "readers"). Every connection then runs `USE wh`, so the gate and
@@ -46,7 +53,8 @@ import { chmodSync, existsSync, rmSync } from "node:fs";
 import { CroftError } from "../core/errors.ts";
 import type { Problem, Sql } from "../core/types.ts";
 import { connect, lockConflict, newerStorage, openInstance, openMemoryInstance, type SandboxSpec } from "../db/connect.ts";
-import { READ_COPY_ALIAS, READERS_VIEWS_DB } from "../db/modes.ts";
+import { isConnectionError } from "../db/lake.ts";
+import { LAKE_ALIAS, modeSecrets, READ_COPY_ALIAS, READERS_VIEWS_DB, scrubThrown } from "../db/modes.ts";
 import { checkFormat } from "../db/state.ts";
 import { type ColumnInfo, renderRows, renderValueRows, resultShape, typeName } from "../db/values.ts";
 import { mapQueryError, toDuck, wireSafe } from "../read/select.ts";
@@ -61,7 +69,7 @@ import { QuackListener } from "./quack-listener.ts";
 export type ToWorker =
   /** `path` is the warehouse, or with `readers` the read copy (server mode: the readers' process, an in-memory
    *  instance with the copy attached read-only; the folders are the extension files' and the secret folder's). */
-  | { op: "open"; path: string; spec: SandboxSpec; protect: string[]; readers?: ReadersOpen }
+  | { op: "open"; path: string; spec: SandboxSpec; protect: string[]; readers?: ReadersOpen; lake?: true }
   /** Server mode: the copy at `path` was replaced; detach the old file and attach the new one. `asOf` is the new copy's as-of time. */
   | { op: "swap"; asOf: string }
   /** Server mode: the keys Quack accepts are now these (a key removed here is refused on its session's next query). */
@@ -278,6 +286,8 @@ class Host {
   private readonly catalogs = new Map<string, { epoch: number; snapshot: Promise<CatalogSnapshot> }>();
   /** The database each readers' connection works in (`USE`). */
   private readonly using = new WeakMap<DuckDBConnection, string>();
+  /** A lake project's worker (`open` with `lake`): the lake is attached read-only, and every connection works in it. */
+  private lake = false;
 
   constructor(private readonly send: (m: FromWorker) => void, private readonly exit: () => void = () => {}) {}
 
@@ -341,6 +351,17 @@ class Host {
           // The deadline's look at the running queries has a connection of its own: the admin one is busy swapping.
           this.quack.watch(await connect(this.instance, this.spec, this.key));
         }
+      } else if (m.lake) {
+        // A lake: an in-memory instance that attaches it read-only before the lock. This process never writes, and the mode is the
+        // read-only login and key (db/lake.ts); a lake that is not there yet is reported as such and tried again by the engine.
+        this.instance = await openMemoryInstance();
+        this.lake = true;
+        this.key = LAKE_KEY;
+        this.spec = m.spec;
+        this.path = m.path;
+        this.protect = m.protect;
+        const first = await connect(this.instance, this.spec, this.key); // checks the files, loads, attaches, locks
+        first.disconnectSync();
       } else {
         this.instance = (await openInstance(m.path, "read_only")).instance;
         this.key = m.path;
@@ -359,8 +380,8 @@ class Host {
     } catch (e) {
       // The instance, if it opened, stays as it is: the engine kills this worker. A readers' process also ends itself,
       // since the instance is part set up and is never reused.
-      this.send({ op: "open_failed", error: toWire(m.readers ? readersOpenError(e, m.path) : e) });
-      if (m.readers) this.exit();
+      this.send({ op: "open_failed", error: toWire(m.readers ? readersOpenError(e, m.path) : this.clean(e)) });
+      if (m.readers || m.lake) this.exit(); // the instance is part set up and is never reused (connect.ts); the engine starts another
     }
   }
 
@@ -443,12 +464,22 @@ class Host {
           if (q.stopped) conn.interrupt();
           a = await answer(conn, m.sql, {
             params: m.params, limit: m.limit, maxRows: m.maxRows, maxBytes: m.maxBytes, timezone: this.spec.timezone, protect: this.protect,
-            ...(m.shared !== undefined ? { shared: m.shared } : {}), catalog: await this.catalogFor(conn, this.admin ? db : this.key, () => q.stopped),
+            // A lake changes whenever a run commits, so its catalog is read for each query; a file's cannot change under the worker.
+            ...(m.shared !== undefined ? { shared: m.shared } : {}), ...(this.lake ? {} : { catalog: await this.catalogFor(conn, this.admin ? db : this.key, () => q.stopped) }),
             checkpoint: () => {
               if (q.stopped) throw new Stopped();
             },
           });
         } catch (e) {
+          // A lake whose catalog connection dropped: the next statement reconnects by itself, so the query runs again, once, on a new connection.
+          if (this.lake && attempt === 0 && !q.stopped && isConnectionError(e)) {
+            if (conn) {
+              conn.disconnectSync();
+              this.all.delete(conn);
+            }
+            conn = null;
+            continue;
+          }
           // A query that straddled a swap may have bound to the file just detached, and read nothing: it runs again, once.
           if (attempt > 0 || !this.admin || q.stopped) throw e;
           if (this.swapping) await this.swapping;
@@ -459,7 +490,7 @@ class Host {
       }
       reply = { op: "answer", id: m.id, conns: 0, peakRss: 0, ...a };
     } catch (e) {
-      reply = { op: "failed", id: m.id, conns: 0, peakRss: 0, error: q.stopped ? { kind: "stopped" } : toWire(e) };
+      reply = { op: "failed", id: m.id, conns: 0, peakRss: 0, error: q.stopped ? { kind: "stopped" } : toWire(this.clean(e)) };
     }
     // Forgotten before its connection goes back: a late interrupt must never reach the next query on it.
     this.running.delete(m.id);
@@ -467,10 +498,25 @@ class Host {
     this.send({ ...reply, conns: this.all.size, peakRss: peakRss() });
   }
 
-  /** A connection, working in `db` when this is the readers' process (the copy for the app token, the views for a key). */
+  /** An error with the lake's credentials taken out (a lake worker holds the read-only login and key; the rest of the error is kept). */
+  private clean(e: unknown): unknown {
+    return this.lake && this.spec?.mode ? scrubThrown(e, modeSecrets(this.spec.mode)) : e;
+  }
+
+  /** A connection, working in `db` when this is the readers' process (the copy for the app token, the views for a key), or in the lake. */
   private async take(db: string = this.alias): Promise<DuckDBConnection> {
     const reuse = this.idle.pop();
     const conn = reuse ?? await connect(this.instance!, this.spec!, this.key);
+    if (this.lake && this.using.get(conn) !== LAKE_ALIAS) {
+      try {
+        await conn.run(`USE ${LAKE_ALIAS}`);
+        this.using.set(conn, LAKE_ALIAS);
+      } catch (e) {
+        conn.disconnectSync();
+        this.all.delete(conn);
+        throw e;
+      }
+    }
     if (this.admin && this.using.get(conn) !== db) {
       // The readers' process: the copy is the default database, as the live file's own catalog is in file mode.
       try {
@@ -576,6 +622,8 @@ const SECOND_COPY_ALIAS = "wh2";
 
 /** The connection factory's key for the readers' process's one instance. */
 export const READERS_KEY = ":memory:readers";
+/** The same for a lake project's worker. */
+const LAKE_KEY = ":memory:lake";
 
 /**
  * Make the copy read-only on disk before it is attached. A refresh in server mode does it, but a copy a project made while
