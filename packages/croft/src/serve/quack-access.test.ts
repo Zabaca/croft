@@ -284,6 +284,47 @@ describe("the cap on running queries (D130, D134)", () => {
     }
   });
 
+  test("a look that began before a session was admitted does not forget it: only admissions the look could have seen stop being counted", async () => {
+    let t = 1000;
+    const { a } = access({ maxConcurrent: 2, now: () => t });
+    for (const s of ["a", "b", "c", "d"]) a.authenticate(s, ALICE);
+    const q = (s: string) => refusal(a, s, "SELECT count(*) FROM orders");
+    // A look begins at 1000 and its query takes 40 ms; two sessions are admitted while it is in flight.
+    a.setActive(0, 1000);
+    t = 1010;
+    expect(await q("a")).toBeNull();
+    t = 1030;
+    expect(await q("b")).toBeNull();
+    // The look ends with 0 running (it began before either query) and must not clear them: a third session is refused.
+    a.setActive(0, 1000);
+    expect(await q("c")).toMatch(/SERVE_UNAVAILABLE/);
+    // The next look began after both admissions, so it has seen them (running, or finished): the count is the look's.
+    t = 1250;
+    a.setActive(1, 1250);
+    expect(await q("c")).toBeNull();
+    expect(await q("d")).toMatch(/SERVE_UNAVAILABLE/);
+    // A session admitted again after a look began is counted again from then, once.
+    t = 1500;
+    a.setActive(0, 1490);
+    expect(await q("a")).toBeNull();
+    expect(await q("a")).toBeNull();
+    expect(await q("b")).toBeNull();
+    expect(await q("d")).toMatch(/SERVE_UNAVAILABLE/);
+  });
+
+  test("a look that fails changes nothing: the count only grows until one succeeds", async () => {
+    const { a } = access({ maxConcurrent: 2 });
+    for (const s of ["a", "b", "c"]) a.authenticate(s, ALICE);
+    const q = (s: string) => refusal(a, s, "SELECT count(*) FROM orders");
+    a.setActive(0);
+    expect(await q("a")).toBeNull();
+    expect(await q("b")).toBeNull();
+    // No look follows (every one failed): the sessions stay counted and a new one is turned away, however long it takes.
+    expect(await q("c")).toMatch(/SERVE_UNAVAILABLE/);
+    a.setActive(0);
+    expect(await q("c")).toBeNull();
+  });
+
   test("a refused attack does not use a slot, and without a cap nothing is counted", async () => {
     const { a } = access({ maxConcurrent: 1 });
     a.authenticate("s", ALICE);

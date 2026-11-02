@@ -132,6 +132,7 @@ export class QuackListener {
     if (this.polling || this.fired) return;
     this.polling = true;
     try {
+      const began = Date.now();
       const reader = await conn.runAndReadAll("SELECT connection_id, state, epoch_ms(query_started_at) AS started FROM quack_active_connections()");
       const live = new Set<string>();
       let worst: { connection: string; ms: number } | null = null;
@@ -145,7 +146,7 @@ export class QuackListener {
         if (ms > this.o.queryTimeoutMs && (!worst || ms > worst.ms)) worst = { connection: String(id), ms };
       }
       this.access.prune(live);
-      this.access.setActive(running);
+      this.access.setActive(running, began);
       if (worst) {
         this.fired = true;
         this.o.overdue(worst);
