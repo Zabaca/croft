@@ -48,6 +48,24 @@ describe("which workflows can publish", () => {
     expect(SCRIPT_PUBLISHES.test("// publishes nothing\nconst x = 1"), "a word").toBe(false);
   });
 
+  test("every job of ci.yml, the log run of the suite (test-log) included, publishes nothing, mints no token and holds no secret", () => {
+    const { doc } = load("ci.yml");
+    expect(Object.keys(doc.jobs)).toEqual(expect.arrayContaining(["test", "test-log", "alpine", "windows", "site"]));
+    expect(doc.on.push.tags).toEqual(["phase-*", "croft-v*"]); // ci.yml runs on the release tag, so it must be unable to publish it
+    for (const [name, job] of Object.entries<any>(doc.jobs)) {
+      const text = JSON.stringify(job);
+      expect(canPublish(`${name}:\n${JSON.stringify(job, null, 1)}`), name).toBe(false);
+      expect(text, name).not.toMatch(/id-token|secrets\.|NPM_TOKEN|NODE_AUTH_TOKEN/);
+      expect(job.permissions ?? {}, name).not.toHaveProperty("id-token");
+      expect(job.environment, name).toBeUndefined();
+    }
+    // The log run sets CROFT_BOOKKEEPING and nothing that reaches a registry; it needs the extension files like the matrix does.
+    const log = doc.jobs["test-log"];
+    expect(log.needs).toBe("changes");
+    expect(JSON.stringify(log)).toContain("fetch-extensions.ts");
+    expect(JSON.stringify(log)).toContain("CROFT_EXTENSION_DIR");
+  });
+
   test("no workflow but those two can mint an OIDC token, which is what trusted publishing publishes with", () => {
     const withToken = files.filter((f) => /id-token:\s*write/.test(withoutComments(load(f).text)));
     expect(withToken.sort()).toEqual(["publish-addons.yml", "publish-npm.yml"]);
