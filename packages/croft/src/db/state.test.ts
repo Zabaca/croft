@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { bookkeepingOf, defaultBookkeeping, STATE_TABLE_NAMES } from "./bookkeeping.ts";
-import { assertFormat, checkFormat, CROFT_VERSION, ensureState, FORMAT_VERSION, hasState, LOG_FORMAT_VERSION, MAX_FORMAT_VERSION, readMeta } from "./state.ts";
+import { assertFormat, checkFormat, CROFT_VERSION, ensureState, FORMAT_VERSION, hasState, LOG_FORMAT_VERSION, readMeta } from "./state.ts";
 import { closeAllWarehouses, openWarehouse } from "./warehouse.ts";
 import { seedState } from "./bookkeeping-testkit.ts";
 
@@ -135,21 +135,39 @@ describe("ensureState", () => {
 
   test("format 4 is the log's: a log warehouse is stamped with it from its first write, and a croft that reads up to 3 refuses it", async () => {
     expect(LOG_FORMAT_VERSION).toBe(4);
-    expect(MAX_FORMAT_VERSION).toBe(4);
     const w = warehouse();
     const meta = await w.write("state", (tx) => ensureState(tx, { bookkeeping: "log" }), { runId: "r" });
     expect(meta.format_version).toBe("4");
     expect(await w.read((db) => readMeta(db), { purpose: "t" })).toMatchObject({ format_version: "4", bookkeeping: "log" });
     // A croft before the log reads up to 3: the same check, with its newest format, refuses the log's.
-    const old = () => assertFormat({ format_version: "4", croft_version: "9.9.9" }, FORMAT_VERSION);
+    const before = { file: FORMAT_VERSION, log: null };
+    const old = () => assertFormat({ format_version: "4", bookkeeping: "log", croft_version: "9.9.9" }, before);
     expect(old).toThrow(CroftError);
     try { old(); } catch (e) { expect((e as CroftError).code).toBe("DB_NEWER_FORMAT"); }
-    // This croft reads both, and a file warehouse stays at 3 whatever else is asked for later.
-    expect(() => assertFormat({ format_version: "4" })).not.toThrow();
-    expect(() => assertFormat({ format_version: "3" }, FORMAT_VERSION)).not.toThrow();
-    expect(() => assertFormat({ format_version: "5" })).toThrow(CroftError);
+    // This croft reads a log at 4, and a file at 3 (as a croft before the log does).
+    expect(() => assertFormat({ format_version: "4", bookkeeping: "log" })).not.toThrow();
+    expect(() => assertFormat({ format_version: "3" }, before)).not.toThrow();
+    expect(() => assertFormat({ format_version: "5", bookkeeping: "log" })).toThrow(CroftError);
+    // Format 4 belongs to the log: a file warehouse at 4 is a newer file format (a croft to come), not read as a log's.
+    for (const meta of [{ format_version: "4" }, { format_version: "4", bookkeeping: "file" }, { format_version: "4", croft_version: "9.9.9" }]) {
+      const refuse = () => assertFormat(meta);
+      expect(refuse, JSON.stringify(meta)).toThrow(CroftError);
+      try { refuse(); } catch (e) { expect((e as CroftError).code).toBe("DB_NEWER_FORMAT"); }
+    }
     const file = warehouse();
     expect((await file.write("state", (tx) => ensureState(tx, { bookkeeping: "file" }), { runId: "r" })).format_version).toBe("3");
+  });
+
+  test("a file warehouse stamped 4 is refused by a read of its format, as a newer file format; a log at 4 is read", async () => {
+    const w = warehouse();
+    await w.write("state", (tx) => ensureState(tx, { bookkeeping: "file" }), { runId: "r" });
+    await w.write("future", (tx) => tx.exec(`UPDATE _croft.meta SET value = '4' WHERE key = 'format_version'`), { runId: "r" });
+    let caught: unknown;
+    try { await w.read((db) => checkFormat(db), { purpose: "t" }); } catch (e) { caught = e; }
+    expect((caught as CroftError).code).toBe("DB_NEWER_FORMAT");
+    const log = warehouse();
+    await log.write("state", (tx) => ensureState(tx, { bookkeeping: "log" }), { runId: "r" });
+    expect(await log.read((db) => checkFormat(db), { purpose: "t" })).toMatchObject({ format_version: "4", bookkeeping: "log" });
   });
 
   test("CROFT_BOOKKEEPING=log is a test switch: it does nothing without the harness mark", () => {

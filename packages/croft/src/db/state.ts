@@ -8,14 +8,14 @@ import { type BookkeepingKind, defaultBookkeeping, fileDdl, kindOfObjects, logDd
 /** Version of the _croft schema. A database with a larger number was written by a newer croft.
  *  2: _croft.writes.attempt (the step attempt that committed, so reconcile() can tell retries apart).
  *  3: _croft.inputs.input_last_loaded_at (the input's last_loaded_at when a transform last read all of it,
- *     which staleness compares with; seen_loaded_at and seen_key stay newRows()'s composite position). */
+ *     which staleness compares with; seen_loaded_at and seen_key stay newRows()'s composite position).
+ *  A file warehouse is at most 3. **4 is taken by the log** (below), so the next file format is 5: a file warehouse at 4
+ *  is refused (assertFormat), which keeps a future croft's format 4 from being read as the log's. */
 export const FORMAT_VERSION = 3;
 /** The format of a warehouse whose bookkeeping is a log (db/bookkeeping.ts, D132). It is a number of its own because a croft
  *  that predates the log cannot use one: it makes `_croft.assets` a table and fails on the view. Stamped on a log warehouse
  *  from its first write, so that croft refuses it with DB_NEWER_FORMAT instead. Everything else about the format is 3's. */
 export const LOG_FORMAT_VERSION = 4;
-/** The newest format this croft reads. */
-export const MAX_FORMAT_VERSION = LOG_FORMAT_VERSION;
 export const CROFT_VERSION: string = pkg.version;
 
 // The file adapter's DDL (db/bookkeeping.ts holds the table specs, shared with the log adapter), each entry one
@@ -45,12 +45,18 @@ export async function readMeta(db: Sql): Promise<Meta> {
   return Object.fromEntries(rows.map((r) => [r.key, r.value ?? undefined]));
 }
 
-/** Refuse a database written by a newer croft rather than risk a downgrade (DB_NEWER_FORMAT). */
-export function assertFormat(meta: Meta, newest: number = MAX_FORMAT_VERSION): void {
+/** The newest format a croft reads, per kind of bookkeeping: null for a kind it does not know. The numbers of the two kinds are
+ *  separate, so a file warehouse at the log's 4 is a newer file format, not a log. */
+export interface FormatsRead { file: number; log: number | null }
+
+/** Refuse a database written by a newer croft rather than risk a downgrade (DB_NEWER_FORMAT). `reads` is what the croft
+ *  checking reads (this one by default); a test gives it an older croft's. */
+export function assertFormat(meta: Meta, reads: FormatsRead = { file: FORMAT_VERSION, log: LOG_FORMAT_VERSION }): void {
   const v = meta.format_version === undefined ? undefined : Number(meta.format_version);
-  if (v !== undefined && !(v <= newest)) {
+  const newest = meta.bookkeeping === "log" ? reads.log : reads.file;
+  if (v !== undefined && (newest === null || !(v <= newest))) {
     throw new CroftError("DB_NEWER_FORMAT", {
-      message: `this warehouse has croft format ${meta.format_version} (written by croft ${meta.croft_version ?? "?"}); this croft ${CROFT_VERSION} reads format ${newest} and older`,
+      message: `this warehouse has croft format ${meta.format_version}${meta.bookkeeping === "log" ? " (a log)" : ""} (written by croft ${meta.croft_version ?? "?"}); this croft ${CROFT_VERSION} reads ${newest === null ? "no such warehouse" : `format ${newest} and older`}`,
       hint: "upgrade croft in this project (bun add @zabaca/croft@latest) instead of opening the database with an older version",
       retryable: false,
       details: { formatVersion: meta.format_version, croftVersion: meta.croft_version, duckdbVersion: meta.duckdb_version },
