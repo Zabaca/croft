@@ -32,7 +32,7 @@ export interface ServeHealth {
   writeIntent: { pid: number; runId: string | null; since: string } | null;
   queriesToday: number;
   /** Server mode only: answers come from the read copy as of this time (null until the readers' process has one). */
-  serverMode?: { state: string; asOf: string | null };
+  serverMode?: { state: string; asOf: string | null; quack?: string };
   /** Set (server mode) when the server answers but something the user should fix makes it a problem: the copy limit. */
   degraded?: { code: string; message: string };
 }

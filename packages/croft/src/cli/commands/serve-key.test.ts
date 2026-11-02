@@ -91,6 +91,64 @@ describe("croft serve key add", () => {
   });
 });
 
+describe("how a person's DuckDB attaches over Quack (D125)", () => {
+  const serverMode = (root: string, sm: Record<string, unknown>, tables = ["orders", "customers"]) =>
+    writeFileSync(join(root, "croft.json"), JSON.stringify({ database: "warehouse.duckdb", timezone: "America/Los_Angeles", serverMode: { enabled: true, ...sm }, serve: { sharedTables: tables } }));
+  type Added = { data: { key: string; quack?: { uri: string | null; loopback: boolean; attach: string | null; asOfView: string } } };
+
+  test("without server mode there is no Quack and the data has no quack", async () => {
+    const p = makeProject();
+    share(p.root, ["orders"]);
+    const added = (await cli(["serve", "key", "add", "alice", "--json"], { cwd: p.root })).json as Added;
+    expect(added.data).not.toHaveProperty("quack");
+    expect((await cli(["serve", "key", "add", "bob"], { cwd: p.root })).stdout).not.toContain("Quack");
+    expect(((await cli(["serve", "key", "list", "--json"], { cwd: p.root })).json as Added).data).not.toHaveProperty("quack");
+  });
+
+  test("in server mode --json has the address, the ATTACH statement with the key in it and the as-of view's name; the human text prints them", async () => {
+    const p = makeProject();
+    serverMode(p.root, {});
+    const added = (await cli(["serve", "key", "add", "alice", "--json"], { cwd: p.root })).json as Added;
+    expect(added.data.quack).toEqual({
+      uri: "quack:127.0.0.1:9494", loopback: true, asOfView: "_croft_as_of", attach: `ATTACH 'quack:127.0.0.1:9494' AS croft (TOKEN '${added.data.key}')`,
+    });
+    const human = await cli(["serve", "key", "add", "bob"], { cwd: p.root });
+    const key = KEY.exec(human.stdout)![0];
+    expect(human.stdout).toContain(`ATTACH 'quack:127.0.0.1:9494' AS croft (TOKEN '${key}');`);
+    expect(human.stdout).toContain("SELECT * FROM croft.orders;");
+    expect(human.stdout).toContain("SELECT as_of FROM croft._croft_as_of;");
+    expect(human.stdout).not.toContain("HTTPS reverse proxy");
+    // list never holds a key: the statement has <key> in its place.
+    const list = (await cli(["serve", "key", "list", "--json"], { cwd: p.root })).json as { data: { quack: { attach: string } } };
+    expect(list.data.quack.attach).toBe("ATTACH 'quack:127.0.0.1:9494' AS croft (TOKEN '<key>')");
+    expect(JSON.stringify(list)).not.toContain(key);
+  });
+
+  test("a port of 0 is only known to a running croft serve: its record gives the address, and without one the data says so", async () => {
+    const p = makeProject();
+    serverMode(p.root, { quackPort: 0 });
+    const cold = (await cli(["serve", "key", "add", "alice", "--json"], { cwd: p.root })).json as Added;
+    expect(cold.data.quack).toMatchObject({ uri: null, attach: null });
+    expect((await cli(["serve", "key", "add", "bob"], { cwd: p.root })).stdout).toContain("croft serve picks the port");
+    // A record of a live process (this one) with the address it bound.
+    writeFileSync(join(p.stateDir, "serve.json"), JSON.stringify({
+      url: "http://127.0.0.1:7447", host: "127.0.0.1", port: 7447, token: "t", pid: process.pid, procStart: null, bootId: null, startedAt: "2026-11-01T18:00:00Z", version: "x",
+      serverMode: true, quack: { uri: "quack:127.0.0.1:55001" },
+    }));
+    const warm = (await cli(["serve", "key", "add", "carol", "--json"], { cwd: p.root })).json as Added;
+    expect(warm.data.quack).toMatchObject({ uri: "quack:127.0.0.1:55001", attach: `ATTACH 'quack:127.0.0.1:55001' AS croft (TOKEN '${warm.data.key}')` });
+  });
+
+  test("an address that is not loopback is said to need an HTTPS reverse proxy, and a client is told to write the machine's name", async () => {
+    const p = makeProject();
+    serverMode(p.root, { quackHost: "0.0.0.0", quackPort: 9500 });
+    const added = (await cli(["serve", "key", "add", "alice", "--json"], { cwd: p.root })).json as Added;
+    expect(added.data.quack).toMatchObject({ uri: "quack:0.0.0.0:9500", loopback: false });
+    expect(added.data.quack!.attach).toBe(`ATTACH 'quack:<this machine>:9500' AS croft (TOKEN '${added.data.key}')`);
+    expect((await cli(["serve", "key", "add", "bob"], { cwd: p.root })).stdout).toContain("HTTPS reverse proxy");
+  });
+});
+
 describe("a shared table that no asset makes", () => {
   test("is named where a typo would otherwise go unnoticed: key add, key list and the banner's data; a real asset is not", async () => {
     const p = makeProject({ files: { "assets/orders.sql": "SELECT 1 AS id\n" } });

@@ -403,7 +403,13 @@ class ReadersEngine implements ServeEngine {
     this.state = this.restarts > 0 || this.attempts > 0 ? "restarting" : "starting";
     const worker: QueryWorker = QueryWorker.spawn({
       onExit: (w) => this.exited(w),
-      onQuack: (e) => this.onQuack?.(e),
+      onQuack: (e) => {
+        try {
+          this.onQuack?.(e);
+        } catch {
+          // A log or a last-use time that cannot be written never costs a client its answer.
+        }
+      },
       onOverdue: (o) => {
         // Quack has no server-side cancel [V: 2.0.0]: the process ends, every session on it with it, and clients attach again (D127).
         this.hooks.quackOverdue?.({ pid: worker.pid, ms: o.ms, at: Date.now() });

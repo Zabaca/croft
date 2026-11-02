@@ -2,7 +2,8 @@
 
 An app reads through croft serve with its token and sees every table. A person gets a key of their own instead: it
 reads only the tables the project shares, read-only, over the same HTTP API, and the user can take it away with one
-command. Keys work with or without server mode (croft docs server-mode); nothing about them needs the read copy.
+command. Keys work with or without server mode (croft docs server-mode); nothing about them needs the read copy. In
+server mode the same key also signs a person's own DuckDB 2.0 in over Quack (croft docs quack).
 
 Giving a person access to data is the user's decision, so `croft serve key add` is on the skill's "Ask the user
 first" list: show them which tables the key will read, and wait for a yes. Removing a key needs no asking.
@@ -54,8 +55,10 @@ otherwise on croft serve's query worker, which steps aside for writes as it does
   croft serve key list                 names, when each was made and last used (never the key); --json too
   croft serve key remove alice         refused on its very next request
 
-Both work with croft serve running or not. croft serve checks the keys file on every request, so a key removed (or
-added) while it runs is honoured at once, with no restart. A keys file that cannot be read means no key is accepted
+Both work with croft serve running or not. croft serve checks the keys file on every HTTP request, so a key removed (or
+added) while it runs is honoured at once, with no restart. A DuckDB session over Quack outlives a request, so croft serve
+reads the file every 250 ms and hands the readers' process the list: a removed key is refused on its session's next
+query within a second, and a key just added may take a quarter of a second to sign in. A keys file that cannot be read means no key is accepted
 (SERVE_KEYS_UNREADABLE says why), and a name has one key (SERVE_KEY_EXISTS).
 
 ## The log
@@ -66,4 +69,5 @@ tables it read, the rows and how long it took, and for a refusal the problem's c
   croft serve: key alice  2026-11-01T10:00:00-08:00  read orders, customers  3 rows  12 ms
   croft serve: key alice  2026-11-01T10:00:05-08:00  refused QUERY_PATH_DENIED  0 rows  1 ms
 
-A person's own DuckDB over Quack, with the same key, is not part of this build.
+A key query over Quack gets a line of the same kind, marked `over Quack`, without the rows and the time, which only the
+client sees (croft docs quack).

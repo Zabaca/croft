@@ -66,7 +66,7 @@ async function journey(serverMode: boolean): Promise<void> {
   p.write("assets/payments.ts", asset(api.url, "/payments"));
   const env = { ...schedulerEnv(), CROFT_EXTENSION_DIR: ext.dir };
   const home = { env };
-  p.edit("croft.json", '"timezone"', `${serverMode ? '"serverMode": { "enabled": true }, ' : ""}"serve": { "sharedTables": ["orders"] }, "timezone"`);
+  p.edit("croft.json", '"timezone"', `${serverMode ? '"serverMode": { "enabled": true, "quackPort": 0 }, ' : ""}"serve": { "sharedTables": ["orders"] }, "timezone"`);
   const built = await p.json(["run"], home);
   expect(built.code, show(built)).toBe(0);
 

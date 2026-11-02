@@ -73,7 +73,7 @@ describe("journey 32: server mode", () => {
     p.write("assets/orders.ts", ordersAsset(api.url));
     const env = { ...schedulerEnv(), CROFT_EXTENSION_DIR: ext.dir };
     const home = { env };
-    p.edit("croft.json", '"timezone"', '"serverMode": { "enabled": true }, "timezone"');
+    p.edit("croft.json", '"timezone"', '"serverMode": { "enabled": true, "quackPort": 0 }, "timezone"');
 
     // A run that changes data makes the copy, read-only on disk, even though readCopy is not set.
     const first = await p.json(["run"], home);
@@ -159,7 +159,7 @@ describe("journey 32: server mode", () => {
     expect((await p.json(["run"], home)).code).toBe(0);
     const copy = join(p.root, "warehouse.read.duckdb");
     expect(existsSync(copy)).toBe(false); // server mode and readCopy were off
-    p.edit("croft.json", '"timezone"', '"serverMode": { "enabled": true }, "timezone"');
+    p.edit("croft.json", '"timezone"', '"serverMode": { "enabled": true, "quackPort": 0 }, "timezone"');
 
     const serve = p.start(["serve", "--port", "0"], home);
     const file = join(p.stateDir, "serve.json");
@@ -193,11 +193,11 @@ describe("journey 32: server mode", () => {
     p.remove("assets/example_sales.ts");
     p.write("assets/orders.ts", ordersAsset(api.url));
     const home = { env: { ...schedulerEnv(), CROFT_EXTENSION_DIR: ext.dir } };
-    p.edit("croft.json", '"timezone"', '"serverMode": { "enabled": true }, "timezone"');
+    p.edit("croft.json", '"timezone"', '"serverMode": { "enabled": true, "quackPort": 0 }, "timezone"');
     expect((await p.json(["run"], home)).code).toBe(0);
     const copy = join(p.root, "warehouse.read.duckdb");
     expect(statSync(copy).mode & 0o222).toBe(0);
-    p.edit("croft.json", '"serverMode": { "enabled": true }', '"readCopy": true, "serverMode": { "enabled": false }');
+    p.edit("croft.json", '"serverMode": { "enabled": true, "quackPort": 0 }', '"readCopy": true, "serverMode": { "enabled": false }');
     state.orders.push({ id: 2, amount: 20 });
     expect((await p.json(["run"], home)).code).toBe(0);
     expect(statSync(copy).mode & 0o200).toBe(0o200);

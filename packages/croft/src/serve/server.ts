@@ -421,7 +421,7 @@ class Handler {
     const s = this.o.engine.status();
     return {
       ok: true, pid: process.pid, version: CROFT_VERSION, database: this.o.envelopeMeta().database, writeIntent: s.writeIntent, queriesToday: s.queriesToday,
-      ...(s.serverMode ? { serverMode: { state: s.serverMode.state, asOf: s.serverMode.asOf } } : {}),
+      ...(s.serverMode ? { serverMode: { state: s.serverMode.state, asOf: s.serverMode.asOf, ...(s.serverMode.quack ? { quack: s.serverMode.quack.uri } : {}) } } : {}),
       ...(s.serverMode?.copyCost ? { degraded: s.serverMode.copyCost } : {}),
     };
   }

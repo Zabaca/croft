@@ -11,7 +11,7 @@ import { cleanup as cleanupChildren, releaseHolder, spawnHolder, spawnIdle, writ
 import { loadProject } from "../../project/root.ts";
 import { defaultDeps, type DoctorDeps, formatDoctor, runDoctor } from "./doctor.ts";
 import { cleanup, cli, makeProject, seed, type TestProject } from "./inspect-testkit.ts";
-import { formatBanner, type ServeData } from "./serve.ts";
+import { formatBanner, quackLogLine, type ServeData } from "./serve.ts";
 import { collectStatus, formatStatus } from "./status.ts";
 
 const scratch: string[] = [];
@@ -237,6 +237,25 @@ describe("the croft serve banner", () => {
 
   test("without server mode the banner is as it was", () => {
     expect(formatBanner(base, "UTC").split("\n")[0]).toBe("croft serve · http://127.0.0.1:7447 · database warehouse.duckdb (read-only, steps aside for writes)");
+    expect(formatBanner(base, "UTC")).not.toContain("Quack");
+  });
+
+  test("it says where DuckDB 2.0 clients attach over Quack (D125), and for an address that is not loopback that an HTTPS proxy belongs in front", () => {
+    const quack = { uri: "quack:127.0.0.1:9494", loopback: true, asOfView: "_croft_as_of", attach: "ATTACH 'quack:127.0.0.1:9494' AS croft (TOKEN '<key>')" };
+    const sm = { readCopy: "warehouse.read.duckdb", asOf: "2026-09-24T10:00:00-07:00" };
+    const near = formatBanner({ ...base, serverMode: sm, quack }, "UTC");
+    expect(near).toContain("DuckDB 2.0 clients attach over Quack at quack:127.0.0.1:9494 with a key: ATTACH 'quack:127.0.0.1:9494' AS croft (TOKEN '<key>'); the copy's as-of time is in _croft_as_of (croft docs quack)");
+    expect(near).not.toContain("Quack is not loopback");
+    const far = formatBanner({ ...base, serverMode: sm, quack: { ...quack, uri: "quack:0.0.0.0:9494", loopback: false } }, "UTC");
+    expect(far).toContain("Quack is not loopback: put an HTTPS reverse proxy in front of 0.0.0.0:9494; clients attach to the proxy's name with the port written out");
+  });
+
+  test("a key query over Quack gets a log line of its own kind: the key, the time and the tables or the refusal, over Quack", () => {
+    const at = Date.parse("2026-11-01T18:00:00Z");
+    expect(quackLogLine({ kind: "query", key: "alice", at, tables: ["orders", "customers"], outcome: "ok" }, "America/Los_Angeles"))
+      .toBe("croft serve: key alice  2026-11-01T10:00:00-08:00  read orders, customers  over Quack"); // the clocks went back that morning
+    expect(quackLogLine({ kind: "query", key: "alice", at, tables: [], outcome: "QUERY_PATH_DENIED" }, "UTC"))
+      .toBe("croft serve: key alice  2026-11-01T18:00:00+00:00  refused QUERY_PATH_DENIED  over Quack");
   });
 });
 

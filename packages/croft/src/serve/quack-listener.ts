@@ -103,7 +103,7 @@ export class QuackListener {
     await conn.run(`SET GLOBAL quack_authorization_function = '${HOOK_AUTHZ}'`);
     const { uri, loopback } = listenAddress(this.o.host, this.o.port);
     try {
-      this.uri = await startQuackListener(conn, uri, { allowOtherHostname: !loopback });
+      this.uri = await startQuackListener(conn, uri, { allowOtherHostname: !loopback, disableSsl: !loopback });
     } catch (e) {
       throw listenFailed(uri, e);
     }

@@ -283,11 +283,13 @@ export function scrubError(e: unknown, mode: ModeSpec | undefined): Error {
  * lock, because DuckDB refuses `quack_serve` afterwards. Who may connect is the authentication hook's job; without
  * a `token`, the one the listener needs is a random placeholder no client is given, and no secret is created for it.
  */
-export async function startQuackListener(conn: DuckDBConnection, uri: string, o: { token?: string; allowOtherHostname?: boolean } | string = {}): Promise<string> {
+export async function startQuackListener(conn: DuckDBConnection, uri: string, o: { token?: string; allowOtherHostname?: boolean; disableSsl?: boolean } | string = {}): Promise<string> {
   const opts = typeof o === "string" ? { token: o } : o;
   const t = opts.token ?? `unused-${crypto.randomUUID()}`;
   // Quack accepts only localhost as its host unless told otherwise [V: 2.0.0]; croft says so for anything else (D125).
-  const other = opts.allowOtherHostname ? ", allow_other_hostname = true" : "";
+  // Past localhost Quack serves TLS with a certificate of its own [V: 2.0.0: a client got "Unsupported protocol" over plain HTTP];
+  // croft's design is a reverse proxy that holds the real certificate and speaks plain HTTP to Quack, as for its HTTP API (D125).
+  const other = `${opts.allowOtherHostname ? ", allow_other_hostname = true" : ""}${opts.disableSsl ? ", disable_ssl = true" : ""}`;
   const reader = await conn.runAndReadAll(`SELECT listen_uri FROM quack_serve(${q(uri)}, token = ${q(t)}, create_secret_if_not_exists = false${other})`);
   // The address actually bound: a port of 0 is replaced by the one the system picked.
   return String(reader.getRowsJS()[0]?.[0] ?? uri);

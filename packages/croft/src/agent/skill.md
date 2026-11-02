@@ -39,7 +39,7 @@ croft status                # failed, stale, held, never run, edited since its l
 - Columns named like SQL keywords must be quoted: `"order"`.
 - Apps read with `import { query } from "@zabaca/croft/read"`; `query<"x">(sql)` types the rows as table x's (croft docs serve). It talks to `croft serve` when one is running (found via CROFT_URL or .croft/serve.json), otherwise opens the file briefly. Never open the .duckdb files directly.
 - `croft serve` runs until stopped: ask the user to start it in their own terminal instead of running it in your shell.
-- A person who needs to read tables gets a key of their own (croft docs keys): the user names the tables to share in `serve.sharedTables`, then `croft serve key add <name>` prints the key once (`data.key` with `--json`; hand it to the user, never paste it elsewhere), `key list` shows who has one, `key remove <name>` takes access away at once.
+- A person who needs to read tables gets a key of their own (croft docs keys): the user names the tables to share in `serve.sharedTables`, then `croft serve key add <name>` prints the key once (`data.key` with `--json`; hand it to the user, never paste it elsewhere), `key list` shows who has one, `key remove <name>` takes access away at once. With `"serverMode"` on, `data.quack` of `key add --json` is how their own DuckDB 2.0 attaches over Quack (croft docs quack).
 - For a GUI (DuckDB UI, DBeaver), set "readCopy": true in croft.json and open warehouse.read.duckdb, never warehouse.duckdb. With `"serverMode"` on (croft docs server-mode) the copy is read-only on disk: open it read-only.
 
 ## APIs

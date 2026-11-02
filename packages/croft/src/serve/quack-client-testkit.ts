@@ -77,3 +77,16 @@ export class QuackClients {
     for (const c of this.children) c.kill("SIGKILL");
   }
 }
+
+/** A port nothing listens on now, for a Quack listener that must come back at the same address after its process is killed. */
+export function freePort(): number {
+  const s = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+  const port = s.port;
+  s.stop(true);
+  return port;
+}
+
+/** `sql` sent to a Quack server as written, with a key, without attaching: the server sees exactly this text. */
+export function raw(client: QuackClient, uri: string, key: string, sql: string): Promise<ClientAnswer> {
+  return client.run(`SELECT * FROM quack_query('${uri}', '${sql.replaceAll("'", "''")}', token = '${key}')`);
+}

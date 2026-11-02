@@ -11,7 +11,8 @@ Turn it on in croft.json (the user decides; it changes what apps see):
 
   "serverMode": { "enabled": true }
 
-That turns the read copy on too. Then, as before, the user starts `croft serve` in their own terminal. Nothing else
+That turns the read copy on too, and starts a listener for DuckDB 2.0 clients (serverMode.quackHost and quackPort, croft
+docs quack). Then, as before, the user starts `croft serve` in their own terminal. Nothing else
 changes for apps: they keep reading with `query()` from @zabaca/croft/read and the same token. A project that never
 turns server mode on is unchanged, and so is one that turns it off again.
 
@@ -26,8 +27,9 @@ turns server mode on is unchanged, and so is one that turns it off again.
 - `croft status` and `croft doctor` say the project is in server mode, the copy's as-of time, and whether croft serve is
   running. GET /health carries `serverMode: {state, asOf}`.
 - The app token reads every table of the project, as it always did. A person's key (croft docs keys) reads the shared
-  tables only, from views of them in the readers' process, with the same as-of time on every answer. DuckDB clients
-  over Quack are not part of this build.
+  tables only, from views of them in the readers' process, with the same as-of time on every answer. The same key lets a
+  person's own DuckDB 2.0 attach over Quack and read those views, with the as-of time in a view of its own
+  (`_croft_as_of`); croft serve prints the address, and `croft serve key add` how to attach (croft docs quack).
 
 ## The read copy is read-only on disk
 
@@ -48,6 +50,11 @@ which writes it with the usual permissions.
 - A query past serve.queryTimeoutMs that interrupts cannot stop ends the readers' process; a new one starts at once.
   Queries running at that moment get a retryable SERVE_UNAVAILABLE (reason "restarted"), which `query()` retries. A
   process that cannot start ends itself and is started again after a wait (none, then 250 ms doubling to 60 s).
+- The same process listens for DuckDB 2.0 clients over Quack, on serverMode.quackHost and quackPort (127.0.0.1 and 9494 by
+  default; 0 picks a free port; anything but loopback must sit behind an HTTPS reverse proxy). A listener that cannot
+  start is QUACK_LISTEN_FAILED. Quack has no way to cancel a query on the server, so one that runs past
+  serve.queryTimeoutMs ends the readers' process like a stuck HTTP query does, and every Quack session on it drops: a
+  client attaches again (croft docs quack).
 - Stopping croft serve (Ctrl-C, SIGTERM) ends the readers' process first and exits 0, even with a query running.
 - One refresh per run, at its end, so the copy shows every table at one consistent point. A run that failed partway
   still refreshes the copy when a step committed.
