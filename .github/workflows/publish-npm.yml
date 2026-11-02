@@ -9,6 +9,10 @@
 # and packs it, and `publish` uploads that tarball. It is packed with `npm pack`, as 0.1.0 to 0.2.1 were by
 # hand: it runs `prepack` (the read client's build, scripts/build-read.ts) and writes bin/croft.mjs with mode
 # 755, where `bun pm pack` copies the checkout's 777.
+#
+# A run publishes only from a tag. The manual run (workflow_dispatch) is for running a release again, from the tag's ref
+# (`gh workflow run publish-npm.yml --ref croft-v<version>`); from a branch both jobs are skipped, because the check that the
+# tag names package.json's version cannot protect a branch and a branch's unpublished version would otherwise be published.
 name: publish-npm
 on:
   push:
@@ -17,6 +21,7 @@ on:
 concurrency: publish-npm
 jobs:
   pack:
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -129,7 +134,7 @@ jobs:
 
   publish:
     needs: pack
-    if: needs.pack.outputs.publish == 'yes'
+    if: github.ref_type == 'tag' && needs.pack.outputs.publish == 'yes'
     runs-on: ubuntu-24.04
     permissions:
       contents: read

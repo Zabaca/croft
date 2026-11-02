@@ -55,7 +55,9 @@ import { join } from "node:path";
 import { CroftError, problem } from "../../core/errors.ts";
 import { formatInstant, parseInstant } from "../../core/time.ts";
 import { recordAlive } from "../../core/proc.ts";
-import type { AssetKind, Problem, Reason } from "../../core/types.ts";
+import type { AddonView, AssetKind, Problem, Reason } from "../../core/types.ts";
+import { addonLine, addonsNeeded, inspectAddons } from "../../db/addon-status.ts";
+import type { ExtensionSearch } from "../../db/extension-files.ts";
 import { assessCopyPolicy, type CloneProbe, copyCostlyProblem, notClonedProblem, type ProbeOptions } from "../../db/copy-policy.ts";
 import { readCopyStatus, readCopyView, type ReadCopyView, readCopyWords } from "../../db/readcopy.ts";
 import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
@@ -149,7 +151,11 @@ export interface StatusData {
   readCopy?: ReadCopyView;
   /** With serverMode on (D119): croft serve answers from the read copy, shown above as of when; `serving` is whether
    *  croft serve runs now (apps read the file directly while it does not). */
-  serverMode?: { serving: boolean };
+  serverMode?: {
+    serving: boolean;
+    /** The add-on that carries server mode's DuckDB extension files, and whether this machine finds them (D134). */
+    addons: AddonView[];
+  };
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -535,6 +541,8 @@ export interface StatusDeps {
   home?: CroftHome;
   /** How the read copy's clone is tried (db/copy-policy.ts): tests give a cp that cannot clone. Default: the real cp. */
   copyProbe?: ProbeOptions & { clone?: CloneProbe };
+  /** Where the add-ons' extension files are looked for (db/extension-files.ts); tests point it at a folder or an empty environment. */
+  extensions?: ExtensionSearch;
 }
 
 /** The scheduler's view by asset while scheduling is on or paused; a warning instead when it cannot be read. */
@@ -690,6 +698,7 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
     const serve = serveOf(project.paths.stateDir);
     if (serve) data.serve = serve;
     const copyProblems: Problem[] = [];
+    const addonProblems: Problem[] = [];
     if (project.config.readCopy) {
       const copy = readCopyView(readCopyStatus(project, db ?? undefined), tz);
       if (copy) data.readCopy = copy;
@@ -698,9 +707,14 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       if (policy.refused) copyProblems.push(copyCostlyProblem(policy, "limit"));
       else if (policy.warn) copyProblems.push(notClonedProblem(policy));
     }
-    if (project.config.serverMode.enabled) data.serverMode = { serving: serve !== undefined };
+    if (project.config.serverMode.enabled) {
+      // The add-on with the mode's extension files (D134): croft serve cannot start without it, so a missing one is a problem here.
+      const addons = inspectAddons(addonsNeeded(project.config), { from: project.root, ...o.extensions });
+      data.serverMode = { serving: serve !== undefined, addons: addons.views };
+      addonProblems.push(...addons.problems);
+    }
     // resolveProject's problems are discovery's (all of them: no selectors) and CYCLE.
-    const problems = [...(missing ? [missing] : []), ...(resolved ? resolved.problems : discovery.problems), ...resolution.problems, ...renamed, ...configChanges, ...copyProblems];
+    const problems = [...(missing ? [missing] : []), ...(resolved ? resolved.problems : discovery.problems), ...resolution.problems, ...renamed, ...configChanges, ...copyProblems, ...addonProblems];
     // The scheduler: stale (the diagnosis reads files only: no launchctl or crontab here), then the held assets.
     const schedulingProblems: Problem[] = [];
     if (rec.stale) {
@@ -843,7 +857,10 @@ export const status: CommandImpl<StatusData> = {
 
 export async function runStatus(ctx: Ctx, deps: StatusDeps = {}): Promise<CommandResult<StatusData>> {
   const project = ctx.project;
-  const state = await collectStatus(project, ctx.now(), { home: deps.home ?? croftHome(ctx.processEnv), ...(deps.scheduleView ? { scheduleView: deps.scheduleView } : {}) });
+  const state = await collectStatus(project, ctx.now(), {
+    home: deps.home ?? croftHome(ctx.processEnv), extensions: deps.extensions ?? { env: ctx.processEnv },
+    ...(deps.scheduleView ? { scheduleView: deps.scheduleView } : {}),
+  });
   const check = ctx.values.check === true;
   const unhealthy = !state.data.healthy;
   const next = statusNext(state.data.assets);
@@ -978,7 +995,10 @@ function readCopyLines(d: StatusData, now: Date, tz: string, o: { root?: string;
   const root = o.root ?? "";
   const w = readCopyWords(d.readCopy, { root, database: o.database ?? "", tz, now });
   const mode = d.serverMode
-    ? [`Server mode on · ${d.serverMode.serving ? "croft serve answers from the read copy" : "croft serve is not running: apps read the warehouse file directly"}`]
+    ? [
+      `Server mode on · ${d.serverMode.serving ? "croft serve answers from the read copy" : "croft serve is not running: apps read the warehouse file directly"}`,
+      ...d.serverMode.addons.filter((a) => !a.ok).map((a) => `  ${addonLine(a)}`),
+    ]
     : [];
   return [...mode, `Read copy ${w.text}`, ...(w.hint ? [`  hint: ${w.hint}`] : [])];
 }

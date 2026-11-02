@@ -19,7 +19,8 @@ import { CroftError } from "../core/errors.ts";
 import type { Fix } from "../core/types.ts";
 import type { Profile } from "./connect.ts";
 import { type ExtensionName } from "./extension-names.ts";
-import { verifyExtensions } from "./extension-files.ts";
+import { addonFor } from "./addons.ts";
+import { verifyModeExtensions } from "./extension-files.ts";
 
 /** The Postgres catalog a lake keeps its metadata in, with one login. Credentials live only in a named secret. */
 export interface LakePostgres {
@@ -61,8 +62,11 @@ export interface LakeTestSpec {
 }
 
 interface ModeBase {
-  /** The folder holding the pinned extension files (extension-files.ts). */
-  extensionDir: string;
+  /** A folder holding the pinned extension files in DuckDB's layout (extension-files.ts): croft's tests and builders name
+   *  one, or set $CROFT_EXTENSION_DIR. Without either, the files come from the mode's add-on package (addons.ts). */
+  extensionDir?: string;
+  /** The project's root, from which the add-on package is found in node_modules (D134). */
+  projectRoot?: string;
   /** DuckDB's secret folder for this instance, inside croft's state folder. */
   secretDir: string;
   /** Runs after the mode's attaches and before the lock: register hooks, start the listener. */
@@ -139,7 +143,7 @@ export const MODE_PROFILES: Readonly<Record<ModeKind, readonly Profile[]>> = {
 
 /** Everything about a mode that is not a secret, as the sandbox fingerprint holds it: two requests that differ in any of it must not share an instance. */
 export function modeIdentity(mode: ModeSpec): unknown {
-  const base = { kind: mode.kind, extensionDir: mode.extensionDir, secretDir: mode.secretDir };
+  const base = { kind: mode.kind, extensionDir: mode.extensionDir ?? null, projectRoot: mode.projectRoot ?? null, secretDir: mode.secretDir };
   if (mode.kind === "readers") return { ...base, copy: mode.copy };
   if (mode.kind === "lake-test") return { ...base, catalog: mode.lake.catalog.path, dataPath: mode.lake.dataPath, access: mode.lake.access };
   const { catalog, data, access } = mode.lake;
@@ -165,7 +169,10 @@ export function checkMode(mode: ModeSpec, profile: Profile): Map<ExtensionName, 
   if (mode.kind === "lake-readers" && mode.lake.access !== "read") {
     throw new CroftError("INTERNAL_ERROR", { message: "a lake behind croft serve is attached read-only", hint: "report this croft bug" });
   }
-  return verifyExtensions(mode.extensionDir, MODE_EXTENSIONS[mode.kind]);
+  return verifyModeExtensions(MODE_EXTENSIONS[mode.kind], (n) => addonFor(mode.kind, n), {
+    ...(mode.extensionDir ? { dir: mode.extensionDir } : {}),
+    ...(mode.projectRoot ? { from: mode.projectRoot } : {}),
+  });
 }
 
 const LOAD_FIX: Fix = {

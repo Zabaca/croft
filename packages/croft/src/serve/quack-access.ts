@@ -72,10 +72,13 @@ export class QuackAccess {
   private catalog: CatalogSnapshot | null = null;
   private replacements: ReadonlyMap<string, string> = new Map();
   private ready = false;
-  /** Queries `quack_active_connections()` showed running at the last look. The cap is soft by that much: a burst that arrives between
-   *  two looks (250 ms) is not seen until the next one, and queries that already finished are never counted, so a client that sends
-   *  one query after another is never refused for them. */
-  private active = 0;
+  /** What `quack_active_connections()` showed running at the last look. */
+  private looked = 0;
+  /** The sessions admitted a query that the last look may not have seen, each with the time of its latest admission (D136). A
+   *  session sends one query at a time, so a second query of one session is not a second running query; counting it would refuse
+   *  a client that sends queries one after another (D130). The queries counted as running are `looked` plus these: a burst of
+   *  sessions inside one look's 250 ms cannot pass the cap. */
+  private readonly admitted = new Map<string, number>();
   private readonly shared: readonly string[];
   private readonly now: () => number;
 
@@ -84,9 +87,16 @@ export class QuackAccess {
     this.now = o.now ?? (() => Date.now());
   }
 
-  /** What the last look at the server's running queries counted (every 250 ms, serve/quack-listener.ts). */
-  setActive(running: number): void {
-    this.active = running;
+  /**
+   * What a look at the server's running queries counted (every 250 ms, serve/quack-listener.ts): the real number. `since` is when
+   * the look began; a session admitted a query before then is in the number (or finished), so it stops being counted separately,
+   * and one admitted while the look was in flight is not in it and stays counted until the next look. Without `since` the look is
+   * taken to have seen every admission so far. A look that fails changes nothing, so the count only grows until one succeeds and
+   * the cap errs toward refusing.
+   */
+  setActive(running: number, since: number = Number.POSITIVE_INFINITY): void {
+    this.looked = running;
+    for (const [session, at] of this.admitted) if (at < since) this.admitted.delete(session);
   }
 
   /** The keys listed now. A session whose key is not among them is refused on its next query. */
@@ -142,7 +152,10 @@ export class QuackAccess {
       if (replacement !== undefined) return replacement;
       const verdict = this.decide(query, parsed);
       const max = this.o.maxConcurrent ?? Number.POSITIVE_INFINITY;
-      if (this.active >= max) throw busy(max);
+      // A session runs one query at a time, so its next query means its last one is over: it counts once however many it sends,
+      // and a session already counted is not turned away by the count it is part of.
+      if (!this.admitted.has(session) && this.looked + this.admitted.size >= max) throw busy(max);
+      this.admitted.set(session, this.now());
       this.tell({ kind: "query", key: s.key, at: this.now(), tables: verdict.tables, outcome: "ok" });
       return verdict.sql;
     } catch (e) {

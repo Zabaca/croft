@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SELF_ROOT } from "../launcher.ts";
 import { cleanup as cleanupChildren, releaseHolder, spawnHolder, spawnIdle, writeServeJson } from "../../read/testkit.ts";
+import { extensionsReady } from "../../db/extension-dir-testkit.ts";
 import { loadProject } from "../../project/root.ts";
 import { defaultDeps, type DoctorDeps, formatDoctor, runDoctor } from "./doctor.ts";
 import { cleanup, cli, makeProject, seed, type TestProject } from "./inspect-testkit.ts";
@@ -54,7 +55,7 @@ function serverProject(o: { serverMode?: Record<string, unknown> | null; readCop
 }
 
 function deps(o: Partial<DoctorDeps> = {}): DoctorDeps {
-  return { ...defaultDeps({ CROFT_NOW: AT, CROFT_BUN_VERSION: "1.3.14" }), croftRoot: SELF_ROOT, home: join(tmpdir(), "no-home"), filesystem: () => ({ type: "apfs", mountPoint: "/", source: "mounts", unsafe: null }), ...o };
+  return { ...defaultDeps({ CROFT_NOW: AT, CROFT_BUN_VERSION: "1.3.14" }), croftRoot: SELF_ROOT, home: join(tmpdir(), "no-home"), filesystem: () => ({ type: "apfs", mountPoint: "/", source: "mounts", unsafe: null }), extensions: { env: process.env }, ...o };
 }
 
 describe("croft doctor", () => {
@@ -174,26 +175,33 @@ describe("croft doctor", () => {
 });
 
 describe("croft status", () => {
-  test("server mode on: data.serverMode says whether croft serve is live, and the human output says so above the copy's line", async () => {
+  // These two say nothing about the extension files, but with server mode on status looks for them (D134): the folder the suite
+  // uses answers, and without its files (a local run that has not fetched them) the tests are skipped, never wrong.
+  const files = extensionsReady(["quack", "httpfs"]);
+  const withFiles = files.ready ? test : test.skip;
+  const env = { CROFT_NOW: AT, CROFT_EXTENSION_DIR: files.dir };
+
+  withFiles("server mode on: data.serverMode says whether croft serve is live, and the human output says so above the copy's line", async () => {
     const p = serverProject({ copyAt: "2026-09-24T17:00:00.000Z" });
-    const json = await cli(["status", "--json"], { cwd: p.root, env: { CROFT_NOW: AT } });
+    const json = await cli(["status", "--json"], { cwd: p.root, env });
     const body = JSON.parse(json.stdout);
-    expect(body.data.serverMode).toEqual({ serving: false });
+    expect(body.data.serverMode.serving).toBe(false);
+    expect(body.data.serverMode.addons[0]).toMatchObject({ addon: "server", ok: true });
     expect(body.data.readCopy).toMatchObject({ asOf: "2026-09-24T10:00:00-07:00", health: "ok" });
-    const human = await cli(["status"], { cwd: p.root, env: { CROFT_NOW: AT } });
+    const human = await cli(["status"], { cwd: p.root, env });
     const lines = human.stdout.split("\n");
     const at = lines.findIndex((l) => l.startsWith("Server mode on"));
     expect(lines[at]).toBe("Server mode on · croft serve is not running: apps read the warehouse file directly");
     expect(lines[at + 1]).toContain("Read copy warehouse.read.duckdb · as of 10:00");
   });
 
-  test("with croft serve live it says it answers from the copy", async () => {
+  withFiles("with croft serve live it says it answers from the copy", async () => {
     const p = serverProject({ copyAt: "2026-09-24T17:00:00.000Z" });
     const idle = spawnIdle();
     writeServeJson(p.stateDir, { url: "http://127.0.0.1:7447", token: "t", pid: idle.pid });
-    const json = JSON.parse((await cli(["status", "--json"], { cwd: p.root, env: { CROFT_NOW: AT } })).stdout);
-    expect(json.data.serverMode).toEqual({ serving: true });
-    expect((await cli(["status"], { cwd: p.root, env: { CROFT_NOW: AT } })).stdout).toContain("Server mode on · croft serve answers from the read copy");
+    const json = JSON.parse((await cli(["status", "--json"], { cwd: p.root, env })).stdout);
+    expect(json.data.serverMode.serving).toBe(true);
+    expect((await cli(["status"], { cwd: p.root, env })).stdout).toContain("Server mode on · croft serve answers from the read copy");
   });
 
   test("without server mode the output has no server mode field or line", async () => {

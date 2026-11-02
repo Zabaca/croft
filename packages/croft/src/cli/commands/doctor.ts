@@ -22,7 +22,9 @@
 //
 // With serverMode on (D119) it also says so: a line with the copy's as-of time and whether croft serve is live, and
 // SERVER_MODE_COPY_COSTLY as an error when server mode is refused. croft serve in server mode never holds the live
-// file, so a lock on it is never croft serve's.
+// file, so a lock on it is never croft serve's. It also has a line for the add-on that carries the mode's DuckDB extension
+// files (D134): ok when every file is found in the project's node_modules and matches its pin, an error with the install
+// command (EXTENSION_MISSING) when not.
 //
 // The data's health, in the Project section, without writing anything:
 // - tables (§5 "Out-of-band changes"): in the warehouse's read lease, every table croft has a commit of is compared
@@ -42,6 +44,8 @@ import { now, offsetSeconds } from "../../core/time.ts";
 import type { LockHolder, Problem } from "../../core/types.ts";
 import { BACKUPS_KEPT, backupsDir, compareEngineVersions, type EngineRecord, listBackups, listProjectBackups, recordedEngine } from "../../db/backup.ts";
 import { assessCopyPolicy, type CloneProbe, copyCostlyProblem, notClonedProblem, type ProbeOptions } from "../../db/copy-policy.ts";
+import { addonLine, addonsNeeded, inspectAddons } from "../../db/addon-status.ts";
+import type { ExtensionSearch } from "../../db/extension-files.ts";
 import { filesystemKind, folderKind, type FsKind } from "../../db/fs-kind.ts";
 import { isHolderAlive, liveIntents } from "../../db/intent.ts";
 import { readCopyStatus, readCopySummary } from "../../db/readcopy.ts";
@@ -111,6 +115,8 @@ export interface DoctorDeps {
   tableScanMs?: number;
   /** How the read copy's clone is tried (db/copy-policy.ts): tests give a cp that cannot clone. Default: the real cp. */
   copyProbe?: ProbeOptions & { clone?: CloneProbe };
+  /** Where the add-ons' extension files are looked for (db/extension-files.ts); tests point it at a folder or an empty environment. Default: `env`. */
+  extensions?: ExtensionSearch;
 }
 
 /** The tables line compares no more tables once this has passed, so doctor stays quick on a big warehouse. */
@@ -197,6 +203,7 @@ export async function runDoctor(cwd: string, d: DoctorDeps): Promise<{ data: Doc
     await checkWarehouse(r, d, project, probe.ok, found);
     await checkServe(r, d, project);
     checkReadCopy(r, d, project);
+    checkAddons(r, d, project);
     if (probe.ok) await checkTzdata(r, d, project.timezone);
   }
 
@@ -625,6 +632,21 @@ function checkReadCopy(r: Report, d: DoctorDeps, project: Project): void {
   }
 }
 
+/**
+ * With a mode on, the add-on that carries its extension files (D134): one check per add-on, "ok" when every file is found
+ * and matches its pin and an error with the install command when not. croft serve would not start without it, and
+ * saying so here is cheaper than finding out from its failure. A line for each add-on, in `--json` too (details).
+ */
+function checkAddons(r: Report, d: DoctorDeps, project: Project): void {
+  const needed = addonsNeeded(project.config);
+  if (!needed.length) return;
+  const report = inspectAddons(needed, { from: project.root, env: d.env, ...d.extensions });
+  for (const v of report.views) {
+    const p = report.problems.find((x) => x.details?.addon === v.addon);
+    r.add("environment", `addon.${v.addon}`, v.ok ? "ok" : "error", addonLine(v), p, { ...v });
+  }
+}
+
 // JSON timestamps take their offsets from Bun's Intl (core/time.ts); `::DATE` and every SQL time function use
 // DuckDB's bundled ICU data. When the two tzdata releases disagree for the project zone, a row's JSON timestamp
 // and its ::DATE can fall on different days. Compared from now over the next two years: every 12 hours, and
@@ -758,7 +780,7 @@ async function checkAssets(r: Report, d: DoctorDeps, project: Project, bindingOk
   let assets: number;
   try {
     const { validateProject } = await import("./validate.ts");
-    const report = await validateProject({ project, env: ProjectEnv.load(project.root, d.env), importTimeoutMs: 5000 });
+    const report = await validateProject({ project, env: ProjectEnv.load(project.root, d.env), importTimeoutMs: 5000, addons: false });
     problems = report.problems;
     assets = report.data.assets.length;
   } catch (e) {

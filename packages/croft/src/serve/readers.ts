@@ -34,7 +34,6 @@ import { CroftError } from "../core/errors.ts";
 import { formatInstant, now, zonedParts } from "../core/time.ts";
 import { canonicalPath, type SandboxSpec, serveResources } from "../db/connect.ts";
 import { assertCopyPolicy, assessCopyPolicy, type CloneProbe, copyCostlyProblem, type ProbeOptions, type ThresholdOption } from "../db/copy-policy.ts";
-import { resolveExtensionDir } from "../db/extension-files.ts";
 import { assertSafeFilesystem, type FsProbe, realProbe } from "../db/fs-kind.ts";
 import { loadProject, type Project } from "../project/root.ts";
 import { mapQueryError } from "../read/select.ts";
@@ -81,7 +80,7 @@ export interface ReadersEngineInternals {
   interruptEveryMs?: number;
   /** COPY_POLL_MS by default. */
   copyPollMs?: number;
-  /** The folder of the pinned extension files; resolveExtensionDir() by default. */
+  /** A folder of the pinned extension files, for croft's tests; by default the server add-on in the project's node_modules (D134). */
   extensionDir?: string;
   /** Where the readers' process listens for DuckDB clients (serverMode.quackHost and quackPort by default); false: nowhere,
    *  for a test that wants no listener. */
@@ -148,7 +147,7 @@ class ReadersEngine implements ServeEngine {
   private readonly protect: string[];
   private readonly copyPath: string;
   private readonly secretDir: string;
-  private readonly extensionDir: string;
+  private readonly extensionDir: string | undefined;
   private readonly maxConcurrent: number;
   private readonly queueMs: number;
   private readonly queryTimeoutMs: number;
@@ -206,7 +205,7 @@ class ReadersEngine implements ServeEngine {
     this.protect = [project.paths.stateDir];
     this.copyPath = canonicalPath(project.paths.readCopy);
     this.secretDir = join(project.paths.stateDir, "readers-secrets");
-    this.extensionDir = o.extensionDir ?? resolveExtensionDir();
+    this.extensionDir = o.extensionDir;
     this.admission = new Admission({
       maxConcurrent: this.maxConcurrent,
       maxQueued: this.maxQueued,
@@ -434,7 +433,7 @@ class ReadersEngine implements ServeEngine {
       opened = await worker.open({
         path: this.copyPath, spec: this.spec, protect: this.protect,
         readers: {
-          extensionDir: this.extensionDir, secretDir: this.secretDir, shared: [...this.project.config.serve.sharedTables], asOf,
+          ...(this.extensionDir ? { extensionDir: this.extensionDir } : {}), projectRoot: this.project.root, secretDir: this.secretDir, shared: [...this.project.config.serve.sharedTables], asOf,
           ...(this.quackAt ? { quack: { ...this.quackAt, queryTimeoutMs: this.queryTimeoutMs, keys: this.keys } } : {}),
         },
       });

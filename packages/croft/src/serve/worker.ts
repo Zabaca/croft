@@ -75,7 +75,10 @@ export type ToWorker =
 /** What the readers' process is opened with: the extension files and secret folder, the shared tables, the copy's as-of time and,
  *  to listen for DuckDB clients, Quack's address and the keys it accepts. */
 export interface ReadersOpen {
-  extensionDir: string;
+  /** The folder of the pinned extension files, when one is named (croft's tests); a project's come from its add-on (D134). */
+  extensionDir?: string;
+  /** The project's root, where the server add-on is looked for. */
+  projectRoot?: string;
   secretDir: string;
   shared: string[];
   asOf: string;
@@ -591,8 +594,8 @@ export function lockCopy(path: string): void {
 /** The sandbox of the readers' process: the serve profile with the `readers` mode, which attaches `copy` read-only and
  *  allows its path and no folder (db/modes.ts). The one place it is built, so a test that opens the same instance to try
  *  SQL past the gate (serve/readers-session-testkit.ts) cannot drift from the worker. */
-export function readersSpec(spec: SandboxSpec, copy: string, r: { extensionDir: string; secretDir: string; prepare?: (conn: DuckDBConnection) => Promise<void> }): SandboxSpec {
-  return { ...spec, mode: { kind: "readers", extensionDir: r.extensionDir, secretDir: r.secretDir, copy, ...(r.prepare ? { prepare: r.prepare } : {}) } };
+export function readersSpec(spec: SandboxSpec, copy: string, r: { extensionDir?: string; projectRoot?: string; secretDir: string; prepare?: (conn: DuckDBConnection) => Promise<void> }): SandboxSpec {
+  return { ...spec, mode: { kind: "readers", ...(r.extensionDir ? { extensionDir: r.extensionDir } : {}), ...(r.projectRoot ? { projectRoot: r.projectRoot } : {}), secretDir: r.secretDir, copy, ...(r.prepare ? { prepare: r.prepare } : {}) } };
 }
 
 /**

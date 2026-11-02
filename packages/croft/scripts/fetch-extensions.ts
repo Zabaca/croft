@@ -1,6 +1,7 @@
 // Fills a folder with the DuckDB extension files croft's modes load, and checks each against the pinned sha256
-// (src/db/extension-pins.ts, DESIGN.md D117). For croft's own tests, builders and CI: how users get these files
-// is a later decision (option 06, slice 5). The files are never committed (together over 100 MB per platform).
+// (src/db/extension-pins.ts, DESIGN.md D117). For croft's own tests, builders and CI, and the source scripts/build-addons.ts packs
+// the add-on packages from: users get these files from the add-ons (D134), never from this script. The files are never committed
+// (together over 100 MB per platform).
 //
 //   bun scripts/fetch-extensions.ts [folder] [--all-platforms] [--only quack,httpfs]
 //

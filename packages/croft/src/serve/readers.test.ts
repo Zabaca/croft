@@ -8,6 +8,7 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { installFakeAddon } from "../db/addon-testkit.ts";
 import { logDdl } from "../db/bookkeeping.ts";
 import { LOG_FORMAT_VERSION } from "../db/state.ts";
 import { closeAllWarehouses } from "../db/warehouse.ts";
@@ -102,6 +103,45 @@ describe("starting", () => {
     putCopy(p, aside(p, "late"), "2026-10-30T10:00:00Z");
     await until("the copy to be served", () => e.status().serverMode?.state === "open", 1500);
     expect(await count(e)).toBe(10);
+  });
+
+  withExt("with no extension folder named, the readers' process loads quack and httpfs from the server add-on in the project's node_modules (D134)", async () => {
+    const p = await project({ n: 10 });
+    installFakeAddon(p.root, "server", { from: ext.dir });
+    // The child inherits this environment: no folder named, and a cache that holds nothing, so only the add-on can be where the files come from.
+    const saved = { dir: process.env.CROFT_EXTENSION_DIR, cache: process.env.XDG_CACHE_HOME };
+    const emptyCache = realpathSync(mkdtempSync(join(tmpdir(), "croft-nocache-")));
+    scratchDirs.push(emptyCache);
+    delete process.env.CROFT_EXTENSION_DIR;
+    process.env.XDG_CACHE_HOME = emptyCache;
+    try {
+      const e = await openReadersEngine({ root: p.root, copyPollMs: 25 });
+      engines.push(e);
+      expect(await count(e)).toBe(10);
+    } finally {
+      if (saved.dir !== undefined) process.env.CROFT_EXTENSION_DIR = saved.dir;
+      if (saved.cache === undefined) delete process.env.XDG_CACHE_HOME;
+      else process.env.XDG_CACHE_HOME = saved.cache;
+    }
+  });
+
+  test("with the server add-on not installed and no folder named, croft serve does not start, and the error is the install command (EXTENSION_MISSING)", async () => {
+    const p = await project();
+    const saved = { dir: process.env.CROFT_EXTENSION_DIR, cache: process.env.XDG_CACHE_HOME };
+    const emptyCache = realpathSync(mkdtempSync(join(tmpdir(), "croft-nocache-")));
+    scratchDirs.push(emptyCache);
+    delete process.env.CROFT_EXTENSION_DIR;
+    process.env.XDG_CACHE_HOME = emptyCache;
+    try {
+      const err = await rejection(openReadersEngine({ root: p.root, copyPollMs: 25 }));
+      expect(err.code).toBe("EXTENSION_MISSING");
+      expect(err.problem.details).toMatchObject({ kind: "addon", addon: "server", installed: false });
+      expect(err.problem.fix).toMatchObject({ kind: "command", command: expect.stringContaining("bun add @zabaca/croft-addon-server@") });
+    } finally {
+      if (saved.dir !== undefined) process.env.CROFT_EXTENSION_DIR = saved.dir;
+      if (saved.cache === undefined) delete process.env.XDG_CACHE_HOME;
+      else process.env.XDG_CACHE_HOME = saved.cache;
+    }
   });
 
   test("with the extension files missing, croft serve does not start, and says which file (EXTENSION_MISSING)", async () => {

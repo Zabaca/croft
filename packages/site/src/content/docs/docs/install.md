@@ -27,7 +27,7 @@ The global `croft` is only a launcher. Every project pins its own croft version 
 
 ## What it installs
 
-croft has one runtime dependency, `@duckdb/node-api`, pinned exactly. It ships prebuilt DuckDB libraries for macOS and Linux (x64 and arm64), with the `json`, `parquet` and `icu` extensions built in, so croft never downloads an extension. `bun.lock` is the whole environment.
+croft has one runtime dependency, `@duckdb/node-api`, pinned exactly. It ships prebuilt DuckDB libraries for macOS and Linux (x64 and arm64), with the `json`, `parquet` and `icu` extensions built in, so croft never downloads an extension. Server mode loads two more of DuckDB's own extension files; they come from an optional add-on package you install yourself when you turn it on (`bun add @zabaca/croft-addon-server@<version>`; the exact command is in `croft validate`'s output, and `croft docs addons` has the rest), and a project that turns no mode on installs none of it. `bun.lock` is the whole environment.
 
 ## Check the machine
 

@@ -63,8 +63,14 @@ test.skipIf(!NPM)("npm pack from a clean checkout ships bin, the schema and the 
   // prepack's own output comes first on stdout; the report is the JSON array after it.
   const at = r.stdout.search(/^\[/m);
   expect(at, r.stdout).toBeGreaterThanOrEqual(0);
-  const report = JSON.parse(r.stdout.slice(at)) as { files: { path: string }[] }[];
+  const report = JSON.parse(r.stdout.slice(at)) as { size: number; unpackedSize: number; files: { path: string; size: number }[] }[];
   const files = report[0]!.files.map((f) => f.path);
+  // A default install is the size it was (D134): the add-ons are separate packages, so no extension file rides along and the
+  // tarball stays the code and its docs (1.15 MB packed, 3.9 MB unpacked at 0.4.1; a wide margin, but nowhere near a DuckDB extension's 20 to 60 MB).
+  expect(files.filter((f) => /\.duckdb_extension$/.test(f))).toEqual([]);
+  expect(Math.max(...report[0]!.files.map((f) => f.size))).toBeLessThan(1_000_000);
+  expect(report[0]!.size).toBeLessThan(2_000_000);
+  expect(report[0]!.unpackedSize).toBeLessThan(6_000_000);
 
   for (const f of ["package.json", "bin/croft.mjs", "croft.schema.json", "dist/read.js", "dist/read.d.ts", "src/index.ts", "src/cli/main.ts",
     "src/cli/schemas.ts", "schemas/envelope.schema.json", "schemas/run.schema.json", "schemas/status.schema.json"]) {

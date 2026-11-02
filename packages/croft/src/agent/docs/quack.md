@@ -85,8 +85,11 @@ views move to it in one transaction, and only then is the old one detached.
 At most `serverMode.quackMaxConcurrent` Quack queries run at once, over all sessions (4 by default, 1 to 64), so people's
 queries cannot crowd the apps' HTTP readers out of croft serve. A query past the cap is refused with a retryable
 `SERVE_UNAVAILABLE` that names the setting: try it again in a moment. The count is what croft saw running at its last look
-(every 250 ms), so a burst between two looks is seen at the next, and queries that already finished are never counted.
-Attaching and a client's transaction control are not counted.
+(every 250 ms) plus one for each session admitted a query since. A session sends one query at a time, so a client that
+attaches once and sends queries one after another counts once and is never refused for the ones it finished. A client that
+opens a session per query (`quack_query` does) counts once per query until the next look, so more than the cap of them
+inside 250 ms get the refusal: ask again after a moment. If croft's look at the running queries keeps failing, the count
+only grows and new sessions are refused until a look succeeds. Attaching and a client's transaction control are not counted.
 
 ## The client's quack build
 
