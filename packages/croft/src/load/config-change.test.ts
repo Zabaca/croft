@@ -14,6 +14,7 @@ import { applyConfigChange, behaviorChange, planPinChanges, readConfigState, typ
 import { readTableSchema } from "./evolve.ts";
 import { tableBatch } from "./table-batch.ts";
 import { writeBatch } from "./write.ts";
+import { seedState } from "../db/bookkeeping-testkit.ts";
 
 afterAll(() => closeAllWarehouses());
 
@@ -70,10 +71,10 @@ async function seed(w: DuckWarehouse, zips: (string | null)[]): Promise<void> {
     await ensureState(tx);
     await tx.exec(`CREATE TABLE people (id BIGINT, zip VARCHAR, _loaded_at TIMESTAMPTZ)`);
     for (const [n, zip] of zips.entries()) await tx.exec(`INSERT INTO people VALUES ($1, $2, '2026-01-01T00:00:00Z')`, [n + 1, zip]);
-    await tx.exec(`INSERT INTO _croft.assets (name, kind, write_mode, key_columns, row_count, max_loaded_at, last_loaded_at)
+    await seedState(tx, `INSERT INTO _croft.assets (name, kind, write_mode, key_columns, row_count, max_loaded_at, last_loaded_at)
       VALUES ('people', 'ingest', 'merge', ['id'], ${zips.length}, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`);
     for (const [name, type] of [["id", "BIGINT"], ["zip", "VARCHAR"]]) {
-      await tx.exec(`INSERT INTO _croft.columns (asset, name, type, source_name, pinned, pending, kinds, present_last_batch, added_at)
+      await seedState(tx, `INSERT INTO _croft.columns (asset, name, type, source_name, pinned, pending, kinds, present_last_batch, added_at)
         VALUES ('people', $1, $2, $1, false, false, [], true, '2026-01-01T00:00:00Z')`, [name, type]);
     }
   }, { runId: "r_seed" });
@@ -177,7 +178,7 @@ describe("readConfigState and applyConfigChange: a key conversion with a pin on 
   /** A table of `zip` texts, as a keyless append ingest wrote it. */
   async function appendZips(w: DuckWarehouse, zips: (string | null)[]): Promise<void> {
     await seed(w, zips);
-    await w.write("append", (tx) => tx.exec(`UPDATE _croft.assets SET write_mode = 'append', key_columns = [], behavior_hash = $1 WHERE name = 'people'`,
+    await w.write("append", (tx) => seedState(tx, `UPDATE _croft.assets SET write_mode = 'append', key_columns = [], behavior_hash = $1 WHERE name = 'people'`,
       [behaviorHash("append", [], { kind: "none" })]), { runId: "r_append" });
   }
   const gains = {

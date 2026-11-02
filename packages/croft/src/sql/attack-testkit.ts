@@ -5,7 +5,7 @@
 // function's name in a comment, in a string literal and after a line comment.
 //
 // The warehouse these are written against has the tables orders and customers (shared), payments and secrets (not shared)
-// and the schema _croft with its table assets (croft's own state). `files/x.csv` stands for any file a project could name.
+// and the schema _croft with its table assets (croft's own state, as the file adapter has it and as the log adapter has it: a log table and a view). `files/x.csv` stands for any file a project could name.
 
 /** The tables the project shares with keys in these tests. */
 export const SHARED = ["orders", "customers"] as const;
@@ -17,6 +17,9 @@ export const WAREHOUSE_SQL = [
   "CREATE TABLE secrets AS SELECT 'token' AS name, 'hunter2' AS value",
   "CREATE SCHEMA _croft",
   "CREATE TABLE _croft.assets AS SELECT 'orders' AS name",
+  // The log adapter's shape of the same state (db/bookkeeping.ts, D132): a log table and a view over one.
+  "CREATE TABLE _croft.assets_log AS SELECT 'orders' AS name, 1::BIGINT AS seq, false AS closed",
+  "CREATE VIEW _croft.columns AS SELECT 'orders' AS asset, 'id' AS name",
 ];
 
 export interface Attack {
@@ -47,6 +50,10 @@ export const HIDDEN_TABLES: readonly Attack[] = [
   a("by another catalog", "SELECT * FROM other.main.payments"),
   a("croft's own schema", "SELECT * FROM _croft.assets"),
   a("croft's own schema, with the catalog", "SELECT * FROM memory._croft.assets"),
+  a("croft's log of its state", "SELECT * FROM _croft.assets_log"),
+  a("croft's log, with the catalog", "SELECT * FROM memory._croft.assets_log"),
+  a("a view over croft's log", "SELECT * FROM _croft.columns"),
+  a("croft's log, quoted with changed case", 'SELECT * FROM "_CROFT"."ASSETS_LOG"'),
   a("with changed case", "SELECT * FROM PAYMENTS"),
   a("quoted, with changed case", 'SELECT * FROM "Payments"'),
   a("croft's schema, with changed case", 'SELECT * FROM "_CROFT".ASSETS'),

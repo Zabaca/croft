@@ -24,6 +24,7 @@ import { runWarnings } from "../checks/run.ts";
 import { CroftError, isCode } from "../core/errors.ts";
 import { formatInstant } from "../core/time.ts";
 import type { Problem, Sql, StepResult } from "../core/types.ts";
+import { bookkeepingOf } from "../db/bookkeeping.ts";
 import { hasState } from "../db/state.ts";
 import { putCatalog, readCatalogEntry } from "../history/catalog.ts";
 import { RESERVED } from "../load/contract.ts";
@@ -104,7 +105,7 @@ export async function runSqlStep(i: StepInput): Promise<StepOutcome> {
         ...(checks ? { checks } : {}), ...(i.readBy ? { readBy: i.readBy } : {}), ...(i.now ? { now: i.now() } : {}),
       });
       // An input the SQL no longer reads is no input any more: staleness must not wait for it.
-      await tx.exec(`DELETE FROM _croft.inputs WHERE asset = $1 AND NOT list_contains(CAST($2::JSON AS VARCHAR[]), input)`,
+      await (await bookkeepingOf(tx)).remove("inputs", `asset = $1 AND NOT list_contains(CAST($2::JSON AS VARCHAR[]), input)`,
         [asset, JSON.stringify(inputs.map((r) => r.input))]);
       const keys = await jsonKeys(tx, NEXT_TABLE);
       await tx.exec(`DROP VIEW IF EXISTS ${tempRef(BODY_VIEW)}`);

@@ -6,6 +6,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { Server } from "bun";
+import { bookkeepingEnv } from "../db/bookkeeping-testkit.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { loadProject, type Project } from "../project/root.ts";
 import { executeRun, type RunnerOptions, type RunOutcome } from "./runner.ts";
@@ -206,7 +207,12 @@ export default ingest({
 export interface CliResult { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; json?: Record<string, any> }
 
 export function cliEnv(extra: Record<string, string> = {}): Record<string, string> {
-  return { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", NO_COLOR: "1", ...extra };
+  return {
+    PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", NO_COLOR: "1",
+    // The suite also runs on the log adapter; every croft a test spawns follows.
+    ...bookkeepingEnv(),
+    ...extra,
+  };
 }
 
 /** Start the CLI (src/cli/main.ts) with stdin ignored, so it is off a TTY. */

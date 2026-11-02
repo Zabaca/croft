@@ -8,6 +8,7 @@
 // - TABLE_MODIFIED_OUTSIDE_CROFT: the real schema (duckdb_columns()) differs from _croft.columns.
 import { CroftError, problem } from "../core/errors.ts";
 import type { Problem, Sql } from "../core/types.ts";
+import { bookkeepingOf } from "../db/bookkeeping.ts";
 import { hasState } from "../db/state.ts";
 import { formatNaive } from "../db/values.ts";
 import { RESERVED } from "../load/contract.ts";
@@ -147,8 +148,8 @@ export async function detectOutOfBand(sql: Sql, asset: string, stats?: TableStat
  */
 export async function markOutOfBand(tx: Sql, asset: string, at: string, stats?: TableStats): Promise<void> {
   const s = stats ?? (await tableStats(tx, asset));
-  await tx.exec(
-    `UPDATE _croft.assets SET last_replaced_at = $2::TIMESTAMPTZ, row_count = $3, max_loaded_at = $4::TIMESTAMPTZ WHERE name = $1`,
+  await (await bookkeepingOf(tx)).update(
+    "assets", { last_replaced_at: "$2::TIMESTAMPTZ", row_count: "$3", max_loaded_at: "$4::TIMESTAMPTZ" }, "name = $1",
     [asset, at, s.rowCount, s.maxLoadedAtUs === null ? null : isoMicros(s.maxLoadedAtUs)],
   );
 }

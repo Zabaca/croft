@@ -59,6 +59,7 @@ import { formatInstant, now as clockNow } from "../core/time.ts";
 import type { LockHolder, PreviewAsset, PreviewColumnChange, PreviewData, Problem, Sql, StepResult } from "../core/types.ts";
 import type { IngestContext, Row, RowsIngest } from "../types.ts";
 import { canonicalPath } from "../db/connect.ts";
+import { bookkeepingOf } from "../db/bookkeeping.ts";
 import { ensureState, hasState } from "../db/state.ts";
 import { type DuckWarehouse, type LeaseSql, openWarehouse, type WarehouseOptions } from "../db/warehouse.ts";
 import type { CatalogAsset } from "../history/catalog.ts";
@@ -374,7 +375,7 @@ function viewSql(schema: string, t: LiveTable): string {
 async function copyState(tx: Sql, snap: LiveSnapshot, table: StateTable, assets: readonly string[]): Promise<void> {
   const path = snap.state[table];
   if (!path || assets.length === 0) return;
-  await tx.exec(`INSERT INTO _croft.${table} BY NAME SELECT * FROM read_parquet(${quoteLiteral(path)})
+  await (await bookkeepingOf(tx)).insertSelect(table, `SELECT * FROM read_parquet(${quoteLiteral(path)})
     WHERE ${STATE_COPIES[table]} IN (${assets.map(quoteLiteral).join(", ")})`);
 }
 

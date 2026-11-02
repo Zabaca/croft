@@ -3,8 +3,10 @@ import { mkdirSync, mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
-import { checkFormat, CROFT_VERSION, ensureState, FORMAT_VERSION, hasState, readMeta, STATE_TABLES } from "./state.ts";
+import { bookkeepingOf, defaultBookkeeping, STATE_TABLE_NAMES } from "./bookkeeping.ts";
+import { assertFormat, checkFormat, CROFT_VERSION, ensureState, FORMAT_VERSION, hasState, LOG_FORMAT_VERSION, readMeta } from "./state.ts";
 import { closeAllWarehouses, openWarehouse } from "./warehouse.ts";
+import { seedState } from "./bookkeeping-testkit.ts";
 
 afterAll(() => closeAllWarehouses());
 
@@ -46,26 +48,39 @@ const PRIMARY_KEYS: Record<string, string[]> = {
   meta: ["key"], assets: ["name"], columns: ["asset", "name"], inputs: ["asset", "input"], files: ["asset", "path"], writes: ["asset", "loaded_at"],
 };
 
-describe("ensureState", () => {
+// What a log adapter's _croft looks like to duckdb_columns(): meta as the file has it, each keyed table as its log (its
+// columns, then seq and closed) and as the view over it (its columns).
+const LOG_EXPECTED: Record<string, [string, string][]> = {
+  ...EXPECTED,
+  ...Object.fromEntries(Object.entries(EXPECTED).filter(([t]) => t !== "meta").map(([t, cols]) => [`${t}_log`, [...cols, ["seq", "BIGINT"], ["closed", "BOOLEAN"]] as [string, string][]])),
+};
+
+describe.each(["file", "log"] as const)("ensureState (%s adapter)", (kind) => {
+  const ensure = (tx: Parameters<typeof ensureState>[0], o: { croftVersion?: string } = {}) => ensureState(tx, { ...o, bookkeeping: kind });
+
   test("creates the _croft schema exactly as designed", async () => {
     const w = warehouse();
     expect(await w.read((db) => hasState(db), { purpose: "t" })).toBe(false);
-    await w.write("state", (tx) => ensureState(tx), { runId: "r" });
+    await w.write("state", (tx) => ensure(tx), { runId: "r" });
     const cols = await w.read((db) => db.all<{ t: string; c: string; ty: string }>(
       `SELECT table_name t, column_name c, data_type ty FROM duckdb_columns() WHERE schema_name = '_croft' ORDER BY table_name, column_index`), { purpose: "t" });
     const byTable: Record<string, [string, string][]> = {};
     for (const r of cols) (byTable[r.t] ??= []).push([r.c, r.ty]);
-    expect(byTable).toEqual(EXPECTED);
-    expect(Object.keys(byTable).sort()).toEqual([...STATE_TABLES].sort());
+    expect(byTable).toEqual(kind === "file" ? EXPECTED : LOG_EXPECTED);
+    expect(Object.keys(byTable).filter((t) => !t.endsWith("_log")).sort()).toEqual([...STATE_TABLE_NAMES].sort());
     const pks = await w.read((db) => db.all<{ t: string; cols: string[] }>(
       `SELECT table_name t, constraint_column_names cols FROM duckdb_constraints() WHERE schema_name = '_croft' AND constraint_type = 'PRIMARY KEY'`), { purpose: "t" });
-    expect(Object.fromEntries(pks.map((r) => [r.t, r.cols]))).toEqual(PRIMARY_KEYS);
+    // A lake refuses primary keys: the log adapter has none.
+    expect(Object.fromEntries(pks.map((r) => [r.t, r.cols]))).toEqual(kind === "file" ? PRIMARY_KEYS : {});
   });
 
   test("records format_version, duckdb_version and croft_version", async () => {
     const w = warehouse();
-    const meta = await w.write("state", (tx) => ensureState(tx), { runId: "r" });
-    expect(meta).toEqual({ format_version: String(FORMAT_VERSION), duckdb_version: expect.stringMatching(/^v2\.0\.0/), croft_version: CROFT_VERSION });
+    const meta = await w.write("state", (tx) => ensure(tx), { runId: "r" });
+    expect(meta).toEqual({
+      format_version: String(kind === "log" ? LOG_FORMAT_VERSION : FORMAT_VERSION), duckdb_version: expect.stringMatching(/^v2\.0\.0/), croft_version: CROFT_VERSION,
+      ...(kind === "log" ? { bookkeeping: "log" } : {}),
+    });
     expect(await w.read((db) => readMeta(db), { purpose: "t" })).toEqual(meta);
     expect(CROFT_VERSION).toMatch(/^\d+\.\d+\.\d+/);
   });
@@ -73,16 +88,27 @@ describe("ensureState", () => {
   test("is idempotent: twice in one transaction, and again later", async () => {
     const w = warehouse();
     await w.write("state", async (tx) => {
-      await ensureState(tx);
-      await ensureState(tx);
+      await ensure(tx);
+      await ensure(tx);
     }, { runId: "r" });
-    await w.write("row", (tx) => tx.exec(`INSERT INTO _croft.assets (name, kind) VALUES ('a', 'ingest')`), { runId: "r" });
-    const again = await w.write("state", (tx) => ensureState(tx, { croftVersion: "0.2.0" }), { runId: "r" });
+    await w.write("row", async (tx) => (await bookkeepingOf(tx)).upsert("assets", { name: "'a'", kind: "'ingest'" }), { runId: "r" });
+    const again = await w.write("state", (tx) => ensure(tx, { croftVersion: "0.2.0" }), { runId: "r" });
     expect(again.croft_version).toBe("0.2.0");
     expect(await w.read((db) => db.all(`SELECT name, kind FROM _croft.assets`), { purpose: "t" })).toEqual([{ name: "a", kind: "ingest" }]);
-    expect(await w.read((db) => db.all(`SELECT count(*)::INTEGER n FROM _croft.meta`), { purpose: "t" })).toEqual([{ n: 3 }]);
+    expect(await w.read((db) => db.all(`SELECT count(*)::INTEGER n FROM _croft.meta`), { purpose: "t" })).toEqual([{ n: kind === "log" ? 4 : 3 }]);
   });
 
+  test("a database that has bookkeeping keeps its adapter whatever is asked for", async () => {
+    const w = warehouse();
+    await w.write("state", (tx) => ensure(tx), { runId: "r" });
+    const other = kind === "file" ? "log" : "file";
+    await w.write("again", (tx) => ensureState(tx, { bookkeeping: other }), { runId: "r" });
+    const names = await w.read((db) => db.all<{ n: string }>(`SELECT table_name n FROM duckdb_tables() WHERE schema_name = '_croft'`), { purpose: "t" });
+    expect(names.some((r) => r.n === "assets_log")).toBe(kind === "log");
+  });
+});
+
+describe("ensureState", () => {
   test("refuses a database from a newer croft with DB_NEWER_FORMAT", async () => {
     const w = warehouse();
     await w.write("state", (tx) => ensureState(tx), { runId: "r" });
@@ -107,17 +133,62 @@ describe("ensureState", () => {
     expect(FORMAT_VERSION).toBe(3);
   });
 
+  test("format 4 is the log's: a log warehouse is stamped with it from its first write, and a croft that reads up to 3 refuses it", async () => {
+    expect(LOG_FORMAT_VERSION).toBe(4);
+    const w = warehouse();
+    const meta = await w.write("state", (tx) => ensureState(tx, { bookkeeping: "log" }), { runId: "r" });
+    expect(meta.format_version).toBe("4");
+    expect(await w.read((db) => readMeta(db), { purpose: "t" })).toMatchObject({ format_version: "4", bookkeeping: "log" });
+    // A croft before the log reads up to 3: the same check, with its newest format, refuses the log's.
+    const before = { file: FORMAT_VERSION, log: null };
+    const old = () => assertFormat({ format_version: "4", bookkeeping: "log", croft_version: "9.9.9" }, before);
+    expect(old).toThrow(CroftError);
+    try { old(); } catch (e) { expect((e as CroftError).code).toBe("DB_NEWER_FORMAT"); }
+    // This croft reads a log at 4, and a file at 3 (as a croft before the log does).
+    expect(() => assertFormat({ format_version: "4", bookkeeping: "log" })).not.toThrow();
+    expect(() => assertFormat({ format_version: "3" }, before)).not.toThrow();
+    expect(() => assertFormat({ format_version: "5", bookkeeping: "log" })).toThrow(CroftError);
+    // Format 4 belongs to the log: a file warehouse at 4 is a newer file format (a croft to come), not read as a log's.
+    for (const meta of [{ format_version: "4" }, { format_version: "4", bookkeeping: "file" }, { format_version: "4", croft_version: "9.9.9" }]) {
+      const refuse = () => assertFormat(meta);
+      expect(refuse, JSON.stringify(meta)).toThrow(CroftError);
+      try { refuse(); } catch (e) { expect((e as CroftError).code).toBe("DB_NEWER_FORMAT"); }
+    }
+    const file = warehouse();
+    expect((await file.write("state", (tx) => ensureState(tx, { bookkeeping: "file" }), { runId: "r" })).format_version).toBe("3");
+  });
+
+  test("a file warehouse stamped 4 is refused by a read of its format, as a newer file format; a log at 4 is read", async () => {
+    const w = warehouse();
+    await w.write("state", (tx) => ensureState(tx, { bookkeeping: "file" }), { runId: "r" });
+    await w.write("future", (tx) => tx.exec(`UPDATE _croft.meta SET value = '4' WHERE key = 'format_version'`), { runId: "r" });
+    let caught: unknown;
+    try { await w.read((db) => checkFormat(db), { purpose: "t" }); } catch (e) { caught = e; }
+    expect((caught as CroftError).code).toBe("DB_NEWER_FORMAT");
+    const log = warehouse();
+    await log.write("state", (tx) => ensureState(tx, { bookkeeping: "log" }), { runId: "r" });
+    expect(await log.read((db) => checkFormat(db), { purpose: "t" })).toMatchObject({ format_version: "4", bookkeeping: "log" });
+  });
+
+  test("CROFT_BOOKKEEPING=log is a test switch: it does nothing without the harness mark", () => {
+    expect(defaultBookkeeping({})).toBe("file");
+    expect(defaultBookkeeping({ CROFT_BOOKKEEPING: "log" })).toBe("file");
+    expect(defaultBookkeeping({ CROFT_TEST_HARNESS: "1" })).toBe("file");
+    expect(defaultBookkeeping({ CROFT_BOOKKEEPING: "file", CROFT_TEST_HARNESS: "1" })).toBe("file");
+    expect(defaultBookkeeping({ CROFT_BOOKKEEPING: "log", CROFT_TEST_HARNESS: "1" })).toBe("log");
+  });
+
   test("migrates a format-1 database: adds _croft.writes.attempt, keeps its rows, records the current format", async () => {
     const w = warehouse();
     await w.write("v1", async (tx) => {
       for (const ddl of FORMAT_1_DDL) await tx.exec(ddl);
       await tx.exec(`INSERT INTO _croft.meta VALUES ('format_version', '1')`);
-      await tx.exec(`INSERT INTO _croft.writes (asset, loaded_at, run_id, rows_in) VALUES ('orders', '2026-09-22T10:00:00Z', 'r_old', 5)`);
+      await seedState(tx, `INSERT INTO _croft.writes (asset, loaded_at, run_id, rows_in) VALUES ('orders', '2026-09-22T10:00:00Z', 'r_old', 5)`);
     }, { runId: "r" });
     // Twice in one transaction, around a write to _croft.writes: the second call must not ALTER it again.
     const meta = await w.write("state", async (tx) => {
       await ensureState(tx);
-      await tx.exec(`INSERT INTO _croft.writes (asset, loaded_at, run_id, rows_in, attempt) VALUES ('orders', '2026-09-22T11:00:00Z', 'r_new', 7, 2)`);
+      await seedState(tx, `INSERT INTO _croft.writes (asset, loaded_at, run_id, rows_in, attempt) VALUES ('orders', '2026-09-22T11:00:00Z', 'r_new', 7, 2)`);
       return ensureState(tx);
     }, { runId: "r" });
     expect(meta.format_version).toBe("3");
@@ -137,7 +208,7 @@ describe("ensureState", () => {
       await tx.exec(`CREATE TABLE _croft.meta (key VARCHAR PRIMARY KEY, value VARCHAR)`);
       await tx.exec(`CREATE TABLE _croft.inputs (asset VARCHAR, input VARCHAR, seen_loaded_at TIMESTAMPTZ, seen_key JSON, PRIMARY KEY (asset, input))`);
       await tx.exec(`INSERT INTO _croft.meta VALUES ('format_version', '2')`);
-      await tx.exec(`INSERT INTO _croft.inputs VALUES ('triage', 'issues', '2026-09-22T10:00:00Z', '[7]')`);
+      await seedState(tx, `INSERT INTO _croft.inputs VALUES ('triage', 'issues', '2026-09-22T10:00:00Z', '[7]')`);
     }, { runId: "r" });
     const meta = await w.write("state", (tx) => ensureState(tx), { runId: "r" });
     expect(meta.format_version).toBe("3");

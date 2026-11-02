@@ -9,7 +9,7 @@ import { offsetSeconds } from "../../core/time.ts";
 import { AGENT_PATH, agentMd, CROFT_VERSION, SKILL_PATH, skillMd } from "../../agent/templates.ts";
 import { ENGINE_SETTING } from "../../db/backup.ts";
 import type { FsKind } from "../../db/fs-kind.ts";
-import { STATE_DDL } from "../../db/state.ts";
+import { seedState, sqlOver, stateDdl } from "../../db/bookkeeping-testkit.ts";
 import { writeIntent } from "../../read/testkit.ts";
 import { tryAcquire } from "../../history/leases.ts";
 import { RunsDb } from "../../history/runs-db.ts";
@@ -1182,7 +1182,7 @@ describe("tables changed outside croft, drift and backups (§5 \"Out-of-band cha
   async function croftWarehouse(root: string, outside: string[] = []): Promise<void> {
     const db = await DuckDBInstance.create(join(root, "warehouse.duckdb"));
     const c = await db.connect();
-    const setup = [...STATE_DDL, `INSERT INTO _croft.meta VALUES ('format_version', '3'), ('duckdb_version', 'v1.5.5'), ('croft_version', '${CROFT_VERSION}')`];
+    const setup = [...stateDdl(), `INSERT INTO _croft.meta VALUES ('format_version', '3'), ('duckdb_version', 'v1.5.5'), ('croft_version', '${CROFT_VERSION}')`];
     for (const [name, rows] of [["orders", 3], ["zones", 2]] as const) {
       setup.push(
         `CREATE TABLE ${name} AS SELECT range + 1 AS id, '${T}'::TIMESTAMPTZ AS _loaded_at FROM range(${rows})`,
@@ -1190,7 +1190,7 @@ describe("tables changed outside croft, drift and backups (§5 \"Out-of-band cha
         `INSERT INTO _croft.columns (asset, name, type) VALUES ('${name}', 'id', 'BIGINT'), ('${name}', '_loaded_at', 'TIMESTAMPTZ')`,
       );
     }
-    for (const s of [...setup, ...outside]) await c.run(s);
+    for (const s of [...setup, ...outside]) await seedState(sqlOver(c), s);
     c.disconnectSync();
     db.closeSync();
   }

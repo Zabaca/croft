@@ -9,6 +9,7 @@ import { join } from "node:path";
 import type { Server } from "bun";
 import { DuckDBInstance } from "@duckdb/node-api";
 import type { Problem, StepResult } from "../core/types.ts";
+import { bookkeepingEnv } from "../db/bookkeeping-testkit.ts";
 import { closeAllWarehouses } from "../db/warehouse.ts";
 import { getCatalog } from "../history/catalog.ts";
 import { RunsDb } from "../history/runs-db.ts";
@@ -396,7 +397,7 @@ await main(["run", "events", "--foreground", "--json"], {
 console.log("finished without the fault");
 `);
   const child = spawn(process.execPath, ["--no-env-file", script], {
-    cwd: root, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root, CROFT_FORBID_OS_JOBS: "1", CROFT_NOTIFY_DRY: "1" },
+    cwd: root, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root, CROFT_FORBID_OS_JOBS: "1", CROFT_NOTIFY_DRY: "1", ...bookkeepingEnv() },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let output = "";
@@ -461,7 +462,7 @@ await main(["run", "events", "--foreground", "--json"], {
 console.log("finished without the fault");
 `);
     const child = spawn(process.execPath, ["--no-env-file", script], {
-      cwd: root, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root, CROFT_FORBID_OS_JOBS: "1", CROFT_NOTIFY_DRY: "1" },
+      cwd: root, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root, CROFT_FORBID_OS_JOBS: "1", CROFT_NOTIFY_DRY: "1", ...bookkeepingEnv() },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let output = "";

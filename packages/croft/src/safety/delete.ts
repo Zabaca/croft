@@ -27,6 +27,7 @@ import { vetCheck } from "../checks/parse.ts";
 import { CroftError } from "../core/errors.ts";
 import { now as clockNow, toEpochMicros } from "../core/time.ts";
 import type { AssetKind, Problem, Sql } from "../core/types.ts";
+import { bookkeepingOf } from "../db/bookkeeping.ts";
 import { hasState } from "../db/state.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
 import { quoteIdent, readTableSchema } from "../load/evolve.ts";
@@ -261,8 +262,9 @@ export async function deleteTable(warehouse: DuckWarehouse, asset: string, o: De
     const kind = await recordedKind(tx, asset);
     await tx.exec(`DROP TABLE main.${quoteIdent(asset)}`);
     if (await hasState(tx)) {
-      await tx.exec(`DELETE FROM _croft.assets WHERE name = $1`, [asset]);
-      for (const table of ["columns", "files", "inputs", "writes"]) await tx.exec(`DELETE FROM _croft.${table} WHERE asset = $1`, [asset]);
+      const bk = await bookkeepingOf(tx);
+      await bk.remove("assets", `name = $1`, [asset]);
+      for (const table of ["columns", "files", "inputs", "writes"] as const) await bk.remove(table, `asset = $1`, [asset]);
     }
     return { down, kind };
   }, { runId: o.runId ?? "delete", asset, ...(o.signal ? { signal: o.signal } : {}) });
@@ -359,9 +361,8 @@ export async function deleteWhere(warehouse: DuckWarehouse, asset: string, where
       }
       const stats = await tableStats(sql, asset);
       if (await hasState(sql)) {
-        await sql.exec(
-          `UPDATE _croft.assets SET row_count = $2, max_loaded_at = $3::TIMESTAMPTZ, last_replaced_at = $4::TIMESTAMPTZ, updated_at = $5::TIMESTAMPTZ
-           WHERE name = $1`,
+        await (await bookkeepingOf(sql)).update(
+          "assets", { row_count: "$2", max_loaded_at: "$3::TIMESTAMPTZ", last_replaced_at: "$4::TIMESTAMPTZ", updated_at: "$5::TIMESTAMPTZ" }, "name = $1",
           [asset, stats.rowCount, stats.maxLoadedAtUs === null ? null : isoMicros(stats.maxLoadedAtUs), isoMicros(stamp), at.toISOString()],
         );
       }

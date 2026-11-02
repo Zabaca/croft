@@ -15,7 +15,7 @@ import type { LogWriter } from "../history/logs.ts";
 import type { RunsDb } from "../history/runs-db.ts";
 import type { RequestBudget } from "../http/budget.ts";
 import type { HttpOptions } from "../http/http.ts";
-import type { WriteBatchInput } from "../load/write.ts";
+import type { Counting, WriteBatchInput } from "../load/write.ts";
 import type { ProjectEnv } from "../project/env.ts";
 import type { Project } from "../project/root.ts";
 import type { IngestOutcome, StepProgress } from "./ingest.ts";
@@ -55,6 +55,8 @@ export interface StepInput {
   fault?: string;
   /** The clock for stamps; default core/time now() (CROFT_NOW freezes it). */
   now?: () => Date;
+  /** How a keyed write counts what it changed (WriteBatchInput.counting): for the tests that hold the two ways to the same numbers. */
+  counting?: Counting;
 }
 
 /** What a step returns: its StepResult, warnings, other problems (CONFIRMATION_REQUIRED), a pending

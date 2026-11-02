@@ -8,7 +8,8 @@ import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/war
 import type { BatchCursor, TypedBatch, WriteTarget } from "./contract.ts";
 import { quoteIdent, readTableSchema } from "./evolve.ts";
 import { tableBatch } from "./table-batch.ts";
-import { FALLBACK, type WriteBatchInput, type WriteResult, writeBatch } from "./write.ts";
+import { type Counting, FALLBACK, type WriteBatchInput, type WriteResult, writeBatch } from "./write.ts";
+import { seedState } from "../db/bookkeeping-testkit.ts";
 
 afterAll(() => closeAllWarehouses());
 
@@ -433,7 +434,7 @@ describe("replace of files", () => {
       { ...merge, replaceFiles: ["c.csv"], now: T2 });
     await w.write("files", async (tx) => {
       for (const [path, at] of [["b.csv", T0], ["a.csv", T1], ["c.csv", T2]]) {
-        await tx.exec(`INSERT INTO _croft.files (asset, path, size, mtime, etag, sha256, loaded_at) VALUES ('sales', $1, 1, NULL, NULL, 'x', $2::TIMESTAMPTZ)`, [path, at]);
+        await seedState(tx, `INSERT INTO _croft.files (asset, path, size, mtime, etag, sha256, loaded_at) VALUES ('sales', $1, 1, NULL, NULL, 'x', $2::TIMESTAMPTZ)`, [path, at]);
       }
     });
     // c.csv is re-exported with order 6 only. a.csv and b.csv are read along (fallback rows, in read order): order 2
@@ -1095,5 +1096,171 @@ describe("a SQL transform's SELECT defines its table", () => {
     }));
     expect(e.code).toBe("CHECK_FAILED");
     expect(await snapshot()).toEqual(before);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// Counting a keyed write (DESIGN.md D133): the MERGE's returned actions and "classify first, then merge the changed rows"
+// give the same numbers, the same rows and the same stamps. A lake can only do the second; a file does whichever the
+// benchmark chose (scripts/bench-merge.ts).
+
+describe("counting what a keyed write changed: classifying first gives the MERGE's counts", () => {
+  const sales = { columns: { order_id: "BIGINT", amount: "DOUBLE", _file: "VARCHAR" } };
+  const dump = async (w: DuckWarehouse, name: string, order: string) =>
+    read(w, `SELECT * EXCLUDE (_loaded_at), strftime(_loaded_at AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%S.%fZ') AS _loaded_at FROM ${quoteIdent(name)} ORDER BY ${order}`);
+  const counts = (rs: WriteResult[]) => rs.map((r) => ({ rows: r.rows, changed: r.changed, loadedAt: r.loadedAt }));
+
+  const scenarios: Record<string, (counting: Counting) => Promise<unknown>> = {
+    "keyed replace: added, updated, unchanged and deleted rows": async (counting) => {
+      const w = warehouse();
+      const rs = [
+        await load(w, "zones", { ...zones, rows: zoneRows(12) }, { key: ["id"], now: T0, counting }),
+        await load(w, "zones", { ...zones, rows: [...zoneRows(9, { 3: "Three", 5: "Five" }), { id: 20, zone: "New", borough: "Bronx" }, { id: 21, zone: "New 2", borough: "Bronx" }] }, { key: ["id"], now: T1, counting }),
+        await load(w, "zones", { ...zones, rows: zoneRows(4) }, { key: ["id"], now: T2, counting, allowShrink: true }),
+        await load(w, "zones", { ...zones, rows: zoneRows(4) }, { key: ["id"], now: T2, counting }),
+      ];
+      expect(rs[1]!.rows).toMatchObject({ added: 2, updated: 2, unchanged: 7, deleted: 3 });
+      expect(rs[3]!.rows).toMatchObject({ added: 0, updated: 0, unchanged: 4, deleted: 0 });
+      return { counts: counts(rs), data: await dump(w, "zones", "id") };
+    },
+    "merge: columns the batch lacks keep their values, a NULL overwrites": async (counting) => {
+      const w = warehouse();
+      const issues = { columns: { id: "BIGINT", title: "VARCHAR", state: "VARCHAR" } };
+      const rs = [
+        await load(w, "issues", { ...issues, rows: [{ id: 1, title: "a", state: "open" }, { id: 2, title: "b", state: "open" }, { id: 3, title: "c", state: "open" }] }, { write: "merge", key: ["id"], now: T0, counting }),
+        await load(w, "issues", { columns: { id: "BIGINT", state: "VARCHAR" }, rows: [{ id: 1, state: "open" }, { id: 2, state: "closed" }, { id: 4, state: "open" }], known: ["title"] }, { write: "merge", key: ["id"], now: T1, counting }),
+        await load(w, "issues", { ...issues, rows: [{ id: 3, title: null, state: "open" }, { id: 4, title: "d", state: "open" }] }, { write: "merge", key: ["id"], now: T2, counting }),
+      ];
+      expect(rs[1]!.rows).toMatchObject({ added: 1, updated: 1, unchanged: 1 });
+      return { counts: counts(rs), data: await dump(w, "issues", "id") };
+    },
+    "merge with a composite key": async (counting) => {
+      const w = warehouse();
+      const c = { columns: { a: "BIGINT", b: "VARCHAR", v: "DOUBLE" } };
+      const rs = [
+        await load(w, "pairs", { ...c, rows: [{ a: 1, b: "x", v: 1 }, { a: 1, b: "y", v: 2 }, { a: 2, b: "x", v: 3 }] }, { write: "merge", key: ["a", "b"], now: T0, counting }),
+        await load(w, "pairs", { ...c, rows: [{ a: 1, b: "y", v: 20 }, { a: 2, b: "x", v: 3 }, { a: 2, b: "y", v: 4 }] }, { write: "merge", key: ["a", "b"], now: T1, counting }),
+      ];
+      expect(rs[1]!.rows).toMatchObject({ added: 1, updated: 1, unchanged: 1 });
+      return { counts: counts(rs), data: await dump(w, "pairs", "a, b") };
+    },
+    "a STRUCT column named like the batch's alias": async (counting) => {
+      const w = warehouse();
+      const rs = [0, 1, 2].map((v) => v);
+      const out: WriteResult[] = [];
+      for (const [i, v] of rs.entries()) {
+        out.push(await w.write("nested", async (tx) => {
+          await tx.exec(`CREATE TEMP TABLE nb${i} AS SELECT *, row_number() OVER () AS _croft_seq FROM (
+            SELECT 1 AS id, {'x': ${v}, 'y': 'a'} AS s UNION ALL SELECT 2, {'x': 2, 'y': 'b'})`);
+          const batch = await tableBatch(tx, { temp: `nb${i}`, asset: "nested" });
+          return writeBatch(tx, { batch, target: { asset: "nested", write: "replace", key: ["id"], runId: `r_${i}` }, kind: "sql", now: [T0, T1, T2][i]!, counting });
+        }, { runId: `r_${i}` }));
+      }
+      expect(out[1]!.rows).toMatchObject({ unchanged: 1, updated: 1 });
+      return { counts: counts(out), data: await dump(w, "nested", "id") };
+    },
+    "keyed file reload: rows of the reloaded file are replaced, deleted or kept by other files": async (counting) => {
+      const w = warehouse();
+      const rs = [
+        await load(w, "sales", { ...sales, rows: [{ order_id: 1, amount: 10, _file: "a.csv" }, { order_id: 2, amount: 20, _file: "a.csv" }, { order_id: 3, amount: 30, _file: "b.csv" }] }, { write: "merge", key: ["order_id"], now: T0, counting }),
+        await load(w, "sales", { ...sales, rows: [{ order_id: 1, amount: 11, _file: "a.csv" }] }, { write: "merge", key: ["order_id"], replaceFiles: ["a.csv"], now: T1, counting }),
+        await load(w, "sales", { columns: {}, rows: [], known: ["order_id", "amount"] }, { write: "merge", key: ["order_id"], replaceFiles: ["a.csv"], now: T2, counting }),
+      ];
+      expect(rs[1]!.rows).toMatchObject({ updated: 1, deleted: 1 });
+      return { counts: counts(rs), data: await dump(w, "sales", "order_id") };
+    },
+    "keyed file reload with fallback rows": async (counting) => {
+      const w = warehouse();
+      const merge = { write: "merge" as const, key: ["order_id"], counting };
+      await load(w, "sales", { ...sales, rows: [{ order_id: 2, amount: 22, _file: "b.csv" }, { order_id: 3, amount: 30, _file: "b.csv" }] }, { ...merge, now: T0 });
+      await load(w, "sales", { ...sales, rows: [{ order_id: 1, amount: 10, _file: "a.csv" }, { order_id: 2, amount: 20, _file: "a.csv" }] }, { ...merge, replaceFiles: ["a.csv"], now: T1 });
+      await load(w, "sales", { columns: { ...sales.columns, note: "VARCHAR" }, rows: [{ order_id: 2, amount: 25, note: "c", _file: "c.csv" }] }, { ...merge, replaceFiles: ["c.csv"], now: T2 });
+      await w.write("files", async (tx) => {
+        for (const [path, at] of [["b.csv", T0], ["a.csv", T1], ["c.csv", T2]]) {
+          await seedState(tx, `INSERT INTO _croft.files (asset, path, size, mtime, etag, sha256, loaded_at) VALUES ('sales', $1, 1, NULL, NULL, 'x', $2::TIMESTAMPTZ)`, [path, at]);
+        }
+      });
+      const fb = { columns: { ...sales.columns, _croft_fallback: "BOOLEAN" }, unplanned: ["_croft_fallback"] };
+      const r = await load(w, "sales", { ...fb, rows: [
+        { order_id: 1, amount: 10, _file: "a.csv", _croft_fallback: true }, { order_id: 2, amount: 20, _file: "a.csv", _croft_fallback: true },
+        { order_id: 2, amount: 22, _file: "b.csv", _croft_fallback: true }, { order_id: 3, amount: 99, _file: "b.csv", _croft_fallback: true },
+        { order_id: 6, amount: 60, _file: "c.csv", _croft_fallback: false },
+      ] }, { ...merge, replaceFiles: ["c.csv"], now: T3 });
+      expect(r.rows).toEqual({ in: 1, added: 1, updated: 1, unchanged: 0, deleted: 0, total: 4 });
+      // A fallback row for a key the table does not have is neither added nor counted.
+      const r2 = await load(w, "sales", { ...fb, rows: [
+        { order_id: 7, amount: 70, _file: "a.csv", _croft_fallback: true }, { order_id: 6, amount: 61, _file: "c.csv", _croft_fallback: false },
+      ] }, { ...merge, now: T3 });
+      expect(r2.rows).toEqual({ in: 1, added: 0, updated: 1, unchanged: 0, deleted: 0, total: 4 });
+      return { counts: counts([r, r2]), data: await dump(w, "sales", "order_id") };
+    },
+    "append and keyless replace (no MERGE in either)": async (counting) => {
+      const w = warehouse();
+      const rs = [
+        await load(w, "events", { columns: { n: "BIGINT" }, rows: [{ n: 1 }, { n: 1 }, { n: 2 }] }, { write: "append", now: T0, counting }),
+        await load(w, "events", { columns: { n: "BIGINT" }, rows: [{ n: 3 }] }, { write: "append", now: T1, counting }),
+        await load(w, "tags", { columns: { t: "VARCHAR" }, rows: [{ t: "a" }, { t: "a" }, { t: "b" }] }, { write: "replace", now: T0, counting }),
+        await load(w, "tags", { columns: { t: "VARCHAR" }, rows: [{ t: "a" }, { t: "c" }] }, { write: "replace", now: T1, counting, allowShrink: true }),
+      ];
+      return { counts: counts(rs), data: [await dump(w, "events", "n, _loaded_at"), await dump(w, "tags", "t")] };
+    },
+  };
+
+  for (const [name, run] of Object.entries(scenarios)) {
+    test(name, async () => {
+      const returning = await run("returning");
+      const classify = await run("classify");
+      expect(classify).toEqual(returning);
+    });
+  }
+
+  test("physical order: added rows land in the order the batch yielded them (as a first load's do); the old MERGE put them in no order at all", async () => {
+    const ids = Array.from({ length: 600 }, (_, i) => (i * 7919) % 5003);   // a shuffled run of distinct ids
+    const first = ids.slice(0, 300), second = ids.slice(300);
+    const run = async (counting: Counting) => {
+      const w = warehouse();
+      const spec = { columns: { id: "BIGINT", v: "VARCHAR" } };
+      await load(w, "ordered", { ...spec, rows: first.map((id) => ({ id, v: `a${id}` })) }, { write: "merge", key: ["id"], now: T0, counting });
+      await load(w, "ordered", { ...spec, rows: [...first.slice(0, 50).map((id) => ({ id, v: `b${id}` })), ...second.map((id) => ({ id, v: `a${id}` }))] }, { write: "merge", key: ["id"], now: T1, counting });
+      return (await read<{ id: number | bigint }>(w, `SELECT id FROM ordered ORDER BY rowid`)).map((r) => Number(r.id));
+    };
+    const classify = await run("classify");
+    expect(classify.slice(0, 300)).toEqual(first);
+    expect(classify.slice(300)).toEqual(second);
+    // Same rows either way; only the MERGE's insertion order is arbitrary.
+    expect([...(await run("returning"))].sort((a, b) => a - b)).toEqual([...classify].sort((a, b) => a - b));
+  });
+
+  test("a key in the table twice, one copy already equal to the batch's row: that copy keeps its stamp, as under the MERGE", async () => {
+    const run = async (counting: Counting) => {
+      const w = warehouse();
+      const spec = { columns: { id: "BIGINT", title: "VARCHAR" } };
+      await load(w, "issues", { ...spec, rows: [{ id: 1, title: "a" }, { id: 2, title: "b" }] }, { write: "merge", key: ["id"], now: T0, counting });
+      await w.write("dup", (tx) => tx.exec(`INSERT INTO issues SELECT 2, 'B', _loaded_at FROM issues WHERE id = 2`), { runId: "r_dup" });
+      const r = await load(w, "issues", { ...spec, rows: [{ id: 2, title: "B" }, { id: 3, title: "c" }] }, { write: "merge", key: ["id"], now: T1, counting });
+      return { rows: r.rows, data: await read(w, `SELECT id, title, strftime(_loaded_at AT TIME ZONE 'UTC', '%H') AS h FROM issues ORDER BY id, h`) };
+    };
+    const returning = await run("returning");
+    const classify = await run("classify");
+    // (2, 'b') is brought to 'B' at T1; the copy that was 'B' already is left alone at T0.
+    expect(returning.data).toEqual([{ id: 1, title: "a", h: "10" }, { id: 2, title: "B", h: "10" }, { id: 2, title: "B", h: "11" }, { id: 3, title: "c", h: "11" }]);
+    expect(classify.data).toEqual(returning.data);
+  });
+
+  test("a key that is in the table twice (changed outside croft): the batch is still merged, the table ends as the MERGE leaves it", async () => {
+    const run = async (counting: Counting) => {
+      const w = warehouse();
+      await load(w, "issues", { columns: { id: "BIGINT", title: "VARCHAR" }, rows: [{ id: 1, title: "a" }, { id: 2, title: "b" }] }, { write: "merge", key: ["id"], now: T0, counting });
+      await w.write("dup", (tx) => tx.exec(`INSERT INTO issues SELECT 2, 'b2', _loaded_at FROM issues WHERE id = 2`), { runId: "r_dup" });
+      const r = await load(w, "issues", { columns: { id: "BIGINT", title: "VARCHAR" }, rows: [{ id: 2, title: "B" }, { id: 3, title: "c" }] }, { write: "merge", key: ["id"], now: T1, counting });
+      return { rows: r.rows, data: await read(w, `SELECT id, title FROM issues ORDER BY id, title`) };
+    };
+    const returning = await run("returning");
+    const classify = await run("classify");
+    expect(classify.data).toEqual(returning.data);
+    expect(classify.data).toEqual([{ id: 1, title: "a" }, { id: 2, title: "B" }, { id: 2, title: "B" }, { id: 3, title: "c" }]);
+    // Counted per row of the batch, where the MERGE counts per row of the table it changed: the one disagreement.
+    expect(classify.rows).toMatchObject({ added: 1, updated: 1 });
+    expect(returning.rows).toMatchObject({ added: 1, updated: 2 });
   });
 });

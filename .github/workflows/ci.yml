@@ -109,6 +109,68 @@ jobs:
         # --timeout: the default timeout tests/preload.ts sets reaches the first test file of a run only (DESIGN.md §10 "Test strategy").
         run: bun test --timeout 60000
 
+  # The whole suite again with croft's bookkeeping kept as a lake keeps it, an append-only log on a plain DuckDB file
+  # (DESIGN.md D132): no Postgres for the lake, no lake. A job of its own, beside the matrix, so neither run lengthens the
+  # other: both full suites in one job went past its 45 minutes. One platform is enough, since the log is the same everywhere.
+  # CROFT_BOOKKEEPING is set here and nowhere else; tests/preload.ts adds the mark that lets it take effect (db/bookkeeping.ts).
+  test-log:
+    name: ubuntu-24.04 · bun 1.3.14 · bookkeeping as a log
+    needs: changes
+    if: needs.changes.outputs.croft == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: git identity
+        run: git config --global user.email ci@zabaca.com && git config --global user.name "croft ci"
+      - run: bun install --frozen-lockfile
+      # The mode tests load DuckDB's real extension files (DESIGN.md D117). They are never committed (over 100 MB per
+      # platform); this step fetches each from DuckDB's official extension repository over HTTPS and checks it against
+      # the checksum croft pins, and the tests fail in CI (CROFT_CI) rather than skip when a file is missing.
+      - name: DuckDB extension files, cached
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/croft-extensions
+          key: duckdb-extensions-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('packages/croft/src/db/extension-pins.ts') }}
+      - name: fetch and verify the DuckDB extension files
+        working-directory: packages/croft
+        env:
+          CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
+        run: bun scripts/fetch-extensions.ts
+      # The lake profile's tests start Postgres in the foreground, as a child of the test. Never as a service.
+      - name: Postgres for the lake tests
+        working-directory: packages/croft
+        run: |
+          if ! bun scripts/check-mode-tools.ts; then
+            if [ "$RUNNER_OS" = macOS ]; then
+              brew install postgresql@17
+              bun scripts/check-mode-tools.ts
+            else
+              # A Linux image without Postgres (the arm image may lack it). Debian starts a service on install; a
+              # policy-rc.d that refuses (exit 101) keeps it from ever starting, so only the test's own foreground
+              # Postgres runs.
+              printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+              sudo chmod +x /usr/sbin/policy-rc.d
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends postgresql
+              sudo rm -f /usr/sbin/policy-rc.d
+              bun scripts/check-mode-tools.ts
+            fi
+          fi
+      - name: test, bookkeeping as a log
+        working-directory: packages/croft
+        env:
+          CROFT_CI: "1"
+          CROFT_BOOKKEEPING: log
+          CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
+        run: bun test --timeout 60000
+
   # Smoke: Alpine (musl) installs and prints its version, and a fresh project runs its example and answers a query.
   alpine:
     name: alpine smoke

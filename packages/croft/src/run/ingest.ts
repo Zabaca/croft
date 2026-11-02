@@ -37,6 +37,7 @@ import type { Confirmation, CursorType, Impact, Problem, SchemaChange, Sql, Step
 import { now as clockNow } from "../core/time.ts";
 import type { FileIngest, IngestContext, Row, RowSource, RowsIngest } from "../types.ts";
 import { canonicalPath } from "../db/connect.ts";
+import { bookkeepingOf } from "../db/bookkeeping.ts";
 import { hasState } from "../db/state.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
 import { type CatalogAsset, type CatalogBase, getCatalog, putCatalog, readCatalogEntry } from "../history/catalog.ts";
@@ -658,8 +659,9 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
       // writeBatch saved greatest(saved, loaded). After a --from beyond the saved cursor that would jump over the
       // rows in between, so the cursor goes back to where it was, in the same transaction (§8).
       if (since.holdCursor !== undefined && res.cursor && res.cursor.after !== since.holdCursor) {
-        await tx.exec(`UPDATE _croft.assets SET cursor_value = $1 WHERE name = $2`, [since.holdCursor, asset]);
-        await tx.exec(`UPDATE _croft.writes SET cursor_after = $1 WHERE asset = $2 AND loaded_at = $3::TIMESTAMPTZ`, [since.holdCursor, asset, res.loadedAt]);
+        const bk = await bookkeepingOf(tx);
+        await bk.update("assets", { cursor_value: "$1" }, "name = $2", [since.holdCursor, asset]);
+        await bk.update("writes", { cursor_after: "$1" }, "asset = $2 AND loaded_at = $3::TIMESTAMPTZ", [since.holdCursor, asset, res.loadedAt]);
         res.cursor = { ...res.cursor, after: since.holdCursor };
       }
       if (files) await recordFiles(tx, asset, files, res.loadedAt);

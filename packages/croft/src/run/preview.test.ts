@@ -9,6 +9,7 @@ import { exitCodeFor } from "../core/errors.ts";
 import type { PreviewAsset } from "../core/types.ts";
 import { RunsDb } from "../history/runs-db.ts";
 import { ProjectEnv } from "../project/env.ts";
+import { bookkeepingEnv } from "../db/bookkeeping-testkit.ts";
 import { cleanup as cleanupHolders, releaseHolder, spawnHolder } from "../read/testkit.ts";
 import { loadProject } from "../project/root.ts";
 import { capRows, previewDatabasePath, runPreview, type PreviewInput } from "./preview.ts";
@@ -88,7 +89,7 @@ SELECT id, title FROM issues WHERE state = 'open'
 `;
 
 const ENV = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", TMPDIR: process.env.TMPDIR ?? "/tmp", NO_COLOR: "1",
-  TZ: "America/Los_Angeles", CROFT_FORBID_OS_JOBS: "1", CROFT_NOTIFY_DRY: "1", CROFT_RETRY_DELAYS: "10,20" };
+  TZ: "America/Los_Angeles", CROFT_FORBID_OS_JOBS: "1", CROFT_NOTIFY_DRY: "1", CROFT_RETRY_DELAYS: "10,20", ...bookkeepingEnv() };
 
 /** croft in a child process (off a TTY): the live warehouse's writer and every reader after a preview. */
 async function croft(root: string, args: string[]): Promise<{ code: number; json: any; stdout: string; stderr: string }> {

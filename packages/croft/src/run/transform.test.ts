@@ -10,12 +10,13 @@ import { checksHook } from "../checks/run.ts";
 import { inputsSeenOf } from "../cli/commands/describe.ts";
 import { CroftError } from "../core/errors.ts";
 import type { Problem, Sql } from "../core/types.ts";
+import { bookkeepingEnv, seedState } from "../db/bookkeeping-testkit.ts";
 import { ensureState } from "../db/state.ts";
 import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/warehouse.ts";
 import { getCatalog, readCatalogEntry } from "../history/catalog.ts";
 import { openLog } from "../history/logs.ts";
 import { RunsDb } from "../history/runs-db.ts";
-import type { CheckContext, CheckHookResult } from "../load/write.ts";
+import type { CheckContext, CheckHookResult, Counting } from "../load/write.ts";
 import { discoverAssets } from "../project/discover.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { loadProject, type Project } from "../project/root.ts";
@@ -88,7 +89,7 @@ async function seed(h: H, table: string, s: SeedSpec): Promise<void> {
       }
       await tx.exec(`INSERT INTO main.${q(table)} SELECT ${all.map((n, i) => `CAST($${i + 1} AS ${types[n]})`).join(", ")}`, all.map((n) => r[n] ?? null));
     }
-    await tx.exec(`INSERT OR REPLACE INTO _croft.assets (name, kind, write_mode, key_columns, last_loaded_at, row_count, max_loaded_at, updated_at)
+    await seedState(tx, `INSERT OR REPLACE INTO _croft.assets (name, kind, write_mode, key_columns, last_loaded_at, row_count, max_loaded_at, updated_at)
       SELECT $1, 'ingest', $2, CAST($3::JSON AS VARCHAR[]), max(_loaded_at), count(*), max(_loaded_at), now() FROM main.${q(table)}`,
       [table, s.key?.length ? "merge" : "replace", JSON.stringify(s.key ?? [])]);
   }, { runId: "r_seed" });
@@ -525,6 +526,26 @@ describe("newRows() positions never skip rows (§3e)", () => {
     expect(g.__t_seen).toEqual(["2", "6"]);
     expect(next.result.rows).toMatchObject({ in: 2, added: 1, updated: 1, total: 6 });
     expect(next.result.inputs).toEqual([{ input: "issues", seenBefore: L1, seenAfter: L2, rows: 2 }]);
+  });
+
+  test("counting (D133): chunks of a TS transform report the same rows whether the MERGE or a classification counts them", async () => {
+    const run = async (counting: Counting) => {
+      CHUNK.rows = 3;
+      const h = harness({ "assets/t.ts": incremental() });
+      await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2, 3, 4, 5, 6, 7], S1) });
+      const s = await plan(h, "t");
+      const first = await step(h, s, { counting });
+      await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: [...issues([2, 5], S2, () => "changed"), ...issues([8, 9], S2)] });
+      const second = await step(h, s, { counting });
+      const writes = await all(h, `SELECT rows_in::INTEGER AS rows_in, added::INTEGER AS added, updated::INTEGER AS updated, unchanged::INTEGER AS unchanged, deleted::INTEGER AS deleted FROM _croft.writes WHERE asset = 't' ORDER BY loaded_at`);
+      return { first: first.result.rows, second: second.result.rows, writes, table: await all(h, `SELECT issue_id, title FROM t ORDER BY issue_id`) };
+    };
+    const returning = await run("returning");
+    const classify = await run("classify");
+    expect(classify).toEqual(returning);
+    expect(classify.first).toMatchObject({ in: 7, added: 7, total: 7 });
+    expect(classify.second).toMatchObject({ in: 4, added: 2, updated: 2, total: 9 });
+    expect(classify.writes).toHaveLength(5);   // 3 chunks, then 2
   });
 
   test("keys compare by their type (9 < 10 as BIGINT), and composite keys column by column", async () => {
@@ -1078,7 +1099,7 @@ export default transform({
     expect(api.calls()).toBe(7);
     // Positions moved under it (another attempt committed): it no longer fits.
     await tx(h2, async (db) => {
-      await db.exec(`INSERT INTO _croft.inputs (asset, input, seen_loaded_at, seen_key) VALUES ('t', 'issues', $1::TIMESTAMPTZ, '["1"]')`, [S1]);
+      await seedState(db, `INSERT INTO _croft.inputs (asset, input, seen_loaded_at, seen_key) VALUES ('t', 'issues', $1::TIMESTAMPTZ, '["1"]')`, [S1]);
     });
     await step(h2, await plan(h2, "t"));
     expect(api.calls()).toBe(9);
@@ -1471,7 +1492,7 @@ await runTransform({ step, project, env: ProjectEnv.load(root, {}), warehouse: w
 console.log("finished without the fault");
 `);
     const child = spawn(process.execPath, ["--no-env-file", script], {
-      cwd: h.root, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: h.root, CROFT_FORBID_OS_JOBS: "1", CROFT_NOTIFY_DRY: "1" }, stdio: ["ignore", "pipe", "pipe"],
+      cwd: h.root, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: h.root, CROFT_FORBID_OS_JOBS: "1", CROFT_NOTIFY_DRY: "1", ...bookkeepingEnv() }, stdio: ["ignore", "pipe", "pipe"],
     });
     let output = "";
     child.stdout!.on("data", (d) => (output += d));
