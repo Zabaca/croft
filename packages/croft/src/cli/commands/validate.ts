@@ -34,6 +34,9 @@
 //    a BIGINT (number | bigint: Number(row.x)). No tsc (or no tsconfig.json) is an info problem and a skip; croft
 //    never installs anything. A tsconfig.json whose "include" leaves out .croft/types is an info problem with the
 //    edit. Plain validate names --types as the next step when TS transforms read assets (nextSteps).
+//    A project with a mode on (serverMode.enabled) also gets its add-on checked (db/addon-status.ts, D132): EXTENSION_MISSING
+//    with the install command as its fix when the extension files are not found, an error like the rest; data.addons says
+//    what was found.
 // 4. --hook: what Claude Code's PostToolUse hook runs after an edit (agent/hook.ts, §9 item 7): the edited asset
 //    and what it can break. Errors go to stderr with exit 2; warnings only, to Claude as additionalContext (JSON
 //    on stdout, exit 0); croft's own failures exit 1, which never blocks Claude (validateHook, hookHuman).
@@ -45,6 +48,7 @@ import { basename, extname, join } from "node:path";
 import { hookContext, hookOutput, hookPaths, hookProblems, hookReport, hookSelection, hookTarget, parseHookInput, readHookStdin, showPaths } from "../../agent/hook.ts";
 import { checkColumns, displayIdent, probeSql } from "../../checks/parse.ts";
 import { type Code, CroftError, CODES, EXIT, isCode, problem } from "../../core/errors.ts";
+import { addonsNeeded, inspectAddons } from "../../db/addon-status.ts";
 import { formatInstant } from "../../core/time.ts";
 import type { Check, Fix, Problem, ValidateAsset, ValidateData } from "../../core/types.ts";
 import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
@@ -78,7 +82,7 @@ const TYPES_NEXT = 3;
 const NEXT_FIRES = 3;
 
 export interface ValidateInput {
-  project: Pick<Project, "root" | "timezone" | "paths">;
+  project: Pick<Project, "root" | "timezone" | "paths"> & Partial<Pick<Project, "config">>;
   /** The project's secrets (.env and the shell): SECRET_MISSING. */
   env: ProjectEnv;
   /** Asset names or globs; none checks every asset. */
@@ -213,7 +217,11 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
   const order = runOrder(graph, resolved.assets);
 
   const renamed = await renamedAssets(i.project, catalog, byName);
+  // A mode that is on needs its add-on's extension files (D132). The edit hook skips it: its problems belong to no asset, and a
+  // check of the files on every edit would only hash them again.
+  const addons = i.project.config && !i.select ? inspectAddons(addonsNeeded(i.project.config), { from: root, ...(i.processEnv ? { env: i.processEnv } : {}) }) : null;
   const problems: Problem[] = [
+    ...(addons?.problems ?? []),
     ...resolved.problems.filter((p) => p.code !== "CYCLE"),
     ...cycles.filter((p) => selected.size === byName.size || cycleNames(p).some((n) => selected.has(n))),
     // A rename that stopped before its new file exists belongs to no asset: the whole project reports it.
@@ -241,7 +249,7 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
     });
   }
 
-  const data: ValidateData = { order: graph.order.slice(), assets };
+  const data: ValidateData = { order: graph.order.slice(), assets, ...(addons?.views.length ? { addons: addons.views } : {}) };
   if (i.types) {
     // The input row types first, with each bound SQL asset's output as its code is now, so tsc checks the TS
     // transforms against the code that the next run will build. Its blocking not_null checks narrow a column

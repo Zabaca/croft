@@ -63,6 +63,12 @@
               ],
               "additionalProperties": false
             },
+            "addons": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/AddonView"
+              }
+            },
             "redactedValues": {
               "const": true
             }
@@ -121,6 +127,62 @@
   ],
   "additionalProperties": false,
   "$defs": {
+    "AddonView": {
+      "type": "object",
+      "properties": {
+        "addon": {
+          "enum": [
+            "lake",
+            "server"
+          ]
+        },
+        "mode": {
+          "type": "string"
+        },
+        "package": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "platform": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "installed": {
+          "type": "boolean"
+        },
+        "install": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "extensions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExtensionView"
+          }
+        }
+      },
+      "required": [
+        "addon",
+        "mode",
+        "package",
+        "version",
+        "platform",
+        "ok",
+        "installed",
+        "install",
+        "extensions"
+      ],
+      "additionalProperties": false
+    },
     "Confirmation": {
       "type": "object",
       "properties": {
@@ -142,6 +204,51 @@
         "expiresAt",
         "command",
         "impact"
+      ],
+      "additionalProperties": false
+    },
+    "ExtensionView": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "enum": [
+            "ducklake",
+            "httpfs",
+            "postgres",
+            "quack",
+            "sqlite"
+          ]
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "source": {
+          "enum": [
+            "addon",
+            "cache",
+            "dir",
+            null
+          ]
+        },
+        "path": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "code": {
+          "type": [
+            "null",
+            "string"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "ok",
+        "source",
+        "path",
+        "code"
       ],
       "additionalProperties": false
     },
