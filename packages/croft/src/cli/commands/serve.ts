@@ -8,6 +8,8 @@
 //    the write-intent handoff), listen (serve/server.ts) with the keys file (serve/keys.ts, read on every request) and
 //    one log line on stderr for every key query, record serve.json (0600), and start the loop that spawns
 //    `croft tick` every minute while scheduling is on (serve/loop.ts).
+//    In server mode the readers' process also listens for DuckDB 2.0 clients over Quack (D125): its address is in the banner and in
+//    serve.json, and each Quack query a key makes gets a log line like an HTTP one.
 // 4. Print the banner (--json: one envelope with the address), then run until SIGINT, SIGTERM or SIGHUP.
 // 5. Stop: no more ticks, remove serve.json (apps fall back to reading the file), stop listening, close the
 //    engine (which interrupts what still runs and kills its workers), exit 0. A worker whose croft serve dies
@@ -27,6 +29,8 @@ import type { SchedulingSetting } from "../../schedule/os.ts";
 import { isLoopbackHost, isUnspecifiedHost, resolveToken, type ServeToken, urlHost } from "../../serve/auth.ts";
 import { KeyStore } from "../../serve/keys.ts";
 import { openEngine } from "../../serve/open.ts";
+import { connectSnippet, listenAddress, type QuackConnect } from "../../serve/quack-address.ts";
+import type { QuackEvent } from "../../serve/quack-access.ts";
 import { type LoopEvent, type SchedulerLoop, startLoop, TICK_INTERVAL_MS, tickEnv, type TickSpawner } from "../../serve/loop.ts";
 import {
   alreadyServing, type KeyQueryLog, removeServeJson, type RunningServer, type ServerOptions, serveJsonPath, startServer, writeServeJson,
@@ -58,12 +62,15 @@ export interface ServeData {
   scheduling: { state: SchedulingSetting["state"]; via: SchedulingSetting["via"]; pausedUntil: string | null; tickEveryMs: number };
   /** The keys people read with (croft serve key add) and the tables they may read (serve.sharedTables), as the server
    *  started: a key made later is honoured at once, a table shared later needs a restart. */
-  keys: { count: number; sharedTables: string[]; unknownTables: string[] };
+  keys: { count: number; sharedTables: string[]; unknownTables: string[]; needsServerMode: boolean };
   /** Set once it stopped. */
   stopped: { signal: string; at: string } | null;
   /** Only with serverMode on (D119): croft serve answers from this read copy (relative to the project when inside it),
    *  as of this time (null until the first copy exists), and never opens the warehouse file. */
   serverMode?: { readCopy: string; asOf: string | null };
+  /** Only in server mode, once the readers' process listens (D125): how a person's DuckDB 2.0 attaches over Quack, with `<key>`
+   *  where the key goes (croft serve key add prints the statement with the key in it). */
+  quack?: QuackConnect & { uri: string; attach: string };
 }
 
 /** What tests replace. Everything defaults to the real thing. */
@@ -146,7 +153,11 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
 
   const started = ctx.now();
   try {
-    engine = await (deps.openEngine ?? openEngine)({ root: project.root, maxConcurrent: cfg.maxConcurrent, queryTimeoutMs: cfg.queryTimeoutMs });
+    engine = await (deps.openEngine ?? openEngine)({
+      root: project.root, maxConcurrent: cfg.maxConcurrent, queryTimeoutMs: cfg.queryTimeoutMs,
+      // Quack's hooks run in the readers' process, which cannot write the log or the last-used time: it reports, and this writes.
+      onQuack: (e) => onQuack(ctx, keys, e, project.timezone),
+    });
     server = (deps.listen ?? startServer)({
       engine, host, port, token: token.token, allowOrigins: cfg.allowOrigins, root: project.root,
       database: project.databaseLabel, timezone: project.timezone, startedAt: formatInstant(started, project.timezone),
@@ -155,10 +166,16 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
       onError: (e) => ctx.render.err(`croft serve: failed while answering a request: ${e instanceof Error ? e.stack ?? e.message : String(e)}`),
     });
     const id = currentIdentity();
+    // The listener starts with the readers' process, which waits for the first read copy; until it exists a fixed address is the
+    // configured one, and a port of 0 is not known yet.
+    const mode = engine.status().serverMode;
+    const sm = project.config.serverMode;
+    const quackUri = mode?.quack?.uri ?? (mode && sm.quackPort !== 0 ? listenAddress(sm.quackHost, sm.quackPort).uri : null);
     writeServeJson(stateDir, {
       url: server.url, host: server.host, port: server.port, token: token.token, pid: id.pid, procStart: id.procStart,
       bootId: id.bootId, startedAt: started.toISOString(), version: CROFT_VERSION,
       ...(engine.status().serverMode ? { serverMode: true as const } : {}),
+      ...(quackUri ? { quack: { uri: quackUri } } : {}),
     });
     loop = startLoop({
       root: project.root, stateDir, env: tickEnv(ctx.processEnv), intervalMs: deps.tickIntervalMs ?? TICK_INTERVAL_MS,
@@ -170,9 +187,14 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
       database: project.databaseLabel, startedAt: formatInstant(started, project.timezone), version: CROFT_VERSION,
       token: { source: token.source, from: token.from ?? null, file: shownPath(project, serveJsonPath(stateDir)) },
       scheduling: { state: scheduling.state, via: scheduling.via, pausedUntil: scheduling.pausedUntil ?? null, tickEveryMs: deps.tickIntervalMs ?? TICK_INTERVAL_MS },
-      keys: { count: keyCount(keys), sharedTables: [...cfg.sharedTables], unknownTables: unknownSharedTables(project) },
+      keys: {
+        count: keyCount(keys), sharedTables: [...cfg.sharedTables], unknownTables: unknownSharedTables(project),
+        // A key works only in server mode (D128): with keys made and server mode off, every key is refused until it is on.
+        needsServerMode: !project.config.serverMode.enabled && keyCount(keys) > 0,
+      },
       stopped: null,
       ...(project.config.serverMode.enabled ? { serverMode: { readCopy: shownPath(project, project.paths.readCopy), asOf: engine.status().serverMode?.asOf ?? null } } : {}),
+      ...(quackUri ? { quack: connectSnippet({ host: project.config.serverMode.quackHost, port: project.config.serverMode.quackPort }, quackUri, null) as QuackConnect & { uri: string; attach: string } } : {}),
     };
     announce(ctx, data);
     deps.onStarted?.(data);
@@ -218,6 +240,19 @@ export function keyLogLine(e: KeyQueryLog, timezone: string): string {
   return `croft serve: key ${e.key}  ${formatInstant(e.at, timezone)}  ${what}  ${e.rows} row${e.rows === 1 ? "" : "s"}  ${e.ms} ms`;
 }
 
+/** What a Quack session did: a key's query gets its log line, and a sign-in or a query counts as the key's last use (D125). */
+function onQuack(ctx: Ctx, keys: KeyStore, e: QuackEvent, timezone: string): void {
+  keys.noteUsed(e.key);
+  if (e.kind === "query") ctx.render.err(quackLogLine(e, timezone));
+}
+
+/** The log line of a key's Quack query (D125): like an HTTP one (keyLogLine), but Quack's hook runs before the query does, so the
+ *  rows and the time are the client's to know, and the line says it went over Quack instead. Never the SQL or the key. */
+export function quackLogLine(e: Extract<QuackEvent, { kind: "query" }>, timezone: string): string {
+  const what = e.outcome === "ok" ? `read ${e.tables.length ? e.tables.join(", ") : "no table"}` : `refused ${e.outcome}`;
+  return `croft serve: key ${e.key}  ${formatInstant(new Date(e.at), timezone)}  ${what}  over Quack`;
+}
+
 function redactorOf(ctx: Ctx) {
   const env = ctx.env;
   return Object.assign((text: string) => env.redact(text), { data: (text: string) => env.redactData(text) });
@@ -253,11 +288,20 @@ export function formatBanner(d: ServeData, timezone: string, now: Date = new Dat
         ? ", and set CROFT_SERVE_TOKEN in .env: hosted apps need a token that does not change on every start"
         : "; every request needs the token"));
   }
-  if (d.keys.count > 0 || d.keys.sharedTables.length > 0) {
+  if (d.keys.needsServerMode) {
+    const n = d.keys.count;
+    lines.push(`${n} key${n === 1 ? " is" : "s are"} refused until server mode is on: a key works only there ("serverMode": {"enabled": true} in croft.json, croft docs keys)`);
+  } else if (d.keys.count > 0 || (d.serverMode && d.keys.sharedTables.length > 0)) {
     const n = `${d.keys.count} key${d.keys.count === 1 ? "" : "s"} (croft serve key list)`;
     lines.push(d.keys.sharedTables.length
       ? `${n} read ${d.keys.sharedTables.join(", ")}, read-only`
       : `${n}, but serve.sharedTables in croft.json names no table, so every key query is refused`);
+  }
+  if (d.quack) {
+    lines.push(`DuckDB 2.0 clients attach over Quack at ${d.quack.uri} with a key: ${d.quack.attach}; the copy's as-of time is in ${d.quack.asOfView} (croft docs quack)`);
+    if (!d.quack.loopback) {
+      lines.push(`Quack is not loopback: put an HTTPS reverse proxy in front of ${d.quack.uri.replace(/^quack:/, "")}; clients attach to the proxy's name with the port written out`);
+    }
   }
   lines.push(...unknownLine(d.keys.unknownTables));
   if (d.token.source === "generated") lines.push(`token: ${d.token.file} (hosted apps: set CROFT_SERVE_TOKEN)`);

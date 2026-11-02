@@ -577,16 +577,17 @@ async function checkServe(r: Report, d: DoctorDeps, project: Project): Promise<v
   }
   const queries = typeof health.queriesToday === "number" ? ` · ${formatCount(health.queriesToday)} queries today` : "";
   // Server mode (D119): the server answers from the read copy and says as of when.
-  const sm = health.serverMode as { state?: string; asOf?: string | null } | undefined;
+  const sm = health.serverMode as { state?: string; asOf?: string | null; quack?: string } | undefined;
   let mode = "";
   if (sm) {
     let at: Date;
     try { at = now(d.env); } catch { at = new Date(); }
     mode = sm.asOf ? ` · server mode, reads the copy as of ${clockText(sm.asOf, project.timezone, at)}` : ` · server mode (${sm.state ?? "starting"}), no copy yet`;
+    if (sm.quack) mode += ` · DuckDB clients attach at ${sm.quack}`;
   }
   const degraded = (health.degraded as { code?: string } | undefined)?.code;
   r.add("environment", "serve", degraded ? "warn" : "ok", `read server on ${where} (pid ${s.pid}) · token in ${shownFile}${queries}${mode}${degraded ? ` · degraded: ${degraded} (see the read copy lines)` : ""}`, undefined,
-    { running: true, pid: s.pid, url: s.url, queriesToday: health.queriesToday ?? null, ...(sm ? { serverMode: { state: sm.state ?? null, asOf: sm.asOf ?? null } } : {}) });
+    { running: true, pid: s.pid, url: s.url, queriesToday: health.queriesToday ?? null, ...(sm ? { serverMode: { state: sm.state ?? null, asOf: sm.asOf ?? null, quack: sm.quack ?? null } } : {}) });
 }
 
 /**

@@ -40,6 +40,31 @@
           "description": "accept that every refresh of the read copy is a full copy of a warehouse over 1 GB (the filesystem cannot clone it); without this, server mode refuses to start there",
           "type": "boolean",
           "default": false
+        },
+        "quackHost": {
+          "description": "the address croft serve listens on for DuckDB 2.0 clients over Quack (croft docs quack); anything but loopback must sit behind an HTTPS reverse proxy",
+          "type": "string",
+          "pattern": "^[^\\s/?#@]+$",
+          "default": "127.0.0.1"
+        },
+        "quackPort": {
+          "description": "the port for Quack; 0 picks a free one and the banner says which",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 9494
+        },
+        "quackPlaintextOnNetwork": {
+          "description": "accept that a quackHost other than loopback carries keys and queries in plaintext, behind an HTTPS reverse proxy of your own; without this croft serve refuses to start with such an address (ask the user first)",
+          "type": "boolean",
+          "default": false
+        },
+        "quackMaxConcurrent": {
+          "description": "Quack queries running at once, over all sessions; past it a query is refused with a retryable answer (1-64)",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 4
         }
       }
     },

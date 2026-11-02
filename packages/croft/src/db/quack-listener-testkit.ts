@@ -24,7 +24,7 @@ const conn = await connect(instance, {
     copy: arg("copy"),
     prepare: async (c) => {
       for (const t of tables) await c.run(`CREATE VIEW memory.main.${t} AS SELECT * FROM ${READ_COPY_ALIAS}.main.${t}`);
-      await startQuackListener(c, `quack:localhost:${port}`, arg("token"));
+      await startQuackListener(c, `quack:localhost:${port}`, { token: arg("token") });
     },
   },
 }, ":memory:readers");

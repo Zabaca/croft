@@ -66,7 +66,7 @@ interface ModeBase {
   /** DuckDB's secret folder for this instance, inside croft's state folder. */
   secretDir: string;
   /** Runs after the mode's attaches and before the lock: register hooks, start the listener. */
-  prepare?: (conn: DuckDBConnection) => Promise<void>;
+  prepare?: (conn: DuckDBConnection) => Promise<unknown>;
 }
 
 /** Server mode's readers' process: quack and httpfs; the read copy attached read-only; afterwards its path allowed and no folder. */
@@ -283,7 +283,13 @@ export function scrubError(e: unknown, mode: ModeSpec | undefined): Error {
  * lock, because DuckDB refuses `quack_serve` afterwards. Who may connect is the authentication hook's job; without
  * a `token`, the one the listener needs is a random placeholder no client is given, and no secret is created for it.
  */
-export async function startQuackListener(conn: DuckDBConnection, uri: string, token?: string): Promise<void> {
-  const t = token ?? `unused-${crypto.randomUUID()}`;
-  await conn.run(`SELECT listen_uri FROM quack_serve(${q(uri)}, token = ${q(t)}, create_secret_if_not_exists = false)`);
+export async function startQuackListener(conn: DuckDBConnection, uri: string, opts: { token?: string; allowOtherHostname?: boolean; disableSsl?: boolean } = {}): Promise<string> {
+  const t = opts.token ?? `unused-${crypto.randomUUID()}`;
+  // Quack accepts only localhost as its host unless told otherwise [V: 2.0.0]; croft says so for anything else (D125).
+  // Past localhost Quack serves TLS with a certificate of its own [V: 2.0.0: a client got "Unsupported protocol" over plain HTTP];
+  // croft's design is a reverse proxy that holds the real certificate and speaks plain HTTP to Quack, as for its HTTP API (D125).
+  const other = `${opts.allowOtherHostname ? ", allow_other_hostname = true" : ""}${opts.disableSsl ? ", disable_ssl = true" : ""}`;
+  const reader = await conn.runAndReadAll(`SELECT listen_uri FROM quack_serve(${q(uri)}, token = ${q(t)}, create_secret_if_not_exists = false${other})`);
+  // The address actually bound: a port of 0 is replaced by the one the system picked.
+  return String(reader.getRowsJS()[0]?.[0] ?? uri);
 }

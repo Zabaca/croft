@@ -134,12 +134,16 @@
                   "items": {
                     "type": "string"
                   }
+                },
+                "needsServerMode": {
+                  "type": "boolean"
                 }
               },
               "required": [
                 "count",
                 "sharedTables",
-                "unknownTables"
+                "unknownTables",
+                "needsServerMode"
               ],
               "additionalProperties": false
             },
@@ -182,6 +186,30 @@
               "required": [
                 "readCopy",
                 "asOf"
+              ],
+              "additionalProperties": false
+            },
+            "quack": {
+              "type": "object",
+              "properties": {
+                "uri": {
+                  "type": "string"
+                },
+                "loopback": {
+                  "type": "boolean"
+                },
+                "attach": {
+                  "type": "string"
+                },
+                "asOfView": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "uri",
+                "loopback",
+                "attach",
+                "asOfView"
               ],
               "additionalProperties": false
             },
@@ -235,6 +263,12 @@
             "file": {
               "type": "string"
             },
+            "serverMode": {
+              "type": "boolean"
+            },
+            "quack": {
+              "$ref": "#/$defs/QuackConnect"
+            },
             "redactedValues": {
               "const": true
             }
@@ -246,7 +280,8 @@
             "createdAt",
             "sharedTables",
             "unknownTables",
-            "file"
+            "file",
+            "serverMode"
           ],
           "additionalProperties": false
         },
@@ -277,6 +312,12 @@
             "file": {
               "type": "string"
             },
+            "serverMode": {
+              "type": "boolean"
+            },
+            "quack": {
+              "$ref": "#/$defs/QuackConnect"
+            },
             "redactedValues": {
               "const": true
             }
@@ -286,7 +327,8 @@
             "keys",
             "sharedTables",
             "unknownTables",
-            "file"
+            "file",
+            "serverMode"
           ],
           "additionalProperties": false
         },
@@ -576,6 +618,36 @@
         "message",
         "hint",
         "docs"
+      ],
+      "additionalProperties": false
+    },
+    "QuackConnect": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "loopback": {
+          "type": "boolean"
+        },
+        "attach": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "asOfView": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri",
+        "loopback",
+        "attach",
+        "asOfView"
       ],
       "additionalProperties": false
     },

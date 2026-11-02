@@ -12,7 +12,8 @@ import { CroftError } from "../core/errors.ts";
 import type { SandboxSpec } from "../db/connect.ts";
 import type { ColumnInfo } from "../db/values.ts";
 import { tickEnv } from "./loop.ts";
-import type { FromWorker, ToWorker, WireError } from "./worker.ts";
+import type { QuackEvent, QuackKey } from "./quack-access.ts";
+import type { FromWorker, ReadersOpen, ToWorker, WireError } from "./worker.ts";
 
 /** The worker's entry: the same croft this server runs. */
 export const WORKER_FILE = fileURLToPath(new URL("./worker.ts", import.meta.url));
@@ -65,6 +66,10 @@ export interface SpawnOptions {
   onExit?(w: QueryWorker): void;
   /** The worker's command (tests); `bun --no-env-file worker.ts` by default. */
   argv?: string[];
+  /** Quack (D125): a person signed in or a query was answered or refused. */
+  onQuack?(e: QuackEvent): void;
+  /** Quack: a query has run past the deadline; the engine ends this worker. */
+  onOverdue?(o: { connection: string; ms: number }): void;
 }
 
 interface Waiting<T> {
@@ -87,7 +92,7 @@ export class QueryWorker {
   readonly exited: Promise<void>;
   private readonly proc: Subprocess<"ignore", "ignore", "pipe"> | null;
   private readonly queries = new Map<number, Waiting<WorkerAnswer>>();
-  private opening: Waiting<void> | null = null;
+  private opening: Waiting<{ quack?: { uri: string } }> | null = null;
   private swapWait: Waiting<void> | null = null;
   private disconnecting: Waiting<number>[] = [];
   private readyWait!: Waiting<void>;
@@ -95,7 +100,7 @@ export class QueryWorker {
   private killedByUs = false;
   private stderr = "";
 
-  private constructor(o: SpawnOptions) {
+  private constructor(private readonly o: SpawnOptions) {
     this.ready = new Promise<void>((resolve, reject) => (this.readyWait = { resolve, reject }));
     this.ready.catch(() => {}); // a worker that dies before it is ready fails the request that waits on it
     const argv = o.argv ?? [process.execPath, "--no-env-file", WORKER_FILE];
@@ -149,21 +154,26 @@ export class QueryWorker {
 
   /** Open the file read-only with the serve sandbox and check its format. Throws a CroftError (DB_NEWER_FORMAT,
    *  CONFIG_INVALID, ...), WorkerConflict (another process holds the file), WorkerGone, or an Error. */
-  async open(o: { path: string; spec: SandboxSpec; protect: string[]; readers?: { extensionDir: string; secretDir: string; shared: string[] } }): Promise<void> {
+  async open(o: { path: string; spec: SandboxSpec; protect: string[]; readers?: ReadersOpen }): Promise<{ quack?: { uri: string } }> {
     await this.ready;
     if (this.opening) throw new Error("the query worker is already opening a database");
-    const p = new Promise<void>((resolve, reject) => (this.opening = { resolve, reject }));
+    const p = new Promise<{ quack?: { uri: string } }>((resolve, reject) => (this.opening = { resolve, reject }));
     this.post({ op: "open", ...o });
     return p;
   }
 
+  /** Server mode: the keys Quack accepts are now these. */
+  setKeys(keys: QuackKey[]): void {
+    this.post({ op: "keys", keys });
+  }
+
   /** Server mode: the readers' process takes in the copy now at its path (detach, attach). Resolves when queries read
    *  the new file; rejects with the error that made the process end itself (it is gone, or about to be). */
-  swap(): Promise<void> {
+  swap(asOf: string): Promise<void> {
     if (this.gone) return Promise.reject(this.gone);
     if (this.swapWait) return Promise.reject(new Error("the readers' process is already swapping the copy"));
     const p = new Promise<void>((resolve, reject) => (this.swapWait = { resolve, reject }));
-    this.post({ op: "swap" });
+    this.post({ op: "swap", asOf });
     return p;
   }
 
@@ -218,7 +228,7 @@ export class QueryWorker {
         return;
       case "opened":
         this.conns = m.conns;
-        this.opening?.resolve();
+        this.opening?.resolve(m.quack ? { quack: m.quack } : {});
         this.opening = null;
         return;
       case "open_failed":
@@ -248,6 +258,12 @@ export class QueryWorker {
       case "disconnected":
         this.conns = m.conns;
         for (const w of this.disconnecting.splice(0)) w.resolve(m.conns);
+        return;
+      case "quack":
+        this.o.onQuack?.(m.event);
+        return;
+      case "quack_overdue":
+        this.o.onOverdue?.({ connection: m.connection, ms: m.ms });
         return;
     }
   }

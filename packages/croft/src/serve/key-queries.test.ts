@@ -1,9 +1,10 @@
-// A key's queries over croft serve's HTTP API (DESIGN.md D122, D123; option 06, slice 3), against the real engines: the file
-// engine (a query worker on the live file, which steps aside for writers) and server mode's readers' process (the read copy,
-// a view per shared table). The app token reads every table; a key reads the shared ones and nothing else. The attack list
-// (sql/attack-testkit.ts) is sent with a key and every request must be refused, with nothing written. The readers' tests
-// start real child processes that load DuckDB's quack and httpfs files (scripts/fetch-extensions.ts); locally a missing
-// file skips them and says why, in CI it fails them.
+// A key's queries over croft serve's HTTP API (DESIGN.md D122, D123, D128; option 06, slice 3), against the real engines. A key works
+// only in server mode (D128): there it reads through the readers' process (the read copy, a view per shared table), and every
+// query has two walls, the gate and the views. On the file engine (a query worker on the live file, which steps aside for
+// writers) a valid key is refused with a 403 before its body is read, and the engine refuses a key's scope itself. The app
+// token reads every table everywhere; a key reads the shared ones and nothing else. The attack list (sql/attack-testkit.ts) is sent
+// with a key and every request must be refused, with nothing written. The readers' tests start real child processes that load
+// DuckDB's quack and httpfs files (scripts/fetch-extensions.ts); locally a missing file skips them and says why, in CI it fails them.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -19,7 +20,6 @@ const rigs = new Rigs();
 afterAll(() => rigs.close());
 
 const KINDS: { name: string; make: () => Promise<Rig>; run: typeof test }[] = [
-  { name: "the file engine", make: () => rigs.file(), run: test },
   { name: "server mode (the readers' process)", make: () => rigs.readers(ext.dir), run: ext.ready ? test : test.skip },
 ];
 
@@ -200,24 +200,89 @@ for (const kind of KINDS) {
   });
 }
 
-describe("keys on the file engine step aside for a writer as the app token does", () => {
-  test("a key's query waits for the write and is told to retry, like the token's", async () => {
+describe("a key without server mode is refused (D128)", () => {
+  /** The file engine over the attack list's warehouse, with a key made and the project sharing orders and customers. */
+  let r: Rig;
+  let alice: string;
+  beforeAll(async () => {
+    r = await rigs.file();
+    alice = r.key("alice");
+  }, 60_000);
+
+  test("a valid key is refused with a 403 and a code of its own, the words say what to turn on, and the usual log line is written", async () => {
+    const a = await r.call(alice, "SELECT count(*) AS n FROM orders");
+    expect(a.status).toBe(403);
+    expect(a.json.ok).toBe(false);
+    expect(a.json.problems[0]).toMatchObject({ code: "SERVE_KEY_NEEDS_SERVER_MODE", retryable: false });
+    expect(a.json.problems[0].message).toContain("server mode");
+    expect(a.json.problems[0].hint).toContain('"serverMode"');
+    expect(a.json.problems[0].fix).toMatchObject({ kind: "manual", requiresHuman: true });
+    expect(r.log.at(-1)).toMatchObject({ key: "alice", tables: [], rows: 0, outcome: "SERVE_KEY_NEEDS_SERVER_MODE" });
+    expect(JSON.stringify(r.log)).not.toContain(alice);
+  }, 60_000);
+
+  test("it is refused before the body is read: a body that is not JSON, and one that is not even the right type, get the same answer", async () => {
+    for (const [type, body] of [["application/json", "this is not json"], ["application/json", '{"sql": "SELECT 1", "nonsense": true}'], ["application/json", ""]] as const) {
+      const res = await fetch(`${r.url}/query`, { method: "POST", headers: { authorization: `Bearer ${alice}`, "content-type": type }, body });
+      expect(res.status, body).toBe(403);
+      expect(((await res.json()) as { problems: { code: string }[] }).problems[0]!.code).toBe("SERVE_KEY_NEEDS_SERVER_MODE");
+    }
+    // The content-type check still comes first, as for every request.
+    const wrongType = await fetch(`${r.url}/query`, { method: "POST", headers: { authorization: `Bearer ${alice}`, "content-type": "text/plain" }, body: "SELECT 1" });
+    expect(wrongType.status).toBe(415);
+  }, 60_000);
+
+  test("every query a key could send is refused the same way, the attack list included, and nothing is written", async () => {
+    const before = listing(r.p.root);
+    const dbBefore = readFileSync(r.p.database).length;
+    const wrong: string[] = [];
+    for (const q of ALL_ATTACKS) {
+      const a = await r.call(alice, q.sql);
+      if (a.status !== 403 || a.json.problems?.[0]?.code !== "SERVE_KEY_NEEDS_SERVER_MODE") wrong.push(`${q.label}: ${q.sql} -> ${a.status}`);
+    }
+    expect(wrong).toEqual([]);
+    expect(listing(r.p.root)).toEqual(before);
+    expect(readFileSync(r.p.database).length).toBe(dbBefore);
+  }, 120_000);
+
+  test("it is not a 401: the key is valid, and a removed or made-up key still is one; the app token reads every table as it always did", async () => {
+    const bob = r.key("bob");
+    r.keys.remove("bob");
+    for (const bearer of [bob, "croftkey_" + "A".repeat(43), "not-a-token"]) {
+      const a = await r.call(bearer, "SELECT 1");
+      expect(a.status).toBe(401);
+      expect(a.json.problems[0].code).toBe("SERVE_UNAUTHORIZED");
+    }
+    for (const sql of ["SELECT count(*) AS n FROM orders", "SELECT count(*) AS n FROM payments", "SELECT value FROM secrets"]) expect((await r.call(TOKEN, sql)).status, sql).toBe(200);
+    // A key is for /query only, so /status and /health stay the app token's, as they always were.
+    for (const path of ["/status", "/health"]) expect((await r.call(alice, "", {}, path)).status, path).toBe(403);
+  }, 60_000);
+
+  test("the engine refuses a query that carries a key's scope itself, whatever the HTTP layer did: the second guard", async () => {
+    for (const tables of [[...SHARED], []]) {
+      const e = await r.engine.query({ sql: "SELECT 1", params: [], limit: 10, scope: { key: "alice", tables } }).catch((x: Error) => x);
+      expect((e as { code?: string }).code).toBe("SERVE_KEY_NEEDS_SERVER_MODE");
+    }
+    expect((await r.engine.query({ sql: "SELECT count(*) AS n FROM orders", params: [], limit: 10 })).rows).toEqual([{ n: 20 }]);
+  }, 60_000);
+
+  test("it is refused at once, not queued behind a writer: the app token waits for the write and is told to retry, the key is told what to turn on", async () => {
     const p = await makeProject({ config: { serve: { sharedTables: [...SHARED] } }, seed: WAREHOUSE_SQL });
     const engine = await openServeEngine({ root: p.root, resources: { threads: 2 }, queueMs: 400, graceMs: 100 });
     rigs.engines.push(engine);
-    const r = await rigs.rig(p, engine);
-    const key = r.key("alice");
-    expect((await r.call(key, "SELECT 1")).status).toBe(200);
+    const w = await rigs.rig(p, engine);
+    const key = w.key("alice");
     const idle = spawnIdle();
     writeIntent(p.stateDir, idle.proc.pid!);
     try {
       await until("the engine steps aside", () => engine.status().state !== "open", 10_000);
-      for (const bearer of [key, TOKEN]) {
-        const a = await r.call(bearer, "SELECT count(*) AS n FROM orders");
-        expect(a.status).toBe(503);
-        expect(a.json.problems[0].code).toBe("SERVE_UNAVAILABLE");
-      }
-      expect(r.log.map((e) => e.outcome).slice(-1)).toEqual(["SERVE_UNAVAILABLE"]);
+      const t = performance.now();
+      const refused = await w.call(key, "SELECT count(*) AS n FROM orders");
+      expect(refused.status).toBe(403);
+      expect(performance.now() - t).toBeLessThan(300);
+      const waited = await w.call(TOKEN, "SELECT count(*) AS n FROM orders");
+      expect(waited.status).toBe(503);
+      expect(waited.json.problems[0].code).toBe("SERVE_UNAVAILABLE");
     } finally {
       idle.proc.kill("SIGKILL");
     }

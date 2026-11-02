@@ -52,6 +52,7 @@ export const CODES = {
   CONFIG_INVALID: { category: "project", severity: "error", exit: 2 },
   DB_NOT_FOUND: { category: "project", severity: "error", exit: 2 },
   SERVE_NO_SHARED_TABLES: { category: "project", severity: "error", exit: 2 },
+  SERVE_KEY_NEEDS_SERVER_MODE: { category: "project", severity: "error", exit: 2 },
   SERVE_KEY_EXISTS: { category: "project", severity: "error", exit: 2 },
   SERVE_KEY_NOT_FOUND: { category: "project", severity: "error", exit: 2 },
   HTTP_ERROR: { category: "run", severity: "error", exit: 1 },
@@ -103,6 +104,8 @@ export const CODES = {
   EXTENSION_LOAD_FAILED: { category: "environment", severity: "error", exit: 2 },
   LAKE_ATTACH_FAILED: { category: "environment", severity: "error", exit: 2 },
   SERVER_MODE_COPY_COSTLY: { category: "environment", severity: "error", exit: 2 },
+  QUACK_LISTEN_FAILED: { category: "environment", severity: "error", exit: 2 },
+  QUACK_PLAINTEXT_NOT_ACCEPTED: { category: "environment", severity: "error", exit: 2 },
   SERVE_KEYS_UNREADABLE: { category: "environment", severity: "error", exit: 2 },
   CLAUDE_FILES_OUTDATED: { category: "environment", severity: "warning", exit: 0 },
   SCHEDULER_STALE: { category: "environment", severity: "warning", exit: 0 },
@@ -137,6 +140,7 @@ export const CODES = {
   DB_ON_SYNCED_FOLDER: { category: "warning", severity: "warning", exit: 0 },
   TZDATA_MISMATCH: { category: "warning", severity: "warning", exit: 0 },
   READ_COPY_NOT_CLONED: { category: "warning", severity: "warning", exit: 0 },
+  SERVER_MODE_OFF_FOR_KEYS: { category: "warning", severity: "warning", exit: 0 },
 } as const satisfies Record<string, CodeInfo>;
 
 export type Code = keyof typeof CODES;

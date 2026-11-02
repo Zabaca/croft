@@ -26,14 +26,21 @@
 // Server mode (D119) runs the same worker as the readers' process: `open` with `readers` makes an in-memory
 // instance (never the live file), loads quack and httpfs by path, attaches the read copy READ_ONLY as `wh`, and
 // locks it down to the copy's path (db/modes.ts, kind "readers"). Every connection then runs `USE wh`, so the gate and
-// the queries see the copy exactly as they see the live file in file mode. `swap` takes a refreshed copy in: it
-// removes any `<copy>.wal` (a valid one would be replayed onto the new copy), DETACHes `wh` and ATTACHes the new file,
-// 2 to 10 ms [V: 2.0.0]. A connection's `USE wh` is by name, so it follows the new file; a query that starts meanwhile
-// waits for the swap, and one that fails because it straddled it is run again, once. A query already reading the old
+// the queries see the copy exactly as they see the live file in file mode. `swap` takes a refreshed copy in without a gap
+// (D129): it removes any `<copy>.wal` (a valid one would be replayed onto the new copy), attaches the new file under the other
+// of two names (`wh`, `wh2`) beside the old one, points the views at it in one transaction, switches the app token's
+// connections to the new name as they are taken, and then detaches the old file. A query that fails because it straddled
+// the switch is run again, once. A query already reading the old
 // file finishes on it. A start or a swap that fails ends this process (the instance is part set up, and is never
 // reused); croft serve replaces it (after a backoff for a start, at once for a swap it killed). The instance stays
 // referenced for the process's whole life:
-// Quack's listener, once slice 4 starts one, stops when its instance is collected [V: 2.0.0].
+// Quack's listener stops when its instance is collected [V: 2.0.0].
+//
+// Quack (D125, option 06 slice 4): with `quack` in the open message the process also registers croft's two hooks in its
+// in-memory database and starts Quack's listener before the lock (serve/quack-listener.ts), so a person's DuckDB 2.0 attaches
+// with a key and reads the shared tables' views and the as-of view (`_croft_as_of`, rebuilt at every swap). `keys` replaces
+// the list of keys the hooks accept (croft serve sends it when the keys file changes, D126), and the process reports each
+// sign-in and query (`quack`) and a query past the deadline (`quack_overdue`, which croft serve answers by killing the process).
 import type { DuckDBConnection, DuckDBInstance, DuckDBPreparedStatement, DuckDBResult } from "@duckdb/node-api";
 import { chmodSync, existsSync, rmSync } from "node:fs";
 import { CroftError } from "../core/errors.ts";
@@ -46,19 +53,34 @@ import { mapQueryError, toDuck, wireSafe } from "../read/select.ts";
 import { tooManyRows } from "../read/wire.ts";
 import type { CatalogSnapshot } from "../sql/gate-core.ts";
 import { gateSelect, loadCatalog } from "../sql/gate.ts";
+import { AS_OF_VIEW } from "./quack-address.ts";
+import type { QuackEvent, QuackKey } from "./quack-access.ts";
+import { QuackListener } from "./quack-listener.ts";
 
 /** Messages croft serve sends. */
 export type ToWorker =
   /** `path` is the warehouse, or with `readers` the read copy (server mode: the readers' process, an in-memory
    *  instance with the copy attached read-only; the folders are the extension files' and the secret folder's). */
-  | { op: "open"; path: string; spec: SandboxSpec; protect: string[]; readers?: { extensionDir: string; secretDir: string; shared: string[] } }
-  /** Server mode: the copy at `path` was replaced; detach the old file and attach the new one. */
-  | { op: "swap" }
+  | { op: "open"; path: string; spec: SandboxSpec; protect: string[]; readers?: ReadersOpen }
+  /** Server mode: the copy at `path` was replaced; detach the old file and attach the new one. `asOf` is the new copy's as-of time. */
+  | { op: "swap"; asOf: string }
+  /** Server mode: the keys Quack accepts are now these (a key removed here is refused on its session's next query). */
+  | { op: "keys"; keys: QuackKey[] }
   | { op: "query"; id: number; sql: string; params: unknown[]; limit: number; maxRows: number; maxBytes: number; shared?: string[] }
   /** Interrupt query `id` (repeated every 20 ms while it runs); ignored once it has settled. */
   | { op: "interrupt"; id: number }
   /** Disconnect every connection: the file is about to be released (the engine then kills this process). */
   | { op: "disconnect" };
+
+/** What the readers' process is opened with: the extension files and secret folder, the shared tables, the copy's as-of time and,
+ *  to listen for DuckDB clients, Quack's address and the keys it accepts. */
+export interface ReadersOpen {
+  extensionDir: string;
+  secretDir: string;
+  shared: string[];
+  asOf: string;
+  quack?: { host: string; port: number; queryTimeoutMs: number; maxConcurrent: number; keys: QuackKey[] };
+}
 
 /** An error, as it crosses the process boundary. */
 export type WireError =
@@ -73,14 +95,18 @@ export type WireError =
  *  resident set so far, in bytes. */
 export type FromWorker =
   | { op: "ready"; pid: number }
-  | { op: "opened"; conns: number }
+  | { op: "opened"; conns: number; quack?: { uri: string } }
   | { op: "open_failed"; error: WireError }
   | { op: "swapped"; conns: number }
   /** The swap failed: this process is part set up and exits at once; croft serve starts another. */
   | { op: "swap_failed"; error: WireError }
   | { op: "answer"; id: number; conns: number; peakRss: number; columns: ColumnInfo[]; rowsJson: string; rowCount: number; tables: string[] }
   | { op: "failed"; id: number; conns: number; peakRss: number; error: WireError }
-  | { op: "disconnected"; conns: number };
+  | { op: "disconnected"; conns: number }
+  /** Quack: a person signed in, or a query was answered or refused (never the SQL or the key). */
+  | { op: "quack"; event: QuackEvent }
+  /** Quack: a query has run past the deadline; croft serve ends this process. */
+  | { op: "quack_overdue"; connection: string; ms: number };
 
 /** What answer() needs besides the SQL. */
 export interface AnswerOptions {
@@ -237,9 +263,13 @@ class Host {
   private swapping: Promise<void> | null = null;
   /** Swaps completed. A query that fails with another count than it started with straddled one. */
   private epoch = 0;
+  /** The name the read copy is attached under now: `wh`, or `wh2` after a swap (D129). */
+  private alias = READ_COPY_ALIAS;
   /** The tables the project shares with keys, and which of them have a view in the readers' in-memory database now. */
   private shared: string[] = [];
   private views: string[] = [];
+  /** Quack's hooks and listener, when the process serves DuckDB clients. */
+  private quack: QuackListener | null = null;
   /** Catalog snapshots, one per way of reading the file (the app token's `wh`, a key's views, the live file), each good for
    *  the epoch it was loaded in: the file cannot change under a worker, and a swap moves the epoch on. */
   private readonly catalogs = new Map<string, { epoch: number; snapshot: Promise<CatalogSnapshot> }>();
@@ -254,7 +284,10 @@ class Host {
         void this.open(m);
         return;
       case "swap":
-        void this.swap();
+        void this.swap(m.asOf);
+        return;
+      case "keys":
+        this.quack?.access.setKeys(m.keys);
         return;
       case "query":
         // Registered before anything awaits, so an interrupt that follows at once finds it.
@@ -283,15 +316,28 @@ class Host {
         // beside it would be replayed in memory by the attach, so none is there when it attaches.
         rmSync(`${m.path}.wal`, { force: true });
         this.instance = await openMemoryInstance();
-        this.spec = readersSpec(m.spec, m.path, m.readers);
+        if (m.readers.quack) {
+          const q = m.readers.quack;
+          this.quack = new QuackListener({
+            host: q.host, port: q.port, queryTimeoutMs: q.queryTimeoutMs, maxConcurrent: q.maxConcurrent, shared: m.readers.shared, keys: q.keys,
+            emit: (event) => this.send({ op: "quack", event }),
+            overdue: (o) => this.send({ op: "quack_overdue", ...o }),
+          });
+        }
+        this.spec = readersSpec(m.spec, m.path, { ...m.readers, ...(this.quack ? { prepare: (c: DuckDBConnection) => this.quack!.prepare(c) } : {}) });
         this.path = m.path;
         this.protect = m.protect;
         this.key = READERS_KEY;
         lockCopy(m.path);
         this.admin = await connect(this.instance, this.spec, this.key); // checks the files, loads, attaches, locks
-        await this.refuseWal(this.admin);
+        await this.refuseWal(this.admin, this.alias);
         this.shared = m.readers.shared;
-        await this.makeViews(this.admin);
+        await this.makeViews(this.admin, m.readers.asOf, this.alias);
+        if (this.quack) {
+          await this.quack.refresh(this.admin, this.views);
+          // The deadline's look at the running queries has a connection of its own: the admin one is busy swapping.
+          this.quack.watch(await connect(this.instance, this.spec, this.key));
+        }
       } else {
         this.instance = (await openInstance(m.path, "read_only")).instance;
         this.key = m.path;
@@ -306,7 +352,7 @@ class Host {
       } finally {
         this.give(conn);
       }
-      this.send({ op: "opened", conns: this.all.size });
+      this.send({ op: "opened", conns: this.all.size, ...(this.quack?.uri ? { quack: { uri: this.quack.uri } } : {}) });
     } catch (e) {
       // The instance, if it opened, stays as it is: the engine kills this worker. A readers' process also ends itself,
       // since the instance is part set up and is never reused.
@@ -317,18 +363,24 @@ class Host {
 
   /** A read-only attach makes no WAL. One that is there right after it appeared while the copy was attached, so something
    *  had it open for writing: detach, and fail (the process ends and is replaced; the new one removes the file first). */
-  private async refuseWal(admin: DuckDBConnection): Promise<void> {
+  private async refuseWal(admin: DuckDBConnection, alias: string): Promise<void> {
     if (!existsSync(`${this.path}.wal`)) return;
     try {
-      await admin.run(`DETACH ${READ_COPY_ALIAS}`);
+      await admin.run(`DETACH ${alias}`);
     } catch {
       // The process ends either way.
     }
     throw new Error("a WAL appeared beside the read copy while it was being attached, so it is not served");
   }
 
-  /** Take in the refreshed copy: detach the old file and attach the one now at the same path. */
-  private async swap(): Promise<void> {
+  /**
+   * Take in the refreshed copy without a gap (D129). The new file is attached under the other of two names (`wh`, `wh2`) while
+   * the old one is still attached [V: 2.0.0: the same path attaches twice under two names, and each reads its own file after
+   * a rename]; its format is checked; the views of the shared tables and the as-of view are pointed at it in one transaction,
+   * so a Quack session sees the old copy or the new one and never neither; the app token's connections switch to the new
+   * name as they are taken; and only then is the old one detached. A query already reading the old file finishes on it.
+   */
+  private async swap(asOf: string): Promise<void> {
     const admin = this.admin;
     if (!admin) {
       this.send({ op: "swap_failed", error: toWire(new Error("this worker is not a readers' process")) });
@@ -337,19 +389,23 @@ class Host {
     const done = (async () => {
       rmSync(`${this.path}.wal`, { force: true });
       lockCopy(this.path);
-      await admin.run(`DETACH ${READ_COPY_ALIAS}`);
-      await admin.run(`ATTACH ${sqlString(this.path)} AS ${READ_COPY_ALIAS} (READ_ONLY)`);
-      await this.refuseWal(admin);
-      await this.makeViews(admin);
+      const old = this.alias;
+      const next = old === READ_COPY_ALIAS ? SECOND_COPY_ALIAS : READ_COPY_ALIAS;
+      await admin.run(`ATTACH ${sqlString(this.path)} AS ${next} (READ_ONLY)`);
+      await this.refuseWal(admin, next);
       // A copy a newer croft wrote is refused here as it is when the process opens (DB_NEWER_FORMAT): the process ends,
       // and the one that replaces it reports the same until the copy is one this croft reads.
-      const conn = await this.take();
+      const conn = await this.take(next);
       try {
         await checkFormat(sqlOn(conn, this.spec!.timezone));
       } finally {
         this.give(conn);
       }
+      await this.makeViews(admin, asOf, next);
+      await this.quack?.refresh(admin, this.views);
+      this.alias = next;
       this.epoch++;
+      await admin.run(`DETACH ${old}`);
     })();
     this.swapping = done.catch(() => {});
     try {
@@ -372,11 +428,12 @@ class Host {
       let a: Answer | null = null;
       // A key's query works in the views of the shared tables; the app token's on the copy itself.
       const scoped = m.shared !== undefined;
-      const db = scoped ? READERS_VIEWS_DB : READ_COPY_ALIAS;
       for (let attempt = 0; a === null; attempt++) {
         const epoch = this.epoch;
+        // The copy is attached under one of two names, and a swap moves it to the other (D129).
+        const db = scoped ? READERS_VIEWS_DB : this.alias;
         try {
-          // A swap in progress is waited for: between its DETACH and its ATTACH there is no `wh` to read.
+          // A swap in progress is waited for: the app token's connections move to the new name when it is done.
           if (this.swapping) await this.swapping;
           conn = await this.take(db);
           q.conn = conn;
@@ -408,7 +465,7 @@ class Host {
   }
 
   /** A connection, working in `db` when this is the readers' process (the copy for the app token, the views for a key). */
-  private async take(db: string = READ_COPY_ALIAS): Promise<DuckDBConnection> {
+  private async take(db: string = this.alias): Promise<DuckDBConnection> {
     const reuse = this.idle.pop();
     const conn = reuse ?? await connect(this.instance!, this.spec!, this.key);
     if (this.admin && this.using.get(conn) !== db) {
@@ -454,23 +511,41 @@ class Host {
   /**
    * One view in the readers' in-memory database for each shared table the copy has: `CREATE VIEW memory.main.t AS SELECT *
    * FROM wh.main.t`. A key's connection works in that database, so the names it can type are those views, and a hidden
-   * table is not a name there at all (the gate's catalog snapshot says the same, D123). Views from before a swap are
-   * dropped first, and made again from the new copy; a shared table the copy lacks has no view. DDL in the in-memory
-   * database is not refused by the lock [V: 2.0.0].
+   * table is not a name there at all (the gate's catalog snapshot says the same, D123), and a Quack session, which always
+   * starts in this database, can name nothing else (D125). After a swap each view is made again from the new copy in place
+   * (CREATE OR REPLACE, so a Quack session mid-swap never finds the name gone) and the view of a shared table the new copy
+   * lacks is dropped. DDL in the in-memory database is not refused by the lock [V: 2.0.0].
+   *
+   * The as-of view, `_croft_as_of`, holds one row, the copy's as-of time (`asOf`, in the project offset), for a DuckDB client
+   * to read; its name starts with an underscore, which no asset's name can. It is not in `views`, which are the shared tables.
    */
-  private async makeViews(admin: DuckDBConnection): Promise<void> {
-    for (const name of this.views) await admin.run(`DROP VIEW IF EXISTS ${READERS_VIEWS_DB}.main.${quote(name)}`);
-    this.views = [];
-    if (!this.shared.length) return;
-    const reader = await admin.runAndReadAll(
-      `SELECT table_name FROM duckdb_tables() WHERE database_name = ${sqlString(READ_COPY_ALIAS)} AND schema_name = 'main' AND NOT temporary`);
-    const have = new Map(reader.getRowsJS().map((r) => [String(r[0]).replace(/[A-Z]/g, (c) => c.toLowerCase()), String(r[0])] as const));
-    for (const name of this.shared) {
-      const actual = have.get(name);
-      if (actual === undefined) continue;
-      await admin.run(`CREATE VIEW ${READERS_VIEWS_DB}.main.${quote(name)} AS SELECT * FROM ${READ_COPY_ALIAS}.main.${quote(actual)}`);
-      this.views.push(name);
+  private async makeViews(admin: DuckDBConnection, asOf: string, alias: string): Promise<void> {
+    const next: string[] = [];
+    const reader = this.shared.length
+      ? await admin.runAndReadAll(`SELECT table_name FROM duckdb_tables() WHERE database_name = ${sqlString(alias)} AND schema_name = 'main' AND NOT temporary`)
+      : null;
+    const have = new Map((reader?.getRowsJS() ?? []).map((r) => [String(r[0]).replace(/[A-Z]/g, (c) => c.toLowerCase()), String(r[0])] as const));
+    // One transaction: the views change together, so a session's query sees the old copy's or the new one's, never a name gone.
+    await admin.run("BEGIN TRANSACTION");
+    try {
+      for (const name of this.shared) {
+        const actual = have.get(name);
+        if (actual === undefined) continue;
+        await admin.run(`CREATE OR REPLACE VIEW ${READERS_VIEWS_DB}.main.${quote(name)} AS SELECT * FROM ${alias}.main.${quote(actual)}`);
+        next.push(name);
+      }
+      await admin.run(`CREATE OR REPLACE VIEW ${READERS_VIEWS_DB}.main.${AS_OF_VIEW} AS SELECT ${sqlString(asOf)}::TIMESTAMPTZ AS as_of`);
+      for (const name of this.views) if (!next.includes(name)) await admin.run(`DROP VIEW IF EXISTS ${READERS_VIEWS_DB}.main.${quote(name)}`);
+      await admin.run("COMMIT");
+    } catch (e) {
+      try {
+        await admin.run("ROLLBACK");
+      } catch {
+        // The process ends either way.
+      }
+      throw e;
     }
+    this.views = next;
   }
 
   private give(conn: DuckDBConnection): void {
@@ -493,6 +568,9 @@ class Host {
 const sqlString = (s: string) => `'${s.replaceAll("'", "''")}'`;
 const quote = (s: string) => `"${s.replaceAll('"', '""')}"`;
 
+/** The other name the read copy is attached under (D129): a swap attaches the new file under the name the old one does not have. */
+const SECOND_COPY_ALIAS = "wh2";
+
 /** The connection factory's key for the readers' process's one instance. */
 export const READERS_KEY = ":memory:readers";
 
@@ -513,8 +591,8 @@ export function lockCopy(path: string): void {
 /** The sandbox of the readers' process: the serve profile with the `readers` mode, which attaches `copy` read-only and
  *  allows its path and no folder (db/modes.ts). The one place it is built, so a test that opens the same instance to try
  *  SQL past the gate (serve/readers-session-testkit.ts) cannot drift from the worker. */
-export function readersSpec(spec: SandboxSpec, copy: string, r: { extensionDir: string; secretDir: string }): SandboxSpec {
-  return { ...spec, mode: { kind: "readers", extensionDir: r.extensionDir, secretDir: r.secretDir, copy } };
+export function readersSpec(spec: SandboxSpec, copy: string, r: { extensionDir: string; secretDir: string; prepare?: (conn: DuckDBConnection) => Promise<void> }): SandboxSpec {
+  return { ...spec, mode: { kind: "readers", extensionDir: r.extensionDir, secretDir: r.secretDir, copy, ...(r.prepare ? { prepare: r.prepare } : {}) } };
 }
 
 /**

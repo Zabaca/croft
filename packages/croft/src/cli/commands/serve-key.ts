@@ -5,15 +5,23 @@
 //   Giving a person access to data is the user's call, so the skill puts `add` on its ask-first list.
 // - list: the names, when each was made and last used; never a key.
 // - remove <name>: the key is refused on its next request. Taking access away needs no asking.
-// All three work with croft serve running or not, and with --json: croft serve reads the keys file on every request
-// (serve/keys.ts), so a key added or removed here is honoured by a running server at once, with no restart.
-import { existsSync } from "node:fs";
-import { basename, extname } from "node:path";
-import { CroftError } from "../../core/errors.ts";
+// All three work with croft serve running or not, and with --json: croft serve reads the keys file on every HTTP request
+// (serve/keys.ts), so a key added or removed here is honoured by a running server at once, with no restart; its readers' process
+// has the list within a poll (250 ms, D126) for the Quack sessions that outlive a request.
+//
+// In server mode (D125) a key also signs in to Quack, from a person's DuckDB 2.0. What a person needs to attach is in the data
+// as `quack` (the address, the ATTACH statement, the name of the as-of view), so an agent gets it as `--json` too, and the
+// human text prints the same.
+import { existsSync, readFileSync } from "node:fs";
+import { basename, extname, join } from "node:path";
+import { CroftError, problem } from "../../core/errors.ts";
+import type { Problem } from "../../core/types.ts";
 import { formatInstant } from "../../core/time.ts";
 import type { Project } from "../../project/root.ts";
 import { didYouMean } from "../../project/suggest.ts";
+import { liveServer } from "../../read/locate.ts";
 import { type KeyInfo, KeyStore } from "../../serve/keys.ts";
+import { connectSnippet, type QuackConnect } from "../../serve/quack-address.ts";
 import type { CommandResult, Ctx } from "../command.ts";
 import { table } from "../render.ts";
 
@@ -39,8 +47,13 @@ export type ServeKeyData =
     unknownTables: string[];
     /** The keys file, relative to the project when inside it: only the key's hash is kept there. */
     file: string;
+    /** Whether server mode is on in croft.json. A key works only there (D128): with it off the key is made all the same, so a
+     *  person can be set up first, and croft serve refuses it until server mode is on. */
+    serverMode: boolean;
+    /** Server mode only: how to attach from a DuckDB 2.0 client, with the key in the statement. */
+    quack?: QuackConnect;
   }
-  | { action: "list"; keys: ServeKeyInfo[]; sharedTables: string[]; unknownTables: string[]; file: string }
+  | { action: "list"; keys: ServeKeyInfo[]; sharedTables: string[]; unknownTables: string[]; file: string; serverMode: boolean; quack?: QuackConnect }
   | { action: "remove"; name: string; createdAt: string; lastUsedAt: string | null; remaining: number };
 
 const ACTIONS = ["add", "list", "remove"] as const;
@@ -59,6 +72,23 @@ export function unknownSharedTables(project: Project): string[] {
     }
   }
   return project.config.serve.sharedTables.filter((t) => !names.has(t));
+}
+
+/** Where a DuckDB 2.0 client attaches, in server mode: the address croft serve recorded if it runs (a port of 0 is only known
+ *  then), else the configured one. Undefined outside server mode, where there is no Quack. */
+function quackFor(project: Project, key: string | null): QuackConnect | undefined {
+  const sm = project.config.serverMode;
+  if (!sm.enabled) return undefined;
+  let running: string | null = null;
+  if (liveServer(project.paths.stateDir)) {
+    try {
+      const rec = JSON.parse(readFileSync(join(project.paths.stateDir, "serve.json"), "utf8")) as { quack?: { uri?: unknown } };
+      if (typeof rec.quack?.uri === "string") running = rec.quack.uri;
+    } catch {
+      // The record is read for the address only; a damaged one means the configured address is shown.
+    }
+  }
+  return connectSnippet({ host: sm.quackHost, port: sm.quackPort }, running, key);
 }
 
 /** `croft serve key <action> [name]`: the positionals after `key`. */
@@ -84,14 +114,17 @@ export function runKey(ctx: Ctx, rest: readonly string[]): CommandResult<ServeKe
   const sharedTables = [...project.config.serve.sharedTables];
   const unknownTables = unknownSharedTables(project);
   if (action === "list") {
-    return { data: { action: "list", keys: store.list().map((k) => view(k, project)), sharedTables, unknownTables, file }, problems: [], next: [] };
+    const quack = quackFor(project, null);
+    const keys = store.list();
+    return { problems: keys.length ? serverModeProblems(project, "every key") : [], next: [], data: { action: "list", keys: store.list().map((k) => view(k, project)), sharedTables, unknownTables, file, serverMode: project.config.serverMode.enabled, ...(quack ? { quack } : {}) } };
   }
   const name = names[0]!;
   if (action === "add") {
     const made = store.add(name);
+    const quack = quackFor(project, made.key);
     return {
-      data: { action: "add", name, key: made.key, createdAt: formatInstant(new Date(made.info.createdAt), project.timezone), sharedTables, unknownTables, file },
-      problems: [], next: [],
+      data: { action: "add", name, key: made.key, createdAt: formatInstant(new Date(made.info.createdAt), project.timezone), sharedTables, unknownTables, file, serverMode: project.config.serverMode.enabled, ...(quack ? { quack } : {}) },
+      problems: serverModeProblems(project, "this key"), next: [],
     };
   }
   const gone = store.remove(name);
@@ -118,6 +151,34 @@ export function unknownLine(unknown: readonly string[]): string[] {
   return unknown.length ? [`serve.sharedTables names no asset called ${unknown.join(", ")} (a typo?): a key cannot read ${unknown.length === 1 ? "it" : "them"}`] : [];
 }
 
+/** The warning problem for keys made with server mode off (D128): exit 0, since the key is made all the same. */
+function serverModeProblems(project: Project, what: string): Problem[] {
+  if (project.config.serverMode.enabled) return [];
+  return [problem("SERVER_MODE_OFF_FOR_KEYS", {
+    message: `serverMode.enabled is off in croft.json, so ${what} is refused until server mode is on`,
+    hint: 'a key works only when croft serve runs in server mode; the key is kept, so a person can be set up first. Turning server mode on is the user\'s decision (croft docs server-mode)',
+    fix: { kind: "manual", description: 'ask the user whether to set "serverMode": {"enabled": true} in croft.json, then restart croft serve', requiresHuman: true },
+    file: "croft.json",
+  })];
+}
+
+/** The lines that tell a person how to attach from DuckDB 2.0 (croft docs quack). */
+function quackLines(q: QuackConnect | undefined, shared: readonly string[]): string[] {
+  if (!q) return [];
+  if (!q.attach) return ["From a DuckDB 2.0 client, over Quack: croft serve picks the port (serverMode.quackPort is 0); its banner shows the address to attach to."];
+  return [
+    "From a DuckDB 2.0 client, over Quack (croft docs quack):",
+    `  ${q.attach};`,
+    `  SELECT * FROM croft.${shared[0] ?? "<shared table>"};   -- the shared tables are views of the read copy`,
+    `  SELECT as_of FROM croft.${q.asOfView};   -- when the copy was taken`,
+    ...(q.loopback ? [] : ["Quack is not on loopback: it must sit behind an HTTPS reverse proxy, and the client attaches to the proxy's name with the port written out."]),
+  ];
+}
+
+function quackAddressLine(q: QuackConnect): string {
+  return q.uri ? `DuckDB 2.0 clients attach over Quack at ${q.uri} (croft docs quack)` : "Quack: croft serve picks the port (serverMode.quackPort is 0); its banner shows it";
+}
+
 /** The human text of a key command. */
 export function formatKey(d: ServeKeyData): string {
   if (d.action === "add") {
@@ -132,6 +193,7 @@ export function formatKey(d: ServeKeyData): string {
       reads,
       ...unknownLine(d.unknownTables),
       "Send it as Authorization: Bearer <key> to croft serve's POST /query, or give it to query() as { token }.",
+      ...quackLines(d.quack, d.sharedTables),
       `Removing it is one command: croft serve key remove ${d.name}`,
     ].join("\n");
   }
@@ -139,7 +201,7 @@ export function formatKey(d: ServeKeyData): string {
     if (!d.keys.length) return `no keys yet; croft serve key add <name> makes one${d.sharedTables.length ? "" : " (and serve.sharedTables in croft.json names the tables it reads)"}`;
     const t = table(["name", "made", "last used"], d.keys.map((k) => [k.name, k.createdAt, k.lastUsedAt ?? "never"]));
     const reads = d.sharedTables.length ? `keys read: ${d.sharedTables.join(", ")}` : "serve.sharedTables names no table, so every key query is refused";
-    return [t.text, reads, ...unknownLine(d.unknownTables)].join("\n");
+    return [t.text, reads, ...unknownLine(d.unknownTables), ...(d.quack ? [quackAddressLine(d.quack)] : [])].join("\n");
   }
   return `removed the key for ${d.name} (made ${d.createdAt}); it is refused on its next request, croft serve running or not. ${d.remaining} key${d.remaining === 1 ? "" : "s"} left`;
 }
