@@ -156,7 +156,7 @@ describe("journey 21: croft serve", () => {
     ]);
     expect(`${stopped.stdout}${stopped.stderr}`).not.toContain(rec.token);
     // Apps read the file directly again once croft serve is gone; a lake has no file, and an app says so (LAKE_DIRECT_READ).
-    if (LAKE) expect(app(p)).toMatchObject({ code: "LAKE_DIRECT_READ" });
+    if (LAKE) expect(app(p, LAKE === "local" ? { CROFT_TEST_LAKE: "local", CROFT_TEST_HARNESS: "1" } : {})).toMatchObject({ code: "LAKE_DIRECT_READ" }); // (a local lake is the children's switch; the app is told too)
     else expect(app(p).rows).toHaveLength(4);
     await expect(fetch(`${rec.url}/health`)).rejects.toThrow();
     expect((await p.json(["status"], home)).json.data.serve).toBeUndefined();
