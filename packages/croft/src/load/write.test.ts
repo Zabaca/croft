@@ -1214,6 +1214,39 @@ describe("counting what a keyed write changed: classifying first gives the MERGE
     });
   }
 
+  test("physical order: added rows land in the order the batch yielded them (as a first load's do); the old MERGE put them in no order at all", async () => {
+    const ids = Array.from({ length: 600 }, (_, i) => (i * 7919) % 5003);   // a shuffled run of distinct ids
+    const first = ids.slice(0, 300), second = ids.slice(300);
+    const run = async (counting: Counting) => {
+      const w = warehouse();
+      const spec = { columns: { id: "BIGINT", v: "VARCHAR" } };
+      await load(w, "ordered", { ...spec, rows: first.map((id) => ({ id, v: `a${id}` })) }, { write: "merge", key: ["id"], now: T0, counting });
+      await load(w, "ordered", { ...spec, rows: [...first.slice(0, 50).map((id) => ({ id, v: `b${id}` })), ...second.map((id) => ({ id, v: `a${id}` }))] }, { write: "merge", key: ["id"], now: T1, counting });
+      return (await read<{ id: number | bigint }>(w, `SELECT id FROM ordered ORDER BY rowid`)).map((r) => Number(r.id));
+    };
+    const classify = await run("classify");
+    expect(classify.slice(0, 300)).toEqual(first);
+    expect(classify.slice(300)).toEqual(second);
+    // Same rows either way; only the MERGE's insertion order is arbitrary.
+    expect([...(await run("returning"))].sort((a, b) => a - b)).toEqual([...classify].sort((a, b) => a - b));
+  });
+
+  test("a key in the table twice, one copy already equal to the batch's row: that copy keeps its stamp, as under the MERGE", async () => {
+    const run = async (counting: Counting) => {
+      const w = warehouse();
+      const spec = { columns: { id: "BIGINT", title: "VARCHAR" } };
+      await load(w, "issues", { ...spec, rows: [{ id: 1, title: "a" }, { id: 2, title: "b" }] }, { write: "merge", key: ["id"], now: T0, counting });
+      await w.write("dup", (tx) => tx.exec(`INSERT INTO issues SELECT 2, 'B', _loaded_at FROM issues WHERE id = 2`), { runId: "r_dup" });
+      const r = await load(w, "issues", { ...spec, rows: [{ id: 2, title: "B" }, { id: 3, title: "c" }] }, { write: "merge", key: ["id"], now: T1, counting });
+      return { rows: r.rows, data: await read(w, `SELECT id, title, strftime(_loaded_at AT TIME ZONE 'UTC', '%H') AS h FROM issues ORDER BY id, h`) };
+    };
+    const returning = await run("returning");
+    const classify = await run("classify");
+    // (2, 'b') is brought to 'B' at T1; the copy that was 'B' already is left alone at T0.
+    expect(returning.data).toEqual([{ id: 1, title: "a", h: "10" }, { id: 2, title: "B", h: "10" }, { id: 2, title: "B", h: "11" }, { id: 3, title: "c", h: "11" }]);
+    expect(classify.data).toEqual(returning.data);
+  });
+
   test("a key that is in the table twice (changed outside croft): the batch is still merged, the table ends as the MERGE leaves it", async () => {
     const run = async (counting: Counting) => {
       const w = warehouse();

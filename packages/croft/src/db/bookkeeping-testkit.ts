@@ -5,21 +5,18 @@
 // it means in both. Test support, left out of the published package (package.json "files").
 import type { DuckDBConnection } from "@duckdb/node-api";
 import type { Sql } from "../core/types.ts";
-import { bookkeepingOf, defaultBookkeeping, fileDdl, logDdl, STATE_SPECS, type StateTableName } from "./bookkeeping.ts";
+import { ASSET_TABLES, bookkeepingOf, defaultBookkeeping, fileDdl, logDdl, STATE_SPECS, type StateTableName } from "./bookkeeping.ts";
 
 /** Whether this run of the suite uses the log adapter. */
 export const LOG_ADAPTER = defaultBookkeeping() === "log";
 
-/** The environment a test gives a croft it spawns, so the child follows the same adapter. */
+/** The environment a test gives a croft it spawns, so the child follows the same adapter: the switch and the harness mark
+ *  that lets it count (defaultBookkeeping()). Nothing when the run is on the file adapter. */
 export function bookkeepingEnv(): Record<string, string> {
-  return process.env.CROFT_BOOKKEEPING ? { CROFT_BOOKKEEPING: process.env.CROFT_BOOKKEEPING } : {};
+  return process.env.CROFT_BOOKKEEPING === "log" ? { CROFT_BOOKKEEPING: "log", CROFT_TEST_HARNESS: "1" } : {};
 }
 
-/** `describe.skipIf`-style switch for tests about the file adapter's own tables: old formats, primary keys. */
-export const FILE_ONLY = LOG_ADAPTER ? "the file adapter's own tables (this run uses the log adapter)" : false;
-
-const LOGGED = ["assets", "columns", "inputs", "files", "writes"] as const satisfies readonly StateTableName[];
-const isLogged = (t: string): t is (typeof LOGGED)[number] => (LOGGED as readonly string[]).includes(t);
+const isLogged = (t: string): t is (typeof ASSET_TABLES)[number] => (ASSET_TABLES as readonly string[]).includes(t);
 
 /** The column names of a bookkeeping table, in order. */
 export function columnNames(table: StateTableName): string[] {

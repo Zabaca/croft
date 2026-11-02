@@ -23,7 +23,7 @@ import { existsSync } from "node:fs";
 import { CroftError } from "../core/errors.ts";
 import { now as clockNow } from "../core/time.ts";
 import type { Problem, Sql } from "../core/types.ts";
-import { bookkeepingOf } from "../db/bookkeeping.ts";
+import { ASSET_TABLES, assetColumn, bookkeepingOf } from "../db/bookkeeping.ts";
 import { ensureState, hasState } from "../db/state.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
 import { quoteIdent, readTableSchema } from "../load/evolve.ts";
@@ -31,8 +31,6 @@ import { downstreamOf, replacedStamp, tableGeneration } from "./delete.ts";
 import { isoMicros, tableStats } from "./guards.ts";
 import { checkOutOfBand } from "./out-of-band.ts";
 import { listTrash, trashFailed, trashTable, type TrashEntry, type TrashKind, withTrashFile } from "./trash.ts";
-
-const STATE_TABLES = ["assets", "columns", "files", "inputs", "writes"] as const;
 
 /** The trash, newest first, for one asset or all. */
 export function listVersions(stateDir: string, asset?: string): TrashEntry[] {
@@ -286,8 +284,8 @@ export async function restoreVersion(warehouse: DuckWarehouse, version: TrashEnt
       const problems: Problem[] = [];
       if (impact.kind === "table") {
         await sql.exec(`CREATE OR REPLACE TABLE main.${quoteIdent(asset)} AS SELECT * FROM ${src}`);
-        for (const table of STATE_TABLES) {
-          const col = table === "assets" ? "name" : "asset";
+        for (const table of ASSET_TABLES) {
+          const col = assetColumn(table);
           await bk.remove(table, `${col} = $1`, [asset]);
           if (await hasTable(sql, alias, "_croft", table)) {
             await bk.insertSelect(table, `SELECT * FROM ${quoteIdent(alias)}._croft.${table} WHERE ${col} = $1`, [asset]);

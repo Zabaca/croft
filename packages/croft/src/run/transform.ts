@@ -734,7 +734,7 @@ async function commitChunk(i: StepInput, c: CommitInput): Promise<{ res: WriteRe
           ...(step.codeHash ? { codeHash: step.codeHash } : {}), behaviorHash: step.behaviorHash, pins: spec.pins,
           attempt: i.attempt, inputs: c.inputs, positions: c.positions,
           ...(checks ? { checks: c.unfinished ? (sql: Sql, ctx: CheckContext) => checks(sql, unfinishedChunk(ctx)) : checks } : {}),
-          ...(i.readBy ? { readBy: i.readBy } : {}), ...(i.now ? { now: i.now() } : {}),
+          ...(i.readBy ? { readBy: i.readBy } : {}), ...(i.now ? { now: i.now() } : {}), ...(i.counting ? { counting: i.counting } : {}),
         });
         // Read-only, but inside the transaction: a failed statement would abort it, so these stay simple.
         const keys = await jsonKeys(tx, batch, c.previous);

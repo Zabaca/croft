@@ -26,14 +26,13 @@ import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { now as clockNow } from "../core/time.ts";
 import type { Sql } from "../core/types.ts";
-import { stateObjects } from "../db/bookkeeping.ts";
+import { ASSET_TABLES, assetColumn, stateObjects } from "../db/bookkeeping.ts";
 import { CROFT_VERSION } from "../db/state.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
 import type { RunsDb } from "../history/runs-db.ts";
 import { currentDatabase, quoteIdent, quoteLiteral, readTableSchema } from "../load/evolve.ts";
 
 export const TRASH_DIR = "trash";
-const STATE_TABLES = ["assets", "columns", "files", "inputs", "writes"] as const;
 
 /** How long the trash keeps versions (§6): 30 days, and each asset's 5 newest whatever their age. */
 export const TRASH_RETENTION = { days: 30, versions: 5 } as const;
@@ -121,9 +120,9 @@ export async function trashTable(warehouse: DuckWarehouse, asset: string, reason
         await sql.exec(`CREATE TABLE ${t}.main.${quoteIdent(asset)} AS SELECT * FROM ${quoteIdent(db)}.main.${quoteIdent(asset)}${filter}`);
         await sql.exec(`CREATE SCHEMA ${t}._croft`);
         const have = await stateObjects(sql);
-        for (const table of STATE_TABLES) {
+        for (const table of ASSET_TABLES) {
           if (!have.has(table)) continue;
-          const col = table === "assets" ? "name" : "asset";
+          const col = assetColumn(table);
           await sql.exec(`CREATE TABLE ${t}._croft.${table} AS SELECT * FROM ${quoteIdent(db)}._croft.${table} WHERE ${col} = $1`, [asset]);
         }
         await sql.exec(`CREATE TABLE ${t}._croft.trash AS SELECT $1::VARCHAR AS asset, $2::VARCHAR AS reason, $3::VARCHAR AS run_id,

@@ -15,6 +15,7 @@ import type { Sql } from "../src/core/types.ts";
 import { DuckDBInstance } from "@duckdb/node-api";
 import { connect, instanceConfig } from "../src/db/connect.ts";
 import { extensionsReady } from "../src/db/extension-dir-testkit.ts";
+import { ensureState } from "../src/db/state.ts";
 import { closeAllWarehouses, LeaseSql, openWarehouse } from "../src/db/warehouse.ts";
 import { tableBatch } from "../src/load/table-batch.ts";
 import { type Counting, writeBatch } from "../src/load/write.ts";
@@ -148,7 +149,6 @@ async function main(): Promise<void> {
 async function lakeSection(log: (s?: string) => void): Promise<void> {
   const ext = extensionsReady(["sqlite", "ducklake"]);
   if (!ext.ready) { log(`lake section skipped: ${ext.skipReason}`); return; }
-  process.env.CROFT_BOOKKEEPING = "log"; // the lake's bookkeeping: an append-only log
   log("");
   log(`In a local lake (SQLite catalog, local folder), ${RUNS} runs per cell (median), the table seeded through croft's own write path:`);
   log("");
@@ -168,12 +168,13 @@ async function lakeSection(log: (s?: string) => void): Promise<void> {
   for (const sc of scenarios.filter((s) => !s.name.includes("1M") && s.name.includes(ONLY))) {
     const target = (runId: string) => ({ asset: "bench", write: sc.write, key: ["id"], runId, allowShrink: true });
     const croft: Record<Bucket | "whole", number[]> = { whole: [], merge: [], classify: [], insert: [], delete: [] };
-    const plain: { whole: number[]; merge: number[] } = { whole: [], merge: [] };
+    const plain: { whole: number[]; merge: number[]; del: number[] } = { whole: [], merge: [], del: [] };
     for (let run = 0; run < RUNS + 1; run++) {
       for (const step of ["croft", "plain"] as const) {
         const lake = await open();
         const { conn } = lake;
         await conn.run("BEGIN");
+        await ensureState(lake.sql, { bookkeeping: "log" }); // the lake's bookkeeping: an append-only log
         await lake.sql.exec(`CREATE TEMP TABLE seed_batch AS SELECT *, row_number() OVER () AS _croft_seq FROM (${select(0, sc.table, false)})`);
         await writeBatch(lake.sql, { batch: await tableBatch(lake.sql, { temp: "seed_batch", asset: "bench" }), target: target("r_seed"), kind: "ingest" });
         await conn.run("COMMIT");
@@ -192,18 +193,18 @@ async function lakeSection(log: (s?: string) => void): Promise<void> {
              WHEN MATCHED AND (t.v IS DISTINCT FROM s.v OR t.s IS DISTINCT FROM s.s OR t.g IS DISTINCT FROM s.g OR t.d IS DISTINCT FROM s.d)
                THEN UPDATE SET v = s.v, s = s.s, g = s.g, d = s.d, _loaded_at = now()
              WHEN NOT MATCHED THEN INSERT (id, v, s, g, d, _loaded_at) VALUES (s.id, s.v, s.s, s.g, s.d, now())`);
-          if (sc.write === "replace") await tx.exec(`DELETE FROM bench AS t WHERE NOT EXISTS (SELECT 1 FROM bench_batch AS s WHERE t.id = s.id)`);
+          if (sc.write === "replace") await tx.exec(`DELETE FROM bench AS __t WHERE NOT EXISTS (SELECT 1 FROM bench_batch AS __s WHERE __t.id = __s.id)`);
         }
         await conn.run("COMMIT");
         const whole = performance.now() - t0;
         lake.close();
         if (run === 0) continue;
         if (step === "croft") { croft.whole.push(whole); for (const b of Object.keys(t) as Bucket[]) croft[b].push(t[b]); }
-        else { plain.whole.push(whole); plain.merge.push(t.merge); }
+        else { plain.whole.push(whole); plain.merge.push(t.merge); plain.del.push(t.delete); }
       }
     }
     log(`| ${sc.name} | croft: classify, insert, merge, delete | ${median(croft.whole).toFixed(0)} | ${median(croft.classify).toFixed(0)} | ${median(croft.insert).toFixed(0)} | ${median(croft.merge).toFixed(0)} | ${median(croft.delete).toFixed(0)} |`);
-    log(`| ${sc.name} | one plain MERGE, nothing counted | ${median(plain.whole).toFixed(0)} | - | - | ${median(plain.merge).toFixed(0)} | - |`);
+    log(`| ${sc.name} | one plain MERGE, nothing counted | ${median(plain.whole).toFixed(0)} | - | - | ${median(plain.merge).toFixed(0)} | ${median(plain.del).toFixed(0)} |`);
   }
 }
 

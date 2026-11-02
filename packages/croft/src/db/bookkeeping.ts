@@ -54,17 +54,25 @@ export const STATE_SPECS = {
 
 export type StateTableName = keyof typeof STATE_SPECS;
 export const STATE_TABLE_NAMES = Object.keys(STATE_SPECS) as StateTableName[];
-/** The tables that keep a log in the log adapter; meta is a plain table in both. */
-export const LOGGED_TABLES = STATE_TABLE_NAMES.filter((t) => t !== "meta");
+/** The five tables of an asset's state (everything but meta): the ones keyed by asset, which the trash copies out and a
+ *  restore copies back, and the ones that keep a log in the log adapter. The one list of them. */
+export const ASSET_TABLES = ["assets", "columns", "inputs", "files", "writes"] as const satisfies readonly Exclude<StateTableName, "meta">[];
+/** The asset-keyed tables' column that names the asset: `name` in assets, `asset` in the others. */
+export const assetColumn = (t: (typeof ASSET_TABLES)[number]): string => (t === "assets" ? "name" : "asset");
 
 const keyOf = (t: StateTableName): readonly string[] => STATE_SPECS[t].key;
 const logOf = (t: StateTableName): string => `_croft.${t}_log`;
 
-/** The kind a new warehouse gets when nothing says otherwise. The log adapter exists for lake mode (option 07); until a
- *  lake can be attached (slice 2) this variable is the only way to ask for it, so the whole test suite can run on it.
- *  It decides only for a warehouse with no bookkeeping yet: a warehouse that has some keeps its kind. */
+/** The kind a new warehouse gets when nothing says otherwise: always the file, outside croft's own test harness.
+ *
+ *  The log adapter exists for lake mode (option 07). Until a lake can be attached (slice 2) the only way to get one is
+ *  CROFT_BOOKKEEPING=log, a switch for the test suite alone, so that the whole suite can run on the log with no Postgres. It is
+ *  honoured only when CROFT_TEST_HARNESS=1 is set as well, which tests/preload.ts sets for the test process and
+ *  bookkeepingEnv() (db/bookkeeping-testkit.ts) gives every croft a test spawns; the variable alone, in a user's shell, does
+ *  nothing, so no user can make a log warehouse before a lake gives them a path to one. It decides only for a warehouse with no
+ *  bookkeeping yet: a warehouse that has some keeps its kind. */
 export function defaultBookkeeping(env: NodeJS.ProcessEnv = process.env): BookkeepingKind {
-  return env.CROFT_BOOKKEEPING === "log" ? "log" : "file";
+  return env.CROFT_BOOKKEEPING === "log" && env.CROFT_TEST_HARNESS === "1" ? "log" : "file";
 }
 
 /** CREATE statements of the file adapter: the tables as every warehouse has had them since format 1. */
@@ -75,10 +83,10 @@ export function fileDdl(): string[] {
 /** The log adapter's tables and views, one statement each, by the name of the object it creates. */
 export function logDdl(): { name: string; ddl: string }[] {
   const out: { name: string; ddl: string }[] = [{ name: "meta", ddl: `CREATE TABLE IF NOT EXISTS _croft.meta (${STATE_SPECS.meta.columns})` }];
-  for (const t of LOGGED_TABLES) {
+  for (const t of ASSET_TABLES) {
     out.push({ name: `${t}_log`, ddl: `CREATE TABLE IF NOT EXISTS ${logOf(t)} (${STATE_SPECS[t].columns}, seq BIGINT, closed BOOLEAN)` });
   }
-  for (const t of LOGGED_TABLES) {
+  for (const t of ASSET_TABLES) {
     out.push({
       name: t,
       ddl: `CREATE VIEW IF NOT EXISTS _croft.${t} AS SELECT * EXCLUDE (seq, closed) FROM ${logOf(t)}
@@ -101,12 +109,9 @@ export async function stateObjects(sql: Sql): Promise<Set<string>> {
  *  tables make it a file; nothing (or only meta) is neither. */
 export function kindOfObjects(names: ReadonlySet<string>): BookkeepingKind | null {
   if (names.has("assets_log")) return "log";
-  if (LOGGED_TABLES.some((t) => names.has(t))) return "file";
+  if (ASSET_TABLES.some((t) => names.has(t))) return "file";
   return null;
 }
-
-/** One duplicate the log adapter's check found: the same key (and, in a log, the same number) twice. */
-export interface DuplicateKey { table: StateTableName; key: Record<string, unknown>; rows: number }
 
 /** Writes to the bookkeeping tables. Values are SQL expressions (`$1`, `CAST($4::JSON AS VARCHAR[])`, `now()`), and the
  *  statement's parameters are shared, so a caller writes the same text for either adapter. */
@@ -125,8 +130,6 @@ export interface Bookkeeping {
   rekey(table: StateTableName, column: string, from: string, to: string): Promise<void>;
   /** Insert the rows of a SELECT, by column name (a trash file's rows, a preview's copy). */
   insertSelect(table: StateTableName, select: string, params?: unknown[]): Promise<void>;
-  /** Keys that appear twice where one is allowed. Always empty for a file, whose primary keys refuse them. */
-  duplicateKeys(): Promise<DuplicateKey[]>;
 }
 
 const cols = (row: Record<string, string>) => Object.keys(row).join(", ");
@@ -153,9 +156,6 @@ class FileBookkeeping implements Bookkeeping {
   }
   async insertSelect(table: StateTableName, select: string, params: unknown[] = []): Promise<void> {
     await this.tx.exec(`INSERT INTO _croft.${table} BY NAME ${select}`, params);
-  }
-  async duplicateKeys(): Promise<DuplicateKey[]> {
-    return [];
   }
 }
 
@@ -195,6 +195,17 @@ class LogBookkeeping implements Bookkeeping {
       `INSERT INTO ${logOf(table)} (${cols(row)}, seq, closed) VALUES (${vals(row)}, ${this.next(table)} + 1, false)`, params);
   }
 
+  /** What a primary key would have said. The checks are made before the write, because the view over a log shows one row
+   *  per key whatever the log holds, so a duplicate could not be found afterwards. */
+  private duplicate(table: StateTableName, what: string): CroftError {
+    const key = keyOf(table);
+    return new CroftError("INTERNAL_ERROR", {
+      message: `_croft.${table} ${what} (${key.join(", ")}); a primary key would have refused it`,
+      hint: "report this croft bug",
+      details: { table, key: [...key] },
+    });
+  }
+
   async insert(table: StateTableName, row: Record<string, string>, params: unknown[] = []): Promise<void> {
     // The duplicate-key check that stands in for the primary key. NULL key parts compare as equal, as they never
     // do in a primary key, which is the stricter reading and one croft's keys never reach (none is nullable in use).
@@ -202,13 +213,7 @@ class LogBookkeeping implements Bookkeeping {
     const used = onlyUsed(key.map((k) => row[k] ?? "NULL"), params);
     const where = key.map((k, i) => `${k} IS NOT DISTINCT FROM ${used.texts[i]}`).join(" AND ");
     const dup = await this.tx.all<{ n: number | bigint }>(`SELECT count(*) AS n FROM _croft.${table} WHERE ${where}`, used.params);
-    if (Number(dup[0]?.n ?? 0) > 0) {
-      throw new CroftError("INTERNAL_ERROR", {
-        message: `_croft.${table} already has a row for this key (${key.join(", ")}); a primary key would have refused it`,
-        hint: "report this croft bug",
-        details: { table, key: [...key] },
-      });
-    }
+    if (Number(dup[0]?.n ?? 0) > 0) throw this.duplicate(table, "already has a row for this key");
     await this.upsert(table, row, params);
   }
 
@@ -226,27 +231,27 @@ class LogBookkeeping implements Bookkeeping {
   }
 
   async rekey(table: StateTableName, column: string, from: string, to: string): Promise<void> {
+    // A row that would take a key the table has already: the rows under `from` against the rows under `to`, the rest of the key equal.
+    const rest = keyOf(table).filter((k) => k !== column).map((k) => `a.${k} IS NOT DISTINCT FROM b.${k}`);
+    const [clash] = await this.tx.all<{ n: number | bigint }>(
+      `SELECT count(*) AS n FROM _croft.${table} AS a JOIN _croft.${table} AS b ON ${["true", ...rest].join(" AND ")} WHERE a.${column} = $1 AND b.${column} = $2`, [from, to]);
+    if (Number(clash?.n ?? 0) > 0) throw this.duplicate(table, "already has a row for a key this rename would give another");
     // The rows under the new key first, then a closing row for each old key (the old rows still read as they were).
     await this.update(table, { [column]: "$2" }, `${column} = $1`, [from, to]);
     await this.remove(table, `${column} = $1`, [from]);
   }
 
   async insertSelect(table: StateTableName, select: string, params: unknown[] = []): Promise<void> {
+    // Keys the table has already, and keys the SELECT has twice (which row would survive is arbitrary): both refused.
+    const key = keyOf(table);
+    const [there] = await this.tx.all<{ n: number | bigint }>(
+      `SELECT count(*) AS n FROM (${select}) AS s JOIN _croft.${table} AS v ON ${key.map((k) => `s.${k} IS NOT DISTINCT FROM v.${k}`).join(" AND ")}`, params);
+    if (Number(there?.n ?? 0) > 0) throw this.duplicate(table, "already has a row for a key being inserted");
+    const [twice] = await this.tx.all<{ n: number | bigint }>(
+      `SELECT count(*) AS n FROM (SELECT 1 FROM (${select}) AS s GROUP BY ${key.map((k) => `s.${k}`).join(", ")} HAVING count(*) > 1)`, params);
+    if (Number(twice?.n ?? 0) > 0) throw this.duplicate(table, "was given a key twice");
     await this.tx.exec(
       `INSERT INTO ${logOf(table)} BY NAME SELECT s.*, ${this.next(table)} + row_number() OVER () AS seq, false AS closed FROM (${select}) AS s`, params);
-  }
-
-  async duplicateKeys(): Promise<DuplicateKey[]> {
-    const out: DuplicateKey[] = [];
-    const meta = await this.tx.all<{ key: string; n: number | bigint }>(`SELECT key, count(*) AS n FROM _croft.meta GROUP BY key HAVING count(*) > 1`);
-    for (const r of meta) out.push({ table: "meta", key: { key: r.key }, rows: Number(r.n) });
-    for (const t of LOGGED_TABLES) {
-      const key = keyOf(t);
-      const rows = await this.tx.all<Record<string, unknown>>(
-        `SELECT ${key.join(", ")}, count(*) AS n FROM ${logOf(t)} WHERE seq IS NOT NULL GROUP BY ${key.join(", ")}, seq HAVING count(*) > 1`);
-      for (const r of rows) out.push({ table: t, key: Object.fromEntries(key.map((k) => [k, r[k]])), rows: Number(r.n) });
-    }
-    return out;
   }
 }
 

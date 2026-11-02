@@ -2,7 +2,7 @@
 // journeys run on the log adapter whatever the suite's adapter is (the child croft processes are given
 // CROFT_BOOKKEEPING=log), and each looks at the log itself as well as at what `_croft.<table>` reads, because the point of a
 // log is how a key written twice, closed and written again, or moved, ends up:
-//   a. the tables are logs, with a view over each, and the meta table says so;
+//   a. the tables are logs, with a view over each, and the meta table says so, in format 4;
 //   b. a --from after the saved cursor writes the asset twice in one transaction: the held-back cursor is the latest row;
 //   c. a --rebuild deletes the asset's rows and writes them again, then sets its replaced time: the new row is the latest;
 //   d. a rename moves every key once: only the new name reads, the old keys are closed in the log;
@@ -89,6 +89,8 @@ describe("journey 35: the bookkeeping as a log", () => {
       "table meta", "view writes", "table writes_log",
     ]);
     expect(await p.rows(`SELECT value FROM _croft.meta WHERE key = 'bookkeeping'`)).toEqual([{ value: "log" }]);
+    // Format 4, so a croft that predates the log refuses the warehouse instead of failing at its first write.
+    expect(await p.rows(`SELECT value FROM _croft.meta WHERE key = 'format_version'`)).toEqual([{ value: "4" }]);
     expect((await p.rows(`SELECT name FROM _croft.assets ORDER BY name`)).map((r) => r.name)).toEqual(["order_totals", "orders"]);
     // croft's own reads (status, describe) see the view.
     const d = await p.json(["describe", "orders"]);

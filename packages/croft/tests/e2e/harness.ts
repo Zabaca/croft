@@ -3,7 +3,7 @@
 // would have it after `bun install`. Every command runs in its own process with stdin ignored, so it is off
 // a TTY exactly as Claude Code runs it. A Bun.serve mock API stands in for GitHub- and Stripe-like services.
 //
-// Nothing here imports croft's source: assertions go through --json envelopes, exit codes and the files a
+// Nothing here imports croft's source but the version floor and the adapter switch for the child: assertions go through --json envelopes, exit codes and the files a
 // user can see.
 //
 // Run: `bun test tests/e2e` from packages/croft (it is also part of the whole `bun test`). Journeys that hit a
@@ -15,6 +15,7 @@ import { dirname, join, resolve } from "node:path";
 import type { Server } from "bun";
 import { test } from "bun:test";
 import { BUN_FLOOR } from "../../src/cli/version.ts";
+import { bookkeepingEnv } from "../../src/db/bookkeeping-testkit.ts";
 
 /** packages/croft */
 export const PKG = resolve(import.meta.dir, "../..");
@@ -65,8 +66,8 @@ export function baseEnv(extra: Record<string, string> = {}): Record<string, stri
     // doctor's Bun line: CI runs the newest Bun too, which may be newer than croft's BUN_TESTED (BUN_UNTESTED).
     // A journey about the other checks must not fail on a Bun release; the Bun line has unit tests of its own.
     CROFT_BUN_VERSION: BUN_FLOOR,
-    // The suite also runs on the log adapter (db/bookkeeping-testkit.ts); every croft a journey spawns follows.
-    ...(process.env.CROFT_BOOKKEEPING ? { CROFT_BOOKKEEPING: process.env.CROFT_BOOKKEEPING } : {}),
+    // The suite also runs on the log adapter; every croft a journey spawns follows.
+    ...bookkeepingEnv(),
     ...extra,
   };
 }

@@ -15,11 +15,13 @@ import { extensionsReady } from "./extension-dir-testkit.ts";
 import { ensureState } from "./state.ts";
 import { tableBatch } from "../load/table-batch.ts";
 import { writeBatch } from "../load/write.ts";
+import { cleanupProjects, cli, makeProject } from "../run/testkit.ts";
 import { closeAllWarehouses, LeaseSql, openWarehouse } from "./warehouse.ts";
 
 const cleanup: (() => void | Promise<void>)[] = [];
 afterAll(async () => {
   await closeAllWarehouses();
+  cleanupProjects();
   for (const f of cleanup.reverse()) await f();
 });
 
@@ -212,6 +214,48 @@ describe("every adapter gives the same latest rows for the same writes", () => {
       expect(await t.read("writes"), t.name).toMatchObject([{ run_id: "r1" }]);
     }
   });
+
+  test("a rekey onto a key the table has is refused, and writes nothing", async () => {
+    for (const t of await Promise.all(targets.map((make) => make()))) {
+      await t.tx(STEPS[0]![1]);
+      await t.tx(async (tx) => (await bookkeepingOf(tx)).upsert("assets", full("assets", { name: "'tickets'", kind: "'sql'" })));
+      await t.tx(async (tx) => {
+        const bk = await bookkeepingOf(tx);
+        await bk.upsert("columns", full("columns", { asset: "'tickets'", name: "'id'", type: "'BIGINT'" }));
+      });
+      const before = await snapshot(t);
+      // issues has columns id and title; tickets has a column id: the rename would make two (tickets, id).
+      await expect(t.tx(async (tx) => (await bookkeepingOf(tx)).rekey("columns", "asset", "issues", "tickets")), t.name).rejects.toThrow();
+      await expect(t.tx(async (tx) => (await bookkeepingOf(tx)).rekey("assets", "name", "issues", "tickets")), t.name).rejects.toThrow();
+      expect(await snapshot(t), t.name).toEqual(before);
+    }
+  });
+
+  test("an insertSelect of a key the table has is refused, and writes nothing", async () => {
+    for (const t of await Promise.all(targets.map((make) => make()))) {
+      await t.tx(STEPS[0]![1]);
+      const before = await snapshot(t);
+      const again = t.tx(async (tx) => {
+        await tx.exec(`CREATE TEMP TABLE kept AS SELECT * FROM _croft.columns WHERE asset = 'issues'`);
+        await (await bookkeepingOf(tx)).insertSelect("columns", `SELECT * FROM kept`);
+      });
+      await expect(again, t.name).rejects.toThrow();
+      expect(await snapshot(t), t.name).toEqual(before);
+    }
+  });
+
+  test("an insertSelect that has a key twice is refused, not left to whichever row sorts last", async () => {
+    for (const t of await Promise.all(targets.map((make) => make()))) {
+      await t.tx(STEPS[0]![1]);
+      const before = await snapshot(t);
+      const twice = t.tx(async (tx) => {
+        await tx.exec(`CREATE TEMP TABLE kept AS SELECT 'other' AS asset, 'id' AS name, 'BIGINT' AS type UNION ALL SELECT 'other', 'id', 'VARCHAR'`);
+        await (await bookkeepingOf(tx)).insertSelect("columns", `SELECT * FROM kept`);
+      });
+      await expect(twice, t.name).rejects.toThrow();
+      expect(await snapshot(t), t.name).toEqual(before);
+    }
+  });
 });
 
 describe("the log adapter", () => {
@@ -222,20 +266,6 @@ describe("the log adapter", () => {
     expect(e).toBeInstanceOf(CroftError);
     expect((e as CroftError).code).toBe("INTERNAL_ERROR");
     expect((e as CroftError).message).toContain("_croft.writes");
-  });
-
-  test("duplicateKeys() finds a key twice in meta and a number twice for one key; a healthy log has none", async () => {
-    const t = fileTarget("log");
-    await t.tx(STEPS[0]![1]);
-    await t.tx(async (tx) => {
-      expect(await (await bookkeepingOf(tx)).duplicateKeys()).toEqual([]);
-      await tx.exec(`INSERT INTO _croft.meta VALUES ('format_version', 'x')`);
-      await tx.exec(`INSERT INTO _croft.assets_log (name, kind, seq, closed) SELECT name, 'dup', seq, false FROM _croft.assets_log`);
-      expect(await (await bookkeepingOf(tx)).duplicateKeys()).toEqual([
-        { table: "meta", key: { key: "format_version" }, rows: 2 },
-        { table: "assets", key: { name: "issues" }, rows: 2 },
-      ]);
-    });
   });
 
   test("the order is croft's own number: later writes of one key win even when the clock and the row ids cannot tell", async () => {
@@ -303,4 +333,36 @@ describe("croft's own write path", () => {
     for (const other of seen.slice(1)) expect(other).toEqual(seen[0]!);
     expect(seen[0]).toMatchObject({ assets: [{ name: "t", row_count: 3000 }], writes: [{ run_id: "r1", added: 2000 }, { run_id: "r2", added: 1000, updated: 500, unchanged: 500 }] });
   });
+});
+
+describe("the log switch", () => {
+  test("a user's CROFT_BOOKKEEPING=log makes no log warehouse: a real croft without the harness mark writes the file's tables", async () => {
+    const root = makeProject({ "assets/t.sql": "-- key: x\nselect 1 as x\n" });
+    const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", NO_COLOR: "1", CROFT_BOOKKEEPING: "log" };
+    const r = await cli(root, ["run", "--json"], env);
+    expect(r.code, r.stdout + r.stderr).toBe(0);
+    const db = await DuckDBInstance.create(join(root, "warehouse.duckdb"), { access_mode: "READ_ONLY" });
+    const c = await db.connect();
+    try {
+      const names = (await c.runAndReadAll(`SELECT table_name FROM duckdb_tables() WHERE schema_name = '_croft' ORDER BY 1`)).getRowsJS().map((x) => x[0]);
+      expect(names).toEqual(["assets", "columns", "files", "inputs", "meta", "writes"]);
+      expect((await c.runAndReadAll(`SELECT value FROM _croft.meta WHERE key = 'format_version'`)).getRowsJS()).toEqual([["3"]]);
+    } finally {
+      c.disconnectSync();
+      db.closeSync();
+    }
+    // With the mark the same switch gives a log, in format 4.
+    const root2 = makeProject({ "assets/t.sql": "-- key: x\nselect 1 as x\n" });
+    const r2 = await cli(root2, ["run", "--json"], { ...env, CROFT_TEST_HARNESS: "1" });
+    expect(r2.code, r2.stdout + r2.stderr).toBe(0);
+    const db2 = await DuckDBInstance.create(join(root2, "warehouse.duckdb"), { access_mode: "READ_ONLY" });
+    const c2 = await db2.connect();
+    try {
+      expect((await c2.runAndReadAll(`SELECT value FROM _croft.meta WHERE key = 'format_version'`)).getRowsJS()).toEqual([["4"]]);
+      expect((await c2.runAndReadAll(`SELECT count(*) FROM duckdb_tables() WHERE schema_name = '_croft' AND table_name = 'assets_log'`)).getRowsJS()).toEqual([[1n]]);
+    } finally {
+      c2.disconnectSync();
+      db2.closeSync();
+    }
+  }, 120_000);
 });

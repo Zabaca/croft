@@ -16,7 +16,7 @@ import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "../db/war
 import { getCatalog, readCatalogEntry } from "../history/catalog.ts";
 import { openLog } from "../history/logs.ts";
 import { RunsDb } from "../history/runs-db.ts";
-import { type CheckContext, type CheckHookResult, type Counting, forceCounting } from "../load/write.ts";
+import type { CheckContext, CheckHookResult, Counting } from "../load/write.ts";
 import { discoverAssets } from "../project/discover.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { loadProject, type Project } from "../project/root.ts";
@@ -530,20 +530,15 @@ describe("newRows() positions never skip rows (§3e)", () => {
 
   test("counting (D-L2): chunks of a TS transform report the same rows whether the MERGE or a classification counts them", async () => {
     const run = async (counting: Counting) => {
-      forceCounting(counting);
-      try {
-        CHUNK.rows = 3;
-        const h = harness({ "assets/t.ts": incremental() });
-        await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2, 3, 4, 5, 6, 7], S1) });
-        const s = await plan(h, "t");
-        const first = await step(h, s);
-        await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: [...issues([2, 5], S2, () => "changed"), ...issues([8, 9], S2)] });
-        const second = await step(h, s);
-        const writes = await all(h, `SELECT rows_in::INTEGER AS rows_in, added::INTEGER AS added, updated::INTEGER AS updated, unchanged::INTEGER AS unchanged, deleted::INTEGER AS deleted FROM _croft.writes WHERE asset = 't' ORDER BY loaded_at`);
-        return { first: first.result.rows, second: second.result.rows, writes, table: await all(h, `SELECT issue_id, title FROM t ORDER BY issue_id`) };
-      } finally {
-        forceCounting(null);
-      }
+      CHUNK.rows = 3;
+      const h = harness({ "assets/t.ts": incremental() });
+      await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: issues([1, 2, 3, 4, 5, 6, 7], S1) });
+      const s = await plan(h, "t");
+      const first = await step(h, s, { counting });
+      await seed(h, "issues", { columns: ISSUES, key: ["id"], rows: [...issues([2, 5], S2, () => "changed"), ...issues([8, 9], S2)] });
+      const second = await step(h, s, { counting });
+      const writes = await all(h, `SELECT rows_in::INTEGER AS rows_in, added::INTEGER AS added, updated::INTEGER AS updated, unchanged::INTEGER AS unchanged, deleted::INTEGER AS deleted FROM _croft.writes WHERE asset = 't' ORDER BY loaded_at`);
+      return { first: first.result.rows, second: second.result.rows, writes, table: await all(h, `SELECT issue_id, title FROM t ORDER BY issue_id`) };
     };
     const returning = await run("returning");
     const classify = await run("classify");

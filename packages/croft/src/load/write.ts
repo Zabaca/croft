@@ -13,13 +13,17 @@
 //   source       the batch aligned to the table's columns, deduplicated by key: highest typed cursor,
 //                then highest _croft_seq (MERGE mishandles duplicate source keys both ways [V])
 //   guards       SHRINK_GUARD
-//   write        replace: MERGE … WHEN MATCHED AND <row differs> THEN UPDATE / NOT MATCHED THEN INSERT /
-//                NOT MATCHED BY SOURCE THEN DELETE; keyless: a multiset diff on the row's content
+//   write        what each kind does (the MERGE statements of DESIGN.md §5 say it; mergeByKey says how it is run):
+//                replace with a key: the rows that differ are updated, new keys added, keys the batch lacks deleted
+//                replace without one: a multiset diff on the row's content
 //                append:  INSERT BY NAME
-//                merge:   MERGE with an unchanged-row skip; columns absent from the batch keep their values
+//                merge:   changed rows updated and new keys added, never deleted; columns absent from the batch keep their values
 //                replaceFiles: the same diff, restricted to the rows of the reloaded files; with a key, see
 //                "Overlapping files" below
 //                a SQL transform's new or recreated table: one CREATE OR REPLACE ... AS SELECT of its rows
+//                A keyed write is counted by classifying the batch against the table first (added, updated, unchanged;
+//                the table rows no batch row has the key of), then INSERTing the added rows, MERGEing only the updated ones
+//                (one UPDATE action to a MERGE, all DuckLake takes) and DELETEing the unmatched: D-L2, Counting below
 //   checks       caller's blocking checks; a throw rolls the whole transaction back
 //   state        cursor, _croft.assets, _croft.columns, _croft.writes (with the step attempt) and, for
 //                transforms, _croft.inputs (positions) in the same transaction
@@ -135,7 +139,7 @@ export interface WriteBatchInput {
   /** Transforms: each input's position, upserted into _croft.inputs in this transaction, so a position commits
    *  with the rows it produced and never without them. */
   positions?: InputPosition[];
-  /** How a keyed merge counts what it changed; default defaultCounting(). Tests and the
+  /** How a keyed merge counts what it changed; default "classify". Tests and the
    *  merge benchmark name one to compare the two. */
   counting?: Counting;
   /** The step attempt this write belongs to (runs.sqlite steps.attempt), for _croft.writes.attempt. reconcile()
@@ -304,7 +308,7 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
     evo.columns = (await readTableSchema(tx, asset, db))!;
   } else {
     counts = await apply(tx, { ref, src, n, dataCols, present, target, srcRows, fallbacks, rowsBefore: before.rowCount, stamp,
-      counting: input.counting ?? defaultCounting() });
+      counting: input.counting ?? "classify" });
   }
 
   const after = await tableStats(tx, asset, db);
@@ -714,22 +718,12 @@ async function emptyBatch(tx: Sql, o: ApplyInput): Promise<Counts> {
  *  first (added, updated, unchanged, and for a replace the table rows no row of the batch matches), then the added rows are
  *  inserted, only the updated ones merged and the unmatched ones deleted; no statement returns anything, which is all a
  *  lake can do (DuckLake refuses RETURNING on MERGE). It is the path of every write, in a file as in a lake: on the merge
- *  benchmark it costs at most 11% of the whole write step (scripts/bench-merge.ts), under the 15% the option allowed, so a
- *  run reports the same numbers in both modes from one path. "returning": the previous way, one MERGE whose returned actions
- *  are counted; nothing selects it but the benchmark and the tests that hold the two to the same numbers. */
+ *  benchmark (scripts/bench-merge.ts, docs/benchmarks) it costs the whole write step about 10% at worst on a machine with
+ *  little else running (a re-run that finds nothing new on 100k rows, or 10k rows against a 1M-row table) and 14.5% once on a
+ *  busy one, under the 15% the option allowed, so a run reports the same numbers in both modes from one path. "returning":
+ *  the previous way, one MERGE whose returned actions are counted; nothing selects it but the benchmark and the tests that
+ *  hold the two to the same numbers. */
 export type Counting = "classify" | "returning";
-
-let forced: Counting | null = null;
-/** Make every keyed write count one way (null: the default, "classify"). For the tests that hold the two ways to the same
- *  numbers, and the merge benchmark. */
-export function forceCounting(c: Counting | null): void {
-  forced = c;
-}
-
-/** The counting a write uses when its caller names none. */
-export function defaultCounting(): Counting {
-  return forced ?? "classify";
-}
 
 /** MERGE by key. replace: every column is compared and set (absent → NULL) and unmatched table rows are
  *  deleted; merge: only columns present in the batch are compared and set. A fallback row (keyed file reload)
@@ -801,19 +795,21 @@ async function mergeByKey(tx: Sql, o: ApplyInput): Promise<Counts> {
   // is known to take for it). Every matched row left is one the classification found different, so it is set unconditionally.
   if (added > 0) {
     await tx.exec(
-      `INSERT INTO ${o.ref} (${cols(o.dataCols)}, ${stampCol}) SELECT ${cols(o.dataCols)}, $1::TIMESTAMPTZ FROM (${rowsOf("= 'added'")})`, [o.stamp]);
+      `INSERT INTO ${o.ref} (${cols(o.dataCols)}, ${stampCol}) SELECT ${cols(o.dataCols)}, $1::TIMESTAMPTZ FROM (${rowsOf("= 'added'")}) ORDER BY ${seqCol}`, [o.stamp]);
   }
   if (updated > 0) {
     // One UPDATE action to a MERGE, which is all DuckLake takes [V: 2.0.0 "MERGE INTO with DuckLake only supports a single
     // UPDATE/DELETE action currently"]: a fallback row (it replaces the row in full) and an ordinary changed row are two.
-    const merge = async (rows: string, set: RealColumn[]) => {
+    const merge = async (rows: string, set: RealColumn[], when: string | null) => {
       if (!set.length) return;
       await tx.exec(
         `MERGE INTO ${o.ref} AS t USING (${rowsOf("= 'updated'")}${rows}) AS s ON (${on})
-         WHEN MATCHED THEN UPDATE SET ${setOf(set)}, ${stampCol} = $1::TIMESTAMPTZ`, [o.stamp]);
+         WHEN MATCHED${when ? ` AND (${when})` : ""} THEN UPDATE SET ${setOf(set)}, ${stampCol} = $1::TIMESTAMPTZ`, [o.stamp]);
     };
-    if (o.fallbacks > 0) await merge(` AND ${fb}`, o.dataCols.filter((c) => !isKey(c.name)));
-    await merge(o.fallbacks > 0 ? ` AND NOT ${fb}` : "", valueCols);
+    if (o.fallbacks > 0) await merge(` AND ${fb}`, o.dataCols.filter((c) => !isKey(c.name)), null);
+    // The condition is the classification's own, so a table row that already equals the batch's (a key twice in the table, one
+    // copy equal) keeps its stamp, as it did under the MERGE that counted.
+    await merge(o.fallbacks > 0 ? ` AND NOT ${fb}` : "", valueCols, differs);
   }
   let deleted = 0;
   if (scope || target.write === "replace") {

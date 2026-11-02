@@ -3,13 +3,19 @@
 import pkg from "../../package.json" with { type: "json" };
 import { CroftError } from "../core/errors.ts";
 import type { Sql } from "../core/types.ts";
-import { type BookkeepingKind, defaultBookkeeping, fileDdl, kindOfObjects, logDdl, remember, STATE_TABLE_NAMES, type StateTableName, stateObjects } from "./bookkeeping.ts";
+import { type BookkeepingKind, defaultBookkeeping, fileDdl, kindOfObjects, logDdl, remember, stateObjects } from "./bookkeeping.ts";
 
 /** Version of the _croft schema. A database with a larger number was written by a newer croft.
  *  2: _croft.writes.attempt (the step attempt that committed, so reconcile() can tell retries apart).
  *  3: _croft.inputs.input_last_loaded_at (the input's last_loaded_at when a transform last read all of it,
  *     which staleness compares with; seen_loaded_at and seen_key stay newRows()'s composite position). */
 export const FORMAT_VERSION = 3;
+/** The format of a warehouse whose bookkeeping is a log (db/bookkeeping.ts, D-L1). It is a number of its own because a croft
+ *  that predates the log cannot use one: it makes `_croft.assets` a table and fails on the view. Stamped on a log warehouse
+ *  from its first write, so that croft refuses it with DB_NEWER_FORMAT instead. Everything else about the format is 3's. */
+export const LOG_FORMAT_VERSION = 4;
+/** The newest format this croft reads. */
+export const MAX_FORMAT_VERSION = LOG_FORMAT_VERSION;
 export const CROFT_VERSION: string = pkg.version;
 
 // The file adapter's DDL (db/bookkeeping.ts holds the table specs, shared with the log adapter), each entry one
@@ -22,9 +28,6 @@ export const STATE_COLUMNS_ADDED: readonly { table: string; column: string; ddl:
   { table: "writes", column: "attempt", ddl: `ALTER TABLE _croft.writes ADD COLUMN attempt INTEGER` },
   { table: "inputs", column: "input_last_loaded_at", ddl: `ALTER TABLE _croft.inputs ADD COLUMN input_last_loaded_at TIMESTAMPTZ` },
 ];
-
-/** The bookkeeping tables by name; in the log adapter all but meta are views over `<name>_log`. */
-export const STATE_TABLES: readonly StateTableName[] = STATE_TABLE_NAMES;
 
 export interface Meta { format_version?: string; duckdb_version?: string; croft_version?: string; [key: string]: string | undefined }
 
@@ -43,11 +46,11 @@ export async function readMeta(db: Sql): Promise<Meta> {
 }
 
 /** Refuse a database written by a newer croft rather than risk a downgrade (DB_NEWER_FORMAT). */
-export function assertFormat(meta: Meta): void {
+export function assertFormat(meta: Meta, newest: number = MAX_FORMAT_VERSION): void {
   const v = meta.format_version === undefined ? undefined : Number(meta.format_version);
-  if (v !== undefined && !(v <= FORMAT_VERSION)) {
+  if (v !== undefined && !(v <= newest)) {
     throw new CroftError("DB_NEWER_FORMAT", {
-      message: `this warehouse has croft format ${meta.format_version} (written by croft ${meta.croft_version ?? "?"}); this croft ${CROFT_VERSION} reads format ${FORMAT_VERSION}`,
+      message: `this warehouse has croft format ${meta.format_version} (written by croft ${meta.croft_version ?? "?"}); this croft ${CROFT_VERSION} reads format ${newest} and older`,
       hint: "upgrade croft in this project (bun add @zabaca/croft@latest) instead of opening the database with an older version",
       retryable: false,
       details: { formatVersion: meta.format_version, croftVersion: meta.croft_version, duckdbVersion: meta.duckdb_version },
@@ -90,7 +93,7 @@ export async function ensureState(tx: Sql, o: { croftVersion?: string; bookkeepi
   const bk = remember(tx, kind);
   const [{ v } = { v: "" }] = await tx.all<{ v: string }>(`SELECT version() v`);
   const want: Meta = {
-    format_version: String(Math.max(FORMAT_VERSION, Number(before.format_version ?? 0))),
+    format_version: String(Math.max(kind === "log" ? LOG_FORMAT_VERSION : FORMAT_VERSION, Number(before.format_version ?? 0))),
     duckdb_version: v,
     croft_version: o.croftVersion ?? CROFT_VERSION,
     ...(kind === "log" ? { bookkeeping: "log" } : {}),

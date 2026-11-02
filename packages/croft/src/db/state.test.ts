@@ -3,8 +3,8 @@ import { mkdirSync, mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
-import { bookkeepingOf } from "./bookkeeping.ts";
-import { checkFormat, CROFT_VERSION, ensureState, FORMAT_VERSION, hasState, readMeta, STATE_TABLES } from "./state.ts";
+import { bookkeepingOf, defaultBookkeeping, STATE_TABLE_NAMES } from "./bookkeeping.ts";
+import { assertFormat, checkFormat, CROFT_VERSION, ensureState, FORMAT_VERSION, hasState, LOG_FORMAT_VERSION, MAX_FORMAT_VERSION, readMeta } from "./state.ts";
 import { closeAllWarehouses, openWarehouse } from "./warehouse.ts";
 import { seedState } from "./bookkeeping-testkit.ts";
 
@@ -67,7 +67,7 @@ describe.each(["file", "log"] as const)("ensureState (%s adapter)", (kind) => {
     const byTable: Record<string, [string, string][]> = {};
     for (const r of cols) (byTable[r.t] ??= []).push([r.c, r.ty]);
     expect(byTable).toEqual(kind === "file" ? EXPECTED : LOG_EXPECTED);
-    expect(Object.keys(byTable).filter((t) => !t.endsWith("_log")).sort()).toEqual([...STATE_TABLES].sort());
+    expect(Object.keys(byTable).filter((t) => !t.endsWith("_log")).sort()).toEqual([...STATE_TABLE_NAMES].sort());
     const pks = await w.read((db) => db.all<{ t: string; cols: string[] }>(
       `SELECT table_name t, constraint_column_names cols FROM duckdb_constraints() WHERE schema_name = '_croft' AND constraint_type = 'PRIMARY KEY'`), { purpose: "t" });
     // A lake refuses primary keys: the log adapter has none.
@@ -78,7 +78,7 @@ describe.each(["file", "log"] as const)("ensureState (%s adapter)", (kind) => {
     const w = warehouse();
     const meta = await w.write("state", (tx) => ensure(tx), { runId: "r" });
     expect(meta).toEqual({
-      format_version: String(FORMAT_VERSION), duckdb_version: expect.stringMatching(/^v2\.0\.0/), croft_version: CROFT_VERSION,
+      format_version: String(kind === "log" ? LOG_FORMAT_VERSION : FORMAT_VERSION), duckdb_version: expect.stringMatching(/^v2\.0\.0/), croft_version: CROFT_VERSION,
       ...(kind === "log" ? { bookkeeping: "log" } : {}),
     });
     expect(await w.read((db) => readMeta(db), { purpose: "t" })).toEqual(meta);
@@ -131,6 +131,33 @@ describe("ensureState", () => {
 
   test("format 3: _croft.writes records the step attempt (2), _croft.inputs what a transform last read in full (3)", () => {
     expect(FORMAT_VERSION).toBe(3);
+  });
+
+  test("format 4 is the log's: a log warehouse is stamped with it from its first write, and a croft that reads up to 3 refuses it", async () => {
+    expect(LOG_FORMAT_VERSION).toBe(4);
+    expect(MAX_FORMAT_VERSION).toBe(4);
+    const w = warehouse();
+    const meta = await w.write("state", (tx) => ensureState(tx, { bookkeeping: "log" }), { runId: "r" });
+    expect(meta.format_version).toBe("4");
+    expect(await w.read((db) => readMeta(db), { purpose: "t" })).toMatchObject({ format_version: "4", bookkeeping: "log" });
+    // A croft before the log reads up to 3: the same check, with its newest format, refuses the log's.
+    const old = () => assertFormat({ format_version: "4", croft_version: "9.9.9" }, FORMAT_VERSION);
+    expect(old).toThrow(CroftError);
+    try { old(); } catch (e) { expect((e as CroftError).code).toBe("DB_NEWER_FORMAT"); }
+    // This croft reads both, and a file warehouse stays at 3 whatever else is asked for later.
+    expect(() => assertFormat({ format_version: "4" })).not.toThrow();
+    expect(() => assertFormat({ format_version: "3" }, FORMAT_VERSION)).not.toThrow();
+    expect(() => assertFormat({ format_version: "5" })).toThrow(CroftError);
+    const file = warehouse();
+    expect((await file.write("state", (tx) => ensureState(tx, { bookkeeping: "file" }), { runId: "r" })).format_version).toBe("3");
+  });
+
+  test("CROFT_BOOKKEEPING=log is a test switch: it does nothing without the harness mark", () => {
+    expect(defaultBookkeeping({})).toBe("file");
+    expect(defaultBookkeeping({ CROFT_BOOKKEEPING: "log" })).toBe("file");
+    expect(defaultBookkeeping({ CROFT_TEST_HARNESS: "1" })).toBe("file");
+    expect(defaultBookkeeping({ CROFT_BOOKKEEPING: "file", CROFT_TEST_HARNESS: "1" })).toBe("file");
+    expect(defaultBookkeeping({ CROFT_BOOKKEEPING: "log", CROFT_TEST_HARNESS: "1" })).toBe("log");
   });
 
   test("migrates a format-1 database: adds _croft.writes.attempt, keeps its rows, records the current format", async () => {
