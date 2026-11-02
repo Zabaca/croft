@@ -53,6 +53,35 @@ jobs:
           else
             echo "publish=yes" >> "$GITHUB_OUTPUT"
           fi
+      # The suite's mode tests need what ci.yml gives them (DESIGN.md D117, D118): DuckDB's real extension files, fetched
+      # and checked against the pinned checksums, and a Postgres the tests start in the foreground. With CROFT_CI set they
+      # fail without them, so a release would fail here.
+      - name: DuckDB extension files, cached
+        if: steps.state.outputs.publish == 'yes'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/croft-extensions
+          key: duckdb-extensions-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('packages/croft/src/db/extension-pins.ts') }}
+      - name: fetch and verify the DuckDB extension files
+        if: steps.state.outputs.publish == 'yes'
+        working-directory: packages/croft
+        env:
+          CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
+        run: bun scripts/fetch-extensions.ts
+      - name: Postgres for the lake tests
+        if: steps.state.outputs.publish == 'yes'
+        working-directory: packages/croft
+        run: |
+          if ! bun scripts/check-mode-tools.ts; then
+            # A Linux image without Postgres. Debian starts a service on install; a policy-rc.d that refuses (exit 101)
+            # keeps it from ever starting, so only the test's own foreground Postgres runs.
+            printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+            sudo chmod +x /usr/sbin/policy-rc.d
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql
+            sudo rm -f /usr/sbin/policy-rc.d
+            bun scripts/check-mode-tools.ts
+          fi
       - name: typecheck
         if: steps.state.outputs.publish == 'yes'
         working-directory: packages/croft
@@ -62,7 +91,8 @@ jobs:
         working-directory: packages/croft
         env:
           CROFT_CI: "1"
-        run: bun test
+          CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
+        run: bun test --timeout 60000
       # The site test keeps the npm README in step with the repository's (packages/site/test/readmes.test.ts).
       - name: site test
         if: steps.state.outputs.publish == 'yes'

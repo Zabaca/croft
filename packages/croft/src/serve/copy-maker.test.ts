@@ -2,16 +2,21 @@
 // failed, a short-lived child refreshes it, once at a time, with a wait after a failure; the server itself opens nothing.
 // Nothing here needs DuckDB's extension files.
 import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { existsSync, rmSync, statSync, utimesSync } from "node:fs";
+import { DuckDBInstance } from "@duckdb/node-api";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { RunsDb } from "../history/runs-db.ts";
 import { readCopyStatus } from "../db/readcopy.ts";
 import { cleanup, makeProject, type TempProject } from "../read/testkit.ts";
-import { CopyMaker } from "./copy-maker.ts";
+import { type CopyNeed, CopyMaker } from "./copy-maker.ts";
 
 setDefaultTimeout(60_000); // as readers-testkit.ts: real child processes
 const makers: CopyMaker[] = [];
+const controls: string[] = [];
 afterAll(async () => {
   for (const m of makers) await m.stop();
+  for (const d of controls) rmSync(d, { recursive: true, force: true });
   cleanup();
 });
 
@@ -116,17 +121,6 @@ describe("making it", () => {
     expect(m.lastFailure).toBe("coalesced");
   });
 
-  test("stopping kills the child that runs, and starts no more", async () => {
-    const p = await serverMode();
-    const m = maker(p, { argv: node("setInterval(() => {}, 1000)") });
-    m.check();
-    expect(m.running).toBe(true);
-    await m.stop();
-    expect(m.running).toBe(false);
-    m.check();
-    expect(m.started).toBe(1);
-  });
-
   test("a copy that exists and is current is left alone", async () => {
     const p = await serverMode();
     const first = maker(p);
@@ -139,4 +133,102 @@ describe("making it", () => {
     again.check();
     expect(again.started).toBe(1);
   });
+});
+
+// ---- ending a child (D122) ---------------------------------------------------------------------------------------------------------
+// A real refresh (serve/refresh-slow-testkit.ts) held under the write lease between the checkpoint of the live warehouse and the clone.
+describe("ending a real refresh in the middle of its copy", () => {
+  const FIXTURE = join(import.meta.dir, "refresh-slow-testkit.ts");
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const control = () => {
+    const d = mkdtempSync(join(tmpdir(), "croft-refresh-"));
+    controls.push(d);
+    return d;
+  };
+  const slow = (p: TempProject, dir: string, graceMs = 60_000) => [process.execPath, "--no-env-file", FIXTURE, p.root, dir, String(graceMs)];
+  const rowsOf = async (file: string, table: string) => {
+    const db = await DuckDBInstance.create(file, { access_mode: "READ_ONLY" });
+    try {
+      const c = await db.connect();
+      return Number((await c.runAndReadAll(`SELECT count(*) AS n FROM ${table}`)).getRowObjectsJS()[0]!.n);
+    } finally {
+      db.closeSync();
+    }
+  };
+
+  test("stopping asks first (SIGTERM): the child finishes the refresh it is in, the copy is whole, and nothing was killed", async () => {
+    const p = await serverMode();
+    const dir = control();
+    const done: { need: CopyNeed; ok: boolean; message: string | null }[] = [];
+    const m = maker(p, { argv: slow(p, dir), stopGraceMs: 30_000, onDone: (r) => done.push(r) });
+    m.check();
+    await until("the refresh to reach its pause", () => existsSync(join(dir, "checkpointed")));
+    const pid = Number(readFileSync(join(dir, "checkpointed"), "utf8"));
+    const stopping = m.stop();
+    await Bun.sleep(400); // long enough for a SIGKILL to have landed
+    expect(alive(pid)).toBe(true);
+    expect(existsSync(p.project.paths.readCopy)).toBe(false);
+    writeFileSync(join(dir, "proceed"), "");
+    await stopping;
+    expect(alive(pid)).toBe(false);
+    expect(done).toEqual([{ need: "missing", ok: true, message: null }]);
+    m.check(); // stopped: no more children
+    expect(m.started).toBe(1);
+    expect(statSync(p.project.paths.readCopy).mode & 0o222).toBe(0);
+    expect(await rowsOf(p.project.paths.readCopy, "t")).toBe(10);
+    expect(await rowsOf(p.database, "t")).toBe(10);
+  }, 60_000);
+
+  test("a child that has not finished when the grace is over is killed, and the live warehouse is whole", async () => {
+    const p = await serverMode();
+    const dir = control();
+    const done: { need: CopyNeed; ok: boolean; message: string | null }[] = [];
+    const m = maker(p, { argv: slow(p, dir), stopGraceMs: 600, onDone: (r) => done.push(r) });
+    m.check();
+    await until("the refresh to reach its pause", () => existsSync(join(dir, "checkpointed")));
+    const pid = Number(readFileSync(join(dir, "checkpointed"), "utf8"));
+    const t = Date.now();
+    await m.stop();
+    const took = Date.now() - t;
+    expect(took).toBeGreaterThanOrEqual(500);
+    expect(took).toBeLessThan(10_000);
+    expect(alive(pid)).toBe(false);
+    expect(done).toHaveLength(1);
+    expect(done[0]!.ok).toBe(false);
+    expect(existsSync(p.project.paths.readCopy)).toBe(false);
+    expect(await rowsOf(p.database, "t")).toBe(10);
+  }, 60_000);
+
+  test("a child whose croft serve was killed notices, and ends itself within its grace", async () => {
+    const p = await serverMode();
+    const dir = control();
+    // A stand-in croft serve: a process that starts the maker, and is then killed without a chance to stop anything.
+    const script = `
+      import { CopyMaker } from ${JSON.stringify(join(import.meta.dir, "copy-maker.ts"))};
+      import { loadProject } from ${JSON.stringify(join(import.meta.dir, "../project/root.ts"))};
+      const m = new CopyMaker({ project: loadProject({ root: ${JSON.stringify(p.root)} }), argv: ${JSON.stringify(slow(p, dir, 700))} });
+      m.check();
+      setInterval(() => {}, 1000);`;
+    const parent = Bun.spawn([process.execPath, "--no-env-file", "-e", script], { stdout: "ignore", stderr: "pipe" });
+    try {
+      await until("the refresh to reach its pause", () => existsSync(join(dir, "checkpointed")));
+      const pid = Number(readFileSync(join(dir, "checkpointed"), "utf8"));
+      expect(alive(pid)).toBe(true);
+      parent.kill("SIGKILL");
+      await parent.exited;
+      // Within half a second it sees its parent gone, and 700 ms later it is gone itself: it was held far longer than that.
+      await until("the orphan to end", () => !alive(pid), 15_000);
+      expect(existsSync(p.project.paths.readCopy)).toBe(false);
+      expect(await rowsOf(p.database, "t")).toBe(10);
+    } finally {
+      parent.kill("SIGKILL");
+    }
+  }, 60_000);
 });

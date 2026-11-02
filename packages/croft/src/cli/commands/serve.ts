@@ -1,10 +1,12 @@
 // croft serve [--host h] [--port 7447] (DESIGN.md §4.1, §4.2, §5 "Server mode", §8 "Turning it on"): the
-// optional long-running read server for apps, with the scheduler loop built in.
+// optional long-running read server for apps, with the scheduler loop built in. `croft serve key add|list|remove <name>`
+// manages the keys people read with (cli/commands/serve-key.ts, D122).
 //
 // 1. Refuse while a live croft serve is recorded for the project (<state>/serve.json).
 // 2. The token: CROFT_SERVE_TOKEN (the shell, then the project's .env), else 32 random bytes.
 // 3. Open the engine (serve/instance.ts: the read-only instance, held in a query worker process it can kill, and
-//    the write-intent handoff), listen (serve/server.ts), record serve.json (0600), and start the loop that spawns
+//    the write-intent handoff), listen (serve/server.ts) with the keys file (serve/keys.ts, read on every request) and
+//    one log line on stderr for every key query, record serve.json (0600), and start the loop that spawns
 //    `croft tick` every minute while scheduling is on (serve/loop.ts).
 // 4. Print the banner (--json: one envelope with the address), then run until SIGINT, SIGTERM or SIGHUP.
 // 5. Stop: no more ticks, remove serve.json (apps fall back to reading the file), stop listening, close the
@@ -23,15 +25,17 @@ import type { Project } from "../../project/root.ts";
 import { liveServer } from "../../read/locate.ts";
 import type { SchedulingSetting } from "../../schedule/os.ts";
 import { isLoopbackHost, isUnspecifiedHost, resolveToken, type ServeToken, urlHost } from "../../serve/auth.ts";
+import { KeyStore } from "../../serve/keys.ts";
 import { openEngine } from "../../serve/open.ts";
 import { type LoopEvent, type SchedulerLoop, startLoop, TICK_INTERVAL_MS, tickEnv, type TickSpawner } from "../../serve/loop.ts";
 import {
-  alreadyServing, removeServeJson, type RunningServer, type ServerOptions, serveJsonPath, startServer, writeServeJson,
+  alreadyServing, type KeyQueryLog, removeServeJson, type RunningServer, type ServerOptions, serveJsonPath, startServer, writeServeJson,
 } from "../../serve/server.ts";
 import type { ServeEngine, ServeEngineOptions } from "../../serve/types.ts";
 import type { CommandImpl, CommandResult, Ctx } from "../command.ts";
 import { buildEnvelope, redactEnvelope } from "../render.ts";
 import { CROFT_VERSION } from "../version.ts";
+import { formatKey, runKey, type ServeKeyData, unknownLine, unknownSharedTables } from "./serve-key.ts";
 
 export interface ServeData {
   url: string;
@@ -52,6 +56,9 @@ export interface ServeData {
     file: string;
   };
   scheduling: { state: SchedulingSetting["state"]; via: SchedulingSetting["via"]; pausedUntil: string | null; tickEveryMs: number };
+  /** The keys people read with (croft serve key add) and the tables they may read (serve.sharedTables), as the server
+   *  started: a key made later is honoured at once, a table shared later needs a restart. */
+  keys: { count: number; sharedTables: string[]; unknownTables: string[] };
   /** Set once it stopped. */
   stopped: { signal: string; at: string } | null;
   /** Only with serverMode on (D119): croft serve answers from this read copy (relative to the project when inside it),
@@ -73,10 +80,21 @@ export interface ServeDeps {
   exit?: (code: number) => void;
 }
 
-export const serve: CommandImpl<ServeData> = {
-  run: (ctx) => runServe(ctx),
+export const serve: CommandImpl<ServeData | ServeKeyData> = {
+  async run(ctx) {
+    const [first, ...rest] = ctx.positionals;
+    if (first === "key") return runKey(ctx, rest);
+    if (first !== undefined) {
+      throw new CroftError("USAGE_ERROR", {
+        message: `croft serve takes no ${JSON.stringify(first.slice(0, 40))}; start it with croft serve, or manage keys with croft serve key add|list|remove <name>`,
+        hint: "croft serve [--host h] [--port p] | croft serve key add|list|remove <name>",
+      });
+    }
+    return runServe(ctx);
+  },
   human(result, ctx) {
     const d = result.data;
+    if ("action" in d) return formatKey(d);
     // The banner went out when the server started; what is left to say is that it stopped.
     return d.stopped ? `croft serve stopped (${d.stopped.signal})` : formatBanner(d, ctx.project.timezone);
   },
@@ -98,6 +116,7 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
     return found && found.source !== "command" ? { value: found.value, source: found.source } : null;
   });
   const scheduling = readScheduling(stateDir, ctx);
+  const keys = new KeyStore(stateDir);
 
   // Signals are caught from here on, so a Ctrl-C while starting still cleans up.
   const signals = deps.stop ? null : catchSignals();
@@ -122,6 +141,7 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
     await step("close the database", () => engine?.close());
     await within(closing, 3000);
     await step("close the connections", () => server?.stop(true));
+    keys.flush(); // last, so the uses of the requests that finished above are in: what croft serve key list shows
   };
 
   const started = ctx.now();
@@ -131,6 +151,7 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
       engine, host, port, token: token.token, allowOrigins: cfg.allowOrigins, root: project.root,
       database: project.databaseLabel, timezone: project.timezone, startedAt: formatInstant(started, project.timezone),
       redact: (text) => ctx.env.redact(text),
+      keys, sharedTables: cfg.sharedTables, onKeyQuery: (e) => ctx.render.err(keyLogLine(e, project.timezone)),
       onError: (e) => ctx.render.err(`croft serve: failed while answering a request: ${e instanceof Error ? e.stack ?? e.message : String(e)}`),
     });
     const id = currentIdentity();
@@ -149,6 +170,7 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
       database: project.databaseLabel, startedAt: formatInstant(started, project.timezone), version: CROFT_VERSION,
       token: { source: token.source, from: token.from ?? null, file: shownPath(project, serveJsonPath(stateDir)) },
       scheduling: { state: scheduling.state, via: scheduling.via, pausedUntil: scheduling.pausedUntil ?? null, tickEveryMs: deps.tickIntervalMs ?? TICK_INTERVAL_MS },
+      keys: { count: keyCount(keys), sharedTables: [...cfg.sharedTables], unknownTables: unknownSharedTables(project) },
       stopped: null,
       ...(project.config.serverMode.enabled ? { serverMode: { readCopy: shownPath(project, project.paths.readCopy), asOf: engine.status().serverMode?.asOf ?? null } } : {}),
     };
@@ -179,6 +201,21 @@ function announce(ctx: Ctx, data: ServeData): void {
   );
   if (ctx.json) ctx.render.envelope(envelope);
   else ctx.render.outRaw(formatBanner(envelope.data, ctx.project.timezone, ctx.now()));
+}
+
+/** How many keys the file holds; 0 when it cannot be read (the server then accepts none, and `croft serve key list` says why). */
+function keyCount(keys: KeyStore): number {
+  try {
+    return keys.list().length;
+  } catch {
+    return 0;
+  }
+}
+
+/** The one log line of a key query (D122): who, when, what it read, how many rows, how long; never the SQL or the key. */
+export function keyLogLine(e: KeyQueryLog, timezone: string): string {
+  const what = e.outcome === "ok" ? `read ${e.tables.length ? e.tables.join(", ") : "no table"}` : `refused ${e.outcome}`;
+  return `croft serve: key ${e.key}  ${formatInstant(e.at, timezone)}  ${what}  ${e.rows} row${e.rows === 1 ? "" : "s"}  ${e.ms} ms`;
 }
 
 function redactorOf(ctx: Ctx) {
@@ -216,6 +253,13 @@ export function formatBanner(d: ServeData, timezone: string, now: Date = new Dat
         ? ", and set CROFT_SERVE_TOKEN in .env: hosted apps need a token that does not change on every start"
         : "; every request needs the token"));
   }
+  if (d.keys.count > 0 || d.keys.sharedTables.length > 0) {
+    const n = `${d.keys.count} key${d.keys.count === 1 ? "" : "s"} (croft serve key list)`;
+    lines.push(d.keys.sharedTables.length
+      ? `${n} read ${d.keys.sharedTables.join(", ")}, read-only`
+      : `${n}, but serve.sharedTables in croft.json names no table, so every key query is refused`);
+  }
+  lines.push(...unknownLine(d.keys.unknownTables));
   if (d.token.source === "generated") lines.push(`token: ${d.token.file} (hosted apps: set CROFT_SERVE_TOKEN)`);
   else lines.push(`token: CROFT_SERVE_TOKEN from ${d.token.from === "env" ? "the environment" : ".env"} (apps in this project also find it in ${d.token.file})`);
   lines.push(schedulerLine(d.scheduling, timezone, now));

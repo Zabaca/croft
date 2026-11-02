@@ -39,7 +39,7 @@ import { assertSafeFilesystem, type FsProbe, realProbe } from "../db/fs-kind.ts"
 import { loadProject, type Project } from "../project/root.ts";
 import { mapQueryError } from "../read/select.ts";
 import { COPY_CHECK_MS, CopyMaker, type CopyMakerOptions } from "./copy-maker.ts";
-import { restartedError, secs, stopError } from "./errors.ts";
+import { noSharedTables, restartedError, secs, stopError } from "./errors.ts";
 import { SERVE_DEFAULTS } from "./instance.ts";
 import { Admission, type Flight, type StopReason } from "./queue.ts";
 import { QueryWorker, WorkerGone, WorkerStopped } from "./query-worker.ts";
@@ -256,6 +256,7 @@ class ReadersEngine implements ServeEngine {
         hint: "send {sql, params?, limit?} with limit a whole number, such as 10000",
       });
     }
+    if (q.scope && q.scope.tables.length === 0) throw noSharedTables();
     if (this.stopped) throw this.stopError("stop");
     if (this.blocked && this.state !== "open") throw this.blocked;
     const flight = await this.admission.enter({ deadline: arrivedAt + this.queueMs, signal: q.signal });
@@ -287,9 +288,14 @@ class ReadersEngine implements ServeEngine {
     flight.attach({ interrupt: () => worker.interrupt(id), abandon: () => void worker.kill() });
     flight.checkpoint();
     const asOf = this.asOf ?? undefined;
-    const a = await worker.query(id, { sql: q.sql, params: q.params, limit: q.limit, maxRows: this.maxRows, maxBytes: this.maxBytes });
+    const a = await worker.query(id, {
+      sql: q.sql, params: q.params, limit: q.limit, maxRows: this.maxRows, maxBytes: this.maxBytes, ...(q.scope ? { shared: [...q.scope.tables] } : {}),
+    });
     const rows = JSON.parse(a.rowsJson) as ServeQueryData["rows"];
-    return { columns: a.columns, rows, rowCount: a.rowCount, tookMs: Math.round(performance.now() - arrived), ...(asOf ? { asOf } : {}) };
+    return {
+      columns: a.columns, rows, rowCount: a.rowCount, tookMs: Math.round(performance.now() - arrived), ...(asOf ? { asOf } : {}),
+      ...(q.scope ? { tables: a.tables } : {}),
+    };
   }
 
   private queryError(e: unknown, flight: Flight): unknown {
@@ -360,7 +366,10 @@ class ReadersEngine implements ServeEngine {
     const worker = QueryWorker.spawn({ onExit: (w) => this.exited(w), ...(this.argv ? { argv: this.argv } : {}) });
     this.opening = worker;
     try {
-      await worker.open({ path: this.copyPath, spec: this.spec, protect: this.protect, readers: { extensionDir: this.extensionDir, secretDir: this.secretDir } });
+      await worker.open({
+        path: this.copyPath, spec: this.spec, protect: this.protect,
+        readers: { extensionDir: this.extensionDir, secretDir: this.secretDir, shared: [...this.project.config.serve.sharedTables] },
+      });
     } catch (e) {
       this.opening = null;
       void worker.kill();

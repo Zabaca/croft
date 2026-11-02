@@ -30,6 +30,7 @@ export const GUIDES: [topic: string, label: string][] = [
   ["secrets", "Secrets"],
   ["serve", "Apps and croft serve"],
   ["server-mode", "Server mode"],
+  ["keys", "Keys for people"],
   ["read-copy", "GUIs and notebooks"],
   ["rename", "Renaming an asset"],
   ["trash", "The trash"],

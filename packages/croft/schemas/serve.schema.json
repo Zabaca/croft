@@ -117,6 +117,32 @@
               ],
               "additionalProperties": false
             },
+            "keys": {
+              "type": "object",
+              "properties": {
+                "count": {
+                  "type": "number"
+                },
+                "sharedTables": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "unknownTables": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "count",
+                "sharedTables",
+                "unknownTables"
+              ],
+              "additionalProperties": false
+            },
             "stopped": {
               "anyOf": [
                 {
@@ -174,7 +200,127 @@
             "version",
             "token",
             "scheduling",
+            "keys",
             "stopped"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "const": "add"
+            },
+            "name": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string"
+            },
+            "createdAt": {
+              "type": "string"
+            },
+            "sharedTables": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "unknownTables": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "file": {
+              "type": "string"
+            },
+            "redactedValues": {
+              "const": true
+            }
+          },
+          "required": [
+            "action",
+            "name",
+            "key",
+            "createdAt",
+            "sharedTables",
+            "unknownTables",
+            "file"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "const": "list"
+            },
+            "keys": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ServeKeyInfo"
+              }
+            },
+            "sharedTables": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "unknownTables": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "file": {
+              "type": "string"
+            },
+            "redactedValues": {
+              "const": true
+            }
+          },
+          "required": [
+            "action",
+            "keys",
+            "sharedTables",
+            "unknownTables",
+            "file"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "const": "remove"
+            },
+            "name": {
+              "type": "string"
+            },
+            "createdAt": {
+              "type": "string"
+            },
+            "lastUsedAt": {
+              "type": [
+                "null",
+                "string"
+              ]
+            },
+            "remaining": {
+              "type": "number"
+            },
+            "redactedValues": {
+              "const": true
+            }
+          },
+          "required": [
+            "action",
+            "name",
+            "createdAt",
+            "lastUsedAt",
+            "remaining"
           ],
           "additionalProperties": false
         },
@@ -430,6 +576,29 @@
         "message",
         "hint",
         "docs"
+      ],
+      "additionalProperties": false
+    },
+    "ServeKeyInfo": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "lastUsedAt": {
+          "type": [
+            "null",
+            "string"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "createdAt",
+        "lastUsedAt"
       ],
       "additionalProperties": false
     }

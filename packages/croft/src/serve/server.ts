@@ -46,9 +46,10 @@ import { loadProject } from "../project/root.ts";
 import { liveServer, type ServeRecord } from "../read/locate.ts";
 import { DEFAULT_LIMIT, tooManyRows } from "../read/wire.ts";
 import {
-  type Binding, canonicalOrigin, checkContentType, checkHost, checkOrigin, checkToken, isLoopbackHost, isUnspecifiedHost,
-  type Refusal, urlHost,
+  authenticate, type Binding, canonicalOrigin, checkContentType, checkHost, checkOrigin, isLoopbackHost, isUnspecifiedHost,
+  type KeyVerifier, keyScopeRefusal, type Principal, type Refusal, urlHost,
 } from "./auth.ts";
+import { noSharedTables } from "./errors.ts";
 import { SERVE_DEFAULTS } from "./instance.ts";
 import type { ServeEngine, ServeHealth, ServeJson, ServeQueryData } from "./types.ts";
 
@@ -62,6 +63,17 @@ export const DEFAULT_IDLE_TIMEOUT_S = 30;
 /** The longest socket timeout Bun.serve takes (idleTimeout's own cap). */
 const MAX_SOCKET_TIMEOUT_S = 255;
 
+/** One key's query, for the one log line it gets (D122): who, when, which tables it read, how many rows it got, how long it
+ *  took, and how it ended ("ok", or the problem's code). Never the SQL or the key. */
+export interface KeyQueryLog {
+  key: string;
+  at: Date;
+  tables: string[];
+  rows: number;
+  ms: number;
+  outcome: string;
+}
+
 export interface ServerOptions {
   engine: ServeEngine;
   /** The address to listen on; "localhost" binds 127.0.0.1 (Bun would bind ::1 only). */
@@ -71,6 +83,12 @@ export interface ServerOptions {
   token: string;
   /** serve.allowOrigins from croft.json. */
   allowOrigins: readonly string[];
+  /** The keys besides the app token (serve/keys.ts), asked on every request. Without it only the token is accepted. */
+  keys?: KeyVerifier;
+  /** serve.sharedTables from croft.json: the only tables a key may name. None: every key query is refused. */
+  sharedTables?: readonly string[];
+  /** Called once for every key query, answered or refused (the command writes the log line). */
+  onKeyQuery?: (e: KeyQueryLog) => void;
   /** The project folder. Its croft.json names the database and time zone unless given below. */
   root: string;
   /** The database label for envelopes and /health (Project.databaseLabel). */
@@ -116,6 +134,7 @@ export function httpStatus(e: CroftError): number {
     case "DB_HELD_BY_OTHER_PROGRAM":
       return 503;
     case "SERVE_UNAUTHORIZED":
+    case "SERVE_NO_SHARED_TABLES":
       return typeof e.problem.details?.status === "number" && e.problem.details.status === 403 ? 403 : 401;
     case "QUERY_TOO_MANY_ROWS":
       return 422;
@@ -150,7 +169,8 @@ export function startServer(o: ServerOptions): RunningServer {
   let url = "";
 
   const handler = new Handler({
-    engine: o.engine, token: o.token, allowOrigins: o.allowOrigins, maxBody, redact, envelopeMeta, root: o.root,
+    engine: o.engine, token: o.token, allowOrigins: o.allowOrigins, keys: o.keys ?? null, sharedTables: o.sharedTables ?? [], onKeyQuery: o.onKeyQuery ?? (() => {}),
+    maxBody, redact, envelopeMeta, root: o.root,
     maxPendingBody: Math.max(o.maxPendingBodyBytes ?? DEFAULT_MAX_PENDING_BODY_BYTES, maxBody), idleTimeoutS,
     requestTimeoutS: () => o.requestTimeoutS ?? requestBudgetS(o.root),
     binding: () => binding, url: () => url, startedAt, onError: o.onError ?? (() => {}),
@@ -204,6 +224,9 @@ interface HandlerInit {
   engine: ServeEngine;
   token: string;
   allowOrigins: readonly string[];
+  keys: KeyVerifier | null;
+  sharedTables: readonly string[];
+  onKeyQuery: (e: KeyQueryLog) => void;
   maxBody: number;
   maxPendingBody: number;
   idleTimeoutS: number;
@@ -251,8 +274,9 @@ class Handler {
       const refused = checkHost(req.headers.get("host"), this.o.binding()) ?? checkOrigin(origin, this.o.allowOrigins);
       if (refused) return this.refusal(command, refused, started, cors);
       if (req.method === "OPTIONS") return preflight(req, cors);
-      const auth = checkToken(this.o.token, req.headers.get("authorization"));
-      if (auth) return this.refusal(command, auth, started, cors);
+      const auth = authenticate(this.o.token, this.o.keys, req.headers.get("authorization"));
+      if ("status" in auth) return this.refusal(command, auth, started, cors);
+      const who = auth.principal;
       if (!known) {
         return this.refusal(command, {
           status: 404,
@@ -274,9 +298,11 @@ class Handler {
           }),
         }, started, cors);
       }
+      // A key reads the shared tables and nothing else: the app token alone sees the server's status.
+      if (who.kind === "key" && known.route !== "query") return this.refusal(command, keyScopeRefusal(path), started, cors);
       if (known.route === "health") return json(200, this.health(), cors);
       if (known.route === "status") return await this.status(started, cors);
-      return await this.query(req, srv, started, cors);
+      return await this.query(req, srv, started, cors, who);
     } catch (e) {
       return this.internal(command, e, started, cors);
     }
@@ -287,9 +313,15 @@ class Handler {
     return c !== null && this.o.allowOrigins.some((a) => canonicalOrigin(a) === c);
   }
 
-  private async query(req: Request, srv: TimeoutControl, started: number, cors: Record<string, string>): Promise<Response> {
+  private async query(req: Request, srv: TimeoutControl, started: number, cors: Record<string, string>, who: Principal): Promise<Response> {
     const type = checkContentType(req.headers.get("content-type"));
     if (type) return this.refusal("query", type, started, cors);
+    // A project that shares no table shares nothing with a key: refused before its body is read (D122).
+    if (who.kind === "key" && this.o.sharedTables.length === 0) {
+      const refused = noSharedTables();
+      this.logKey(who, started, [], 0, refused.code);
+      return this.problemResponse("query", refused, started, cors);
+    }
     const length = req.headers.get("content-length");
     const declared = length === null ? NaN : Number(length);
     if (declared > this.o.maxBody) return this.tooLarge(started, cors);
@@ -316,7 +348,7 @@ class Handler {
       this.budget ??= this.o.requestTimeoutS();
       srv.timeout(req, this.budget > MAX_SOCKET_TIMEOUT_S ? 0 : this.budget);
       try {
-        return await this.answer(req, body, started, cors);
+        return await this.answer(req, body, started, cors, who);
       } finally {
         srv.timeout(req, this.o.idleTimeoutS);
       }
@@ -325,18 +357,34 @@ class Handler {
     }
   }
 
-  private async answer(req: Request, body: { sql: string; params: unknown[]; limit: number }, started: number, cors: Record<string, string>): Promise<Response> {
+  private async answer(req: Request, body: { sql: string; params: unknown[]; limit: number }, started: number, cors: Record<string, string>, who: Principal): Promise<Response> {
+    const scope = who.kind === "key" ? { key: who.name, tables: this.o.sharedTables } : undefined;
     try {
-      const data = await this.o.engine.query({ ...body, signal: req.signal });
+      const { tables, ...data } = await this.o.engine.query({ ...body, ...(scope ? { scope } : {}), signal: req.signal });
       // Never pass on more rows than asked for: the client would refuse them anyway.
       if (data.rows.length > body.limit) throw tooManyRows(body.limit, { rowsReturned: data.rows.length, via: "croft serve" });
       const out: ServeQueryData & { truncatedRows: 0; truncatedValues: 0 } = { ...data, truncatedRows: 0, truncatedValues: 0 };
+      this.logKey(who, started, tables ?? [], data.rowCount, "ok");
       return json(200, this.envelope("query", out, started), cors);
     } catch (e) {
       // The client went away and the engine gave up on its query: nobody reads this answer, and it is no bug.
-      if (req.signal.aborted && !(e instanceof CroftError)) return new Response(null, { status: 499 });
+      if (req.signal.aborted && !(e instanceof CroftError)) {
+        this.logKey(who, started, [], 0, "INTERRUPTED");
+        return new Response(null, { status: 499 });
+      }
+      this.logKey(who, started, [], 0, e instanceof CroftError ? e.code : "INTERNAL_ERROR");
       if (!(e instanceof CroftError)) throw e;
       return this.problemResponse("query", e, started, cors);
+    }
+  }
+
+  /** The one log line a key's query gets (D122): the key's name, never its value, and never the SQL. */
+  private logKey(who: Principal, started: number, tables: string[], rows: number, outcome: string): void {
+    if (who.kind !== "key") return;
+    try {
+      this.o.onKeyQuery({ key: who.name, at: new Date(), tables, rows, ms: Math.round(performance.now() - started), outcome });
+    } catch {
+      // A log that cannot be written never costs a client its answer.
     }
   }
 

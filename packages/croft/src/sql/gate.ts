@@ -1,566 +1,106 @@
-// The one-SELECT gate (DESIGN.md §5 "Sandboxing every DuckDB instance"). All user-authored SQL must be
-// exactly one SELECT: `extractStatements` must find one statement AND `json_serialize_sql` must accept it.
-// Neither is enough alone: json_serialize_sql serializes `select 1; select 2` as two statements, and
-// extractStatements happily counts one COPY or ATTACH. DESCRIBE, SUMMARIZE and SHOW serialize, so they pass.
+// The one-SELECT gate's shell (DESIGN.md §5 "Sandboxing every DuckDB instance", D112, D123). The decision is one
+// synchronous function in sql/gate-core.ts, decide(), that every path to user SQL goes through (`croft query`, SQL assets,
+// checks, TS transforms, croft serve for the app token and for keys, and Quack's authorization hook later). This file
+// fetches what that function is given, from DuckDB, before it decides:
 //
-// A SELECT can still do harm, so the gate then walks the statement's AST (verified on DuckDB 1.5.5):
-// - DuckDB's sandbox always lets a connection read its own database file, even outside allowed_directories.
-//   `read_blob('warehouse.duckdb')`, a symlink or hard link to it, or a replacement scan such as
-//   `FROM 'files/up/warehouse.duckdb'` opens a second descriptor on the file, and closing it drops the
-//   process's POSIX lock (§5, hazard 3). So every path a query names must be a string literal, and the gate
-//   resolves it as the OS will (symlinks, `..` after a symlink, `~`, `file://`, globs) and refuses the open
-//   database, its WAL and temp files (also by inode, which catches hard links), anything a caller protects,
-//   and anything outside the connection's allowed_directories.
-// - Table functions are an allowlist (TABLE_FUNCTIONS). Those with side effects (enable_logging changes the
-//   whole instance even on a locked READ_ONLY connection; checkpoint writes) and those whose SQL or table
-//   name is a string the walk cannot see (query, query_table, json_execute_serialized_sql) are refused, and
-//   so is any table function or table macro not in the list.
-// - croft serve is an allowlist too: user tables in the main schema, CTEs and a few harmless table
-//   functions. DuckDB's built-in views need no parentheses (`FROM duckdb_databases`, `FROM pg_settings`), so
-//   a denylist of function calls is not enough.
-// Not covered: a macro or view created in the warehouse outside croft can shadow a built-in name; the gate
-// trusts the warehouse's own catalog. Paths are checked just before DuckDB opens them, not atomically.
+// - the statement count (extractStatements) and the parsed query (json_serialize_sql);
+// - for the serve profile, the catalog snapshot (loadCatalog): which tables and views the connection can name;
+// - for the profiles that read files, the path policy (loadPathPolicy) and the matches of every glob a query's paths hold
+//   (`glob()`), so that decide() never has to ask DuckDB.
+//
+// A caller that runs many queries on one attached file (croft serve's workers) loads the catalog snapshot once and passes it
+// in; the file cannot change under it until it is swapped. Everyone else lets gateSelect() fetch it for the one query. The
+// path policy is fetched only for a query that names a path, once per query: the serve profile names none, so the workers
+// never load one, and the paths that do (croft query, SQL assets, ctx.query) run one query per connection.
 // It uses no Bun-only APIs, so read.ts can import it.
 import type { DuckDBConnection } from "@duckdb/node-api";
-import { statSync } from "node:fs";
-import { homedir } from "node:os";
-import { isAbsolute, sep } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { mapSandboxError, type Profile } from "../db/connect.ts";
-import { physicalPath } from "../project/root.ts";
-import { pivotWithoutValuesIn } from "./lex.ts";
 import {
-  args, asciiLower, type AstNode, charIndex, collect, constant, finiteJson, foreignQueryNode, literal, location, looksLikePath, positional, stringOf, TABLE_ARGUMENT_FUNCTIONS, tableArguments,
-  type Use, walk,
-} from "./ast.ts";
+  type CatalogRow, type CatalogSnapshot, catalogOf, decide, type GateOptions, type GateVerdict, type GlobExpansion, parseSerialized, PathPolicy,
+  pathLiterals, type PathSettings, type SelectAst,
+} from "./gate-core.ts";
 
-export interface GateOptions {
-  profile?: Profile;                                  // "serve" allows tables only
-  notSelectCode?: "QUERY_NOT_SELECT" | "SQL_NOT_SELECT"; // SQL assets report SQL_NOT_SELECT (§3c)
-  file?: string;                                      // for problem locations
-  lineOffset?: number;                                // lines before the SQL in `file` (asset headers)
-  /** Files and folders user SQL must never read, beyond the connection's own database files; e.g. the
-   *  state folder (runs.sqlite, serve.json) on a warehouse connection, which allows it for croft itself. */
-  protect?: string[];
-}
-
-/** The parsed statement, as json_serialize_sql returns it (the `statements[0]` object). */
-export type SelectAst = { node: Record<string, unknown>; named_param_map?: unknown } & Record<string, unknown>;
-
-/** What the gate does with a table function or table macro. */
-export type TableFunctionKind =
-  | "serve"       // harmless everywhere, croft serve included
-  | "local"       // catalog, settings and introspection: fine for croft query, not over HTTP
-  | "path"        // reads the files its first argument names (a path, a glob or a list of them)
-  | "table"       // its first argument names a table, or a file through a replacement scan
-  | "hidden-sql"  // runs SQL or names a table given as a string, which the AST walk cannot see
-  | "effect";     // changes the instance, the database or the process (or takes raw pointers)
-
-const kinds = (kind: TableFunctionKind, names: string) => names.trim().split(/\s+/).map((n) => [n, kind] as const);
-
-/**
- * Every table function and table macro of DuckDB 2.0.0, classified. gate.test.ts fails when DuckDB ships
- * one that is not listed here (until it is classified, the gate refuses it), and when one listed here is no
- * longer shipped.
- */
-export const TABLE_FUNCTIONS: ReadonlyMap<string, TableFunctionKind> = new Map([
-  ...kinds("serve", "range generate_series unnest json_each json_tree"),
-  ...kinds("local", `
-    duckdb_approx_database_count duckdb_columns duckdb_connection_count duckdb_constraints
-    duckdb_coordinate_systems duckdb_databases duckdb_dependencies duckdb_extensions duckdb_external_file_cache
-    duckdb_functions duckdb_indexes duckdb_keywords duckdb_log_contexts duckdb_logs duckdb_logs_parsed
-    duckdb_memory duckdb_optimizers duckdb_prepared_statements duckdb_profiling_settings duckdb_schemas
-    duckdb_secret_types duckdb_secrets duckdb_sequences duckdb_settings duckdb_table_sample duckdb_tables
-    duckdb_temporary_files duckdb_types duckdb_variables duckdb_views which_secret
-    duckdb_available_metrics duckdb_dialects duckdb_eviction_queues duckdb_extension_repositories
-    duckdb_external_resource_types duckdb_external_resources duckdb_grammar_extensions
-    duckdb_secret_type_parameters duckdb_triggers sql_tokenize
-    pragma_collations pragma_database_size pragma_metadata_info pragma_platform pragma_show
-    pragma_storage_info pragma_table_info pragma_user_agent pragma_version
-    pg_timezone_names icu_calendar_names sql_auto_complete check_peg_parser
-    repeat repeat_row summary seq_scan test_all_types test_vector_types`),
-  ...kinds("path", `
-    read_csv read_csv_auto read_json read_json_auto read_json_objects read_json_objects_auto read_ndjson
-    read_ndjson_auto read_ndjson_objects read_parquet parquet_scan read_text read_blob read_duckdb glob
-    sniff_csv parquet_metadata parquet_schema parquet_file_metadata parquet_kv_metadata parquet_full_metadata
-    parquet_bloom_probe read_single_csv_file read_single_json_file read_single_parquet_file`),
-  ...kinds("table", [...TABLE_ARGUMENT_FUNCTIONS].join(" ")),
-  ...kinds("hidden-sql", "query query_table json_execute_serialized_sql"),
-  ...kinds("effect", `
-    checkpoint force_checkpoint enable_logging disable_logging truncate_duckdb_logs enable_profiling
-    disable_profiling arrow_scan arrow_scan_dumb create_external_resource deregister_external_resource
-    destroy_external_resource register_external_resource register_external_resource_type`),
-]);
-
-// Scalar functions: write_log writes into the instance's log, setval moves a sequence; over HTTP, settings and
-// variables reveal paths, and sleep_ms only holds a worker.
-const SCALAR_DENIED = new Set(["write_log", "setval"]);
-const SERVE_SCALAR_DENIED = new Set(["current_setting", "getvariable", "sleep_ms"]);
-// SHOW forms that are not DESCRIBE: they list names, never paths.
-const SHOW_LISTS = new Set(["tables", "databases", "variables", "__show_tables_expanded"]);
-// Over HTTP only SHOW TABLES, which lists the main schema's names. SHOW ALL TABLES (also a bare DESCRIBE or SHOW,
-// which DuckDB parses as __show_tables_expanded) lists every schema's tables with their columns, _croft's
-// included, and SHOW databases/schemas/variables name catalogs and settings the serve gate refuses to read.
-const SERVE_SHOW_LISTS = new Set(["tables"]);
-const SHOW_NAMES: Record<string, string> = { __show_tables_expanded: "SHOW ALL TABLES (or a bare DESCRIBE or SHOW)" };
-
-/**
- * The longest list range() or generate_series() may build as a value (not as a table) over HTTP. A scalar builds
- * its whole list inside one expression, which DuckDB evaluates (and constant-folds while planning) without
- * checking for interrupts: `list_sort(range(150000000))` ran 25 s past every interrupt. The serve engine's
- * watchdog (serve/instance.ts) ends such a query by killing its worker process; this cap only refuses the
- * literal cases up front. As a table (`FROM range(n)`) range() streams and stops at the next interrupt.
- */
-export const SERVE_MAX_LIST_VALUES = 10_000_000;
-const LIST_BUILDERS = new Set(["range", "generate_series"]);
-
-/** 1-based line and column (in code points) of a DuckDB position, which counts UTF-8 bytes on 2.0 (verified with
- *  emoji and CJK). */
-export function lineColumn(sql: string, position: number): { line: number; column: number } {
-  const before = sql.slice(0, charIndex(sql, position));
-  const lineStart = before.lastIndexOf("\n") + 1;
-  return { line: before.split("\n").length, column: Array.from(before.slice(lineStart)).length + 1 };
-}
-
-interface Serialized {
-  error: boolean;
-  error_type?: string;
-  error_message?: string;
-  position?: string;
-  statements?: SelectAst[];
-}
-
-async function serialize(conn: DuckDBConnection, sql: string): Promise<Serialized> {
-  const reader = await conn.runAndReadAll("SELECT json_serialize_sql($1::VARCHAR)", [sql]);
-  // A DOUBLE constant beyond range comes back as a bare Infinity (`SELECT 1e400`), which JSON.parse refuses.
-  return JSON.parse(finiteJson(String(reader.getRowsJS()[0]?.[0] ?? "{}"))) as Serialized;
-}
-
-function syntaxError(sql: string, s: Serialized, o: GateOptions): CroftError {
-  const pos = s.position !== undefined ? Number(s.position) : NaN;
-  const at = Number.isFinite(pos) ? lineColumn(sql, pos) : undefined;
-  return new CroftError("SQL_SYNTAX", {
-    message: at ? `${s.error_message} (line ${at.line}, column ${at.column})` : String(s.error_message),
-    hint: "fix the SQL near the reported position",
-    file: o.file,
-    line: at ? at.line + (o.lineOffset ?? 0) : undefined,
-    column: at?.column,
-  });
+/** What a caller may hand the gate so that it need not fetch it again: see the head of this file. */
+export interface GateKnowns {
+  catalog?: CatalogSnapshot;
 }
 
 /**
- * Throw unless `sql` is exactly one read-only SELECT (or DESCRIBE/SUMMARIZE/SHOW) that reads only what its
- * profile allows. Returns the statement's AST.
+ * Fetch what decide() needs and decide: throw unless `sql` is exactly one read-only SELECT (or DESCRIBE/SUMMARIZE/SHOW)
+ * that reads only what its profile allows. Returns the statement's AST, the SQL to run and the tables it reads.
  * Codes: SQL_NOT_ONE_STATEMENT, QUERY_NOT_SELECT (or SQL_NOT_SELECT), SQL_SYNTAX, QUERY_PATH_DENIED.
  */
-export async function assertOneSelect(conn: DuckDBConnection, sql: string, o: GateOptions = {}): Promise<SelectAst> {
-  let count: number;
+export async function gateSelect(conn: DuckDBConnection, sql: string, o: GateOptions & GateKnowns = {}): Promise<GateVerdict> {
+  let count: number | "unparsable";
   try {
     count = (await conn.extractStatements(sql)).count;
   } catch {
-    // Parse errors and empty input both land here; json_serialize_sql tells them apart and gives a position.
-    const s = await serialize(conn, sql);
-    if (s.error && s.error_type === "parser") throw syntaxError(sql, s, o);
-    count = s.statements?.length ?? 0;
-    if (count === 1) {
-      throw new CroftError("INTERNAL_ERROR", { message: "extractStatements failed on a statement json_serialize_sql accepted", hint: "report this croft bug" });
-    }
+    count = "unparsable";
   }
-  if (count !== 1) {
-    throw new CroftError("SQL_NOT_ONE_STATEMENT", {
-      message: count === 0 ? "found no SQL statement" : `found ${count} statements; croft runs exactly one SELECT`,
-      hint: count === 0 ? "write a SELECT" : "run one SELECT at a time; combine queries with a CTE (WITH ...) or UNION",
-      file: o.file,
-    });
-  }
-  const s = await serialize(conn, sql);
-  if (s.error) {
-    if (s.error_type === "parser") throw syntaxError(sql, s, o);
-    const code = o.notSelectCode ?? "QUERY_NOT_SELECT";
-    // DuckDB 2.0 cannot serialize a PIVOT whose columns depend on the data (no IN list): name the fix.
-    const pivot = pivotWithoutValuesIn(sql);
-    if (pivot) {
-      throw new CroftError(code, {
-        message: `PIVOT ... ON ${pivot.column} lists no values, so its columns depend on the data; croft runs SELECTs whose columns it can know`,
-        hint: `list the values: ON ${pivot.column} IN ('pro', 'basic'), or use sum(x) FILTER (WHERE ${pivot.column} = 'pro')`,
-        file: o.file,
-        details: { duckdb: s.error_message, column: pivot.column },
-      });
-    }
-    throw new CroftError(code, {
-      message: code === "QUERY_NOT_SELECT"
-        ? "query runs exactly one SELECT (DESCRIBE, SUMMARIZE and SHOW also work)"
-        : "an SQL asset is exactly one SELECT (CTEs allowed)",
-      hint: code === "QUERY_NOT_SELECT"
-        ? "to export, put the SELECT in an asset or pipe --json output; exports are post-v1"
-        : "remove statements other than the SELECT; croft creates and writes the table itself",
-      file: o.file,
-      details: { duckdb: s.error_message },
-    });
-  }
-  const stmt = s.statements?.[0];
-  if (!stmt || s.statements!.length !== 1) {
-    throw new CroftError("SQL_NOT_ONE_STATEMENT", { message: `found ${s.statements?.length ?? 0} statements`, hint: "run one SELECT at a time", file: o.file });
-  }
-  await new Checker(conn, sql, o).check(stmt);
-  return stmt;
-}
-
-// ---- AST helpers (the walk is sql/ast.ts) -----------------------------------------------------------------
-
-type Node = AstNode;
-const lower = asciiLower;
-const str = stringOf;
-
-/** 'a' or ['a', 'b'] → the strings; anything computed → null. */
-function literalPaths(n: Node | undefined): string[] | null {
-  const one = literal(n);
-  if (one !== null) return [one];
-  if (n?.class === "FUNCTION" && lower(str(n.function_name)) === "list_value") {
-    const all = args(n).map((a) => (a.name ? null : literal(a.expression)));
-    return all.length && all.every((p): p is string => p !== null) ? all : null;
-  }
-  return null;
-}
-
-const NUMERIC_TYPES = new Set(["TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT",
-  "FLOAT", "DOUBLE", "DECIMAL", "INT", "INT1", "INT2", "INT4", "INT8", "INT16", "INT32", "INT64", "INT128", "LONG", "SHORT", "SIGNED", "REAL",
-  "FLOAT4", "FLOAT8", "NUMERIC", "UINT8", "UINT16", "UINT32", "UINT64", "UINT128", "BYTEINT", "UBYTEINT"]);
-
-/** A numeric literal's value (through casts to numeric types and a unary minus); null when `n` is computed
- *  (a column, a function, a string), "unknown" when it is a constant of a shape croft does not know, so the
- *  caller can refuse rather than guess. */
-function numericLiteral(n: Node | undefined): number | null | "unknown" {
-  if (!n) return null;
-  if (n.class === "CAST") {
-    const to = str((n.type_expr as { type_name?: unknown } | undefined)?.type_name);
-    if (!to) return "unknown";
-    return NUMERIC_TYPES.has(to.toUpperCase()) ? numericLiteral(n.child as Node | undefined) : null;
-  }
-  if (n.class === "FUNCTION" && (str(n.function_name) === "-" || str(n.function_name) === "+")) {
-    const a = args(n);
-    if (a.length !== 1) return null;
-    const v = numericLiteral(a[0]!.expression);
-    return typeof v === "number" && str(n.function_name) === "-" ? -v : v;
-  }
-  if (n.class !== "CONSTANT") return null;
-  const c = constant(n);
-  if (!c) return "unknown";
-  if (c.kind === "STRING" || c.kind === "BOOLEAN" || c.kind === "NULL_LITERAL") return null;
-  if (c.kind !== "INTEGER" && c.kind !== "NUMERIC") return "unknown";
-  const x = Number(c.text.replace(/_/g, ""));
-  // 1e400 is Infinity: no list of that length fits, which listSize treats as such.
-  return Number.isNaN(x) ? "unknown" : x;
-}
-
-/** How many values range()/generate_series() with these arguments build; null unless every bound is a literal,
- *  "unknown" when a bound is a constant croft cannot read. */
-function listSize(name: string, list: Node[]): number | null | "unknown" {
-  const n = list.map(numericLiteral);
-  if (n.includes("unknown")) return "unknown";
-  if (n.length === 0 || n.length > 3 || n.some((x) => x === null)) return null;
-  const [start, stop, step] = (n.length === 1 ? [0, n[0], 1] : [n[0], n[1], n.length === 3 ? n[2] : 1]) as number[];
-  if (step === 0) return null; // DuckDB refuses it
-  const span = (stop! - start!) / step!;
-  if (!Number.isFinite(span)) return span > 0 ? Infinity : 0;
-  const size = name === "generate_series" ? Math.floor(span) + 1 : Math.ceil(span);
-  return Math.max(0, size);
-}
-
-// ---- The checks -------------------------------------------------------------------------------------------
-
-interface ServeCatalog { current: string; userTables: Set<string>; others: Set<string> }
-
-class Checker {
-  private readonly serve: boolean;
-  private paths?: Promise<PathGuard>;
-  private catalog?: Promise<ServeCatalog>;
-
-  constructor(private readonly conn: DuckDBConnection, private readonly sql: string, private readonly o: GateOptions) {
-    this.serve = o.profile === "serve";
-  }
-
-  async check(stmt: SelectAst): Promise<void> {
-    const foreign = foreignQueryNode(stmt);
-    if (foreign) {
-      throw this.notSelect(`the query holds a ${foreign.type.replace(/_QUERY_NODE$|_NODE$/, "").replace(/_/g, " ")} statement; croft runs read-only SELECTs`,
-        "a CTE that writes or exports (INSERT, UPDATE, DELETE or COPY inside WITH) is not a read; keep the SELECT, and let croft write tables", foreign.at);
-    }
-    for (const u of collect(stmt).uses) {
-      if (u.kind === "scalar") await this.scalar(u.name, u.at);
-      else if (u.kind === "table_function") await this.tableFunction(u.name, u.fn, u.at);
-      else if (u.kind === "relation") await this.relation(u);
-      else if (this.serve) this.show(u.name);
-    }
-    if (this.serve) this.lists(stmt);
-  }
-
-  /** SHOW forms over HTTP: SHOW TABLES only (the main schema's names). */
-  private show(name: string): void {
-    const n = lower(name);
-    if (SERVE_SHOW_LISTS.has(n)) return;
-    const shown = SHOW_NAMES[n] ?? `SHOW ${name}`;
-    throw this.serveDenied(shown, undefined,
-      SHOW_LISTS.has(n) ? "lists schemas, catalogs or settings beyond the project's tables; the read server shows those only" : "is not available",
-      "SHOW TABLES lists the project's tables, and DESCRIBE <table> the columns of one");
-  }
-
-  /** range() and generate_series() used as values with literal bounds past SERVE_MAX_LIST_VALUES. */
-  private lists(stmt: SelectAst): void {
-    // A table function's own node sits under its TABLE_FUNCTION's `function` key; every other call is a scalar.
-    const tables = new Set<Node>();
-    walk(stmt, (n) => {
-      if (n.type === "TABLE_FUNCTION" && n.function && typeof n.function === "object") tables.add(n.function as Node);
-    });
-    walk(stmt, (n) => {
-      if (typeof n.function_name !== "string" || tables.has(n) || !LIST_BUILDERS.has(lower(n.function_name))) return;
-      const size = listSize(lower(n.function_name), positional(n));
-      if (size === null || (size !== "unknown" && size <= SERVE_MAX_LIST_VALUES)) return;
-      const values = size === "unknown" ? "values croft cannot count" : Number.isFinite(size) ? `${size.toLocaleString("en-US")} values` : "more values than memory holds";
-      const cap = SERVE_MAX_LIST_VALUES.toLocaleString("en-US");
-      throw this.serveDenied(`${n.function_name}() as a value`, location(n),
-        `builds a list of ${values} in one expression, which DuckDB cannot interrupt; over HTTP such a list may hold at most ${cap} values`,
-        `use it as a table instead (SELECT ... FROM range(n)), which the query deadline can stop, or keep the list under ${cap} values`);
-    });
-  }
-
-  private async scalar(name: string, at?: number): Promise<void> {
-    const n = lower(name);
-    if (this.serve && (SCALAR_DENIED.has(n) || SERVE_SCALAR_DENIED.has(n))) throw this.serveDenied(`${name}()`, at);
-    if (n === "setval") throw this.notSelect(`${name}() changes a sequence; croft runs read-only SELECTs`, "remove it", at);
-    if (SCALAR_DENIED.has(n)) {
-      throw this.notSelect(`${name}() writes to DuckDB's log; croft runs read-only SELECTs`, "remove it; croft keeps its own logs", at);
-    }
-  }
-
-  private async tableFunction(name: string, fn: Node, at?: number): Promise<void> {
-    const kind = TABLE_FUNCTIONS.get(lower(name));
-    if (this.serve) {
-      if (kind === "serve") return;
-      throw this.serveDenied(`${name}()`, at);
-    }
-    switch (kind) {
-      case "serve":
-      case "local":
-        return;
-      case "path": {
-        const args = positional(fn);
-        const paths = literalPaths(args[0]);
-        if (!paths) throw this.notLiteral(`${name}()`, location(args[0] ?? fn) ?? at);
-        const guard = await this.pathGuard();
-        for (const p of paths) await guard.check(p, (why, hint) => this.pathDenied(why, hint, location(args[0]!) ?? at));
-        return;
+  const reader = await conn.runAndReadAll("SELECT json_serialize_sql($1::VARCHAR)", [sql]);
+  const parsed = String(reader.getRowsJS()[0]?.[0] ?? "{}");
+  // Only a statement that parsed can name a table or a path; one that did not is refused by decide() without them.
+  const s = parseSerialized(parsed);
+  const stmt = !s.error && s.statements?.length === 1 ? s.statements[0]! : null;
+  let catalog = o.catalog;
+  let paths: PathPolicy | undefined;
+  const globs = new Map<string, GlobExpansion>();
+  if (stmt) {
+    if (o.profile === "serve") catalog ??= await loadCatalog(conn);
+    else {
+      const raws = pathLiterals(stmt, o.profile);
+      if (raws.length) {
+        paths = await loadPathPolicy(conn, o);
+        for (const raw of raws) if (!globs.has(raw) && paths.hasGlob(raw)) globs.set(raw, await expandGlob(conn, raw, o.profile));
       }
-      case "table":
-        // Its table, or file, comes next as a relation of its own (collect()), checked like any other.
-        if (!tableArguments(fn)) throw this.notLiteral(`${name}()`, location(positional(fn)[0] ?? fn) ?? at);
-        return;
-      case "hidden-sql":
-        throw this.notSelect(`${name}() runs SQL or reads a table named in a string, which croft cannot check`,
-          "write the SELECT, or name the table, directly in the query", at);
-      case "effect":
-        throw this.notSelect(`${name}() changes DuckDB's state (logging, profiling, external resources or a checkpoint); croft runs read-only SELECTs`,
-          "remove it; croft manages checkpoints, logging and profiling itself", at);
-      case undefined:
-        throw this.notSelect(`${name}() is not a table function croft allows; croft cannot tell what it reads or changes`,
-          "query tables, read files under files/ with read_csv, read_parquet or read_json, or use range() and unnest()", at);
     }
   }
-
-  private async relation(u: Extract<Use, { kind: "relation" }>): Promise<void> {
-    const shown = [u.catalog, u.schema, u.name].filter(Boolean).join(".");
-    if (looksLikePath(u.name)) {
-      // `FROM 'files/x.csv'`: DuckDB reads the file through a replacement scan (or attaches a .duckdb file).
-      if (this.serve) throw this.serveDenied(shown, u.at, "is a file; the read server reads the project's tables only");
-      const guard = await this.pathGuard();
-      await guard.check(u.name, (why, hint) => this.pathDenied(why, hint, u.at));
-      return;
-    }
-    if (!this.serve) return;
-    const cat = await this.serveCatalog();
-    const name = lower(u.name);
-    const plain = u.catalog === "" && u.schema === "";
-    const inMain = (u.catalog === "" || lower(u.catalog) === cat.current) && (u.schema === "" || lower(u.schema) === "main");
-    if (inMain && cat.userTables.has(name)) return;
-    // A CTE in scope here (collect() scopes them as DuckDB does). A CTE may still not share a name with a
-    // built-in view: were the two ever to disagree about a scope, the name would reach the view.
-    if (plain && u.cte && !cat.others.has(name)) return;
-    throw this.serveDenied(shown, u.at, "is not one of the project's tables; the read server reads those only");
-  }
-
-  private pathGuard(): Promise<PathGuard> {
-    this.paths ??= PathGuard.load(this.conn, this.o);
-    return this.paths;
-  }
-
-  private serveCatalog(): Promise<ServeCatalog> {
-    this.catalog ??= (async () => {
-      const reader = await this.conn.runAndReadAll(`
-        SELECT current_database() AS current, table_name AS name, schema_name = 'main' AND database_name = current_database() AND NOT temporary AS mine, schema_name
-        FROM duckdb_tables()
-        UNION ALL
-        SELECT current_database(), view_name, false, schema_name FROM duckdb_views()`);
-      const rows = reader.getRowObjectsJS() as { current: string; name: string; mine: boolean; schema_name: string }[];
-      const userTables = new Set<string>();
-      const others = new Set<string>();
-      for (const r of rows) {
-        if (r.mine) userTables.add(lower(r.name));
-        else if (r.schema_name === "main" || r.schema_name === "pg_catalog") others.add(lower(r.name)); // reachable unqualified
-      }
-      const current = rows[0]?.current ?? String((await this.conn.runAndReadAll("SELECT current_database()")).getRowsJS()[0]?.[0] ?? "");
-      return { current: lower(current), userTables, others };
-    })();
-    return this.catalog;
-  }
-
-  private where(at?: number): { line?: number; column?: number; file?: string } {
-    const pos = at !== undefined ? lineColumn(this.sql, at) : undefined;
-    return { file: this.o.file, line: pos ? pos.line + (this.o.lineOffset ?? 0) : undefined, column: pos?.column };
-  }
-
-  private serveDenied(what: string, at?: number, why = "is not available over HTTP; the read server reads the project's tables only",
-    hint = "query the project's tables by name; files come in through file ingests"): CroftError {
-    return new CroftError("QUERY_PATH_DENIED", { message: `${what} ${why}`, hint, ...this.where(at) });
-  }
-
-  private notSelect(message: string, hint: string, at?: number): CroftError {
-    return new CroftError(this.o.notSelectCode ?? "QUERY_NOT_SELECT", { message, hint, ...this.where(at) });
-  }
-
-  private notLiteral(what: string, at?: number): CroftError {
-    return new CroftError("QUERY_PATH_DENIED", {
-      message: `${what} needs its path as a string literal; croft checks every path before DuckDB opens it`,
-      hint: "write the path as a quoted string, e.g. read_csv('files/orders.csv')",
-      ...this.where(at),
-    });
-  }
-
-  private pathDenied(message: string, hint: string, at?: number): CroftError {
-    return new CroftError("QUERY_PATH_DENIED", { message, hint, ...this.where(at) });
-  }
+  return decide({ sql, count, parsed, options: o, ...(catalog ? { catalog } : {}), ...(paths ? { paths } : {}), globs });
 }
 
-// ---- Paths ------------------------------------------------------------------------------------------------
+/** gateSelect() for a caller that wants the statement's AST only. */
+export async function assertOneSelect(conn: DuckDBConnection, sql: string, o: GateOptions & GateKnowns = {}): Promise<SelectAst> {
+  return (await gateSelect(conn, sql, o)).ast;
+}
 
-type Deny = (message: string, hint: string) => CroftError;
+/** The tables and views the connection can name (its default database's main schema), and the built-in names a CTE may
+ *  not take. One query; take it once per attached file. */
+export async function loadCatalog(conn: DuckDBConnection): Promise<CatalogSnapshot> {
+  const reader = await conn.runAndReadAll(`
+    SELECT current_database() AS current, table_name AS name, 'table' AS kind, database_name, schema_name, temporary, false AS internal
+    FROM duckdb_tables()
+    UNION ALL
+    SELECT current_database(), view_name, 'view', database_name, schema_name, temporary, internal
+    FROM duckdb_views()`);
+  const rows = (reader.getRowObjectsJS() as unknown as (Omit<CatalogRow, "database" | "schema"> & { database_name: string; schema_name: string })[])
+    .map(({ database_name, schema_name, ...r }): CatalogRow => ({ ...r, database: database_name, schema: schema_name }));
+  const current = rows[0]?.current ?? String((await conn.runAndReadAll("SELECT current_database()")).getRowsJS()[0]?.[0] ?? "");
+  return catalogOf(rows, current);
+}
 
-const within = (p: string, dir: string) => p === dir || p.startsWith(dir.endsWith(sep) ? dir : dir + sep);
+/** Where the connection lets a query read files, and which files it must never name: its sandbox settings and attached
+ *  databases (and `o.protect`, such as the state folder), resolved. One query. */
+async function loadPathPolicy(conn: DuckDBConnection, o: { protect?: string[] } = {}): Promise<PathPolicy> {
+  const reader = await conn.runAndReadAll(`SELECT
+    current_setting('enable_external_access') AS external,
+    current_setting('allowed_directories') AS dirs,
+    current_setting('allowed_paths') AS files,
+    current_setting('temp_directory') AS temp,
+    current_setting('home_directory') AS home,
+    (SELECT list(path) FROM duckdb_databases() WHERE path IS NOT NULL AND path <> '') AS databases`);
+  const s = reader.getRowObjectsJS()[0] as unknown as PathSettings;
+  return PathPolicy.from(s, { protect: o.protect });
+}
 
-// stat never opens the file, so it cannot release the process's lock (§5); realpath can (see physicalPath).
-const inode = (p: string): string | null => {
+/** The files a glob in a query's path matches, through DuckDB's own glob(), or why it could not be expanded. */
+async function expandGlob(conn: DuckDBConnection, raw: string, profile: Profile | undefined): Promise<GlobExpansion> {
   try {
-    const st = statSync(p);
-    return st.isFile() ? `${st.dev}:${st.ino}` : null;
-  } catch {
-    return null;
+    const reader = await conn.runAndReadAll("SELECT file FROM glob($1::VARCHAR)", [raw]);
+    return { files: reader.getRowsJS().map((r) => String(r[0])) };
+  } catch (e) {
+    const mapped = mapSandboxError(e, profile ?? "warehouse");
+    if (mapped instanceof CroftError) return { failed: { message: mapped.message, hint: mapped.problem.hint } };
+    return { failed: { message: `cannot check the files ${raw} matches: ${(e as Error).message.split("\n")[0]}`, hint: "name the files without a pattern" } };
   }
-};
-
-/** Where a query may read files on one connection, and what it must never touch. */
-class PathGuard {
-  private constructor(
-    private readonly conn: DuckDBConnection,
-    private readonly home: string,
-    private readonly allowed: string[] | null,       // canonical folders and files; null = no sandbox
-    private readonly protectedPaths: string[],       // canonical, lower-cased: equal or inside is refused
-    private readonly protectedInodes: Set<string>,   // dev:ino of protected files (catches hard links)
-    private readonly profile: Profile | undefined,
-  ) {}
-
-  static async load(conn: DuckDBConnection, o: GateOptions): Promise<PathGuard> {
-    const reader = await conn.runAndReadAll(`SELECT
-      current_setting('enable_external_access') AS external,
-      current_setting('allowed_directories') AS dirs,
-      current_setting('allowed_paths') AS files,
-      current_setting('temp_directory') AS temp,
-      current_setting('home_directory') AS home,
-      (SELECT list(path) FROM duckdb_databases() WHERE path IS NOT NULL AND path <> '') AS databases`);
-    const s = reader.getRowObjectsJS()[0] as { external: boolean; dirs: string[] | null; files: string[] | null; temp: string | null; home: string | null; databases: string[] | null };
-    const home = s.home || process.env.HOME || homedir();
-    const canon = (p: string) => physicalPath(p).path;
-    // DuckDB always lets a connection reach its own file, WAL and spill folder; croft's user SQL never may.
-    const protect = [...(s.databases ?? []).flatMap((d) => [d, `${d}.wal`, `${d}.tmp`]), ...(s.temp ? [s.temp] : []), ...(o.protect ?? [])];
-    const protectedInodes = new Set<string>();
-    for (const p of protect) {
-      const id = inode(p);
-      if (id) protectedInodes.add(id);
-    }
-    const allowed = s.external ? null : [...(s.dirs ?? []), ...(s.files ?? [])].map(canon);
-    return new PathGuard(conn, home, allowed, protect.map((p) => lower(canon(p))), protectedInodes, o.profile);
-  }
-
-  /** Throw (via `deny`) unless DuckDB may read `raw`, as a query wrote it. Globs are expanded first. */
-  async check(raw: string, deny: Deny): Promise<void> {
-    const local = this.localPath(raw);
-    if (local === null) throw deny(`cannot read ${raw}: croft reads local files only`, "fetch URLs in a TS ingest with ctx.http, then query the table");
-    if (!/[*?[]/.test(local)) return this.checkOne(raw, local, deny);
-    let matches: string[];
-    try {
-      const reader = await this.conn.runAndReadAll("SELECT file FROM glob($1::VARCHAR)", [raw]);
-      matches = reader.getRowsJS().map((r) => String(r[0]));
-    } catch (e) {
-      const mapped = mapSandboxError(e, this.profile ?? "warehouse");
-      if (mapped instanceof CroftError) throw deny(mapped.message, mapped.problem.hint);
-      throw deny(`cannot check the files ${raw} matches: ${(e as Error).message.split("\n")[0]}`, "name the files without a pattern");
-    }
-    for (const m of matches) {
-      const p = this.localPath(m);
-      if (p === null) throw deny(`cannot read ${m} (matched by ${raw}): croft reads local files only`, "narrow the pattern");
-      this.checkOne(m === raw ? raw : `${m} (matched by ${raw})`, p, deny);
-    }
-  }
-
-  /** DuckDB's own prefixes: file:///x, file://localhost/x and file:/x are /x; ~ is the home folder. Any
-   *  other scheme (https://, s3://, ...) is not a local file: null. */
-  private localPath(raw: string): string | null {
-    let p = raw;
-    if (p.startsWith("file://localhost/")) p = p.slice("file://localhost".length);
-    else if (p.startsWith("file:///")) p = p.slice("file://".length);
-    else if (/^file:\/(?!\/)/.test(p)) p = p.slice("file:".length);
-    else if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(p)) return null;
-    if (p.startsWith("~")) p = this.home + p.slice(1);
-    return p;
-  }
-
-  private checkOne(shown: string, path: string, deny: Deny): void {
-    // No lexical normalization: `files/up/../x` must go through the symlink `up` first, as open(2) does.
-    const abs = isAbsolute(path) ? path : `${process.cwd()}${sep}${path}`;
-    let resolved: { path: string; exists: boolean };
-    try {
-      resolved = physicalPath(abs);
-    } catch (e) {
-      throw deny(`cannot read ${shown}: ${(e as Error).message}`, "name a file under files/");
-    }
-    const { path: real, exists } = resolved;
-    const id = exists ? inode(real) : null;
-    const key = lower(real);
-    if ((id && this.protectedInodes.has(id)) || this.protectedPaths.some((p) => within(key, p))) {
-      throw deny(`cannot read ${shown}: it is ${real === shown ? "" : `${real}, `}a file croft must never open this way (the open database, its WAL or temp files, or croft's state)`,
-        "query the warehouse's tables by name; croft never reads its own files through SQL");
-    }
-    if (this.allowed && !this.allowed.some((d) => within(real, d))) {
-      const where = this.allowed.length ? `outside the folders this SQL may read (${this.allowed.join(", ")})` : "not readable here: this connection may not read files";
-      throw deny(`cannot read ${shown}: ${real === shown || real === abs ? "it is" : `it resolves to ${real},`} ${where}`,
-        "move the file under files/, or load it with a file ingest");
-    }
-  }
-}
-
-/** First function node (table or scalar) whose name matches, with its source position when known. */
-export function findFunctions(ast: unknown, match: (name: string) => boolean): { name: string; location?: number } | null {
-  const stack: unknown[] = [ast];
-  while (stack.length) {
-    const node = stack.pop();
-    if (Array.isArray(node)) {
-      for (let i = node.length - 1; i >= 0; i--) stack.push(node[i]);
-      continue;
-    }
-    if (!node || typeof node !== "object") continue;
-    const rec = node as Record<string, unknown>;
-    if (typeof rec.function_name === "string" && match(rec.function_name)) {
-      return { name: rec.function_name, location: location(rec) };
-    }
-    for (const v of Object.values(rec)) if (v && typeof v === "object") stack.push(v);
-  }
-  return null;
 }

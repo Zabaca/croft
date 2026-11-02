@@ -21,6 +21,18 @@ export function restartedError(e: WorkerGone | null, what: "query worker" | "rea
   });
 }
 
+/** A key's query when the project shares no table: every key query is refused, so turning keys on never exposes a table by
+ *  accident (D122). The server answers it before the engine is asked (403), and each engine refuses it too. */
+export function noSharedTables(): CroftError {
+  return new CroftError("SERVE_NO_SHARED_TABLES", {
+    message: "the project shares no table with keys, so this key can read nothing",
+    hint: 'name the tables keys may read in croft.json, like "serve": {"sharedTables": ["orders"]}, and restart croft serve',
+    fix: { kind: "manual", description: 'add "serve": {"sharedTables": [...]} to croft.json with the tables to share, then restart croft serve', requiresHuman: true },
+    retryable: false,
+    details: { status: 403 },
+  });
+}
+
 /** What a query stopped for its deadline, because its request went away, or because the server is stopping reports.
  *  A query stopped for a writer is the file engine's alone. */
 export function stopError(reason: Exclude<StopReason, "write">, o: { queryTimeoutMs: number }): CroftError {

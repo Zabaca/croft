@@ -91,6 +91,10 @@ export const MODE_EXTENSIONS: Readonly<Record<ModeKind, readonly ExtensionName[]
 
 /** The alias a mode's attached database gets: the read copy, or the lake. */
 export const READ_COPY_ALIAS = "wh";
+/** The readers' process's own in-memory database (an in-memory instance's default catalog): it holds one view per shared
+ *  table, reading the copy, and nothing else. A key's connection works in it, so a name it can type is one of those
+ *  views (D122); a Quack session always starts here too, and no setting changes that (slice 4). */
+export const READERS_VIEWS_DB = "memory";
 export const LAKE_ALIAS = "lake";
 /** The named secrets (temporary, in memory) that carry the lake's credentials. */
 export const LAKE_CATALOG_SECRET = "croft_lake_catalog";

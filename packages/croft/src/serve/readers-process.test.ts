@@ -113,7 +113,7 @@ describe("restarting", () => {
       path: p.project.paths.readCopy,
       spec: { profile: "serve", timezone: "UTC", stateDir: p.stateDir },
       protect: [p.stateDir],
-      readers: { extensionDir: join(p.root, "no-extensions"), secretDir: join(p.stateDir, "readers-secrets") },
+      readers: { extensionDir: join(p.root, "no-extensions"), secretDir: join(p.stateDir, "readers-secrets"), shared: [] },
     }));
     expect(err.code).toBe("EXTENSION_MISSING");
     const t = Date.now();

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
-  bearerToken, checkContentType, checkHost, checkOrigin, generateToken, isLoopbackHost, isUnspecifiedHost, resolveToken,
-  tokenMatches, urlHost,
+  authenticate, bearerToken, checkContentType, checkHost, checkOrigin, generateToken, isLoopbackHost, isUnspecifiedHost, keyScopeRefusal,
+  resolveToken, tokenMatches, urlHost,
 } from "./auth.ts";
 
 describe("the token", () => {
@@ -151,5 +151,38 @@ describe("Content-Type", () => {
       expect(r.problem.code).toBe("USAGE_ERROR");
       expect(r.problem.hint).toContain("application/json");
     }
+  });
+});
+
+describe("who a request is (authenticate)", () => {
+  const keys = { verify: (given: string | null) => (given === "croftkey_alice" ? "alice" : null) };
+  const bearer = (t: string) => `Bearer ${t}`;
+
+  test("the app token is the token; a listed key is a key by name; anything else is the 401", () => {
+    expect(authenticate("tok-12345", keys, bearer("tok-12345"))).toEqual({ principal: { kind: "token" } });
+    expect(authenticate("tok-12345", keys, bearer("croftkey_alice"))).toEqual({ principal: { kind: "key", name: "alice" } });
+    for (const header of [null, "", "Basic abc", bearer("croftkey_mallory"), bearer("tok-1234"), bearer("")]) {
+      const r = authenticate("tok-12345", keys, header);
+      expect("status" in r && r.status, String(header)).toBe(401);
+      expect("status" in r && r.problem.code).toBe("SERVE_UNAUTHORIZED");
+    }
+  });
+
+  test("without keys only the token opens it; a key is asked on every request", () => {
+    expect("status" in authenticate("tok-12345", null, bearer("croftkey_alice"))).toBe(true);
+    let asked = 0;
+    const counting = { verify: () => (asked++, null) };
+    authenticate("tok-12345", counting, bearer("a"));
+    authenticate("tok-12345", counting, bearer("a"));
+    expect(asked).toBe(2);
+    // The token is never looked up as a key.
+    authenticate("tok-12345", counting, bearer("tok-12345"));
+    expect(asked).toBe(2);
+  });
+
+  test("a key on /status or /health is the 403 for keys, not a 401", () => {
+    const r = keyScopeRefusal("/status");
+    expect(r.status).toBe(403);
+    expect(r.problem.details).toMatchObject({ status: 403, reason: "key_scope" });
   });
 });

@@ -36,7 +36,7 @@ import { didYouMean } from "../project/suggest.ts";
 import { mapQueryError } from "../read/select.ts";
 import { asciiLower, finiteJson, location } from "./ast.ts";
 import { planScans } from "./deps.ts";
-import { lineColumn } from "./gate.ts";
+import { lineColumn } from "./gate-core.ts";
 
 /** A column of a shadow table, or of an asset's output. */
 export interface ShadowColumn {

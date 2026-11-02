@@ -68,3 +68,18 @@ test("serve --json: one envelope when the server starts, nothing more when it st
   await twice.done;
   golden("serve", second, { failed: true, exit: 2 });
 }, 120_000);
+
+test("serve key add, list, remove --json: the key once, then only names and times; each validated against serve's schema (D122)", async () => {
+  const added = golden("serve", await p.croft(["serve", "key", "add", "alice", "--json"], { env })).data;
+  expect(added).toMatchObject({ action: "add", name: "alice", sharedTables: [], file: ".croft/serve-keys.json" });
+  expect(added.key).toMatch(/^croftkey_[A-Za-z0-9_-]{43}$/);
+  const listed = await p.croft(["serve", "key", "list", "--json"], { env });
+  const list = golden("serve", listed).data;
+  expect(list).toMatchObject({ action: "list", keys: [{ name: "alice", lastUsedAt: null }], sharedTables: [] });
+  expect(listed.stdout).not.toContain(added.key);
+  golden("serve", await p.croft(["serve", "key", "add", "alice", "--json"], { env }), { failed: true, exit: 2 });
+  const removed = golden("serve", await p.croft(["serve", "key", "remove", "alice", "--json"], { env })).data;
+  expect(removed).toMatchObject({ action: "remove", name: "alice", remaining: 0 });
+  golden("serve", await p.croft(["serve", "key", "remove", "alice", "--json"], { env }), { failed: true, exit: 2 });
+  golden("serve", await p.croft(["serve", "key", "list", "--json"], { env })); // empty, not an error
+}, 120_000);

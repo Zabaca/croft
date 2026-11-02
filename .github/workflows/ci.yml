@@ -106,7 +106,8 @@ jobs:
         env:
           CROFT_CI: "1"
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
-        run: bun test
+        # --timeout: the default timeout tests/preload.ts sets reaches the first test file of a run only (DESIGN.md §10 "Test strategy").
+        run: bun test --timeout 60000
 
   # Smoke: Alpine (musl) installs and prints its version, and a fresh project runs its example and answers a query.
   alpine:
