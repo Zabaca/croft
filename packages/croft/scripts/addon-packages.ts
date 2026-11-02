@@ -8,11 +8,12 @@ import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  ADDON_NAMES, ADDON_VERSION, ADDONS, type AddonName, addonPackage, extensionPackage, PLATFORM_NPM, packagedFile, SHIPPED_EXTENSIONS,
+  ADDON_NAMES, ADDON_VERSION, ADDONS, type AddonName, addonPackage, extensionPackage, extensionsOf, PLATFORM_NPM, packagedFile, SHIPPED_EXTENSIONS,
 } from "../src/db/addons.ts";
 import { DUCKDB_VERSION, type ExtensionName, PLATFORMS, type Platform } from "../src/db/extension-names.ts";
 import { extensionPath } from "../src/db/extension-files.ts";
 import { EXTENSION_PINS } from "../src/db/extension-pins.ts";
+import { licenseFor, noticesFor } from "./notices.ts";
 
 /** One package to write. */
 export interface PlannedPackage {
@@ -27,7 +28,10 @@ export interface PlannedPackage {
   file?: { extension: ExtensionName; platform: Platform; name: string };
 }
 
-const REPOSITORY = { type: "git", url: "git+https://github.com/Zabaca/croft.git", directory: "packages/croft" };
+/** Where the packages are built from: the scripts that write them, in the repository. */
+const REPOSITORY = { type: "git", url: "git+https://github.com/Zabaca/croft.git", directory: "packages/croft/scripts" };
+const BUGS = { url: "https://github.com/Zabaca/croft/issues" };
+const KEYWORDS = ["croft", "duckdb", "duckdb-extension"];
 
 /** DuckDB's own license for its extensions (MIT, the same text in each extension's repository). */
 export const LICENSE_TEXT = `Copyright 2018-2025 Stichting DuckDB Foundation
@@ -54,10 +58,10 @@ export function planPackages(): PlannedPackage[] {
         file: { extension, platform, name: packagedFile(extension) },
         manifest: {
           name, version: ADDON_VERSION,
-          description: `DuckDB ${DUCKDB_VERSION}'s ${extension} extension for ${platform}, for croft's modes. Not for direct use: install the add-on that needs it.`,
-          license: "MIT", homepage: "https://croft.zabaca.com", repository: REPOSITORY,
+          description: `DuckDB ${DUCKDB_VERSION}'s ${extension} extension for ${npm.slug}, for croft's modes. Not for direct use: install the add-on that needs it.`,
+          license: licenseFor(extension), homepage: "https://croft.zabaca.com", repository: REPOSITORY, bugs: BUGS, keywords: [...KEYWORDS, extension],
           os: [npm.os], cpu: [npm.cpu], ...(npm.libc ? { libc: [npm.libc] } : {}),
-          files: [packagedFile(extension), "LICENSE", "README.md"],
+          files: [packagedFile(extension), "LICENSE", "THIRD_PARTY_NOTICES.txt", "README.md"],
           publishConfig: { access: "public" },
           croft: { extension, platform, duckdb: DUCKDB_VERSION, sha256: pin.sha256, bytes: pin.bytes },
         },
@@ -67,15 +71,15 @@ export function planPackages(): PlannedPackage[] {
   }
   for (const addon of ADDON_NAMES) {
     const name = addonPackage(addon);
-    const extensions = ADDONS[addon].extensions as readonly ExtensionName[];
+    const extensions = extensionsOf(addon);
     const optionalDependencies: Record<string, string> = {};
     for (const extension of extensions) for (const platform of PLATFORMS) optionalDependencies[extensionPackage(extension, platform)] = ADDON_VERSION;
     out.push({
       name, version: ADDON_VERSION, kind: "addon", folder: folderOf(name),
       manifest: {
         name, version: ADDON_VERSION,
-        description: `The DuckDB ${DUCKDB_VERSION} extension files croft's ${ADDONS[addon].mode} loads (${extensions.join(", ")}), for macOS and Linux (glibc) on x64 and arm64.`,
-        license: "MIT", homepage: "https://croft.zabaca.com", repository: REPOSITORY,
+        description: `The DuckDB ${DUCKDB_VERSION} extension files croft's ${ADDONS[addon].mode} loads (${extensions.join(", ")}), for darwin and linux (glibc) on arm64 and x64.`,
+        license: "MIT", homepage: "https://croft.zabaca.com", repository: REPOSITORY, bugs: BUGS, keywords: [...KEYWORDS, ...extensions],
         files: ["LICENSE", "README.md"],
         optionalDependencies,
         publishConfig: { access: "public" },
@@ -98,7 +102,7 @@ Install it in a project that turns ${mode} on, next to \`@zabaca/croft\`:
     bun add ${addonPackage(addon)}@${ADDON_VERSION}
 
 This package holds no code. Its optional dependencies are one extension package per platform
-(macOS and Linux with glibc, x64 and arm64); your package manager installs only the one for your machine.
+(darwin and linux with glibc, arm64 and x64); your package manager installs only the one for your machine.
 croft finds the file in your project's \`node_modules\`, checks it against the checksum it pins, and loads it
 by path. A project that does not turn ${mode} on does not need this package, and croft itself never
 downloads an extension. \`croft doctor\` and \`croft validate\` say whether the files are found.
@@ -111,7 +115,8 @@ function extensionReadme(extension: ExtensionName, platform: Platform): string {
   return `# ${extensionPackage(extension, platform)}
 
 DuckDB ${DUCKDB_VERSION}'s \`${extension}\` extension for ${platform}, as published by the DuckDB project, unchanged.
-croft checks its sha256 against the one it pins before loading it. You do not install this package yourself:
+croft checks its sha256 against the one it pins before loading it. The file links other projects' code statically;
+THIRD_PARTY_NOTICES.txt has their licenses. You do not install this package yourself:
 it is an optional dependency of the add-on that needs it (${ADDON_NAMES.filter((a) => (ADDONS[a].extensions as readonly string[]).includes(extension)).map(addonPackage).join(", ")}).
 See https://croft.zabaca.com.
 `;
@@ -150,6 +155,7 @@ export function writePackages(out: string, o: WriteOptions): PlannedPackage[] {
     writeFileSync(join(dir, "package.json"), `${JSON.stringify(p.manifest, null, 2)}\n`);
     writeFileSync(join(dir, "README.md"), p.readme);
     writeFileSync(join(dir, "LICENSE"), LICENSE_TEXT);
+    if (p.file) writeFileSync(join(dir, "THIRD_PARTY_NOTICES.txt"), noticesFor(p.file.extension, PLATFORM_NPM[p.file.platform].slug));
     if (p.file) {
       const from = extensionPath(o.source, p.file.extension, p.file.platform);
       if (!existsSync(from)) {

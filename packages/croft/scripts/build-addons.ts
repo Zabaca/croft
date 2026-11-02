@@ -13,8 +13,8 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { ADDON_NAMES, ADDON_VERSION, ADDONS, extensionPackage, PLATFORM_NPM } from "../src/db/addons.ts";
-import { DUCKDB_VERSION, type ExtensionName, PLATFORMS } from "../src/db/extension-names.ts";
+import { ADDON_NAMES, ADDON_VERSION, addonPackage, extensionPackage, extensionsOf, PLATFORM_NPM } from "../src/db/addons.ts";
+import { DUCKDB_VERSION, PLATFORMS } from "../src/db/extension-names.ts";
 import { oversize, packageDir, type PlannedPackage, writePackages } from "./addon-packages.ts";
 
 const args = process.argv.slice(2);
@@ -73,11 +73,11 @@ if (flag("--pack")) {
 const sizeOf = (name: string) => packed.find((p) => p.name === name);
 const perPlatform = packed.length
   ? Object.fromEntries(PLATFORMS.map((platform) => [platform, Object.fromEntries(ADDON_NAMES.map((addon) => {
-    const files = (ADDONS[addon].extensions as readonly ExtensionName[]).map((e) => sizeOf(extensionPackage(e, platform))!);
+    const files = extensionsOf(addon).map((e) => sizeOf(extensionPackage(e, platform))!);
     return [addon, {
       packages: files.length + 1,
-      packedBytes: files.reduce((n, f) => n + f.packedBytes, 0) + sizeOf(`@zabaca/croft-addon-${addon}`)!.packedBytes,
-      unpackedBytes: files.reduce((n, f) => n + f.unpackedBytes, 0) + sizeOf(`@zabaca/croft-addon-${addon}`)!.unpackedBytes,
+      packedBytes: files.reduce((n, f) => n + f.packedBytes, 0) + sizeOf(addonPackage(addon))!.packedBytes,
+      unpackedBytes: files.reduce((n, f) => n + f.unpackedBytes, 0) + sizeOf(addonPackage(addon))!.unpackedBytes,
       npm: PLATFORM_NPM[platform],
     }];
   }))]))

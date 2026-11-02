@@ -21,8 +21,10 @@ Run it in the project's folder, once, when the mode is turned on:
 this croft was tested with (`version` in `data.addons` of `croft validate --json`).
 
 The add-on holds no code. Its optional dependencies are one package per extension and platform, such as
-`@zabaca/croft-ext-quack-darwin-arm64`, and Bun installs only the one for this machine. The platforms are macOS and Linux
-with glibc, on arm64 and x64. Alpine and other musl systems and Windows are not covered: a mode there is
+`@zabaca/croft-ext-quack-darwin-arm64`, each marked with the operating system, CPU and (on Linux) libc it is for, so that Bun
+should install only the one for this machine (unverified: Bun did not apply those fields to packages installed from local
+files, and no add-on has been published yet to try it on the registry; if every platform's file arrives, the install is
+larger than the table below but works the same). The platforms are macOS and Linux with glibc, on arm64 and x64. Alpine and other musl systems and Windows are not covered: a mode there is
 EXTENSION_MISSING with `details.kind` "platform", and no install changes that. What an install costs, for one platform
 (download, then on disk):
 
@@ -41,6 +43,40 @@ footer says it is for another DuckDB or platform. After the install nothing need
 `croft validate --json` has `data.addons` (one entry per add-on the project needs: `ok`, `installed`, `install`, and
 each extension's `source`: "addon", "dir" or "cache"), `croft doctor --json` an `addon.<name>` check with the same under
 `details`, and `croft status --json` `data.serverMode.addons`.
+
+## Licenses
+
+Each extension file is DuckDB's own build and is under DuckDB's MIT license (`LICENSE` in its package). The files link other
+projects' code statically, so each extension package also carries `THIRD_PARTY_NOTICES.txt` with those projects' licenses,
+and a `license` field that names them all as an SPDX expression. What was found in the files themselves:
+
+| Extension | Linked, besides DuckDB's own sources |
+|---|---|
+| httpfs | OpenSSL 3.6.0 (Apache-2.0), libcurl 8.21.0 (curl) |
+| quack | OpenSSL 3.6.0 (Apache-2.0) |
+| postgres | libpq 18 (PostgreSQL), OpenSSL 3.6.0 (Apache-2.0) |
+| ducklake | CRoaring (Apache-2.0 OR MIT, taken under Apache-2.0) |
+
+All four also contain parts of the third-party sources in DuckDB's own tree (Mbed TLS, RE2, {fmt}, yyjson, utf8proc, Zstandard
+and others), whose notices are in the same file. This was read from the binaries and DuckDB's source tree by a person with
+tools, not by a lawyer.
+
+## Publishing the add-ons (for croft's maintainers)
+
+The packages are published by `.github/workflows/publish-addons.yml`, a manual run that builds and measures by default and
+publishes only when told to, with a typed confirmation and the version `ADDON_VERSION` holds. Two of its checks cannot be
+enforced by a file in the repository, because anyone who can push a branch can edit the file and run it from there, so
+before the first publish the maintainer sets up GitHub and npm:
+
+1. On GitHub, create the `npm-addons` environment (Settings, Environments) before the first run: a run that names an
+   environment that does not exist creates it with no protection. Give it a deployment-branch rule that allows `main` only
+   and the maintainer as required reviewer.
+2. Publish the first version of each of the 18 packages by hand from a machine logged in to npm (the build job's tarballs are
+   the files to publish): npm cannot set up trusted publishing for a package that does not exist yet.
+3. On npmjs.com, for each of the 18 packages, set the trusted publisher to this repository, the workflow file
+   `publish-addons.yml` and the environment `npm-addons` (`npm trust github`, npm 11.15 or newer), so that npm itself refuses a
+   publish from any other workflow, branch or environment.
+4. Run the workflow once with `publish` left at `build-only` and read the sizes in its summary, then again to publish.
 
 ## For croft's own tests
 
