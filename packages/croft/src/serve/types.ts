@@ -67,7 +67,8 @@ export interface ServeQuery {
   params: unknown[];
   limit: number;
   /** A key's query (D122): who asks, and the only tables the query may name. Absent for the app token, which reads every
-   *  table. An empty `tables` shares nothing, and the engine refuses the query (SERVE_NO_SHARED_TABLES). */
+   *  table. An empty `tables` shares nothing, and the engine refuses the query (SERVE_NO_SHARED_TABLES). A key works only in
+   *  server mode (D128): the file engine refuses any query that carries a scope (SERVE_KEY_NEEDS_SERVER_MODE). */
   scope?: KeyScope;
   /** The request went away: stop waiting or interrupt. */
   signal?: AbortSignal;

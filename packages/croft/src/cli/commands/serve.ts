@@ -62,7 +62,7 @@ export interface ServeData {
   scheduling: { state: SchedulingSetting["state"]; via: SchedulingSetting["via"]; pausedUntil: string | null; tickEveryMs: number };
   /** The keys people read with (croft serve key add) and the tables they may read (serve.sharedTables), as the server
    *  started: a key made later is honoured at once, a table shared later needs a restart. */
-  keys: { count: number; sharedTables: string[]; unknownTables: string[] };
+  keys: { count: number; sharedTables: string[]; unknownTables: string[]; needsServerMode: boolean };
   /** Set once it stopped. */
   stopped: { signal: string; at: string } | null;
   /** Only with serverMode on (D119): croft serve answers from this read copy (relative to the project when inside it),
@@ -183,7 +183,11 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
       database: project.databaseLabel, startedAt: formatInstant(started, project.timezone), version: CROFT_VERSION,
       token: { source: token.source, from: token.from ?? null, file: shownPath(project, serveJsonPath(stateDir)) },
       scheduling: { state: scheduling.state, via: scheduling.via, pausedUntil: scheduling.pausedUntil ?? null, tickEveryMs: deps.tickIntervalMs ?? TICK_INTERVAL_MS },
-      keys: { count: keyCount(keys), sharedTables: [...cfg.sharedTables], unknownTables: unknownSharedTables(project) },
+      keys: {
+        count: keyCount(keys), sharedTables: [...cfg.sharedTables], unknownTables: unknownSharedTables(project),
+        // A key works only in server mode (D128): with keys made and server mode off, every key is refused until it is on.
+        needsServerMode: !project.config.serverMode.enabled && keyCount(keys) > 0,
+      },
       stopped: null,
       ...(project.config.serverMode.enabled ? { serverMode: { readCopy: shownPath(project, project.paths.readCopy), asOf: engine.status().serverMode?.asOf ?? null } } : {}),
       ...(quackUri ? { quack: connectSnippet({ host: project.config.serverMode.quackHost, port: project.config.serverMode.quackPort }, quackUri, null) as QuackConnect & { uri: string; attach: string } } : {}),
@@ -280,7 +284,10 @@ export function formatBanner(d: ServeData, timezone: string, now: Date = new Dat
         ? ", and set CROFT_SERVE_TOKEN in .env: hosted apps need a token that does not change on every start"
         : "; every request needs the token"));
   }
-  if (d.keys.count > 0 || d.keys.sharedTables.length > 0) {
+  if (d.keys.needsServerMode) {
+    const n = d.keys.count;
+    lines.push(`${n} key${n === 1 ? " is" : "s are"} refused until server mode is on: a key works only there ("serverMode": {"enabled": true} in croft.json, croft docs keys)`);
+  } else if (d.keys.count > 0 || (d.serverMode && d.keys.sharedTables.length > 0)) {
     const n = `${d.keys.count} key${d.keys.count === 1 ? "" : "s"} (croft serve key list)`;
     lines.push(d.keys.sharedTables.length
       ? `${n} read ${d.keys.sharedTables.join(", ")}, read-only`

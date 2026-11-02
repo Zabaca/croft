@@ -2,21 +2,29 @@
 // reads, settings, globs) are sent through every way croft runs user SQL, and each must be refused on every one of them:
 // `croft query`, an SQL asset, a `-- check:` rule, croft serve over HTTP with the app token and over HTTP with a key. They
 // all reach the same synchronous decision (sql/gate-core.ts decide()), so a case one path refuses another cannot let through.
-// A positive control says each path still runs a plain read.
+// A positive control says each path still runs a plain read. A key works only in server mode (D128), so its path is server mode's
+// readers' process; without the extension files it is left out locally, and the tests fail in CI.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cli } from "../cli/commands/inspect-testkit.ts";
 import { type Rig, Rigs, TOKEN } from "./key-rig-testkit.ts";
+import { extensionFiles } from "./readers-testkit.ts";
 
+const { ext } = extensionFiles("gate-paths.test");
 const rigs = new Rigs();
 let r: Rig;
+/** server mode's rig, where a key can run; absent locally without the extension files */
+let kr: Rig | undefined;
 let root: string;
 let key: string;
 beforeAll(async () => {
   r = await rigs.file();
   root = r.p.root;
-  key = r.key("paths-key");
+  if (ext.ready) {
+    kr = await rigs.readers(ext.dir);
+    key = kr.key("paths-key");
+  }
   mkdirSync(join(root, "assets"), { recursive: true });
   writeFileSync(join(root, "files", "x.csv"), "a,b\n1,2\n");
 }, 60_000);
@@ -72,7 +80,7 @@ const path = {
     return { refused: x.status >= 400, how: JSON.stringify(x.json).slice(0, 300) };
   },
   key: async (sql: string) => {
-    const x = await r.call(key, sql);
+    const x = await kr!.call(key, sql);
     return { refused: x.status >= 400, how: JSON.stringify(x.json).slice(0, 300) };
   },
 };
@@ -80,7 +88,7 @@ const path = {
 describe("the same cases, refused on every path", () => {
   for (const [what, sql] of Object.entries(CASES)) {
     test(what, async () => {
-      for (const [name, run] of Object.entries(path)) {
+      for (const [name, run] of Object.entries(path).filter(([n]) => n !== "key" || kr)) {
         const x = await run(sql);
         expect([name, x.refused, x.how], `${name}: ${sql}`).toEqual([name, true, x.how]);
       }
@@ -91,6 +99,6 @@ describe("the same cases, refused on every path", () => {
   test("a plain read still runs on the paths that run queries (an asset and a check are vetted, not run)", async () => {
     expect((await path.query("SELECT count(*) AS n FROM orders")).refused).toBe(false);
     expect((await path.token("SELECT count(*) AS n FROM orders")).refused).toBe(false);
-    expect((await path.key("SELECT count(*) AS n FROM orders")).refused).toBe(false);
+    if (kr) expect((await path.key("SELECT count(*) AS n FROM orders")).refused).toBe(false);
   }, 60_000);
 });

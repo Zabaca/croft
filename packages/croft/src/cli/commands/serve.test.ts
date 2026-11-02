@@ -29,14 +29,18 @@ interface Fake extends ServeEngine {
   opened: ServeEngineOptions[];
 }
 
-function fakeEngine(): Fake {
+/** A fake engine; with `serverMode` its status says so, as the readers' engine's does (a key works only there, D128). */
+function fakeEngine(serverMode = false): Fake {
   const e: Fake = {
     calls: [], closed: false, opened: [],
     async query(q) {
       e.calls.push(q);
       return { columns: [{ name: "a", type: "INTEGER" }], rows: [{ a: 1 }], rowCount: 1, tookMs: 0 };
     },
-    status: () => ({ state: "open", writeIntent: null, inFlight: 0, queued: 0, openConnections: 1, queriesToday: e.calls.length }),
+    status: () => ({
+      state: "open", writeIntent: null, inFlight: 0, queued: 0, openConnections: 1, queriesToday: e.calls.length,
+      ...(serverMode ? { serverMode: { state: "open" as const, copy: "warehouse.read.duckdb", asOf: null, workerPid: null, swaps: 0, restarts: 0, copyCost: null, makingCopy: false, quack: null } } : {}),
+    }),
     async close() {
       e.closed = true;
     },
@@ -67,8 +71,8 @@ function command(deps: ServeDeps): Command {
 }
 
 /** Start `croft serve` in this process; resolves once it listens. */
-async function start(argv: string[], o: { root: string; env?: Record<string, string>; deps?: Partial<ServeDeps> } ) {
-  const engine = fakeEngine();
+async function start(argv: string[], o: { root: string; env?: Record<string, string>; deps?: Partial<ServeDeps>; serverMode?: boolean }) {
+  const engine = fakeEngine(o.serverMode ?? false);
   const ticks = spawner();
   const { stop, fire } = stopper();
   let onStarted!: (d: ServeData) => void;
@@ -310,7 +314,7 @@ describe("the banner", () => {
     url: "http://127.0.0.1:7447", host: "127.0.0.1", port: 7447, pid: 4121, loopback: true, database: "warehouse.duckdb",
     startedAt: "2026-09-24T10:00:00-07:00", version: "0.1.0",
     token: { source: "generated", from: null, file: ".croft/serve.json" },
-    scheduling: { state: "on", via: "serve", pausedUntil: null, tickEveryMs: 60_000 }, keys: { count: 0, sharedTables: [], unknownTables: [] }, stopped: null,
+    scheduling: { state: "on", via: "serve", pausedUntil: null, tickEveryMs: 60_000 }, keys: { count: 0, sharedTables: [], unknownTables: [], needsServerMode: false }, stopped: null,
   };
 
   test("DESIGN.md §4.2", () => {
@@ -342,17 +346,20 @@ describe("the banner", () => {
 });
 
 describe("keys on a running server (D122)", () => {
-  const shareOrders = (root: string) =>
-    writeFileSync(join(root, "croft.json"), JSON.stringify({ database: "warehouse.duckdb", timezone: "America/Los_Angeles", serve: { sharedTables: ["orders", "customers"] } }));
+  const shareOrders = (root: string, serverMode = true) =>
+    writeFileSync(join(root, "croft.json"), JSON.stringify({
+      database: "warehouse.duckdb", timezone: "America/Los_Angeles", serve: { sharedTables: ["orders", "customers"] },
+      ...(serverMode ? { serverMode: { enabled: true, quackPort: 0 } } : {}),
+    }));
   const post = (url: string, bearer: string, sql: string) =>
     fetch(`${url}/query`, { method: "POST", headers: { authorization: `Bearer ${bearer}`, "content-type": "application/json" }, body: JSON.stringify({ sql }) });
 
   test("a key made while it runs is accepted at once, with the shared tables as its scope; removed, it is refused on its next request; one log line each", async () => {
     const p = makeProject();
     shareOrders(p.root);
-    const s = await start(["--port", "0"], { root: p.root });
+    const s = await start(["--port", "0"], { root: p.root, serverMode: true });
     const d = s.started!;
-    expect(d.keys).toEqual({ count: 0, sharedTables: ["orders", "customers"], unknownTables: ["orders", "customers"] }); // no asset makes them in this fixture
+    expect(d.keys).toEqual({ count: 0, sharedTables: ["orders", "customers"], unknownTables: ["orders", "customers"], needsServerMode: false }); // no asset makes them in this fixture
     const made = (await cli(["serve", "key", "add", "alice", "--json"], { cwd: p.root })).json as { data: { key: string } };
     const key = made.data.key;
     const ok = await post(d.url, key, "SELECT secret_looking_column FROM orders");
@@ -380,6 +387,41 @@ describe("keys on a running server (D122)", () => {
     expect(existsSync(join(p.stateDir, "serve-keys-used.json"))).toBe(true);
   });
 
+  test("without server mode a valid key is refused with a 403 before its body is read, the engine never sees it, the usual log line is written, and the app token reads on (D128)", async () => {
+    const p = makeProject();
+    shareOrders(p.root, false);
+    const made = (await cli(["serve", "key", "add", "alice", "--json"], { cwd: p.root })).json as { data: { key: string; serverMode: boolean } };
+    expect(made.data.serverMode).toBe(false);
+    const s = await start(["--port", "0"], { root: p.root });
+    const d = s.started!;
+    expect(d.keys).toMatchObject({ count: 1, needsServerMode: true });
+    // Before the body is read: a body that is not JSON gets the same answer as a good one.
+    for (const body of ['{"sql": "SELECT 1"}', "not json at all"]) {
+      const r = await fetch(`${d.url}/query`, { method: "POST", headers: { authorization: `Bearer ${made.data.key}`, "content-type": "application/json" }, body });
+      expect(r.status).toBe(403);
+      const j = (await r.json()) as { ok: boolean; problems: { code: string; message: string; hint: string; fix?: { requiresHuman?: boolean } }[] };
+      expect(j.ok).toBe(false);
+      expect(j.problems[0]).toMatchObject({ code: "SERVE_KEY_NEEDS_SERVER_MODE" });
+      expect(j.problems[0]!.hint).toContain("serverMode");
+      expect(j.problems[0]!.fix?.requiresHuman).toBe(true);
+    }
+    expect(s.engine.calls).toHaveLength(0);
+    // The key is no 401: it is valid, and the answer says what is missing. /status and /health stay the app token's.
+    expect((await fetch(`${d.url}/status`, { headers: { authorization: `Bearer ${made.data.key}` } })).status).toBe(403);
+    const token = JSON.parse(readFileSync(join(p.stateDir, "serve.json"), "utf8")).token as string;
+    expect((await post(d.url, token, "SELECT 1")).status).toBe(200);
+    expect(s.engine.calls).toHaveLength(1);
+    s.fire("SIGINT");
+    const r = await s.done;
+    expect(r.exit).toBe(0);
+    const lines = r.stderr.split("\n").filter((l) => l.startsWith("croft serve: key "));
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toMatch(/^croft serve: key alice {2}\S+ {2}refused SERVE_KEY_NEEDS_SERVER_MODE {2}0 rows {2}\d+ ms$/);
+    expect(r.stderr + r.stdout).not.toContain(made.data.key);
+    // The banner says so.
+    expect(r.stdout).toContain('1 key is refused until server mode is on: a key works only there ("serverMode": {"enabled": true} in croft.json, croft docs keys)');
+  });
+
   test("the banner names a shared table that no asset makes", async () => {
     const p = makeProject({ files: { "assets/orders.sql": "SELECT 1 AS id\n" } });
     writeFileSync(join(p.root, "croft.json"), JSON.stringify({ database: "warehouse.duckdb", timezone: "America/Los_Angeles", serve: { sharedTables: ["orders", "custmers"] } }));
@@ -390,12 +432,13 @@ describe("keys on a running server (D122)", () => {
 
   test("the banner says how many keys there are and what they read, and warns when no table is shared", async () => {
     const p = makeProject();
+    writeFileSync(join(p.root, "croft.json"), JSON.stringify({ database: "warehouse.duckdb", timezone: "America/Los_Angeles", serverMode: { enabled: true, quackPort: 0 } }));
     await cli(["serve", "key", "add", "alice"], { cwd: p.root });
-    const warned = await start(["--port", "0"], { root: p.root });
+    const warned = await start(["--port", "0"], { root: p.root, serverMode: true });
     warned.fire("SIGINT");
     expect((await warned.done).stdout).toContain("1 key (croft serve key list), but serve.sharedTables in croft.json names no table, so every key query is refused");
     shareOrders(p.root);
-    const shared = await start(["--port", "0"], { root: p.root });
+    const shared = await start(["--port", "0"], { root: p.root, serverMode: true });
     shared.fire("SIGINT");
     expect((await shared.done).stdout).toContain("1 key (croft serve key list) read orders, customers, read-only");
   });

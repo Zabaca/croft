@@ -1,9 +1,10 @@
-// Journey 33: a key per person (DESIGN.md D122, D123; option 06, slice 3). With the project sharing `orders` (and not `payments`),
-// `croft serve key add` makes keys in its own processes; a real croft serve answers a key with the shared table only, the
-// app token with both; a key removed or added while the server runs is honoured on the very next request; a run's new rows
-// reach a key; stopping the server writes each key's last use; and no key appears in anything croft prints or keeps. It runs on
-// the file engine, and, when the extension files are there, in server mode too (the readers' process, a view per shared
-// table). The real CLI throughout, a mock API for the data. Locally a missing extension file skips the server-mode run.
+// Journey 33: a key per person (DESIGN.md D122, D123, D128; option 06, slice 3). With the project sharing `orders` (and not `payments`),
+// `croft serve key add` makes keys in its own processes; a real croft serve in server mode (the readers' process, a view per shared
+// table) answers a key with the shared table only, the app token with both; a key removed or added while the server runs is honoured
+// on the very next request; a run's new rows reach a key; stopping the server writes each key's last use; and no key appears in
+// anything croft prints or keeps. A key works only in server mode (D128): without it the same server refuses a valid key with a 403
+// that says so, and the app token reads on. The real CLI throughout, a mock API for the data. Locally a missing extension file skips
+// the server-mode run.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -56,7 +57,7 @@ function everything(dir: string): string {
   return out.join("\n");
 }
 
-async function journey(serverMode: boolean): Promise<void> {
+async function journey(): Promise<void> {
   const state = { orders: [{ id: 1, amount: 10 }, { id: 2, amount: 20 }] };
   api.route("/orders", () => json(state.orders));
   api.route("/payments", () => json([{ id: 1, card: "4111-secret" }]));
@@ -66,7 +67,7 @@ async function journey(serverMode: boolean): Promise<void> {
   p.write("assets/payments.ts", asset(api.url, "/payments"));
   const env = { ...schedulerEnv(), CROFT_EXTENSION_DIR: ext.dir };
   const home = { env };
-  p.edit("croft.json", '"timezone"', `${serverMode ? '"serverMode": { "enabled": true, "quackPort": 0 }, ' : ""}"serve": { "sharedTables": ["orders"] }, "timezone"`);
+  p.edit("croft.json", '"timezone"', `"serverMode": { "enabled": true, "quackPort": 0 }, "serve": { "sharedTables": ["orders"] }, "timezone"`);
   const built = await p.json(["run"], home);
   expect(built.code, show(built)).toBe(0);
 
@@ -74,7 +75,7 @@ async function journey(serverMode: boolean): Promise<void> {
   const keyOf = async (name: string) => {
     const r = await p.json(["serve", "key", "add", name], home);
     expect(r.code, show(r)).toBe(0);
-    expect(r.json.data).toMatchObject({ action: "add", name, sharedTables: ["orders"], file: ".croft/serve-keys.json" });
+    expect(r.json.data).toMatchObject({ action: "add", name, sharedTables: ["orders"], file: ".croft/serve-keys.json", serverMode: true });
     return r.json.data.key as string;
   };
   const alice = await keyOf("alice");
@@ -97,7 +98,7 @@ async function journey(serverMode: boolean): Promise<void> {
     const own = await ask(rec, alice, "select id, amount from orders order by id");
     expect(own.status, JSON.stringify(own.body)).toBe(200);
     expect(own.body.data.rows).toEqual([{ id: 1, amount: 10 }, { id: 2, amount: 20 }]);
-    if (serverMode) expect(own.body.data.asOf).toMatch(/^\d{4}-\d\d-\d\dT/);
+    expect(own.body.data.asOf).toMatch(/^\d{4}-\d\d-\d\dT/);
     expect((await ask(rec, rec.token, "select card from payments")).body.data.rows).toEqual([{ card: "4111-secret" }]);
 
     // Any other table is refused in the words for one that is not there.
@@ -158,13 +159,53 @@ async function journey(serverMode: boolean): Promise<void> {
   }
 
   // No key is in any file of the project, its state or its backups.
-  const backup = await p.json(["backup", join(p.root, "..", `backup-${serverMode ? "sm" : "file"}`)], home);
+  const backup = await p.json(["backup", join(p.root, "..", "backup-sm")], home);
   expect(backup.code, show(backup)).toBe(0);
-  const bytes = everything(p.root) + everything(join(p.root, "..", `backup-${serverMode ? "sm" : "file"}`));
+  const bytes = everything(p.root) + everything(join(p.root, "..", "backup-sm"));
   for (const k of [alice, bob]) expect(bytes.includes(k), "a key is in a file").toBe(false);
 }
 
+/** Without server mode (D128): the key is made, the real server refuses it with a 403 that names what to turn on, and the token reads on. */
+async function refused(): Promise<void> {
+  api.route("/orders", () => json([{ id: 1, amount: 10 }]));
+  const { project: p } = await initProject();
+  p.remove("assets/example_sales.ts");
+  p.write("assets/orders.ts", asset(api.url, "/orders"));
+  const home = { env: schedulerEnv() };
+  p.edit("croft.json", '"timezone"', '"serve": { "sharedTables": ["orders"] }, "timezone"');
+  expect((await p.json(["run"], home)).code).toBe(0);
+  const added = await p.json(["serve", "key", "add", "alice"], home);
+  expect(added.code, show(added)).toBe(0);
+  expect(added.json.data.serverMode).toBe(false);
+  const key = added.json.data.key as string;
+  const serve = p.start(["serve", "--port", "0"], home);
+  const file = join(p.stateDir, "serve.json");
+  try {
+    await until(() => existsSync(file) || serve.proc.exitCode !== null, 30_000);
+    if (!existsSync(file)) throw new Error(`croft serve did not start\n${show(await serve.done)}`);
+    const rec = JSON.parse(readFileSync(file, "utf8")) as ServeRecord;
+    const own = await ask(rec, key, "select id from orders");
+    expect(own.status, JSON.stringify(own.body)).toBe(403);
+    expect(own.body.problems[0]).toMatchObject({ code: "SERVE_KEY_NEEDS_SERVER_MODE" });
+    expect((await ask(rec, rec.token, "select id from orders")).body.data.rows).toEqual([{ id: 1 }]);
+    const removed = await p.json(["serve", "key", "remove", "alice"], home);
+    expect(removed.code, show(removed)).toBe(0);
+    expect((await ask(rec, key, "select id from orders")).status).toBe(401);
+    serve.proc.kill("SIGINT");
+    const stopped = await serve.done;
+    expect(stopped.code, show(stopped)).toBe(0);
+    expect(stopped.stdout).toContain("1 key is refused until server mode is on");
+    expect(stopped.stderr).toMatch(/croft serve: key alice {2}\S+ {2}refused SERVE_KEY_NEEDS_SERVER_MODE {2}0 rows {2}\d+ ms/);
+    expect(stopped.stdout + stopped.stderr).not.toContain(key);
+  } finally {
+    if (serve.proc.exitCode === null) {
+      serve.proc.kill("SIGKILL");
+      await serve.done;
+    }
+  }
+}
+
 describe("journey 33: keys", () => {
-  test("on the file engine", () => journey(false), 180_000);
-  (ext.ready ? test : test.skip)("in server mode", () => journey(true), 180_000);
+  test("without server mode a valid key is refused, and the app token reads on", () => refused(), 180_000);
+  (ext.ready ? test : test.skip)("in server mode", () => journey(), 180_000);
 });

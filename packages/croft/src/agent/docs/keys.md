@@ -2,8 +2,10 @@
 
 An app reads through croft serve with its token and sees every table. A person gets a key of their own instead: it
 reads only the tables the project shares, read-only, over the same HTTP API, and the user can take it away with one
-command. Keys work with or without server mode (croft docs server-mode); nothing about them needs the read copy. In
-server mode the same key also signs a person's own DuckDB 2.0 in over Quack (croft docs quack).
+command. A key works only when croft serve runs in server mode (croft docs server-mode), where every query of a person
+has two walls: the gate that checks the SQL, and the readers' process, whose views hold only the shared tables. Without
+server mode a valid key is refused with a 403 (SERVE_KEY_NEEDS_SERVER_MODE), before its body is read. In server mode the
+same key also signs a person's own DuckDB 2.0 in over Quack (croft docs quack).
 
 Giving a person access to data is the user's decision, so `croft serve key add` is on the skill's "Ask the user
 first" list: show them which tables the key will read, and wait for a yes. Removing a key needs no asking.
@@ -17,8 +19,10 @@ first" list: show them which tables the key will read, and wait for a yes. Remov
 
    croft serve reads croft.json when it starts: after changing the list, the user restarts croft serve. A name no
    asset makes (a typo) shares nothing; croft serve key add and list, and croft serve's banner, name it.
-2. The user starts croft serve in their own terminal (croft docs serve). Keys are made and removed whether or not
-   it runs.
+2. The user turns server mode on ("serverMode": {"enabled": true} in croft.json, which also changes what apps see:
+   croft docs server-mode) and starts croft serve in their own terminal (croft docs serve). Keys are made and removed
+   whether or not it runs, and whether or not server mode is on: croft serve key add and list say that a key is refused
+   until it is, so a person can be set up first.
 3. Make a key for one person:
 
      croft serve key add alice            prints the key once
@@ -46,9 +50,10 @@ first" list: show them which tables the key will read, and wait for a yes. Remov
 - The app token is unchanged. It reads every table, as it always did.
 
 Answers follow the same limits as the app token's: serve.maxRows and serve.maxBytes (a result past one fails with
-QUERY_TOO_MANY_ROWS, never cut short), serve.queryTimeoutMs and serve.maxConcurrent. Where the query runs: in server
-mode, on the readers' process, against one view per shared table of the read copy (every answer says asOf);
-otherwise on croft serve's query worker, which steps aside for writes as it does for the app token.
+QUERY_TOO_MANY_ROWS, never cut short), serve.queryTimeoutMs and serve.maxConcurrent. A key's query runs on the
+readers' process, against one view per shared table of the read copy (every answer says asOf); it never waits for a
+run. The app token also runs there in server mode, and otherwise on croft serve's query worker, which steps aside for
+writes.
 
 ## Managing keys
 

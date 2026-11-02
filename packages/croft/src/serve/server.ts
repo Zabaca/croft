@@ -49,7 +49,7 @@ import {
   authenticate, type Binding, canonicalOrigin, checkContentType, checkHost, checkOrigin, isLoopbackHost, isUnspecifiedHost,
   type KeyVerifier, keyScopeRefusal, type Principal, type Refusal, urlHost,
 } from "./auth.ts";
-import { noSharedTables } from "./errors.ts";
+import { keyNeedsServerMode, noSharedTables } from "./errors.ts";
 import { SERVE_DEFAULTS } from "./instance.ts";
 import type { ServeEngine, ServeHealth, ServeJson, ServeQueryData } from "./types.ts";
 
@@ -135,6 +135,7 @@ export function httpStatus(e: CroftError): number {
       return 503;
     case "SERVE_UNAUTHORIZED":
     case "SERVE_NO_SHARED_TABLES":
+    case "SERVE_KEY_NEEDS_SERVER_MODE":
       return typeof e.problem.details?.status === "number" && e.problem.details.status === 403 ? 403 : 401;
     case "QUERY_TOO_MANY_ROWS":
       return 422;
@@ -316,6 +317,13 @@ class Handler {
   private async query(req: Request, srv: TimeoutControl, started: number, cors: Record<string, string>, who: Principal): Promise<Response> {
     const type = checkContentType(req.headers.get("content-type"));
     if (type) return this.refusal("query", type, started, cors);
+    // A key works only in server mode (D128): refused before its body is read, with the usual log line. Not by leaving keys out of
+    // the server, which would turn a valid key into a 401 that says it is wrong.
+    if (who.kind === "key" && this.o.engine.status().serverMode === undefined) {
+      const refused = keyNeedsServerMode();
+      this.logKey(who, started, [], 0, refused.code);
+      return this.problemResponse("query", refused, started, cors);
+    }
     // A project that shares no table shares nothing with a key: refused before its body is read (D122).
     if (who.kind === "key" && this.o.sharedTables.length === 0) {
       const refused = noSharedTables();

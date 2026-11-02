@@ -56,9 +56,9 @@ Every request needs Authorization: Bearer <token>.
   GET  /status  the server and its database connection
   GET  /health  {ok, pid, version, database, writeIntent, queriesToday} (server mode adds serverMode: {state, asOf})
 
-The bearer is the app token, which reads every table, or, on POST /query only, a person's key, which reads the
-tables named in serve.sharedTables and nothing else (croft docs keys). croft serve key add|list|remove <name> manage
-the keys; adding one is on the skill's "Ask the user first" list.
+The bearer is the app token, which reads every table, or, on POST /query only and only in server mode, a person's key,
+which reads the tables named in serve.sharedTables and nothing else (croft docs keys). croft serve key add|list|remove
+<name> manage the keys; adding one is on the skill's "Ask the user first" list.
 
 ## Errors
 
@@ -67,6 +67,8 @@ the keys; adding one is on the skill's "Ask the user first" list.
   /status or /health, which need the app token, is a 403.
 - SERVE_NO_SHARED_TABLES: a key's query while serve.sharedTables in croft.json names no table (403). The user
   names the tables people may read, and restarts croft serve (croft docs keys).
+- SERVE_KEY_NEEDS_SERVER_MODE: a valid key's query when croft serve does not run in server mode (403, before the body is
+  read). The user decides whether to turn server mode on (croft docs server-mode); the app token is not affected.
 - SERVE_UNAVAILABLE: the server did not answer, or stayed busy (503 with Retry-After), for the whole timeoutMs
   (10 s by default). A long write step can cause it; "readCopy": true lets the server answer from the read copy
   meanwhile, marked stale: true with asOf (croft docs read-copy).

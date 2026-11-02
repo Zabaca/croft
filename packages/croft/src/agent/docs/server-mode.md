@@ -26,10 +26,12 @@ turns server mode on is unchanged, and so is one that turns it off again.
   warehouse yet queries are DB_NOT_FOUND until a run creates it.
 - `croft status` and `croft doctor` say the project is in server mode, the copy's as-of time, and whether croft serve is
   running. GET /health carries `serverMode: {state, asOf}`.
-- The app token reads every table of the project, as it always did. A person's key (croft docs keys) reads the shared
+- The app token reads every table of the project, as it always did. A person's key (croft docs keys) works only in
+  server mode, where every query has two walls (the gate, and views that hold nothing but the shared tables). It reads the shared
   tables only, from views of them in the readers' process, with the same as-of time on every answer. The same key lets a
   person's own DuckDB 2.0 attach over Quack and read those views, with the as-of time in a view of its own
-  (`_croft_as_of`); croft serve prints the address, and `croft serve key add` how to attach (croft docs quack).
+  (`_croft_as_of`); croft serve prints the address, and `croft serve key add` how to attach (croft docs quack). A project
+  that turns server mode off again keeps its keys, and they are refused until it is on.
 
 ## The read copy is read-only on disk
 

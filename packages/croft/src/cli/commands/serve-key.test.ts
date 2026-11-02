@@ -23,8 +23,11 @@ describe("croft serve key add", () => {
     expect(r.exit).toBe(0);
     expect(r.json).toMatchObject({ ok: true, command: "serve", problems: [] });
     const d = (r.json as { data: Record<string, unknown> }).data;
-    expect(Object.keys(d)).toEqual(["action", "name", "key", "createdAt", "sharedTables", "unknownTables", "file"]);
-    expect(d).toMatchObject({ action: "add", name: "alice", createdAt: "2026-11-01T10:00:00-08:00", sharedTables: ["orders", "customers"], unknownTables: ["orders", "customers"], file: ".croft/serve-keys.json" });
+    expect(Object.keys(d)).toEqual(["action", "name", "key", "createdAt", "sharedTables", "unknownTables", "file", "serverMode"]);
+    expect(d).toMatchObject({
+      action: "add", name: "alice", createdAt: "2026-11-01T10:00:00-08:00", sharedTables: ["orders", "customers"], unknownTables: ["orders", "customers"],
+      file: ".croft/serve-keys.json", serverMode: false,
+    });
     expect(d.key).toMatch(new RegExp(`^${KEY.source}$`));
     // The key opens exactly one door: the one the server checks.
     expect(new KeyStore(p.stateDir).verify(d.key as string)).toBe("alice");
@@ -88,6 +91,39 @@ describe("croft serve key add", () => {
     expect(bad.exit).toBe(2);
     expect((bad.json as { problems: { code: string }[] }).problems[0]!.code).toBe("USAGE_ERROR");
     expect(readFileSync(join(p.stateDir, "serve-keys.json"), "utf8")).toBe(before);
+  });
+});
+
+describe("a key without server mode (D128)", () => {
+  const WARN = /server mode is off in croft\.json, so (this key|every key) is refused until server mode is on/;
+
+  test("is made all the same, so a person can be set up first, and the output says it is refused until server mode is on, in the data too", async () => {
+    const p = makeProject();
+    share(p.root, ["orders"]);
+    const human = await cli(["serve", "key", "add", "alice"], { cwd: p.root });
+    expect(human.exit).toBe(0);
+    expect(human.stdout).toMatch(KEY);
+    expect(human.stdout).toContain('server mode is off in croft.json, so this key is refused until server mode is on ("serverMode": {"enabled": true}, which the user decides: croft docs keys)');
+    const json = (await cli(["serve", "key", "add", "bob", "--json"], { cwd: p.root })).json as { data: { serverMode: boolean }; problems: unknown[] };
+    expect(json.data.serverMode).toBe(false);
+    expect(json.problems).toEqual([]); // a warning in the data, as unknownTables is, not a problem: nothing failed
+    const list = await cli(["serve", "key", "list"], { cwd: p.root });
+    expect(list.stdout).toContain("alice");
+    expect(list.stdout).toMatch(WARN);
+    expect(list.stdout).toContain("every key is refused");
+    expect(((await cli(["serve", "key", "list", "--json"], { cwd: p.root })).json as { data: { serverMode: boolean } }).data.serverMode).toBe(false);
+    // remove needs no warning: taking access away is always fine.
+    expect((await cli(["serve", "key", "remove", "bob"], { cwd: p.root })).stdout).not.toMatch(WARN);
+  });
+
+  test("with server mode on there is no warning and the data says so", async () => {
+    const p = makeProject();
+    writeFileSync(join(p.root, "croft.json"), JSON.stringify({ database: "warehouse.duckdb", timezone: "America/Los_Angeles", serverMode: { enabled: true }, serve: { sharedTables: ["orders"] } }));
+    const human = await cli(["serve", "key", "add", "alice"], { cwd: p.root });
+    expect(human.stdout).not.toMatch(WARN);
+    const json = (await cli(["serve", "key", "list", "--json"], { cwd: p.root })).json as { data: { serverMode: boolean } };
+    expect(json.data.serverMode).toBe(true);
+    expect((await cli(["serve", "key", "list"], { cwd: p.root })).stdout).not.toMatch(WARN);
   });
 });
 
@@ -186,6 +222,7 @@ describe("croft serve key list", () => {
       sharedTables: ["orders"],
       unknownTables: ["orders"], // this project has no assets: nothing makes the table
       file: ".croft/serve-keys.json",
+      serverMode: false,
     });
     expect(r.stdout).not.toContain(a.data.key);
     const human = await cli(["serve", "key", "list"], { cwd: p.root });

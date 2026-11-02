@@ -52,6 +52,7 @@ export const CODES = {
   CONFIG_INVALID: { category: "project", severity: "error", exit: 2 },
   DB_NOT_FOUND: { category: "project", severity: "error", exit: 2 },
   SERVE_NO_SHARED_TABLES: { category: "project", severity: "error", exit: 2 },
+  SERVE_KEY_NEEDS_SERVER_MODE: { category: "project", severity: "error", exit: 2 },
   SERVE_KEY_EXISTS: { category: "project", severity: "error", exit: 2 },
   SERVE_KEY_NOT_FOUND: { category: "project", severity: "error", exit: 2 },
   HTTP_ERROR: { category: "run", severity: "error", exit: 1 },

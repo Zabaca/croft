@@ -134,12 +134,16 @@
                   "items": {
                     "type": "string"
                   }
+                },
+                "needsServerMode": {
+                  "type": "boolean"
                 }
               },
               "required": [
                 "count",
                 "sharedTables",
-                "unknownTables"
+                "unknownTables",
+                "needsServerMode"
               ],
               "additionalProperties": false
             },
@@ -259,6 +263,9 @@
             "file": {
               "type": "string"
             },
+            "serverMode": {
+              "type": "boolean"
+            },
             "quack": {
               "$ref": "#/$defs/QuackConnect"
             },
@@ -273,7 +280,8 @@
             "createdAt",
             "sharedTables",
             "unknownTables",
-            "file"
+            "file",
+            "serverMode"
           ],
           "additionalProperties": false
         },
@@ -304,6 +312,9 @@
             "file": {
               "type": "string"
             },
+            "serverMode": {
+              "type": "boolean"
+            },
             "quack": {
               "$ref": "#/$defs/QuackConnect"
             },
@@ -316,7 +327,8 @@
             "keys",
             "sharedTables",
             "unknownTables",
-            "file"
+            "file",
+            "serverMode"
           ],
           "additionalProperties": false
         },

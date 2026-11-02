@@ -33,6 +33,19 @@ export function noSharedTables(): CroftError {
   });
 }
 
+/** A key's query when croft serve does not run in server mode (D128): a person's key works only there, where every query has two
+ *  walls, the gate and the readers' views database. The server answers it before the body is read (403), and the file engine
+ *  refuses it too, so no path lets a key through a single wall. The app token is not affected. */
+export function keyNeedsServerMode(): CroftError {
+  return new CroftError("SERVE_KEY_NEEDS_SERVER_MODE", {
+    message: "a key reads only when croft serve runs in server mode, and this croft serve does not",
+    hint: 'turn server mode on in croft.json ("serverMode": {"enabled": true}) and restart croft serve; the app token is not affected',
+    fix: { kind: "manual", description: 'ask the user to set "serverMode": {"enabled": true} in croft.json (apps then read the read copy, as of the last run), then restart croft serve', requiresHuman: true },
+    retryable: false,
+    details: { status: 403 },
+  });
+}
+
 /** What a query stopped for its deadline, because its request went away, or because the server is stopping reports.
  *  A query stopped for a writer is the file engine's alone. */
 export function stopError(reason: Exclude<StopReason, "write">, o: { queryTimeoutMs: number }): CroftError {
