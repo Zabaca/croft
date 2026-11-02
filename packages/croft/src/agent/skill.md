@@ -63,6 +63,7 @@ croft status                # failed, stale, held, never run, edited since its l
 - `croft serve key add <name>` and naming tables in `serve.sharedTables`: they give a person access to data. Show which tables the key will read. `croft serve key remove` and `key list` need no asking.
 - Turning `"serverMode"` on or off in croft.json (apps then read the read copy, as of the last run, and DuckDB 2.0 clients with a key can attach over Quack; turning it on also needs the server add-on installed, the `bun add` command `croft validate` prints when it is missing, croft docs addons), `serverMode.acceptFullCopyCost` (disk and write time at every run), and `serverMode.quackPlaintextOnNetwork` (it lets Quack listen beyond this machine, in plaintext, behind a proxy of the user's own).
 - Adding or changing a `"lake"` block in croft.json (the warehouse then lives in a catalog and a bucket folder that someone else runs, with two logins and two keys named by secret names; it needs the lake add-on, the `bun add` command `croft validate` prints, croft docs lake). One machine writes a lake. Never make a Postgres, a bucket or a key yourself, never put a secret's value in croft.json, never run CHECKPOINT or set an expiry on a lake, and never put anything else in its folder (DuckLake's cleanup deletes it).
+- Setting `lake.maintenance.enabled` to false (the lake then grows until `croft maintain` is run by hand), and `croft maintain --orphans` (it ends in `croft confirm`: the files it lists are not the lake's own and are gone for good once deleted). `croft maintain` itself, `croft maintain --dry-run` and `croft backup` of a lake need no asking: a pass removes nothing the 30 days or 5 versions promise keeps, and croft runs one by itself once a day.
 - Deleting .croft/ or warehouse*.duckdb, or `git clean -X` (the trash and backups live in .croft/).
 - Weakening or deleting a failing check.
 
@@ -87,8 +88,14 @@ croft status                # failed, stale, held, never run, edited since its l
 - Lake (croft docs lake): LAKE_CONNECTION_LOST or LAKE_ATTACH_FAILED are about the catalog or the bucket, not the project: check
   `croft doctor`, tell the user, run again when they are reachable. LAKE_COMMIT_UNCERTAIN: look at `croft status` before running
   again. LAKE_OTHER_WRITER: tell the user; do not run from this machine until they decide which machine writes.
+- Lake maintenance: croft runs it by itself (croft docs lake); `croft maintain --dry-run` says what a pass would expire,
+  `croft maintain` runs one. LAKE_MAINTENANCE_FAILED is a warning (the lake is fine, croft tries again within the hour).
+  A version of a table in a lake older than a few days is read with `AT (VERSION => n)` or `AT (TIMESTAMP => ...)` in
+  `croft query`, within the 30 days or the table's 5 newest versions.
 - Backup: croft backup (into .croft/backups/), or croft backup <folder> on another disk; safe while croft serve
-  runs. Never copy warehouse*.duckdb by hand. Putting a backup back replaces data: ask the user (croft docs backup).
+  runs. A lake's backup is a pg_dump of the catalog and a mirror of the bucket folder (LAKE_BACKUP_TOOL_MISSING: ask the
+  user to install the Postgres client tools). Never copy warehouse*.duckdb by hand. Putting a backup back replaces
+  data: ask the user (croft docs backup).
 
 ## Output
 - JSON timestamps carry the project offset; ::DATE uses the croft.json timezone.

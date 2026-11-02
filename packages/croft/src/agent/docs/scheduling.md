@@ -31,6 +31,11 @@ croft run per group of due assets, in the background:
 - an ingest whose schedule fired since it last ran, with the stale transforms downstream of it;
 - any stale transform, even when no ingest is due (after croft run --only, say).
 
+In a lake project the tick also starts the lake's maintenance when a pass is due (croft docs lake): a detached
+croft maintain that runs a pass only if one is due, once the last pass that worked is lake.maintenance.everyHours
+old (24 by default); what it prints goes to .croft/logs/maintain.log. It is not a scheduled asset and needs no code
+approved.
+
 Missed fires run once: after 8 hours asleep, an hourly ingest runs once and its cursor fetches everything since.
 An asset still running from an earlier run is skipped and stays due. croft logs --runs marks these runs
 "schedule".

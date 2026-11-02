@@ -5,7 +5,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { extensionsReady } from "../../db/extension-dir-testkit.ts";
-import { localLakeBlock, useLake } from "../../db/lake-testkit.ts";
+import { localLakeBlock, sqliteLakeClock, useLake } from "../../db/lake-testkit.ts";
 import { closeAllWarehouses } from "../../db/warehouse.ts";
 import { cleanup, cli, makeProject } from "./inspect-testkit.ts";
 import { lakeProject } from "./lake-project-testkit.ts";
@@ -185,5 +185,97 @@ describe("croft maintain", () => {
     const after = await cli(["maintain", "--json"], { cwd: l.p.root, env: l.env });
     await closeAllWarehouses();
     expect(after.exit, after.stdout).toBe(0);
+  }, 120_000);
+
+  maybe("a run starts the pass when one is due, after the run, and a trashed version pins the snapshot it was taken from", async () => {
+    const l = await lakeProject("local", { extensionDir: ready.dir });
+    const T = Date.now();
+    const exec = async (args: string[], at?: number) => {
+      // A run reads the project's clock from the process (core/time.ts now()), as the real CLI's child does.
+      if (at) process.env.CROFT_NOW = iso(at);
+      try {
+        const r = await cli([...args, "--json"], { cwd: l.p.root, env: { ...l.env, ...(at ? { CROFT_NOW: iso(at) } : {}) } });
+        await closeAllWarehouses();
+        return r;
+      } finally {
+        delete process.env.CROFT_NOW;
+      }
+    };
+    // The run that built `orders` was the lake's first look (nothing due). A run a day and an hour later is followed by a pass.
+    expect((await exec(["maintain", "--dry-run"])).json.data.auto.lastOkAt).toBeNull();
+    const soon = await exec(["run", "orders", "--foreground"], T + 2 * HOUR);
+    expect(soon.exit, soon.stdout + soon.stderr).toBe(0);
+    expect((await exec(["maintain", "--dry-run"])).json.data.auto.lastOkAt).toBeNull();
+    const later = await exec(["run", "orders", "--foreground"], T + 25 * HOUR);
+    expect(later.exit, later.stdout + later.stderr).toBe(0);
+    const auto = (await exec(["maintain", "--dry-run"])).json.data.auto;
+    expect(auto.lastOkAt).not.toBeNull();
+    expect(auto.lastPass).toMatchObject({ ok: true });
+    // A trashed version in a lake notes the lake's snapshot it was taken from, and the plan names it.
+    const asked = await exec(["delete", "orders"]);
+    expect(asked.exit).toBe(5);
+    expect((await exec(["confirm", asked.json.confirmation.token])).exit).toBe(0);
+    const trashDir = join(l.p.stateDir, "trash", "orders");
+    const sidecar = JSON.parse(await Bun.file(join(trashDir, (await Array.fromAsync(new Bun.Glob("*.json").scan(trashDir)))[0]!)).text());
+    expect(sidecar.lakeSnapshot).toEqual(expect.any(Number));
+    const plan = (await exec(["maintain", "--dry-run"])).json.data.plan;
+    expect(plan.pins).toEqual([sidecar.lakeSnapshot]);
+  }, 240_000);
+
+  maybe("an age-based expiry set by another tool is a warning in doctor and in the plan, and changes nothing croft's pass does (acceptance 3)", async () => {
+    const l = await lakeProject("local", { extensionDir: ready.dir });
+    await sqliteLakeClock(join(l.p.root, "lake", "catalog.sqlite")).setOption("expire_older_than", "2 days");
+    const exec = async (args: string[]) => {
+      const r = await cli([...args, "--json"], { cwd: l.p.root, env: l.env });
+      await closeAllWarehouses();
+      return r;
+    };
+    const doctor = await exec(["doctor"]);
+    const checks = doctor.json.data.checks as { id: string; status: string; code?: string; text: string }[];
+    expect(checks.find((c) => c.id === "lake.expiry")).toMatchObject({ status: "warn", code: "LAKE_EXPIRY_OPTION" });
+    expect(checks.find((c) => c.id === "lake.expiry")!.text).toContain("expire_older_than = 2 days");
+    const plan = await exec(["maintain", "--dry-run"]);
+    expect(plan.json.data.plan.expiryOptions).toEqual([{ name: "expire_older_than", value: "2 days" }]);
+    expect(plan.json.problems.map((p: { code: string }) => p.code)).toContain("LAKE_EXPIRY_OPTION");
+    // The pass expires by its own list, and the lake's option does nothing to it: the table reads, and the plan said nothing to expire.
+    const ran = await exec(["maintain"]);
+    expect(ran.exit, ran.stdout + ran.stderr).toBe(0);
+    expect(ran.json.data.report.plan.expired).toBe(0);
+    expect((await exec(["query", "select count(*)::INT as n from orders"])).json.data.rows).toEqual([{ n: 20 }]);
+  }, 120_000);
+
+  maybe("the scheduler's tick starts the lake's maintenance when one is due, once, and never runs it itself", async () => {
+    const l = await lakeProject("local", { extensionDir: ready.dir });
+    const { RunsDb } = await import("../../history/runs-db.ts");
+    const { projectTick } = await import("../../schedule/tick.ts");
+    const runs = RunsDb.open(l.p.stateDir);
+    runs.setScheduling({ state: "on", via: "serve" });
+    runs.close();
+    const T = Date.now();
+    const started: { root: string }[] = [];
+    const tick = (at: number) => projectTick({
+      project: l.project, env: {}, now: new Date(at), spawn: async () => {}, maintain: async (r) => void started.push({ root: r.root }),
+    });
+    expect((await tick(T)).result.maintenance).toBeUndefined(); // the first look stamps the lake
+    expect((await tick(T + 23 * HOUR)).result.maintenance).toBeUndefined();
+    const due = await tick(T + 25 * HOUR);
+    expect(due.result.maintenance).toBe(true);
+    expect(started.length).toBe(1);
+    // The next minute's tick leaves it be: the pass is starting. If it never ran, ten minutes on the tick starts it again.
+    expect((await tick(T + 25 * HOUR + 60_000)).result.maintenance).toBeUndefined();
+    expect((await tick(T + 25 * HOUR + 11 * 60_000)).result.maintenance).toBe(true);
+    expect(started.length).toBe(2);
+    // A spawn that fails is a warning of the tick, not its failure.
+    const broken = await projectTick({ project: l.project, env: {}, now: new Date(T + 26 * HOUR), spawn: async () => {}, maintain: async () => { throw new Error("no bun"); } });
+    expect(broken.result.maintenance).toBeUndefined();
+    expect(broken.problems.map((p) => p.message).join(" ")).toContain("could not start the lake's maintenance: no bun");
+    // Off, the tick never starts it.
+    const cfg = JSON.parse(await Bun.file(join(l.p.root, "croft.json")).text());
+    cfg.lake.maintenance = { enabled: false };
+    writeFileSync(join(l.p.root, "croft.json"), JSON.stringify(cfg));
+    const { loadProject } = await import("../../project/root.ts");
+    const off = await projectTick({ project: loadProject({ root: l.p.root }), env: {}, now: new Date(T + 500 * HOUR), spawn: async () => {}, maintain: async () => void started.push({ root: "off" }) });
+    expect(off.result.maintenance).toBeUndefined();
+    expect(started.length).toBe(2);
   }, 120_000);
 });

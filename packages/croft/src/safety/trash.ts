@@ -285,34 +285,42 @@ export function versionNote(path: string, key: string): unknown {
  * its sidecar and any WAL DuckDB left next to it; an asset folder left empty goes too.
  */
 export function pruneTrash(stateDir: string, o: { asset?: string; now?: Date; keep?: readonly string[] } = {}): TrashEntry[] {
-  const cutoff = (o.now ?? clockNow()).getTime() - TRASH_RETENTION.days * 86_400_000;
-  const keep = new Set(o.keep ?? []);
-  const byAsset = new Map<string, TrashEntry[]>();
-  for (const e of listTrash(stateDir, o.asset)) byAsset.set(e.asset, [...(byAsset.get(e.asset) ?? []), e]);
-  const pruned: TrashEntry[] = [];
-  for (const [asset, versions] of byAsset) {
-    // listTrash lists newest first: the first TRASH_RETENTION.versions stay whatever their age.
-    versions.forEach((e, i) => {
-      if (i < TRASH_RETENTION.versions || keep.has(e.path) || !(Date.parse(e.trashedAt) < cutoff)) return;
-      for (const f of [e.path, `${e.path}.wal`, e.path.replace(/\.duckdb$/, ".json")]) rmSync(f, { force: true });
-      pruned.push(e);
-    });
-    if (pruned.some((e) => e.asset === asset)) {
-      try {
-        const dir = trashDir(stateDir, asset);
-        if (readdirSync(dir).length === 0) rmdirSync(dir);
-      } catch {
-        // Gone already.
-      }
+  const pruned = expiredVersions(stateDir, o);
+  for (const e of pruned) for (const f of [e.path, `${e.path}.wal`, e.path.replace(/\.duckdb$/, ".json")]) rmSync(f, { force: true });
+  for (const asset of new Set(pruned.map((e) => e.asset))) {
+    try {
+      const dir = trashDir(stateDir, asset);
+      if (readdirSync(dir).length === 0) rmdirSync(dir);
+    } catch {
+      // Gone already.
     }
   }
   return pruned;
 }
 
-/** The lake snapshots the trash pins: those its versions were taken from (TrashEntry.lakeSnapshot). A version the pruning has removed pins
- *  nothing, so the lake's maintenance, which asks after pruning the trash, lets the snapshot go with it. */
-export function pinnedSnapshots(stateDir: string): number[] {
-  return [...new Set(listTrash(stateDir).flatMap((e) => (e.lakeSnapshot !== undefined ? [e.lakeSnapshot] : [])))].sort((a, b) => a - b);
+/** The lake snapshots the trash pins: those its versions were taken from (TrashEntry.lakeSnapshot). A version the pruning has removed, or
+ *  would remove at `now`, pins nothing, so the lake lets a snapshot go with the version. */
+export function pinnedSnapshots(stateDir: string, o: { now?: Date } = {}): number[] {
+  const gone = new Set(expiredVersions(stateDir, o.now ? { now: o.now } : {}).map((e) => e.path));
+  return [...new Set(listTrash(stateDir).flatMap((e) => (e.lakeSnapshot !== undefined && !gone.has(e.path) ? [e.lakeSnapshot] : [])))].sort((a, b) => a - b);
+}
+
+/** The versions pruneTrash would remove now, without removing any: older than the retention's days, with the retention's number of newer
+ *  versions of their asset, and not in `keep`. */
+export function expiredVersions(stateDir: string, o: { asset?: string; now?: Date; keep?: readonly string[] } = {}): TrashEntry[] {
+  const cutoff = (o.now ?? clockNow()).getTime() - TRASH_RETENTION.days * 86_400_000;
+  const keep = new Set(o.keep ?? []);
+  const byAsset = new Map<string, TrashEntry[]>();
+  for (const e of listTrash(stateDir, o.asset)) byAsset.set(e.asset, [...(byAsset.get(e.asset) ?? []), e]);
+  const out: TrashEntry[] = [];
+  for (const versions of byAsset.values()) {
+    // listTrash lists newest first: the first TRASH_RETENTION.versions stay whatever their age.
+    versions.forEach((e, i) => {
+      if (i < TRASH_RETENTION.versions || keep.has(e.path) || !(Date.parse(e.trashedAt) < cutoff)) return;
+      out.push(e);
+    });
+  }
+  return out;
 }
 
 /** Where the next trash file of an asset would go (for a confirmation's impact; the stamp is a guess). */

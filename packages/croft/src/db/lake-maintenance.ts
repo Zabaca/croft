@@ -220,7 +220,7 @@ export async function ageBasedExpiryOptions(sql: Sql): Promise<ExpiryOption[]> {
 
 /**
  * A failure worth trying again: the catalog's connection dropped, or the store answered with a server error or asked to slow down. R2
- * answered HTTP 500 to three bulk deletes in five days on ryzen-9's lake, and a retry succeeded. A refused login or key, a missing
+ * answered HTTP 500 to three bulk deletes in five days on a lake that was in use, and a retry succeeded. A refused login or key, a missing
  * file the catalog names and a bad request are not transient: they would fail the same way.
  */
 export function isTransientStorage(e: unknown): boolean {

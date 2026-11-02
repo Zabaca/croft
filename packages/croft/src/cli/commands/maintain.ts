@@ -22,7 +22,7 @@ import type { LockHolder, Problem } from "../../core/types.ts";
 import { RunsDb, RUNS_DB_FILE } from "../../history/runs-db.ts";
 import { deleteOrphansOf, listOrphansOf, type MaintenancePlan, maintainIfDue, maintainProject, type PassOutcome, planProject } from "../../db/lake-pass.ts";
 import { type MaintenanceView, maintenanceView, readState } from "../../db/lake-maintenance-state.ts";
-import { type LakeStats, type PassReport, type StepReport } from "../../db/lake-maintenance.ts";
+import { DEFAULT_RETRY, type LakeStats, type PassReport, type RetryPolicy, type StepReport } from "../../db/lake-maintenance.ts";
 import { Confirmations, type HashedImpact } from "../../safety/confirm.ts";
 import type { CommandImpl, CommandResult, Ctx } from "../command.ts";
 import { dispatchOf } from "../main.ts";
@@ -84,7 +84,7 @@ export const maintain: CommandImpl<MaintainData> = {
       return { data: data(ctx, plan ? "planned" : "no_lake", { plan }), problems: expiryProblems(plan), next: plan && plan.expire > 0 ? [{ command: "croft maintain", reason: "run the pass the plan describes" }] : [] };
     }
     const input = {
-      now: ctx.now(), isTTY: ctx.isTTY.stdin && ctx.isTTY.stdout,
+      now: ctx.now(), isTTY: ctx.isTTY.stdin && ctx.isTTY.stdout, ...retryKnob(ctx.processEnv),
       onStep: (step: string) => ctx.render.progress(`lake maintenance: ${step}`),
       onWait: (h: LockHolder, ms: number) => ctx.render.progress(`waiting for the lake: ${h.action === "maintenance" ? "another pass" : `croft run ${h.runId ?? h.pid}`} holds it (${Math.round(ms / 1000)} s so far)`),
     };
@@ -97,6 +97,12 @@ export const maintain: CommandImpl<MaintainData> = {
     return format(result.data);
   },
 };
+
+/** Test knob: CROFT_MAINTAIN_RETRY_MS="5" makes a step's retries wait 5 ms, then 10, 20 (default 750 ms, doubling), instead of seconds. */
+function retryKnob(env: Record<string, string | undefined>): { retry?: RetryPolicy } {
+  const ms = Number(env.CROFT_MAINTAIN_RETRY_MS);
+  return Number.isFinite(ms) && ms > 0 ? { retry: { ...DEFAULT_RETRY, baseMs: ms } } : {};
+}
 
 function fromOutcome(ctx: Ctx, o: PassOutcome): CommandResult<MaintainData> {
   const d = data(ctx, o.status, { report: o.report ?? null });

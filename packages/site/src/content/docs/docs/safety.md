@@ -67,3 +67,5 @@ croft backup /Volumes/Backup     # or inside a folder on another disk
 ```
 
 It takes the file the way a croft writer does, so it is safe while `croft serve` runs or a run is going: serve steps aside for the moment a checkpoint and a copy-on-write clone take. Never copy `warehouse.duckdb` by hand; a copy taken mid-write, or with commits still in its WAL, can miss rows. croft never overwrites or deletes a backup. Putting one back is a few manual steps, described in [Backups](/docs/guides/backup/).
+
+A project whose warehouse is a [lake](/docs/guides/lake/) is backed up the same way, as a dump of the catalog (with Postgres's `pg_dump`) and a mirror of the bucket folder, with the run history and the trash; writes wait only for the dump, and a later backup links the files an earlier one holds instead of copying them again. A lake also keeps itself short: `croft maintain` (which croft runs by itself once a day) expires the history outside the trash's promise of 30 days or 5 versions per table, so everything inside it can still be read as it was.

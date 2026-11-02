@@ -213,6 +213,8 @@ export interface TestLake {
   db?: string;
   /** Postgres: the store, for faults. */
   s3?: TestS3;
+  /** Postgres: the rig the lake is in (its superuser reads the catalog's size, and more). */
+  rig?: LakeRig;
   close(): Promise<void>;
 }
 
@@ -247,7 +249,7 @@ export async function openTestLake(kind: TestLakeKind, o: { extensionDir: string
   const w = openWarehouse({ ...base, mode: "read_write", ...(o.waits ? { waits: o.waits } : {}) });
   const r = openWarehouse({ ...base, path: join(root, "r.duckdb"), mode: "read_only", profile: "query" });
   return {
-    kind, w, r, clock, conn, root, stateDir, dataDir, ...(db ? { db } : {}), ...(o.rig ? { s3: o.rig.s3 } : {}),
+    kind, w, r, clock, conn, root, stateDir, dataDir, ...(db ? { db } : {}), ...(o.rig ? { s3: o.rig.s3, rig: o.rig } : {}),
     async close() {
       await w.close();
       await r.close();

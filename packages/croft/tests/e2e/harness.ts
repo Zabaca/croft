@@ -254,7 +254,7 @@ export async function initProject(name = "proj"): Promise<{ project: Project; in
 let rig: Promise<LakeRig> | null = null;
 
 /** The Postgres and the S3-compatible store of a CROFT_E2E_LAKE=postgres run: started on first use, stopped by cleanupAll (when a test file ends). */
-async function lakeRig(): Promise<LakeRig> {
+export async function lakeRig(): Promise<LakeRig> {
   const ready = lakeRigReady();
   if (!ready.ready) throw new Error(`CROFT_E2E_LAKE=postgres needs Postgres, the S3 testkit and the extension files: ${ready.skipReason}`);
   return (rig ??= startLakeRig());

@@ -14,7 +14,7 @@
 // - the trash is pruned first, then the snapshots its versions pin are asked for: the lake keeps what the trash keeps.
 import { CroftError, problem } from "../core/errors.ts";
 import { currentIdentity, type ProcessIdentity, recordAlive } from "../core/proc.ts";
-import type { Problem } from "../core/types.ts";
+import type { LockHolder, Problem } from "../core/types.ts";
 import { RunsDb } from "../history/runs-db.ts";
 import type { ProjectEnv } from "../project/env.ts";
 import type { Project } from "../project/root.ts";
@@ -59,7 +59,7 @@ export interface MaintainInput {
   waitMs?: number;
   retry?: RetryPolicy;
   onStep?: (step: StepName) => void | Promise<void>;
-  onWait?: (holder: import("../core/types.ts").LockHolder, waitedMs: number) => void;
+  onWait?: (holder: LockHolder, waitedMs: number) => void;
 }
 
 /** A pass summary without the details only the report has. */
@@ -80,8 +80,19 @@ export async function maintainProject(project: Project, env: ProjectEnv, o: Main
   const ownRuns = o.runs === undefined;
   const runs = o.runs ?? RunsDb.open(stateDir);
   try {
-    // A lake nobody has written is not made by a pass.
-    if (!(await lakeExists(project, env))) return { status: "no_lake" };
+    // A lake nobody has written is not made by a pass. A catalog or a store that cannot even be reached is a failed attempt like any other:
+    // it is kept, so that status and doctor say so and the next try waits the hour.
+    try {
+      if (!(await lakeExists(project, env))) return { status: "no_lake" };
+    } catch (e) {
+      const p = e instanceof CroftError ? e.problem : problem("LAKE_MAINTENANCE_FAILED", {
+        message: `the lake's maintenance could not reach the lake: ${String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 300)}`,
+        hint: "croft tries again within the hour, or croft maintain now", retryable: true,
+      });
+      const failed: PassOutcome = { status: "failed", problem: p };
+      finish(runs, o.now, failed, true);
+      return failed;
+    }
     const id = currentIdentity();
     const claimed = claim(runs, o.now, id);
     if (!claimed) return { status: "running" };
@@ -242,7 +253,7 @@ export async function planProject(project: Project, env: ProjectEnv, o: { now: D
   });
   try {
     // The trash as the pass would find it: its expired versions do not pin anything.
-    const pins = pinnedSnapshots(stateDir);
+    const pins = pinnedSnapshots(stateDir, { now: o.now });
     return await w.read(async (db) => {
       const stats = await lakeStats(db);
       const { snapshots, tables } = await readPlanInput(db);

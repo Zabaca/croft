@@ -6,6 +6,7 @@ import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statS
 import { basename, dirname, join } from "node:path";
 import { cleanup, cli } from "../cli/commands/inspect-testkit.ts";
 import { lakeProject, type LakeProject, ORDERS_SQL } from "../cli/commands/lake-project-testkit.ts";
+import { IN_CI } from "./extension-dir-testkit.ts";
 import { lakeRigReady, type LakeRig, READER_LOGIN, startLakeRig, WRITER_LOGIN } from "./lake-testkit.ts";
 import { findPgDump } from "./lake-backup.ts";
 import { backupRunning, markBackupRunning } from "./lake.ts";
@@ -14,6 +15,15 @@ import { closeAllWarehouses } from "./warehouse.ts";
 const ready = lakeRigReady();
 if (!ready.ready) console.warn(`[lake-backup.test] SKIPPING: ${ready.skipReason}`);
 const maybe = ready.ready ? test : test.skip;
+// A Postgres lake's backup needs pg_dump and pg_restore: locally their absence skips with a reason; in CI it fails (scripts/check-mode-tools.ts).
+const pgDump = findPgDump(process.env);
+const havePgTools = pgDump !== null && existsSync(join(dirname(pgDump), "pg_restore"));
+if (ready.ready && !havePgTools) {
+  const why = "pg_dump and pg_restore are not installed (the Postgres client tools)";
+  if (IN_CI) throw new Error(`CI must have the Postgres client tools for the lake backup tests: ${why}`);
+  console.warn(`[lake-backup.test] SKIPPING the Postgres lake's backup: ${why}`);
+}
+const maybePg = ready.ready && havePgTools ? test : test.skip;
 
 let rig: LakeRig;
 beforeAll(async () => {
@@ -86,9 +96,7 @@ describe("croft backup of a lake", () => {
     expect(status.json.data.assets[0]).toMatchObject({ asset: "orders", status: "ok" });
   }, 240_000);
 
-  maybe("a Postgres lake: pg_dump of the catalog and a mirror of the bucket folder; a second backup reuses the files the first holds; it restores to a fresh catalog and a fresh bucket (acceptance 7)", async () => {
-    const pgDump = findPgDump(process.env);
-    expect(pgDump, "pg_dump is needed for this test").not.toBeNull();
+  maybePg("a Postgres lake: pg_dump of the catalog and a mirror of the bucket folder; a second backup reuses the files the first holds; it restores to a fresh catalog and a fresh bucket (acceptance 7)", async () => {
     const l = await lakeProject("postgres", { extensionDir: ready.dir, rig });
     const before = await snapshotOf(l);
     const first = await run(l, ["backup"], { CROFT_PG_DUMP: pgDump! });
@@ -143,7 +151,7 @@ describe("croft backup of a lake", () => {
     rmSync(root2, { recursive: true, force: true });
   }, 420_000);
 
-  maybe("a project with no pg_dump is told before anything is written; a lake nobody has written has nothing to back up; a backup copying keeps passes away", async () => {
+  maybePg("a project with no pg_dump is told before anything is written; a lake nobody has written has nothing to back up; a backup copying keeps passes away", async () => {
     const l = await lakeProject("postgres", { extensionDir: ready.dir, rig });
     const none = await run(l, ["backup"], { CROFT_PG_DUMP: "/nowhere/pg_dump" });
     expect(none.exit).toBe(2);

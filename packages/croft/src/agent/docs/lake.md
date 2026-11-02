@@ -79,8 +79,9 @@ What a pass keeps is the trash's promise (croft docs trash), and it is not a set
 days, the newest snapshot before them (the state when the window began), each asset's 5 newest versions however old (a
 version is a snapshot in which the asset's table changed), and every snapshot the trash pins (the one a trashed version
 was taken from). Everything else is expired. Nothing the promise keeps is ever deleted: a kept version reads back
-exactly (`SELECT ... FROM t AT (VERSION => 41)`, with the number from `FROM lake.snapshots()`), and a version outside
-both limits is gone.
+exactly, and a version outside both limits is gone. A person reads one with `AT (TIMESTAMP => '2026-10-20 12:00')` in
+`croft query` (or their own DuckDB, where `FROM lake.snapshots()` lists the versions and `AT (VERSION => 41)` names one);
+a snapshot that was expired answers "No snapshot found".
 
 When it runs: after a run, and from the scheduler's tick, once the last pass that worked is `lake.maintenance.everyHours`
 old (24; an hour after a pass that failed). A lake croft has not seen before is stamped when it is first looked at, so
@@ -104,7 +105,11 @@ would expire a snapshot the trash pinned, and it deletes any file in the folder 
 warns with LAKE_EXPIRY_OPTION when an age-based expiry is set on the lake; croft's own pass ignores it.
 
 `croft doctor` and `croft status` show when maintenance last worked and what the lake holds: snapshots, files, the
-tables that keep small inserts inside the catalog, and files freed but not yet deleted.
+tables that keep small inserts inside the catalog, and files freed but not yet deleted. What it does to a lake of five
+assets run hourly: after a week the catalog held 842 snapshots, 839 files and 181 inlined tables; a pass takes about a
+second and leaves, once the week is older than 30 days, 28 snapshots, 26 files and 18 tables, and in a steady state
+(30 days of hourly runs kept) it takes 0.2 to 0.5 s. The catalog's size on disk is Postgres's to give back (VACUUM FULL);
+the rows it holds are what fall.
 
 ## Backups of a lake
 
