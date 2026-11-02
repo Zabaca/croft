@@ -1,4 +1,4 @@
-// croft's bookkeeping tables behind one interface, with two adapters (DESIGN.md §5 "Where state lives", D-L1).
+// croft's bookkeeping tables behind one interface, with two adapters (DESIGN.md §5 "Where state lives", D132).
 //
 // - file: today's tables in schema _croft, primary keys and upserts, exactly as every existing warehouse has them.
 // - log: what a DuckLake can hold. DuckLake refuses primary keys, unique and check constraints, INSERT OR REPLACE and

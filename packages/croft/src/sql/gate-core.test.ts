@@ -284,6 +284,9 @@ describe("the catalog snapshot", () => {
     expect(catalog.current).toBe("memory");
     expect([...catalog.userTables].sort()).toEqual(["customers", "orders", "payments", "secrets"]);
     expect(catalog.userTables.has("assets")).toBe(false); // _croft's table
+    // The log adapter's table and view live in _croft too: no schema but main is in the snapshot.
+    expect(catalog.userTables.has("assets_log")).toBe(false);
+    expect(catalog.views.has("columns")).toBe(false);
     expect(catalog.others.has("duckdb_tables")).toBe(true);
   });
 

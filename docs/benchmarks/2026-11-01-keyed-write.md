@@ -1,6 +1,6 @@
 # The merge benchmark: what a keyed write costs, before and after counting by classifying (2026-11-01)
 
-Option 07, slice 1 (DESIGN.md D-L2). A keyed write used to count what it changed from the actions one `MERGE ... RETURNING`
+Option 07, slice 1 (DESIGN.md D133). A keyed write used to count what it changed from the actions one `MERGE ... RETURNING`
 gives back; a lake refuses `RETURNING` on `MERGE`, so croft now classifies the batch against the table first (added, updated,
 unchanged; for a replace, the table rows no batch row has the key of), inserts the added rows, merges only the updated ones and
 deletes the unmatched. The option let a file keep the old way if the new one made the whole write step more than 15% slower.

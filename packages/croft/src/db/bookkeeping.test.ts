@@ -1,4 +1,4 @@
-// The bookkeeping adapters (DESIGN.md §5 "Where state lives", D-L1; option 07, slice 1). The same sequence of writes
+// The bookkeeping adapters (DESIGN.md §5 "Where state lives", D132; option 07, slice 1). The same sequence of writes
 // goes through the file adapter, the log adapter on a plain DuckDB file and the log adapter in a local lake (a SQLite
 // catalog and a local folder, no Postgres), and every table reads the same through `_croft.<table>` in all three.
 import { afterAll, describe, expect, test } from "bun:test";

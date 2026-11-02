@@ -528,7 +528,7 @@ describe("newRows() positions never skip rows (§3e)", () => {
     expect(next.result.inputs).toEqual([{ input: "issues", seenBefore: L1, seenAfter: L2, rows: 2 }]);
   });
 
-  test("counting (D-L2): chunks of a TS transform report the same rows whether the MERGE or a classification counts them", async () => {
+  test("counting (D133): chunks of a TS transform report the same rows whether the MERGE or a classification counts them", async () => {
     const run = async (counting: Counting) => {
       CHUNK.rows = 3;
       const h = harness({ "assets/t.ts": incremental() });

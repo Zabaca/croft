@@ -23,7 +23,7 @@
 //                a SQL transform's new or recreated table: one CREATE OR REPLACE ... AS SELECT of its rows
 //                A keyed write is counted by classifying the batch against the table first (added, updated, unchanged;
 //                the table rows no batch row has the key of), then INSERTing the added rows, MERGEing only the updated ones
-//                (one UPDATE action to a MERGE, all DuckLake takes) and DELETEing the unmatched: D-L2, Counting below
+//                (one UPDATE action to a MERGE, all DuckLake takes) and DELETEing the unmatched: D133, Counting below
 //   checks       caller's blocking checks; a throw rolls the whole transaction back
 //   state        cursor, _croft.assets, _croft.columns, _croft.writes (with the step attempt) and, for
 //                transforms, _croft.inputs (positions) in the same transaction
@@ -714,7 +714,7 @@ async function emptyBatch(tx: Sql, o: ApplyInput): Promise<Counts> {
   return { added: 0, updated: 0, unchanged: 0, deleted: Number(row?.Count ?? 0) };
 }
 
-/** How a keyed write counts what it changed (DESIGN.md D-L2). "classify": the rows are classified against the table
+/** How a keyed write counts what it changed (DESIGN.md D133). "classify": the rows are classified against the table
  *  first (added, updated, unchanged, and for a replace the table rows no row of the batch matches), then the added rows are
  *  inserted, only the updated ones merged and the unmatched ones deleted; no statement returns anything, which is all a
  *  lake can do (DuckLake refuses RETURNING on MERGE). It is the path of every write, in a file as in a lake: on the merge

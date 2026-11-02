@@ -8,6 +8,8 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { logDdl } from "../db/bookkeeping.ts";
+import { LOG_FORMAT_VERSION } from "../db/state.ts";
 import { closeAllWarehouses } from "../db/warehouse.ts";
 import { cleanup, seed, type TempProject } from "../read/testkit.ts";
 import { aside, ask, count, extensionFiles, openEngine, project, putCopy, rejection, replaceCopy, sleep, until } from "./readers-testkit.ts";
@@ -154,6 +156,38 @@ describe("starting", () => {
     const newer = join(p.root, "newer.duckdb");
     copyFileSync(p.database, newer);
     await seed(newer, ["CREATE SCHEMA _croft", "CREATE TABLE _croft.meta (key VARCHAR PRIMARY KEY, value VARCHAR)", "INSERT INTO _croft.meta VALUES ('format_version', '999')", "CHECKPOINT"]);
+    putCopy(p, newer, "2026-10-30T10:00:00Z");
+    const err = await rejection(openReadersEngine({ root: p.root, extensionDir: ext.dir, copyPollMs: 25 }));
+    expect(err.code).toBe("DB_NEWER_FORMAT");
+  });
+});
+
+describe("a warehouse whose bookkeeping is a log (D132)", () => {
+  withExt("its read copy is served: the format 4 is read, the tables answer, and croft's log, its views and its schema stay out of reach", async () => {
+    const p = await project({ n: 5, copy: false });
+    const logged = join(p.root, "logged.duckdb");
+    copyFileSync(p.database, logged);
+    await seed(logged, [
+      "CREATE SCHEMA IF NOT EXISTS _croft", ...logDdl().map((d) => d.ddl),
+      `INSERT INTO _croft.meta VALUES ('format_version', '${LOG_FORMAT_VERSION}'), ('bookkeeping', 'log')`,
+      "INSERT INTO _croft.assets_log (name, kind, row_count, seq, closed) VALUES ('orders', 'ingest', 5, 1, false)",
+      "CHECKPOINT",
+    ]);
+    putCopy(p, logged, "2026-10-30T10:00:00Z");
+    const e = await engine(p);
+    expect(await count(e, "orders")).toBe(5);
+    expect((await ask(e, "SHOW TABLES")).rows.map((r) => r.name)).toEqual(["orders"]);
+    for (const sql of ["SELECT * FROM _croft.assets", "SELECT * FROM _croft.assets_log", "SELECT * FROM wh._croft.assets_log", "SELECT * FROM wh._croft.columns", "SHOW TABLES FROM _croft"]) {
+      const err = await rejection(ask(e, sql));
+      expect(["QUERY_PATH_DENIED", "QUERY_NOT_SELECT", "UNKNOWN_TABLE"], sql).toContain(err.code);
+    }
+  });
+
+  withExt("a croft that reads up to the log's format refuses the next one", async () => {
+    const p = await project({ n: 5, copy: false });
+    const newer = join(p.root, "newer.duckdb");
+    copyFileSync(p.database, newer);
+    await seed(newer, ["CREATE SCHEMA _croft", "CREATE TABLE _croft.meta (key VARCHAR, value VARCHAR)", `INSERT INTO _croft.meta VALUES ('format_version', '${LOG_FORMAT_VERSION + 1}')`, "CHECKPOINT"]);
     putCopy(p, newer, "2026-10-30T10:00:00Z");
     const err = await rejection(openReadersEngine({ root: p.root, extensionDir: ext.dir, copyPollMs: 25 }));
     expect(err.code).toBe("DB_NEWER_FORMAT");

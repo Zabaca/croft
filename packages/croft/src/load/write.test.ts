@@ -1100,7 +1100,7 @@ describe("a SQL transform's SELECT defines its table", () => {
 });
 
 // ---------------------------------------------------------------------------------------------------------
-// Counting a keyed write (DESIGN.md D-L2): the MERGE's returned actions and "classify first, then merge the changed rows"
+// Counting a keyed write (DESIGN.md D133): the MERGE's returned actions and "classify first, then merge the changed rows"
 // give the same numbers, the same rows and the same stamps. A lake can only do the second; a file does whichever the
 // benchmark chose (scripts/bench-merge.ts).
 

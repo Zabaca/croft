@@ -1,4 +1,4 @@
-// croft's merge benchmark (DESIGN.md D-L2): what a keyed write costs in a DuckDB file under the two ways of counting
+// croft's merge benchmark (DESIGN.md D133): what a keyed write costs in a DuckDB file under the two ways of counting
 // what it changed, "returning" (one MERGE whose returned actions are counted) and "classify" (classify the batch against
 // the table, merge only the changed rows, delete the unmatched ones; nothing returns anything, which is all a lake can do).
 //

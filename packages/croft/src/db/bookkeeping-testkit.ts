@@ -1,4 +1,4 @@
-// Test support for the bookkeeping adapters (DESIGN.md §10 "Test strategy", D-L1). The whole suite runs twice: with the
+// Test support for the bookkeeping adapters (DESIGN.md §10 "Test strategy", D132). The whole suite runs twice: with the
 // file adapter, and with the log adapter on a plain DuckDB file (CROFT_BOOKKEEPING=log, no Postgres and no lake).
 // A test that seeds the bookkeeping with SQL of its own (INSERT INTO _croft.assets ...) writes it through seedState(),
 // which runs the statement as it is for a file and turns it into the log's appends for a log, so the fixture says what

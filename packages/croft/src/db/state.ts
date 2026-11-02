@@ -10,7 +10,7 @@ import { type BookkeepingKind, defaultBookkeeping, fileDdl, kindOfObjects, logDd
  *  3: _croft.inputs.input_last_loaded_at (the input's last_loaded_at when a transform last read all of it,
  *     which staleness compares with; seen_loaded_at and seen_key stay newRows()'s composite position). */
 export const FORMAT_VERSION = 3;
-/** The format of a warehouse whose bookkeeping is a log (db/bookkeeping.ts, D-L1). It is a number of its own because a croft
+/** The format of a warehouse whose bookkeeping is a log (db/bookkeeping.ts, D132). It is a number of its own because a croft
  *  that predates the log cannot use one: it makes `_croft.assets` a table and fails on the view. Stamped on a log warehouse
  *  from its first write, so that croft refuses it with DB_NEWER_FORMAT instead. Everything else about the format is 3's. */
 export const LOG_FORMAT_VERSION = 4;

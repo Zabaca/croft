@@ -1,4 +1,4 @@
-// Journey 35: croft's bookkeeping as an append-only log (DESIGN.md §5 "Where state lives", D-L1; option 07, slice 1). The
+// Journey 35: croft's bookkeeping as an append-only log (DESIGN.md §5 "Where state lives", D132; option 07, slice 1). The
 // journeys run on the log adapter whatever the suite's adapter is (the child croft processes are given
 // CROFT_BOOKKEEPING=log), and each looks at the log itself as well as at what `_croft.<table>` reads, because the point of a
 // log is how a key written twice, closed and written again, or moved, ends up:
