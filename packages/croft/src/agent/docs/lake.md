@@ -45,23 +45,16 @@ DuckLake migrate a catalog by itself. The writer's login and key are used only b
 `croft query`, `croft status`, `croft doctor` and the rest attach read-only with the read-only login and key. The
 read-only key is what keeps a reader that got past the gate out of the bucket, so it must not be able to write.
 
-## A local lake (development)
-
-    "lake": { "catalog": { "kind": "sqlite", "path": "lake/catalog.sqlite" }, "dataPath": "lake/data" }
-
-A SQLite catalog and a folder, for one machine and for trying lake mode: no Postgres, no bucket, no logins. It needs the
-lake add-on too, and DuckDB's sqlite extension, which no add-on ships (it is for development and croft's own tests: from
-a source checkout, scripts/fetch-extensions.ts puts it where croft looks). There is no key to keep a reader out of the
-folder, so the gate is the only wall. Do not use it to share data.
-
 ## One writing machine
 
 One machine writes a lake, one write at a time. croft takes a lock of its own on the machine (`.croft/lake-write.lock`)
 in place of the file's lock: a second `croft run` waits for the first, then gets DB_BUSY naming the holder; a writer
-that was killed is reclaimed by the next. Every write records which machine made it (`_croft.meta`, key last_writer),
-and `croft doctor` warns with LAKE_OTHER_WRITER when another machine wrote since. Writing from two machines is not
-supported: they would not know of each other's runs. A machine is told apart by the platform's machine id; where that
-changes at every start (some containers), set CROFT_MACHINE_ID to a fixed name in the environment that runs croft.
+that was killed is reclaimed by the next. Every write records which machine made it (`_croft.meta`, one row `writer.<machine>` each),
+and `croft doctor` warns with LAKE_OTHER_WRITER when another machine has written since this machine's last write. Writing from two machines is not
+supported: they would not know of each other's runs. Every machine keeps a record of its own, so one machine's write does
+not hide another's. A machine is told apart by the platform's machine id; where that changes at every start (some
+containers), set CROFT_MACHINE_ID to a fixed name in the environment that runs croft. Two copies of one project folder on
+one machine are one machine to croft: they share the id, and neither the lock nor the warning tells them apart.
 
 A lost connection is mended by croft: a read whose catalog connection dropped is tried again, and a write is tried again
 as a whole after croft checks by the tag its commit carries whether the commit landed (a landed commit is never run
@@ -121,6 +114,8 @@ LAKE_TYPE_UNSUPPORTED and the cast that fixes it (`CAST(col AS VARCHAR)`).
   versions the trash promises to keep. croft will run each maintenance step itself.
 - `croft backup` (LAKE_UNSUPPORTED): back the lake up with the tools of whoever runs the Postgres and the bucket.
 - Moving an existing project's file into a lake, and server mode over a lake.
+- A lake on one machine with no Postgres (a SQLite catalog and a folder). It exists for croft's own tests, and croft.json refuses it
+  otherwise; it may be offered later as its own decision.
 
 Codes: LAKE_ATTACH_FAILED, LAKE_CONNECTION_LOST, LAKE_COMMIT_UNCERTAIN, LAKE_TYPE_UNSUPPORTED, LAKE_DIRECT_READ,
 LAKE_UNSUPPORTED, LAKE_OTHER_WRITER (croft docs <CODE>), and EXTENSION_MISSING when the add-on is not installed.

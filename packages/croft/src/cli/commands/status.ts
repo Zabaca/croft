@@ -65,6 +65,7 @@ import { type DriftEntry, driftNote, recentDrift } from "../../history/drift.ts"
 import { logDir, tail } from "../../history/logs.ts";
 import { RUNS_DB_FILE, RunsDb, type RunRecord, type StepRecord } from "../../history/runs-db.ts";
 import { discoverAssets, type DiscoveredAsset } from "../../project/discover.ts";
+import { bucketPath } from "../../project/lake-config.ts";
 import type { ResolvedAsset, ResolvedProject } from "../../project/resolve.ts";
 import { type Project, warehouseExists } from "../../project/root.ts";
 import { readServeRecord } from "../../read/locate.ts";
@@ -725,7 +726,7 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       const lake = project.config.lake;
       if (lake) {
         data.lake = {
-          kind: lake.kind, folder: lake.kind === "postgres" ? `s3://${lake.bucket.name}/${lake.bucket.folder}` : lake.dataPath,
+          kind: lake.kind, folder: lake.kind === "postgres" ? bucketPath(lake.bucket) : lake.dataPath,
           addons: addons.views.filter((v) => v.addon === "lake"),
         };
       }

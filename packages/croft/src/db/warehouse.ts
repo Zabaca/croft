@@ -34,7 +34,7 @@ import { type AccessMode, canonicalPath, connect, type LockConflict, lockConflic
 import { bookkeepingOf, seqResetSql } from "./bookkeeping.ts";
 import * as intents from "./intent.ts";
 import {
-  commitLanded, isCommitFailure, isConflict, isConnectionError, LAKE_RETRY, type LakeConnection, lakeBackoffMs, LakeWriteLock, newCommitTag, WRITER_KEY, writerRecord,
+  isCommitFailure, isConflict, isConnectionError, LAKE_RETRY, type LakeConnection, lakeBackoffMs, landedTag, LakeWriteLock, newCommitTag, WRITER_PREFIX, writerKey, writerRecord,
 } from "./lake.ts";
 import { LAKE_ALIAS, modeSecrets, scrubThrown } from "./modes.ts";
 import { checkFormat, hasState } from "./state.ts";
@@ -81,6 +81,9 @@ export interface WarehouseOptions {
   /** Tests only: runs right after a lake write's COMMIT returned, and may throw what a connection that dropped at that moment would
    *  (the commit landed and its answer did not), which is the one case of an unknown outcome a test cannot otherwise make happen. */
   afterLakeCommit?: () => void | Promise<void>;
+  /** Tests only: runs in a lake write just before the commit is tagged and issued, and may throw what a connection that dropped at that
+   *  moment would (the commit did not land, and the step does not know), or do what another writer's commit that lands late would. */
+  beforeLakeCommit?: (a: { attempt: number; tag: string }) => void | Promise<void>;
 }
 
 export interface WriteOptions {
@@ -88,6 +91,11 @@ export interface WriteOptions {
   runId: string;
   asset?: string;
   transaction?: boolean;
+  /** A write that does not write the lake (`transaction: false` bodies that write a trash file, with the lake only read): no commit tag,
+   *  no record of the writer, no second try. Default true; a file warehouse ignores it. */
+  touchesLake?: boolean;
+  /** Tests only: the tag the lake commit carries, in place of a fresh one. */
+  commitTag?: string;
   /** Ends the wait for the file (and for this process's earlier writes) at once: the signal's CroftError
    *  reason (a run's INTERRUPTED or TIMEOUT), else INTERRUPTED. */
   signal?: AbortSignal;
@@ -148,6 +156,9 @@ export class LeaseSql implements Sql {
    *  included, aborts the transaction, and a COMMIT after it ends the transaction without writing anything and
    *  without an error [V]; write() refuses to commit then. */
   failed: Error | null = null;
+  /** A lake write whose body begins and commits its own transactions (`transaction: false`): what croft does as it begins one (forget the
+   *  log numbers of an earlier one) and just before it commits (tag the commit, record the machine). */
+  hooks: { begin?: () => Promise<void>; commit?: () => Promise<void> } | null = null;
 
   constructor(readonly connection: DuckDBConnection, private readonly ctx: RenderContext, private readonly guard: TxGuard | null) {}
 
@@ -187,10 +198,13 @@ export class LeaseSql implements Sql {
         throw new CroftError("INTERNAL_ERROR", { message: "write() owns the transaction; do not BEGIN, COMMIT or ROLLBACK inside it", hint: "report this croft bug" });
       }
       this.guard?.check(type, sql);
+      const word = this.hooks && type === StatementType.TRANSACTION ? /^\s*(\w+)/.exec(sql)?.[1]?.toUpperCase() : undefined;
+      if (word === "COMMIT") await this.hooks!.commit?.();
       let out: DuckDBResultReader | undefined;
       try {
         if (params.length) stmt.bind(params.map(toDuck));
         out = read ? await stmt.runAndReadAll() : (await stmt.run(), undefined);
+        if (word === "BEGIN") await this.hooks!.begin?.();
       } catch (e) {
         if (this.guard) this.failed ??= e as Error;
         throw e;
@@ -534,9 +548,16 @@ export class DuckWarehouse implements Warehouse {
 
   /**
    * One write step on the lake: croft's lock first (one write at a time on this machine), then the body in a transaction, tagged with a
-   * token the snapshot it commits carries. When the connection to the catalog dropped, or the commit's outcome is not known, the tag says
-   * whether the commit landed: if it did, the write is done and its result is returned; if not, the whole step is run again, once for a
-   * dropped connection and a few times for a conflict, in a new transaction. A step is never run again after its commit landed.
+   * token the snapshot it commits carries. When the connection to the catalog dropped, or the commit's outcome is not known, the tags of
+   * the attempts that reached their commit say whether one of them landed: if it did, the write is done and its result is returned; if not,
+   * the whole step is run again, once for a dropped connection and a few times for a conflict, in a new transaction. Before every retry
+   * all the earlier attempts' tags are asked about, not only the last one's, since an attempt's commit that was in flight can land after
+   * a later attempt began (that attempt then conflicts with it, on the machine's record every write updates, and the retry finds the
+   * first one landed). A step is never run again after a commit of it landed.
+   *
+   * A body that begins and commits its own transactions (`transaction: false`: delete and restore) goes through the same: croft's hooks
+   * on its BEGIN and COMMIT forget the log numbers and tag and record the commit. Such a body has no result to return for a commit that
+   * landed without its answer, so that is said as LAKE_COMMIT_UNCERTAIN (landed: true) and not retried.
    */
   private async lakeWrite<T>(conn: DuckDBConnection, label: string, fn: (tx: LeaseSql) => Promise<T>, o: WriteOptions | undefined): Promise<T> {
     const release = await this.writeLock!.acquire({
@@ -546,52 +567,73 @@ export class DuckWarehouse implements Warehouse {
       aborted: () => waitAborted(o!.signal!),
     });
     try {
-      if (o?.transaction === false) return await fn(new LeaseSql(conn, this.renderCtx(), null));
+      const own = o?.transaction === false;
+      if (own && o?.touchesLake === false) return await fn(new LeaseSql(conn, this.renderCtx(), null));
       const tagged = (tag: string) => `CALL ${LAKE_ALIAS}.set_commit_message('croft', '${tag}')`;
+      const reset = async () => {
+        for (const stmt of seqResetSql()) await conn.run(stmt);
+      };
+      /** The attempts whose commit may yet land, with what their body returned. */
+      const maybe: { tag: string; result: T | undefined }[] = [];
+      const uncertain = (message: string, extra: Record<string, unknown> = {}) => new CroftError("LAKE_COMMIT_UNCERTAIN", {
+        message,
+        hint: "check the lake before running again: croft status shows what the last run wrote; a run that did not land is safe to run again",
+        retryable: true,
+        details: { database: this.lake!.label, step: label, ...extra },
+      });
       for (let attempt = 0; ; attempt++) {
-        const tag = newCommitTag();
-        const tx = new LeaseSql(conn, this.renderCtx(), new TxGuard({ database: LAKE_ALIAS }));
+        const tag = o?.commitTag ?? newCommitTag();
+        const tx = new LeaseSql(conn, this.renderCtx(), own ? null : new TxGuard({ database: LAKE_ALIAS }));
         let result: T | undefined;
         let ran = false;
-        await conn.run("BEGIN TRANSACTION");
-        try {
-          // The numbers the log adapter kept (D145) are this transaction's: forget those of an earlier one, or of a rolled-back one.
-          for (const reset of seqResetSql()) await conn.run(reset);
-          result = await fn(tx);
+        /** Just before the commit: this machine's record, the tag. */
+        const beforeCommit = async () => {
           ran = true;
-          if (tx.failed) {
-            // The body went on after a statement DuckDB refused: the transaction is aborted, and COMMIT would silently write nothing.
-            throw new CroftError("INTERNAL_ERROR", {
-              message: `write "${label}" went on after a statement failed (${tx.failed.message.split("\n")[0]}); nothing was committed`,
-              hint: "report this croft bug",
-            });
-          }
           await this.recordWriter(tx, o?.runId);
+          await this.o.beforeLakeCommit?.({ attempt, tag });
           await conn.run(tagged(tag));
-          await conn.run("COMMIT");
+        };
+        if (own) tx.hooks = { begin: reset, commit: beforeCommit };
+        try {
+          if (!own) {
+            await conn.run("BEGIN TRANSACTION");
+            // The numbers the log adapter kept (D145) are this transaction's: forget those of an earlier one, or of a rolled-back one.
+            await reset();
+          }
+          result = await fn(tx);
+          if (!own) {
+            if (tx.failed) {
+              // The body went on after a statement DuckDB refused: the transaction is aborted, and COMMIT would silently write nothing.
+              throw new CroftError("INTERNAL_ERROR", {
+                message: `write "${label}" went on after a statement failed (${tx.failed.message.split("\n")[0]}); nothing was committed`,
+                hint: "report this croft bug",
+              });
+            }
+            await beforeCommit();
+            await conn.run("COMMIT");
+          }
           await this.o.afterLakeCommit?.();
           return result as T;
         } catch (e) {
           try {
             await conn.run("ROLLBACK");
-          } catch {} // already rolled back by a failed COMMIT
+          } catch {} // already rolled back by a failed COMMIT, or by the body
           const lostConnection = isConnectionError(e);
           const unsure = ran && (isCommitFailure(e) || lostConnection);
           const conflict = isConflict(e) && !lostConnection;
           if (!lostConnection && !unsure && !conflict) throw e;
-          if (unsure) {
-            let landed: boolean;
+          if (unsure) maybe.push({ tag, result });
+          if (maybe.length) {
+            let landed: string | null;
             try {
-              landed = await commitLanded(new LeaseSql(conn, this.renderCtx(), null), tag);
+              landed = await landedTag(new LeaseSql(conn, this.renderCtx(), null), maybe.map((m) => m.tag));
             } catch (check) {
-              throw new CroftError("LAKE_COMMIT_UNCERTAIN", {
-                message: `write "${label}" was committing when croft lost its connection to the lake, and croft could not find out whether it landed: ${(check instanceof Error ? check.message : String(check)).split("\n")[0]!.slice(0, 200)}`,
-                hint: "check the lake before running again: croft status shows what the last run wrote; a run that did not land is safe to run again",
-                retryable: true,
-                details: { database: this.lake!.label, step: label },
-              });
+              throw uncertain(`write "${label}" was committing when croft lost its connection to the lake, and croft could not find out whether it landed: ${(check instanceof Error ? check.message : String(check)).split("\n")[0]!.slice(0, 200)}`);
             }
-            if (landed) return result as T;
+            if (landed) {
+              if (!own) return maybe.find((m) => m.tag === landed)!.result as T;
+              throw uncertain(`write "${label}" landed (its commit was found in the lake by its tag), but croft lost the answer and cannot report what it did`, { landed: true });
+            }
           }
           if (attempt + 1 >= (conflict ? LAKE_RETRY.conflict : LAKE_RETRY.connection)) throw lostConnection || unsure ? this.lost(e) : e;
           await sleep(lakeBackoffMs(attempt));
@@ -603,10 +645,16 @@ export class DuckWarehouse implements Warehouse {
     }
   }
 
-  /** Which machine wrote, in the same transaction as the write: a row of _croft.meta that croft doctor compares with its own machine. */
+  /**
+   * Which machine wrote, in the same transaction as the write: this machine's row of _croft.meta (one row per machine, so a machine's
+   * write does not hide another's), which also says whether this write found that another machine had written since the one before it.
+   * It is a row every write of the machine updates, so two attempts of one step that overlap conflict on it instead of both landing.
+   */
   private async recordWriter(tx: LeaseSql, runId: string | undefined): Promise<void> {
     if (!(await hasState(tx))) return;
-    await (await bookkeepingOf(tx)).upsert("meta", { key: "$1", value: "$2" }, [WRITER_KEY, JSON.stringify(writerRecord(runId ?? null))]);
+    const rows = await tx.all<{ key: string; value: string }>(`SELECT key, value FROM _croft.meta WHERE key LIKE '${WRITER_PREFIX}%'`);
+    const record = writerRecord(runId ?? null, new Date(), rows);
+    await (await bookkeepingOf(tx)).upsert("meta", { key: "$1", value: "$2" }, [writerKey(record.machine), JSON.stringify(record)]);
   }
 
   private async open(kind: "read" | "write", waitMs: number, runId?: string, signal?: AbortSignal): Promise<DuckDBInstance> {

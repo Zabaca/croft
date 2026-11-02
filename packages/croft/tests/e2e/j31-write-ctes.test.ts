@@ -8,7 +8,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { extensionsReady } from "../../src/db/extension-dir-testkit.ts";
-import { cleanupAll, codes, type Envelope, initProject, type Project, show, tempDir, until } from "./harness.ts";
+import { cleanupAll, codes, type Envelope, initProject, type Project, show, tempDir, until, LAKE } from "./harness.ts";
 
 afterAll(cleanupAll);
 
@@ -192,4 +192,4 @@ async function serveRefuses(serverMode: boolean): Promise<void> {
 }
 
 test("croft serve refuses it over HTTP, with the app token", () => serveRefuses(false), 180_000);
-(ext.ready ? test : test.skip)("croft serve in server mode refuses it over HTTP, with the app token and with a key", () => serveRefuses(true), 180_000);
+(ext.ready && !LAKE ? test : test.skip)("croft serve in server mode refuses it over HTTP, with the app token and with a key", () => serveRefuses(true), 180_000);

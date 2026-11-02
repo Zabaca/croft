@@ -69,7 +69,7 @@
       }
     },
     "lake": {
-      "description": "lake mode: keep the warehouse in a DuckLake instead of the file. A shared lake is a Postgres catalog and an S3-compatible bucket; a local one (development) is a SQLite catalog and a folder (croft docs lake)",
+      "description": "lake mode: keep the warehouse in a DuckLake instead of the file. A shared lake is a Postgres catalog and an S3-compatible bucket; a SQLite catalog and a local folder are for croft's own tests and are refused otherwise (croft docs lake)",
       "type": "object",
       "additionalProperties": false,
       "required": ["catalog"],
@@ -81,7 +81,7 @@
           "required": ["kind"],
           "properties": {
             "kind": {
-              "description": "lake mode: keep the warehouse in a DuckLake. \"postgres\" is a shared lake (a Postgres catalog and a bucket); \"sqlite\" is a local one for development (croft docs lake)",
+              "description": "lake mode: keep the warehouse in a DuckLake. \"postgres\" is a shared lake (a Postgres catalog and a bucket); \"sqlite\" (a local lake) is for croft's own tests and is refused otherwise (croft docs lake)",
               "type": "string",
               "enum": ["postgres", "sqlite"]
             },

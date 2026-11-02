@@ -16,7 +16,7 @@
 // - validate, status and the dry run never wait while another program holds the warehouse.
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { githubAsset, githubRoute, type Issue, issue, stripeAsset, TOKEN } from "./fixtures.ts";
-import { cleanupAll, type Envelope, initProject, json, type MockApi, mockApi, type Project, show } from "./harness.ts";
+import { cleanupAll, type Envelope, initProject, json, type MockApi, mockApi, type Project, show, fileOnly, WAREHOUSE_LABEL } from "./harness.ts";
 
 const KEY = "sk_test_e2eStripeKey987654";
 let api: MockApi;
@@ -351,7 +351,7 @@ test("journey 19c: the §4.2 validate JSON: UNKNOWN_COLUMN with an edit fix that
   const at = position(p.read("assets/open_issues.sql"), "updatd_at");
   const v = await p.json(["validate"]);
   expect(v.code, show(v)).toBe(2);
-  expect(v.json).toMatchObject({ schemaVersion: 1, ok: false, command: "validate", database: "warehouse.duckdb", timezone: "America/Los_Angeles" });
+  expect(v.json).toMatchObject({ schemaVersion: 1, ok: false, command: "validate", database: WAREHOUSE_LABEL, timezone: "America/Los_Angeles" });
   expect(v.json.data.order).toEqual(ORDER);
   expect(assetOf(v.json, "open_issues")).toEqual({
     name: "open_issues", kind: "sql", inputs: ["github_issues"], behavior: "replace; key id", outputColumns: null, codeChanged: true,
@@ -516,7 +516,7 @@ test("journey 19d: dry-run lines: windows, reasons, --from echoed, confirmations
   expect(await lastRuns(p)).toEqual(runsBefore);
 }, 120_000);
 
-test("journey 19e: validate, status and the dry run never wait while another program holds the warehouse", async () => {
+fileOnly("another program holds the warehouse file; a lake has no file to hold")("journey 19e: validate, status and the dry run never wait while another program holds the warehouse", async () => {
   expect(shared).toBeDefined();
   const p = shared!;
   // A program that is not croft (a DuckDB UI, say) opens the file read-write and keeps it.

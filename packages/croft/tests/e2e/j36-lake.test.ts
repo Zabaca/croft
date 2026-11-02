@@ -80,7 +80,10 @@ for (const kind of ["local", "postgres"] as const) {
       // The bookkeeping: a log, format 4, and the machine that wrote.
       const meta = Object.fromEntries((await run(p, ["query", "select key, value from _croft.meta", "--full-values"])).json.data.rows.map((r: { key: string; value: string }) => [r.key, r.value]));
       expect(meta).toMatchObject({ format_version: "4", bookkeeping: "log" });
-      expect(JSON.parse(meta.last_writer)).toMatchObject({ machine: expect.stringMatching(/^[0-9a-f]{16}$/), croft: expect.any(String) });
+      const machines = Object.keys(meta).filter((k) => k.startsWith("writer."));
+      expect(machines.length).toBe(1);
+      expect(JSON.parse(meta[machines[0]!])).toMatchObject({ machine: machines[0]!.slice("writer.".length), croft: expect.any(String), crossed: null });
+      expect(machines[0]).toMatch(/^writer\.[0-9a-f]{16}$/);
     }, 120_000);
 
     test("b. a second run changes nothing; a SQL asset that reads the table is built and follows it", async () => {

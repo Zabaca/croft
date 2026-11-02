@@ -1,7 +1,7 @@
 # LAKE_ATTACH_FAILED: croft could not attach the project's lake
 
-In lake mode the warehouse lives in a DuckLake: a catalog (a Postgres, or a SQLite file for a local lake) plus Parquet
-files in one bucket folder or one local folder. croft attaches it when a command starts, with the catalog login and
+In lake mode the warehouse lives in a DuckLake: a catalog (a Postgres) plus Parquet
+files in one bucket folder. croft attaches it when a command starts, with the catalog login and
 the bucket key from the project's secrets (the writer's pair for a command that writes, the read-only pair for one that
 only reads and for croft serve), and could not. details.duckdb holds DuckDB's first line of explanation with every
 password and key taken out.

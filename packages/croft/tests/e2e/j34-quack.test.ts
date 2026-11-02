@@ -10,7 +10,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { extensionsReady } from "../../src/db/extension-dir-testkit.ts";
 import { QuackClients } from "../../src/serve/quack-client-testkit.ts";
-import { cleanupAll, initProject, json, type MockApi, mockApi, schedulerEnv, show, until } from "./harness.ts";
+import { cleanupAll, initProject, json, type MockApi, mockApi, schedulerEnv, show, until, LAKE } from "./harness.ts";
 
 let api: MockApi;
 const clients = new QuackClients();
@@ -39,7 +39,7 @@ export default ingest({
 interface ServeRecord { url: string; token: string; pid: number; quack?: { uri: string } }
 
 describe("journey 34: a person's DuckDB over Quack", () => {
-  (ext.ready ? test : test.skip)("attach with a key, read, see a refresh, lose the key", async () => {
+  (ext.ready && !LAKE ? test : test.skip)("attach with a key, read, see a refresh, lose the key", async () => {
     const state = { orders: [{ id: 1, amount: 10 }, { id: 2, amount: 20 }] };
     api.route("/orders", () => json(state.orders));
     api.route("/payments", () => json([{ id: 1, card: "4111-secret" }]));

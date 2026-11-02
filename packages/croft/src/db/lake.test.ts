@@ -2,7 +2,7 @@
 // messages DuckDB, DuckLake and Postgres really gave in the spike and in db/lake-warehouse.test.ts), croft's lock on the writes of a machine
 // (taken, waited for, reclaimed from a writer that was killed), the types a lake cannot hold, and the record of which machine wrote.
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
@@ -193,6 +193,39 @@ describe("croft's lock on the writes of a machine", () => {
       child.kill("SIGKILL");
     }
   }, 30_000);
+
+  test("two waiters that judged a holder dead: the one that is late does not remove the lock the first let a new taker make", async () => {
+    const dir = folder();
+    const lockDir = join(dir, "lake-write.lock");
+    mkdirSync(lockDir);
+    const dead = { pid: 2_147_483_000, procStart: "never", bootId: "never", runId: "r_dead", label: "x", since: "2026-11-01T00:00:00.000Z" };
+    writeFileSync(join(lockDir, "holder.json"), JSON.stringify(dead));
+    type Inside = { read(): unknown; reclaim(judged: unknown): void };
+    const late = new LakeWriteLock(dir);
+    const judgedByLate = (late as unknown as Inside).read(); // the late waiter has looked and judged the holder dead ...
+    expect(judgedByLate).toMatchObject({ runId: "r_dead" });
+    const first = new LakeWriteLock(dir);
+    expect(first.holder()).toBeNull(); // ... the first reclaims it ...
+    const taker = new LakeWriteLock(dir);
+    const release = await taker.acquire({ waitMs: 100, runId: "r_live", label: "live", busy, aborted }); // ... and a new taker makes the lock ...
+    try {
+      (late as unknown as Inside).reclaim(judgedByLate); // ... and only then does the late waiter act on what it saw.
+      expect(taker.holder()).toMatchObject({ pid: process.pid, runId: "r_live" }); // the live lock is still there
+    } finally {
+      release();
+    }
+    // A reclaimer's own lock does not outlive it, and one left by a reclaimer that died is cleared after a while.
+    expect(existsSync(`${lockDir}.reclaim`)).toBe(false);
+    mkdirSync(`${lockDir}.reclaim`);
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(`${lockDir}.reclaim`, old, old);
+    mkdirSync(lockDir);
+    writeFileSync(join(lockDir, "holder.json"), JSON.stringify(dead));
+    const again = new LakeWriteLock(dir);
+    expect(again.holder()).toBeNull(); // the stale reclaim lock is cleared by this try ...
+    expect(again.holder()).toBeNull(); // ... and the dead holder is reclaimed by the next
+    expect(existsSync(lockDir)).toBe(false);
+  });
 
   test("a lock folder whose taker died before it wrote its name is stale after a while, not at once", async () => {
     const dir = folder();

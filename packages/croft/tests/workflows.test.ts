@@ -50,7 +50,7 @@ describe("which workflows can publish", () => {
 
   test("every job of ci.yml, the log run of the suite (test-log) included, publishes nothing, mints no token and holds no secret", () => {
     const { doc } = load("ci.yml");
-    expect(Object.keys(doc.jobs)).toEqual(expect.arrayContaining(["test", "test-log", "alpine", "windows", "site"]));
+    expect(Object.keys(doc.jobs)).toEqual(expect.arrayContaining(["test", "test-log", "test-lake-local", "test-lake-postgres", "alpine", "windows", "site"]));
     expect(doc.on.push.tags).toEqual(["phase-*", "croft-v*"]); // ci.yml runs on the release tag, so it must be unable to publish it
     for (const [name, job] of Object.entries<any>(doc.jobs)) {
       const text = JSON.stringify(job);
@@ -64,6 +64,23 @@ describe("which workflows can publish", () => {
     expect(log.needs).toBe("changes");
     expect(JSON.stringify(log)).toContain("fetch-extensions.ts");
     expect(JSON.stringify(log)).toContain("CROFT_EXTENSION_DIR");
+  });
+
+  test("the journeys run on a lake of each kind in jobs of their own, beside the others, each with its own timeout (DESIGN.md D146)", () => {
+    const { doc } = load("ci.yml");
+    for (const [job, kind] of [["test-lake-local", "local"], ["test-lake-postgres", "postgres"]] as const) {
+      const j = doc.jobs[job];
+      expect(j.needs, job).toBe("changes");
+      expect(typeof j["timeout-minutes"], job).toBe("number");
+      const text = JSON.stringify(j);
+      expect(text, job).toContain(`"CROFT_E2E_LAKE":"${kind}"`);
+      expect(text, job).toContain("tests/e2e");
+      expect(text, job).toContain("fetch-extensions.ts");
+      expect(text, job).toContain("check-mode-tools.ts");
+    }
+    // The DuckDB 1.5 read of a lake (acceptance 11) is run in the Postgres job, with the older DuckDB fetched there.
+    expect(JSON.stringify(doc.jobs["test-lake-postgres"])).toContain("fetch-old-duckdb.ts");
+    expect(JSON.stringify(doc.jobs["test-lake-postgres"])).toContain("CROFT_TEST_OLD_DUCKDB");
   });
 
   test("no workflow but those two can mint an OIDC token, which is what trusted publishing publishes with", () => {

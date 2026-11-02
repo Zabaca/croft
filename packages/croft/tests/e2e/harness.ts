@@ -3,7 +3,7 @@
 // would have it after `bun install`. Every command runs in its own process with stdin ignored, so it is off
 // a TTY exactly as Claude Code runs it. A Bun.serve mock API stands in for GitHub- and Stripe-like services.
 //
-// Nothing here imports croft's source but the version floor and the adapter switch for the child: assertions go through --json envelopes, exit codes and the files a
+// Nothing here imports croft's source but the version floor, the adapter switch for the child and the lake rig: assertions go through --json envelopes, exit codes and the files a
 // user can see.
 //
 // Run: `bun test tests/e2e` from packages/croft (it is also part of the whole `bun test`). Journeys that hit a
@@ -13,13 +13,38 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { Server } from "bun";
-import { test } from "bun:test";
+import { expect, test } from "bun:test";
 import { BUN_FLOOR } from "../../src/cli/version.ts";
 import { bookkeepingEnv } from "../../src/db/bookkeeping-testkit.ts";
 import { resolveExtensionDir } from "../../src/db/extension-files.ts";
+import { lakeRigReady, type LakeRig, startLakeRig, useLake } from "../../src/db/lake-testkit.ts";
 
 /** packages/croft */
 export const PKG = resolve(import.meta.dir, "../..");
+/**
+ * Every journey on a lake instead of the file: `CROFT_E2E_LAKE=local` gives each project a SQLite catalog and a local folder (the children
+ * are told by CROFT_TEST_LAKE, project/root.ts testHarnessLake), `CROFT_E2E_LAKE=postgres` a database of a Postgres and a folder of an
+ * S3-compatible store, both started as children of this process (db/lake-testkit.ts) and stopped when a test file ends, with the lake
+ * block and its secrets written into the project by initProject. A journey that is about the warehouse file, or about server mode (a
+ * project with a lake refuses it until slice 5), says so with fileOnly() and does not run on a lake; the others run unchanged.
+ */
+export type LakeKind = "local" | "postgres";
+export const LAKE: LakeKind | null = (() => {
+  const v = process.env.CROFT_E2E_LAKE;
+  if (v === undefined || v === "" || v === "file") return null;
+  if (v !== "local" && v !== "postgres") throw new Error(`CROFT_E2E_LAKE must be "local", "postgres" or unset; found ${JSON.stringify(v)}`);
+  return v;
+})();
+
+/** What an envelope's `database` says for the warehouse: the file's name, or `lake ...` for a lake. */
+export const WAREHOUSE_LABEL: unknown = LAKE ? expect.stringMatching(/^lake /) : "warehouse.duckdb";
+
+/** `test`, or on a lake a skipped test that says why it is about the file (or about server mode) and has nothing to say about a lake. */
+export function fileOnly(reason: string): typeof test {
+  if (!LAKE) return test;
+  return ((name: string, ...rest: unknown[]) => (test.skip as (...a: unknown[]) => unknown)(`${name} [skipped on a lake: ${reason}]`, ...rest)) as unknown as typeof test;
+}
+
 /** The bin a user's `croft` ends up running. */
 export const CROFT_BIN = join(PKG, "bin", "croft.mjs");
 
@@ -67,14 +92,17 @@ export function baseEnv(extra: Record<string, string> = {}): Record<string, stri
     // doctor's Bun line: CI runs the newest Bun too, which may be newer than croft's BUN_TESTED (BUN_UNTESTED).
     // A journey about the other checks must not fail on a Bun release; the Bun line has unit tests of its own.
     CROFT_BUN_VERSION: BUN_FLOOR,
+    // The mark that lets croft's test-only switches take effect in the children, as it does in this process (tests/preload.ts): the log
+    // adapter, and a local lake, which croft.json refuses without it.
+    CROFT_TEST_HARNESS: "1",
     // The suite also runs on the log adapter; every croft a journey spawns follows.
     ...bookkeepingEnv(),
-    // And with every project's warehouse in a local lake (CROFT_E2E_LAKE=local): the child croft is given the harness's lake switch
+    // And with every project's warehouse in a lake (CROFT_E2E_LAKE, above): a local lake is the child croft's harness switch
     // (project/root.ts testHarnessLake), so a journey that is not about the file itself runs unchanged on a lake. Only the children get it:
     // this process's own projects are the file's.
-    ...(process.env.CROFT_E2E_LAKE === "local"
-      ? { CROFT_TEST_LAKE: "local", CROFT_TEST_HARNESS: "1", CROFT_EXTENSION_DIR: resolveExtensionDir(process.env) } // a child's HOME may be a fake one: name the folder
-      : {}),
+    // A postgres lake is in each project's croft.json (initProject); both need the extension files, named since a child's HOME may be a fake one.
+    ...(LAKE === "local" ? { CROFT_TEST_LAKE: "local" } : {}),
+    ...(LAKE ? { CROFT_EXTENSION_DIR: resolveExtensionDir(process.env) } : {}),
     ...extra,
   };
 }
@@ -137,6 +165,9 @@ export function tempDir(prefix = "croft-e2e-"): string {
 export class Project {
   constructor(readonly root: string) {}
 
+  /** The lines a postgres lake needs in .env (its logins and keys, by name): a journey that writes .env whole must not take them away. */
+  lakeEnv = "";
+
   croft(args: string[], o: { env?: Record<string, string>; stdin?: string } = {}): Promise<CliResult> {
     return croftIn(this.root, args, o);
   }
@@ -162,7 +193,7 @@ export class Project {
   write(rel: string, text: string): void {
     const p = join(this.root, rel);
     mkdirSync(dirname(p), { recursive: true });
-    writeFileSync(p, text);
+    writeFileSync(p, rel === ".env" && this.lakeEnv ? `${text}${text.endsWith("\n") || text === "" ? "" : "\n"}${this.lakeEnv}` : text);
   }
 
   read(rel: string): string {
@@ -212,11 +243,30 @@ export async function initProject(name = "proj"): Promise<{ project: Project; in
   if (init.code !== 0) throw new Error(`croft init failed\n${show(init)}`);
   mkdirSync(join(target, "node_modules", "@zabaca"), { recursive: true });
   symlinkSync(PKG, join(target, "node_modules", "@zabaca", "croft"));
-  return { project: new Project(target), init };
+  const project = new Project(target);
+  if (LAKE === "postgres") {
+    useLake(target, await (await lakeRig()).lake());
+    project.lakeEnv = readFileSync(join(target, ".env"), "utf8").split("\n").filter((l) => l.startsWith("LAKE_")).map((l) => `${l}\n`).join("");
+  }
+  return { project, init };
+}
+
+let rig: Promise<LakeRig> | null = null;
+
+/** The Postgres and the S3-compatible store of a CROFT_E2E_LAKE=postgres run: started on first use, stopped by cleanupAll (when a test file ends). */
+async function lakeRig(): Promise<LakeRig> {
+  const ready = lakeRigReady();
+  if (!ready.ready) throw new Error(`CROFT_E2E_LAKE=postgres needs Postgres, the S3 testkit and the extension files: ${ready.skipReason}`);
+  return (rig ??= startLakeRig());
 }
 
 /** Kill whatever croft processes a test left behind and delete the temp folders. */
 export async function cleanupAll(): Promise<void> {
+  if (rig) {
+    const r = rig;
+    rig = null;
+    await (await r).stop().catch(() => {});
+  }
   for (const p of spawned) {
     try {
       p.kill("SIGKILL");

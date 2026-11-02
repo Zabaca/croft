@@ -8,7 +8,7 @@
 //   told apart by what DuckDB and DuckLake say (isConnectionError, isCommitFailure, isConflict), tested against a real Postgres
 //   that is terminated and restarted. db/warehouse.ts retries reads, and writes as a whole.
 // - One writing machine, one write at a time on it: a lock of croft's own in the state folder, in place of the file's lock (LakeWriteLock).
-// - Which machine wrote last is a row in _croft.meta (WRITER_KEY), so croft doctor can warn when another machine has written since.
+// - Which machines wrote is a row of _croft.meta for each (writerKey), so croft doctor can warn when another machine has written since.
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
@@ -130,18 +130,21 @@ export function lakeBackoffMs(attempt: number): number {
 }
 
 /**
- * Whether the write that tagged its commit with `token` landed: DuckLake records the commit message on the snapshot. A commit
- * that was in flight when the connection dropped is ended by Postgres either way within moments, so the check waits a beat first.
- * The tag is how croft tells apart a commit that landed from one that did not, for every kind of write, rather than reading the
- * bookkeeping of one: a delete, a restore and a rename write no run of their own.
+ * Which of the tags of a step's earlier attempts is on a snapshot of the lake, or null: DuckLake records the commit message on the
+ * snapshot. A commit that was in flight when the connection dropped is ended by Postgres either way within moments, so the check waits
+ * a beat first. The tag is how croft tells apart a commit that landed from one that did not, for every kind of write, rather than
+ * reading the bookkeeping of one: a delete, a restore and a rename write no run of their own. Every attempt whose commit may still
+ * land is asked about at once, before each retry, since an earlier attempt's commit can land after a later one has begun.
  */
-export async function commitLanded(sql: Sql, token: string, o: { settleMs?: number } = {}): Promise<boolean> {
+export async function landedTag(sql: Sql, tags: readonly string[], o: { settleMs?: number } = {}): Promise<string | null> {
   await sleep(o.settleMs ?? 250);
   let last: unknown;
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
-      const [row] = await sql.all<{ n: number | bigint }>(`SELECT count(*) AS n FROM ducklake_snapshots('${LAKE_ALIAS}') WHERE commit_message = $1`, [token]);
-      return Number(row?.n ?? 0) > 0;
+      // The tags are croft's own (croft:<pid>:<uuid>, or a test's), never text from a user; still quoted as literals.
+      const list = tags.map((t) => `'${t.replaceAll("'", "''")}'`).join(", ");
+      const rows = await sql.all<{ m: string }>(`SELECT commit_message AS m FROM ducklake_snapshots('${LAKE_ALIAS}') WHERE commit_message IN (${list})`);
+      return tags.find((t) => rows.some((r) => r.m === t)) ?? null;
     } catch (e) {
       last = e;
       if (!isConnectionError(e)) throw e;
@@ -194,8 +197,9 @@ export function refuseLakeTypes(asset: string, columns: readonly { name: string;
 
 // ---- Which machine wrote ----------------------------------------------------------------------------------------
 
-/** The row of _croft.meta that says who wrote the lake last. */
-export const WRITER_KEY = "last_writer";
+/** The prefix of the rows of _croft.meta that say which machines wrote the lake: one row per machine, the last write of each. */
+export const WRITER_PREFIX = "writer.";
+export const writerKey = (machineId: string): string => `${WRITER_PREFIX}${machineId}`;
 
 let machine: string | undefined;
 
@@ -221,11 +225,23 @@ export function machineId(): string {
   return machine;
 }
 
-/** What `_croft.meta[last_writer]` holds: the machine, the host's name, when, which run and which croft. */
-export interface WriterRecord { machine: string; host: string; at: string; run: string | null; croft: string }
+/**
+ * What a machine's row of _croft.meta holds (`writer.<machine>`): the machine, the host's name, when, which run and which croft, and, when
+ * the write found that another machine had written since this machine's one before (or, for its first, at all), that machine's record.
+ * `crossed` stays until this machine's next write finds nothing of the kind, so `croft doctor` can say it after the machine has written
+ * again over it.
+ */
+export interface WriterRecord { machine: string; host: string; at: string; run: string | null; croft: string; crossed: Crossing | null }
+export interface Crossing { machine: string; host: string; at: string; run: string | null }
 
-export function writerRecord(runId: string | null, at: Date = new Date()): WriterRecord {
-  return { machine: machineId(), host: hostname(), at: at.toISOString(), run: runId, croft: CROFT_VERSION };
+/** This machine's record for a write at `at`, given the rows of meta that are machines' records (`key`, `value`). */
+export function writerRecord(runId: string | null, at: Date = new Date(), others: readonly { key: string; value: string }[] = []): WriterRecord {
+  const me = machineId();
+  const records = others.flatMap((r) => (r.key.startsWith(WRITER_PREFIX) ? [parseWriter(r.value)] : [])).filter((r): r is WriterRecord => r !== null);
+  const mine = records.find((r) => r.machine === me);
+  const newest = records.filter((r) => r.machine !== me).sort((a, b) => (a.at < b.at ? 1 : -1))[0];
+  const crossed = newest && (!mine || newest.at > mine.at) ? { machine: newest.machine, host: newest.host, at: newest.at, run: newest.run } : null;
+  return { machine: me, host: hostname(), at: at.toISOString(), run: runId, croft: CROFT_VERSION, crossed };
 }
 
 /** The record in meta text, or null when it is not one. */
@@ -233,10 +249,28 @@ export function parseWriter(value: string | undefined | null): WriterRecord | nu
   if (!value) return null;
   try {
     const v = JSON.parse(value) as Partial<WriterRecord>;
-    return typeof v.machine === "string" && typeof v.at === "string" ? { machine: v.machine, host: v.host ?? "", at: v.at, run: v.run ?? null, croft: v.croft ?? "" } : null;
+    if (typeof v.machine !== "string" || typeof v.at !== "string") return null;
+    const c = v.crossed;
+    const crossed = c && typeof c.machine === "string" && typeof c.at === "string" ? { machine: c.machine, host: c.host ?? "", at: c.at, run: c.run ?? null } : null;
+    return { machine: v.machine, host: v.host ?? "", at: v.at, run: v.run ?? null, croft: v.croft ?? "", crossed };
   } catch {
     return null;
   }
+}
+
+/**
+ * What `croft doctor` makes of the machines' records in meta, for the machine it runs on. Another machine has written since this one's
+ * last write when its record is newer than this one's, or when this machine's own record says its last write found one. A machine that has
+ * never written is not a competing writer, so it is told who wrote and nothing else.
+ */
+export function writerReport(meta: Readonly<Record<string, string | undefined>>): { mine: WriterRecord | null; others: WriterRecord[]; crossing: Crossing | null } {
+  const records = Object.entries(meta).flatMap(([k, v]) => (k.startsWith(WRITER_PREFIX) ? [parseWriter(v)] : [])).filter((r): r is WriterRecord => r !== null);
+  const me = machineId();
+  const mine = records.find((r) => r.machine === me) ?? null;
+  const others = records.filter((r) => r.machine !== me).sort((a, b) => (a.at < b.at ? 1 : -1));
+  const newer = mine ? others.find((o) => o.at > mine.at) : undefined;
+  const crossing = mine ? (newer ? { machine: newer.machine, host: newer.host, at: newer.at, run: newer.run } : mine.crossed) : null;
+  return { mine, others, crossing };
 }
 
 // ---- One writer at a time on this machine -----------------------------------------------------------------------
@@ -246,6 +280,8 @@ interface LockRecord { pid: number; procStart: string; bootId: string; runId: st
 const LOCK_FOLDER = "lake-write.lock";
 /** A lock folder whose holder file never appeared (its taker died between the mkdir and the write) is stale after this long. */
 const HOLDERLESS_STALE_MS = 10_000;
+/** The lock a reclaimer holds while it removes a dead holder's lock is stale after this long. */
+const RECLAIM_STALE_MS = 10_000;
 
 /**
  * croft's own lock on the lake's writes, in place of the file's lock (DuckDB's), which a lake does not have. It is a folder made with
@@ -264,9 +300,9 @@ export class LakeWriteLock {
   holder(): LockHolder | null {
     const rec = this.read();
     if (rec === "none") return null;
-    if (rec === "empty") return statSafe(this.dir) > HOLDERLESS_STALE_MS ? (this.reclaim(), null) : { pid: null, program: "croft" };
+    if (rec === "empty") return statSafe(this.dir) > HOLDERLESS_STALE_MS ? (this.reclaim("empty"), null) : { pid: null, program: "croft" };
     if (!recordAlive({ pid: rec.pid, procStart: rec.procStart, bootId: rec.bootId })) {
-      this.reclaim();
+      this.reclaim(rec);
       return null;
     }
     return { pid: rec.pid, program: "croft", ...(rec.runId ? { runId: rec.runId } : {}), ...(rec.asset ? { asset: rec.asset } : {}), action: "write", since: rec.since };
@@ -330,15 +366,40 @@ export class LakeWriteLock {
     }
   }
 
-  /** Move a stale lock out of the way (a rename is atomic, so of two reclaimers one wins) and delete it. */
-  private reclaim(): void {
-    const away = `${this.dir}.stale-${process.pid}-${Date.now()}`;
+  /**
+   * Remove the lock whose holder was judged dead (`judged`: the record that was read, or "empty" for a folder with no holder file).
+   * Two waiters can judge the same holder dead; the first to remove it lets a new taker in, and the second must not then remove that
+   * live lock. So reclaimers take a small lock of their own for the moment, and look again at what is there before they remove it:
+   * only the holder that was judged, and still dead, is removed. (Only reclaimers remove a dead holder's lock, and a taker cannot make
+   * the lock while it stands, so nothing changes between the second look and the rename.) A reclaim lock left by a reclaimer that died
+   * is itself stale after a few seconds.
+   */
+  private reclaim(judged: LockRecord | "empty"): void {
+    const guard = `${this.dir}.reclaim`;
     try {
-      renameSync(this.dir, away);
-    } catch {
-      return; // someone else reclaimed it first
+      mkdirSync(guard, { mode: 0o700 });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EEXIST" && statSafe(guard) > RECLAIM_STALE_MS) rmSync(guard, { recursive: true, force: true });
+      return; // another reclaimer is at it (or the state folder is not there): the caller looks again
     }
-    rmSync(away, { recursive: true, force: true });
+    try {
+      const now = this.read();
+      if (now === "none") return;
+      if (judged === "empty") {
+        if (now !== "empty" || statSafe(this.dir) <= HOLDERLESS_STALE_MS) return;
+      } else if (now === "empty" || now.pid !== judged.pid || now.since !== judged.since || recordAlive({ pid: now.pid, procStart: now.procStart, bootId: now.bootId })) {
+        return; // it is not the holder that was judged any more, or it is alive: someone took the lock after the one that was judged
+      }
+      const away = `${this.dir}.stale-${process.pid}-${Date.now()}`;
+      try {
+        renameSync(this.dir, away);
+      } catch {
+        return;
+      }
+      rmSync(away, { recursive: true, force: true });
+    } finally {
+      rmSync(guard, { recursive: true, force: true });
+    }
   }
 }
 

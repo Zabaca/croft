@@ -41,8 +41,8 @@ import { COPY_CHECK_MS, CopyMaker, type CopyMakerOptions } from "./copy-maker.ts
 import { KeyStore } from "./keys.ts";
 import type { QuackKey } from "./quack-access.ts";
 import { listenAddress } from "./quack-address.ts";
-import { noSharedTables, plaintextNotAccepted, restartedError, secs, stopError } from "./errors.ts";
-import { SERVE_DEFAULTS } from "./instance.ts";
+import { noSharedTables, notAdmittedError, plaintextNotAccepted, queueFullError, restartedError, stopError } from "./errors.ts";
+import { SERVE_DEFAULTS, serveLimits } from "./instance.ts";
 import { Admission, type Flight, type StopReason } from "./queue.ts";
 import { QueryWorker, WorkerGone, WorkerStopped } from "./query-worker.ts";
 import type { ServeEngine, ServeEngineOptions, ServeEngineStatus, ServeQuery, ServeQueryData } from "./types.ts";
@@ -184,13 +184,13 @@ class ReadersEngine implements ServeEngine {
   private count = 0;
 
   constructor(private readonly project: Project, o: ServeEngineOptions & ReadersEngineInternals) {
-    const serve = project.config.serve;
-    this.maxConcurrent = o.maxConcurrent ?? serve.maxConcurrent ?? SERVE_DEFAULTS.maxConcurrent;
-    this.queueMs = o.queueMs ?? SERVE_DEFAULTS.queueMs;
-    this.queryTimeoutMs = o.queryTimeoutMs ?? serve.queryTimeoutMs ?? SERVE_DEFAULTS.queryTimeoutMs;
-    this.maxBytes = o.maxBytes ?? serve.maxBytes;
-    this.maxRows = o.maxRows ?? serve.maxRows ?? SERVE_DEFAULTS.maxRows;
-    this.maxQueued = o.maxQueued ?? SERVE_DEFAULTS.maxQueued;
+    const limits = serveLimits(project, o);
+    this.maxConcurrent = limits.maxConcurrent;
+    this.queueMs = limits.queueMs;
+    this.queryTimeoutMs = limits.queryTimeoutMs;
+    this.maxBytes = limits.maxBytes;
+    this.maxRows = limits.maxRows;
+    this.maxQueued = limits.maxQueued;
     this.pollMs = o.copyPollMs ?? COPY_POLL_MS;
     this.argv = o.workerArgv;
     this.policy = o.policy;
@@ -543,31 +543,12 @@ class ReadersEngine implements ServeEngine {
   /** Why a query was not admitted within queueMs. */
   private notAdmitted(waitedMs: number): CroftError {
     if (this.stopped) return this.stopError("stop");
-    if (this.state !== "open") {
-      return new CroftError("SERVE_UNAVAILABLE", {
-        message: `croft's read server has no readers' process for the read copy yet (waited ${secs(waitedMs)} s); the query was not run`,
-        hint: "retry after Retry-After: croft serve starts the process again after a kill or a crash; croft doctor shows what is wrong if it keeps failing",
-        retryable: true,
-        details: { reason: "unavailable", retryAfterMs: SERVE_DEFAULTS.retryAfterMs, waitedMs, state: this.state, attempts: this.attempts },
-      });
-    }
-    return new CroftError("SERVE_UNAVAILABLE", {
-      message: `all ${this.maxConcurrent} query slots of croft's read server stayed busy for ${secs(waitedMs)} s; the query was not run`,
-      hint: "retry after Retry-After; slow queries hold the slots, so filter or aggregate them in SQL, or raise serve.maxConcurrent in croft.json",
-      retryable: true,
-      details: { reason: "busy", retryAfterMs: SERVE_DEFAULTS.retryAfterMs, waitedMs, maxConcurrent: this.maxConcurrent },
-    });
+    return notAdmittedError({ what: "readers' process for the read copy", waitedMs, state: this.state, attempts: this.attempts, maxConcurrent: this.maxConcurrent });
   }
 
   /** A query refused because maxQueued already wait. */
   private queueFull(): CroftError {
-    if (this.stopped) return this.stopError("stop");
-    return new CroftError("SERVE_UNAVAILABLE", {
-      message: `${this.maxQueued} queries are already waiting for croft's read server; this one was not queued`,
-      hint: "retry after Retry-After; send fewer queries at once, or make them cheaper (filter or aggregate in SQL) so the slots free up sooner",
-      retryable: true,
-      details: { reason: "busy", retryAfterMs: SERVE_DEFAULTS.retryAfterMs, maxQueued: this.maxQueued, maxConcurrent: this.maxConcurrent },
-    });
+    return this.stopped ? this.stopError("stop") : queueFullError(this.maxQueued, this.maxConcurrent);
   }
 
   private restarted(e: WorkerGone | null): CroftError {

@@ -125,6 +125,43 @@ for (const kind of ["local", "postgres"] as const) {
       expect((await run(p, ["confirm", ask2.json.confirmation.token])).code).toBe(0);
       expect(await view(p)).toMatchObject({ rows: 4, recorded: 4 });
     }, 240_000);
+
+    test("e. kill -9 between the trash and the reset of a rebuild: the table is whole, and a new confirmation finishes it", async () => {
+      const { p, state } = await shop(kind, [1, 2, 3].map(order));
+      p.remove("assets/totals.sql");
+      state.orders.push(order(4));
+      const asked = await run(p, ["run", "orders", "--rebuild"]);
+      expect(asked.code, show(asked)).toBe(5);
+      const killed = await p.croft(["confirm", asked.json.confirmation.token], { env: { ...EXT, CROFT_FAULT: "between_trash_and_reset" } });
+      expect(killed.code).not.toBe(0);
+      expect(readdirSync(join(p.stateDir, "trash", "orders")).filter((f) => f.endsWith(".duckdb")).length).toBe(1);
+      expect(await view(p)).toMatchObject({ rows: 3, recorded: 3, written: 3 }); // the trash committed, the table did not change
+      const again = await run(p, ["run", "orders", "--rebuild"]);
+      expect(again.code, show(again)).toBe(5);
+      expect((await run(p, ["confirm", again.json.confirmation.token])).code).toBe(0);
+      expect(await view(p)).toMatchObject({ rows: 4, recorded: 4 }); // refetched whole
+      expect(readdirSync(join(p.stateDir, "trash", "orders")).filter((f) => f.endsWith(".duckdb")).length).toBe(2);
+    }, 240_000);
+
+    for (const point of ["rename_before_commit", "rename_after_commit", "rename_after_state", "rename_after_earlier", "rename_after_trash"]) {
+      test(`f. kill -9 at ${point} of a rename: nothing is lost, and the same rename finishes it`, async () => {
+        const { p } = await shop(kind, [1, 2, 3].map(order));
+        p.remove("assets/totals.sql");
+        const killed = await p.croft(["rename", "orders", "sales", "--json"], { env: { ...EXT, CROFT_FAULT: point } });
+        expect(killed.signal === "SIGKILL" || killed.code === 137, show(killed)).toBe(true); // killed, as a crash would
+        // Whichever side of the commit it stopped on, the rows are in the lake under one of the two names.
+        const names = ((await run(p, ["query", "select table_name as n from duckdb_tables() where schema_name = 'main' and table_name in ('orders', 'sales')"])).json.data.rows as { n: string }[]).map((r) => r.n);
+        expect(names.length, point).toBe(1);
+        const again = await run(p, ["rename", "orders", "sales"]);
+        expect(again.code, show(again)).toBe(0);
+        expect((await run(p, ["query", "select count(*)::INT as n from sales"])).json.data.rows).toEqual([{ n: 3 }]);
+        expect((await run(p, ["query", "select count(*) from orders"])).code).not.toBe(0);
+        const recorded = ((await run(p, ["query", "select name from _croft.assets order by name"])).json.data.rows as { name: string }[]).map((r) => r.name);
+        expect(recorded).toContain("sales"); // (totals is still recorded: its file was removed, its table is not croft's to drop)
+        expect(recorded).not.toContain("orders");
+        expect(existsSync(join(p.stateDir, "lake-write.lock"))).toBe(false);
+      }, 180_000);
+    }
   });
 }
 
@@ -184,7 +221,7 @@ maybe("journey 37 (postgres lake): credentials never leave", () => {
   };
 
   test("d. a wrong password: attach fails with a code and a fix, and nothing printed or recorded has the password", async () => {
-    const wrong = "WRONG-pw-Zq81-not-the-real-one";
+    const wrong = "test-wrong-password";
     const lake = await rig!.lake({ writerPassword: wrong });
     const { project: p } = await initProject();
     useLake(p.root, lake);

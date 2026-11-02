@@ -276,7 +276,8 @@ function loopLogger(ctx: Ctx): (e: LoopEvent) => void {
 export function formatBanner(d: ServeData, timezone: string, now: Date = new Date()): string {
   const lines = [d.serverMode
     ? `croft serve · ${d.url} · server mode: answers from ${d.serverMode.readCopy}, never opens ${d.database}`
-    : `croft serve · ${d.url} · database ${d.database} (read-only, steps aside for writes)`];
+    // A lake (its label starts "lake ", project/lake-config.ts lakeLabel) is read as of its last snapshot and never stepped aside from (D143).
+    : `croft serve · ${d.url} · database ${d.database} (read-only, ${d.database.startsWith("lake ") ? "reads the last snapshot, never waits for a run" : "steps aside for writes"})`];
   if (d.serverMode) {
     lines.push(`the read copy is ${d.serverMode.asOf ? `as of ${localTime(d.serverMode.asOf, timezone, now)}` : "not made yet: croft serve is making it, and a run makes it too"}; every answer says as of when, and runs never wait for croft serve`);
   }

@@ -10,8 +10,8 @@ import type { LakeConnection } from "./lake.ts";
 import type { ModeSpec } from "./modes.ts";
 import { postgresBin, startPostgres, startS3, type TestPostgres, type TestS3 } from "./mode-testkit.ts";
 
-export const WRITER_LOGIN = { user: "lakew", password: "Wr1ter-pw-Zx81" };
-export const READER_LOGIN = { user: "laker", password: "R3ader-pw-Qj42" };
+export const WRITER_LOGIN = { user: "lakew", password: "test-writer-password" };
+export const READER_LOGIN = { user: "laker", password: "test-reader-password" };
 export const WRITER_KEY = { id: "WKEYID0123456789", secret: "wsecret-0123456789abcdef" };
 export const READER_KEY = { id: "RKEYID0123456789", secret: "rsecret-0123456789abcdef" };
 

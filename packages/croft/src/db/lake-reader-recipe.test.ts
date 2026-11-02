@@ -48,7 +48,7 @@ describe("the docs' recipe for reading a lake from your own DuckDB", () => {
     const lake = l.shared!;
     const database = (lake.block as { catalog: { database: string } }).catalog.database;
     const v = {
-      analyst: "analyst_reader", analyst_password: "An4lyst-pw-Hk27", database, writer: WRITER_LOGIN.user,
+      analyst: "analyst_reader", analyst_password: "test-analyst-password", database, writer: WRITER_LOGIN.user,
       host: rig.pg.host, port: String(rig.pg.port), key_id: READER_KEY.id, key_secret: READER_KEY.secret, endpoint: rig.s3.endpoint,
       use_ssl: "false", bucket: lake.bucket, folder: lake.folder,
     };
@@ -98,7 +98,7 @@ describe("the docs' recipe for reading a lake from your own DuckDB", () => {
     const lake = l.shared!;
     const database = (lake.block as { catalog: { database: string } }).catalog.database;
     const v = {
-      analyst: "old_reader", analyst_password: "An4lyst-pw-Hk27", database, writer: WRITER_LOGIN.user,
+      analyst: "old_reader", analyst_password: "test-analyst-password", database, writer: WRITER_LOGIN.user,
       host: rig.pg.host, port: String(rig.pg.port), key_id: READER_KEY.id, key_secret: READER_KEY.secret, endpoint: rig.s3.endpoint,
       use_ssl: "false", bucket: lake.bucket, folder: lake.folder,
     };

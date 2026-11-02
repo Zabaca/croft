@@ -58,6 +58,19 @@ import { Admission, type Flight, type StopReason } from "./queue.ts";
 import { QueryWorker, WorkerConflict, WorkerGone, WorkerStopped } from "./query-worker.ts";
 import type { ServeEngine, ServeEngineOptions, ServeEngineStatus, ServeQuery, ServeQueryData } from "./types.ts";
 
+/** The limits an engine that runs its own process works under: the call's, else croft.json's `serve` block, else SERVE_DEFAULTS. */
+export function serveLimits(project: Project, o: { maxConcurrent?: number; queueMs?: number; queryTimeoutMs?: number; maxBytes?: number; maxRows?: number; maxQueued?: number }) {
+  const serve = project.config.serve;
+  return {
+    maxConcurrent: o.maxConcurrent ?? serve.maxConcurrent ?? SERVE_DEFAULTS.maxConcurrent,
+    queueMs: o.queueMs ?? SERVE_DEFAULTS.queueMs,
+    queryTimeoutMs: o.queryTimeoutMs ?? serve.queryTimeoutMs ?? SERVE_DEFAULTS.queryTimeoutMs,
+    maxBytes: o.maxBytes ?? serve.maxBytes,
+    maxRows: o.maxRows ?? serve.maxRows ?? SERVE_DEFAULTS.maxRows,
+    maxQueued: o.maxQueued ?? SERVE_DEFAULTS.maxQueued,
+  };
+}
+
 export const SERVE_DEFAULTS = {
   maxConcurrent: 4,
   queueMs: 10_000,

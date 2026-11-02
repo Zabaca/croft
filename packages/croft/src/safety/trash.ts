@@ -140,7 +140,7 @@ export async function trashTable(warehouse: DuckWarehouse, asset: string, reason
     } finally {
       await sql.exec(`DETACH ${quoteIdent(alias)}`).catch(() => {});
     }
-  }, { runId: o.runId ?? "trash", asset, transaction: false, ...(o.signal ? { signal: o.signal } : {}) });
+  }, { runId: o.runId ?? "trash", asset, transaction: false, touchesLake: false, ...(o.signal ? { signal: o.signal } : {}) });
   if (!entry) return null;
   const out: TrashEntry = {
     asset, path, trashedAt: at.toISOString(), reason, runId: o.runId ?? null, rows: entry.rows,

@@ -21,6 +21,37 @@ export function restartedError(e: WorkerGone | null, what: "query worker" | "rea
   });
 }
 
+/**
+ * Why a query was not admitted within queueMs: the engine has no process yet (`what` names it, "the readers' process for the read copy"),
+ * or every slot stayed busy. Shared by the engines that run one process of their own (server mode's and a lake's).
+ */
+export function notAdmittedError(o: { what: string; waitedMs: number; state: string; attempts: number; maxConcurrent: number }): CroftError {
+  if (o.state !== "open") {
+    return new CroftError("SERVE_UNAVAILABLE", {
+      message: `croft's read server has no ${o.what} yet (waited ${secs(o.waitedMs)} s); the query was not run`,
+      hint: "retry after Retry-After: croft serve starts the process again after a kill or a crash; croft doctor shows what is wrong if it keeps failing",
+      retryable: true,
+      details: { reason: "unavailable", retryAfterMs: RETRY_AFTER_MS, waitedMs: o.waitedMs, state: o.state, attempts: o.attempts },
+    });
+  }
+  return new CroftError("SERVE_UNAVAILABLE", {
+    message: `all ${o.maxConcurrent} query slots of croft's read server stayed busy for ${secs(o.waitedMs)} s; the query was not run`,
+    hint: "retry after Retry-After; slow queries hold the slots, so filter or aggregate them in SQL, or raise serve.maxConcurrent in croft.json",
+    retryable: true,
+    details: { reason: "busy", retryAfterMs: RETRY_AFTER_MS, waitedMs: o.waitedMs, maxConcurrent: o.maxConcurrent },
+  });
+}
+
+/** A query refused because maxQueued already wait. */
+export function queueFullError(maxQueued: number, maxConcurrent: number): CroftError {
+  return new CroftError("SERVE_UNAVAILABLE", {
+    message: `${maxQueued} queries are already waiting for croft's read server; this one was not queued`,
+    hint: "retry after Retry-After; send fewer queries at once, or make them cheaper (filter or aggregate in SQL) so the slots free up sooner",
+    retryable: true,
+    details: { reason: "busy", retryAfterMs: RETRY_AFTER_MS, maxQueued, maxConcurrent },
+  });
+}
+
 /** A key's query when the project shares no table: every key query is refused, so turning keys on never exposes a table by
  *  accident (D122). The server answers it before the engine is asked (403), and each engine refuses it too. */
 export function noSharedTables(): CroftError {

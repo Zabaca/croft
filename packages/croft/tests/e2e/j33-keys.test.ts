@@ -9,7 +9,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { extensionsReady } from "../../src/db/extension-dir-testkit.ts";
-import { cleanupAll, type Envelope, initProject, json, type MockApi, mockApi, type Project, schedulerEnv, show, until } from "./harness.ts";
+import { cleanupAll, type Envelope, fileOnly, initProject, json, LAKE, type MockApi, mockApi, type Project, schedulerEnv, show, until } from "./harness.ts";
 
 let api: MockApi;
 beforeAll(() => {
@@ -233,6 +233,6 @@ async function refused(): Promise<void> {
 }
 
 describe("journey 33: keys", () => {
-  test("without server mode a valid key is refused, and the app token reads on", () => refused(), 180_000);
-  (ext.ready ? test : test.skip)("in server mode", () => journey(), 180_000);
+  fileOnly("server mode, the read copy and keys are refused with a lake until slice 5 (D138)")("without server mode a valid key is refused, and the app token reads on", () => refused(), 180_000);
+  (ext.ready && !LAKE ? test : test.skip)("in server mode", () => journey(), 180_000);
 });

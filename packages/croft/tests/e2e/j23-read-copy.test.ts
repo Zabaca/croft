@@ -6,7 +6,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { cleanupAll, type Envelope, holdDuckDb, initProject, json, type MockApi, mockApi, readDuckDb, schedulerEnv, show } from "./harness.ts";
+import { cleanupAll, type Envelope, holdDuckDb, initProject, json, type MockApi, mockApi, readDuckDb, schedulerEnv, show, fileOnly } from "./harness.ts";
 
 let api: MockApi;
 beforeAll(() => {
@@ -24,7 +24,7 @@ const QUERIES = {
 };
 
 describe("journey 23: readCopy", () => {
-  test("the copy matches after a run, a GUI holding it does not block the next run, and it refreshes", async () => {
+  fileOnly("server mode, the read copy and keys are refused with a lake until slice 5 (D138)")("the copy matches after a run, a GUI holding it does not block the next run, and it refreshes", async () => {
     const state = { orders: [{ id: 1, amount: 10 }, { id: 2, amount: 20 }] };
     api.route("/orders", () => json(state.orders));
     const { project: p } = await initProject();

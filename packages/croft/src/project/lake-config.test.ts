@@ -109,6 +109,20 @@ describe("a shared lake", () => {
 });
 
 describe("a local lake", () => {
+  test("is croft's own tests' alone: croft.json refuses it without the harness mark, as the log switch needs one (D137)", () => {
+    const mark = process.env.CROFT_TEST_HARNESS;
+    delete process.env.CROFT_TEST_HARNESS;
+    try {
+      const found = issues({ lake: local });
+      expect(found.map((i) => i.path)).toEqual(["lake.catalog.kind"]);
+      expect(found[0]!.message).toContain("for croft's own tests");
+      expect(found[0]!.hint).toContain("Postgres");
+    } finally {
+      if (mark !== undefined) process.env.CROFT_TEST_HARNESS = mark;
+    }
+    expect(issues({ lake: local })).toEqual([]);
+  });
+
   test("is a SQLite catalog and a folder, both as written", () => {
     const r = validateConfig({ ...tz, lake: local });
     expect(r.ok && r.config.lake).toEqual({ kind: "local", catalog: { path: "lake/catalog.sqlite" }, dataPath: "lake/data" });

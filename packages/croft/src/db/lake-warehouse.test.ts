@@ -9,6 +9,9 @@ import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { retypeColumns } from "../load/evolve.ts";
 import { lakeRigReady, type LakeRig, RIG_SECRETS, rigConnection, startLakeRig, WRITER_KEY, WRITER_LOGIN } from "./lake-testkit.ts";
+import { bookkeepingOf } from "./bookkeeping.ts";
+import { columnNames } from "./bookkeeping-testkit.ts";
+import { ensureState } from "./state.ts";
 import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "./warehouse.ts";
 
 const ready = lakeRigReady();
@@ -29,7 +32,7 @@ afterAll(async () => {
 interface Rig { w: DuckWarehouse; r: DuckWarehouse; root: string; stateDir: string; db: string }
 
 /** A writing warehouse and a read-only one on a new lake, in a new project folder. */
-async function fresh(o: { afterLakeCommit?: () => void | Promise<void>; waits?: Partial<{ offTtyMs: number }>; stateDir?: string; lake?: Awaited<ReturnType<LakeRig["lake"]>> } = {}): Promise<Rig> {
+async function fresh(o: { afterLakeCommit?: () => void | Promise<void>; beforeLakeCommit?: (a: { attempt: number; tag: string }) => void | Promise<void>; waits?: Partial<{ offTtyMs: number }>; stateDir?: string; lake?: Awaited<ReturnType<LakeRig["lake"]>> } = {}): Promise<Rig> {
   const lake = o.lake ?? await rig.lake();
   const root = mkdtempSync(join(tmpdir(), "croft-lakewh-"));
   made.push(root);
@@ -37,7 +40,7 @@ async function fresh(o: { afterLakeCommit?: () => void | Promise<void>; waits?: 
   mkdirSync(stateDir, { recursive: true });
   const conn = rigConnection(rig, lake, { stateDir, extensionDir: ready.dir });
   const base = { path: join(root, `warehouse-${made.length}.duckdb`), timezone: "UTC", root, stateDir, lake: conn, isTTY: false, register: false };
-  const w = openWarehouse({ ...base, mode: "read_write", ...(o.afterLakeCommit ? { afterLakeCommit: o.afterLakeCommit } : {}), ...(o.waits ? { waits: o.waits } : {}) });
+  const w = openWarehouse({ ...base, mode: "read_write", ...(o.afterLakeCommit ? { afterLakeCommit: o.afterLakeCommit } : {}), ...(o.beforeLakeCommit ? { beforeLakeCommit: o.beforeLakeCommit } : {}), ...(o.waits ? { waits: o.waits } : {}) });
   // The read-only handle is another warehouse of its own, on another path, with the same lake.
   const r = openWarehouse({ ...base, path: join(root, `warehouse-r${made.length}.duckdb`), mode: "read_only", profile: "query" });
   return { w, r, root, stateDir, db: lake.db };
@@ -201,7 +204,7 @@ describe("a warehouse that is a lake", () => {
       return openWarehouse({ path: join(root, "w.duckdb"), mode: "read_write", timezone: "UTC", root, stateDir, lake: conn, register: false, isTTY: false });
     };
     const texts: string[] = [];
-    const wrongPassword = "WRONG-pw-Zq81-not-the-real-one";
+    const wrongPassword = "test-wrong-password";
     const e1 = await (await bad({ writerPassword: wrongPassword })).write("w", (tx) => tx.exec("CREATE TABLE t (a INTEGER)"), { runId: "r1" }).catch((e: unknown) => e);
     expect(e1).toBeInstanceOf(CroftError);
     expect((e1 as CroftError).code).toBe("LAKE_ATTACH_FAILED");
@@ -226,6 +229,74 @@ describe("a warehouse that is a lake", () => {
     for (const secret of [...RIG_SECRETS, wrongPassword, "UNKNOWNKEYID0123456", WRITER_KEY.id, WRITER_LOGIN.password]) {
       for (const t of texts) expect(t, `a secret in an error: ${secret.slice(0, 6)}...`).not.toContain(secret);
     }
+  }, 120_000);
+
+  maybe("an earlier attempt's commit that lands after a later attempt began is found before the retry: the step lands once, not twice", async () => {
+    const lake = await rig.lake();
+    const tags: string[] = [];
+    let landLate: (() => Promise<void>) | undefined;
+    let armed = false;
+    // Attempt 0 reaches its commit and the connection dies there (the commit did not land, as far as anyone can tell). Attempt 1 begins, and
+    // while it is about to commit, attempt 0's commit lands after all (another connection of the catalog, with attempt 0's tag).
+    const a = await fresh({
+      lake,
+      beforeLakeCommit: async ({ attempt, tag }) => {
+        if (!armed) return;
+        tags[attempt] = tag;
+        if (attempt === 0) throw new Error("server closed the connection unexpectedly");
+        if (attempt === 1) await landLate!();
+      },
+    });
+    const b = await fresh({ lake });
+    await a.w.write("make t", async (tx) => {
+      await ensureState(tx, { bookkeeping: "log" });
+      await tx.exec("CREATE TABLE t (a INTEGER)");
+    }, { runId: "r0" });
+    landLate = () => b.w.write("attempt 0, late", (tx) => tx.exec("INSERT INTO t VALUES (1)"), { runId: "r1", commitTag: tags[0]! });
+    armed = true;
+    const result = await a.w.write("the step", async (tx) => {
+      await tx.exec("INSERT INTO t VALUES (1)");
+      return "done";
+    }, { runId: "r1" });
+    expect(result).toBe("done");
+    expect(tags.length).toBe(2); // attempt 1 conflicted with the late commit, and no third attempt ran
+    expect(await a.r.read(async (db) => Number((await db.all<{ n: number | bigint }>("SELECT count(*) AS n FROM t"))[0]!.n), { purpose: "test" })).toBe(1);
+  }, 120_000);
+
+  maybe("a write that runs its own transaction (delete, restore) is tagged and records its machine like any other; one that landed without its answer is said, not run again", async () => {
+    let lose = false;
+    const a = await fresh({
+      afterLakeCommit: () => {
+        if (lose) throw new Error("server closed the connection unexpectedly");
+      },
+    });
+    await a.w.write("make t", async (tx) => {
+      await ensureState(tx, { bookkeeping: "log" });
+      await tx.exec("CREATE TABLE t (a INTEGER)");
+    }, { runId: "r0" });
+    const own = (v: number, run: string) => a.w.write("its own transaction", async (tx) => {
+      await tx.exec("BEGIN TRANSACTION");
+      await tx.exec(`INSERT INTO t VALUES (${v})`);
+      // The log numbers are this transaction's, from the log, as in any write.
+      await (await bookkeepingOf(tx)).upsert("assets", Object.fromEntries(columnNames("assets").map((c) => [c, c === "name" ? "'x'" : "NULL"])));
+      await tx.exec("COMMIT");
+      return "its result";
+    }, { runId: run, transaction: false });
+    expect(await own(7, "r_own")).toBe("its result");
+    const last = await a.r.read(async (db) => ({
+      tag: (await db.all<{ m: string }>("SELECT commit_message AS m FROM ducklake_snapshots('lake') ORDER BY snapshot_id DESC LIMIT 1"))[0]!.m,
+      writer: (await db.all<{ value: string }>("SELECT value FROM _croft.meta WHERE key LIKE 'writer.%'")).map((r) => JSON.parse(r.value) as { run: string }),
+    }), { purpose: "test" });
+    expect(last.tag).toMatch(/^croft:\d+:[0-9a-f-]{36}$/);
+    expect(last.writer.map((w) => w.run)).toEqual(["r_own"]);
+    // The commit landed and the connection dropped before the answer: found by its tag, not run again, and said (the body's result is gone).
+    lose = true;
+    const err = await own(8, "r_lost").catch((e: unknown) => e);
+    lose = false;
+    expect(err).toBeInstanceOf(CroftError);
+    expect((err as CroftError).code).toBe("LAKE_COMMIT_UNCERTAIN");
+    expect((err as CroftError).problem.details).toMatchObject({ landed: true });
+    expect(await a.r.read(async (db) => Number((await db.all<{ n: number | bigint }>("SELECT count(*) AS n FROM t WHERE a = 8"))[0]!.n), { purpose: "test" })).toBe(1);
   }, 120_000);
 
   maybe("a column's type changes in a lake: a widening is an ALTER, anything else is one rewrite with the same columns, order and rows (retypeColumns)", async () => {

@@ -994,7 +994,7 @@ async function rewriteTrashFile(w: DuckWarehouse, path: string, from: string, to
     } finally {
       await sql.exec(`DETACH ${quoteIdent(alias)}`).catch(() => {});
     }
-  }, { runId, asset: from, transaction: false });
+  }, { runId, asset: from, transaction: false, touchesLake: false });
 }
 
 function moveSidecar(src: string, dst: string, to: string, trashFile: string): void {

@@ -8,13 +8,11 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { extensionsReady } from "../../src/db/extension-dir-testkit.ts";
-import {
-  alive, cleanupAll, type Envelope, initProject, json, type MockApi, mockApi, PKG, type Project, schedulerEnv, show, until,
-} from "./harness.ts";
+import { alive, cleanupAll, type Envelope, initProject, json, type MockApi, mockApi, PKG, type Project, schedulerEnv, show, until, LAKE } from "./harness.ts";
 
 const ext = extensionsReady(["quack", "httpfs"]);
 if (!ext.ready) console.warn(`[j32-server-mode] SKIPPING: ${ext.skipReason}`);
-const journey = ext.ready ? test : test.skip;
+const journey = ext.ready && !LAKE ? test : test.skip; // a project with a lake refuses server mode until slice 5 (D138)
 
 let api: MockApi;
 let built: { code: number | null; out: string };

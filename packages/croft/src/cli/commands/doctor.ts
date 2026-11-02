@@ -55,6 +55,7 @@ import { listLeases } from "../../history/leases.ts";
 import { RUNS_DB_FILE, RunsDb } from "../../history/runs-db.ts";
 import { commandText, ProjectEnv } from "../../project/env.ts";
 import { appRootOf, relocationPlan } from "../../project/init.ts";
+import { bucketPath } from "../../project/lake-config.ts";
 import { configProblems, findRoot, loadProject, syncedLocation, type ConfigIssue, type Project, type SecretsFrom } from "../../project/root.ts";
 import { croftHome, type CroftHome } from "../../schedule/home.ts";
 import { jobPath } from "../../schedule/register.ts";
@@ -537,7 +538,7 @@ async function checkWarehouse(r: Report, d: DoctorDeps, project: Project, bindin
 async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: boolean, found: { scan: TableScanResult }): Promise<void> {
   const lake = project.config.lake!;
   const label = project.databaseLabel;
-  const folder = lake.kind === "postgres" ? `s3://${lake.bucket.name}/${lake.bucket.folder}` : lake.dataPath;
+  const folder = lake.kind === "postgres" ? bucketPath(lake.bucket) : lake.dataPath;
   const details: Record<string, unknown> = { lake: lake.kind, folder };
   r.add("environment", "lake.folder", "info",
     `the lake's folder (${folder}) must hold nothing but this lake: DuckLake's own cleanup deletes any file in it that it does not recognise`, undefined, details);
@@ -550,7 +551,7 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
     const { openWarehouse } = await import("../../db/warehouse.ts");
     const { readMeta } = await import("../../db/state.ts");
     const { scanTables } = await import("../../safety/out-of-band.ts");
-    const { lakeOption, machineId, parseWriter, WRITER_KEY } = await import("../../db/lake.ts");
+    const { lakeOption, machineId, writerReport } = await import("../../db/lake.ts");
     w = openWarehouse({
       path: project.paths.database, mode: "read_only", profile: "query", timezone: project.timezone, root: project.root, stateDir: project.paths.stateDir,
       ...lakeOption(project, ProjectEnv.load(project.root, d.env)), isTTY: false, register: false, noticeAfterMs: Number.MAX_SAFE_INTEGER,
@@ -567,20 +568,20 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
       return m;
     }, { waitMs: d.lockWaitMs, purpose: "doctor" });
     const parts = [label, meta.format_version ? `croft format ${meta.format_version}${meta.bookkeeping ? ` (${meta.bookkeeping})` : ""} · duckdb ${String(meta.duckdb_version ?? "?").replace(/^v/, "")}` : "no croft state yet"];
-    const writer = parseWriter(meta[WRITER_KEY]);
-    Object.assign(details, { meta, writer });
-    const mine = machineId();
-    if (writer && writer.machine !== mine) {
-      const when = (() => { try { return clockText(writer.at, project.timezone, now(d.env)); } catch { return writer.at; } })();
+    const { mine, others, crossing } = writerReport(meta);
+    Object.assign(details, { meta, writer: mine, otherWriters: others });
+    const when = (at: string) => { try { return clockText(at, project.timezone, now(d.env)); } catch { return at; } };
+    if (crossing) {
       const p = problem("LAKE_OTHER_WRITER", {
-        message: `the lake was last written by another machine, ${writer.host || writer.machine}, at ${when}${writer.run ? ` (run ${writer.run})` : ""}; a lake has one writing machine`,
+        message: `another machine, ${crossing.host || crossing.machine}, has written this lake since this machine's last write: at ${when(crossing.at)}${crossing.run ? ` (run ${crossing.run})` : ""}; a lake has one writing machine`,
         hint: "run croft on one machine only for this project, and stop the scheduler on the other (croft schedule off there); croft docs LAKE_OTHER_WRITER",
         fix: { kind: "manual", description: "decide which machine writes this lake, and stop croft on the other", requiresHuman: true },
-        details: { machine: writer.machine, host: writer.host, at: writer.at, run: writer.run, croft: writer.croft, thisMachine: mine },
+        details: { machine: crossing.machine, host: crossing.host, at: crossing.at, run: crossing.run, thisMachine: machineId() },
       });
       r.add("environment", "warehouse", "warn", `${parts.join(" · ")} · ${p.message}`, p, details);
     } else {
-      parts.push(writer ? `last written ${(() => { try { return clockText(writer.at, project.timezone, now(d.env)); } catch { return writer.at; } })()} by this machine` : "no write recorded yet");
+      const newest = others[0];
+      parts.push(mine ? `last written ${when(mine.at)} by this machine` : newest ? `last written ${when(newest.at)} by ${newest.host || newest.machine}; this machine has not written it` : "no write recorded yet");
       r.add("environment", "warehouse", "ok", parts.join(" · "), undefined, details);
     }
   } catch (e) {

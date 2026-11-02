@@ -107,6 +107,13 @@ export function validateLake(raw: unknown, c: LakeChecks): LakeConfig | null {
       kind === undefined ? `add "kind": "postgres"` : `set "lake.catalog.kind" to "postgres" or "sqlite"`);
     return null;
   }
+  if (kind === "sqlite" && process.env.CROFT_TEST_HARNESS !== "1") {
+    // A lake on one machine goes past what option 07 settled for slice 2: its gate is the only wall (no key stands between SQL and the
+    // folder), and the sqlite extension ships in no add-on. It is for croft's own tests, switched on as the log adapter is (D137).
+    add("lake.catalog.kind", `"lake.catalog.kind": "sqlite" (a lake on one machine) is for croft's own tests, and is not offered yet`,
+      `use a Postgres catalog: "kind": "postgres" with a bucket (croft docs lake)`);
+    return null;
+  }
   const result = kind === "postgres" ? sharedLake(raw, cat, c) : localLake(raw, cat, c);
   return issueCount(c) > before ? null : result;
 }

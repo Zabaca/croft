@@ -11,7 +11,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { statSync } from "node:fs";
 import { join } from "node:path";
 import { at, githubAsset, githubRoute, issue, type Issue, TOKEN } from "./fixtures.ts";
-import { cleanupAll, codes, initProject, type MockApi, mockApi, type Project, show } from "./harness.ts";
+import { cleanupAll, codes, initProject, type MockApi, mockApi, type Project, show, LAKE } from "./harness.ts";
 
 let api: MockApi;
 const llm = { calls: 0, previews: [] as boolean[] };
@@ -85,8 +85,9 @@ test("journey 18b: edit SQL → preview (diff, columns, checks, sample) → quer
   const p = await project([issue(1, 1), issue(2, 2, { state: "closed" }), issue(3, 3), issue(4, 4)]);
   const first = await p.json(["run"]);
   expect(first.code, show(first)).toBe(0);
-  const db = join(p.root, "warehouse.duckdb");
-  const before = statSync(db).mtimeMs;
+  // What "the live warehouse is untouched" is made of: the file's mtime, or on a lake the writes it has recorded (no file to stat).
+  const live = async () => (LAKE ? JSON.stringify(await p.rows("select count(*)::INT as n, max(loaded_at)::VARCHAR as t from _croft.writes")) : statSync(join(p.root, "warehouse.duckdb")).mtimeMs);
+  const before = await live();
 
   p.write("assets/open_issues.sql", `-- description: open issues
 -- key: id
@@ -104,7 +105,7 @@ SELECT id, upper(title) AS title, length(title) AS title_length FROM github_issu
   expect(lines.slice(-2)).toEqual([`Explore: croft query --preview "from open_issues"`, "Apply:   croft run open_issues"]);
 
   // Nothing real changed: the file, the table, what status says.
-  expect(statSync(db).mtimeMs).toBe(before);
+  expect(await live()).toBe(before);
   expect(await p.rows("select id, title from open_issues order by id")).toEqual([
     { id: 1, title: "Issue 1" }, { id: 3, title: "Issue 3" }, { id: 4, title: "Issue 4" },
   ]);

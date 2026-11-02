@@ -8,9 +8,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import {
-  cleanupAll, type Envelope, initProject, json, laTime, type MockApi, mockApi, PKG, type Project, schedulerEnv, show, until,
-} from "./harness.ts";
+import { cleanupAll, type Envelope, initProject, json, laTime, type MockApi, mockApi, PKG, type Project, schedulerEnv, show, until, LAKE, WAREHOUSE_LABEL } from "./harness.ts";
 
 // `croft schedule on|off` once refused in every croft process started with a temp HOME under CROFT_FORBID_OS_JOBS=1
 // (Bun's os.userInfo() answers $HOME); guardRealHome now asks the password database (schedule.ts passwdHome).
@@ -99,7 +97,7 @@ describe("journey 21: croft serve", () => {
     expect(statSync(file).mode & 0o777).toBe(0o600);
     const up = await health(rec);
     expect(up.status).toBe(200);
-    expect(up.body).toMatchObject({ ok: true, pid: rec.pid, database: "warehouse.duckdb", writeIntent: null, queriesToday: 0 });
+    expect(up.body).toMatchObject({ ok: true, pid: rec.pid, database: WAREHOUSE_LABEL, writeIntent: null, queriesToday: 0 });
     expect((await health(rec, "not-the-token")).status).toBe(401);
 
     // The app finds the server and its token in .croft/serve.json: its query goes over HTTP.
@@ -146,7 +144,9 @@ describe("journey 21: croft serve", () => {
     expect(stopped.code, show(stopped)).toBe(0);
     expect(existsSync(file)).toBe(false);
     expect(stopped.stdout.split("\n")).toEqual([
-      `croft serve · ${rec.url} · database warehouse.duckdb (read-only, steps aside for writes)`,
+      LAKE
+        ? expect.stringMatching(/ · database lake .* \(read-only, reads the last snapshot, never waits for a run\)$/)
+        : `croft serve · ${rec.url} · database warehouse.duckdb (read-only, steps aside for writes)`,
       "token: .croft/serve.json (hosted apps: set CROFT_SERVE_TOKEN)",
       "scheduler: off (croft schedule on turns it on; on a server without an OS job: croft schedule on --no-os-job)",
       'apps: import from "@zabaca/croft/read" in this project, or set CROFT_URL + CROFT_SERVE_TOKEN',
@@ -155,7 +155,9 @@ describe("journey 21: croft serve", () => {
       "",
     ]);
     expect(`${stopped.stdout}${stopped.stderr}`).not.toContain(rec.token);
-    expect(app(p).rows).toHaveLength(4);
+    // Apps read the file directly again once croft serve is gone; a lake has no file, and an app says so (LAKE_DIRECT_READ).
+    if (LAKE) expect(app(p)).toMatchObject({ code: "LAKE_DIRECT_READ" });
+    else expect(app(p).rows).toHaveLength(4);
     await expect(fetch(`${rec.url}/health`)).rejects.toThrow();
     expect((await p.json(["status"], home)).json.data.serve).toBeUndefined();
   }, 120_000);
