@@ -411,7 +411,11 @@ describe("behind a reverse proxy", () => {
       expect((await c.attach(`quack:${at}`, alice)).ok).toBe(true);
       expect(await c.rows("SELECT count(*) AS n FROM r.orders WHERE k = 3")).toEqual([{ n: "3" }]);
       expect(seen.length).toBeGreaterThan(3);
-      expect(seen.every((s) => s.path === "/quack" && s.id === "svc-123.access" && s.secret === "shh")).toBe(true);
+      // DuckDB sends each extra header twice on the wire (checked with raw bytes: `CF-Access-Client-Id: …` appears two times), which
+      // Bun 1.3.14's Headers.get answered with one value and Bun 1.4.4's answers as the standard says, joined with ", ". So the
+      // check is that every value the proxy was sent is the service token, however many times a Bun version lists it.
+      const only = (value: string | null, want: string) => value !== null && value.split(/,\s*/).every((v) => v === want);
+      expect(seen.every((s) => s.path === "/quack" && only(s.id, "svc-123.access") && only(s.secret, "shh"))).toBe(true);
     } finally {
       proxy.stop(true);
     }
