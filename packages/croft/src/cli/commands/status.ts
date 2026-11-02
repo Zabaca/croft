@@ -698,6 +698,7 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
     const serve = serveOf(project.paths.stateDir);
     if (serve) data.serve = serve;
     const copyProblems: Problem[] = [];
+    const addonProblems: Problem[] = [];
     if (project.config.readCopy) {
       const copy = readCopyView(readCopyStatus(project, db ?? undefined), tz);
       if (copy) data.readCopy = copy;
@@ -710,10 +711,10 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       // The add-on with the mode's extension files (D132): croft serve cannot start without it, so a missing one is a problem here.
       const addons = inspectAddons(addonsNeeded(project.config), { from: project.root, ...o.extensions });
       data.serverMode = { serving: serve !== undefined, addons: addons.views };
-      copyProblems.push(...addons.problems);
+      addonProblems.push(...addons.problems);
     }
     // resolveProject's problems are discovery's (all of them: no selectors) and CYCLE.
-    const problems = [...(missing ? [missing] : []), ...(resolved ? resolved.problems : discovery.problems), ...resolution.problems, ...renamed, ...configChanges, ...copyProblems];
+    const problems = [...(missing ? [missing] : []), ...(resolved ? resolved.problems : discovery.problems), ...resolution.problems, ...renamed, ...configChanges, ...copyProblems, ...addonProblems];
     // The scheduler: stale (the diagnosis reads files only: no launchctl or crontab here), then the held assets.
     const schedulingProblems: Problem[] = [];
     if (rec.stale) {

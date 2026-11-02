@@ -118,6 +118,16 @@ describe("croft doctor", () => {
     expect(formatDoctor(data, problems)).toContain("bun add @zabaca/croft-addon-server");
   });
 
+  test("the assets line is about assets: a project with no add-on and no assets has no asset errors", async () => {
+    const p = projectWith();
+    const { data } = await runDoctor(p.root, doctorDeps(emptyEnv()));
+    const assets = data.checks.find((c) => c.id === "assets");
+    expect(assets, "the assets line is there").toBeDefined();
+    expect(assets).toMatchObject({ status: "ok", details: { assets: 0, errors: 0 } });
+    expect(assets!.text).toContain("0 assets · 0 errors");
+    expect(data.summary.errors).toBe(1);
+  });
+
   withFiles("with the add-on installed the line is ok and says which package supplied the files", async () => {
     const p = projectWith();
     installFakeAddon(p.root, "server", { from: ready.dir });

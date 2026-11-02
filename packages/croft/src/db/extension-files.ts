@@ -177,10 +177,15 @@ const addonOrigins = (s: ExtensionSearch): string[] => [...new Set([s.from, s.cr
 
 const DIR_FIX = "fill the extensions folder with DuckDB's pinned files using scripts/fetch-extensions.ts from the croft repository; it checks each file against the pinned checksum before writing it";
 
-/** The fix for a file that is there and wrong, by where it came from: a reinstall of the add-on, or the folder's own refill. */
+/**
+ * The fix for a file that is there and wrong, by where it came from: a reinstall of the add-on that carries the pinned file, or,
+ * for the builders' cache (which a user never chose, and which croft looks in after the add-on), the install of the add-on; only a
+ * folder the caller named is refilled by hand.
+ */
 function wrongFileFix(source: ExtensionSource, addon: AddonName | null, root: string | undefined): Fix {
-  if (source === "addon" && addon) {
-    return { kind: "command", description: `reinstall the ${addon} add-on, which carries the pinned file (${addonPackage(addon)}@${ADDON_VERSION})`, command: installCommand(addon, root) };
+  if (addon && source !== "dir") {
+    const verb = source === "addon" ? "reinstall" : "install";
+    return { kind: "command", description: `${verb} the ${addon} add-on, which carries the pinned file (${addonPackage(addon)}@${ADDON_VERSION})`, command: installCommand(addon, root) };
   }
   return { kind: "manual", description: DIR_FIX };
 }
@@ -201,18 +206,18 @@ function platformError(name: ExtensionName): CroftError {
   });
 }
 
-interface How { source: ExtensionSource; addon: AddonName | null; root: string | undefined }
+interface Origin { source: ExtensionSource; addon: AddonName | null; root: string | undefined }
 
 /** Check one file against its pin and return its path; throws a CroftError with a stable code when it is not the pinned file. */
-function checkFile(path: string, name: ExtensionName, platform: Platform, how: How): string {
+function checkFile(path: string, name: ExtensionName, platform: Platform, origin: Origin): string {
   let st;
   try {
     st = statSync(path);
   } catch {
     throw new CroftError("EXTENSION_MISSING", {
       message: `the ${name} extension file is missing: ${path}`,
-      hint: how.source === "dir" && how.addon
-        ? `put DuckDB's pinned extension files in the extensions folder, or unset $CROFT_EXTENSION_DIR and install the ${how.addon} add-on: ${installCommand(how.addon, how.root)}`
+      hint: origin.source === "dir" && origin.addon
+        ? `put DuckDB's pinned extension files in the extensions folder, or unset $CROFT_EXTENSION_DIR and install the ${origin.addon} add-on: ${installCommand(origin.addon, origin.root)}`
         : "put DuckDB's pinned extension files in the extensions folder",
       fix: { kind: "manual", description: DIR_FIX },
       retryable: false,
@@ -229,23 +234,24 @@ function checkFile(path: string, name: ExtensionName, platform: Platform, how: H
   }
   // Not the pinned file. Say what it is when its own footer says it was built for another DuckDB or platform.
   const footer = safeFooter(path);
-  const fix = wrongFileFix(how.source, how.addon, how.root);
-  const again = fix.kind === "command" ? ` ${fix.command}` : "";
+  const fix = wrongFileFix(origin.source, origin.addon, origin.root);
+  const install = fix.kind === "command" ? `${origin.source === "addon" ? "reinstall" : "install"} the add-on: ${fix.command}` : null;
+  const stale = origin.source === "cache" ? `the builders' cache holds a file that is not the pinned one, and croft looks there only when no add-on has the file; ` : "";
   if (footer && (footer.duckdb !== `v${DUCKDB_VERSION}` || footer.platform !== platform)) {
     throw new CroftError("EXTENSION_WRONG_BUILD", {
       message: `the ${name} extension file was built for DuckDB ${footer.duckdb} on ${footer.platform}, not DuckDB v${DUCKDB_VERSION} on ${platform}: ${path}`,
-      hint: fix.kind === "command" ? `reinstall the add-on at the version this croft needs:${again}` : "replace it with the pinned file for this DuckDB version and platform",
+      hint: install ? `${stale}${install} (the version this croft needs)` : "replace it with the pinned file for this DuckDB version and platform",
       fix,
       retryable: false,
-      details: { kind: "build", extension: name, platform, duckdb: DUCKDB_VERSION, path, built: footer, source: how.source },
+      details: { kind: "build", extension: name, platform, duckdb: DUCKDB_VERSION, path, built: footer, source: origin.source },
     });
   }
   throw new CroftError("EXTENSION_CHECKSUM_MISMATCH", {
     message: `the ${name} extension file is not the pinned file (its checksum differs): ${path}`,
-    hint: fix.kind === "command" ? `croft loads only the files it pins; reinstall the add-on to replace it:${again}` : "croft loads only the files it pins; replace it with the pinned file",
+    hint: install ? `croft loads only the files it pins; ${stale}${install}` : "croft loads only the files it pins; replace it with the pinned file",
     fix,
     retryable: false,
-    details: { kind: "checksum", extension: name, platform, duckdb: DUCKDB_VERSION, path, bytes: st.size, expectedBytes: pin.bytes, source: how.source },
+    details: { kind: "checksum", extension: name, platform, duckdb: DUCKDB_VERSION, path, bytes: st.size, expectedBytes: pin.bytes, source: origin.source },
   });
 }
 
@@ -271,14 +277,14 @@ export function verifyExtensions(dir: string, names: readonly ExtensionName[], p
 export function verifyModeExtension(name: ExtensionName, addon: AddonName | null, s: ExtensionSearch = {}, platform: Platform | null = hostPlatform()): ExtensionFile {
   if (!platform) throw platformError(name);
   const env = s.env ?? process.env;
-  const how = (source: ExtensionSource): How => ({ source, addon, root: s.from });
+  const origin = (source: ExtensionSource): Origin => ({ source, addon, root: s.from });
   const dir = s.dir ?? (env.CROFT_EXTENSION_DIR || undefined);
-  if (dir) return { path: checkFile(extensionPath(dir, name, platform), name, platform, how("dir")), source: "dir" };
+  if (dir) return { path: checkFile(extensionPath(dir, name, platform), name, platform, origin("dir")), source: "dir" };
   const origins = addonOrigins(s);
   const found = addon ? findInAddon(addon, name, platform, origins) : { path: null, installed: false };
-  if (found.path) return { path: checkFile(found.path, name, platform, how("addon")), source: "addon" };
+  if (found.path) return { path: checkFile(found.path, name, platform, origin("addon")), source: "addon" };
   const cached = extensionPath(cacheDir(env), name, platform);
-  if (existsSync(cached)) return { path: checkFile(cached, name, platform, how("cache")), source: "cache" };
+  if (existsSync(cached)) return { path: checkFile(cached, name, platform, origin("cache")), source: "cache" };
   if (!addon) {
     throw new CroftError("EXTENSION_MISSING", {
       message: `the ${name} extension file is missing: ${cached}`,

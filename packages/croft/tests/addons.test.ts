@@ -6,11 +6,12 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { ADDON_VERSION, ADDONS, addonPackage, extensionPackage, PLATFORM_NPM, SHIPPED_EXTENSIONS } from "../src/db/addons.ts";
+import { ADDON_VERSION, addonPackage, extensionPackage, extensionsOf, PLATFORM_NPM, SHIPPED_EXTENSIONS } from "../src/db/addons.ts";
 import { extensionPath } from "../src/db/extension-files.ts";
 import { DUCKDB_VERSION, type ExtensionName, PLATFORMS } from "../src/db/extension-names.ts";
 import { EXTENSION_PINS } from "../src/db/extension-pins.ts";
 import { assertPinned, oversize, packageDir, planPackages, writePackages } from "../scripts/addon-packages.ts";
+import { COMPONENTS, componentsFor, licenseFor, noticesFor } from "../scripts/notices.ts";
 
 const PKG = resolve(import.meta.dir, "..");
 const NPM = Bun.which("npm");
@@ -60,8 +61,14 @@ describe("the plan", () => {
         expect(m.os).toEqual([npm.os]);
         expect(m.cpu).toEqual([npm.cpu]);
         expect(m.libc).toEqual(npm.libc ? [npm.libc] : undefined);
-        expect(m.license).toBe("MIT");
-        expect(m.files).toEqual([`${extension === "postgres" ? "postgres_scanner" : extension}.duckdb_extension`, "LICENSE", "README.md"]);
+        expect(m.license).toBe(licenseFor(extension));
+        expect(m.files).toEqual([`${extension === "postgres" ? "postgres_scanner" : extension}.duckdb_extension`, "LICENSE", "THIRD_PARTY_NOTICES.txt", "README.md"]);
+        // The metadata a package page shows, in the names the package names use.
+        expect(m.description).toContain(npm.slug);
+        expect(m.description).not.toContain(platform);
+        expect(m.bugs).toEqual({ url: "https://github.com/Zabaca/croft/issues" });
+        expect(m.keywords).toContain("duckdb-extension");
+        expect(m.repository.directory).toBe("packages/croft/scripts");
         // The pin it carries is the one croft checks.
         expect(m.croft).toEqual({ extension, platform, duckdb: DUCKDB_VERSION, sha256: EXTENSION_PINS[platform][extension].sha256, bytes: EXTENSION_PINS[platform][extension].bytes });
         expect(m.dependencies).toBeUndefined();
@@ -73,7 +80,7 @@ describe("the plan", () => {
   test("an add-on holds no file and no code: optional dependencies on exactly the extension packages its mode loads, at its own version", () => {
     for (const addon of ["server", "lake"] as const) {
       const m = byName.get(addonPackage(addon))!.manifest as Record<string, any>;
-      const expected = (ADDONS[addon].extensions as readonly ExtensionName[]).flatMap((e) => PLATFORMS.map((p) => extensionPackage(e, p))).sort();
+      const expected = extensionsOf(addon).flatMap((e) => PLATFORMS.map((p) => extensionPackage(e, p))).sort();
       expect(Object.keys(m.optionalDependencies).sort()).toEqual(expected);
       expect(Object.values(m.optionalDependencies).every((v) => v === ADDON_VERSION)).toBe(true);
       expect(m.dependencies).toBeUndefined();
@@ -81,6 +88,9 @@ describe("the plan", () => {
       expect(m.bin).toBeUndefined();
       expect(m.files).toEqual(["LICENSE", "README.md"]);
       expect(m.os).toBeUndefined();
+      expect(m.license).toBe("MIT");
+      expect(m.bugs).toBeDefined();
+      expect(m.keywords).toContain("duckdb");
     }
     expect(Object.keys((byName.get(addonPackage("server"))!.manifest as any).optionalDependencies)).toHaveLength(8);
     expect(Object.keys((byName.get(addonPackage("lake"))!.manifest as any).optionalDependencies)).toHaveLength(12);
@@ -100,6 +110,58 @@ describe("the plan", () => {
   });
 });
 
+describe("third-party notices", () => {
+  const dir = resolve(import.meta.dir, "../scripts/notices");
+
+  test("every component has its license file, which names the project it is for, and its source", () => {
+    for (const c of COMPONENTS) {
+      const text = readFileSync(join(dir, c.file), "utf8");
+      expect(text.length, c.id).toBeGreaterThan(100);
+      expect(c.source, c.id).toMatch(/^https:\/\/raw\.githubusercontent\.com\//);
+      expect(c.found.length, c.id).toBeGreaterThan(5);
+    }
+    expect(new Set(COMPONENTS.map((c) => c.id)).size).toBe(COMPONENTS.length);
+  });
+
+  test("what each extension links, as read from the files: OpenSSL in httpfs, quack and postgres; curl in httpfs; libpq in postgres; CRoaring in ducklake", () => {
+    const ids = (e: ExtensionName) => componentsFor(e).map((c) => c.id);
+    expect(ids("httpfs")).toEqual(expect.arrayContaining(["openssl", "curl", "mbedtls"]));
+    expect(ids("quack")).toContain("openssl");
+    expect(ids("quack")).not.toContain("curl");
+    expect(ids("postgres")).toEqual(expect.arrayContaining(["openssl", "libpq"]));
+    expect(ids("ducklake")).toContain("croaring");
+    expect(ids("ducklake")).not.toContain("openssl");
+    expect(ids("httpfs")).not.toContain("libpq");
+  });
+
+  test("the SPDX expression of each package names every license taken, MIT first, once each", () => {
+    expect(licenseFor("httpfs")).toContain("curl");
+    expect(licenseFor("postgres")).toContain("PostgreSQL");
+    expect(licenseFor("postgres")).not.toContain("curl");
+    for (const e of SHIPPED_EXTENSIONS) {
+      const l = licenseFor(e);
+      expect(l.startsWith("MIT AND "), e).toBe(true);
+      expect(l, e).toContain("Apache-2.0");
+      const parts = l.split(" AND ");
+      expect(new Set(parts).size, e).toBe(parts.length);
+    }
+  });
+
+  test("a package's notices carry the full text of each license it needs: OpenSSL's Apache-2.0 where OpenSSL is linked, libpq's where libpq is", () => {
+    const httpfs = noticesFor("httpfs", "darwin-arm64");
+    expect(httpfs).toContain("OpenSSL 3.6.0");
+    expect(httpfs).toContain("Apache License");
+    expect(httpfs).toContain("COPYRIGHT AND PERMISSION NOTICE");
+    expect(httpfs).not.toContain("PostgreSQL Database Management System");
+    const postgres = noticesFor("postgres", "linux-x64");
+    expect(postgres).toContain("PostgreSQL Database Management System");
+    expect(postgres).toContain("OpenSSL 3.6.0");
+    expect(noticesFor("ducklake", "linux-arm64")).toContain("CRoaring");
+    expect(noticesFor("ducklake", "linux-arm64")).not.toContain("OpenSSL 3.6.0");
+    for (const e of SHIPPED_EXTENSIONS) expect(noticesFor(e, "darwin-x64"), e).not.toContain("\u2014");
+  });
+});
+
 describe("writing the packages", () => {
   test("writes each package's folder with its manifest, readme, license and (an extension package) its one file, copied from the source", () => {
     const out = folder("addons-out");
@@ -109,6 +171,7 @@ describe("writing the packages", () => {
     const ext = plan.find((p) => p.name === extensionPackage("quack", "osx_arm64"))!;
     expect(readFileSync(join(packageDir(out, ext), "quack.duckdb_extension"), "utf8")).toBe("stand-in quack osx_arm64");
     expect(readFileSync(join(packageDir(out, ext), "LICENSE"), "utf8")).toContain("Stichting DuckDB Foundation");
+    expect(readFileSync(join(packageDir(out, ext), "THIRD_PARTY_NOTICES.txt"), "utf8")).toContain("OpenSSL 3.6.0");
     expect(readFileSync(join(packageDir(out, ext), "package.json"), "utf8").endsWith("\n")).toBe(true);
   });
 
@@ -143,7 +206,7 @@ describe("writing the packages", () => {
       expect(r.status, `${r.stdout}${r.stderr}`).toBe(0);
       const files = (JSON.parse(r.stdout) as { files: { path: string }[] }[])[0]!.files.map((f) => f.path).sort();
       const file = p.file ? [`${p.file.extension === "postgres" ? "postgres_scanner" : p.file.extension}.duckdb_extension`] : [];
-      expect(files, name).toEqual([...file, "LICENSE", "README.md", "package.json"].sort());
+      expect(files, name).toEqual([...file, "LICENSE", ...(p.file ? ["THIRD_PARTY_NOTICES.txt"] : []), "README.md", "package.json"].sort());
     }
   }, 120_000);
 });

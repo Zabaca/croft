@@ -6,7 +6,7 @@
 // Nothing here opens DuckDB or touches the network; it hashes at most the files a mode would load, once per process.
 import { CroftError } from "../core/errors.ts";
 import type { AddonView, ExtensionView, Problem } from "../core/types.ts";
-import { ADDON_VERSION, ADDONS, type AddonName, addonPackage, installCommand } from "./addons.ts";
+import { ADDON_VERSION, ADDONS, type AddonName, addonPackage, extensionsOf, installCommand } from "./addons.ts";
 import { type ExtensionName, type Platform } from "./extension-names.ts";
 import { type ExtensionSearch, hostPlatform, verifyModeExtension } from "./extension-files.ts";
 
@@ -28,7 +28,7 @@ export function inspectAddons(addons: readonly AddonName[], s: ExtensionSearch =
   for (const addon of addons) {
     const extensions: ExtensionView[] = [];
     const failures: CroftError[] = [];
-    for (const name of ADDONS[addon].extensions as readonly ExtensionName[]) {
+    for (const name of extensionsOf(addon)) {
       try {
         const f = verifyModeExtension(name, addon, s, platform);
         extensions.push({ name, ok: true, source: f.source, path: f.path, code: null });
@@ -41,11 +41,13 @@ export function inspectAddons(addons: readonly AddonName[], s: ExtensionSearch =
     views.push({
       addon, mode: ADDONS[addon].mode, package: addonPackage(addon), version: ADDON_VERSION, platform,
       ok: failures.length === 0,
-      // Installed: every file was found (some of them wrong, which is another failure), or the add-on's own package was found
-      // and a file for this machine did not come with it. A file found alone, from another add-on, does not make this one installed.
-      installed: failures.every((f) => (f.problem.details as { kind?: string } | undefined)?.kind !== "addon")
-        || failures.some((f) => (f.problem.details as { installed?: boolean } | undefined)?.installed === true),
-      install: platform ? installCommand(addon, s.from) : null,
+      // Installed: every file is there (a wrong one is there: that is another failure), or the add-on's own package was found and
+      // a file for this machine did not come with it. Nothing is installed where files are missing and no package says otherwise:
+      // an unpinned platform, an empty folder, one file found alone that another add-on shares.
+      installed: failures.some((f) => (f.problem.details as { installed?: boolean } | undefined)?.installed === true)
+        || failures.every((f) => ["checksum", "build"].includes((f.problem.details as { kind?: string } | undefined)?.kind ?? "")),
+      // The command is offered where it can help: not on a platform with no files, and not while a folder is the only place looked.
+      install: platform && !folderInForce(s) ? installCommand(addon, s.from) : null,
       extensions,
     });
     if (failures.length) {
@@ -59,6 +61,11 @@ export function inspectAddons(addons: readonly AddonName[], s: ExtensionSearch =
   return { views, problems };
 }
 
+/** Whether a folder, named by the caller or $CROFT_EXTENSION_DIR, is the only place the files are looked for. */
+function folderInForce(s: ExtensionSearch): boolean {
+  return !!(s.dir ?? (s.env ?? process.env).CROFT_EXTENSION_DIR);
+}
+
 /** One line for a view, for doctor and status: what is found and where from, or what to run. */
 export function addonLine(v: AddonView): string {
   if (v.ok) {
@@ -68,5 +75,7 @@ export function addonLine(v: AddonView): string {
   if (!v.platform) return `${v.mode} add-on: croft pins no extension files for this machine, so ${v.mode} cannot run here`;
   const bad = v.extensions.filter((x) => !x.ok);
   const wrong = bad.some((x) => x.code === "EXTENSION_CHECKSUM_MISMATCH" || x.code === "EXTENSION_WRONG_BUILD");
-  return `${v.mode} add-on: ${wrong ? "a file is not the pinned one" : v.installed ? "not whole" : "not installed"}; ${v.install}`;
+  const what = wrong ? "a file is not the pinned one" : v.installed ? "not whole" : "not installed";
+  // With a folder in force the add-on is not looked for, so its command alone would change nothing.
+  return `${v.mode} add-on: ${what}; ${v.install ?? "a folder is named ($CROFT_EXTENSION_DIR) and is the only place looked: fill it, or unset it and install the add-on"}`;
 }

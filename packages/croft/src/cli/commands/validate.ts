@@ -89,6 +89,9 @@ export interface ValidateInput {
   selectors?: readonly string[];
   /** Also run the project's tsc --noEmit. */
   types?: boolean;
+  /** Check the add-on of a mode that is on (default true). croft doctor says false: it has a line of its own for the add-on, and its
+   *  count of assets and their errors is about assets. */
+  addons?: boolean;
   /** A TS asset whose top-level code has not finished after this long is ASSET_INVALID (default 30 s). */
   importTimeoutMs?: number;
   /** The shell environment tsc runs with (PATH, HOME); nothing from .env. */
@@ -219,7 +222,7 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
   const renamed = await renamedAssets(i.project, catalog, byName);
   // A mode that is on needs its add-on's extension files (D132). The edit hook skips it: its problems belong to no asset, and a
   // check of the files on every edit would only hash them again.
-  const addons = i.project.config && !i.select ? inspectAddons(addonsNeeded(i.project.config), { from: root, ...(i.processEnv ? { env: i.processEnv } : {}) }) : null;
+  const addons = i.addons !== false && i.project.config && !i.select ? inspectAddons(addonsNeeded(i.project.config), { from: root, ...(i.processEnv ? { env: i.processEnv } : {}) }) : null;
   const problems: Problem[] = [
     ...(addons?.problems ?? []),
     ...resolved.problems.filter((p) => p.code !== "CYCLE"),

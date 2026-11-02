@@ -26,6 +26,8 @@ export const ADDONS = {
 
 export type AddonName = keyof typeof ADDONS;
 export const ADDON_NAMES = Object.keys(ADDONS) as AddonName[];
+/** The extensions an add-on carries, in load order. */
+export const extensionsOf = (a: AddonName): readonly ExtensionName[] => ADDONS[a].extensions;
 
 /** The add-ons a mode's extensions come from. The lake test mode loads sqlite, which only croft's own suite needs, from a folder. */
 export const MODE_ADDONS: Readonly<Record<ModeKind, readonly AddonName[]>> = {
@@ -44,7 +46,7 @@ export const PLATFORM_NPM: Readonly<Record<Platform, { slug: string; os: "darwin
 };
 
 /** The extensions that ship in an add-on at all: sqlite is the lake's test suite only and is not published. */
-export const SHIPPED_EXTENSIONS: readonly ExtensionName[] = [...new Set(Object.values(ADDONS).flatMap((a) => a.extensions as readonly ExtensionName[]))];
+export const SHIPPED_EXTENSIONS: readonly ExtensionName[] = [...new Set(ADDON_NAMES.flatMap(extensionsOf))];
 
 export const addonPackage = (a: AddonName): string => `@zabaca/croft-addon-${a}`;
 export const extensionPackage = (name: ExtensionName, platform: Platform): string => `@zabaca/croft-ext-${name}-${PLATFORM_NPM[platform].slug}`;
@@ -53,7 +55,7 @@ export const packagedFile = (name: ExtensionName): string => `${EXTENSIONS[name]
 
 /** The add-on a mode's extension comes from (the first of the mode's add-ons that carries it), or null for one no add-on carries. */
 export function addonFor(kind: ModeKind, name: ExtensionName): AddonName | null {
-  return MODE_ADDONS[kind].find((a) => (ADDONS[a].extensions as readonly ExtensionName[]).includes(name)) ?? null;
+  return MODE_ADDONS[kind].find((a) => extensionsOf(a).includes(name)) ?? null;
 }
 
 /** The command that installs an add-on into a project, as an agent can run it. */

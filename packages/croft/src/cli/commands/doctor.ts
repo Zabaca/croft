@@ -780,7 +780,7 @@ async function checkAssets(r: Report, d: DoctorDeps, project: Project, bindingOk
   let assets: number;
   try {
     const { validateProject } = await import("./validate.ts");
-    const report = await validateProject({ project, env: ProjectEnv.load(project.root, d.env), importTimeoutMs: 5000 });
+    const report = await validateProject({ project, env: ProjectEnv.load(project.root, d.env), importTimeoutMs: 5000, addons: false });
     problems = report.problems;
     assets = report.data.assets.length;
   } catch (e) {

@@ -10,7 +10,7 @@ import { CroftError } from "../core/errors.ts";
 import { inspectAddons, addonLine, addonsNeeded } from "./addon-status.ts";
 import { installFakeAddon } from "./addon-testkit.ts";
 import {
-  ADDON_NAMES, ADDON_VERSION, ADDONS, addonFor, addonPackage, extensionPackage, installCommand, MODE_ADDONS, PLATFORM_NPM, SHIPPED_EXTENSIONS,
+  ADDON_NAMES, ADDON_VERSION, ADDONS, addonFor, addonPackage, extensionPackage, extensionsOf, installCommand, MODE_ADDONS, PLATFORM_NPM, SHIPPED_EXTENSIONS,
 } from "./addons.ts";
 import { extensionsReady } from "./extension-dir-testkit.ts";
 import { extensionPath, hostPlatform, verifyModeExtension, verifyModeExtensions } from "./extension-files.ts";
@@ -51,7 +51,7 @@ describe("what the add-ons are", () => {
     for (const kind of Object.keys(MODE_EXTENSIONS).filter((k) => k !== "lake-test") as ModeKind[]) {
       for (const name of MODE_EXTENSIONS[kind]) expect(addonFor(kind, name), `${kind}/${name}`).not.toBeNull();
       // A mode's add-ons carry no extension the mode does not load, so installing one never installs a file the mode ignores.
-      const carried = new Set(MODE_ADDONS[kind].flatMap((a) => ADDONS[a].extensions as readonly ExtensionName[]));
+      const carried = new Set(MODE_ADDONS[kind].flatMap(extensionsOf));
       for (const name of carried) expect(MODE_EXTENSIONS[kind], `${kind} carries ${name}`).toContain(name);
     }
   });
@@ -142,8 +142,61 @@ describe("a mode whose add-on is not installed", () => {
     expect(e.problem.details).toMatchObject({ kind: "platform" });
     expect(e.problem.fix?.kind).toBe("manual");
     const report = inspectAddons(["server"], search, null);
-    expect(report.views[0]).toMatchObject({ ok: false, platform: null, install: null });
+    expect(report.views[0]).toMatchObject({ ok: false, platform: null, install: null, installed: false });
     expect(addonLine(report.views[0]!)).toContain("cannot run here");
+  });
+});
+
+describe("what is installed and what to run", () => {
+  here("an empty $CROFT_EXTENSION_DIR installs nothing and offers no command, since the add-on is not looked for while a folder is named", () => {
+    const { search, env } = fresh();
+    const empty = folder("addon-dir");
+    const report = inspectAddons(["server"], { ...search, env: { ...env, CROFT_EXTENSION_DIR: empty } });
+    expect(report.views[0]).toMatchObject({ ok: false, installed: false, install: null });
+    expect(report.problems[0]).toMatchObject({ code: "EXTENSION_MISSING", details: { kind: "file" } });
+    expect(addonLine(report.views[0]!)).toContain("fill it, or unset it and install the add-on");
+  });
+
+  here("with nothing anywhere it is not installed, and the command is offered", () => {
+    const { search } = fresh();
+    const report = inspectAddons(["server"], search);
+    expect(report.views[0]).toMatchObject({ ok: false, installed: false });
+    expect(report.views[0]!.install).toContain("bun add @zabaca/croft-addon-server@");
+  });
+
+  here("a wrong file in the add-on counts as installed (it is there), and the add-on's package without our file counts as installed too", () => {
+    const wrong = fresh();
+    installFakeAddon(wrong.root, "server", { from: null });
+    expect(inspectAddons(["server"], wrong.search).views[0]).toMatchObject({ ok: false, installed: true });
+    const bare = fresh();
+    installFakeAddon(bare.root, "server", { from: null, only: [] });
+    expect(inspectAddons(["server"], bare.search).views[0]).toMatchObject({ ok: false, installed: true });
+  });
+
+  here("one file found alone, which another add-on shares, does not make this add-on installed", () => {
+    const ready = extensionsReady(["httpfs"]);
+    if (!ready.ready) return;
+    const { search, root } = fresh();
+    installFakeAddon(root, "server", { from: ready.dir, only: ["httpfs"], meta: false });
+    const view = inspectAddons(["lake"], search).views[0]!;
+    expect(view).toMatchObject({ ok: false, installed: false });
+    expect(view.extensions.map((x) => [x.name, x.ok])).toEqual([["httpfs", true], ["postgres", false], ["ducklake", false]]);
+  });
+
+  here("a stale wrong file in the builders' cache does not hide the install: with no add-on the fix is the add-on's command, not a repo script", () => {
+    const { search, env } = fresh();
+    const cache = join(env.XDG_CACHE_HOME, "croft", "test-extensions");
+    mkdirSync(join(cache, `v${DUCKDB_VERSION}`, platform!), { recursive: true });
+    writeFileSync(extensionPath(cache, "httpfs", platform!), "x".repeat(600));
+    const e = caught(() => verifyModeExtension("httpfs", "server", search));
+    expect(e.code).toBe("EXTENSION_CHECKSUM_MISMATCH");
+    expect(e.problem.details).toMatchObject({ source: "cache" });
+    expect(e.problem.fix).toMatchObject({ kind: "command", command: expect.stringContaining("bun add @zabaca/croft-addon-server@") });
+    expect(e.problem.hint).toContain("builders' cache");
+    expect(e.problem.hint).toContain("bun add @zabaca/croft-addon-server@");
+    // A mode with no add-on (the lake test mode's sqlite) can only be told to fill the folder.
+    const lone = caught(() => verifyModeExtension("sqlite", null, { ...search, env: { ...env } }));
+    expect(lone.code).toBe("EXTENSION_MISSING");
   });
 });
 

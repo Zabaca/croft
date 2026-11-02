@@ -4,7 +4,7 @@
 // Test support, left out of the published package (package.json "files").
 import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { ADDON_VERSION, ADDONS, type AddonName, addonPackage, extensionPackage, packagedFile } from "./addons.ts";
+import { ADDON_VERSION, type AddonName, addonPackage, extensionPackage, extensionsOf, packagedFile } from "./addons.ts";
 import { extensionPath, hostPlatform } from "./extension-files.ts";
 import { type ExtensionName, type Platform } from "./extension-names.ts";
 
@@ -33,7 +33,7 @@ export function installFakeAddon(root: string, addon: AddonName, o: FakeAddon): 
   const metaDir = layout === "isolated" ? join(root, "node_modules", ".store", `croft-addon-${addon}@${ADDON_VERSION}`, "node_modules", "@zabaca", `croft-addon-${addon}`) : join(scope, `croft-addon-${addon}`);
   const extRoot = layout === "isolated" ? join(dirname(metaDir)) : scope;
   const files = new Map<ExtensionName, string>();
-  for (const name of (o.only ?? ADDONS[addon].extensions) as readonly ExtensionName[]) {
+  for (const name of o.only ?? extensionsOf(addon)) {
     const dir = join(extRoot, extensionPackage(name, platform).replace("@zabaca/", ""));
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "package.json"), JSON.stringify({ name: extensionPackage(name, platform), version: ADDON_VERSION }));
