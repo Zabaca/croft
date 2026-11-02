@@ -65,9 +65,9 @@ pins, so each upgrade of that build needs them captured again; until then attach
 
 A query that runs past `serve.queryTimeoutMs` (30 s by default) ends the readers' process, because Quack cannot cancel
 a query on the server. That drops every session on it, not only the slow one's. croft serve starts another process at once
-(about half a second, mostly checking the extension files again). Meanwhile, and after, a client that stays attached gets
-an error on every query, `Could not connect to server` while the new process starts and `Invalid connection id` after, and
-never a wrong answer. It carries on by attaching again:
+(about 0.4 s, mostly checking the extension files again). Meanwhile, and after, a client that stays attached gets an
+error on every query, `Could not connect to server` while the new process starts and `Invalid connection id` once it
+listens, and never a wrong answer. It carries on by attaching again:
 
   DETACH croft;
   ATTACH 'quack:127.0.0.1:9494' AS croft (TOKEN 'croftkey_…');
@@ -81,10 +81,12 @@ run it again.
 
 ## One thing to know about DuckDB 2.0
 
-Two connections that share one `ATTACH`, each with a transaction open, fail with `cannot start a transaction within a
-transaction`, and once that invalidated the client's database (a fatal error) [V: DuckDB 2.0.0, the option's tests]. A
-program that keeps several connections open on one DuckDB should give each its own ATTACH, or not open explicit
-transactions on them. This is DuckDB's client, not croft's; croft does nothing to prevent it.
+Two connections that share one `ATTACH`, each with a transaction open, fail: the second one's first query on it is
+`TransactionContext Error: cannot start a transaction within a transaction`, and its COMMIT then says no transaction is
+active [V: DuckDB 2.0.0, reproduced against croft serve]. Once, in the option's tests, the same pattern invalidated the
+client's whole database (a fatal error). A program that keeps several connections open on one DuckDB should give each its
+own ATTACH, or not open explicit transactions on them. This is DuckDB's client, not croft's; croft does nothing to
+prevent it, and it has not been reported to DuckDB.
 
 ## The address, and a proxy
 

@@ -139,6 +139,27 @@ describe("the attack list over Quack", () => {
     expect((await raw(c, uri, alice, "SELECT count(*) AS n FROM orders")).ok).toBe(true);
   }, 120_000);
 
+  withExt("bytes that are not plain SQL text buy nothing: a NUL, a no-break space, a zero-width space and full-width letters in a name", async () => {
+    const p = await project({ n: 20, also: WAREHOUSE_SQL.filter((s) => !s.startsWith("CREATE TABLE orders")), config: { serve: { sharedTables: [...SHARED] } } });
+    const e = await openEngine(engines, ext.dir, p);
+    const alice = new KeyStore(p.stateDir).add("alice").key;
+    await Bun.sleep(150);
+    const uri = e.status().serverMode!.quack!.uri;
+    const c = await clients.start(ext.dir);
+    // The text is built in SQL on the client, since a literal cannot hold a NUL. The parser sees the whole string, NUL included
+    // (a name with a NUL is not the shared table's), and the same string is what runs.
+    for (const text of [
+      "'SELECT 1' || chr(0) || '; DROP VIEW orders'", "'SELECT count(*) FROM orders' || chr(0) || ' UNION ALL SELECT count(*) FROM payments'",
+      "chr(0) || 'SELECT * FROM payments'", "'SELECT 1 FROM orders;' || chr(0) || 'SELECT * FROM payments'", "'SELECT 1' || chr(12) || '; SELECT * FROM payments'",
+      "'SELECT * FROM payments' || chr(160)", "'SELECT * FROM pay' || chr(8203) || 'ments'", "'SELECT * FROM ｐａｙｍｅｎｔｓ'",
+    ]) {
+      const a = await c.run(`SELECT * FROM quack_query('${uri}', ${text}, token = '${alice}')`);
+      expect(a.ok, text).toBe(false);
+      expect(a.ok ? "" : a.error, text).toContain("Authorization callback failed");
+    }
+    expect((await raw(c, uri, alice, "SELECT count(*) AS n FROM orders")).ok).toBe(true);
+  }, 120_000);
+
   withExt("a CTE named after a hidden table gets the same answer as one named after nothing, over Quack too", async () => {
     const p = await project({ n: 20, also: WAREHOUSE_SQL.filter((s) => !s.startsWith("CREATE TABLE orders")), config: { serve: { sharedTables: [...SHARED] } } });
     const e = await openEngine(engines, ext.dir, p);

@@ -143,9 +143,8 @@ describe("keys", () => {
     const r = await rig();
     const a = await person(r, await r.key("alice"));
     const b = await person(r, await r.key("bob"));
-    const bobsOther = await clients.start(ext.dir);
-    expect((await bobsOther.attach(r.uri(), r.keys.list().length ? (await r.key("carol")) : "", "r")).ok).toBe(true);
-    for (const c of [a, b, bobsOther]) expect(await c.rows("SELECT count(*) AS n FROM r.orders")).toEqual([{ n: "20" }]);
+    const carols = await person(r, await r.key("carol"));
+    for (const c of [a, b, carols]) expect(await c.rows("SELECT count(*) AS n FROM r.orders")).toEqual([{ n: "20" }]);
     const removedAt = performance.now();
     r.keys.remove("alice");
     let refused = "";
@@ -161,7 +160,7 @@ describe("keys", () => {
     for (const sql of ["SELECT count(*) FROM r.orders", "SELECT * FROM r._croft_as_of", "SELECT * FROM r.customers"]) expect((await a.run(sql)).ok, sql).toBe(false);
     // The other sessions read on.
     expect(await b.rows("SELECT count(*) AS n FROM r.orders")).toEqual([{ n: "20" }]);
-    expect(await bobsOther.rows("SELECT count(*) AS n FROM r.orders")).toEqual([{ n: "20" }]);
+    expect(await carols.rows("SELECT count(*) AS n FROM r.orders")).toEqual([{ n: "20" }]);
   }, 60_000);
 
   withExt("a key made after croft serve started signs in within a poll, and each sign-in and query is told to the command", async () => {
