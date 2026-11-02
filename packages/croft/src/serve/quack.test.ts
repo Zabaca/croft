@@ -24,10 +24,10 @@ afterAll(async () => {
 });
 
 /** A server-mode project with the attack list's warehouse (orders and customers shared; payments and secrets not), its engine, and a key store. */
-async function rig(o: { engine?: Parameters<typeof openEngine>[3]; shared?: readonly string[]; asOf?: string; port?: number } = {}) {
+async function rig(o: { engine?: Parameters<typeof openEngine>[3]; shared?: readonly string[]; asOf?: string; port?: number; serverMode?: Record<string, unknown> } = {}) {
   const p = await project({
     n: 20, also: WAREHOUSE_SQL.filter((s) => !s.startsWith("CREATE TABLE orders")), asOf: o.asOf ?? "2026-10-30T10:00:00Z",
-    config: { serve: { sharedTables: [...(o.shared ?? SHARED)] } },
+    config: { serve: { sharedTables: [...(o.shared ?? SHARED)] }, ...(o.serverMode ? { serverMode: o.serverMode } : {}) },
   });
   const events: QuackEvent[] = [];
   const e = await openEngine(engines, ext.dir, p, {
@@ -214,8 +214,24 @@ describe("the listener", () => {
     }
   }, 60_000);
 
-  withExt("an address other than loopback is allowed to listen (Quack's override), and a client dials it", async () => {
-    const r = await rig({ engine: { quack: { host: "0.0.0.0", port: 0 } } });
+  withExt("an address other than loopback is refused to start with, QUACK_PLAINTEXT_NOT_ACCEPTED, unless the project accepts plaintext on the network (D131)", async () => {
+    for (const host of ["0.0.0.0", "::", "10.1.2.3", "my-host.example.com"]) {
+      const p = await project({ n: 5 });
+      const e = await rejection(openEngine(engines, ext.dir, p, { quack: { host, port: 0 } }));
+      expect(e.code, host).toBe("QUACK_PLAINTEXT_NOT_ACCEPTED");
+      expect(e.problem.hint).toContain("quackPlaintextOnNetwork");
+      expect(e.problem.fix).toMatchObject({ kind: "manual", requiresHuman: true });
+    }
+    // Loopback needs nothing: a reverse proxy on this machine connects to 127.0.0.1.
+    for (const host of ["127.0.0.1", "localhost"]) {
+      const p = await project({ n: 5 });
+      const e = await openEngine(engines, ext.dir, p, { quack: { host, port: 0 } });
+      expect(e.status().serverMode!.quack!.uri).toMatch(/^quack:127\.0\.0\.1:\d+$/);
+    }
+  }, 120_000);
+
+  withExt("with that accepted, an address other than loopback is allowed to listen (Quack's override), and a client dials it", async () => {
+    const r = await rig({ serverMode: { quackPlaintextOnNetwork: true }, engine: { quack: { host: "0.0.0.0", port: 0 } } });
     expect(r.uri()).toMatch(/^quack:0\.0\.0\.0:\d+$/);
     const alice = await r.key("alice");
     const c = await clients.start(ext.dir);
@@ -229,6 +245,33 @@ describe("the listener", () => {
     const a = await r.e.query({ sql: "SELECT count(*) AS n FROM orders", params: [], limit: 10, scope: { key: "alice", tables: [...SHARED] } });
     expect(a.rows).toEqual([{ n: 20 }]);
   }, 60_000);
+});
+
+describe("the cap on running Quack queries (D130)", () => {
+  withExt("past serverMode.quackMaxConcurrent a query is refused with a retryable answer while another runs; HTTP readers are not crowded out, and the cap lifts when it ends", async () => {
+    const port = freePort();
+    const r = await rig({ port, engine: { quack: { host: "127.0.0.1", port, maxConcurrent: 1 }, queryTimeoutMs: 60_000 } });
+    const alice = await r.key("alice");
+    const slow = await person(r, alice);
+    const other = await person(r, alice);
+    // One long query holds the only slot (the next look at the running queries is within 250 ms).
+    const running = slow.run("SELECT count(*) FROM r.orders a, r.orders b, range(5000000) c WHERE (a.id + b.id + c.range) % 7 = 3");
+    await Bun.sleep(700);
+    const refused = await other.run("SELECT count(*) AS n FROM r.orders");
+    expect(refused.ok).toBe(false);
+    expect(refused.ok ? "" : refused.error).toContain("SERVE_UNAVAILABLE");
+    expect(refused.ok ? "" : refused.error).toContain("serverMode.quackMaxConcurrent");
+    expect(r.events.some((e) => e.kind === "query" && e.outcome === "SERVE_UNAVAILABLE")).toBe(true);
+    // The HTTP API in the same process answers meanwhile, and the client's attach and transaction control are not counted.
+    const t = performance.now();
+    expect(await count(r.e)).toBe(20);
+    expect(performance.now() - t).toBeLessThan(CI ? 3000 : 1500);
+    expect((await other.attach(r.uri(), alice, "again")).ok).toBe(true);
+    // When the long query ends, the slot is free again.
+    const done = await running;
+    expect(done.ok).toBe(true);
+    await until("the cap to lift", async () => (await other.run("SELECT count(*) AS n FROM r.orders")).ok, 10_000);
+  }, 120_000);
 });
 
 describe("the time limit", () => {

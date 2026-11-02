@@ -23,7 +23,9 @@ list. Once the user has said yes:
      SELECT as_of FROM croft._croft_as_of;
 
    The address is `serverMode.quackHost` and `serverMode.quackPort` (127.0.0.1 and 9494 by default; a port of 0 picks a
-   free one, which croft serve's banner and `data.quack.uri` of `croft serve --json` show). The key reaches croft serve
+   free one, which croft serve's banner and `data.quack.uri` of `croft serve --json` show). The listener starts with the readers' process, which waits for the
+   first read copy, so on a project that has never run it is not up until a run (or croft serve itself) has made one; the
+   banner shows the configured address meanwhile, and nothing when the port is 0. The key reaches croft serve
    within 250 ms of `key add`, so a first attach in the same second may be told `Authentication failed`: try again.
 3. `croft serve key remove alice` ends it. An open DuckDB session of that key is refused on its next query, within a
    second, with `the key alice was removed`; other people's sessions are not affected.
@@ -75,9 +77,24 @@ listens, and never a wrong answer. It carries on by attaching again:
 which takes about 12 to 40 ms. With `serverMode.quackPort` set to 0 the new process picks a new port, so use a fixed port
 wherever clients are meant to come back.
 
-A swap of a refreshed copy does not drop sessions. A query that arrives in the few milliseconds between the old copy being
-detached and the new one attached can fail with `Catalog Error: Table with name "wh.main.orders" does not exist`:
-run it again.
+A swap of a refreshed copy does not drop sessions and fails no query: the new copy is attached beside the old one, the
+views move to it in one transaction, and only then is the old one detached.
+
+## How many queries run at once
+
+At most `serverMode.quackMaxConcurrent` Quack queries run at once, over all sessions (4 by default, 1 to 64), so people's
+queries cannot crowd the apps' HTTP readers out of croft serve. A query past the cap is refused with a retryable
+`SERVE_UNAVAILABLE` that names the setting: try it again in a moment. The count is what croft saw running at its last look
+(every 250 ms), so a burst between two looks is seen at the next, and queries that already finished are never counted.
+Attaching and a client's transaction control are not counted.
+
+## The client's quack build
+
+A DuckDB 2.0 client sends two fixed catalog queries when it attaches, and their text belongs to the build of the quack
+extension. croft recognises the text of the build it pins (a test fails when that build changes), so a client on DuckDB
+2.0.0 with that same quack build attaches. A client whose quack extension is another build may send other text, and its
+attach is then refused with an authorization error: use DuckDB 2.0.0 and its own quack extension for that release, and
+tell the user if an attach is refused for no other reason.
 
 ## One thing to know about DuckDB 2.0
 
@@ -90,11 +107,13 @@ prevent it, and it has not been reported to DuckDB.
 
 ## The address, and a proxy
 
-The listener is on the machine itself (127.0.0.1) unless `serverMode.quackHost` says otherwise. Any other address
-prints a warning in croft serve's banner and in `croft serve --json` (`data.quack.loopback` is false): an HTTPS reverse
-proxy belongs in front, as for the HTTP API. For such an address croft turns Quack's own TLS off (`allow_other_hostname`,
-`disable_ssl`), so the proxy holds the certificate and speaks plain HTTP to Quack, and a key crosses the network in the
-clear if there is none.
+The listener is on the machine itself (127.0.0.1). A reverse proxy on the same machine connects to that address and needs
+nothing else. Any other `serverMode.quackHost` makes croft serve refuse to start (QUACK_PLAINTEXT_NOT_ACCEPTED) unless
+croft.json also says `"serverMode": {"quackPlaintextOnNetwork": true}`: Quack's own TLS uses a certificate a plain client
+cannot use, so past localhost croft turns it off (`allow_other_hostname`, `disable_ssl`) and expects an HTTPS reverse proxy
+of your own to hold the real certificate. Without one a key crosses the network in the clear. Setting it is the user's
+decision, not yours: it is on the skill's "ask first" list. With it set, croft serve's banner and `croft serve --json`
+(`data.quack.loopback` is false) keep warning that a proxy belongs in front.
 
 Quack works through a reverse proxy with the port written out in the address: a client attaches to
 `quack:<the proxy's name>:443`, not to a bare name. If the proxy is Cloudflare Access, a client sends its service token

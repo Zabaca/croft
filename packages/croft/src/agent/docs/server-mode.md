@@ -48,12 +48,14 @@ which writes it with the usual permissions.
 - croft serve starts a child process, the readers' process: an in-memory DuckDB that loads DuckDB's quack and httpfs
   extensions by path, attaches the read copy read-only, and locks itself down to that one file. It checks the copy's
   identity (device, inode, modification time and size) every 250 ms. When a refresh renames a new copy into place it
-  detaches the old one and attaches the new one, a few milliseconds, with its connections kept.
+  attaches the new one beside the old, moves the views to it in one transaction and detaches the old one: a few
+  milliseconds, with its connections kept and no moment in which a name is missing.
 - A query past serve.queryTimeoutMs that interrupts cannot stop ends the readers' process; a new one starts at once.
   Queries running at that moment get a retryable SERVE_UNAVAILABLE (reason "restarted"), which `query()` retries. A
   process that cannot start ends itself and is started again after a wait (none, then 250 ms doubling to 60 s).
 - The same process listens for DuckDB 2.0 clients over Quack, on serverMode.quackHost and quackPort (127.0.0.1 and 9494 by
-  default; 0 picks a free port; anything but loopback must sit behind an HTTPS reverse proxy). A listener that cannot
+  default; 0 picks a free port; loopback only unless serverMode.quackPlaintextOnNetwork accepts plaintext behind an HTTPS
+  reverse proxy of your own, which the user decides). A listener that cannot
   start is QUACK_LISTEN_FAILED. Quack has no way to cancel a query on the server, so one that runs past
   serve.queryTimeoutMs ends the readers' process like a stuck HTTP query does, and every Quack session on it drops: a
   client attaches again (croft docs quack).

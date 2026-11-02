@@ -53,6 +53,18 @@
           "minimum": 0,
           "maximum": 65535,
           "default": 9494
+        },
+        "quackPlaintextOnNetwork": {
+          "description": "accept that a quackHost other than loopback carries keys and queries in plaintext, behind an HTTPS reverse proxy of your own; without this croft serve refuses to start with such an address (ask the user first)",
+          "type": "boolean",
+          "default": false
+        },
+        "quackMaxConcurrent": {
+          "description": "Quack queries running at once, over all sessions; past it a query is refused with a retryable answer (1-64)",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 4
         }
       }
     },

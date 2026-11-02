@@ -21,7 +21,8 @@ describe("croft serve key add", () => {
     share(p.root, ["orders", "customers"]);
     const r = await cli(["serve", "key", "add", "alice", "--json"], { cwd: p.root, env: { CROFT_NOW: "2026-11-01T18:00:00Z" } });
     expect(r.exit).toBe(0);
-    expect(r.json).toMatchObject({ ok: true, command: "serve", problems: [] });
+    // Server mode is off in this project, so the key is made and the envelope carries the warning (D128): ok, exit 0.
+    expect(r.json).toMatchObject({ ok: true, command: "serve", problems: [{ severity: "warning", code: "SERVER_MODE_OFF_FOR_KEYS" }] });
     const d = (r.json as { data: Record<string, unknown> }).data;
     expect(Object.keys(d)).toEqual(["action", "name", "key", "createdAt", "sharedTables", "unknownTables", "file", "serverMode"]);
     expect(d).toMatchObject({
@@ -95,7 +96,7 @@ describe("croft serve key add", () => {
 });
 
 describe("a key without server mode (D128)", () => {
-  const WARN = /server mode is off in croft\.json, so (this key|every key) is refused until server mode is on/;
+  const WARN = /serverMode\.enabled is off in croft\.json, so (this key|every key) is refused until server mode is on/;
 
   test("is made all the same, so a person can be set up first, and the output says it is refused until server mode is on, in the data too", async () => {
     const p = makeProject();
@@ -103,14 +104,25 @@ describe("a key without server mode (D128)", () => {
     const human = await cli(["serve", "key", "add", "alice"], { cwd: p.root });
     expect(human.exit).toBe(0);
     expect(human.stdout).toMatch(KEY);
-    expect(human.stdout).toContain('server mode is off in croft.json, so this key is refused until server mode is on ("serverMode": {"enabled": true}, which the user decides: croft docs keys)');
-    const json = (await cli(["serve", "key", "add", "bob", "--json"], { cwd: p.root })).json as { data: { serverMode: boolean }; problems: unknown[] };
+    expect(human.stdout).toMatch(WARN); // the warning problem, printed after the key
+    expect(human.stdout).toContain("warn  SERVER_MODE_OFF_FOR_KEYS");
+    expect(human.stdout.match(/refused until server mode is on/g)).toHaveLength(1);
+    const added = await cli(["serve", "key", "add", "bob", "--json"], { cwd: p.root });
+    const json = added.json as { ok: boolean; data: { serverMode: boolean }; problems: { severity: string; code: string; message: string; hint: string; fix?: { requiresHuman?: boolean } }[] };
+    expect(added.exit).toBe(0);
+    expect(json.ok).toBe(true);
     expect(json.data.serverMode).toBe(false);
-    expect(json.problems).toEqual([]); // a warning in the data, as unknownTables is, not a problem: nothing failed
+    // The warning is in the envelope too, naming the setting; nothing failed, so the exit is 0.
+    expect(json.problems).toHaveLength(1);
+    expect(json.problems[0]).toMatchObject({ severity: "warning", code: "SERVER_MODE_OFF_FOR_KEYS" });
+    expect(json.problems[0]!.message).toContain("serverMode.enabled");
+    expect(json.problems[0]!.fix?.requiresHuman).toBe(true);
+    const listJson = (await cli(["serve", "key", "list", "--json"], { cwd: p.root })).json as { problems: { code: string }[] };
+    expect(listJson.problems.map((x) => x.code)).toEqual(["SERVER_MODE_OFF_FOR_KEYS"]);
     const list = await cli(["serve", "key", "list"], { cwd: p.root });
     expect(list.stdout).toContain("alice");
     expect(list.stdout).toMatch(WARN);
-    expect(list.stdout).toContain("every key is refused");
+    expect(list.stdout).toContain("every key is refused until server mode is on");
     expect(((await cli(["serve", "key", "list", "--json"], { cwd: p.root })).json as { data: { serverMode: boolean } }).data.serverMode).toBe(false);
     // remove needs no warning: taking access away is always fine.
     expect((await cli(["serve", "key", "remove", "bob"], { cwd: p.root })).stdout).not.toMatch(WARN);
@@ -121,8 +133,9 @@ describe("a key without server mode (D128)", () => {
     writeFileSync(join(p.root, "croft.json"), JSON.stringify({ database: "warehouse.duckdb", timezone: "America/Los_Angeles", serverMode: { enabled: true }, serve: { sharedTables: ["orders"] } }));
     const human = await cli(["serve", "key", "add", "alice"], { cwd: p.root });
     expect(human.stdout).not.toMatch(WARN);
-    const json = (await cli(["serve", "key", "list", "--json"], { cwd: p.root })).json as { data: { serverMode: boolean } };
+    const json = (await cli(["serve", "key", "list", "--json"], { cwd: p.root })).json as { data: { serverMode: boolean }; problems: unknown[] };
     expect(json.data.serverMode).toBe(true);
+    expect(json.problems).toEqual([]);
     expect((await cli(["serve", "key", "list"], { cwd: p.root })).stdout).not.toMatch(WARN);
   });
 });

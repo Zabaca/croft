@@ -42,6 +42,8 @@ export interface QuackOptions {
   queryTimeoutMs: number;
   /** serve.sharedTables. */
   shared: readonly string[];
+  /** serverMode.quackMaxConcurrent: Quack queries running at once (D130). */
+  maxConcurrent: number;
   keys: readonly QuackKey[];
   emit(e: QuackEvent): void;
   /** A query ran past the limit: croft serve kills this process. Called once. */
@@ -62,7 +64,7 @@ export class QuackListener {
   private fired = false;
 
   constructor(private readonly o: QuackOptions) {
-    this.access = new QuackAccess({ shared: o.shared, emit: o.emit });
+    this.access = new QuackAccess({ shared: o.shared, emit: o.emit, maxConcurrent: o.maxConcurrent });
     this.access.setKeys(o.keys);
   }
 
@@ -133,14 +135,17 @@ export class QuackListener {
       const reader = await conn.runAndReadAll("SELECT connection_id, state, epoch_ms(query_started_at) AS started FROM quack_active_connections()");
       const live = new Set<string>();
       let worst: { connection: string; ms: number } | null = null;
+      let running = 0;
       const at = Date.now();
       for (const [id, state, started] of reader.getRowsJS()) {
         live.add(String(id));
         if (state !== "active" || started === null || started === undefined) continue;
+        running++;
         const ms = at - Number(started);
         if (ms > this.o.queryTimeoutMs && (!worst || ms > worst.ms)) worst = { connection: String(id), ms };
       }
       this.access.prune(live);
+      this.access.setActive(running);
       if (worst) {
         this.fired = true;
         this.o.overdue(worst);

@@ -75,6 +75,7 @@ const VALID: unknown[] = [
   { ...tz, http: {} }, { ...tz, http: { budgets: {} } },
   { ...tz, serverMode: {} }, { ...tz, serverMode: { enabled: true } }, { ...tz, serverMode: { enabled: true, acceptFullCopyCost: true }, readCopy: false },
   { ...tz, serverMode: { quackHost: "0.0.0.0", quackPort: 0 } }, { ...tz, serverMode: { quackHost: "::1", quackPort: 65535 } },
+  { ...tz, serverMode: { quackPlaintextOnNetwork: true, quackMaxConcurrent: 64 } },
   { ...tz, http: { budgets: { "api.example.com": { perHour: 50, perDay: 125 }, "127.0.0.1:8080": { perMinute: 1 }, "[::1]:9000": { perDay: 1_000_000_000 } } } },
 ];
 const INVALID: unknown[] = [
@@ -93,6 +94,7 @@ const INVALID: unknown[] = [
   { ...tz, serverMode: { enable: true } }, { ...tz, serverMode: { tables: ["orders"] } },
   { ...tz, serverMode: { quackPort: 65536 } }, { ...tz, serverMode: { quackPort: -1 } }, { ...tz, serverMode: { quackPort: "9494" } }, { ...tz, serverMode: { quackHost: 5 } },
   { ...tz, serverMode: { quackHost: "http://host" } }, { ...tz, serverMode: { quackHost: "a b" } },
+  { ...tz, serverMode: { quackMaxConcurrent: 0 } }, { ...tz, serverMode: { quackMaxConcurrent: 65 } }, { ...tz, serverMode: { quackPlaintextOnNetwork: "true" } },
   { ...tz, concurrency: 0 }, { ...tz, concurrency: 65 }, { ...tz, concurrency: 1.5 }, { ...tz, concurrency: "4" },
   { ...tz, notify: [] }, { ...tz, notify: true },
   { ...tz, notify: { desktop: "yes" } },

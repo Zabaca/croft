@@ -14,7 +14,8 @@
 // human text prints the same.
 import { existsSync, readFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
-import { CroftError } from "../../core/errors.ts";
+import { CroftError, problem } from "../../core/errors.ts";
+import type { Problem } from "../../core/types.ts";
 import { formatInstant } from "../../core/time.ts";
 import type { Project } from "../../project/root.ts";
 import { didYouMean } from "../../project/suggest.ts";
@@ -114,7 +115,8 @@ export function runKey(ctx: Ctx, rest: readonly string[]): CommandResult<ServeKe
   const unknownTables = unknownSharedTables(project);
   if (action === "list") {
     const quack = quackFor(project, null);
-    return { data: { action: "list", keys: store.list().map((k) => view(k, project)), sharedTables, unknownTables, file, serverMode: project.config.serverMode.enabled, ...(quack ? { quack } : {}) }, problems: [], next: [] };
+    const keys = store.list();
+    return { problems: keys.length ? serverModeProblems(project, "every key") : [], next: [], data: { action: "list", keys: store.list().map((k) => view(k, project)), sharedTables, unknownTables, file, serverMode: project.config.serverMode.enabled, ...(quack ? { quack } : {}) } };
   }
   const name = names[0]!;
   if (action === "add") {
@@ -122,7 +124,7 @@ export function runKey(ctx: Ctx, rest: readonly string[]): CommandResult<ServeKe
     const quack = quackFor(project, made.key);
     return {
       data: { action: "add", name, key: made.key, createdAt: formatInstant(new Date(made.info.createdAt), project.timezone), sharedTables, unknownTables, file, serverMode: project.config.serverMode.enabled, ...(quack ? { quack } : {}) },
-      problems: [], next: [],
+      problems: serverModeProblems(project, "this key"), next: [],
     };
   }
   const gone = store.remove(name);
@@ -149,9 +151,15 @@ export function unknownLine(unknown: readonly string[]): string[] {
   return unknown.length ? [`serve.sharedTables names no asset called ${unknown.join(", ")} (a typo?): a key cannot read ${unknown.length === 1 ? "it" : "them"}`] : [];
 }
 
-/** The warning for keys with server mode off (D128): a key is made all the same, so a person can be set up before the mode is turned on. */
-export function serverModeLine(on: boolean, what: string): string[] {
-  return on ? [] : [`server mode is off in croft.json, so ${what} is refused until server mode is on ("serverMode": {"enabled": true}, which the user decides: croft docs keys)`];
+/** The warning problem for keys made with server mode off (D128): exit 0, since the key is made all the same. */
+function serverModeProblems(project: Project, what: string): Problem[] {
+  if (project.config.serverMode.enabled) return [];
+  return [problem("SERVER_MODE_OFF_FOR_KEYS", {
+    message: `serverMode.enabled is off in croft.json, so ${what} is refused until server mode is on`,
+    hint: 'a key works only when croft serve runs in server mode; the key is kept, so a person can be set up first. Turning server mode on is the user\'s decision (croft docs server-mode)',
+    fix: { kind: "manual", description: 'ask the user whether to set "serverMode": {"enabled": true} in croft.json, then restart croft serve', requiresHuman: true },
+    file: "croft.json",
+  })];
 }
 
 /** The lines that tell a person how to attach from DuckDB 2.0 (croft docs quack). */
@@ -184,7 +192,6 @@ export function formatKey(d: ServeKeyData): string {
       "",
       reads,
       ...unknownLine(d.unknownTables),
-      ...serverModeLine(d.serverMode, "this key"),
       "Send it as Authorization: Bearer <key> to croft serve's POST /query, or give it to query() as { token }.",
       ...quackLines(d.quack, d.sharedTables),
       `Removing it is one command: croft serve key remove ${d.name}`,
@@ -194,7 +201,7 @@ export function formatKey(d: ServeKeyData): string {
     if (!d.keys.length) return `no keys yet; croft serve key add <name> makes one${d.sharedTables.length ? "" : " (and serve.sharedTables in croft.json names the tables it reads)"}`;
     const t = table(["name", "made", "last used"], d.keys.map((k) => [k.name, k.createdAt, k.lastUsedAt ?? "never"]));
     const reads = d.sharedTables.length ? `keys read: ${d.sharedTables.join(", ")}` : "serve.sharedTables names no table, so every key query is refused";
-    return [t.text, reads, ...unknownLine(d.unknownTables), ...serverModeLine(d.serverMode, "every key"), ...(d.quack ? [quackAddressLine(d.quack)] : [])].join("\n");
+    return [t.text, reads, ...unknownLine(d.unknownTables), ...(d.quack ? [quackAddressLine(d.quack)] : [])].join("\n");
   }
   return `removed the key for ${d.name} (made ${d.createdAt}); it is refused on its next request, croft serve running or not. ${d.remaining} key${d.remaining === 1 ? "" : "s"} left`;
 }

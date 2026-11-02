@@ -29,7 +29,7 @@ import type { SchedulingSetting } from "../../schedule/os.ts";
 import { isLoopbackHost, isUnspecifiedHost, resolveToken, type ServeToken, urlHost } from "../../serve/auth.ts";
 import { KeyStore } from "../../serve/keys.ts";
 import { openEngine } from "../../serve/open.ts";
-import { connectSnippet, type QuackConnect } from "../../serve/quack-address.ts";
+import { connectSnippet, listenAddress, type QuackConnect } from "../../serve/quack-address.ts";
 import type { QuackEvent } from "../../serve/quack-access.ts";
 import { type LoopEvent, type SchedulerLoop, startLoop, TICK_INTERVAL_MS, tickEnv, type TickSpawner } from "../../serve/loop.ts";
 import {
@@ -166,7 +166,11 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
       onError: (e) => ctx.render.err(`croft serve: failed while answering a request: ${e instanceof Error ? e.stack ?? e.message : String(e)}`),
     });
     const id = currentIdentity();
-    const quackUri = engine.status().serverMode?.quack?.uri ?? null;
+    // The listener starts with the readers' process, which waits for the first read copy; until it exists a fixed address is the
+    // configured one, and a port of 0 is not known yet.
+    const mode = engine.status().serverMode;
+    const sm = project.config.serverMode;
+    const quackUri = mode?.quack?.uri ?? (mode && sm.quackPort !== 0 ? listenAddress(sm.quackHost, sm.quackPort).uri : null);
     writeServeJson(stateDir, {
       url: server.url, host: server.host, port: server.port, token: token.token, pid: id.pid, procStart: id.procStart,
       bootId: id.bootId, startedAt: started.toISOString(), version: CROFT_VERSION,

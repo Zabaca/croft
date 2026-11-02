@@ -46,6 +46,18 @@ export function keyNeedsServerMode(): CroftError {
   });
 }
 
+/** A Quack address other than loopback, which the project has not accepted (D131): Quack's own TLS is off there, so keys and queries
+ *  cross the network in plaintext unless an HTTPS reverse proxy of the user's own sits in front. croft serve does not start. */
+export function plaintextNotAccepted(uri: string): CroftError {
+  return new CroftError("QUACK_PLAINTEXT_NOT_ACCEPTED", {
+    message: `serverMode.quackHost makes croft serve listen for DuckDB clients on ${uri.replace(/^quack:/, "")}, which is not this machine only; Quack there carries keys and queries in plaintext`,
+    hint: 'keep quackHost on 127.0.0.1 (a reverse proxy on this machine needs nothing else), or, behind an HTTPS reverse proxy of your own, set "serverMode": {"quackPlaintextOnNetwork": true}',
+    fix: { kind: "manual", description: 'ask the user: remove "serverMode.quackHost" from croft.json to listen on this machine only, or set "serverMode.quackPlaintextOnNetwork" to true if an HTTPS reverse proxy is in front', requiresHuman: true },
+    retryable: false,
+    details: { uri },
+  });
+}
+
 /** What a query stopped for its deadline, because its request went away, or because the server is stopping reports.
  *  A query stopped for a writer is the file engine's alone. */
 export function stopError(reason: Exclude<StopReason, "write">, o: { queryTimeoutMs: number }): CroftError {

@@ -30,6 +30,11 @@ export interface ServerModeConfig {
   quackHost: string;
   /** 0 picks a free port; croft serve's banner, `croft status` and serve.json say which. */
   quackPort: number;
+  /** Accept that an address other than loopback carries keys and queries in plaintext (D131): croft turns Quack's own TLS off
+   *  there and expects an HTTPS reverse proxy in front. Without it croft serve refuses to start with such an address. */
+  quackPlaintextOnNetwork: boolean;
+  /** Quack queries running at once, over all sessions (D130); past it a query is refused with a retryable answer. */
+  quackMaxConcurrent: number;
 }
 /** Where secrets come from besides the shell and .env (§9.8 "Secrets", D108): a command whose output is dotenv. */
 export interface SecretsFrom { command: string[] }
@@ -57,7 +62,7 @@ export interface CroftConfig {
 export const DEFAULTS = {
   database: "warehouse.duckdb",
   readCopy: false,
-  serverMode: { enabled: false, acceptFullCopyCost: false, quackHost: "127.0.0.1", quackPort: 9494 },
+  serverMode: { enabled: false, acceptFullCopyCost: false, quackHost: "127.0.0.1", quackPort: 9494, quackPlaintextOnNetwork: false, quackMaxConcurrent: 4 },
   notify: { desktop: true, webhook: null },
   concurrency: 4,
   http: { budgets: {} },
@@ -73,6 +78,8 @@ export const CONFIG_KEYS: { key: string; type: string; default: string; descript
   { key: "serverMode.acceptFullCopyCost", type: "boolean", default: "false", description: "accept that every refresh of the read copy is a full copy of a warehouse over 1 GB (the filesystem cannot clone it); without this, server mode refuses to start there" },
   { key: "serverMode.quackHost", type: "string", default: `"${DEFAULTS.serverMode.quackHost}"`, description: "the address croft serve listens on for DuckDB 2.0 clients over Quack (croft docs quack); anything but loopback must sit behind an HTTPS reverse proxy" },
   { key: "serverMode.quackPort", type: "integer", default: String(DEFAULTS.serverMode.quackPort), description: "the port for Quack; 0 picks a free one and the banner says which" },
+  { key: "serverMode.quackPlaintextOnNetwork", type: "boolean", default: "false", description: "accept that a quackHost other than loopback carries keys and queries in plaintext, behind an HTTPS reverse proxy of your own; without this croft serve refuses to start with such an address (ask the user first)" },
+  { key: "serverMode.quackMaxConcurrent", type: "integer", default: String(DEFAULTS.serverMode.quackMaxConcurrent), description: "Quack queries running at once, over all sessions; past it a query is refused with a retryable answer (1-64)" },
   { key: "notify.desktop", type: "boolean", default: "true", description: "desktop notification when a scheduled run fails" },
   { key: "notify.webhook", type: "string | null", default: "null", description: "http(s) URL that receives the failure envelope of a scheduled run" },
   { key: "concurrency", type: "integer", default: String(DEFAULTS.concurrency), description: "extractions that run at the same time in one run (1-64)" },
@@ -90,7 +97,7 @@ export const CONFIG_KEYS: { key: string; type: string; default: string; descript
 ];
 
 const TOP_KEYS = ["$schema", "database", "timezone", "readCopy", "serverMode", "notify", "concurrency", "http", "serve", "stateDir", "secretsFrom"];
-const SERVER_MODE_KEYS = ["enabled", "acceptFullCopyCost", "quackHost", "quackPort"];
+const SERVER_MODE_KEYS = ["enabled", "acceptFullCopyCost", "quackHost", "quackPort", "quackPlaintextOnNetwork", "quackMaxConcurrent"];
 /** A shared table is an asset's table: the asset naming rule (project/discover.ts NAME_PATTERN). */
 const SHARED_TABLE = /^[a-z][a-z0-9_]*$/;
 const NOTIFY_KEYS = ["desktop", "webhook"];
@@ -230,6 +237,8 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined, p
     acceptFullCopyCost: bool(sm, "serverMode.acceptFullCopyCost", "acceptFullCopyCost", DEFAULTS.serverMode.acceptFullCopyCost),
     quackHost: str(sm, "serverMode.quackHost", "quackHost", DEFAULTS.serverMode.quackHost).trim(),
     quackPort: int(sm, "serverMode.quackPort", "quackPort", DEFAULTS.serverMode.quackPort, 0, 65535),
+    quackPlaintextOnNetwork: bool(sm, "serverMode.quackPlaintextOnNetwork", "quackPlaintextOnNetwork", DEFAULTS.serverMode.quackPlaintextOnNetwork),
+    quackMaxConcurrent: int(sm, "serverMode.quackMaxConcurrent", "quackMaxConcurrent", DEFAULTS.serverMode.quackMaxConcurrent, 1, 64),
   };
   if (sm.quackHost !== undefined && /[\s/?#@]/.test(serverMode.quackHost)) {
     add("serverMode.quackHost", `"serverMode.quackHost" must be an address to listen on; found ${show(sm.quackHost)}`,

@@ -35,9 +35,11 @@ const ALICE = "croftkey_alice-alice-alice-alice-alice-alice-alice-0";
 const BOB = "croftkey_bob-bob-bob-bob-bob-bob-bob-bob-bob-bob-bob-0";
 const keyOf = (name: string, key: string) => ({ name, hash: hashKey(key) });
 
-function access(o: { shared?: string[]; now?: () => number } = {}) {
+function access(o: { shared?: string[]; now?: () => number; maxConcurrent?: number } = {}) {
   const events: QuackEvent[] = [];
-  const a = new QuackAccess({ shared: o.shared ?? ["orders", "customers"], emit: (e) => events.push(e), ...(o.now ? { now: o.now } : {}) });
+  const a = new QuackAccess({
+    shared: o.shared ?? ["orders", "customers"], emit: (e) => events.push(e), ...(o.now ? { now: o.now } : {}), ...(o.maxConcurrent ? { maxConcurrent: o.maxConcurrent } : {}),
+  });
   a.setKeys([keyOf("alice", ALICE), keyOf("bob", BOB)]);
   a.setCatalog(catalog, VIEWS);
   return { a, events };
@@ -210,6 +212,48 @@ describe("a query goes through the same gate as over HTTP", () => {
       expect(why).toContain("sharedTables");
     }
     expect(await refusal(a, "s", "COMMIT")).toBeNull();
+  });
+});
+
+describe("the cap on running queries (D130)", () => {
+  const read = async (a: QuackAccess, sql = "SELECT count(*) FROM orders") => refusal(a, "s", sql);
+
+  test("past the cap a data query is refused with a retryable answer that names the setting; the client's own control and catalog queries still run", async () => {
+    const { a, events } = access({ maxConcurrent: 2 });
+    a.authenticate("s", ALICE);
+    a.setActive(2);
+    const why = await read(a);
+    expect(why).toMatch(/SERVE_UNAVAILABLE/);
+    expect(why).toContain("serverMode.quackMaxConcurrent");
+    expect(why).toContain("2 Quack queries");
+    expect(events.at(-1)).toMatchObject({ kind: "query", outcome: "SERVE_UNAVAILABLE", tables: [] });
+    for (const t of ["BEGIN TRANSACTION", "COMMIT", "ROLLBACK", SCHEMA_QUERY, TABLES_QUERY]) expect(await read(a, t), t.slice(0, 20)).toBeNull();
+    a.setActive(1);
+    expect(await read(a)).toBeNull();
+  });
+
+  test("only queries the last look saw running count: a client that sends one query after another, in a hundred sessions, is never refused for the ones that finished", async () => {
+    const { a } = access({ maxConcurrent: 2 });
+    a.authenticate("s", ALICE);
+    for (let i = 0; i < 100; i++) {
+      a.authenticate(`s${i}`, ALICE);
+      expect(await refusal(a, `s${i}`, "SELECT count(*) FROM orders"), String(i)).toBeNull();
+    }
+    a.setActive(1);
+    expect(await read(a)).toBeNull();
+    a.setActive(2);
+    expect(await refusal(a, "s1", "SELECT count(*) FROM orders")).toMatch(/SERVE_UNAVAILABLE/);
+  });
+
+  test("a refused attack does not use a slot, and without a cap nothing is counted", async () => {
+    const { a } = access({ maxConcurrent: 1 });
+    a.authenticate("s", ALICE);
+    for (let i = 0; i < 5; i++) expect(await read(a, "DROP VIEW orders")).toMatch(/QUERY_NOT_SELECT/);
+    expect(await read(a)).toBeNull();
+    const { a: free } = access();
+    free.authenticate("s", ALICE);
+    free.setActive(1000);
+    expect(await read(free)).toBeNull();
   });
 });
 

@@ -477,10 +477,10 @@ class Engine implements ServeEngine {
     flight.attach({ interrupt: () => worker.interrupt(id), abandon: () => void worker.kill() });
     flight.checkpoint();
     const a = await worker.query(id, {
-      sql: q.sql, params: q.params, limit: q.limit, maxRows: this.maxRows, maxBytes: this.maxBytes, ...(q.scope ? { shared: [...q.scope.tables] } : {}),
+      sql: q.sql, params: q.params, limit: q.limit, maxRows: this.maxRows, maxBytes: this.maxBytes,
     });
     const rows = JSON.parse(a.rowsJson) as ServeQueryData["rows"];
-    return { columns: a.columns, rows, rowCount: a.rowCount, tookMs: Math.round(performance.now() - arrived), ...(q.scope ? { tables: a.tables } : {}) };
+    return { columns: a.columns, rows, rowCount: a.rowCount, tookMs: Math.round(performance.now() - arrived) };
   }
 
   /** What a failed query reports: why it was stopped, if it was; the worker going away under it; or its own error. */

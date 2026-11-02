@@ -79,7 +79,7 @@ export interface ReadersOpen {
   secretDir: string;
   shared: string[];
   asOf: string;
-  quack?: { host: string; port: number; queryTimeoutMs: number; keys: QuackKey[] };
+  quack?: { host: string; port: number; queryTimeoutMs: number; maxConcurrent: number; keys: QuackKey[] };
 }
 
 /** An error, as it crosses the process boundary. */
@@ -319,7 +319,7 @@ class Host {
         if (m.readers.quack) {
           const q = m.readers.quack;
           this.quack = new QuackListener({
-            host: q.host, port: q.port, queryTimeoutMs: q.queryTimeoutMs, shared: m.readers.shared, keys: q.keys,
+            host: q.host, port: q.port, queryTimeoutMs: q.queryTimeoutMs, maxConcurrent: q.maxConcurrent, shared: m.readers.shared, keys: q.keys,
             emit: (event) => this.send({ op: "quack", event }),
             overdue: (o) => this.send({ op: "quack_overdue", ...o }),
           });

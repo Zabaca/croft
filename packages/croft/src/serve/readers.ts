@@ -41,7 +41,8 @@ import { mapQueryError } from "../read/select.ts";
 import { COPY_CHECK_MS, CopyMaker, type CopyMakerOptions } from "./copy-maker.ts";
 import { KeyStore } from "./keys.ts";
 import type { QuackKey } from "./quack-access.ts";
-import { noSharedTables, restartedError, secs, stopError } from "./errors.ts";
+import { listenAddress } from "./quack-address.ts";
+import { noSharedTables, plaintextNotAccepted, restartedError, secs, stopError } from "./errors.ts";
 import { SERVE_DEFAULTS } from "./instance.ts";
 import { Admission, type Flight, type StopReason } from "./queue.ts";
 import { QueryWorker, WorkerGone, WorkerStopped } from "./query-worker.ts";
@@ -84,7 +85,7 @@ export interface ReadersEngineInternals {
   extensionDir?: string;
   /** Where the readers' process listens for DuckDB clients (serverMode.quackHost and quackPort by default); false: nowhere,
    *  for a test that wants no listener. */
-  quack?: false | { host: string; port: number };
+  quack?: false | { host: string; port: number; maxConcurrent?: number };
   /** How the copy policy tries to clone (db/copy-policy.ts), for tests. */
   policy?: ProbeOptions & ThresholdOption & { clone?: CloneProbe };
   /** The readers' process command (tests); `bun --no-env-file worker.ts` by default. */
@@ -127,6 +128,7 @@ export async function openReadersEngine(o: ServeEngineOptions & ReadersEngineInt
   assertSafeFilesystem({ root: project.root, database: project.paths.database, stateDir: project.paths.stateDir }, o.fs ?? realProbe);
   assertCopyPolicy(project, o.policy);
   const engine = new ReadersEngine(project, o);
+  engine.assertQuackAddress();
   await engine.start();
   return engine;
 }
@@ -157,7 +159,7 @@ class ReadersEngine implements ServeEngine {
   private readonly argv: string[] | undefined;
   private readonly policy: (ProbeOptions & ThresholdOption & { clone?: CloneProbe }) | undefined;
   private readonly delayOf: (attempts: number) => number;
-  private readonly quackAt: { host: string; port: number } | null;
+  private readonly quackAt: { host: string; port: number; maxConcurrent: number } | null;
   private readonly onQuack: ServeEngineOptions["onQuack"];
   /** Reads the keys file for the Quack hooks (D126); the engine never writes it. */
   private readonly keyStore: KeyStore;
@@ -196,7 +198,7 @@ class ReadersEngine implements ServeEngine {
     this.maker = o.copyMaker === false ? null : new CopyMaker({ project, ...(typeof o.copyMaker === "object" ? o.copyMaker : {}) });
     this.delayOf = o.restartDelayMs ?? restartDelayMs;
     const sm = project.config.serverMode;
-    this.quackAt = o.quack === false ? null : (o.quack ?? { host: sm.quackHost, port: sm.quackPort });
+    this.quackAt = o.quack === false ? null : { host: sm.quackHost, port: sm.quackPort, maxConcurrent: sm.quackMaxConcurrent, ...o.quack };
     this.onQuack = o.onQuack;
     this.keyStore = new KeyStore(project.paths.stateDir);
     this.hooks = guarded(o.hooks ?? {});
@@ -214,6 +216,13 @@ class ReadersEngine implements ServeEngine {
       aborted: () => this.stopError("abort"),
       full: () => this.queueFull(),
     });
+  }
+
+  /** The listener's address must be loopback, or the project must have accepted plaintext on the network (D131). */
+  assertQuackAddress(): void {
+    if (!this.quackAt) return;
+    const { uri, loopback } = listenAddress(this.quackAt.host, this.quackAt.port);
+    if (!loopback && !this.project.config.serverMode.quackPlaintextOnNetwork) throw plaintextNotAccepted(uri);
   }
 
   /** First open. A copy that is not there yet is waited for (the first run that changes data makes it); a start that

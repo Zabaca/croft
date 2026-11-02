@@ -25,6 +25,16 @@ import { hashKey } from "./keys.ts";
 /** A refusal the hook throws on purpose: Quack shows the client its text. Anything else thrown in a hook is croft's bug. */
 export class QuackRefusal extends Error {}
 
+/** The answer to a query past the cap on running Quack queries (D130): retryable, like the HTTP API's "busy". */
+function busy(max: number): CroftError {
+  return new CroftError("SERVE_UNAVAILABLE", {
+    message: `croft serve is already running ${max} Quack ${max === 1 ? "query" : "queries"}, the most it runs at once (serverMode.quackMaxConcurrent); this one was not run`,
+    hint: "try the query again in a moment; filter or aggregate in SQL so each one finishes sooner, or ask the user to raise serverMode.quackMaxConcurrent in croft.json",
+    retryable: true,
+    details: { reason: "busy", maxConcurrent: max },
+  });
+}
+
 /** A key as the process holds it: its name and the digest croft stores (serve/keys.ts hashKey). Never the key. */
 export interface QuackKey {
   name: string;
@@ -43,6 +53,8 @@ export interface QuackAccessOptions {
   emit(e: QuackEvent): void;
   /** Milliseconds since the epoch; the clock by default. */
   now?(): number;
+  /** The most Quack queries running at once over all sessions (D130); past it a query is refused with a retryable answer. */
+  maxConcurrent?: number;
 }
 
 interface Session {
@@ -60,12 +72,21 @@ export class QuackAccess {
   private catalog: CatalogSnapshot | null = null;
   private replacements: ReadonlyMap<string, string> = new Map();
   private ready = false;
+  /** Queries `quack_active_connections()` showed running at the last look. The cap is soft by that much: a burst that arrives between
+   *  two looks (250 ms) is not seen until the next one, and queries that already finished are never counted, so a client that sends
+   *  one query after another is never refused for them. */
+  private active = 0;
   private readonly shared: readonly string[];
   private readonly now: () => number;
 
   constructor(private readonly o: QuackAccessOptions) {
     this.shared = [...o.shared, AS_OF_VIEW];
     this.now = o.now ?? (() => Date.now());
+  }
+
+  /** What the last look at the server's running queries counted (every 250 ms, serve/quack-listener.ts). */
+  setActive(running: number): void {
+    this.active = running;
   }
 
   /** The keys listed now. A session whose key is not among them is refused on its next query. */
@@ -120,6 +141,8 @@ export class QuackAccess {
       const replacement = this.replacements.get(query);
       if (replacement !== undefined) return replacement;
       const verdict = this.decide(query, parsed);
+      const max = this.o.maxConcurrent ?? Number.POSITIVE_INFINITY;
+      if (this.active >= max) throw busy(max);
       this.tell({ kind: "query", key: s.key, at: this.now(), tables: verdict.tables, outcome: "ok" });
       return verdict.sql;
     } catch (e) {

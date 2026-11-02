@@ -61,7 +61,7 @@ croft status                # failed, stale, held, never run, edited since its l
 - Renaming or deleting files in assets/ (use `croft rename`); `croft schedule on|off|pause`.
 - `croft serve` (it runs scheduled work unattended, and a `--host` other than 127.0.0.1 exposes data beyond this machine).
 - `croft serve key add <name>` and naming tables in `serve.sharedTables`: they give a person access to data. Show which tables the key will read. `croft serve key remove` and `key list` need no asking.
-- Turning `"serverMode"` on or off in croft.json (apps then read the read copy, as of the last run, and DuckDB 2.0 clients with a key can attach over Quack), `serverMode.acceptFullCopyCost` (disk and write time at every run), and a `serverMode.quackHost` other than 127.0.0.1 (it exposes data beyond this machine).
+- Turning `"serverMode"` on or off in croft.json (apps then read the read copy, as of the last run, and DuckDB 2.0 clients with a key can attach over Quack), `serverMode.acceptFullCopyCost` (disk and write time at every run), and `serverMode.quackPlaintextOnNetwork` (it lets Quack listen beyond this machine, in plaintext, behind a proxy of the user's own).
 - Deleting .croft/ or warehouse*.duckdb, or `git clean -X` (the trash and backups live in .croft/).
 - Weakening or deleting a failing check.
 

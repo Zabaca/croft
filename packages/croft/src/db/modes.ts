@@ -283,8 +283,7 @@ export function scrubError(e: unknown, mode: ModeSpec | undefined): Error {
  * lock, because DuckDB refuses `quack_serve` afterwards. Who may connect is the authentication hook's job; without
  * a `token`, the one the listener needs is a random placeholder no client is given, and no secret is created for it.
  */
-export async function startQuackListener(conn: DuckDBConnection, uri: string, o: { token?: string; allowOtherHostname?: boolean; disableSsl?: boolean } | string = {}): Promise<string> {
-  const opts = typeof o === "string" ? { token: o } : o;
+export async function startQuackListener(conn: DuckDBConnection, uri: string, opts: { token?: string; allowOtherHostname?: boolean; disableSsl?: boolean } = {}): Promise<string> {
   const t = opts.token ?? `unused-${crypto.randomUUID()}`;
   // Quack accepts only localhost as its host unless told otherwise [V: 2.0.0]; croft says so for anything else (D125).
   // Past localhost Quack serves TLS with a certificate of its own [V: 2.0.0: a client got "Unsupported protocol" over plain HTTP];
