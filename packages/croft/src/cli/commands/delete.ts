@@ -32,6 +32,7 @@ import { isAbsolute, relative } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { CroftError, problem } from "../../core/errors.ts";
 import type { AssetKind, Confirmation, Impact, LockHolder, Problem, StepResult } from "../../core/types.ts";
+import { lakeOption } from "../../db/lake.ts";
 import { refreshReadCopy } from "../../db/readcopy.ts";
 import { type DuckWarehouse, openWarehouse } from "../../db/warehouse.ts";
 import { baseFrom, type CatalogAsset, getCatalog, putCatalog, readCatalogEntry } from "../../history/catalog.ts";
@@ -41,7 +42,7 @@ import { reconcile } from "../../history/reconcile.ts";
 import { RunsDb } from "../../history/runs-db.ts";
 import { NAME_PATTERN } from "../../project/discover.ts";
 import { unfinishedRename } from "../../project/rename.ts";
-import type { Project } from "../../project/root.ts";
+import { type Project, warehouseExists } from "../../project/root.ts";
 import { Confirmations, type HashedImpact, impactHash, shownImpact } from "../../safety/confirm.ts";
 import { deleteImpact, deleteTable, deleteWhere, type DeleteImpact, type DeleteResult } from "../../safety/delete.ts";
 import { annotateVersion, plannedTrashPath } from "../../safety/trash.ts";
@@ -159,6 +160,7 @@ export async function openSession(ctx: Ctx, label: string): Promise<Session> {
   try {
     warehouse = openWarehouse({
       path: paths.database, mode: "read_write", timezone: project.timezone, root: project.root, stateDir: paths.stateDir, isTTY: tty,
+      ...lakeOption(project, ctx.env),
       lookupHolder: (pid) => {
         const h = runs.getLockHolder();
         return h && h.pid === pid ? h : null;
@@ -464,7 +466,7 @@ export const del: CommandImpl<DeleteData> = {
       });
     }
     const project = ctx.project;
-    if (!existsSync(project.paths.database)) {
+    if (!warehouseExists(project)) {
       throw new CroftError("UNKNOWN_TABLE", {
         asset, message: `there is no table named ${asset}: the warehouse has no tables yet`, hint: "croft status lists the assets; nothing was changed",
         effect: "nothing was changed", fix: { kind: "command", description: "list the assets", command: "croft status" },

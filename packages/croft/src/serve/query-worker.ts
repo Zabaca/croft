@@ -154,7 +154,7 @@ export class QueryWorker {
 
   /** Open the file read-only with the serve sandbox and check its format. Throws a CroftError (DB_NEWER_FORMAT,
    *  CONFIG_INVALID, ...), WorkerConflict (another process holds the file), WorkerGone, or an Error. */
-  async open(o: { path: string; spec: SandboxSpec; protect: string[]; readers?: ReadersOpen }): Promise<{ quack?: { uri: string } }> {
+  async open(o: { path: string; spec: SandboxSpec; protect: string[]; readers?: ReadersOpen; lake?: true }): Promise<{ quack?: { uri: string } }> {
     await this.ready;
     if (this.opening) throw new Error("the query worker is already opening a database");
     const p = new Promise<{ quack?: { uri: string } }>((resolve, reject) => (this.opening = { resolve, reject }));

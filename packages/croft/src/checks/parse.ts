@@ -96,7 +96,7 @@ export function parseChecks(i: ParseChecksInput): { checks: Check[]; problems: P
 /** CHECK_INVALID for each check whose `SELECT (<expr>) FROM <asset>` is not exactly one statement with one select
  *  item (json_serialize_sql on `conn`, which needs no tables); [] when all are valid.
  *  @param o.file root-relative, for the problems' location. */
-export async function validateChecks(conn: DuckDBConnection, asset: string, checks: readonly Check[], o: { file?: string } = {}): Promise<Problem[]> {
+export async function validateChecks(conn: DuckDBConnection, asset: string, checks: readonly Check[], o: { file?: string; lake?: boolean } = {}): Promise<Problem[]> {
   return (await analyzeChecks(conn, asset, checks, o)).problems;
 }
 
@@ -106,7 +106,7 @@ export async function validateChecks(conn: DuckDBConnection, asset: string, chec
  * out), which is exact where parseChecks' lexical reading is a close estimate (it does not scope CTE names).
  * For resolving a project, where a connection is at hand.
  */
-export async function analyzeChecks(conn: DuckDBConnection, asset: string, checks: readonly Check[], o: { file?: string } = {}): Promise<{ checks: Check[]; problems: Problem[] }> {
+export async function analyzeChecks(conn: DuckDBConnection, asset: string, checks: readonly Check[], o: { file?: string; lake?: boolean } = {}): Promise<{ checks: Check[]; problems: Problem[] }> {
   const serialize = async (sql: string) => {
     const reader = await conn.runAndReadAll("SELECT json_serialize_sql($1::VARCHAR)::VARCHAR", [sql]);
     return String(reader.getRowsJS()[0]?.[0] ?? "{}");
@@ -114,7 +114,7 @@ export async function analyzeChecks(conn: DuckDBConnection, asset: string, check
   const out: Check[] = [];
   const problems: Problem[] = [];
   for (const c of checks) {
-    const v = await vetCheck(serialize, asset, c);
+    const v = await vetCheck(serialize, asset, c, { lake: o.lake === true });
     if (v.ok) out.push({ ...c, reads: v.reads });
     else problems.push(invalid(asset, o.file, c.source, c.blocking, v.why, v.hint, v.fix));
   }
@@ -136,7 +136,7 @@ export type Vetting = { ok: true; reads: string[] } | { ok: false; why: string; 
  * json_serialize_sql's text for a statement (on any connection: it parses, never binds or runs). Rules go through
  * DuckDB's parser; the other forms only need their croft-made SQL to have the documented shape.
  */
-export async function vetCheck(serialize: (sql: string) => Promise<string>, asset: string, c: Check): Promise<Vetting> {
+export async function vetCheck(serialize: (sql: string) => Promise<string>, asset: string, c: Check, o: { lake?: boolean } = {}): Promise<Vetting> {
   const bad = (why: string, hint = LANGUAGE_HINT): Vetting => ({ ok: false, why, hint });
   if (c.kind === "unique" || c.kind === "not_null") {
     return checkColumns(c) ? { ok: true, reads: [] } : bad("names no columns croft can read");
@@ -210,7 +210,7 @@ export async function vetCheck(serialize: (sql: string) => Promise<string>, asse
   }
   // The gate's decision, last: what the loop above lets through must also be a read the gate allows.
   try {
-    decide({ sql: probe, parsed: text, options: { profile: "memory" }, paths: PathPolicy.none() });
+    decide({ sql: probe, parsed: text, options: { profile: "memory", ...(o.lake ? { lake: true } : {}) }, paths: PathPolicy.none() });
   } catch (e) {
     if (e instanceof CroftError) return bad(e.message, e.problem.hint);
     throw e;

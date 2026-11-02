@@ -36,7 +36,7 @@ import { openWarehouse } from "../../db/warehouse.ts";
 import type { ColumnInfo } from "../../db/values.ts";
 import { renderValue, resultColumns } from "../../db/values.ts";
 import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
-import type { Project } from "../../project/root.ts";
+import { type Project, warehouseExists } from "../../project/root.ts";
 import { didYouMean } from "../../project/suggest.ts";
 import { mapQueryError } from "../../read/select.ts";
 import { deletedByCroft } from "../../safety/trash.ts";
@@ -108,8 +108,12 @@ export const query: CommandImpl<QueryData> = {
     // No warehouse yet (nothing has run): an in-memory DuckDB, never a new warehouse file.
     const raw = ctx.values.preview === true
       ? await fromPreview(ctx, project, run)
-      : existsSync(project.paths.database)
-        ? await fromWarehouse(ctx, project, configs, run)
+      : warehouseExists(project)
+        ? await fromWarehouse(ctx, project, configs, run).catch((e: unknown) => {
+          // A lake nobody has written yet is no warehouse yet, like a file that is not there (D138).
+          if (e instanceof CroftError && e.code === "DB_NOT_FOUND" && e.problem.details?.notCreated === true) return withoutWarehouse(project, configs, run);
+          throw e;
+        })
         : await withoutWarehouse(project, configs, run);
 
     const redact = (s: string) => ctx.env.redactData(s);

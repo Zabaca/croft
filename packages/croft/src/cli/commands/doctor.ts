@@ -55,6 +55,7 @@ import { listLeases } from "../../history/leases.ts";
 import { RUNS_DB_FILE, RunsDb } from "../../history/runs-db.ts";
 import { commandText, ProjectEnv } from "../../project/env.ts";
 import { appRootOf, relocationPlan } from "../../project/init.ts";
+import { bucketPath } from "../../project/lake-config.ts";
 import { configProblems, findRoot, loadProject, syncedLocation, type ConfigIssue, type Project, type SecretsFrom } from "../../project/root.ts";
 import { croftHome, type CroftHome } from "../../schedule/home.ts";
 import { jobPath } from "../../schedule/register.ts";
@@ -418,6 +419,7 @@ type TableScanResult = import("../../safety/out-of-band.ts").TableScan | Error |
 
 /** The warehouse line. In the same read lease, the tables croft has a record of are compared with it (`found.scan`). */
 async function checkWarehouse(r: Report, d: DoctorDeps, project: Project, bindingOk: boolean, found: { scan: TableScanResult }): Promise<void> {
+  if (project.config.lake) return checkLake(r, d, project, bindingOk, found);
   const path = project.paths.database;
   const label = project.databaseLabel;
   if (!existsSync(path)) {
@@ -525,6 +527,81 @@ async function checkWarehouse(r: Report, d: DoctorDeps, project: Project, bindin
   }
 }
 
+/**
+ * The lake line (lake mode, D138 to D144): the warehouse of a project with a `lake` block is attached read-only, with the read-only login
+ * and bucket key, like any command that only reads, and not held: there is no file to be kept out of, so no writer's intent matters.
+ * It says where the lake is and whether it is made yet, the croft format and bookkeeping kind in it, and who wrote it last (a write
+ * from a machine other than this one is LAKE_OTHER_WRITER, a warning: one lake has one writing machine). A second line says what the
+ * lake's folder must hold: nothing else, because DuckLake's own cleanup deletes files in it that it does not recognise. In the same
+ * read lease the tables croft has a record of are compared with it, as for a file (`found.scan`).
+ */
+async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: boolean, found: { scan: TableScanResult }): Promise<void> {
+  const lake = project.config.lake!;
+  const label = project.databaseLabel;
+  const folder = lake.kind === "postgres" ? bucketPath(lake.bucket) : lake.dataPath;
+  const details: Record<string, unknown> = { lake: lake.kind, folder };
+  r.add("environment", "lake.folder", "info",
+    `the lake's folder (${folder}) must hold nothing but this lake: DuckLake's own cleanup deletes any file in it that it does not recognise`, undefined, details);
+  if (!bindingOk) {
+    r.add("environment", "warehouse", "info", `${label} · not opened (the DuckDB binding does not load)`, undefined, details);
+    return;
+  }
+  let w: import("../../db/warehouse.ts").DuckWarehouse | undefined;
+  try {
+    const { openWarehouse } = await import("../../db/warehouse.ts");
+    const { readMeta } = await import("../../db/state.ts");
+    const { scanTables } = await import("../../safety/out-of-band.ts");
+    const { lakeOption, machineId, writerReport } = await import("../../db/lake.ts");
+    w = openWarehouse({
+      path: project.paths.database, mode: "read_only", profile: "query", timezone: project.timezone, root: project.root, stateDir: project.paths.stateDir,
+      ...lakeOption(project, ProjectEnv.load(project.root, d.env)), isTTY: false, register: false, noticeAfterMs: Number.MAX_SAFE_INTEGER,
+    });
+    const meta = await w.read(async (db) => {
+      const m = await readMeta(db);
+      if (m.format_version) {
+        try {
+          found.scan = await scanTables(db, { budgetMs: d.tableScanMs ?? TABLE_SCAN_MS });
+        } catch (e) {
+          found.scan = e instanceof Error ? e : new Error(String(e));
+        }
+      }
+      return m;
+    }, { waitMs: d.lockWaitMs, purpose: "doctor" });
+    const parts = [label, meta.format_version ? `croft format ${meta.format_version}${meta.bookkeeping ? ` (${meta.bookkeeping})` : ""} · duckdb ${String(meta.duckdb_version ?? "?").replace(/^v/, "")}` : "no croft state yet"];
+    const { mine, others, crossing } = writerReport(meta, now(d.env).getTime());
+    Object.assign(details, { meta, writer: mine, otherWriters: others });
+    const when = (at: string) => { try { return clockText(at, project.timezone, now(d.env)); } catch { return at; } };
+    if (crossing) {
+      const p = problem("LAKE_OTHER_WRITER", {
+        message: `another machine, ${crossing.host || crossing.machine}, has written this lake since this machine's last write: at ${when(crossing.at)}${crossing.run ? ` (run ${crossing.run})` : ""}; a lake has one writing machine`,
+        hint: "run croft on one machine only for this project, and stop the scheduler on the other (croft schedule off there); croft docs LAKE_OTHER_WRITER",
+        fix: { kind: "manual", description: "decide which machine writes this lake, and stop croft on the other", requiresHuman: true },
+        details: { machine: crossing.machine, host: crossing.host, at: crossing.at, run: crossing.run, thisMachine: machineId() },
+      });
+      r.add("environment", "warehouse", "warn", `${parts.join(" · ")} · ${p.message}`, p, details);
+    } else {
+      const newest = others[0];
+      parts.push(mine ? `last written ${when(mine.at)} by this machine` : newest ? `last written ${when(newest.at)} by ${newest.host || newest.machine}; this machine has not written it` : "no write recorded yet");
+      r.add("environment", "warehouse", "ok", parts.join(" · "), undefined, details);
+    }
+  } catch (e) {
+    if (!(e instanceof CroftError)) {
+      const first = String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 200);
+      const p = problem("DB_UNREADABLE", {
+        message: `${label} cannot be opened: ${first}`, hint: "run croft doctor again once the catalog and the bucket are reachable",
+        details: { error: first },
+      });
+      r.add("environment", "warehouse", "error", p.message, p, details);
+    } else if (e.code === "DB_NOT_FOUND" && e.problem.details?.notCreated === true) {
+      r.add("environment", "warehouse", "ok", `${label} not created yet (the first croft run creates it)`, undefined, { ...details, exists: false });
+    } else {
+      r.add("environment", "warehouse", "error", `${label} · ${e.problem.message}`, e.problem, details);
+    }
+  } finally {
+    await w?.close();
+  }
+}
+
 interface ServeFile { pid: number; alive: boolean; url: string | null; token: string | null; raw: Record<string, unknown> }
 
 function servePid(stateDir: string): ServeFile | null {
@@ -552,7 +629,9 @@ async function checkServe(r: Report, d: DoctorDeps, project: Project): Promise<v
   const file = join(project.paths.stateDir, "serve.json");
   const s = servePid(project.paths.stateDir);
   if (!s) {
-    r.add("environment", "serve", "info", "no read server running (apps read the warehouse file directly)", undefined, { running: false });
+    r.add("environment", "serve", "info", project.config.lake
+      ? "no read server running (apps read a lake through croft serve, which never steps aside for a run)"
+      : "no read server running (apps read the warehouse file directly)", undefined, { running: false });
     return;
   }
   if (!s.alive) {
@@ -1044,7 +1123,7 @@ function checkBackups(r: Report, d: DoctorDeps, project: Project, probe: DuckdbP
     rec = recordedEngine(stateDir);
   } catch { /* runs.sqlite cannot be read: nothing pending that doctor can tell */ }
   const running = probe.ok ? probe.version : null;
-  const pending = running !== null && rec !== null && existsSync(project.paths.database) && compareEngineVersions(running, rec.version) > 0;
+  const pending = running !== null && rec !== null && !project.config.lake && existsSync(project.paths.database) && compareEngineVersions(running, rec.version) > 0;
   const dir = backupsDir(stateDir);
   const made = listProjectBackups(dir);
   if (list.length === 0 && made.length === 0 && !pending) return;

@@ -6,7 +6,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-import { cleanupAll, initProject, PKG, type Project, rawJson, type MockApi, mockApi, show } from "./harness.ts";
+import { cleanupAll, initProject, PKG, type Project, rawJson, type MockApi, mockApi, show, fileOnly, LAKE } from "./harness.ts";
 
 const NODE = Bun.which("node");
 let api: MockApi;
@@ -97,7 +97,7 @@ describe("journey 10: @zabaca/croft/read", () => {
     expect(mt.when).toBe("DATE");
   }, 120_000);
 
-  test("from Bun: rows match croft query --json", async () => {
+  fileOnly("direct mode opens the warehouse file; a lake is read through croft serve (LAKE_DIRECT_READ)")("from Bun: rows match croft query --json", async () => {
     const r = runReader(process.execPath);
     expect(r.code, `${r.stdout}\n${r.stderr}`).toBe(0);
     const got = JSON.parse(r.stdout);
@@ -109,7 +109,7 @@ describe("journey 10: @zabaca/croft/read", () => {
     expect(got.refused).toBe("QUERY_NOT_SELECT");
   }, 120_000);
 
-  test.skipIf(!NODE)(`from Node (${NODE ?? "not installed"}): rows match croft query --json`, async () => {
+  (LAKE ? test.skip : test.skipIf(!NODE))(`[skipped on a lake: direct mode opens the warehouse file] from Node (${NODE ?? "not installed"}): rows match croft query --json`, async () => {
     const r = runReader(NODE!);
     expect(r.code, `${r.stdout}\n${r.stderr}`).toBe(0);
     const got = JSON.parse(r.stdout);

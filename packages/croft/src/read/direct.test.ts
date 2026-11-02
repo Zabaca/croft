@@ -32,6 +32,17 @@ const SALES = [
     (2, 3.00, 7, TIMESTAMPTZ '2026-07-01 06:00:00Z', DATE '2026-07-01', [], NULL)`,
 ];
 
+describe("direct mode over a lake", () => {
+  test("a project whose warehouse is a lake is LAKE_DIRECT_READ: an app reads it through croft serve, and nothing is opened", async () => {
+    const p = await makeProject({ config: { lake: { catalog: { kind: "sqlite", path: "lake/catalog.sqlite" }, dataPath: "lake/data" } } });
+    const err = await rejection(directQuery(p.project, req("SELECT 1"), FAST));
+    expect(err.code).toBe("LAKE_DIRECT_READ");
+    expect(err.problem.fix).toMatchObject({ kind: "command", command: "croft serve" });
+    expect(err.problem.hint).toContain("croft serve");
+    expect(isOpen(p.database)).toBe(false);
+  });
+});
+
 describe("direct mode", () => {
   test("reads rows with the §4.3 json rendering in the project time zone", async () => {
     const p = await makeProject({ seed: SALES });

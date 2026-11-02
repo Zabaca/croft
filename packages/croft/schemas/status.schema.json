@@ -87,6 +87,32 @@
               ],
               "additionalProperties": false
             },
+            "lake": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "local",
+                    "postgres"
+                  ]
+                },
+                "folder": {
+                  "type": "string"
+                },
+                "addons": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/AddonView"
+                  }
+                }
+              },
+              "required": [
+                "kind",
+                "folder",
+                "addons"
+              ],
+              "additionalProperties": false
+            },
             "redactedValues": {
               "const": true
             }

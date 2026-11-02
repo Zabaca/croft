@@ -45,18 +45,41 @@ export async function gateSelect(conn: DuckDBConnection, sql: string, o: GateOpt
   const stmt = !s.error && s.statements?.length === 1 ? s.statements[0]! : null;
   let catalog = o.catalog;
   let paths: PathPolicy | undefined;
+  let lake = o.lake;
   const globs = new Map<string, GlobExpansion>();
   if (stmt) {
     if (o.profile === "serve") catalog ??= await loadCatalog(conn);
     else {
+      // A connection with a lake attached is a lake project's: the caller need not say so (and cannot forget to). Its local files
+      // (a local lake's data folder and SQLite catalog) are the connection's to read and write, and are never SQL's to name.
+      const files = await lakeFiles(conn);
+      lake ??= files !== null;
       const raws = pathLiterals(stmt, o.profile);
       if (raws.length) {
-        paths = await loadPathPolicy(conn, o);
+        paths = await loadPathPolicy(conn, files?.length ? { ...o, protect: [...(o.protect ?? []), ...files] } : o);
         for (const raw of raws) if (!globs.has(raw) && paths.hasGlob(raw)) globs.set(raw, await expandGlob(conn, raw, o.profile));
       }
     }
   }
-  return decide({ sql, count, parsed, options: o, ...(catalog ? { catalog } : {}), ...(paths ? { paths } : {}), globs });
+  return decide({ sql, count, parsed, options: lake ? { ...o, lake } : o, ...(catalog ? { catalog } : {}), ...(paths ? { paths } : {}), globs });
+}
+
+/**
+ * The local files of the lakes attached to this connection's instance (db/modes.ts attaches a project's lake before the lock): null when
+ * none is attached, else the folders and files a query must never name even though the instance may read them, a local lake's data
+ * folder and its SQLite catalog (a lake in a bucket has none). Two local queries on a lake's connection, none on any other.
+ */
+async function lakeFiles(conn: DuckDBConnection): Promise<string[] | null> {
+  const lakes = (await conn.runAndReadAll("SELECT database_name, path FROM duckdb_databases() WHERE type = 'ducklake'")).getRowsJS();
+  if (!lakes.length) return null;
+  const out: string[] = [];
+  for (const [name, path] of lakes) {
+    const catalog = typeof path === "string" && path.startsWith("sqlite:") ? path.slice("sqlite:".length) : null;
+    if (catalog) out.push(catalog, `${catalog}-wal`, `${catalog}-shm`, `${catalog}-journal`);
+    const data = (await conn.runAndReadAll("SELECT value FROM ducklake_options($1::VARCHAR) WHERE option_name = 'data_path'", [String(name)])).getRowsJS()[0]?.[0];
+    if (typeof data === "string" && data !== "" && !/^[a-z][a-z0-9+.-]*:\/\//i.test(data)) out.push(data);
+  }
+  return out;
 }
 
 /** gateSelect() for a caller that wants the statement's AST only. */

@@ -3,7 +3,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { cleanupAll, findProblem, initProject, show, tempDir } from "./harness.ts";
+import { cleanupAll, findProblem, initProject, show, tempDir, fileOnly } from "./harness.ts";
 
 afterAll(async () => {
   await cleanupAll();
@@ -106,7 +106,7 @@ describe("the agent contract", () => {
 });
 
 describe("the warehouse file is missing after a run", () => {
-  test("status, context and query agree: it was built before and is gone", async () => {
+  fileOnly("it deletes the warehouse file; a lake has no file, and a lake that is gone is a catalog and a bucket someone else runs")("status, context and query agree: it was built before and is gone", async () => {
     const { project: p } = await initProject();
     const run = await p.json(["run", "example_sales", "--foreground"]);
     expect(run.code, show(run)).toBe(0);

@@ -3,7 +3,7 @@
 import pkg from "../../package.json" with { type: "json" };
 import { CroftError } from "../core/errors.ts";
 import type { Sql } from "../core/types.ts";
-import { type BookkeepingKind, defaultBookkeeping, fileDdl, kindOfObjects, logDdl, remember, stateObjects } from "./bookkeeping.ts";
+import { type BookkeepingKind, defaultBookkeeping, fileDdl, inLake, kindOfObjects, logDdl, remember, stateObjects } from "./bookkeeping.ts";
 
 /** Version of the _croft schema. A database with a larger number was written by a newer croft.
  *  2: _croft.writes.attempt (the step attempt that committed, so reconcile() can tell retries apart).
@@ -84,7 +84,8 @@ export async function ensureState(tx: Sql, o: { croftVersion?: string; bookkeepi
   const before = await readMeta(tx);
   assertFormat(before);
   const names = await stateObjects(tx);
-  const kind = kindOfObjects(names) ?? o.bookkeeping ?? defaultBookkeeping();
+  // A lake refuses primary keys and the rest of what the file's tables use, so its bookkeeping is the log, whatever else was asked.
+  const kind = kindOfObjects(names) ?? ((await inLake(tx)) ? "log" : o.bookkeeping ?? defaultBookkeeping());
   if (kind === "log") {
     // Only what is missing: an existing lake pays no catalog write for CREATE ... IF NOT EXISTS.
     if (!names.size) await tx.exec(`CREATE SCHEMA IF NOT EXISTS _croft`);

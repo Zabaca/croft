@@ -11,14 +11,14 @@ type Schema = {
   type?: string | string[]; properties?: Record<string, Schema>; additionalProperties?: boolean | Schema; required?: string[];
   propertyNames?: Schema; minProperties?: number;
   minimum?: number; maximum?: number; minLength?: number; minItems?: number; pattern?: string; items?: Schema; default?: unknown;
-  description?: string; $schema?: string; $id?: string; title?: string;
+  description?: string; $schema?: string; $id?: string; title?: string; enum?: unknown[];
 };
 
 const SCHEMA_PATH = fileURLToPath(new URL("../../croft.schema.json", import.meta.url));
 const schema = JSON.parse(readFileSync(SCHEMA_PATH, "utf8")) as Schema;
 
 const SUPPORTED = new Set(["type", "properties", "additionalProperties", "required", "minimum", "maximum", "minLength", "minItems", "pattern",
-  "items", "default", "description", "$schema", "$id", "title", "markdownDescription", "propertyNames", "minProperties"]);
+  "items", "default", "description", "$schema", "$id", "title", "markdownDescription", "propertyNames", "minProperties", "enum"]);
 
 function typeOf(v: unknown): string[] {
   if (v === null) return ["null"];
@@ -34,6 +34,7 @@ function valid(s: Schema, v: unknown): boolean {
     const types = Array.isArray(s.type) ? s.type : [s.type];
     if (!typeOf(v).some((t) => types.includes(t))) return false;
   }
+  if (s.enum !== undefined && !s.enum.includes(v)) return false;
   if (typeof v === "number") {
     if (s.minimum !== undefined && v < s.minimum) return false;
     if (s.maximum !== undefined && v > s.maximum) return false;
@@ -59,7 +60,18 @@ function valid(s: Schema, v: unknown): boolean {
 }
 
 const tz = { timezone: "UTC" };
+/** A shared lake, whole: a Postgres catalog with two logins, a bucket folder with two keys. */
+const sharedLake = (over: Record<string, unknown> = {}) => ({
+  catalog: { kind: "postgres", host: "db.example.com", port: 5432, database: "croft_lake",
+    writer: { user: "croft_writer", passwordSecret: "LAKE_WRITER_PASSWORD" }, reader: { user: "croft_reader", passwordSecret: "LAKE_READER_PASSWORD" } },
+  bucket: { name: "my-bucket", folder: "croft/orders/", endpoint: "abc123.r2.cloudflarestorage.com", region: "auto", urlStyle: "path", useSsl: true,
+    writer: { keyIdSecret: "LAKE_WRITER_KEY_ID", secretKeySecret: "LAKE_WRITER_KEY" }, reader: { keyIdSecret: "LAKE_READER_KEY_ID", secretKeySecret: "LAKE_READER_KEY", sessionTokenSecret: "LAKE_READER_TOKEN" } },
+  ...over,
+});
+const localLake = (over: Record<string, unknown> = {}) => ({ catalog: { kind: "sqlite", path: "lake/catalog.sqlite" }, dataPath: "lake/data", ...over });
 const VALID: unknown[] = [
+  { ...tz, lake: sharedLake() }, { ...tz, lake: localLake() }, { ...tz, lake: localLake({ catalog: { kind: "sqlite", path: "/var/croft/catalog.sqlite" }, dataPath: "~/croft/data/" }) },
+  { ...tz, lake: sharedLake({ bucket: { name: "b-1", folder: "a", writer: { keyIdSecret: "A1", secretKeySecret: "B1" }, reader: { keyIdSecret: "A2", secretKeySecret: "B2" } } }) },
   { database: "warehouse.duckdb", timezone: "UTC" },
   { $schema: "./node_modules/@zabaca/croft/croft.schema.json", database: "warehouse.duckdb", timezone: "America/Los_Angeles" },
   { timezone: "Asia/Tokyo" },
@@ -78,7 +90,25 @@ const VALID: unknown[] = [
   { ...tz, serverMode: { quackPlaintextOnNetwork: true, quackMaxConcurrent: 64 } },
   { ...tz, http: { budgets: { "api.example.com": { perHour: 50, perDay: 125 }, "127.0.0.1:8080": { perMinute: 1 }, "[::1]:9000": { perDay: 1_000_000_000 } } } },
 ];
+const sharedCatalog = sharedLake().catalog;
+const sharedBucket = sharedLake().bucket;
 const INVALID: unknown[] = [
+  { ...tz, lake: true }, { ...tz, lake: [] }, { ...tz, lake: {} }, { ...tz, lake: { dataPath: "lake/data" } }, { ...tz, lake: { catalog: {} } },
+  { ...tz, lake: { catalog: { kind: "mysql" } } }, { ...tz, lake: { catalog: { kind: "postgres", host: "x y" } } },
+  { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, host: "https://db.example.com" } }) }, { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, port: 0 } }) },
+  { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, port: "5432" } }) }, { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, database: "a b" } }) },
+  { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, writer: { user: "w" } } }) }, { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, reader: { passwordSecret: "A" } } }) },
+  { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, writer: { user: "w", passwordSecret: "has space" } } }) },
+  { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, writer: { user: "w", passwordSecret: "A", password: "hunter2" } } }) },
+  { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, password: "hunter2" } }) },
+  { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, name: "A" } }) }, { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, name: "s3://my-bucket" } }) },
+  { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, folder: "/abs" } }) }, { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, folder: "a//b" } }) },
+  { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, folder: "" } }) },
+  { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, endpoint: "https://x.example.com" } }) }, { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, urlStyle: "domain" } }) },
+  { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, useSsl: "yes" } }) }, { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, writer: { keyIdSecret: "A" } } }) },
+  { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, writer: { keyIdSecret: "A", secretKeySecret: "B", secret: "sk" } } }) },
+  { ...tz, lake: localLake({ dataPath: "" }) }, { ...tz, lake: localLake({ catalog: { kind: "sqlite", path: "" } }) },
+  { ...tz, lake: { ...sharedLake(), extra: 1 } },
   [], "croft", null, 42,
   {},
   { database: "warehouse.duckdb" },
@@ -134,6 +164,16 @@ const SCHEMA_ACCEPTS_VALIDATOR_REJECTS: unknown[] = [
   { ...tz, serve: { allowOrigins: ["http://localhost:80"] } },
   { ...tz, serve: { sharedTables: ["orders", "orders"] } },            // a table listed twice
   { ...tz, secretsFrom: { command: ["sops -d secrets.yaml"] } },        // a command line in one string: no shell splits it
+  // What lake mode needs of the combination of keys, which a draft-07 schema without conditionals cannot say:
+  { ...tz, lake: { catalog: sharedCatalog } },                                                  // a Postgres catalog needs its bucket
+  { ...tz, lake: { catalog: sharedCatalog, dataPath: "lake/data", bucket: sharedBucket } },     // not a bucket and a local folder both
+  { ...tz, lake: { ...localLake(), bucket: sharedBucket } }, { ...tz, lake: { catalog: { kind: "sqlite" }, dataPath: "d" } }, // a SQLite catalog is a path and a folder
+  { ...tz, lake: localLake({ catalog: { kind: "sqlite", path: "c.sqlite", host: "x" } }) },     // a SQLite catalog has no host
+  { ...tz, lake: { catalog: { kind: "postgres", host: "h" }, bucket: sharedBucket } },          // a Postgres catalog needs its database and logins
+  { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, reader: sharedCatalog.writer } }) }, // the read-only login is not the writer's
+  { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, reader: sharedBucket.writer } }) },    // nor is the read-only bucket key
+  { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, folder: "../other/" } }) },            // the folder stays inside the bucket
+  { ...tz, lake: sharedLake(), serverMode: { enabled: true } }, { ...tz, lake: sharedLake(), readCopy: true }, // server mode over a lake is a later slice; no read copy of a lake
 ];
 
 describe("croft.schema.json", () => {

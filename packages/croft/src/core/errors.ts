@@ -51,10 +51,15 @@ export const CODES = {
   QUERY_FAILED: { category: "project", severity: "error", exit: 2 },
   CONFIG_INVALID: { category: "project", severity: "error", exit: 2 },
   DB_NOT_FOUND: { category: "project", severity: "error", exit: 2 },
+  LAKE_DIRECT_READ: { category: "project", severity: "error", exit: 2 },
+  LAKE_UNSUPPORTED: { category: "project", severity: "error", exit: 2 },
   SERVE_NO_SHARED_TABLES: { category: "project", severity: "error", exit: 2 },
   SERVE_KEY_NEEDS_SERVER_MODE: { category: "project", severity: "error", exit: 2 },
   SERVE_KEY_EXISTS: { category: "project", severity: "error", exit: 2 },
   SERVE_KEY_NOT_FOUND: { category: "project", severity: "error", exit: 2 },
+  LAKE_TYPE_UNSUPPORTED: { category: "run", severity: "error", exit: 1 },
+  LAKE_CONNECTION_LOST: { category: "run", severity: "error", exit: 1 },
+  LAKE_COMMIT_UNCERTAIN: { category: "run", severity: "error", exit: 1 },
   HTTP_ERROR: { category: "run", severity: "error", exit: 1 },
   HTTP_BUDGET_SPENT: { category: "run", severity: "error", exit: 1 },
   ASSET_CODE_ERROR: { category: "run", severity: "error", exit: 1 },
@@ -141,6 +146,7 @@ export const CODES = {
   TZDATA_MISMATCH: { category: "warning", severity: "warning", exit: 0 },
   READ_COPY_NOT_CLONED: { category: "warning", severity: "warning", exit: 0 },
   SERVER_MODE_OFF_FOR_KEYS: { category: "warning", severity: "warning", exit: 0 },
+  LAKE_OTHER_WRITER: { category: "warning", severity: "warning", exit: 0 },
 } as const satisfies Record<string, CodeInfo>;
 
 export type Code = keyof typeof CODES;

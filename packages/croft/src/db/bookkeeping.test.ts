@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import type { Sql } from "../core/types.ts";
-import { bookkeepingOf, type BookkeepingKind, STATE_SPECS, type StateTableName } from "./bookkeeping.ts";
+import { bookkeepingOf, type BookkeepingKind, seqResetSql, STATE_SPECS, type StateTableName } from "./bookkeeping.ts";
 import { columnNames, sqlOver } from "./bookkeeping-testkit.ts";
 import { connect, instanceConfig } from "./connect.ts";
 import { extensionsReady } from "./extension-dir-testkit.ts";
@@ -63,7 +63,7 @@ async function lakeTarget(): Promise<Target> {
   const instance = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
   const conn: DuckDBConnection = await connect(instance, {
     profile: "serve", timezone: "UTC",
-    mode: { kind: "lake-test", extensionDir: lakeExt.dir, secretDir: join(root, "secrets"), lake: { catalog: { kind: "sqlite", path: join(root, "meta.sqlite") }, dataPath: join(root, "data") + "/", access: "write" } },
+    mode: { kind: "lake-local", extensionDir: lakeExt.dir, secretDir: join(root, "secrets"), lake: { catalog: { kind: "sqlite", path: join(root, "meta.sqlite") }, dataPath: join(root, "data") + "/", access: "write" } },
   }, ":memory:bk-lake");
   cleanup.push(() => { conn.disconnectSync(); instance.closeSync(); });
   await conn.run("USE lake");
@@ -73,6 +73,7 @@ async function lakeTarget(): Promise<Target> {
     async tx(fn) {
       await conn.run("BEGIN TRANSACTION");
       try {
+        for (const reset of seqResetSql()) await conn.run(reset); // as the warehouse does as it begins a lake write
         await ensureState(sql, { bookkeeping: "log" });
         const out = await fn(sql);
         await conn.run("COMMIT");
@@ -284,6 +285,34 @@ describe("the log adapter", () => {
       expect(seqs.map((s) => Number(s.seq))).toEqual([1, 2, 3, 4, 5, 6]);
     });
     expect(await t.read("assets")).toMatchObject([{ name: "a", cursor_value: "v6" }]);
+  });
+
+  test("in a lake the number is read from the log once per transaction and table, and numbers every kind of write, through any wrapper of the transaction's Sql", async () => {
+    if (!lakeExt.ready) return;
+    const t = await lakeTarget();
+    await t.tx(async (tx) => {
+      const bk = await bookkeepingOf(tx);
+      for (const v of ["v1", "v2", "v3"]) await bk.upsert("assets", full("assets", { name: "'a'", cursor_value: `'${v}'` }));
+      await bk.upsert("assets", full("assets", { name: "'b'", cursor_value: "'b1'" }));
+      await bk.update("assets", { cursor_value: "'v4'" }, "name = 'a'"); // several rows in one statement would number from the variable too
+      await bk.remove("assets", "name = 'b'");
+      // A wrapper around the same transaction (a step's abortable Sql) is another object over the same connection: it must go on from the same number.
+      const wrapped: Sql = { all: (q, p) => tx.all(q, p), exec: (q, p) => tx.exec(q, p) };
+      await (await bookkeepingOf(wrapped)).upsert("assets", full("assets", { name: "'c'", cursor_value: "'c1'" }));
+      await bk.upsert("assets", full("assets", { name: "'d'", cursor_value: "'d1'" }));
+      const seqs = (await tx.all<{ seq: number | bigint }>(`SELECT seq FROM _croft.assets_log ORDER BY seq`)).map((r) => Number(r.seq));
+      expect(seqs).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    });
+    // The next transaction goes on from the log, also after a transaction that was rolled back.
+    await expect(t.tx(async (tx) => {
+      await (await bookkeepingOf(tx)).upsert("assets", full("assets", { name: "'x'" }));
+      throw new Error("rolled back");
+    })).rejects.toThrow("rolled back");
+    await t.tx(async (tx) => {
+      await (await bookkeepingOf(tx)).upsert("assets", full("assets", { name: "'e'", cursor_value: "'e1'" }));
+      const seqs = (await tx.all<{ seq: number | bigint }>(`SELECT seq FROM _croft.assets_log ORDER BY seq`)).map((r) => Number(r.seq));
+      expect(seqs).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    });
   });
 
   test("a row somebody inserted by hand, with no number, is older than any row croft writes", async () => {

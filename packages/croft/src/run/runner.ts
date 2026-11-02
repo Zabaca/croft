@@ -75,6 +75,7 @@ import type { ExampleResult } from "../project/init.ts";
 import { Confirmations } from "../safety/confirm.ts";
 import { deletedByCroft } from "../safety/trash.ts";
 import { canonicalPath } from "../db/connect.ts";
+import { lakeOption } from "../db/lake.ts";
 import { openWarehouse, type DuckWarehouse } from "../db/warehouse.ts";
 import { allCatalog, type CatalogAsset, getCatalog } from "../history/catalog.ts";
 import { acquire, release, tryAcquire } from "../history/leases.ts";
@@ -659,7 +660,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
       // the write reads only those snapshots (a `file: "*.csv"` ingest would otherwise open the whole root).
       warehouse = openWarehouse({
         path: paths.database, mode: "read_write", timezone: project.timezone, root: project.root, stateDir: paths.stateDir,
-        isTTY: interactive, ...(o.runId ? { runId: o.runId } : {}),
+        ...lakeOption(project, env), isTTY: interactive, ...(o.runId ? { runId: o.runId } : {}),
         // --no-wait: a held database file is exit 4 at once, like a held asset. A scheduled run waits 30 min.
         ...(o.noWait ? { waits: { offTtyMs: 0, ttyReadMs: 0, ttyWriteMs: 0 } }
           : scheduled ? { waits: { offTtyMs: SCHEDULED_LOCK_WAIT_MS, ttyReadMs: SCHEDULED_LOCK_WAIT_MS, ttyWriteMs: SCHEDULED_LOCK_WAIT_MS } } : {}),

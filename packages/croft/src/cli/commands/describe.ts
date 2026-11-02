@@ -31,6 +31,7 @@
 import { readFileSync } from "node:fs";
 import { CroftError, problem } from "../../core/errors.ts";
 import type { AssetKind, CursorType, Incremental, LockHolder, OnceColumn, Problem, WriteMode } from "../../core/types.ts";
+import { lakeOption } from "../../db/lake.ts";
 import { hasState } from "../../db/state.ts";
 import { type DuckWarehouse, type LeaseSql, openWarehouse } from "../../db/warehouse.ts";
 import { type CatalogAsset, readInputsSeen } from "../../history/catalog.ts";
@@ -310,7 +311,7 @@ export function holderFromRuns(stateDir: string, pid: number): Partial<LockHolde
 export function readOnlyWarehouse(ctx: Ctx, project: Project): DuckWarehouse {
   return openWarehouse({
     path: project.paths.database, mode: "read_only", profile: "query", timezone: project.timezone,
-    root: project.root, stateDir: project.paths.stateDir, isTTY: ctx.isTTY.stdin && ctx.isTTY.stdout,
+    root: project.root, stateDir: project.paths.stateDir, ...lakeOption(project, ctx.env), isTTY: ctx.isTTY.stdin && ctx.isTTY.stdout,
     onWait: (h, ms) => ctx.render.progress(`waiting for the warehouse: ${holderText(h)} holds it (${Math.round(ms / 1000)} s so far)`),
     lookupHolder: (pid) => holderFromRuns(project.paths.stateDir, pid),
   });

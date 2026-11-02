@@ -250,14 +250,20 @@ describe("the listener", () => {
 describe("the cap on running Quack queries (D130)", () => {
   withExt("past serverMode.quackMaxConcurrent a query is refused with a retryable answer while another runs; HTTP readers are not crowded out, and the cap lifts when it ends", async () => {
     const port = freePort();
-    const r = await rig({ port, engine: { quack: { host: "127.0.0.1", port, maxConcurrent: 1 }, queryTimeoutMs: 60_000 } });
+    // The first query is far longer than the test needs (a cross join of 400 rows with 50 million), so it holds the only slot
+    // until the engine's own time limit ends it: the slot is taken for exactly as long as the test needs, whatever the machine's speed.
+    const r = await rig({ port, engine: { quack: { host: "127.0.0.1", port, maxConcurrent: 1 }, queryTimeoutMs: 15_000 } });
     const alice = await r.key("alice");
     const slow = await person(r, alice);
     const other = await person(r, alice);
-    // One long query holds the only slot (the next look at the running queries is within 250 ms).
-    const running = slow.run("SELECT count(*) FROM r.orders a, r.orders b, range(5000000) c WHERE (a.id + b.id + c.range) % 7 = 3");
-    await Bun.sleep(700);
-    const refused = await other.run("SELECT count(*) AS n FROM r.orders");
+    const running = slow.run("SELECT count(*) FROM r.orders a, r.orders b, range(50000000) c WHERE (a.id + b.id + c.range) % 7 = 3");
+    // The first query is admitted before the second is tried (a session admitted a query is counted at once, D136), then the second is refused.
+    await until("the long query to be admitted", () => r.events.some((e) => e.kind === "query"), 15_000);
+    let refused = await other.run("SELECT count(*) AS n FROM r.orders");
+    for (let i = 0; refused.ok && i < 40; i++) {
+      await Bun.sleep(250);
+      refused = await other.run("SELECT count(*) AS n FROM r.orders");
+    }
     expect(refused.ok).toBe(false);
     expect(refused.ok ? "" : refused.error).toContain("SERVE_UNAVAILABLE");
     expect(refused.ok ? "" : refused.error).toContain("serverMode.quackMaxConcurrent");
@@ -267,9 +273,11 @@ describe("the cap on running Quack queries (D130)", () => {
     expect(await count(r.e)).toBe(20);
     expect(performance.now() - t).toBeLessThan(CI ? 3000 : 1500);
     expect((await other.attach(r.uri(), alice, "again")).ok).toBe(true);
-    // When the long query ends, the slot is free again.
-    const done = await running;
-    expect(done.ok).toBe(true);
+    // The long query ends (at the time limit, which replaces the readers' process, or on its own on a machine fast enough), and the slot is free again.
+    await running;
+    await until("the replacement to open", () => r.e.status().serverMode?.state === "open", 30_000);
+    expect((await other.run("DETACH r")).ok).toBe(true);
+    expect((await other.attach(r.uri(), alice, "r")).ok).toBe(true);
     await until("the cap to lift", async () => (await other.run("SELECT count(*) AS n FROM r.orders")).ok, 10_000);
   }, 120_000);
 });

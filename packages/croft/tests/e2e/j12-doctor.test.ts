@@ -2,7 +2,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { readdirSync } from "node:fs";
 import { stripeAsset } from "./fixtures.ts";
-import { cleanupAll, croftIn, initProject, type Project, show, tempDir } from "./harness.ts";
+import { cleanupAll, croftIn, initProject, LAKE, type Project, show, tempDir } from "./harness.ts";
 
 afterAll(cleanupAll);
 
@@ -39,9 +39,15 @@ test("journey 12: doctor --json on a fresh project, after a run, and outside any
   expect(after.code, show(after)).toBe(0);
   const wh = after.json.data.checks.find((c: { id: string }) => c.id === "warehouse");
   expect(wh.status, JSON.stringify(wh)).toBe("ok");
-  expect(wh.details).toMatchObject({ exists: true, writable: true, heldBy: null });
-  // A file warehouse is format 3; the suite also runs on the log, which is format 4 (DESIGN.md D132).
-  expect(wh.details.meta.format_version).toBe(process.env.CROFT_BOOKKEEPING === "log" ? "4" : "3");
+  if (LAKE) {
+    // A lake is read, not held: where it is, the croft format in it (a log, format 4) and the machine that wrote it last (D144).
+    expect(wh.details).toMatchObject({ lake: LAKE === "postgres" ? "postgres" : "local", meta: { format_version: "4", bookkeeping: "log" }, writer: { machine: expect.any(String) } });
+    expect(wh.text).toContain("by this machine");
+  } else {
+    expect(wh.details).toMatchObject({ exists: true, writable: true, heldBy: null });
+    // A file warehouse is format 3; the suite also runs on the log, which is format 4 (DESIGN.md D132).
+    expect(wh.details.meta.format_version).toBe(process.env.CROFT_BOOKKEEPING === "log" ? "4" : "3");
+  }
   expect(after.json.data.summary).toMatchObject({ errors: 0, warnings: 0 });
   expect(after.json.durationMs).toBeLessThan(3000); // §4.1: "under 1 s" (loose bound for loaded CI machines)
   // Human output: sections, one line per check.

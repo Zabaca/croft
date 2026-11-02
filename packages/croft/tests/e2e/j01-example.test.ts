@@ -1,7 +1,7 @@
 // Journey 1: croft init → run example_sales → query, status, describe, context (the §4.3 JSON shapes) → run
 // again: nothing changed, so every row keeps its _loaded_at; one edited CSV row is the only row restamped.
 import { afterAll, expect, test } from "bun:test";
-import { cleanupAll, envelopeKeys, initProject, ISO_WITH_OFFSET, RUN_ID, show } from "./harness.ts";
+import { cleanupAll, envelopeKeys, initProject, ISO_WITH_OFFSET, RUN_ID, show, WAREHOUSE_LABEL } from "./harness.ts";
 
 afterAll(cleanupAll);
 
@@ -14,14 +14,14 @@ test("journey 1: init → run example_sales → query/status/describe/context �
     expect(p.exists(f)).toBe(true);
   }
   const cfg = JSON.parse(p.read("croft.json"));
-  expect(cfg).toMatchObject({ database: "warehouse.duckdb" });
+  expect(cfg).toMatchObject({ database: "warehouse.duckdb" }); // the setting stays, a lake or not
   expect(typeof cfg.timezone).toBe("string");
 
   // run (off a TTY: detached and followed; the example finishes well within --follow)
   const run = await p.json(["run", "example_sales"]);
   expect(run.code, show(run)).toBe(0);
   expect(envelopeKeys(run.json)).toEqual(ENVELOPE);
-  expect(run.json).toMatchObject({ schemaVersion: 1, ok: true, command: "run", database: "warehouse.duckdb", timezone: cfg.timezone });
+  expect(run.json).toMatchObject({ schemaVersion: 1, ok: true, command: "run", database: WAREHOUSE_LABEL, timezone: cfg.timezone });
   expect(run.json.data.runId).toMatch(RUN_ID);
   expect(run.json.data.status).toBe("succeeded");
   const step = run.json.data.steps[0];

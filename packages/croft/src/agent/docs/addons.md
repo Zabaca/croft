@@ -8,7 +8,10 @@ turns no mode on installs nothing, and croft is the size it was.
 | Mode | Add-on | Extension files |
 |---|---|---|
 | server mode (`"serverMode": {"enabled": true}`) | `@zabaca/croft-addon-server` | quack, httpfs |
-| lake mode (no setting turns it on in this release) | `@zabaca/croft-addon-lake` | ducklake, httpfs, postgres |
+| lake mode (a `"lake"` block in croft.json, croft docs lake) | `@zabaca/croft-addon-lake` | ducklake, httpfs, postgres |
+
+A lake has a Postgres catalog. (A SQLite catalog and a local folder exist for croft's own tests only, and need DuckDB's sqlite
+extension, which no add-on carries.)
 
 ## Installing one
 
@@ -42,7 +45,7 @@ footer says it is for another DuckDB or platform. After the install nothing need
 
 `croft validate --json` has `data.addons` (one entry per add-on the project needs: `ok`, `installed`, `install`, and
 each extension's `source`: "addon", "dir" or "cache"), `croft doctor --json` an `addon.<name>` check with the same under
-`details`, and `croft status --json` `data.serverMode.addons`.
+`details`, and `croft status --json` `data.serverMode.addons` (server mode) and `data.lake.addons` (lake mode).
 
 ## Licenses
 

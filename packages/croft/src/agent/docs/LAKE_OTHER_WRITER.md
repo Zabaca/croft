@@ -1,0 +1,19 @@
+# LAKE_OTHER_WRITER: a different machine has written to this lake (warning)
+
+A lake has one writing machine (croft docs lake). Every machine that writes keeps a record of its last write in the
+lake, and `croft doctor` found that another machine has written since this machine's last write (or, at this
+machine's last write, found that one had written in between): details.machine and details.host name it, details.at
+says when it wrote by its own clock, details.run the run. The order is the lake's own (a counter in each record), not
+the machines' clocks, so a machine whose clock is behind is still seen. Two machines writing the same lake are not
+supported: they would not know of each other's runs, and the second one's history, schedule and crash recovery are
+its own.
+
+This is a warning, not an error. Reading is not affected, and nothing was changed.
+
+What to do:
+- If the other machine is the one that should write from now on (the lake moved), nothing is wrong: run croft from
+  that machine only, and stop the scheduler on this one (`croft schedule off`).
+- If both machines run croft on this project, stop one of them. Ask the user which one keeps the lake before
+  stopping anything: a scheduler on the other machine is theirs to turn off.
+- The warning stays for 7 days after the other machine's write (or after this machine's write that found it), and a
+  clean write of this machine's own does not clear it. After that it goes by itself.

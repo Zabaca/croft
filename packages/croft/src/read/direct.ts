@@ -115,6 +115,16 @@ export async function directQuery(project: Project, req: SelectRequest, timings:
   if (inproc) {
     return inproc.read((db) => runSelect(db.connection, req, { timezone: project.timezone, profile: "query", protect: [project.paths.stateDir] }), { purpose: "@zabaca/croft/read" });
   }
+  // Direct mode opens the warehouse file in the app's process. A lake has no file, and attaching it needs the lake's extensions, credentials
+  // and lockdown, which belong to croft and not to every app that reads: apps read a lake through croft serve (D143).
+  if (project.config.lake) {
+    throw new CroftError("LAKE_DIRECT_READ", {
+      message: "this project keeps its warehouse in a lake, which an app cannot open directly",
+      hint: "start croft serve in the project (croft serve); @zabaca/croft/read then finds it and reads the lake's last snapshot through it",
+      fix: { kind: "command", description: "start the read server", command: "croft serve" },
+      details: { database: project.databaseLabel },
+    });
+  }
   const path = canonicalPath(project.paths.database);
   const spec: SandboxSpec = { profile: "query", timezone: project.timezone, root: project.root };
   const instance = await acquire(project, path, timings);

@@ -131,7 +131,7 @@ function lakeTestSpec(p: Project, access: "write" | "read" = "write", prepare?: 
   return {
     profile: "serve", timezone: "UTC",
     mode: {
-      kind: "lake-test", extensionDir: ext.dir, secretDir: p.secrets, prepare,
+      kind: "lake-local", extensionDir: ext.dir, secretDir: p.secrets, prepare,
       lake: { catalog: { kind: "sqlite", path: over.catalog ?? join(p.state, "meta.sqlite") }, dataPath: over.dataPath ?? join(p.root, "lake-data") + "/", access },
     },
   };
@@ -167,8 +167,8 @@ describe("the pinned list", () => {
     expect(MODE_EXTENSIONS.readers).toEqual(["httpfs", "quack"]);
     expect(MODE_EXTENSIONS.lake).toEqual(["httpfs", "postgres", "ducklake"]);
     expect(MODE_EXTENSIONS["lake-readers"]).toEqual(["httpfs", "postgres", "ducklake", "quack"]);
-    expect(MODE_EXTENSIONS["lake-test"]).toEqual(["sqlite", "ducklake"]);
-    for (const [kind, names] of Object.entries(MODE_EXTENSIONS)) if (kind !== "lake-test") expect(names, kind).not.toContain("sqlite");
+    expect(MODE_EXTENSIONS["lake-local"]).toEqual(["sqlite", "ducklake"]);
+    for (const [kind, names] of Object.entries(MODE_EXTENSIONS)) if (kind !== "lake-local") expect(names, kind).not.toContain("sqlite");
   });
 
   withExt("with no mode, no extension is loaded (acceptance 1)", async () => {
@@ -206,13 +206,13 @@ describe("a file that is not the pinned file loads nothing (acceptance 3)", () =
     writeFileSync(to, Buffer.concat([Buffer.alloc(2048, 1), footer]));
   }
 
-  async function failure(dir: string, kind: "readers" | "lake-test"): Promise<{ error: CroftError; conn: DuckDBConnection }> {
+  async function failure(dir: string, kind: "readers" | "lake-local"): Promise<{ error: CroftError; conn: DuckDBConnection }> {
     const p = await project();
     const instance = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
     cleanup.push(() => instance.closeSync());
     const spec: SandboxSpec = kind === "readers"
       ? readers(p, { extensionDir: dir })
-      : { profile: "serve", timezone: "UTC", mode: { kind: "lake-test", extensionDir: dir, secretDir: p.secrets, lake: { catalog: { kind: "sqlite", path: join(p.state, "meta.sqlite") }, dataPath: join(p.state, "lake") + "/", access: "write" } } };
+      : { profile: "serve", timezone: "UTC", mode: { kind: "lake-local", extensionDir: dir, secretDir: p.secrets, lake: { catalog: { kind: "sqlite", path: join(p.state, "meta.sqlite") }, dataPath: join(p.state, "lake") + "/", access: "write" } } };
     try {
       await connect(instance, spec, `:memory:bad${++seq}`);
     } catch (e) {
@@ -239,13 +239,13 @@ describe("a file that is not the pinned file loads nothing (acceptance 3)", () =
   });
 
   withExt("a checksum mismatch: EXTENSION_CHECKSUM_MISMATCH, and the files before it are not loaded either", async () => {
-    // lake-test loads sqlite first, then ducklake: damage ducklake, the second, and prove sqlite did not load.
+    // lake-local loads sqlite first, then ducklake: damage ducklake, the second, and prove sqlite did not load.
     const dir = folderWith("ducklake", (real, to) => {
       const bytes = readFileSync(real);
       bytes[Math.floor(bytes.length / 2)]! ^= 0xff; // one flipped byte, same size, same footer
       writeFileSync(to, bytes);
     });
-    const { error: e, conn } = await failure(dir, "lake-test");
+    const { error: e, conn } = await failure(dir, "lake-local");
     expect(e.code).toBe("EXTENSION_CHECKSUM_MISMATCH");
     expect(e.problem.details).toMatchObject({ extension: "ducklake" });
     expect(e.problem.fix).toBeDefined();
@@ -438,10 +438,15 @@ describe("a mode that does not fit its profile, differs from the instance, or fa
     const c = await connect(instance, readers(p), `:memory:fit${seq}`);
     cleanup.push(() => c.disconnectSync());
     expect(await error(c, `SELECT * FROM read_text('${p.secrets}/probe.txt')`)).toContain("Permission Error");
-    // The lake test profile and lake-readers are the same: serve only.
+    // lake-readers runs under the serve profile only; a lake behind a project's commands (Postgres and a bucket, or a local one) runs under any.
     const other = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
     cleanup.push(() => other.closeSync());
-    await expect(connect(other, { ...lakeTestSpec(p), profile: "warehouse", root: p.root, stateDir: p.state }, `:memory:fit2${seq}`)).rejects.toBeInstanceOf(CroftError);
+    await expect(connect(other, { ...lakeTestSpec(p), profile: "warehouse", root: p.root, stateDir: p.state }, `:memory:fit2${seq}`)).resolves.toBeDefined();
+    const third = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
+    cleanup.push(() => third.closeSync());
+    const readersOnAFile = { profile: "warehouse" as const, timezone: "UTC", root: p.root, stateDir: p.state, mode: { kind: "lake-readers" as const, extensionDir: ext.dir, secretDir: p.secrets,
+      lake: { catalog: { kind: "postgres" as const, host: "127.0.0.1", port: 1, database: "d", user: "u", password: "p" }, data: { path: "s3://lake/x/", keyId: "k", secretKey: "s" }, access: "read" as const } } };
+    await expect(connect(third, readersOnAFile, `:memory:fit3${seq}`)).rejects.toBeInstanceOf(CroftError);
   });
 
   withExt("the lake test profile reaches its own folder only: not the state folder, files/, or the project", async () => {
@@ -598,6 +603,42 @@ describe("lake test profile (a SQLite catalog and a local folder)", () => {
     await c.run("DETACH trash");
   });
 
+  withExt("the format is pinned: a new lake is made at 1.0, and a catalog of another format is refused with DuckDB's words, never migrated (D137)", async () => {
+    const { Database } = await import("bun:sqlite");
+    const versionOf = (catalog: string): string => {
+      const db = new Database(catalog, { readonly: true });
+      try {
+        return (db.query("SELECT value FROM ducklake_metadata WHERE key = 'version'").get() as { value: string }).value;
+      } finally {
+        db.close();
+      }
+    };
+    // A lake croft makes is at 1.0 ...
+    const p = await project();
+    const c = await open(lakeTest(p));
+    await c.run(`CREATE TABLE ${LAKE_ALIAS}.t AS SELECT 1 a`);
+    expect(versionOf(join(p.state, "meta.sqlite"))).toBe("1.0");
+    // ... and a catalog DuckDB 2.0 made at its own default (1.1) is not attached by a croft that asks for 1.0, writer or reader, and stays 1.1.
+    const q = await project();
+    mkdirSync(join(q.root, "lake-data"), { recursive: true });
+    const raw = await DuckDBInstance.create(":memory:");
+    const rc = await raw.connect();
+    await rc.run(`LOAD '${extensionPath(ext.dir, "sqlite", hostPlatform()!)}'`);
+    await rc.run(`LOAD '${extensionPath(ext.dir, "ducklake", hostPlatform()!)}'`);
+    await rc.run(`ATTACH 'ducklake:sqlite:${join(q.state, "meta.sqlite")}' AS other (DATA_PATH '${join(q.root, "lake-data")}/')`);
+    await rc.run("CREATE TABLE other.t AS SELECT 1 a");
+    rc.disconnectSync();
+    raw.closeSync();
+    expect(versionOf(join(q.state, "meta.sqlite"))).toBe("1.1");
+    for (const access of ["write", "read"] as const) {
+      const err = await open(lakeTest(q, access)).catch((e: unknown) => e);
+      expect(err, access).toBeInstanceOf(CroftError);
+      expect((err as CroftError).code).toBe("LAKE_ATTACH_FAILED");
+      expect(JSON.stringify((err as CroftError).problem), access).toMatch(/downgrade/i);
+    }
+    expect(versionOf(join(q.state, "meta.sqlite"))).toBe("1.1");
+  });
+
   withExt("attached read-only, a write is refused", async () => {
     const p = await project();
     const w = await open(lakeTest(p));
@@ -609,8 +650,8 @@ describe("lake test profile (a SQLite catalog and a local folder)", () => {
 });
 
 describe("lake profile (a Postgres catalog and a bucket folder)", () => {
-  const WRITER = { user: "lakew", password: "Wr1ter-pw-Zx81" };
-  const READER = { user: "laker", password: "R3ader-pw-Qj42" };
+  const WRITER = { user: "lakew", password: "test-writer-password" };
+  const READER = { user: "laker", password: "test-reader-password" };
   const KEYS = { rw: { id: "KEYIDWRITER01", secret: "sekrit-writer-0123456789" }, ro: { id: "KEYIDREADER02", secret: "sekrit-reader-9876543210" } };
   let pg: TestPostgres;
   let s3: TestS3;
@@ -776,7 +817,7 @@ describe("lake profile (a Postgres catalog and a bucket folder)", () => {
     /** Every text an error can reach a person or a log through. */
     const surfaces = (e: unknown): string =>
       [String(e), (e as Error).message, (e as Error).stack ?? "", JSON.stringify((e as CroftError).problem ?? null), JSON.stringify(e, Object.getOwnPropertyNames(e as object))].join("\n");
-    const never = ["Wr1ter-pw-Zx81", "KEYIDWRITER01", "sekrit-writer-0123456789", "R3ader-pw-Qj42", "KEYIDREADER02", "sekrit-reader-9876543210", "host=127.0.0.1"];
+    const never = ["test-writer-password", "KEYIDWRITER01", "sekrit-writer-0123456789", "test-reader-password", "KEYIDREADER02", "sekrit-reader-9876543210", "host=127.0.0.1"];
 
     async function attachFails(lk: LakeSpec, p: Project): Promise<CroftError> {
       const instance = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));

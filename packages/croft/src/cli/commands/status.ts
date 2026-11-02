@@ -65,8 +65,9 @@ import { type DriftEntry, driftNote, recentDrift } from "../../history/drift.ts"
 import { logDir, tail } from "../../history/logs.ts";
 import { RUNS_DB_FILE, RunsDb, type RunRecord, type StepRecord } from "../../history/runs-db.ts";
 import { discoverAssets, type DiscoveredAsset } from "../../project/discover.ts";
+import { bucketPath } from "../../project/lake-config.ts";
 import type { ResolvedAsset, ResolvedProject } from "../../project/resolve.ts";
-import type { Project } from "../../project/root.ts";
+import { type Project, warehouseExists } from "../../project/root.ts";
 import { readServeRecord } from "../../read/locate.ts";
 import { deletedByCroft } from "../../safety/trash.ts";
 import { type EngineChange, engineWords } from "../../run/engine-change.ts";
@@ -154,6 +155,14 @@ export interface StatusData {
   serverMode?: {
     serving: boolean;
     /** The add-on that carries server mode's DuckDB extension files, and whether this machine finds them (D134). */
+    addons: AddonView[];
+  };
+  /** With a `lake` in croft.json (D138): where the warehouse is, and the add-on that carries lake mode's DuckDB extension files. */
+  lake?: {
+    /** "postgres": a shared lake (a Postgres catalog and a bucket); "local": a SQLite catalog and a folder. */
+    kind: "postgres" | "local";
+    /** The lake's folder: `s3://bucket/folder/`, or the local data folder. It holds nothing but the lake. */
+    folder: string;
     addons: AddonView[];
   };
 }
@@ -444,7 +453,7 @@ export function warehouseHistory(db: RunsDb | null, catalog: readonly CatalogAss
 /** DB_NOT_FOUND for a warehouse file that is gone although croft built it before (the catalog lists tables).
  *  null while the file is there, or when nothing was ever built (then a missing file is simply "not yet"). */
 export function missingWarehouse(project: Project, history: WarehouseHistory, tz: string): Problem | null {
-  if (history.built === 0 || existsSync(project.paths.database)) return null;
+  if (history.built === 0 || warehouseExists(project)) return null;
   const label = project.databaseLabel;
   const when = zoned(history.lastLoadedAt, tz);
   return problem("DB_NOT_FOUND", {
@@ -707,10 +716,20 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       if (policy.refused) copyProblems.push(copyCostlyProblem(policy, "limit"));
       else if (policy.warn) copyProblems.push(notClonedProblem(policy));
     }
-    if (project.config.serverMode.enabled) {
-      // The add-on with the mode's extension files (D134): croft serve cannot start without it, so a missing one is a problem here.
+    if (project.config.serverMode.enabled || project.config.lake) {
+      // The add-ons with the modes' extension files (D134): croft serve cannot start without them, nor a lake open, so a missing one is a
+      // problem here.
       const addons = inspectAddons(addonsNeeded(project.config), { from: project.root, ...o.extensions });
-      data.serverMode = { serving: serve !== undefined, addons: addons.views };
+      if (project.config.serverMode.enabled) {
+        data.serverMode = { serving: serve !== undefined, addons: addons.views.filter((v) => v.addon === "server") };
+      }
+      const lake = project.config.lake;
+      if (lake) {
+        data.lake = {
+          kind: lake.kind, folder: lake.kind === "postgres" ? bucketPath(lake.bucket) : lake.dataPath,
+          addons: addons.views.filter((v) => v.addon === "lake"),
+        };
+      }
       addonProblems.push(...addons.problems);
     }
     // resolveProject's problems are discovery's (all of them: no selectors) and CYCLE.
@@ -991,6 +1010,8 @@ export function formatStatus(d: StatusData, now: Date, o: { tz?: string; problem
 
 /** "Read copy warehouse.read.duckdb · as of 11:58 (2 min ago)", and for a warning its hint on the next line. */
 function readCopyLines(d: StatusData, now: Date, tz: string, o: { root?: string; database?: string }): string[] {
+  // A lake has no read copy: its line is the add-on's, when that is not whole (the lake cannot be opened without it).
+  if (d.lake && !d.readCopy) return d.lake.addons.filter((a) => !a.ok).map((a) => `Lake mode · ${addonLine(a)}`);
   if (!d.readCopy) return [];
   const root = o.root ?? "";
   const w = readCopyWords(d.readCopy, { root, database: o.database ?? "", tz, now });

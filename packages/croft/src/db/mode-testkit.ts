@@ -54,6 +54,10 @@ export interface TestPostgres {
   sql(statement: string, db?: string): Promise<string>;
   /** Make a database with a writer login and a read-only login (SELECT on everything, now and later). */
   createLakeDatabase(db: string, writer: { user: string; password: string }, reader: { user: string; password: string }): Promise<void>;
+  /** End every connection of the lake's logins (pg_terminate_backend), as a network drop or a failover does; returns how many ended. */
+  terminateConnections(): Promise<number>;
+  /** Stop the server, keep it down for `downMs`, and start it again on the same data folder and port. */
+  restart(downMs?: number): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -72,8 +76,12 @@ export async function startPostgres(): Promise<TestPostgres> {
   }
   const port = freePort();
   // -k points the unix socket at the temporary folder, so nothing is left in /tmp or the system socket folder.
-  const child = Bun.spawn([join(bin, "postgres"), "-D", data, "-p", String(port), "-k", dir, "-c", "listen_addresses=127.0.0.1", "-c", "fsync=off", "-c", "max_connections=60"], { stdout: "ignore", stderr: "ignore" });
-  children.add(child);
+  const launch = () => {
+    const c = Bun.spawn([join(bin, "postgres"), "-D", data, "-p", String(port), "-k", dir, "-c", "listen_addresses=127.0.0.1", "-c", "fsync=off", "-c", "max_connections=60"], { stdout: "ignore", stderr: "ignore" });
+    children.add(c);
+    return c;
+  };
+  let child = launch();
   const sql = async (statement: string, db = "postgres"): Promise<string> => {
     const r = Bun.spawn([join(bin, "psql"), "-h", "127.0.0.1", "-p", String(port), "-U", "postgres", "-d", db, "-v", "ON_ERROR_STOP=1", "-tAc", statement], { env: { PATH: process.env.PATH ?? "", PGPASSWORD: password }, stdout: "pipe", stderr: "pipe" });
     const [out, errText, code] = await Promise.all([new Response(r.stdout).text(), new Response(r.stderr).text(), r.exited]);
@@ -101,6 +109,19 @@ export async function startPostgres(): Promise<TestPostgres> {
       await sql(`CREATE DATABASE ${db} OWNER ${writer.user}`);
       await sql(`GRANT CONNECT ON DATABASE ${db} TO ${reader.user}`, db);
       await sql(`GRANT USAGE ON SCHEMA public TO ${reader.user}; ALTER DEFAULT PRIVILEGES FOR ROLE ${writer.user} IN SCHEMA public GRANT SELECT ON TABLES TO ${reader.user}`, db);
+    },
+    async terminateConnections() {
+      return Number(await sql("select count(pg_terminate_backend(pid)) from pg_stat_activity where usename not in ('postgres') and pid <> pg_backend_pid()"));
+    },
+    async restart(downMs = 300) {
+      await stop(child, "SIGINT");
+      await Bun.sleep(downMs);
+      child = launch();
+      for (let i = 0; i < 200; i++) {
+        try { if ((await sql("select 1")) === "1") return; } catch { /* not up yet */ }
+        await Bun.sleep(50);
+      }
+      throw new Error("postgres did not come back");
     },
     async stop() {
       await stop(child, "SIGINT");

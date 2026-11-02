@@ -69,7 +69,7 @@ describe("loadProject", () => {
     expect(p.root).toBe(root);
     expect(p.timezone).toBe("Asia/Tokyo");
     expect(p.config).toEqual({
-      database: "warehouse.duckdb", timezone: "Asia/Tokyo", readCopy: false, serverMode: { enabled: false, acceptFullCopyCost: false, quackHost: "127.0.0.1", quackPort: 9494, quackPlaintextOnNetwork: false, quackMaxConcurrent: 4 },
+      database: "warehouse.duckdb", timezone: "Asia/Tokyo", readCopy: false, serverMode: { enabled: false, acceptFullCopyCost: false, quackHost: "127.0.0.1", quackPort: 9494, quackPlaintextOnNetwork: false, quackMaxConcurrent: 4 }, lake: null,
       notify: { desktop: true, webhook: null }, concurrency: 4, http: { budgets: {} },
       serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 30000, maxConcurrent: 4, maxBytes: 67108864, maxRows: 100000, allowOrigins: [], sharedTables: [] },
       stateDir: null, secretsFrom: null,
@@ -264,7 +264,7 @@ describe("croft.json validation messages", () => {
     const [j] = issues('{"timezone": "UTC", "serve": {"prot": 1}}');
     expect(j!.message).toBe('unknown key "serve.prot"; did you mean "serve.port"?');
     const [k] = issues('{"timezone": "UTC", "colour": 1}');
-    expect(k!.message).toBe('unknown key "colour"; croft.json takes "database", "timezone", "readCopy", "serverMode", "notify", "concurrency", "http", "serve", "stateDir", "secretsFrom"');
+    expect(k!.message).toBe('unknown key "colour"; croft.json takes "database", "timezone", "readCopy", "serverMode", "lake", "notify", "concurrency", "http", "serve", "stateDir", "secretsFrom"');
   });
 
   test("time zones: misspelled case, a city, and a fixed offset", () => {
