@@ -8,6 +8,10 @@
 // It is checked when croft serve starts and then every few seconds. A refresh already under way (a run's, or another
 // maker's) is left alone: db/readcopy.ts coalesces them. A failed one is tried again after a wait that doubles, so a full
 // disk is not hammered.
+//
+// Ending a child (D124): never SIGKILL first. A refresh may be checkpointing the live warehouse, so the child is sent SIGTERM,
+// which it catches (serve/refresh-child.ts): it finishes the refresh in hand and exits. Only a child still running after a
+// short grace period is killed. A child whose croft serve was killed (no signal can be caught) bounds itself.
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { readCopyStatus } from "../db/readcopy.ts";
@@ -19,8 +23,10 @@ export const REFRESH_CHILD_FILE = fileURLToPath(new URL("./refresh-child.ts", im
 
 /** How often the engine asks whether a copy is needed. */
 export const COPY_CHECK_MS = 5000;
-/** A refresh child that runs longer is killed (db/readcopy.ts's own clone timeout is 10 minutes). */
+/** A refresh child that runs longer is ended (db/readcopy.ts's own clone timeout is 10 minutes). */
 const CHILD_TIMEOUT_MS = 12 * 60_000;
+/** How long a child that was asked to end (SIGTERM) may take to finish the refresh in hand before it is killed. */
+export const STOP_GRACE_MS = 5000;
 
 export type CopyNeed = "missing" | "behind" | "failed";
 
@@ -34,6 +40,8 @@ export interface CopyMakerOptions {
   settleMs?: number;
   /** Called when a child ends, with what it printed (or null). */
   onDone?(r: { need: CopyNeed; ok: boolean; message: string | null }): void;
+  /** STOP_GRACE_MS. */
+  stopGraceMs?: number;
 }
 
 export class CopyMaker {
@@ -89,7 +97,7 @@ export class CopyMaker {
     }
     this.child = proc;
     this.started++;
-    const timer = setTimeout(() => proc.kill("SIGKILL"), CHILD_TIMEOUT_MS);
+    const timer = setTimeout(() => this.end(proc), CHILD_TIMEOUT_MS);
     (timer as { unref?: () => void }).unref?.();
     this.done = (async () => {
       const [out, err] = await Promise.all([new Response(proc.stdout as ReadableStream).text(), new Response(proc.stderr as ReadableStream).text()]);
@@ -127,14 +135,28 @@ export class CopyMaker {
     }
   }
 
-  /** Stop: no more children, and the one running is killed. */
+  /** Ask a child to end: SIGTERM, which lets it finish the refresh in hand, and SIGKILL once the grace period has passed. */
+  private end(proc: ReturnType<typeof Bun.spawn>): void {
+    try {
+      proc.kill("SIGTERM");
+    } catch {
+      return; // gone
+    }
+    const kill = setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // gone
+      }
+    }, this.o.stopGraceMs ?? STOP_GRACE_MS);
+    (kill as { unref?: () => void }).unref?.();
+    void proc.exited.then(() => clearTimeout(kill));
+  }
+
+  /** Stop: no more children, and the one running is asked to end (it finishes its refresh, or is killed after the grace). */
   async stop(): Promise<void> {
     this.stopped = true;
-    try {
-      this.child?.kill("SIGKILL");
-    } catch {
-      // gone
-    }
+    if (this.child) this.end(this.child);
     await this.done.catch(() => {});
   }
 }
