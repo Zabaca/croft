@@ -62,7 +62,7 @@ jobs:
         working-directory: packages/croft
         env:
           CROFT_CI: "1"
-        run: bun test
+        run: bun test --timeout 60000
       # The site test keeps the npm README in step with the repository's (packages/site/test/readmes.test.ts).
       - name: site test
         if: steps.state.outputs.publish == 'yes'

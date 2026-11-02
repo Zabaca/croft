@@ -9,5 +9,11 @@ process.env.CROFT_NOTIFY_DRY = "1";
 // Bun's default per-test timeout is 5 s. A test that normally takes 1-3 s (a CLI process or two, a query worker)
 // hit it on a busy CI runner, four in one run (ubuntu, 2026-10-19); timing that a test checks is its own
 // assertion, never this. Tests that set their own timeout keep it.
+//
+// This call reaches the FIRST test file of a `bun test` run and no other: with several files, every later one starts again
+// at 5 s [V: Bun 1.3.14 and 1.4.4; three one-test files that sleep 6 s, run together: the first passed, the other two timed out
+// at 5000 ms; one file alone passes; `[test] timeout` in bunfig.toml is not read]. The suite therefore runs as
+// `bun test --timeout 60000` (package.json "test", ci.yml, publish-npm.yml), which sets it for every file; this call stays
+// for a bare `bun test <one file>`, and the files that start real processes set their own default as well.
 import { setDefaultTimeout } from "bun:test";
 setDefaultTimeout(60_000);
