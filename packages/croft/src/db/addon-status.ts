@@ -1,4 +1,4 @@
-// What croft validate, croft doctor and croft status say about the add-ons the project's modes need (DESIGN.md D132):
+// What croft validate, croft doctor and croft status say about the add-ons the project's modes need (DESIGN.md D134):
 // for each, whether its extension files are found and match the pins, where they came from, and, when one is not there,
 // the install command. The same checks the mode makes when it starts (extension-files.ts), run ahead of it and on every
 // extension rather than stopping at the first, so the project hears about it before `croft serve` fails to start.

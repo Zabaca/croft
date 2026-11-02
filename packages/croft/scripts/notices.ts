@@ -1,4 +1,4 @@
-// The third-party notices each extension package carries (DESIGN.md D133). The extension files are DuckDB's builds, and each links
+// The third-party notices each extension package carries (DESIGN.md D135). The extension files are DuckDB's builds, and each links
 // other projects' code statically: the files need nothing but the system's libc and C++ runtime (otool -L on macOS, the ELF NEEDED
 // entries on Linux), so everything below travels inside them and its licenses must travel with them.
 //

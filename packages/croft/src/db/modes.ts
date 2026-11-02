@@ -65,7 +65,7 @@ interface ModeBase {
   /** A folder holding the pinned extension files in DuckDB's layout (extension-files.ts): croft's tests and builders name
    *  one, or set $CROFT_EXTENSION_DIR. Without either, the files come from the mode's add-on package (addons.ts). */
   extensionDir?: string;
-  /** The project's root, from which the add-on package is found in node_modules (D132). */
+  /** The project's root, from which the add-on package is found in node_modules (D134). */
   projectRoot?: string;
   /** DuckDB's secret folder for this instance, inside croft's state folder. */
   secretDir: string;

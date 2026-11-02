@@ -175,7 +175,7 @@ describe("croft doctor", () => {
 });
 
 describe("croft status", () => {
-  // These two say nothing about the extension files, but with server mode on status looks for them (D132): the folder the suite
+  // These two say nothing about the extension files, but with server mode on status looks for them (D134): the folder the suite
   // uses answers, and without its files (a local run that has not fetched them) the tests are skipped, never wrong.
   const files = extensionsReady(["quack", "httpfs"]);
   const withFiles = files.ready ? test : test.skip;

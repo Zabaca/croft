@@ -105,7 +105,7 @@ describe("starting", () => {
     expect(await count(e)).toBe(10);
   });
 
-  withExt("with no extension folder named, the readers' process loads quack and httpfs from the server add-on in the project's node_modules (D132)", async () => {
+  withExt("with no extension folder named, the readers' process loads quack and httpfs from the server add-on in the project's node_modules (D134)", async () => {
     const p = await project({ n: 10 });
     installFakeAddon(p.root, "server", { from: ext.dir });
     // The child inherits this environment: no folder named, and a cache that holds nothing, so only the add-on can be where the files come from.

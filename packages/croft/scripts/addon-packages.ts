@@ -1,4 +1,4 @@
-// The add-on packages as files (DESIGN.md D132, D133): what each package.json says, which file each carries, and the checks that
+// The add-on packages as files (DESIGN.md D134, D135): what each package.json says, which file each carries, and the checks that
 // no file goes into a package unless it is the one croft pins. Pure planning plus a writer; scripts/build-addons.ts is the command,
 // and tests/addons.test.ts drives it with small stand-in files.
 //
@@ -134,7 +134,7 @@ export function assertPinned(path: string, extension: ExtensionName, platform: P
   if (sha !== pin.sha256) throw new Error(`${path} has sha256 ${sha}; croft pins ${pin.sha256} for ${extension} on ${platform}`);
 }
 
-/** The packed packages whose tarball is over the limit. The limit is ours, far below what npm has been seen to take (D133). */
+/** The packed packages whose tarball is over the limit. The limit is ours, far below what npm has been seen to take (D135). */
 export function oversize<T extends { packedBytes: number }>(packed: readonly T[], maxBytes: number): T[] {
   return packed.filter((p) => p.packedBytes > maxBytes);
 }

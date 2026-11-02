@@ -215,7 +215,7 @@ describe("a query goes through the same gate as over HTTP", () => {
   });
 });
 
-describe("the cap on running queries (D130, D134)", () => {
+describe("the cap on running queries (D130, D136)", () => {
   const read = async (a: QuackAccess, sql = "SELECT count(*) FROM orders") => refusal(a, "s", sql);
 
   test("past the cap a data query is refused with a retryable answer that names the setting; the client's own control and catalog queries still run", async () => {
@@ -232,7 +232,7 @@ describe("the cap on running queries (D130, D134)", () => {
     expect(await read(a)).toBeNull();
   });
 
-  test("a burst inside one look is capped: each session admitted a query counts at once, so the query past the cap is refused before the next look (D134)", async () => {
+  test("a burst inside one look is capped: each session admitted a query counts at once, so the query past the cap is refused before the next look (D136)", async () => {
     const { a, events } = access({ maxConcurrent: 2 });
     for (let i = 0; i < 5; i++) a.authenticate(`s${i}`, ALICE);
     // The last look saw nothing running; five sessions then send a query within the same 250 ms.

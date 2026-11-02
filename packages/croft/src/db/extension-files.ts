@@ -2,7 +2,7 @@
 //
 // croft never runs INSTALL and never reaches DuckDB's extension repository from a croft process (a test asserts it).
 // A mode loads exactly the files it names, by absolute path, after checking each against the sha256 pinned in
-// extension-pins.ts. Where the files come from, in order (D132): a folder the caller names, or $CROFT_EXTENSION_DIR
+// extension-pins.ts. Where the files come from, in order (D134): a folder the caller names, or $CROFT_EXTENSION_DIR
 // (croft's tests and builders fill one with scripts/fetch-extensions.ts); else the add-on package for the mode in the
 // project's node_modules, which is how a user gets them (addons.ts); else the cache folder builders share. Whichever
 // it is, the file is checked against the pin before it is used.
@@ -269,7 +269,7 @@ export function verifyExtensions(dir: string, names: readonly ExtensionName[], p
 }
 
 /**
- * Find and check one extension the way a mode does (D132). A folder the caller names, or $CROFT_EXTENSION_DIR, is the
+ * Find and check one extension the way a mode does (D134). A folder the caller names, or $CROFT_EXTENSION_DIR, is the
  * only place looked. Otherwise the add-on that carries the extension is looked for in the project's node_modules (and
  * croft's own), and failing that the builders' cache. No file anywhere is EXTENSION_MISSING with kind "addon" and the
  * install command as its fix: the user turned a mode on, and the add-on is what that needs.

@@ -1,4 +1,4 @@
-// The add-on packages as built (DESIGN.md D132, D133; option 06, slice 5): scripts/addon-packages.ts writes them from the pins, with
+// The add-on packages as built (DESIGN.md D134, D135; option 06, slice 5): scripts/addon-packages.ts writes them from the pins, with
 // stand-in files here (the real ones are over 100 MB per platform) and `verify: false`; the check that only a pinned file goes in is
 // tested on its own. `npm pack --dry-run` says what each tarball would hold, skipped where npm is not installed.
 import { afterAll, describe, expect, test } from "bun:test";

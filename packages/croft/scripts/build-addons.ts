@@ -1,4 +1,4 @@
-// Builds the add-on packages (DESIGN.md D132, D133) into a folder and, with --pack, packs each with `npm pack`. It publishes
+// Builds the add-on packages (DESIGN.md D134, D135) into a folder and, with --pack, packs each with `npm pack`. It publishes
 // nothing: publishing is .github/workflows/publish-addons.yml, which runs this and then an explicit, confirmed publish.
 //
 //   bun scripts/build-addons.ts --source <folder> --out <folder> [--pack] [--max-mb 50] [--json]
@@ -8,7 +8,7 @@
 // hold the pinned file. --out is outside the workspace on purpose (a package.json under packages/ would join the workspace).
 // With --pack the tarballs go to <out>/tarballs and <out>/summary.json lists each one's name, version, size and sha256, in the order
 // to publish (extension packages first, then the add-ons that depend on them), and the installed size of each add-on per platform.
-// Exit 1 when a tarball is over --max-mb (default 50), a figure chosen far below what npm has been seen to accept (D133).
+// Exit 1 when a tarball is over --max-mb (default 50), a figure chosen far below what npm has been seen to accept (D135).
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";

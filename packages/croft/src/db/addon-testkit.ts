@@ -1,4 +1,4 @@
-// A project folder with an add-on "installed" in its node_modules, for tests (DESIGN.md D132). The extension files are symlinks to a
+// A project folder with an add-on "installed" in its node_modules, for tests (DESIGN.md D134). The extension files are symlinks to a
 // folder of real ones (extension-dir-testkit.ts), so no test copies 100 MB; the packages are laid out as a package manager does,
 // hoisted or in the isolated layout where the add-on's dependencies are not at the top of node_modules.
 // Test support, left out of the published package (package.json "files").

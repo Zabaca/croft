@@ -75,7 +75,7 @@ export type ToWorker =
 /** What the readers' process is opened with: the extension files and secret folder, the shared tables, the copy's as-of time and,
  *  to listen for DuckDB clients, Quack's address and the keys it accepts. */
 export interface ReadersOpen {
-  /** The folder of the pinned extension files, when one is named (croft's tests); a project's come from its add-on (D132). */
+  /** The folder of the pinned extension files, when one is named (croft's tests); a project's come from its add-on (D134). */
   extensionDir?: string;
   /** The project's root, where the server add-on is looked for. */
   projectRoot?: string;

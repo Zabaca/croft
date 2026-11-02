@@ -86,7 +86,7 @@ describe("journey 32: server mode", () => {
     expect(doctor.json.data.checks.find((c: Envelope) => c.id === "servermode")).toMatchObject({ status: "ok", details: { serving: false } });
     const offline = (await p.json(["status"], home)).json.data.serverMode;
     expect(offline.serving).toBe(false);
-    // The mode's extension files are found (D132): from the folder the journey names, not an add-on.
+    // The mode's extension files are found (D134): from the folder the journey names, not an add-on.
     expect(offline.addons).toHaveLength(1);
     expect(offline.addons[0]).toMatchObject({ addon: "server", ok: true });
 

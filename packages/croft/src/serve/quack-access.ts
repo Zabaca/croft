@@ -74,7 +74,7 @@ export class QuackAccess {
   private ready = false;
   /** What `quack_active_connections()` showed running at the last look. */
   private looked = 0;
-  /** The sessions admitted a query that the last look may not have seen, each with the time of its latest admission (D134). A
+  /** The sessions admitted a query that the last look may not have seen, each with the time of its latest admission (D136). A
    *  session sends one query at a time, so a second query of one session is not a second running query; counting it would refuse
    *  a client that sends queries one after another (D130). The queries counted as running are `looked` plus these: a burst of
    *  sessions inside one look's 250 ms cannot pass the cap. */

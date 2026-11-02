@@ -113,7 +113,7 @@ export interface ExtensionView {
   code: string | null;
 }
 
-/** An add-on package a project needs because it turned a mode on (D132): the DuckDB extension files for that mode. */
+/** An add-on package a project needs because it turned a mode on (D134): the DuckDB extension files for that mode. */
 export interface AddonView {
   addon: "server" | "lake";
   /** The mode that needs it: "server mode" or "lake mode". */
@@ -142,7 +142,7 @@ export interface ValidateData {
    *  problem says so; croft never installs it). */
   types?: { status: "ok" | "failed" | "skipped"; errors: number };
   /** With a mode on (serverMode.enabled): each add-on that carries the mode's DuckDB extension files, and whether this
-   *  machine finds them (D132). Absent with no mode on. */
+   *  machine finds them (D134). Absent with no mode on. */
   addons?: AddonView[];
 }
 

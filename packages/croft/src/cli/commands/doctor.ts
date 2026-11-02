@@ -23,7 +23,7 @@
 // With serverMode on (D119) it also says so: a line with the copy's as-of time and whether croft serve is live, and
 // SERVER_MODE_COPY_COSTLY as an error when server mode is refused. croft serve in server mode never holds the live
 // file, so a lock on it is never croft serve's. It also has a line for the add-on that carries the mode's DuckDB extension
-// files (D132): ok when every file is found in the project's node_modules and matches its pin, an error with the install
+// files (D134): ok when every file is found in the project's node_modules and matches its pin, an error with the install
 // command (EXTENSION_MISSING) when not.
 //
 // The data's health, in the Project section, without writing anything:
@@ -633,7 +633,7 @@ function checkReadCopy(r: Report, d: DoctorDeps, project: Project): void {
 }
 
 /**
- * With a mode on, the add-on that carries its extension files (D132): one check per add-on, "ok" when every file is found
+ * With a mode on, the add-on that carries its extension files (D134): one check per add-on, "ok" when every file is found
  * and matches its pin and an error with the install command when not. croft serve would not start without it, and
  * saying so here is cheaper than finding out from its failure. A line for each add-on, in `--json` too (details).
  */

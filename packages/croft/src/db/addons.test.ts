@@ -1,4 +1,4 @@
-// How a user gets the extension files (DESIGN.md D132; option 06, slice 5, decision a): the add-on packages in the project's
+// How a user gets the extension files (DESIGN.md D134; option 06, slice 5, decision a): the add-on packages in the project's
 // node_modules, found and checked against the pins. Plain croft downloads nothing and a mode that finds no add-on says which
 // command installs it. Most tests use stand-in packages (a wrong file under the right name); the ones that need DuckDB's
 // real files link them in (extension-dir-testkit.ts) and skip locally, or fail in CI, when they are not there.

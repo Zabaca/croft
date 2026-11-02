@@ -1,4 +1,4 @@
-// What can publish to npm from this repository (DESIGN.md D133; option 06, slice 5). Two workflows publish, each its own package set,
+// What can publish to npm from this repository (DESIGN.md D135; option 06, slice 5). Two workflows publish, each its own package set,
 // and nothing else does: a release of @zabaca/croft is the `croft-v*` tag (and publish-npm.yml's manual run from a tag's ref), the
 // add-on packages are publish-addons.yml's manual run behind a typed confirmation, and no tag, push or pull request reaches the
 // second. This test reads the workflow files and the scripts they run, so adding a trigger that publishes, or a third workflow that

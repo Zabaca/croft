@@ -52,7 +52,7 @@ const ORDERS = (n: number) => `CREATE TABLE orders AS SELECT range AS id, range 
 export async function project(o: { n?: number; asOf?: string; copy?: boolean; config?: Record<string, unknown>; also?: string[] } = {}): Promise<TempProject> {
   // Quack listens on a free port (quackPort 0) so no two engines of a test file, or two files, fight for 9494 (D125).
   // Its cap on running queries is out of the way (64, the most): `quack_query` opens a session per call, so a test that sends a
-  // list of queries one after another inside a look would meet the cap (D134). The tests of the cap itself set their own.
+  // list of queries one after another inside a look would meet the cap (D136). The tests of the cap itself set their own.
   const serverMode = { enabled: true, quackPort: 0, quackMaxConcurrent: 64, ...(o.config?.serverMode as Record<string, unknown> | undefined) };
   const p = await makeProject({ config: { ...o.config, serverMode }, seed: [ORDERS(o.n ?? 10), ...(o.also ?? [])] });
   if (o.copy !== false) putCopy(p, aside(p, "template"), o.asOf ?? "2026-10-30T10:00:00Z");

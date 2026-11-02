@@ -1,5 +1,5 @@
 // croft validate, croft doctor and croft status on a project with a mode on and its add-on installed, missing or wrong
-// (DESIGN.md D132; option 06, slice 5). Each says the same thing in its text and in its --json: the stable code, and the
+// (DESIGN.md D134; option 06, slice 5). Each says the same thing in its text and in its --json: the stable code, and the
 // install command as the fix. The files are the add-on's, linked from DuckDB's real ones where a test needs them.
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";

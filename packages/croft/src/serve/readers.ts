@@ -80,7 +80,7 @@ export interface ReadersEngineInternals {
   interruptEveryMs?: number;
   /** COPY_POLL_MS by default. */
   copyPollMs?: number;
-  /** A folder of the pinned extension files, for croft's tests; by default the server add-on in the project's node_modules (D132). */
+  /** A folder of the pinned extension files, for croft's tests; by default the server add-on in the project's node_modules (D134). */
   extensionDir?: string;
   /** Where the readers' process listens for DuckDB clients (serverMode.quackHost and quackPort by default); false: nowhere,
    *  for a test that wants no listener. */

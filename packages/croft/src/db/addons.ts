@@ -1,4 +1,4 @@
-// The add-on packages that carry DuckDB's extension files to the projects that turn a mode on (DESIGN.md D132, D133;
+// The add-on packages that carry DuckDB's extension files to the projects that turn a mode on (DESIGN.md D134, D135;
 // option 06, slice 5, decision a). Plain croft ships none of them and never downloads code: a project that turns server
 // mode on installs the server add-on with its own package manager, and croft finds the files in the project's
 // node_modules and checks each against the checksum it pins (extension-files.ts) before it loads one.

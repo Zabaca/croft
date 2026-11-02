@@ -34,7 +34,7 @@
 //    a BIGINT (number | bigint: Number(row.x)). No tsc (or no tsconfig.json) is an info problem and a skip; croft
 //    never installs anything. A tsconfig.json whose "include" leaves out .croft/types is an info problem with the
 //    edit. Plain validate names --types as the next step when TS transforms read assets (nextSteps).
-//    A project with a mode on (serverMode.enabled) also gets its add-on checked (db/addon-status.ts, D132): EXTENSION_MISSING
+//    A project with a mode on (serverMode.enabled) also gets its add-on checked (db/addon-status.ts, D134): EXTENSION_MISSING
 //    with the install command as its fix when the extension files are not found, an error like the rest; data.addons says
 //    what was found.
 // 4. --hook: what Claude Code's PostToolUse hook runs after an edit (agent/hook.ts, §9 item 7): the edited asset
@@ -220,7 +220,7 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
   const order = runOrder(graph, resolved.assets);
 
   const renamed = await renamedAssets(i.project, catalog, byName);
-  // A mode that is on needs its add-on's extension files (D132). The edit hook skips it: its problems belong to no asset, and a
+  // A mode that is on needs its add-on's extension files (D134). The edit hook skips it: its problems belong to no asset, and a
   // check of the files on every edit would only hash them again.
   const addons = i.addons !== false && i.project.config && !i.select ? inspectAddons(addonsNeeded(i.project.config), { from: root, ...(i.processEnv ? { env: i.processEnv } : {}) }) : null;
   const problems: Problem[] = [

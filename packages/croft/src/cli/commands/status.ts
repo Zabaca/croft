@@ -153,7 +153,7 @@ export interface StatusData {
    *  croft serve runs now (apps read the file directly while it does not). */
   serverMode?: {
     serving: boolean;
-    /** The add-on that carries server mode's DuckDB extension files, and whether this machine finds them (D132). */
+    /** The add-on that carries server mode's DuckDB extension files, and whether this machine finds them (D134). */
     addons: AddonView[];
   };
 }
@@ -708,7 +708,7 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       else if (policy.warn) copyProblems.push(notClonedProblem(policy));
     }
     if (project.config.serverMode.enabled) {
-      // The add-on with the mode's extension files (D132): croft serve cannot start without it, so a missing one is a problem here.
+      // The add-on with the mode's extension files (D134): croft serve cannot start without it, so a missing one is a problem here.
       const addons = inspectAddons(addonsNeeded(project.config), { from: project.root, ...o.extensions });
       data.serverMode = { serving: serve !== undefined, addons: addons.views };
       addonProblems.push(...addons.problems);

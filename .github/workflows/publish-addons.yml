@@ -1,5 +1,5 @@
 # Builds, and only when told to, publishes the add-on packages that carry DuckDB's extension files to the projects that turn a
-# mode on (DESIGN.md D132, D133): @zabaca/croft-addon-server, @zabaca/croft-addon-lake and one @zabaca/croft-ext-<extension>-<platform>
+# mode on (DESIGN.md D134, D135): @zabaca/croft-addon-server, @zabaca/croft-addon-lake and one @zabaca/croft-ext-<extension>-<platform>
 # package for each of quack, httpfs, ducklake and postgres on macOS and Linux (arm64 and x64), 18 in all. Each publish is the maintainer's word.
 #
 # THE ONLY TRIGGER is a manual run (workflow_dispatch). No tag, push or pull request starts it, so the `croft-v*` tag that releases
@@ -14,7 +14,7 @@
 # only hold with GitHub settings that no file in the repository can make: the `npm-addons` environment must exist, with a deployment
 # branch rule that allows main only and the maintainer as required reviewer, and each package's trusted publisher on npmjs.com must
 # name that environment, so that npm refuses a publish from anywhere else. A run that names an environment that does not exist
-# creates it with no protection. The checklist is in DESIGN.md D133 and `croft docs addons`; do it before the first publish.
+# creates it with no protection. The checklist is in DESIGN.md D135 and `croft docs addons`; do it before the first publish.
 #
 # Trusted publishing, as for @zabaca/croft: no npm token. Each package names this repository and this workflow file as its trusted
 # publisher on npmjs.com. npm cannot set that up for a package that does not exist yet, and a first publish cannot use it, so the first
