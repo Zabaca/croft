@@ -30,6 +30,7 @@ export const GUIDES: [topic: string, label: string][] = [
   ["secrets", "Secrets"],
   ["serve", "Apps and croft serve"],
   ["server-mode", "Server mode"],
+  ["addons", "Add-ons for server mode"],
   ["keys", "Keys for people"],
   ["quack", "DuckDB over Quack"],
   ["read-copy", "GUIs and notebooks"],
