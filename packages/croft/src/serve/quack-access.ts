@@ -72,10 +72,13 @@ export class QuackAccess {
   private catalog: CatalogSnapshot | null = null;
   private replacements: ReadonlyMap<string, string> = new Map();
   private ready = false;
-  /** Queries `quack_active_connections()` showed running at the last look. The cap is soft by that much: a burst that arrives between
-   *  two looks (250 ms) is not seen until the next one, and queries that already finished are never counted, so a client that sends
-   *  one query after another is never refused for them. */
+  /** The queries counted as running: what `quack_active_connections()` showed at the last look, plus one for each session that
+   *  has been admitted a query since (D134), so a burst of sessions inside one look's 250 ms cannot pass the cap. The next look
+   *  sets the count back to what the server shows. */
   private active = 0;
+  /** The sessions already counted in `active` since the last look. A session sends one query at a time, so a second query of one
+   *  session is not a second running query; counting it would refuse a client that sends queries one after another (D130). */
+  private readonly admitted = new Set<string>();
   private readonly shared: readonly string[];
   private readonly now: () => number;
 
@@ -84,9 +87,11 @@ export class QuackAccess {
     this.now = o.now ?? (() => Date.now());
   }
 
-  /** What the last look at the server's running queries counted (every 250 ms, serve/quack-listener.ts). */
+  /** What the last look at the server's running queries counted (every 250 ms, serve/quack-listener.ts): the real number, which
+   *  replaces the count of sessions admitted since. */
   setActive(running: number): void {
     this.active = running;
+    this.admitted.clear();
   }
 
   /** The keys listed now. A session whose key is not among them is refused on its next query. */
@@ -142,7 +147,13 @@ export class QuackAccess {
       if (replacement !== undefined) return replacement;
       const verdict = this.decide(query, parsed);
       const max = this.o.maxConcurrent ?? Number.POSITIVE_INFINITY;
-      if (this.active >= max) throw busy(max);
+      // A session runs one query at a time, so its next query means its last one is over: it counts once however many it sends,
+      // and a session already counted is not turned away by the count it is part of.
+      if (!this.admitted.has(session)) {
+        if (this.active >= max) throw busy(max);
+        this.admitted.add(session);
+        this.active++;
+      }
       this.tell({ kind: "query", key: s.key, at: this.now(), tables: verdict.tables, outcome: "ok" });
       return verdict.sql;
     } catch (e) {

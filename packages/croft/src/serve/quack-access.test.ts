@@ -215,7 +215,7 @@ describe("a query goes through the same gate as over HTTP", () => {
   });
 });
 
-describe("the cap on running queries (D130)", () => {
+describe("the cap on running queries (D130, D134)", () => {
   const read = async (a: QuackAccess, sql = "SELECT count(*) FROM orders") => refusal(a, "s", sql);
 
   test("past the cap a data query is refused with a retryable answer that names the setting; the client's own control and catalog queries still run", async () => {
@@ -232,17 +232,56 @@ describe("the cap on running queries (D130)", () => {
     expect(await read(a)).toBeNull();
   });
 
-  test("only queries the last look saw running count: a client that sends one query after another, in a hundred sessions, is never refused for the ones that finished", async () => {
+  test("a burst inside one look is capped: each session admitted a query counts at once, so the query past the cap is refused before the next look (D134)", async () => {
+    const { a, events } = access({ maxConcurrent: 2 });
+    for (let i = 0; i < 5; i++) a.authenticate(`s${i}`, ALICE);
+    // The last look saw nothing running; five sessions then send a query within the same 250 ms.
+    a.setActive(0);
+    expect(await refusal(a, "s0", "SELECT count(*) FROM orders")).toBeNull();
+    expect(await refusal(a, "s1", "SELECT count(*) FROM orders")).toBeNull();
+    for (const s of ["s2", "s3", "s4"]) expect(await refusal(a, s, "SELECT count(*) FROM orders"), s).toMatch(/SERVE_UNAVAILABLE/);
+    expect(events.filter((e) => e.kind === "query" && e.outcome === "ok")).toHaveLength(2);
+  });
+
+  test("the next look replaces the count with the real number, so sessions whose query finished stop being counted", async () => {
+    const { a } = access({ maxConcurrent: 2 });
+    for (const s of ["a", "b", "c", "d", "e", "f", "g"]) a.authenticate(s, ALICE);
+    const q = (s: string) => refusal(a, s, "SELECT count(*) FROM orders");
+    a.setActive(0);
+    expect(await q("a")).toBeNull();
+    expect(await q("b")).toBeNull();
+    expect(await q("c")).toMatch(/SERVE_UNAVAILABLE/);
+    // Both finished; the look sees one running (somebody else's), not the two admitted.
+    a.setActive(1);
+    expect(await q("d")).toBeNull();
+    expect(await q("e")).toMatch(/SERVE_UNAVAILABLE/);
+    // And a look that sees the server idle clears it whatever was admitted before.
+    a.setActive(0);
+    expect(await q("f")).toBeNull();
+    expect(await q("g")).toBeNull();
+    expect(await q("a")).toMatch(/SERVE_UNAVAILABLE/);
+  });
+
+  test("a session that sends one query after another counts once: it is never refused for the ones it finished, whatever the look says", async () => {
     const { a } = access({ maxConcurrent: 2 });
     a.authenticate("s", ALICE);
+    a.setActive(0);
+    for (let i = 0; i < 100; i++) expect(await read(a), String(i)).toBeNull();
+    // A second session joins it, and a third is past the cap: two sessions are two running queries, not a hundred.
+    a.authenticate("t", ALICE);
+    a.authenticate("u", ALICE);
+    expect(await refusal(a, "t", "SELECT count(*) FROM orders")).toBeNull();
+    expect(await refusal(a, "u", "SELECT count(*) FROM orders")).toMatch(/SERVE_UNAVAILABLE/);
+    for (let i = 0; i < 100; i++) expect(await read(a), String(i)).toBeNull();
+  });
+
+  test("a hundred sessions that send one query each per look are never refused", async () => {
+    const { a } = access({ maxConcurrent: 2 });
     for (let i = 0; i < 100; i++) {
       a.authenticate(`s${i}`, ALICE);
+      a.setActive(0);
       expect(await refusal(a, `s${i}`, "SELECT count(*) FROM orders"), String(i)).toBeNull();
     }
-    a.setActive(1);
-    expect(await read(a)).toBeNull();
-    a.setActive(2);
-    expect(await refusal(a, "s1", "SELECT count(*) FROM orders")).toMatch(/SERVE_UNAVAILABLE/);
   });
 
   test("a refused attack does not use a slot, and without a cap nothing is counted", async () => {
