@@ -58,11 +58,17 @@ function readBootId(): string {
   // is not: the system moves it when it steps the clock (time sync, waking from sleep), by the seconds of the step [V: macOS 15, a full suite
   // run saw 1790105420 become 1790105421 half way through], and every process that read it afterwards saw another boot, so a live run's
   // lease, intent and record were taken for those of a machine that had restarted. Its seconds remain the fallback, for a macOS without the UUID.
-  const uuid = runTool(SYSCTL, ["-n", "kern.bootsessionuuid"]);
-  const id = uuid && uuid.status === 0 ? (uuid.stdout ?? "").trim() : "";
-  if (BOOT_UUID.test(id)) return id;
-  const res = runTool(SYSCTL, ["-n", "kern.boottime"]);
-  const out = res && res.status === 0 ? res.stdout ?? "" : "";
+  return macBootId((name) => {
+    const res = runTool(SYSCTL, ["-n", name]);
+    return res && res.status === 0 ? res.stdout ?? "" : null;
+  });
+}
+
+/** The macOS boot id from what `sysctl -n <name>` prints (null when it could not be run): the UUID, else kern.boottime's seconds. */
+export function macBootId(sysctl: (name: string) => string | null): string {
+  const uuid = (sysctl("kern.bootsessionuuid") ?? "").trim();
+  if (BOOT_UUID.test(uuid)) return uuid;
+  const out = sysctl("kern.boottime") ?? "";
   return out.match(/sec = (\d+)/)?.[1] ?? out.trim();
 }
 

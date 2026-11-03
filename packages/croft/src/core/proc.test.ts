@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { bootId, currentIdentity, isAlive, knownBoot, procStart, recordAlive, sameBoot, UNKNOWN_BOOT } from "./proc.ts";
+import { bootId, currentIdentity, isAlive, knownBoot, macBootId, procStart, recordAlive, sameBoot, UNKNOWN_BOOT } from "./proc.ts";
 
 test("current process is alive", () => {
   expect(isAlive(currentIdentity())).toBe(true);
@@ -42,6 +42,19 @@ test("a boot id of the old macOS kind (boottime seconds) is the same boot when t
   expect(sameBoot(UUID_A, "1790105420")).toBe(true);
   expect(sameBoot(UUID_A, UUID_B)).toBe(false);
   expect(sameBoot("other-boot", "another-boot")).toBe(false);
+});
+
+test("a step of the clock moves kern.boottime by its seconds and is still one boot: the UUID when sysctl has it, the seconds, tolerated, when it does not", () => {
+  const boottime = (sec: number) => `{ sec = ${sec}, usec = 123 } Tue Sep 22 12:30:21 2026\n`;
+  const withUuid = (sec: number) => macBootId((name) => (name === "kern.bootsessionuuid" ? "5D5DD5DD-CB11-4C93-A86D-1D64A20EA230\n" : boottime(sec)));
+  expect(withUuid(1790105420)).toBe("5D5DD5DD-CB11-4C93-A86D-1D64A20EA230");
+  expect(withUuid(1790105421)).toBe(withUuid(1790105420)); // the boot time moved by a second: the id did not
+  const bare = (sec: number) => macBootId((name) => (name === "kern.boottime" ? boottime(sec) : null));
+  expect(bare(1790105420)).toBe("1790105420");
+  expect(bare(1790105421)).not.toBe(bare(1790105420)); // as they read before: two ids for one boot ...
+  expect(sameBoot(bare(1790105420), bare(1790105421))).toBe(true); // ... that are one boot
+  expect(sameBoot(bare(1790105420), bare(1790105420 + 7200))).toBe(false);
+  expect(macBootId(() => null)).toBe(""); // nothing to read: unknown, which the caller makes UNKNOWN_BOOT
 });
 
 test("the boot id is read, never empty", () => {
