@@ -5,6 +5,7 @@ import { blobValue, type DuckDBConnection, type DuckDBValue, listValue } from "@
 import { CroftError } from "../core/errors.ts";
 import type { Row } from "../types.ts";
 import { mapSandboxError, type Profile } from "../db/connect.ts";
+import { storeTlsError } from "../db/store-tls.ts";
 import { renderRows } from "../db/values.ts";
 import { assertOneSelect } from "../sql/gate.ts";
 import { type SelectRequest, stringifyLossless, tooManyRows } from "./wire.ts";
@@ -28,6 +29,9 @@ export function mapQueryError(err: unknown, profile: Profile): unknown {
   if (err instanceof CroftError) return err;
   const mapped = mapSandboxError(err, profile);
   if (mapped !== err) return mapped;
+  // A store whose certificate cannot be checked is not a problem with the query (D-R1).
+  const tls = storeTlsError(err);
+  if (tls) return tls;
   if (!(err instanceof Error)) return err;
   const first = err.message.split("\n")[0]!;
   // "Failed to bind value: Invalid Input Error: ..." comes from binding params; the kind follows the prefix.

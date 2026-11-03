@@ -641,7 +641,7 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
 async function checkLakeMaintenance(r: Report, d: DoctorDeps, project: Project, w: import("../../db/warehouse.ts").DuckWarehouse): Promise<void> {
   const lake = project.config.lake!;
   const { lakeStats, ageBasedExpiryOptions } = await import("../../db/lake-maintenance.ts");
-  const { maintenanceView, readState } = await import("../../db/lake-maintenance-state.ts");
+  const { failedPassProblem, maintenanceView, readState } = await import("../../db/lake-maintenance-state.ts");
   const at = now(d.env);
   let seen;
   try {
@@ -668,10 +668,7 @@ async function checkLakeMaintenance(r: Report, d: DoctorDeps, project: Project, 
       : `every ${view.everyHours} h; no pass yet${view.nextDueAt ? ` (the first is due ${Date.parse(view.nextDueAt) <= at.getTime() ? "now" : `at ${clockText(view.nextDueAt, project.timezone, at)}`})` : ""}`;
   const details = { ...view, lake: s, expiryOptions: seen.options };
   if (view.lastError) {
-    const p = { ...problem("LAKE_MAINTENANCE_FAILED", {
-      message: `the last maintenance pass failed${view.lastError.step ? ` at the ${view.lastError.step} step` : ""} ${agoText(view.lastError.at, at)}: ${view.lastError.message}`,
-      hint: "the lake is usable and nothing was lost; croft tries again within the hour, or croft maintain now (croft docs LAKE_MAINTENANCE_FAILED)", retryable: true,
-    }), severity: "warning" as const };
+    const p = failedPassProblem(view.lastError, agoText(view.lastError.at, at));
     r.add("environment", "lake.maintenance", "warn", `maintenance: ${last} · ${p.message} · ${held}`, p, details);
   } else {
     r.add("environment", "lake.maintenance", "ok", `maintenance: ${last} · ${held}`, undefined, details);

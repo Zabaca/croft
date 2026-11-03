@@ -303,6 +303,16 @@ jobs:
           CROFT_E2E_LAKE: postgres
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
         run: bun test --timeout 60000 --shard=${{ matrix.shard }}/2 tests/e2e
+      # The store over HTTPS with a self-signed certificate (D-R1): with the CA the project names every command works; without it, or with another's,
+      # every command says LAKE_STORE_TLS. The journeys above reach the store over plain HTTP, which is why they never met the lockdown refusing a CA file.
+      # Certificates are made with the runner's openssl program.
+      - name: the lake's store over HTTPS
+        if: matrix.shard == 1
+        working-directory: packages/croft
+        env:
+          CROFT_CI: "1"
+          CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
+        run: bun test --timeout 60000 src/db/store-tls.test.ts
       # A lake croft wrote is read by DuckDB 1.5 as well (the lake is format 1.0, D137, acceptance 11): an older DuckDB and its extension files
       # are fetched into a folder of the runner and the recipe of `croft docs lake` is run with them.
       - name: a lake read by DuckDB 1.5.5

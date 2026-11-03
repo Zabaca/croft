@@ -310,6 +310,7 @@ async function mirrorData(project: Project, mode: ModeSpec, to: string, parent: 
   const access: S3Access = {
     ...(lake.bucket.endpoint ? { endpoint: lake.bucket.endpoint } : {}), region: lake.bucket.region ?? "us-east-1", useSsl: lake.bucket.useSsl, urlStyle: lake.bucket.urlStyle,
     bucket: lake.bucket.name, keyId: b.keyId, secretKey: b.secretKey, ...(b.sessionToken ? { sessionToken: b.sessionToken } : {}),
+    ...(b.caFile ? { caFile: b.caFile } : {}),
   };
   const folder = `s3://${lake.bucket.name}/${lake.bucket.folder}`;
   const earlier = previousMirror(parent, folder);

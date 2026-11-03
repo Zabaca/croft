@@ -11,6 +11,7 @@ import { createWriteStream, mkdirSync, renameSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { storeTlsError } from "./store-tls.ts";
 
 export interface S3Access {
   /** `host[:port]` of the store; absent for AWS. */
@@ -22,6 +23,8 @@ export interface S3Access {
   keyId: string;
   secretKey: string;
   sessionToken?: string;
+  /** The PEM file the store's certificate is checked against, when the project names one (db/store-tls.ts); else the runtime's own authorities. */
+  caFile?: string;
 }
 
 const EMPTY_SHA256 = createHash("sha256").update("").digest("hex");
@@ -99,7 +102,13 @@ async function get(a: S3Access, key: string, query: Record<string, string>): Pro
   });
   const qs = Object.keys(query).sort().map((k) => `${enc(k)}=${enc(query[k]!)}`).join("&");
   // A redirect would send the signed request, and the key's signature with it, somewhere the store did not name: refused.
-  const res = await fetch(`${t.base}${qs ? `?${qs}` : ""}`, { method: "GET", headers, redirect: "error" });
+  let res: Response;
+  try {
+    res = await fetch(`${t.base}${qs ? `?${qs}` : ""}`, { method: "GET", headers, redirect: "error", ...(a.caFile ? { tls: { ca: Bun.file(a.caFile) } } : {}) });
+  } catch (e) {
+    // The store's certificate not checking out is LAKE_STORE_TLS here as it is for DuckDB (D-R1), not a failure of the backup's folder.
+    throw storeTlsError(e, { named: !!a.caFile }) ?? e;
+  }
   if (!res.ok) {
     // The store's error code names what went wrong (AccessDenied, NoSuchKey); its body may echo the key id, so only the code is kept.
     const code = /<Code>([^<]*)<\/Code>/.exec(await res.text().catch(() => ""))?.[1] ?? "";

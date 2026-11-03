@@ -24,7 +24,8 @@ import {
   ageBasedExpiryOptions, countSuperseded, DEFAULT_RETRY, deleteOrphans, type ExpiryOption, lakeStats, type LakeStats, listOrphans, type PassReport, planExpiry, type RetryPolicy, readPlanInput, runPass,
   type StepName,
 } from "./lake-maintenance.ts";
-import { ensureState, maintenanceDue, type MaintenanceState, type PassSummary, writeState } from "./lake-maintenance-state.ts";
+import { ensureState, MAINTENANCE_RETRY, maintenanceDue, type MaintenanceState, type PassSummary, writeState } from "./lake-maintenance-state.ts";
+import { storeTlsProblem } from "./store-tls.ts";
 import { openWarehouse } from "./warehouse.ts";
 
 // ---- Running a pass ------------------------------------------------------------------------------------------------
@@ -93,7 +94,7 @@ export async function maintainProject(project: Project, env: ProjectEnv, o: Main
     } catch (e) {
       const p = e instanceof CroftError ? e.problem : problem("LAKE_MAINTENANCE_FAILED", {
         message: `the lake's maintenance could not reach the lake: ${String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 300)}`,
-        hint: "croft tries again within the hour, or croft maintain now", retryable: true,
+        hint: MAINTENANCE_RETRY, retryable: true,
       });
       const failed: PassOutcome = { status: "failed", problem: p };
       finish(runs, o.now, failed, true);
@@ -131,9 +132,11 @@ export async function maintainProject(project: Project, env: ProjectEnv, o: Main
       outcome = { status: report.ok ? "ran" : "failed", report };
       if (!report.ok) {
         const bad = report.steps.find((s) => s.status === "failed");
-        outcome.problem = problem("LAKE_MAINTENANCE_FAILED", {
+        const tls = bad?.error ? storeTlsProblem(new Error(bad.error)) : null;
+        // A store whose certificate does not check out is the same clear code and fix as in every other command (D-R1); a pass is a warning.
+        outcome.problem = tls ? { ...tls, severity: "warning" } : problem("LAKE_MAINTENANCE_FAILED", {
           message: `the lake's maintenance pass failed at the ${bad?.step ?? "first"} step after ${bad?.attempts ?? 1} ${bad?.attempts === 1 ? "try" : "tries"}: ${bad?.error ?? "unknown"}`,
-          hint: "the lake is usable and nothing was lost; croft tries again within the hour, or croft maintain now (croft docs LAKE_MAINTENANCE_FAILED)",
+          hint: `the lake is usable and nothing was lost; ${MAINTENANCE_RETRY} (croft docs LAKE_MAINTENANCE_FAILED)`,
           retryable: true,
           details: { step: bad?.step ?? null, attempts: bad?.attempts ?? null, steps: report.steps.map((s) => ({ step: s.step, status: s.status })) },
         });
@@ -145,7 +148,7 @@ export async function maintainProject(project: Project, env: ProjectEnv, o: Main
       } else {
         const p = e instanceof CroftError ? e.problem : problem("LAKE_MAINTENANCE_FAILED", {
           message: `the lake's maintenance pass could not run: ${warehouse.redact(String((e as Error)?.message ?? e).split("\n")[0]!).slice(0, 300)}`,
-          hint: "croft tries again within the hour, or croft maintain now", retryable: true,
+          hint: MAINTENANCE_RETRY, retryable: true,
         });
         outcome = { status: "failed", problem: p };
       }
@@ -232,7 +235,7 @@ export async function maintainIfDue(project: Project, env: ProjectEnv, o: Mainta
   } catch (e) {
     const p = e instanceof CroftError ? e.problem : problem("LAKE_MAINTENANCE_FAILED", {
       message: `the lake's maintenance could not start: ${String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 300)}`,
-      hint: "croft tries again within the hour, or croft maintain now", retryable: true,
+      hint: MAINTENANCE_RETRY, retryable: true,
     });
     return { status: "failed", problem: p };
   } finally {

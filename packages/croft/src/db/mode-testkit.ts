@@ -150,24 +150,27 @@ export interface TestS3 {
   stop(): Promise<void>;
 }
 
-/** Start the S3-compatible store (s3-store-testkit.ts) with a temporary folder. `keys`: id -> "rw" | "ro". */
-export async function startS3(o: { buckets: string[]; keys: Record<string, "rw" | "ro"> }): Promise<TestS3> {
+/** Start the S3-compatible store (s3-store-testkit.ts) with a temporary folder. `keys`: id -> "rw" | "ro". With `tls` (PEM files; see
+ *  store-tls-testkit.ts) it serves HTTPS, as a real store does, and a client must use `useSsl: true`. */
+export async function startS3(o: { buckets: string[]; keys: Record<string, "rw" | "ro">; tls?: { cert: string; key: string } }): Promise<TestS3> {
   const root = mkdtempSync(join(tmpdir(), "croft-s3-"));
   const args = [process.execPath, join(import.meta.dir, "s3-store-testkit.ts"), "--root", root];
+  if (o.tls) args.push("--tls-cert", o.tls.cert, "--tls-key", o.tls.key);
   for (const b of o.buckets) args.push("--bucket", b);
   for (const [id, mode] of Object.entries(o.keys)) args.push("--key", `${id}:${mode}`);
   const child = Bun.spawn(args, { stdout: "pipe", stderr: "inherit" });
   children.add(child);
   const port = await readListening(child);
+  const scheme = o.tls ? "https" : "http";
   return {
     endpoint: `127.0.0.1:${port}`,
     port,
     root,
     async failDeletes(n, status = 500) {
-      await fetch(`http://127.0.0.1:${port}/__control?failDeletes=${n}&status=${status}`, { method: "POST" });
+      await fetch(`${scheme}://127.0.0.1:${port}/__control?failDeletes=${n}&status=${status}`, { method: "POST", ...(o.tls ? { tls: { ca: Bun.file(o.tls.cert) } } : {}) });
     },
     async stats() {
-      return (await (await fetch(`http://127.0.0.1:${port}/__control`)).json()) as { deleteRequests: number; failedDeletes: number; objectsDeleted: number };
+      return (await (await fetch(`${scheme}://127.0.0.1:${port}/__control`, o.tls ? { tls: { ca: Bun.file(o.tls.cert) } } : {})).json()) as { deleteRequests: number; failedDeletes: number; objectsDeleted: number };
     },
     async stop() {
       await stop(child);

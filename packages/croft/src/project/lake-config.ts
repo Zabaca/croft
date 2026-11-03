@@ -29,6 +29,9 @@ export interface LakeBucketConfig {
   region?: string;
   urlStyle: "path" | "vhost";
   useSsl: boolean;
+  /** A PEM file of the certificate authorities the store's certificate is signed by, as written (relative to the project folder, or `~/`);
+   *  absent: this machine's CA bundle. Only with `useSsl`. */
+  sslRootCert?: string;
   writer: LakeKey;
   reader: LakeKey;
 }
@@ -78,7 +81,7 @@ export const LAKE_KEYS = ["catalog", "bucket", "dataPath", "maintenance"];
 const MAINTENANCE_KEYS = ["enabled", "everyHours"];
 const CATALOG_KEYS = ["kind", "host", "port", "database", "sslMode", "sslRootCert", "writer", "reader", "path"];
 const LOGIN_KEYS = ["user", "passwordSecret"];
-const BUCKET_KEYS = ["name", "folder", "endpoint", "region", "urlStyle", "useSsl", "writer", "reader"];
+const BUCKET_KEYS = ["name", "folder", "endpoint", "region", "urlStyle", "useSsl", "sslRootCert", "writer", "reader"];
 const KEY_KEYS = ["keyIdSecret", "secretKeySecret", "sessionTokenSecret"];
 
 /** The name of an environment variable, which is what a secret is. */
@@ -301,7 +304,9 @@ function bucketConfig(raw: unknown, c: LakeChecks): LakeBucketConfig | null {
   } else if (typeof raw.folder !== "string") {
     add("lake.bucket.folder", `"lake.bucket.folder" must be a folder path like "croft/orders/"; found ${show(raw.folder)}`, `give a folder inside the bucket`);
   } else {
-    const parts = raw.folder.split("/").filter((s, i, all) => !(s === "" && i === all.length - 1));
+    // Trailing slashes are the folder's own ("trial-1", "trial-1/" and "trial-1//" are one folder: `s3://bucket/trial-1/`, never `trial-1//`,
+    // which names another place); an empty part inside it is not (D-R4).
+    const parts = raw.folder.replace(/\/+$/, "").split("/");
     if (!parts.length || parts.some((s) => !FOLDER_SEGMENT.test(s) || s === "." || s === "..")) {
       add("lake.bucket.folder", `"lake.bucket.folder" must be a folder inside the bucket, like "croft/orders/" (not the bucket's top, no leading slash, no ".." and no empty parts); found ${show(raw.folder)}`,
         `name a folder that holds only this lake`);
@@ -327,6 +332,16 @@ function bucketConfig(raw: unknown, c: LakeChecks): LakeBucketConfig | null {
     else add("lake.bucket.urlStyle", `"lake.bucket.urlStyle" must be "path" or "vhost"; found ${show(raw.urlStyle)}`, `use "path" unless the store needs "vhost"`);
   }
   const useSsl = c.bool(raw, "lake.bucket.useSsl", "useSsl", true);
+  let sslRootCert: string | undefined;
+  if (raw.sslRootCert !== undefined) {
+    if (typeof raw.sslRootCert !== "string" || raw.sslRootCert.trim() === "") {
+      add("lake.bucket.sslRootCert", `"lake.bucket.sslRootCert" must be the path of a PEM file of certificate authorities; found ${show(raw.sslRootCert)}`,
+        `use a path such as "certs/store-ca.pem" (relative to the project folder), or remove the setting to use this machine's CA bundle`);
+    } else if (!useSsl) {
+      add("lake.bucket.sslRootCert", `"lake.bucket.sslRootCert" names the authorities the store's certificate is checked against, and "lake.bucket.useSsl" is false: nothing is checked`,
+        `remove "sslRootCert", or set "useSsl" to true`);
+    } else sslRootCert = raw.sslRootCert.trim();
+  }
   const writer = bucketKey(c, raw, "lake.bucket", "writer");
   const reader = bucketKey(c, raw, "lake.bucket", "reader");
   if (writer && reader) {
@@ -335,7 +350,7 @@ function bucketConfig(raw: unknown, c: LakeChecks): LakeBucketConfig | null {
         `make a key that can only read the lake's folder, and give each key its own secrets (croft docs lake)`);
     }
   }
-  return name && folder && writer && reader ? { name, folder, ...(endpoint ? { endpoint } : {}), ...(region ? { region } : {}), urlStyle, useSsl, writer, reader } : null;
+  return name && folder && writer && reader ? { name, folder, ...(endpoint ? { endpoint } : {}), ...(region ? { region } : {}), urlStyle, useSsl, ...(sslRootCert ? { sslRootCert } : {}), writer, reader } : null;
 }
 
 function localLake(raw: Record<string, unknown>, cat: Record<string, unknown>, c: LakeChecks, maintenance: LakeMaintenanceConfig): LocalLakeConfig | null {

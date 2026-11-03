@@ -27,6 +27,7 @@ import { TRASH_RETENTION } from "../safety/trash.ts";
 import { ASSET_TABLES, kindOfObjects, STATE_SPECS, stateObjects } from "./bookkeeping.ts";
 import { isConnectionError } from "./lake.ts";
 import { LAKE_ALIAS } from "./modes.ts";
+import { isStoreTls } from "./store-tls.ts";
 
 /** The schema the assets' tables are in; croft's bookkeeping is in `_croft`. */
 export const ASSET_SCHEMA = "main";
@@ -302,6 +303,7 @@ export async function ageBasedExpiryOptions(sql: Sql): Promise<ExpiryOption[]> {
  */
 export function isTransientStorage(e: unknown): boolean {
   const text = e instanceof Error ? e.message : String(e);
+  if (isStoreTls(e)) return false; // a certificate that does not check out is the same on the next try
   // DuckDB's httpfs says "HTTP Error: Request returned HTTP 500 for HTTP POST to '<url>'" [V: 2.0.0, the test store].
   if (/\bHTTP (?:429|5\d\d)\b|SlowDown|InternalError|ServiceUnavailable|RequestTimeout|Please try again/i.test(text)) return true;
   if (/timed? ?out|timeout|connection (?:reset|closed|refused)|temporarily unavailable|broken pipe|EOF/i.test(text) && !/denied|forbidden|invalid access|signature/i.test(text)) return true;

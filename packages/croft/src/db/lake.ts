@@ -24,6 +24,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { catalogTls } from "./catalog-tls.ts";
 import { LAKE_ALIAS, type ModeSpec, REFUSED, TLS_REFUSED } from "./modes.ts";
 import { CROFT_VERSION } from "./state.ts";
+import { storeCaFile } from "./store-tls.ts";
 
 /** What a warehouse needs to attach the project's lake: its label, and the mode (extensions, credentials, attach) for an access. */
 export interface LakeConnection {
@@ -81,6 +82,7 @@ function lakeMode(lake: LakeConfig, project: Project, access: "write" | "read", 
   const key = access === "write" ? lake.bucket.writer : lake.bucket.reader;
   const b = lake.bucket;
   const tls = catalogTls(lake.catalog, project.root, { env: tlsEnv });
+  const caFile = storeCaFile(b, project.root);
   return {
     ...base,
     kind: "lake",
@@ -90,6 +92,7 @@ function lakeMode(lake: LakeConfig, project: Project, access: "write" | "read", 
         path: bucketPath(b), keyId: secret(key.keyIdSecret), secretKey: secret(key.secretKeySecret),
         ...(key.sessionTokenSecret ? { sessionToken: secret(key.sessionTokenSecret) } : {}),
         ...(b.endpoint ? { endpoint: b.endpoint } : {}), ...(b.region ? { region: b.region } : {}), urlStyle: b.urlStyle, useSsl: b.useSsl,
+        ...(caFile ? { caFile } : {}),
       },
       access,
     },

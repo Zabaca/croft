@@ -102,6 +102,7 @@ export const CONFIG_KEYS: { key: string; type: string; default: string; descript
   { key: "lake.bucket.region", type: "string", default: "(the store's default)", description: "the store's region name, e.g. \"us-east-1\" or \"auto\"" },
   { key: "lake.bucket.urlStyle", type: "\"path\" | \"vhost\"", default: "\"path\"", description: "how the store's addresses are written" },
   { key: "lake.bucket.useSsl", type: "boolean", default: "true", description: "reach the store over HTTPS; false only for a store on this machine" },
+  { key: "lake.bucket.sslRootCert", type: "string", default: "(this machine's CA bundle)", description: "a PEM file of the certificate authorities the store's certificate is signed by, relative to the project folder (~/ for the home folder); for a store with a private authority's certificate" },
   { key: "lake.bucket.writer.keyIdSecret", type: "string", default: "(required, postgres)", description: "the NAME of the secret that holds the writer bucket key's id" },
   { key: "lake.bucket.writer.secretKeySecret", type: "string", default: "(required, postgres)", description: "the NAME of the secret that holds the writer bucket key's secret" },
   { key: "lake.bucket.writer.sessionTokenSecret", type: "string", default: "(none)", description: "the NAME of the secret that holds the writer key's session token, when the key is temporary" },

@@ -37,6 +37,7 @@ import {
   isCommitFailure, isConflict, isConnectionError, LAKE_RETRY, type LakeConnection, lakeBackoffMs, landedTag, LakeWriteLock, newCommitTag, TX_VARIABLE, WRITER_PREFIX, writerKey, writerRecord,
 } from "./lake.ts";
 import { LAKE_ALIAS, modeSecrets, scrub, scrubThrown } from "./modes.ts";
+import { storeTlsError } from "./store-tls.ts";
 import { now as clockNow } from "../core/time.ts";
 import { checkFormat, ensureState, hasState } from "./state.ts";
 import { TxGuard } from "./tx-guard.ts";
@@ -504,7 +505,14 @@ export class DuckWarehouse implements Warehouse {
 
   /** The lake's error with its credentials taken out: the password, the key id and secret and the session token. */
   private scrub(e: unknown): unknown {
-    return this.spec.mode ? scrubThrown(e, modeSecrets(this.spec.mode)) : e;
+    const clean = this.spec.mode ? scrubThrown(e, modeSecrets(this.spec.mode)) : e;
+    // The check of the store's certificate failing is one code wherever a command meets it (D-R1), not whatever the command makes of an
+    // unknown error (INTERNAL_ERROR, QUERY_FAILED).
+    if (this.lake && !(clean instanceof CroftError)) {
+      const m = this.spec.mode;
+      return storeTlsError(clean, { named: (m?.kind === "lake" || m?.kind === "lake-readers") && !!m.lake.data.caFile }) ?? clean;
+    }
+    return clean;
   }
 
   /** Text (a step's error that a body caught and reports itself) with the lake's credentials taken out. */
