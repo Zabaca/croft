@@ -10,7 +10,9 @@
 //  - a process that was reparented away from its test (a detached croft run or serve whose parent exited) and runs this checkout's
 //    code (a command line naming bin/, src/, tests/ or evals/ of this package's folder) with no `bun test` among its ancestors.
 //    Another checkout's processes carry another folder, and a process under another live `bun test` (two suites at once) belongs to
-//    that run.
+//    that run. A reparented process cannot be told from one that a second suite of THIS checkout started (or that a developer started
+//    from it meanwhile), so while another `bun test` runs with this package as its working directory the guard looks at descendants
+//    only (CROFT_LEAK_GUARD_ORPHANS=always looks at both, for the guard's own test): one suite per checkout gets the whole check.
 // A process that is still exiting gets LEAK_GRACE_MS to finish, polled, never slept: a test's kill() does not wait for the exit.
 // What is found is killed (so one leak does not pile up, or hold a port for the files after it) and named in the failure.
 import { spawnSync } from "node:child_process";
@@ -98,16 +100,49 @@ export function pidsNow(): Set<number> {
   return new Set(processTable().map((p) => p.pid));
 }
 
+/** The working directory of a process, or null when it cannot be told (lsof, or /proc on Linux). */
+function cwdOf(pid: number): string | null {
+  if (process.platform === "linux") {
+    const r = spawnSync("readlink", [`/proc/${pid}/cwd`], { encoding: "utf8" });
+    return r.status === 0 ? r.stdout.trim() : null;
+  }
+  const r = spawnSync("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], { encoding: "utf8" });
+  if (r.error || r.status !== 0) return null;
+  return /^n(.+)$/m.exec(r.stdout)?.[1] ?? null;
+}
+
+/** Is another `bun test` (not this run, its ancestors or its descendants) running with this package as its working directory? */
+export function anotherRunHere(table: Proc[], self: number): boolean {
+  const byPid = new Map(table.map((p) => [p.pid, p]));
+  const mine = new Set(descendantsOf(self, table).map((p) => p.pid));
+  const ancestors = new Set<number>();
+  for (let cur = byPid.get(self); cur && !ancestors.has(cur.pid); cur = byPid.get(cur.ppid)) ancestors.add(cur.pid);
+  return table.some((p) => {
+    if (p.pid === self || mine.has(p.pid) || ancestors.has(p.pid) || !alive(p) || !/\bbun\b[^\n]*\btest\b/.test(p.command)) return false;
+    const cwd = cwdOf(p.pid);
+    return cwd !== null && (cwd === PACKAGE_ROOT || cwd.startsWith(`${PACKAGE_ROOT}/`));
+  });
+}
+
+/** What the file left now: descendants always; reparented processes too unless another run of this checkout makes them ambiguous. */
+function currentLeaks(before: ReadonlySet<number>, self: number): Proc[] {
+  const table = processTable();
+  const found = findLeaks(table, before, self);
+  const mine = new Set(descendantsOf(self, table).map((p) => p.pid));
+  if (found.every((p) => mine.has(p.pid)) || process.env.CROFT_LEAK_GUARD_ORPHANS === "always") return found;
+  return anotherRunHere(table, self) ? found.filter((p) => mine.has(p.pid)) : found;
+}
+
 /** Throw when the file left a process running (after the grace), killing what it left. `file` is named in the failure. */
 export async function assertNoLeaks(file: string, before: ReadonlySet<number>, o: { graceMs?: number; self?: number } = {}): Promise<void> {
   const self = o.self ?? process.pid;
   const started = Date.now();
   const deadline = started + (o.graceMs ?? LEAK_GRACE_MS);
-  let leaks = findLeaks(processTable(), before, self);
+  let leaks = currentLeaks(before, self);
   const first = leaks;
   while (leaks.length > 0 && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 50));
-    leaks = findLeaks(processTable(), before, self);
+    leaks = currentLeaks(before, self);
   }
   // CROFT_LEAK_GUARD_REPORT=1 says which files still had a process running after their last test and were let off because it was gone within the grace.
   if (leaks.length === 0 && first.length > 0 && process.env.CROFT_LEAK_GUARD_REPORT === "1") {
@@ -117,6 +152,6 @@ export async function assertNoLeaks(file: string, before: ReadonlySet<number>, o
   killAll(leaks);
   throw new Error(
     `${file} left ${leaks.length} process${leaks.length === 1 ? "" : "es"} running after its last test:\n${leaks.map((p) => `  ${describeProc(p)}`).join("\n")}\n` +
-      "Stop what a test starts before it ends: await the exit of the child (kill it in afterEach/afterAll, or in a finally), or close the server that owns it. The guard killed what it found (DESIGN.md §10, \"The leak guard\").",
+      "Stop what a test starts before it ends: await the exit of the child (kill it in afterEach/afterAll, or in a finally), or close the server that owns it. The guard killed what it found (DESIGN.md §10 \"Test strategy\", the rules against flaking).",
   );
 }

@@ -149,10 +149,11 @@ describe("write-intent handshake", () => {
     await writer.waitFor("up");
     writeIntent(p.stateDir, writer.pid);
     const t0 = Date.now();
-    const rows = await directQuery(p.project, req("SELECT count(*)::INTEGER AS n FROM sales"), FAST);
+    // An intentWaitMs of its own, not the default's 2000 and not FAST's: the wait asked for is the wait made.
+    const rows = await directQuery(p.project, req("SELECT count(*)::INTEGER AS n FROM sales"), { ...FAST, intentWaitMs: 2500 });
     const waited = Date.now() - t0;
     expect(rows).toEqual([{ n: 2 }]);
-    expect(waited).toBeGreaterThanOrEqual(FAST.intentWaitMs - 20); // the intent was waited for; that it was given up at intentWaitMs, not kept, is this test's timeout
+    expect(waited).toBeGreaterThanOrEqual(2500 - 20); // that it is then given up, and not kept, is this test's timeout
   }, 20_000);
 
   test("opens as soon as the intent goes away", async () => {

@@ -487,7 +487,7 @@ describe("webhook", () => {
     await notifyScheduledFailure(root, failure(), { processEnv: DRY, sleep, retryDelaysMs: [1, 1], timeoutMs: 150 }); // the hook never answers: only the timeout ends each try
     expect(hook.hits).toHaveLength(3);
     expect(notifyLog()).toContain("gave up after 3 attempts");
-  });
+  }, 10_000); // three tries at the 150 ms limit; a timeoutMs that was ignored would take the 10 s default for each, 30 s in all
 
   test("under DRY a webhook that is not loopback is recorded, not sent", async () => {
     project({ desktop: false, webhook: "https://hooks.slack.com/services/T0/B0/xyzSECRETPATH" });

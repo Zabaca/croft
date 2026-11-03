@@ -418,7 +418,6 @@ describe("croft validate --hook: the real hook command", () => {
     proc.stdin.end();
     expect(exit).toBe(1);
     expect(stderr).toContain("stdin was still open after 5 s");
-    expect(seconds).toBeGreaterThanOrEqual(4.9);
-    expect(seconds).toBeLessThan(20);
+    expect(seconds).toBeGreaterThanOrEqual(4.9); // it waited the 5 s; that it then gave up (exit 1, the message) and was not killed at 30 s is the exit code above
   }, 60_000);
 });

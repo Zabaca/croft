@@ -1952,7 +1952,7 @@ export default ingest({
     const finishedAt = Date.parse(db.getRun(runId)!.finishedAt!);
     db.close();
     expect(finishedAt).toBeGreaterThanOrEqual(started - 1000);
-    expect(returned - finishedAt).toBeLessThan(1000);
+    expect(returned - finishedAt).toBeLessThan(2000); // timing-gap: a parent that waited for the leaky process to exit would wait out the 3 s exit grace
     const pid = (JSON.parse(readFileSync(join(root, ".croft", "logs", runId, "_process.json"), "utf8")) as { pid: number }).pid;
     const gone = () => {
       try {

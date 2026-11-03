@@ -274,7 +274,7 @@ describe("the copy is refreshed under the readers", () => {
     expect(a.asOf).toBe("2026-10-30T04:00:00-07:00");
     expect(e.status().serverMode).toMatchObject({ workerPid: pid, restarts: 0 });
     expect(swapped).toHaveLength(1);
-    expect(swapped[0]!.ms).toBeGreaterThanOrEqual(0); // how long the swap took is reported, and never held to a bound by a test
+    expect(swapped[0]!.asOf).toBe(a.asOf!); // the hook names the copy swapped in; how long the swap took is reported, and never held to a bound by a test
   });
 
   withExt("across three refreshes under steady queries from two clients, no query fails and the process and its connections survive", async () => {

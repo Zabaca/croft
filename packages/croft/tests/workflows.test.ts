@@ -115,6 +115,8 @@ describe("which workflows can publish", () => {
     expect(Object.keys(doc.on).sort()).toEqual(["push", "workflow_dispatch"]);
     expect(doc.on.push).toEqual({ tags: ["croft-v*"] });
     expect(Object.keys(doc.jobs)).toEqual(["pack", "publish"]);
+    // The release runs the whole suite in this one job (ci.yml splits it in shards): its limit leaves room to grow.
+    expect(doc.jobs.pack["timeout-minutes"]).toBeGreaterThanOrEqual(75);
     // The check that a tag names package.json's version cannot protect a branch, so a manual run from one is skipped whole.
     expect(doc.jobs.pack.if).toBe("github.ref_type == 'tag'");
     expect(doc.jobs.publish.if).toContain("github.ref_type == 'tag'");

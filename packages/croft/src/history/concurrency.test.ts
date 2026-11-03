@@ -105,9 +105,9 @@ describe("leases across processes", () => {
     try {
       setTimeout(() => child.proc.kill("SIGKILL"), 300);
       const t0 = Date.now();
-      const [l] = await acquire(db, "orders", "r_me", { waitMs: 10_000 });
+      const [l] = await acquire(db, "orders", "r_me", { waitMs: 60_000 }); // longer than this test's timeout: a wait that slept to its deadline would hang the test
       expect(l?.runId).toBe("r_me");
-      expect(Date.now() - t0).toBeGreaterThanOrEqual(250); // not before the child died; that it came at once after is the wait's 10 s against this test's timeout
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(250); // not before the child died
     } finally {
       db.close();
     }

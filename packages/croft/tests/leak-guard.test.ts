@@ -6,7 +6,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describeProc, descendantsOf, findLeaks, PACKAGE_ROOT, parseProcessTable, type Proc } from "./leak-guard.ts";
+import { anotherRunHere, describeProc, descendantsOf, findLeaks, PACKAGE_ROOT, parseProcessTable, processTable, type Proc } from "./leak-guard.ts";
 
 const p = (pid: number, ppid: number, command: string, stat = "S"): Proc => ({ pid, ppid, stat, command });
 const SELF = 100;
@@ -38,6 +38,27 @@ describe("which processes count as left behind", () => {
   });
 });
 
+describe("a second suite in this checkout", () => {
+  test("is seen by its working directory, and one elsewhere is not", async () => {
+    const stand = (cwd: string) => Bun.spawn([process.execPath, "-e", "setTimeout(() => {}, 60000)", "test"], { cwd, stdio: ["ignore", "ignore", "ignore"] });
+    const here = stand(PACKAGE_ROOT);
+    const away = stand(tmpdir());
+    try {
+      const seen = async (child: ReturnType<typeof stand>) => {
+        // lsof can only name the directory once the process exists; poll until it can
+        for (const end = Date.now() + 10_000; Date.now() < end; await Bun.sleep(50)) if (anotherRunHere(processTable().filter((p) => p.pid === child.pid), 1)) return true; // as seen by some other run: self 1 has no descendants here
+        return false;
+      };
+      expect(await seen(here)).toBe(true);
+      expect(anotherRunHere(processTable().filter((p) => p.pid === away.pid), 1)).toBe(false);
+    } finally {
+      here.kill("SIGKILL");
+      away.kill("SIGKILL");
+      await Promise.all([here.exited, away.exited]);
+    }
+  });
+});
+
 // A throwaway test run, with this package's preload (the guard) over files written for the occasion.
 const dirs: string[] = [];
 afterAll(() => {
@@ -53,7 +74,7 @@ async function runFiles(files: Record<string, string>): Promise<{ code: number |
     cwd: dir,
     // Bun 1.4 sets BUN_FEATURE_FLAG_NO_ORPHANS in the children of a `bun test --no-orphans` run, and every Bun process that has it kills what its own
     // children left behind when they exit: the fixtures here would be reaped before the guard looked, so the throwaway run is without it.
-    env: { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "BUN_FEATURE_FLAG_NO_ORPHANS")), CROFT_LEAK_GRACE_MS: "1500", NO_COLOR: "1" },
+    env: { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "BUN_FEATURE_FLAG_NO_ORPHANS")), CROFT_LEAK_GRACE_MS: "1500", CROFT_LEAK_GUARD_ORPHANS: "always", NO_COLOR: "1" },
     stdout: "pipe",
     stderr: "pipe",
   });

@@ -23,7 +23,9 @@ jobs:
   pack:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # The whole suite in this one job: ci.yml splits it in two shards per platform because one job of it took 31 to 40 minutes against 45
+    # (DESIGN.md §10 "Test strategy"). A release keeps the one job, and the time for it to grow.
+    timeout-minutes: 90
     permissions:
       contents: read
     outputs:
