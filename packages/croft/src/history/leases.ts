@@ -4,7 +4,7 @@
 // lease, so a kill -9 can never leave an asset busy forever.
 import { setTimeout as sleep } from "node:timers/promises";
 import { CroftError } from "../core/errors.ts";
-import { currentIdentity, recordAlive, type ProcessIdentity } from "../core/proc.ts";
+import { currentIdentity, recordAlive, sameBoot, type ProcessIdentity } from "../core/proc.ts";
 import type { RunsDb } from "./runs-db.ts";
 
 export interface Lease { asset: string; runId: string; pid: number; procStart: string; bootId: string; since: string }
@@ -36,7 +36,7 @@ function assetList(assets: string | string[]): string[] {
 }
 
 function sameProcess(l: Lease, id: ProcessIdentity): boolean {
-  return l.pid === id.pid && l.procStart === id.procStart && l.bootId === id.bootId;
+  return l.pid === id.pid && l.procStart === id.procStart && sameBoot(l.bootId, id.bootId);
 }
 
 /** True while the process that took the lease is still running. A lease without a start time names no
