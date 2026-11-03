@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, w
 import { join, relative } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { lakeRigReady, type LakeRig, openTestLake, startLakeRig, type TestLake, type TestLakeKind } from "./lake-testkit.ts";
-import { ageBasedExpiryOptions, deleteOrphans, listOrphans, orphanCutoff, type PassReport, runPass, type RetryPolicy } from "./lake-maintenance.ts";
+import { ageBasedExpiryOptions, deleteOrphans, listOrphans, METADATA_ALIAS, orphanCutoff, type PassReport, runPass, type RetryPolicy } from "./lake-maintenance.ts";
 import { MAINTENANCE_LOCK_LABEL } from "./lake.ts";
 import { closeAllWarehouses, openWarehouse, refuseOnLake } from "./warehouse.ts";
 
@@ -134,6 +134,29 @@ for (const kind of ["local", "postgres"] as const) {
         rows += i % 2 ? 4 : 20;
         expect(await rowsAt(l, "ticks", ids[i - 1]), `ticks v${i}`).toBe(rows);
       }
+    }, 120_000);
+
+    maybe("the flush leaves croft's own bookkeeping in the catalog: only the assets' rows become files (D-R3)", async () => {
+      const l = await fresh(kind);
+      await version(l, "ticks", async (tx) => {
+        await tx.exec("CREATE TABLE ticks (n INTEGER)");
+        await tx.exec("INSERT INTO ticks SELECT range FROM range(4)"); // few rows: kept inside the catalog
+      }, 1);
+      // Every write recorded this machine in _croft.meta; its rows are inlined too.
+      const filesBy = async (): Promise<Record<string, number>> => Object.fromEntries((await l.w.read((db) => db.all<{ s: string; n: number | bigint }>(
+        `SELECT s.schema_name AS s, count(*) AS n FROM ${METADATA_ALIAS}.ducklake_data_file f
+           JOIN ${METADATA_ALIAS}.ducklake_table t ON t.table_id = f.table_id
+           JOIN ${METADATA_ALIAS}.ducklake_schema s ON s.schema_id = t.schema_id WHERE f.end_snapshot IS NULL GROUP BY 1`), { purpose: "test" })).map((r) => [r.s, Number(r.n)]));
+      const inlinedBefore = await l.w.read((db) => db.all<{ n: number | bigint }>("SELECT count(*) AS n FROM _croft.meta"), { purpose: "test" });
+      expect(Number(inlinedBefore[0]!.n)).toBeGreaterThan(0);
+      expect(await filesBy()).toEqual({});
+      const report = await pass(l);
+      expect(report.ok, JSON.stringify(report.steps)).toBe(true);
+      expect(report.steps.find((s) => s.step === "flush")!.did).toEqual({ tables: 1, rows: 4 });
+      // ticks became a file; nothing of _croft did, and _croft still reads back.
+      expect(await filesBy()).toEqual({ main: 1 });
+      expect(Number((await l.w.read((db) => db.all<{ n: number | bigint }>("SELECT count(*) AS n FROM _croft.meta"), { purpose: "test" }))[0]!.n)).toBe(Number(inlinedBefore[0]!.n));
+      expect(await rowsAt(l, "ticks")).toBe(4);
     }, 120_000);
 
     maybe("another tool's age-based expiry on the lake expires nothing the promise keeps: not the pass, and not closing croft's instance (acceptance 3)", async () => {

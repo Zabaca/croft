@@ -10,7 +10,8 @@
 // follow-up spike recorded in option 07, item 1 of "What the follow-ups settled"), and it deletes any file in the data folder the lake does not
 // own. Each step is run by name instead, in this order:
 //   0. prune    croft's own bookkeeping log loses the rows a newer row of the same key has superseded (D154);
-//   1. flush    the rows DuckLake held inside the catalog become files;
+//   1. flush    the rows DuckLake held inside the catalog become files, for the assets' schema only: croft's own bookkeeping (`_croft`)
+//               stays in the catalog, because each read of it from a store costs a request or three once it is files (D-R3);
 //   2. expire   the snapshots outside the promise, by an explicit list of ids croft computes (planExpiry);
 //   3. merge    small files become fewer, larger ones (time travel is kept: the merged file remembers each row's snapshot);
 //   4. rewrite  files dominated by deleted rows are rewritten;
@@ -26,6 +27,9 @@ import { TRASH_RETENTION } from "../safety/trash.ts";
 import { ASSET_TABLES, kindOfObjects, STATE_SPECS, stateObjects } from "./bookkeeping.ts";
 import { isConnectionError } from "./lake.ts";
 import { LAKE_ALIAS } from "./modes.ts";
+
+/** The schema the assets' tables are in; croft's bookkeeping is in `_croft`. */
+export const ASSET_SCHEMA = "main";
 
 /** The name DuckLake gives the catalog's own tables once the lake is attached (`__ducklake_metadata_<alias>`). */
 export const METADATA_ALIAS = `__ducklake_metadata_${LAKE_ALIAS}`;
@@ -74,12 +78,12 @@ export function assetsChanged(changes: Record<string, string[]>, tables: Readonl
     for (const v of values) {
       if (kind === "tables_created") {
         const dot = v.indexOf(".");
-        if (dot > 0 && v.slice(0, dot) === "main") out.add(v.slice(dot + 1));
+        if (dot > 0 && v.slice(0, dot) === ASSET_SCHEMA) out.add(v.slice(dot + 1));
         continue;
       }
       const id = Number(v);
       const t = Number.isInteger(id) ? tables.get(id) : undefined;
-      if (t && t.schema === "main") out.add(t.name);
+      if (t && t.schema === ASSET_SCHEMA) out.add(t.name);
     }
   }
   return [...out];
@@ -400,7 +404,9 @@ export async function runPass(sql: Sql, o: PassOptions): Promise<PassReport> {
   };
   await step("prune", async () => pruneBookkeeping(sql));
   await step("flush", async () => {
-    const rows = await sql.all<{ rows_flushed: unknown }>(`CALL ducklake_flush_inlined_data('${LAKE_ALIAS}')`);
+    // The assets' schema alone (D-R3): the rows of `_croft` are a few at a time, and read on every run, so they are kept where a read of them is
+    // one round trip to the catalog, not a list and a range read of a Parquet file for each table in the store.
+    const rows = await sql.all<{ rows_flushed: unknown }>(`CALL ducklake_flush_inlined_data('${LAKE_ALIAS}', schema_name => '${ASSET_SCHEMA}')`);
     return { tables: rows.length, rows: rows.reduce((n, r) => n + num(r.rows_flushed), 0) };
   });
   await step("expire", async () => {
