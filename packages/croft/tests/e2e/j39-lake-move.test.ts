@@ -306,7 +306,7 @@ if (!LAKE) {
       const asked = await p.json(["move-to-lake"]);
       expect(asked.code, show(asked)).toBe(2);
       expect(asked.json.problems[0]).toMatchObject({ code: "MOVE_LAKE_NOT_EMPTY", effect: "nothing was changed" });
-      expect(asked.json.problems[0].message).toMatch(/written since|not this one/);
+      expect(asked.json.problems[0].message).toMatch(/written since|not this one|move finished/);
     }, 300_000);
   });
 

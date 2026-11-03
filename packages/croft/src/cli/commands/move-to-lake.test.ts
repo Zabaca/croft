@@ -236,12 +236,10 @@ describe("croft move-to-lake: the move, in miniature", () => {
     const back = await child(p, ["status", "--json"]);
     expect(back.json.data.lakeMove).toMatchObject({ state: "back" });
     expect(back.json.database).toBe("warehouse.duckdb");
-    // Moved again without a write in between: the lake already holds an equal copy, which is proved again and switched to.
+    // Moved again without a write in between: refused, the move already finished (a move that only stopped is finished, tests/e2e/j39-lake-move.test.ts).
     const second = await move(p);
-    expect(second.exit, second.stdout).toBe(5);
-    expect(second.json.data.mode).toBe("finish");
-    const finished = await cli(["confirm", second.json.confirmation.token, "--json"], { cwd: p.root, env });
-    await closeAllWarehouses();
-    expect(finished.json.data.result).toMatchObject({ status: "moved", mode: "finish" });
+    expect(second.exit, second.stdout).toBe(2);
+    expect(second.json.problems[0]).toMatchObject({ code: "MOVE_LAKE_NOT_EMPTY", effect: "nothing was changed" });
+    expect(second.json.problems[0].message).toContain("that move finished and the project was switched back to the file since");
   }, 300_000);
 });
