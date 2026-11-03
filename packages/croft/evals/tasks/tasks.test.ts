@@ -125,7 +125,7 @@ describe("the eval tasks' verifiers", () => {
   }
 });
 
-// The task that dates its story by the clock is also run at the hours a real clock once broke it (now less 24 and 48 hours, DESIGN.md D-F3):
+// The task that dates its story by the clock is also run at the hours a real clock once broke it (now less 24 and 48 hours, DESIGN.md D157):
 // in the fixture's zone, 23:00 to midnight on the day the clocks went back and on the day after (last night was today; the night before last
 // was last night), and midnight to 01:00 on the first two days after they went forward (a night skipped).
 describe("failed-last-night at the hours a clock could break it", () => {
