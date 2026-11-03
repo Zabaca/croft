@@ -30,7 +30,7 @@ import { type DuckDBConnection, type DuckDBInstance, type DuckDBResultReader, ty
 import { CroftError } from "../core/errors.ts";
 import type { LockHolder, Sql, Warehouse } from "../core/types.ts";
 import type { Row } from "../types.ts";
-import { type AccessMode, canonicalPath, connect, type LockConflict, lockConflict, openInstance, openMemoryInstance, type SandboxSpec } from "./connect.ts";
+import { type AccessMode, canonicalPath, connect, type LockConflict, lockConflict, openInstance, openMemoryInstance, type SandboxSpec, startFailure } from "./connect.ts";
 import { bookkeepingOf, seqResetSql } from "./bookkeeping.ts";
 import * as intents from "./intent.ts";
 import {
@@ -163,8 +163,16 @@ export class LeaseSql implements Sql {
   hooks: { begin?: () => Promise<void>; commit?: () => Promise<void> } | null = null;
   /** The statements of a lake warehouse: croft never runs CHECKPOINT on a lake, sets one of its options or expires its snapshots by age (D149). */
   lake = false;
+  /** A lake read is one transaction (DuckLake charges the catalog's round trips for each one, D-T2), and a statement DuckDB refuses aborts it: this
+   *  starts another, so a body that goes on after a refused statement (a table that is not there, a query the user got wrong) is as it was when
+   *  every statement was a transaction of its own. Not called for a connection that dropped: the lease retries the whole body. */
+  recover: (() => Promise<void>) | null = null;
 
   constructor(readonly connection: DuckDBConnection, private readonly ctx: RenderContext, private readonly guard: TxGuard | null) {}
+
+  private async mended(e: unknown): Promise<void> {
+    if (this.recover && !isConnectionError(e)) await this.recover();
+  }
 
   async all<T = Row>(sql: string, params: unknown[] = []): Promise<T[]> {
     return renderRows((await this.run(sql, params, true))!, this.ctx) as T[];
@@ -191,6 +199,7 @@ export class LeaseSql implements Sql {
       stmt = await this.connection.prepare(sql);
     } catch (e) {
       if (this.guard) this.failed ??= e as Error;
+      await this.mended(e);
       if (/Cannot prepare multiple statements/.test((e as Error).message)) {
         throw new CroftError("SQL_NOT_ONE_STATEMENT", { message: "croft runs one SQL statement per call", hint: "report this croft bug", details: { sql: sql.slice(0, 200) } });
       }
@@ -212,6 +221,7 @@ export class LeaseSql implements Sql {
         if (word === "BEGIN") await this.hooks!.begin?.();
       } catch (e) {
         if (this.guard) this.failed ??= e as Error;
+        await this.mended(e);
         throw e;
       }
       this.guard?.record(type, sql);
@@ -296,10 +306,21 @@ export class DuckWarehouse implements Warehouse {
   }
 
   /** The Sql over a connection of this warehouse; a lake's refuses what croft never runs on one (refuseOnLake). */
-  private sqlOver(conn: DuckDBConnection, guard: TxGuard | null): LeaseSql {
+  private sqlOver(conn: DuckDBConnection, guard: TxGuard | null, wholeRead = false): LeaseSql {
     const sql = new LeaseSql(conn, this.renderCtx(), guard);
     sql.lake = this.lake !== null;
+    if (wholeRead && this.lake) sql.recover = () => this.restartRead(conn);
     return sql;
+  }
+
+  /** A lake read's transaction was aborted by a statement DuckDB refused: end it and begin another (the default catalog survives a rollback). */
+  private async restartRead(conn: DuckDBConnection): Promise<void> {
+    try {
+      await conn.run("ROLLBACK");
+      await conn.run("BEGIN TRANSACTION");
+    } catch {
+      // The next statement says what is wrong with the connection.
+    }
   }
 
   /** Whether this warehouse is a lake. */
@@ -318,7 +339,7 @@ export class DuckWarehouse implements Warehouse {
   }
 
   read<T>(fn: (db: LeaseSql) => Promise<T>, o?: ReadOptions): Promise<T> {
-    return this.lease("read", o?.waitMs, (conn) => fn(this.sqlOver(conn, null)), undefined, o?.signal);
+    return this.lease("read", o?.waitMs, (conn) => fn(this.sqlOver(conn, null, true)), undefined, o?.signal);
   }
 
   write<T>(label: string, fn: (tx: LeaseSql) => Promise<T>, o?: WriteOptions): Promise<T> {
@@ -525,6 +546,13 @@ export class DuckWarehouse implements Warehouse {
    * A lease on the lake: a connection (the first one attaches the lake, retried when the catalog was unreachable for a moment), working in
    * the lake, and the body. A read whose catalog or store connection dropped is tried again; a write does its own retrying
    * (lakeWrite), because it must check its commit first. Every error that leaves is scrubbed.
+   *
+   * A read is one transaction from `USE lake` to the end of its body (D-T2). Every statement outside a transaction is a DuckLake
+   * transaction of its own, and each of those costs the catalog's round trips (a snapshot lookup, and for each table the files, the stats and
+   * the inlined rows: 9 to 26 of them, 0.4 to 1.1 s at the 41 ms the second real-lake trial measured), so the 11 statements croft ran to
+   * read the state of one asset cost 6 s; in one transaction the snapshot and what DuckLake learned of a table are paid once. Nothing in a
+   * read changes the lake, so the transaction is rolled back at the end, which costs nothing; and a statement DuckDB refuses (which aborts a
+   * transaction) is followed by a new one (LeaseSql.recover), so a body may go on after a failed statement as it could before.
    */
   private async inLake<T>(kind: "read" | "write", first: DuckDBInstance, body: (conn: DuckDBConnection) => Promise<T>, signal: AbortSignal | undefined,
     give: (conn: DuckDBConnection) => void): Promise<T> {
@@ -533,7 +561,10 @@ export class DuckWarehouse implements Warehouse {
     for (let attempt = 0; !conn; attempt++) {
       try {
         conn = await connect(instance, this.spec, this.key);
-      } catch (e) {
+      } catch (raised) {
+        // A lease that shared the instance with one whose attach failed is refused by the instance ("left part set up"), and that is not what
+        // went wrong: what stopped the attach is, and it is the same attach.
+        const e = startFailure(instance) ?? raised;
         this.dropInstance(instance);
         const details = e instanceof CroftError && e.code === "LAKE_ATTACH_FAILED" ? e.problem.details : undefined;
         if (details?.notCreated) {
@@ -547,7 +578,8 @@ export class DuckWarehouse implements Warehouse {
         if (details && typeof details.duckdb === "string" && isConnectionError(details.duckdb) && attempt < LAKE_RETRY.connection) {
           await sleep(lakeBackoffMs(attempt));
           if (signal?.aborted) throw waitAborted(signal);
-          instance = await this.openLake();
+          // The instance another lease opened since, or a new one (one open at a time).
+          instance = await this.ensureOpen(kind, 0, undefined, signal);
           continue;
         }
         throw this.scrub(e);
@@ -555,19 +587,30 @@ export class DuckWarehouse implements Warehouse {
     }
     give(conn);
     this.conns.add(conn);
-    await conn.run(`USE ${LAKE_ALIAS}`);
+    const whole = kind === "read";
+    const endRead = async () => {
+      try { await conn!.run("ROLLBACK"); } catch { /* none open, or the connection is gone */ }
+    };
+    let used = false;
     for (let attempt = 0; ; attempt++) {
       try {
+        if (whole) await conn.run("BEGIN TRANSACTION");
+        if (whole || !used) {
+          await conn.run(`USE ${LAKE_ALIAS}`);
+          used = true;
+        }
         if (!this.formatChecked) {
           // Refuse a lake from a newer croft before touching it (DB_NEWER_FORMAT); once per process.
           await checkFormat(this.sqlOver(conn, null));
           this.formatChecked = true;
         }
-        return await body(conn);
+        const out = await body(conn);
+        if (whole) await endRead();
+        return out;
       } catch (e) {
+        if (whole) await endRead();
         if (kind === "read" && isConnectionError(e)) {
           if (attempt < LAKE_RETRY.connection) {
-            try { await conn.run("ROLLBACK"); } catch { /* none open */ }
             await sleep(lakeBackoffMs(attempt));
             continue;
           }
