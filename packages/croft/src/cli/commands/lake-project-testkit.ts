@@ -21,9 +21,9 @@ export interface LakeProject {
 }
 
 /** A lake project with `orders` built (20 rows). `rig` is needed for a shared lake (Postgres and a store); a local one needs none. */
-export async function lakeProject(kind: "local" | "postgres", o: { extensionDir: string; rig?: LakeRig; files?: Record<string, string> }): Promise<LakeProject> {
+export async function lakeProject(kind: "local" | "postgres", o: { extensionDir: string; rig?: LakeRig; lake?: RigLake; files?: Record<string, string> }): Promise<LakeProject> {
   const p = makeProject({ files: { "files/x.csv": "a,b\n1,2\n", "assets/orders.sql": ORDERS_SQL, ...o.files } });
-  const shared = kind === "postgres" ? await o.rig!.lake() : null;
+  const shared = kind === "postgres" ? o.lake ?? await o.rig!.lake() : null;
   useLake(p.root, { block: shared ? shared.block : localLakeBlock(), ...(shared ? { env: shared.env } : {}) });
   const env: Record<string, string> = { CROFT_EXTENSION_DIR: o.extensionDir, ...(shared?.env ?? {}) };
   const built = await cli(["run", "orders", "--foreground", "--json"], { cwd: p.root, env });

@@ -3,7 +3,7 @@
 // service, and nothing here uses launchctl (tests/preload.ts keeps refusing it). A test that needs one skips with
 // a clear reason when the program is not installed, and fails in CI (CROFT_CI=1).
 import { type Subprocess } from "bun";
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -61,8 +61,9 @@ export interface TestPostgres {
   stop(): Promise<void>;
 }
 
-/** Start a Postgres with a temporary data folder, listening on 127.0.0.1 only. */
-export async function startPostgres(): Promise<TestPostgres> {
+/** Start a Postgres with a temporary data folder, listening on 127.0.0.1 only. With `tls` it offers TLS with that certificate and key
+ *  (PEM files, copied into the server's folder; tls-testkit.ts makes them), as a hosted Postgres does. */
+export async function startPostgres(o: { tls?: { cert: string; key: string } } = {}): Promise<TestPostgres> {
   const bin = postgresBin();
   if (!bin) throw new Error("postgres is not installed");
   const dir = mkdtempSync(join(tmpdir(), "croft-pg-"));
@@ -75,9 +76,17 @@ export async function startPostgres(): Promise<TestPostgres> {
     throw new Error(`initdb failed: ${init.stderr.toString()}`);
   }
   const port = freePort();
+  const tlsArgs: string[] = [];
+  if (o.tls) {
+    // Postgres refuses a key file that is readable by anyone else.
+    copyFileSync(o.tls.cert, join(dir, "server.crt"));
+    copyFileSync(o.tls.key, join(dir, "server.key"));
+    chmodSync(join(dir, "server.key"), 0o600);
+    tlsArgs.push("-c", "ssl=on", "-c", `ssl_cert_file=${join(dir, "server.crt")}`, "-c", `ssl_key_file=${join(dir, "server.key")}`);
+  }
   // -k points the unix socket at the temporary folder, so nothing is left in /tmp or the system socket folder.
   const launch = () => {
-    const c = Bun.spawn([join(bin, "postgres"), "-D", data, "-p", String(port), "-k", dir, "-c", "listen_addresses=127.0.0.1", "-c", "fsync=off", "-c", "max_connections=60"], { stdout: "ignore", stderr: "ignore" });
+    const c = Bun.spawn([join(bin, "postgres"), "-D", data, "-p", String(port), "-k", dir, "-c", "listen_addresses=127.0.0.1", "-c", "fsync=off", "-c", "max_connections=60", ...tlsArgs], { stdout: "ignore", stderr: "ignore" });
     children.add(c);
     return c;
   };

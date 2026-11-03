@@ -9,6 +9,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSy
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { CroftError } from "../core/errors.ts";
+import type { CatalogSslMode } from "../project/lake-config.ts";
 import { connect, instanceConfig, type SandboxSpec } from "./connect.ts";
 import { extensionsReady, IN_CI } from "./extension-dir-testkit.ts";
 import { extensionPath, hostPlatform, verifyExtension } from "./extension-files.ts";
@@ -477,13 +478,13 @@ describe("a mode that does not fit its profile, differs from the instance, or fa
   });
 
   test("the identity and credential digest tell two lakes apart without printing a secret", () => {
-    const lake = (o: { access?: "write" | "read"; host?: string; port?: number; database?: string; user?: string; password?: string; keyId?: string }): ModeSpec => ({
+    const lake = (o: { access?: "write" | "read"; host?: string; port?: number; database?: string; user?: string; password?: string; keyId?: string; sslMode?: CatalogSslMode; sslRootCert?: string }): ModeSpec => ({
       kind: "lake", extensionDir: "/e", secretDir: "/s",
-      lake: { catalog: { kind: "postgres", host: o.host ?? "h", port: o.port ?? 5432, database: o.database ?? "d", user: o.user ?? "u", password: o.password ?? "pw-one-1234" }, data: { path: "s3://b/f/", keyId: o.keyId ?? "KEYID1234", secretKey: "sk-one-5678" }, access: o.access ?? "write" },
+      lake: { catalog: { kind: "postgres", host: o.host ?? "h", port: o.port ?? 5432, database: o.database ?? "d", user: o.user ?? "u", password: o.password ?? "pw-one-1234", ...(o.sslMode ? { sslMode: o.sslMode } : {}), ...(o.sslRootCert ? { sslRootCert: o.sslRootCert } : {}) }, data: { path: "s3://b/f/", keyId: o.keyId ?? "KEYID1234", secretKey: "sk-one-5678" }, access: o.access ?? "write" },
     });
     const id = (m: ModeSpec) => JSON.stringify(modeIdentity(m));
     const base = lake({});
-    for (const other of [lake({ access: "read" }), lake({ host: "h2" }), lake({ port: 5433 }), lake({ database: "d2" }), lake({ user: "u2" })]) expect(id(other)).not.toBe(id(base));
+    for (const other of [lake({ access: "read" }), lake({ host: "h2" }), lake({ port: 5433 }), lake({ database: "d2" }), lake({ user: "u2" }), lake({ sslMode: "disable" }), lake({ sslMode: "verify-full", sslRootCert: "/ca.pem" }), lake({ sslMode: "verify-full", sslRootCert: "/other.pem" })]) expect(id(other)).not.toBe(id(base));
     expect(id(lake({ password: "pw-two-9999" }))).toBe(id(base));
     expect(modeCredentialDigest(lake({ password: "pw-two-9999" }))).not.toBe(modeCredentialDigest(base));
     expect(modeCredentialDigest(lake({ keyId: "KEYID9999" }))).not.toBe(modeCredentialDigest(base));

@@ -40,10 +40,16 @@ export interface LakeBucketConfig {
 export interface LakeMaintenanceConfig { enabled: boolean; everyHours: number }
 export const DEFAULT_MAINTENANCE: LakeMaintenanceConfig = { enabled: true, everyHours: 24 };
 
-/** A shared lake: a Postgres catalog and a bucket. */
+/** How the catalog connection uses TLS (libpq's sslmode): `verify-full` checks the server's certificate and host name, `require`
+ *  encrypts and does not check the host name, `prefer` encrypts when the server offers it (libpq's own default), `disable` never does (D159). */
+export type CatalogSslMode = "verify-full" | "require" | "prefer" | "disable";
+export const SSL_MODES: readonly CatalogSslMode[] = ["verify-full", "require", "prefer", "disable"];
+
+/** A shared lake: a Postgres catalog and a bucket. `sslMode` is always set: what the project wrote, else the default for its host
+ *  (isLoopbackHost). `sslRootCert` is as written (relative to the project folder, or absolute), present only with `verify-full`. */
 export interface SharedLakeConfig {
   kind: "postgres";
-  catalog: { host: string; port: number; database: string; writer: LakeLogin; reader: LakeLogin };
+  catalog: { host: string; port: number; database: string; sslMode: CatalogSslMode; sslRootCert?: string; writer: LakeLogin; reader: LakeLogin };
   bucket: LakeBucketConfig;
   maintenance: LakeMaintenanceConfig;
 }
@@ -70,7 +76,7 @@ export interface LakeChecks {
 
 export const LAKE_KEYS = ["catalog", "bucket", "dataPath", "maintenance"];
 const MAINTENANCE_KEYS = ["enabled", "everyHours"];
-const CATALOG_KEYS = ["kind", "host", "port", "database", "writer", "reader", "path"];
+const CATALOG_KEYS = ["kind", "host", "port", "database", "sslMode", "sslRootCert", "writer", "reader", "path"];
 const LOGIN_KEYS = ["user", "passwordSecret"];
 const BUCKET_KEYS = ["name", "folder", "endpoint", "region", "urlStyle", "useSsl", "writer", "reader"];
 const KEY_KEYS = ["keyIdSecret", "secretKeySecret", "sessionTokenSecret"];
@@ -84,6 +90,15 @@ const BUCKET = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
 const FOLDER_SEGMENT = /^[A-Za-z0-9._-]+$/;
 const ENDPOINT = /^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?$/;
 const REGION = /^[A-Za-z0-9-]{1,30}$/;
+
+/** A catalog on this machine: nothing crosses a network, so TLS is not what keeps its password from anyone (D159). `127.x.x.x` is
+ *  four octets, each 0 to 255: anything else is a name to look up, and a name is not known to be this machine. */
+export function isLoopbackHost(host: string): boolean {
+  const h = host.trim().toLowerCase();
+  if (h === "localhost") return true;
+  const m = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  return !!m && m.slice(1).every((o) => Number(o) <= 255);
+}
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
@@ -214,6 +229,7 @@ function sharedLake(raw: Record<string, unknown>, cat: Record<string, unknown>, 
   else if (typeof cat.database !== "string" || !DATABASE.test(cat.database)) {
     add("lake.catalog.database", `"lake.catalog.database" must be a Postgres database name (letters, digits and underscores); found ${show(cat.database)}`, `use a name like "croft_lake"`);
   } else database = cat.database;
+  const tls = validateCatalogTls(cat, host, c);
   const writer = login(c, cat, "lake.catalog", "writer");
   const reader = login(c, cat, "lake.catalog", "reader");
   if (writer && reader) {
@@ -227,7 +243,39 @@ function sharedLake(raw: Record<string, unknown>, cat: Record<string, unknown>, 
     }
   }
   const bucket = bucketConfig(raw.bucket, c);
-  return host && database && writer && reader && bucket ? { kind: "postgres", catalog: { host, port, database, writer, reader }, bucket, maintenance } : null;
+  return host && database && writer && reader && bucket && tls
+    ? { kind: "postgres", catalog: { host, port, database, sslMode: tls.sslMode, ...(tls.sslRootCert ? { sslRootCert: tls.sslRootCert } : {}), writer, reader }, bucket, maintenance } : null;
+}
+
+/** `sslMode` and `sslRootCert` (D159). Without `sslMode` a catalog on this machine keeps libpq's `prefer` (what croft did before the
+ *  setting existed) and any other host is `verify-full`: the password and every catalog row cross a network, and an unchecked
+ *  certificate lets whoever is in the path read them. The root certificate file is not opened here (db/catalog-tls.ts does, at attach). */
+function validateCatalogTls(cat: Record<string, unknown>, host: string, c: LakeChecks): { sslMode: CatalogSslMode; sslRootCert?: string } | null {
+  const { add, show } = c;
+  let sslMode: CatalogSslMode | undefined;
+  let bad = false;
+  if (cat.sslMode !== undefined) {
+    if (typeof cat.sslMode === "string" && (SSL_MODES as readonly string[]).includes(cat.sslMode)) sslMode = cat.sslMode as CatalogSslMode;
+    else {
+      bad = true;
+      add("lake.catalog.sslMode", `"lake.catalog.sslMode" must be ${SSL_MODES.map((m) => `"${m}"`).join(", ")}; found ${show(cat.sslMode)}`,
+        `use "verify-full" for a catalog on another machine (it checks the server's certificate and host name)`);
+    }
+  }
+  const effective = sslMode ?? (isLoopbackHost(host) ? "prefer" : "verify-full");
+  let sslRootCert: string | undefined;
+  if (cat.sslRootCert !== undefined) {
+    if (typeof cat.sslRootCert !== "string" || cat.sslRootCert.trim() === "") {
+      bad = true;
+      add("lake.catalog.sslRootCert", `"lake.catalog.sslRootCert" must be the path of a PEM file of certificate authorities; found ${show(cat.sslRootCert)}`,
+        `give a path such as "certs/neon-root.pem", or leave it out to use this machine's CA bundle`);
+    } else if (!bad && effective !== "verify-full") {
+      bad = true;
+      add("lake.catalog.sslRootCert", `"lake.catalog.sslRootCert" is used only by "sslMode": "verify-full"; this catalog's sslMode is "${effective}"${sslMode ? "" : " (the default for a catalog on this machine)"}`,
+        `set "lake.catalog.sslMode" to "verify-full", or remove "sslRootCert"`);
+    } else sslRootCert = cat.sslRootCert;
+  }
+  return bad ? null : { sslMode: effective, ...(sslRootCert ? { sslRootCert } : {}) };
 }
 
 function bucketConfig(raw: unknown, c: LakeChecks): LakeBucketConfig | null {
@@ -292,7 +340,7 @@ function bucketConfig(raw: unknown, c: LakeChecks): LakeBucketConfig | null {
 
 function localLake(raw: Record<string, unknown>, cat: Record<string, unknown>, c: LakeChecks, maintenance: LakeMaintenanceConfig): LocalLakeConfig | null {
   const { add, show } = c;
-  for (const k of ["host", "port", "database", "writer", "reader"]) {
+  for (const k of ["host", "port", "database", "sslMode", "sslRootCert", "writer", "reader"]) {
     if (cat[k] !== undefined) add(joinPath("lake.catalog", k), `"lake.catalog.${k}" is for a Postgres catalog; a SQLite catalog is one file, "path"`, `remove "${k}", or set "kind" to "postgres"`);
   }
   if (raw.bucket !== undefined) add("lake.bucket", `"lake.bucket" is for a lake with a Postgres catalog; a local lake keeps its files in "dataPath"`, `remove "bucket", or set the catalog's "kind" to "postgres"`);

@@ -17,6 +17,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { CroftError } from "../core/errors.ts";
 import type { Fix } from "../core/types.ts";
+import type { CatalogSslMode } from "../project/lake-config.ts";
 import type { Profile } from "./connect.ts";
 import { type ExtensionName } from "./extension-names.ts";
 import { addonFor } from "./addons.ts";
@@ -30,6 +31,10 @@ export interface LakePostgres {
   database: string;
   user: string;
   password: string;
+  /** libpq's `sslmode` and, for `verify-full`, the CA file (an absolute path); see db/catalog-tls.ts. Left out, libpq's own default
+   *  applies (`prefer`, which is also what any ambient PGSSLMODE would change): lake.ts always sets it. */
+  sslMode?: CatalogSslMode;
+  sslRootCert?: string;
 }
 
 /** Where a lake keeps its Parquet files: one folder of one bucket on an S3-compatible store, with one key. */
@@ -154,7 +159,7 @@ export function modeIdentity(mode: ModeSpec): unknown {
   if (mode.kind === "readers") return { ...base, copy: mode.copy };
   if (mode.kind === "lake-local") return { ...base, catalog: mode.lake.catalog.path, dataPath: mode.lake.dataPath, access: mode.lake.access };
   const { catalog, data, access } = mode.lake;
-  return { ...base, catalog: [catalog.host, catalog.port, catalog.database, catalog.user], data: [data.path, data.endpoint ?? null, data.region ?? null, data.urlStyle ?? null, data.useSsl ?? null], access };
+  return { ...base, catalog: [catalog.host, catalog.port, catalog.database, catalog.user, catalog.sslMode ?? null, catalog.sslRootCert ?? null], data: [data.path, data.endpoint ?? null, data.region ?? null, data.urlStyle ?? null, data.useSsl ?? null], access };
 }
 
 /** A digest of the mode's credentials, compared but never printed: a different password or key is a different instance. */
@@ -238,8 +243,11 @@ export async function startMode(conn: DuckDBConnection, mode: ModeSpec, files: M
 /** Create the lake's two named secrets and attach it; the password and keys are in the statements below and nowhere else. */
 async function attachLake(conn: DuckDBConnection, lake: LakeSpec, secrets: string[]): Promise<void> {
   const { catalog, data, access } = lake;
-  const fail = (e: unknown) => lakeFailure(e, secrets, access);
-  await attempt(conn, `CREATE OR REPLACE TEMPORARY SECRET ${LAKE_CATALOG_SECRET} (TYPE postgres, HOST ${q(catalog.host)}, PORT ${Math.trunc(catalog.port)}, DATABASE ${q(catalog.database)}, USER ${q(catalog.user)}, PASSWORD ${q(catalog.password)})`, fail);
+  const fail = (e: unknown) => lakeFailure(e, secrets, access, catalog.sslMode);
+  // sslmode and sslrootcert are libpq connection parameters, which the postgres extension reads from the secret [V: 2.0.0, a Postgres with
+  // TLS]. libpq reads the CA file itself, outside DuckDB's file system, so the lock's allowed_directories neither needs nor gets it.
+  const tls = [...(catalog.sslMode ? [`SSLMODE ${q(catalog.sslMode)}`] : []), ...(catalog.sslRootCert ? [`SSLROOTCERT ${q(catalog.sslRootCert)}`] : [])];
+  await attempt(conn, `CREATE OR REPLACE TEMPORARY SECRET ${LAKE_CATALOG_SECRET} (TYPE postgres, HOST ${q(catalog.host)}, PORT ${Math.trunc(catalog.port)}, DATABASE ${q(catalog.database)}, USER ${q(catalog.user)}, PASSWORD ${q(catalog.password)}${tls.map((t) => `, ${t}`).join("")})`, fail);
   const opts = [
     "TYPE s3", `KEY_ID ${q(data.keyId)}`, `SECRET ${q(data.secretKey)}`, `SCOPE ${q(data.path)}`,
     ...(data.sessionToken ? [`SESSION_TOKEN ${q(data.sessionToken)}`] : []),
@@ -264,21 +272,35 @@ const NOT_CREATED = /Existing DuckLake .* does not exist|creating a new DuckLake
  *  is down or unreachable is not one of these: that is mended by waiting. */
 export const REFUSED = /password authentication failed|authentication failed|no pg_hba|role "[^"]*" does not exist|database "[^"]*" does not exist|InvalidAccessKeyId|SignatureDoesNotMatch|AccessDenied|HTTP 40[13]/i;
 
-/** DuckDB's refusal to attach a lake, with every credential taken out of the text. */
-function lakeFailure(e: unknown, secrets: readonly string[], access?: "write" | "read"): CroftError {
+/** libpq's and OpenSSL's words for a TLS check that failed (an unverifiable certificate, a name it was not issued for, a server with no
+ *  TLS when TLS is required) [V: 2.0.0, a Postgres with TLS and one without]. Waiting does not change the answer, so it is not a
+ *  connection that dropped (isConnectionError) and is not retried. */
+export const TLS_REFUSED = /certificate verify failed|does not match host name|server does not support SSL|SSL error: (?:sslv3|tlsv1|wrong version|no protocols|ca md too weak)|root certificate file|invalid sslmode/i;
+
+const TLS_SETTINGS = "lake.catalog.sslMode, lake.catalog.sslRootCert (croft docs lake)";
+
+/** DuckDB's refusal to attach a lake, with every credential taken out of the text. `sslMode` is the catalog's, for the hint of a TLS refusal. */
+function lakeFailure(e: unknown, secrets: readonly string[], access?: "write" | "read", sslMode?: string): CroftError {
   const raw = e instanceof Error ? e.message : String(e);
-  const detail = scrub(raw.split("\n")[0]!, secrets);
+  const tls = TLS_REFUSED.test(raw);
+  // With several addresses for one host name (localhost: ::1 and 127.0.0.1) libpq lists each failure on a line of its own, and DuckDB's
+  // first line can be the one about an address nobody listens on; the line about the TLS check is the one that says what to fix.
+  const detail = scrub((tls ? raw.split("\n").find((l) => TLS_REFUSED.test(l)) : undefined) ?? raw.split("\n")[0]!, secrets);
   const notCreated = access === "read" && NOT_CREATED.test(raw);
-  const refused = REFUSED.test(raw);
+  const refused = !tls && REFUSED.test(raw);
   return new CroftError("LAKE_ATTACH_FAILED", {
     message: `croft could not attach the lake: ${detail}`,
     hint: notCreated
       ? "the lake does not exist yet: the machine that writes creates it with its first run (croft run), then readers can attach"
+      : tls
+        ? sslMode === "verify-full"
+          ? `croft checks the catalog's certificate and it did not check out: it must be signed by a CA in the file lake.catalog.sslRootCert names (default: this machine's CA bundle) and issued for the name in lake.catalog.host. A catalog with no TLS fails here too. Fix the catalog's certificate or ${TLS_SETTINGS}; trying again will not help. Do not weaken lake.catalog.sslMode without asking the user`
+          : `the catalog's TLS handshake failed with lake.catalog.sslMode "${sslMode ?? "prefer"}": check that setting against what the catalog offers (${TLS_SETTINGS}); trying again will not help`
       : refused
         ? "the catalog or the store refused the login or the key: ask the user to check the secrets the lake block names (croft docs LAKE_ATTACH_FAILED); trying again will not help"
         : "check the catalog's host, port, database and login, and the bucket's endpoint and key, in the project's settings and secrets",
-    retryable: !notCreated && !refused,
-    details: { duckdb: detail, ...(notCreated ? { notCreated: true } : {}), ...(refused ? { refused: true } : {}) },
+    retryable: !notCreated && !refused && !tls,
+    details: { duckdb: detail, ...(notCreated ? { notCreated: true } : {}), ...(refused ? { refused: true } : {}), ...(tls ? { tls: true } : {}) },
   });
 }
 

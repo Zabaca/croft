@@ -41,7 +41,7 @@ describe("a shared lake", () => {
     if (!r.ok) return;
     expect(r.config.lake).toEqual({
       kind: "postgres",
-      catalog: { host: "db.example.com", port: 5432, database: "croft_lake",
+      catalog: { host: "db.example.com", port: 5432, database: "croft_lake", sslMode: "verify-full",
         writer: { user: "croft_writer", passwordSecret: "LAKE_WRITER_PASSWORD" }, reader: { user: "croft_reader", passwordSecret: "LAKE_READER_PASSWORD" } },
       bucket: { name: "my-bucket", folder: "croft/orders/", urlStyle: "path", useSsl: true,
         writer: { keyIdSecret: "LAKE_WRITER_KEY_ID", secretKeySecret: "LAKE_WRITER_KEY" }, reader: { keyIdSecret: "LAKE_READER_KEY_ID", secretKeySecret: "LAKE_READER_KEY" } },
@@ -129,6 +129,46 @@ describe("a lake's maintenance setting (D150)", () => {
     expect(m({ everyHours: 721 })).toContain("lake.maintenance.everyHours");
     expect(m({ enabled: "yes" })).toContain("lake.maintenance.enabled");
     expect(m("daily")).toContain('"lake.maintenance" must be an object');
+  });
+});
+
+describe("the TLS of a shared lake's catalog (D159)", () => {
+  const tls = (catalog: Record<string, unknown>) => {
+    const r = validateConfig({ ...tz, lake: shared({ catalog }) });
+    return r.ok && r.config.lake?.kind === "postgres" ? { sslMode: r.config.lake.catalog.sslMode, sslRootCert: r.config.lake.catalog.sslRootCert } : null;
+  };
+
+  test("without a setting, a catalog on another machine is checked (verify-full) and one on this machine keeps libpq's prefer", () => {
+    expect(tls({})).toEqual({ sslMode: "verify-full", sslRootCert: undefined });
+    for (const host of ["localhost", "LOCALHOST", "127.0.0.1", "127.1.2.3", "127.255.255.255"]) expect(tls({ host }), host).toEqual({ sslMode: "prefer", sslRootCert: undefined });
+    for (const host of ["10.0.0.5", "db.internal", "128.0.0.1", "127.0.0.1.example.com", "127.999.0.1", "127.0.0.256", "[::1]"]) expect(tls({ host }), host).toEqual({ sslMode: "verify-full", sslRootCert: undefined });
+  });
+
+  test("each mode is kept as written, wherever the host is, and a root certificate goes with verify-full", () => {
+    for (const sslMode of ["verify-full", "require", "prefer", "disable"] as const) {
+      expect(tls({ sslMode }), sslMode).toEqual({ sslMode, sslRootCert: undefined });
+      expect(tls({ host: "127.0.0.1", sslMode }), sslMode).toEqual({ sslMode, sslRootCert: undefined });
+    }
+    expect(tls({ sslRootCert: "certs/neon.pem" })).toEqual({ sslMode: "verify-full", sslRootCert: "certs/neon.pem" });
+    expect(tls({ host: "127.0.0.1", sslMode: "verify-full", sslRootCert: "/etc/ssl/ca.pem" })).toEqual({ sslMode: "verify-full", sslRootCert: "/etc/ssl/ca.pem" });
+  });
+
+  test("a mode that is not one, and a root certificate that nothing would use, are named with the setting to change", () => {
+    const m = (catalog: Record<string, unknown>) => issues({ lake: shared({ catalog }) }).map((i) => [i.path, i.message, i.hint] as const);
+    expect(m({ sslMode: "verify" })).toEqual([["lake.catalog.sslMode", expect.stringContaining('must be "verify-full", "require", "prefer", "disable"; found "verify"'), expect.stringContaining("verify-full")]]);
+    expect(m({ sslMode: true })).toEqual([["lake.catalog.sslMode", expect.stringContaining("found true"), expect.any(String)]]);
+    expect(m({ sslRootCert: "" })).toEqual([["lake.catalog.sslRootCert", expect.stringContaining("PEM file"), expect.any(String)]]);
+    expect(m({ sslRootCert: 7 })).toEqual([["lake.catalog.sslRootCert", expect.stringContaining("found 7"), expect.any(String)]]);
+    expect(m({ sslMode: "require", sslRootCert: "ca.pem" })).toEqual([["lake.catalog.sslRootCert", expect.stringContaining('only by "sslMode": "verify-full"; this catalog\'s sslMode is "require"'), expect.stringContaining('set "lake.catalog.sslMode" to "verify-full"')]]);
+    // On this machine the default is prefer, so a root certificate alone says what the project meant only with verify-full beside it.
+    expect(m({ host: "localhost", sslRootCert: "ca.pem" })).toEqual([["lake.catalog.sslRootCert", expect.stringContaining("the default for a catalog on this machine"), expect.any(String)]]);
+    // A bad mode is reported once, not again as a root certificate nobody can use.
+    expect(m({ sslMode: "bogus", sslRootCert: "ca.pem" }).map((x) => x[0])).toEqual(["lake.catalog.sslMode"]);
+  });
+
+  test("a local lake has no TLS to set", () => {
+    const m = issues({ lake: { ...local, catalog: { ...local.catalog, sslMode: "disable" } } }).map((i) => i.path);
+    expect(m).toEqual(["lake.catalog.sslMode"]);
   });
 });
 

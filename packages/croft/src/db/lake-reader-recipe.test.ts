@@ -51,6 +51,8 @@ describe("the docs' recipe for reading a lake from your own DuckDB", () => {
       analyst: "analyst_reader", analyst_password: "test-analyst-password", database, writer: WRITER_LOGIN.user,
       host: rig.pg.host, port: String(rig.pg.port), key_id: READER_KEY.id, key_secret: READER_KEY.secret, endpoint: rig.s3.endpoint,
       use_ssl: "false", bucket: lake.bucket, folder: lake.folder,
+      // The rig's Postgres is on this machine and offers no TLS: the docs' "same machine" values, with a file that exists.
+      sslmode: "prefer", ca_file: import.meta.path,
     };
     // The person who runs the Postgres makes the login, from the docs' block.
     await rig.pg.sql(fill(block("postgres-admin"), v), database);
@@ -101,6 +103,8 @@ describe("the docs' recipe for reading a lake from your own DuckDB", () => {
       analyst: "old_reader", analyst_password: "test-analyst-password", database, writer: WRITER_LOGIN.user,
       host: rig.pg.host, port: String(rig.pg.port), key_id: READER_KEY.id, key_secret: READER_KEY.secret, endpoint: rig.s3.endpoint,
       use_ssl: "false", bucket: lake.bucket, folder: lake.folder,
+      // The rig's Postgres is on this machine and offers no TLS: the docs' "same machine" values, with a file that exists.
+      sslmode: "prefer", ca_file: import.meta.path,
     };
     await rig.pg.sql(fill(block("postgres-admin"), v), database);
     const ext = (name: string): string => join(oldExt!, `${name === "postgres" ? "postgres_scanner" : name}.duckdb_extension`);
