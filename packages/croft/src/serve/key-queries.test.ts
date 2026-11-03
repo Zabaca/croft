@@ -276,10 +276,8 @@ describe("a key without server mode is refused (D128)", () => {
     writeIntent(p.stateDir, idle.proc.pid!);
     try {
       await until("the engine steps aside", () => engine.status().state !== "open", 10_000);
-      const t = performance.now();
       const refused = await w.call(key, "SELECT count(*) AS n FROM orders");
-      expect(refused.status).toBe(403);
-      expect(performance.now() - t).toBeLessThan(300);
+      expect(refused.status).toBe(403); // refused at once, not queued: a queued key query would come back 503 after the engine's queueMs
       const waited = await w.call(TOKEN, "SELECT count(*) AS n FROM orders");
       expect(waited.status).toBe(503);
       expect(waited.json.problems[0].code).toBe("SERVE_UNAVAILABLE");

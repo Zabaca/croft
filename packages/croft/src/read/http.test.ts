@@ -125,9 +125,7 @@ describe("postDirect (raw HTTP/1.1 over node:net)", () => {
 
   test("keep-alive servers that do not close: completes on Content-Length", async () => {
     const srv = await rawServer(["HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n", "{}"], { gapMs: 10 });
-    const t0 = Date.now();
-    expect((await postDirect(srv.url, "{}", {}, T)).body).toBe("{}");
-    expect(Date.now() - t0).toBeLessThan(1000);
+    expect((await postDirect(srv.url, "{}", {}, T)).body).toBe("{}"); // the server never closes: a client that waited for it would end in TransportError
     expect(srv.requests[0]).toContain("Connection: close\r\n");
     expect(srv.requests[0]).toContain("Content-Length: 2\r\n");
   });

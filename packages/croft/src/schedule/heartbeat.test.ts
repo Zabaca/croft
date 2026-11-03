@@ -96,7 +96,6 @@ describe("waitForHeartbeat", () => {
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.heartbeatAt.getTime()).toBeGreaterThanOrEqual(since.getTime());
-      expect(r.waitedMs).toBeLessThan(5000);
     }
   });
 

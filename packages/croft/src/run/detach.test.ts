@@ -163,12 +163,10 @@ describe("followRun", () => {
       db.createRun({ id: "r_0101_0000_stck", trigger: "manual", human: false, argv: ["run"] });
       db.finishRun("r_0101_0000_stck", "succeeded", { data: { runId: "r_0101_0000_stck", status: "succeeded", steps: [] }, problems: [], next: [], exit: 0, ok: true });
       db.close();
-      await Bun.sleep(20_000);
+      await Bun.sleep(600_000); // never ends inside the test: a parent that waited for it hangs
     `);
     const sp2 = spawnDetachedRun({ root: s2, stateDir: s2, args: [], runId: "r_0101_0000_stck", env: { PATH: process.env.PATH }, entry: stuck });
-    const t0 = Date.now();
     expect(await followRun({ stateDir: s2, runId: "r_0101_0000_stck", timeoutMs: 10_000, pollMs: 20, spawned: sp2, exitGraceMs: 300 })).toMatchObject({ kind: "finished" });
-    expect(Date.now() - t0).toBeLessThan(5000);
     sp2.child.kill("SIGKILL");
   });
 

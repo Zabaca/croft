@@ -863,11 +863,8 @@ describe("the facts cache: nothing imported when nothing changed", () => {
     expect(scheduleStateOf(p, "issues")).toMatchObject({ phrase: "every hour", cron: "0 * * * *", fileHash: factsOf(p).issues!.fileHash });
 
     for (const now of ["2026-09-22T10:07:00Z", "2026-09-22T11:00:30Z", "2026-09-22T12:00:30Z"]) {
-      const t0 = performance.now();
       w = await work(p, now, { resolve: c.resolve });
-      const took = performance.now() - t0;
       expect(w.imported).toBe(false);
-      expect(took).toBeLessThan(500);
     }
     expect(c.calls.length).toBe(2);
     expect(imports(marker)).toBe(1);

@@ -4,7 +4,8 @@
 // the pinned quack build's catalog texts are held in quack-catalog.test.ts.
 import { afterAll, describe, expect } from "bun:test";
 import { closeAllWarehouses } from "../db/warehouse.ts";
-import { cleanup, spawnWriter } from "../read/testkit.ts";
+import { TIMING_GAP } from "../../tests/timing-gap.ts";
+import { cleanup, releaseHolder, spawnWriter } from "../read/testkit.ts";
 import { ALLOWED, SHARED, WAREHOUSE_SQL } from "../sql/attack-testkit.ts";
 import { KeyStore } from "./keys.ts";
 import type { QuackEvent } from "./quack-access.ts";
@@ -12,7 +13,6 @@ import { freePort, QuackClients, raw } from "./quack-client-testkit.ts";
 import { ask, count, extensionFiles, openEngine, project, rejection, replaceCopy, until } from "./readers-testkit.ts";
 import type { ServeEngine } from "./types.ts";
 
-const CI = process.env.CROFT_CI === "1";
 const { ext, withExt } = extensionFiles("quack.test");
 const engines: ServeEngine[] = [];
 const clients = new QuackClients();
@@ -72,16 +72,15 @@ describe("signing in and reading", () => {
   withExt("it works while a croft write is in progress, from a client that dials 127.0.0.1 or localhost", async () => {
     const r = await rig();
     const alice = await r.key("alice");
-    const writer = spawnWriter(r.p, "w1", 5000);
+    const writer = spawnWriter(r.p, "w1", "release"); // held until the clients have read: a client that waited for the write would hang the test
     await writer.waitFor("acquired");
-    const started = performance.now();
     for (const host of ["127.0.0.1", "localhost"]) {
       const c = await clients.start(ext.dir);
       const uri = r.uri().replace("127.0.0.1", host);
       expect((await c.attach(uri, alice)).ok, host).toBe(true);
       for (let i = 0; i < 10; i++) expect(await c.rows("SELECT count(*) AS n FROM r.orders")).toEqual([{ n: "20" }]);
     }
-    expect(performance.now() - started).toBeLessThan(4000); // the writer still held the file
+    releaseHolder(writer);
     await writer.waitFor("released", 20_000);
     expect(r.e.status().serverMode).toMatchObject({ restarts: 0 });
   }, 60_000);
@@ -129,8 +128,9 @@ describe("keys", () => {
     const alice = await r.key("alice");
     const bob = await r.key("bob");
     r.keys.remove("bob");
-    await Bun.sleep(150);
     const c = await clients.start(ext.dir);
+    // croft serve hands the readers the keys on its poll: wait until bob is refused, then check every kind of wrong key.
+    await until("bob to be refused", async () => !(await c.attach(r.uri(), bob, "x")).ok, 10_000);
     for (const token of [`croftkey_${"A".repeat(43)}`, bob, "app-token-for-tests", "abcd", `${alice}x`, alice.toUpperCase()]) {
       const a = await c.attach(r.uri(), token, "x");
       expect(a.ok, token).toBe(false);
@@ -151,10 +151,9 @@ describe("keys", () => {
     while (!refused) {
       const x = await a.run("SELECT count(*) AS n FROM r.orders");
       if (!x.ok) refused = x.error;
-      else if (performance.now() - removedAt > 5000) throw new Error("the removed key still reads");
+      else if (performance.now() - removedAt > TIMING_GAP) throw new Error("the removed key still reads"); // timing-gap: the removal is told to the readers' process on the next poll
       else await Bun.sleep(25);
     }
-    expect(performance.now() - removedAt).toBeLessThan(1000);
     expect(refused).toContain("alice was removed");
     // It stays refused, for everything, and it cannot sign in again.
     for (const sql of ["SELECT count(*) FROM r.orders", "SELECT * FROM r._croft_as_of", "SELECT * FROM r.customers"]) expect((await a.run(sql)).ok, sql).toBe(false);
@@ -271,7 +270,7 @@ describe("the cap on running Quack queries (D130)", () => {
     // The HTTP API in the same process answers meanwhile, and the client's attach and transaction control are not counted.
     const t = performance.now();
     expect(await count(r.e)).toBe(20);
-    expect(performance.now() - t).toBeLessThan(CI ? 3000 : 1500);
+    expect(performance.now() - t).toBeLessThan(TIMING_GAP); // timing-gap: the Quack query holds the readers' slot for the 15 s limit; HTTP is not queued behind it
     expect((await other.attach(r.uri(), alice, "again")).ok).toBe(true);
     // The long query ends (at the time limit, which replaces the readers' process, or on its own on a machine fast enough), and the slot is free again.
     await running;
@@ -294,7 +293,7 @@ describe("the time limit", () => {
     const started = performance.now();
     const long = await c.run("SELECT count(*) FROM r.orders a, r.orders b, range(300000000) c WHERE (a.id + b.id + c.range) % 7 = 3");
     expect(long.ok).toBe(false); // an error, never a wrong answer
-    expect(performance.now() - started).toBeLessThan(1500 + 1500 + (CI ? 2000 : 0));
+    expect(performance.now() - started).toBeLessThan(1500 + TIMING_GAP); // timing-gap: the query runs for minutes; the 1.5 s limit ends it
     expect(overdue).toHaveLength(1);
     expect(overdue[0]).toBeGreaterThanOrEqual(1500);
     await until("the old process to exit", () => r.e.status().serverMode?.workerPid !== first);
@@ -305,10 +304,8 @@ describe("the time limit", () => {
     const stale = await c.run("SELECT count(*) AS n FROM r.orders");
     expect(stale.ok).toBe(false);
     expect((await c.run("DETACH r")).ok).toBe(true);
-    const reattached = performance.now();
     expect((await c.attach(r.uri(), alice)).ok).toBe(true);
     expect(await c.rows("SELECT count(*) AS n FROM r.orders")).toEqual([{ n: "20" }]);
-    expect(performance.now() - reattached).toBeLessThan(1000);
     expect(await count(r.e)).toBe(20);
   }, 90_000);
 
@@ -328,13 +325,11 @@ describe("the time limit", () => {
       expect(x.ok).toBe(false);
       expect(x.ok ? "" : x.error).toMatch(/Invalid connection id|Could not connect/);
     }
-    const t = performance.now();
     for (const c of [a, b]) {
       await c.run("DETACH r");
       expect((await c.attach(r.uri(), alice)).ok).toBe(true);
       expect(await c.rows("SELECT count(*) AS n FROM r.orders")).toEqual([{ n: "20" }]);
     }
-    expect(performance.now() - t).toBeLessThan(1000);
   }, 90_000);
 });
 

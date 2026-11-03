@@ -98,8 +98,7 @@ describe("journey 11: crashes", () => {
     state.issues.push(issue(4, 4), issue(5, 5));
     const killed = await p.json(["run", "github_issues", "--follow", "30s"], { env: { CROFT_FAULT: "before_commit" } });
     // The parent survives its child and reports what happened, without waiting out --follow.
-    expect(killed.code, show(killed)).toBe(1);
-    expect(killed.ms).toBeLessThan(25_000);
+    expect(killed.code, show(killed)).toBe(1); // crashed, said at once: a parent that waited out the 30 s follow would exit 6
     expect(killed.json.data.status).toBe("crashed");
     const runId = killed.json.data.runId as string;
     expect(await agree(p)).toEqual({ cursor: at(3), rows: 3 });

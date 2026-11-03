@@ -10,9 +10,9 @@ import { closeAllWarehouses } from "../db/warehouse.ts";
 import { cleanup } from "../read/testkit.ts";
 import { absentFor, ALL_ATTACKS, type Attack, CTE_SHAPES, HIDDEN_NAMES, HIDDEN_TABLES, NOT_A_READ, REACHING_OUT, SHARED, variants, WAREHOUSE_SQL } from "../sql/attack-testkit.ts";
 import { KeyStore } from "./keys.ts";
-import { QuackClients, raw } from "./quack-client-testkit.ts";
+import { type QuackClient, QuackClients, raw } from "./quack-client-testkit.ts";
 import { SCHEMA_QUERY, TABLES_QUERY, TRANSACTION_TEXTS } from "./quack-catalog.ts";
-import { count, extensionFiles, openEngine, project } from "./readers-testkit.ts";
+import { count, extensionFiles, openEngine, project, until } from "./readers-testkit.ts";
 import type { ServeEngine } from "./types.ts";
 
 const { ext, withExt } = extensionFiles("quack-attacks.test");
@@ -73,15 +73,20 @@ function pathAttacks(root: string, stateDir: string, copy: string): Attack[] {
   ];
 }
 
+/** croft serve hands the readers' process the keys on its poll: a new key signs in once that has happened, and not before. */
+async function accepted(c: QuackClient, uri: string, key: string): Promise<void> {
+  await until("the key to be accepted", async () => (await raw(c, uri, key, "SELECT count(*) AS n FROM orders")).ok, 15_000);
+}
+
 describe("the attack list over Quack", () => {
   withExt("every attack is refused, written plainly and with a catalog function in a comment, a string and after a line comment; nothing is written and the server stands", async () => {
     const p = await project({ n: 20, also: WAREHOUSE_SQL.filter((s) => !s.startsWith("CREATE TABLE orders")), config: { serve: { sharedTables: [...SHARED] } } });
     const e = await openEngine(engines, ext.dir, p);
     const keys = new KeyStore(p.stateDir);
     const alice = keys.add("alice").key;
-    await Bun.sleep(150);
     const uri = e.status().serverMode!.quack!.uri;
     const c = await clients.start(ext.dir);
+    await accepted(c, uri, alice);
     const copy = p.project.paths.readCopy;
     const before = { root: listing(p.root), cwd: listing(process.cwd()), db: readFileSync(p.database).length, copy: readFileSync(copy).length };
     const pid = e.status().serverMode!.workerPid;
@@ -120,9 +125,9 @@ describe("the attack list over Quack", () => {
     const p = await project({ n: 20, also: WAREHOUSE_SQL.filter((s) => !s.startsWith("CREATE TABLE orders")), config: { serve: { sharedTables: [...SHARED] } } });
     const e = await openEngine(engines, ext.dir, p);
     const alice = new KeyStore(p.stateDir).add("alice").key;
-    await Bun.sleep(150);
     const uri = e.status().serverMode!.quack!.uri;
     const c = await clients.start(ext.dir);
+    await accepted(c, uri, alice);
     // As sent: the listing is the in-memory database's main schema and the views, nothing of croft's.
     const schemas = await raw(c, uri, alice, SCHEMA_QUERY);
     expect(schemas.ok && schemas.rows.map((r) => [r.database_name, JSON.stringify(r.schema_path)])).toEqual([["memory", '["main"]']]);
@@ -143,9 +148,9 @@ describe("the attack list over Quack", () => {
     const p = await project({ n: 20, also: WAREHOUSE_SQL.filter((s) => !s.startsWith("CREATE TABLE orders")), config: { serve: { sharedTables: [...SHARED] } } });
     const e = await openEngine(engines, ext.dir, p);
     const alice = new KeyStore(p.stateDir).add("alice").key;
-    await Bun.sleep(150);
     const uri = e.status().serverMode!.quack!.uri;
     const c = await clients.start(ext.dir);
+    await accepted(c, uri, alice);
     // The text is built in SQL on the client, since a literal cannot hold a NUL. The parser sees the whole string, NUL included
     // (a name with a NUL is not the shared table's), and the same string is what runs.
     for (const text of [
@@ -164,9 +169,9 @@ describe("the attack list over Quack", () => {
     const p = await project({ n: 20, also: WAREHOUSE_SQL.filter((s) => !s.startsWith("CREATE TABLE orders")), config: { serve: { sharedTables: [...SHARED] } } });
     const e = await openEngine(engines, ext.dir, p);
     const alice = new KeyStore(p.stateDir).add("alice").key;
-    await Bun.sleep(150);
     const uri = e.status().serverMode!.quack!.uri;
     const c = await clients.start(ext.dir);
+    await accepted(c, uri, alice);
     let ok = 0;
     let refused = 0;
     for (const hidden of HIDDEN_NAMES) {

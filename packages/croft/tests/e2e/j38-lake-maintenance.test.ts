@@ -213,7 +213,7 @@ if (!LAKE) {
         expect(after.dataFiles).toBeLessThan(40);
         expect(after.inlinedTables).toBeLessThan(25);
         expect(after.pendingDeletion).toBe(0);
-        expect(report.tookMs).toBeLessThan(20_000);
+        expect(report.tookMs).toBeLessThan(20_000); // timing-gap: a pass over this week takes 0.3 to 0.9 s (D150); one that merged nothing would take minutes
         // The lake still reads: every table as of today.
         const rows = await l.r.read((db) => db.all<{ n: number | bigint }>("SELECT (SELECT count(*) FROM tiny_a) + (SELECT count(*) FROM inc_a) + (SELECT count(*) FROM full_r) AS n"), { purpose: "j38" });
         expect(Number(rows[0]!.n)).toBe(840 + 4225 + 2000);

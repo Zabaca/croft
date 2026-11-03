@@ -97,7 +97,7 @@ test("start times do not depend on the locale or time zone of the process readin
 test.skipIf(process.platform === "linux")("macOS start times are epoch seconds", () => {
   const start = Number(currentIdentity().procStart);
   expect(Number.isInteger(start)).toBe(true);
-  expect(Math.abs(start - (Date.now() / 1000 - process.uptime()))).toBeLessThan(3);
+  expect(Math.abs(start - (Date.now() / 1000 - process.uptime()))).toBeLessThan(3); // timing-gap: not a duration: two readings of this process's start (ps, and the clock less the uptime) agree to within seconds
 });
 
 // Records written before start times were normalized hold `ps -o lstart` text in the writer's locale and zone.

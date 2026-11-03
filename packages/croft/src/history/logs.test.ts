@@ -163,9 +163,7 @@ describe("follow", () => {
     writeFileSync(file(), "x\n");
     const ac = new AbortController();
     setTimeout(() => ac.abort(), 50);
-    const t0 = Date.now();
-    expect(await collect(follow(file(), { pollMs: 10_000, signal: ac.signal }))).toEqual(["x"]);
-    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(await collect(follow(file(), { pollMs: 600_000, signal: ac.signal }))).toEqual(["x"]); // the poll is ten minutes: a follow the abort did not stop would hang the test
   });
 
   test("redacts followed lines", async () => {

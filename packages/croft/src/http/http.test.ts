@@ -29,6 +29,15 @@ const BINARY = new Uint8Array([0x63, 0x61, 0x66, 0xe9, 0x0a, 0xff, 0x00, 0x1f, 0
 type Issue = { id: number; updated_at: string };
 const ISSUES: Issue[] = Array.from({ length: 7 }, (_, i) => ({ id: i + 1, updated_at: `2026-09-2${i}T00:00:00Z` }));
 
+/** Hold an answer for `ms`, or until the client has gone: a route that is slow on purpose stays slow however busy the machine is, and never outlives its request. */
+const holdFor = (signal: AbortSignal, ms: number) =>
+  new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+  });
+/** How long "never answers" is: far past any test, ended early by the client giving up. */
+const NEVER_MS = 120_000;
+
 const server = Bun.serve({
   port: 0,
   async fetch(req) {
@@ -80,14 +89,14 @@ const server = Bun.serve({
         return new Response('{"message":"Not Found"}', { status: 404 });
       case "/slow":
         hit("slow");
-        await Bun.sleep(Number(u.searchParams.get("ms") ?? "2000"));
+        await holdFor(req.signal, Number(u.searchParams.get("ms") ?? NEVER_MS));
         return Response.json({ late: true });
       case "/slow-body": {
         hit("slow-body");
         const stream = new ReadableStream({
           async start(c) {
             c.enqueue(new TextEncoder().encode('{"partial":'));
-            await Bun.sleep(1500);
+            await holdFor(req.signal, NEVER_MS);
             c.enqueue(new TextEncoder().encode("true}"));
             c.close();
           },
@@ -299,9 +308,7 @@ describe("retries", () => {
 
   test("a Retry-After longer than croft waits in a run fails at once with retryAfterMs", async () => {
     const { http, lines } = client();
-    const t0 = performance.now();
-    const e = await httpError(http.get(`${BASE}/rate-limited-long`));
-    expect(performance.now() - t0).toBeLessThan(500);
+    const e = await httpError(http.get(`${BASE}/rate-limited-long`)); // at once: a client that waited the hour out would hang the test
     expect(e.problem.details).toMatchObject({ status: 429, attempts: 1, retryAfterMs: 3_600_000 });
     expect(e.problem.retryable).toBe(true);
     expect(e.message).toContain("asks to wait 3600 s");
@@ -370,9 +377,7 @@ describe("retries", () => {
 describe("timeouts and abort", () => {
   test("a request that gets no answer times out, is retried, then fails", async () => {
     const { http } = client();
-    const t0 = performance.now();
-    const e = await httpError(http.get(`${BASE}/slow`, { timeoutMs: 100, retries: 1, query: { ms: 1000 } }));
-    expect(performance.now() - t0).toBeLessThan(900);
+    const e = await httpError(http.get(`${BASE}/slow`, { timeoutMs: 100, retries: 1 })); // the route never answers: only the timeout ends it
     expect(hits.get("slow")).toBe(2);
     expect(e.problem.details).toMatchObject({ reason: "timeout", attempts: 2, status: null });
     expect(e.message).toContain("no answer within 100 ms");
@@ -380,9 +385,7 @@ describe("timeouts and abort", () => {
 
   test("the timeout covers a body that stalls after the headers", async () => {
     const { http } = client();
-    const t0 = performance.now();
     const e = await httpError(http.get(`${BASE}/slow-body`, { timeoutMs: 150, retries: 0 }));
-    expect(performance.now() - t0).toBeLessThan(1000);
     expect(e.problem.details).toMatchObject({ reason: "timeout" });
   });
 
@@ -397,10 +400,8 @@ describe("timeouts and abort", () => {
     const { http } = client({ signal: ac.signal });
     const reason = new Error("interrupted by Ctrl-C");
     setTimeout(() => ac.abort(reason), 50);
-    const t0 = performance.now();
-    const err = await http.get(`${BASE}/slow`, { query: { ms: 2000 } }).then(() => null, (x: unknown) => x);
+    const err = await http.get(`${BASE}/slow`).then(() => null, (x: unknown) => x); // never answers: only the abort ends it
     expect(err).toBe(reason);
-    expect(performance.now() - t0).toBeLessThan(1000);
     expect(hits.get("slow")).toBe(1);
   });
 
@@ -408,10 +409,8 @@ describe("timeouts and abort", () => {
     const ac = new AbortController();
     const { http } = client({ signal: ac.signal });
     setTimeout(() => ac.abort(new Error("stop")), 100);
-    const t0 = performance.now();
-    const err = await http.get(`${BASE}/rate-limited`).then(() => null, (x: unknown) => x as Error);
+    const err = await http.get(`${BASE}/rate-limited`).then(() => null, (x: unknown) => x as Error); // a wait the abort did not stop would end in the retry's success: no error
     expect(err?.message).toBe("stop");
-    expect(performance.now() - t0).toBeLessThan(700);
     expect(hits.get("rate-limited")).toBe(1);
   });
 
@@ -479,9 +478,7 @@ describe("getBytes", () => {
     const aborted = client({ signal: ac.signal }).http;
     const reason = new Error("interrupted by Ctrl-C");
     setTimeout(() => ac.abort(reason), 50);
-    const t0 = performance.now();
-    expect(await aborted.getBytes(`${BASE}/slow`, { query: { ms: 2000 } }).then(() => null, (x: unknown) => x)).toBe(reason);
-    expect(performance.now() - t0).toBeLessThan(1000);
+    expect(await aborted.getBytes(`${BASE}/slow`).then(() => null, (x: unknown) => x)).toBe(reason);
   });
 });
 

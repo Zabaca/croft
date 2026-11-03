@@ -284,9 +284,7 @@ process.exit(0);
       expect(stderr).toBe("");
       // Meanwhile a run here committed rows and asks for a refresh: the child is refreshing, so it is left to it.
       await seed(p.database, ["INSERT INTO t SELECT range FROM range(10, 17)"]);
-      const started = Date.now();
-      expect(await refreshReadCopy(p.root)).toEqual({ status: "coalesced" });
-      expect(Date.now() - started).toBeLessThan(2000);
+      expect(await refreshReadCopy(p.root)).toEqual({ status: "coalesced" }); // at once: the child waits for "go" below, so a request that waited for it would hang the test
       child.stdin!.write("go\n");
       expect(await exited).toBe(0);
       const out = JSON.parse(stdout.trim().split("\n").pop()!) as ReadCopyOutcome;
@@ -355,26 +353,22 @@ describe("errors are logged and recorded, never thrown", () => {
   test("a clone that hangs is killed at its timeout, and the lease ends with it", async () => {
     const p = await seeded();
     const hang = join(p.root, "hanging-cp");
-    writeFileSync(hang, "#!/bin/sh\nexec sleep 30\n", { mode: 0o755 });
-    const started = Date.now();
+    writeFileSync(hang, "#!/bin/sh\nexec sleep 600\n", { mode: 0o755 }); // never ends by itself: a clone not killed at its timeout hangs the test
     const out = await refreshReadCopy(p.root, { cp: [hang], cloneTimeoutMs: 200 });
-    expect(Date.now() - started).toBeLessThan(5000);
     expect(out).toMatchObject({ status: "failed", error: { code: null } });
     if (out.status !== "failed") throw new Error("unreachable");
     expect(out.error.message).toContain("took longer than");
     expect(listIntents(p.stateDir)).toEqual([]);
     expect(warehouseFor(p.database)?.isOpen).toBe(false);
     expect(temps(p)).toEqual([]);
-  });
+  }, 20_000);
 
   test("a program holding the warehouse: the refresh gives up after its wait and says who", async () => {
     const p = await seeded();
-    const holder = spawnHolder(p.database, 10_000);
+    const holder = spawnHolder(p.database, "release"); // held until killed below: a refresh that waited past its waitMs would hang the test
     try {
       await holder.waitFor("held");
-      const started = Date.now();
       const out = await refreshReadCopy(p.root, { waitMs: 300 });
-      expect(Date.now() - started).toBeLessThan(5000);
       expect(out.status).toBe("failed");
       if (out.status !== "failed") throw new Error("unreachable");
       expect(["DB_HELD_BY_OTHER_PROGRAM", "DB_BUSY"]).toContain(out.error.code!);
@@ -384,7 +378,7 @@ describe("errors are logged and recorded, never thrown", () => {
     } finally {
       holder.proc.kill("SIGKILL");
     }
-  });
+  }, 20_000);
 
   test("no warehouse yet: nothing to copy, and the refresh does not create one", async () => {
     const p = await makeReadProject({ config: { readCopy: true } });

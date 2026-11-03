@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { formatWithOptions, inspect } from "node:util";
+import { TIMING_GAP } from "../../tests/timing-gap.ts";
 import { CroftError } from "../core/errors.ts";
 import { CONFIRM_GRANT_ENV } from "../safety/confirm.ts";
 import { TOKEN_ENV } from "../serve/auth.ts";
@@ -384,7 +385,7 @@ describe("redact: escaped and encoded renderings", () => {
     const started = performance.now();
     expect(many.redact(`${text}secret-value-7-/+=abcdef7`)).toEndWith("[redacted:K7]");
     expect(many.redact(text)).toBe(text);
-    expect(performance.now() - started).toBeLessThan(2000);
+    expect(performance.now() - started).toBeLessThan(TIMING_GAP); // timing-gap: this takes 0.1 s; a redaction that scanned the text once for every value and every rendering would take far longer as the text grows
   });
 
   test("a text of many backslashes does not make redaction backtrack for long", () => {
@@ -393,7 +394,7 @@ describe("redact: escaped and encoded renderings", () => {
     const text = `${"\\".repeat(5000)}/${"\\".repeat(5000)}u002f`;
     expect(bs.redact(text)).toBe(text);
     expect(bs.redact(`${"\\".repeat(3000)}a${"\\".repeat(10)}b\\/c\\\\d`)).toEndWith("[redacted:BS]");
-    expect(performance.now() - started).toBeLessThan(1000);
+    expect(performance.now() - started).toBeLessThan(TIMING_GAP); // timing-gap: this takes 0.1 s; the backtracking it guards against grows without bound with the length of the text
   });
 
   test("a long text is redacted the same way, including values with no letters or digits", () => {

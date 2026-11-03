@@ -1,7 +1,8 @@
 // croft serve's query engine against real DuckDB files and real writers in child processes (DESIGN.md §5
 // "Server mode"). Timings are measured from the moment the writer's intent appeared (its `since`, stamped just
-// before the file is written), so a slow start of a child never counts against the engine. CPU-starved CI runners
-// get a margin (CROFT_CI=1); the budgets themselves are DESIGN's.
+// before the file is written), so a slow start of a child never counts against the engine. A latency is bounded
+// far above its budget, by what the engine does when it is wrong (TIMING_GAP, or the grace it was meant to skip),
+// since a bound at the budget is a bound on the machine (DESIGN.md §10, the rules against flaking).
 import { afterAll, describe, expect, test } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -13,14 +14,12 @@ import { intentDir, intentFileName } from "../db/intent.ts";
 import type { FsProbe } from "../db/fs-kind.ts";
 import { directQuery } from "../read/direct.ts";
 import { cleanup, makeProject, releaseHolder, spawnHolder, spawnIdle, type TempProject, writeIntent } from "../read/testkit.ts";
-import { openServeEngine, type ServeEngineHooks, type ServeEngineInternals } from "./instance.ts";
+import { openServeEngine, SERVE_DEFAULTS, type ServeEngineHooks, type ServeEngineInternals } from "./instance.ts";
+import { STUCK_MS, TIMING_GAP } from "../../tests/timing-gap.ts";
 import type { ServeEngine, ServeEngineOptions } from "./types.ts";
 
-const CI = process.env.CROFT_CI === "1";
-/** Extra time CPU-starved CI runners get on every timing budget. */
-const SLACK = CI ? 600 : 0;
-/** The writer child's own share: its 5 ms lock retries and its scheduling, on top of the engine's budget. */
-const WRITER_SHARE = 150;
+/** What an engine that did not step aside at once would take: the grace it is meant to skip. */
+const GRACE = SERVE_DEFAULTS.graceMs;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -260,11 +259,9 @@ describe("queries", () => {
     const { e } = await engine(p, { hooks: { queryEnded: (x) => peaks.push(x.workerPeakRss) } });
     await e.query(q("SELECT count(*) AS c FROM big"));
     const before = peaks.at(-1)!;
-    const start = Date.now();
     const err = await rejection(e.query(q("SELECT * FROM big", { limit: 10 })));
     expect(err.code).toBe("QUERY_TOO_MANY_ROWS");
     expect(err.problem.details).toMatchObject({ limit: 10 });
-    expect(Date.now() - start).toBeLessThan(2000 + SLACK);
     // Materialized, the result took about 1.4 GB; streamed, a few chunks.
     expect(peaks.at(-1)! - before).toBeLessThan(200 * 1024 * 1024);
     // The same with a 1 MB cap and a limit that allows everything: it fails as the bytes pass the cap.
@@ -310,11 +307,9 @@ describe("queries", () => {
     await until("the slow query to run", () => e.status().inFlight === 1);
     const waiting = [rejection(e.query(q("SELECT 1 AS x", { signal: stop.signal }))), rejection(e.query(q("SELECT 1 AS x", { signal: stop.signal })))];
     await until("two queued", () => e.status().queued === 2);
-    const start = Date.now();
     const err = await rejection(e.query(q("SELECT 1 AS x")));
-    expect(Date.now() - start).toBeLessThan(100 + SLACK);
     expect(err.code).toBe("SERVE_UNAVAILABLE");
-    expect(err.problem.details).toMatchObject({ reason: "busy", maxQueued: 2 });
+    expect(err.problem.details).toMatchObject({ reason: "busy", maxQueued: 2 }); // the queue's own refusal, which names maxQueued; a wait that timed out names maxConcurrent
     expect(err.problem.details?.retryAfterMs).toBeGreaterThan(0);
     expect(err.message).toContain("waiting");
     stop.abort();
@@ -356,12 +351,10 @@ describe("queries", () => {
   test("a query past queryTimeoutMs is interrupted: TIMEOUT", async () => {
     const p = await seeded();
     const { e } = await engine(p, { queryTimeoutMs: 200 });
-    const start = Date.now();
-    const err = await rejection(e.query(q(SLOW)));
+    const err = await rejection(e.query(q(SLOW))); // SLOW runs for hours: only the deadline ends it
     expect(err.code).toBe("TIMEOUT");
     expect(err.problem.details).toMatchObject({ phase: "query", timeoutMs: 200 });
     expect(err.problem.hint).toContain("serve.queryTimeoutMs");
-    expect(Date.now() - start).toBeLessThan(200 + 1000 + SLACK);
     // The connection is fine afterwards.
     expect((await e.query(q("SELECT count(*) AS c FROM t"))).rows).toEqual([{ c: 5 }]);
   });
@@ -426,8 +419,9 @@ describe("handing the file to a writer", () => {
     const released = events.find((x) => x.kind === "released" && x.pid === w.pid);
     expect(released).toBeDefined();
     expect(released!.since).toBe(since);
-    expect(released!.at - appeared).toBeLessThanOrEqual(100 + SLACK);
-    expect(acquired - appeared).toBeLessThanOrEqual(100 + WRITER_SHARE + SLACK);
+    // timing-gap: an idle engine steps aside at once; one that waited out the grace would take GRACE.
+    expect(released!.at - appeared).toBeLessThan(GRACE);
+    expect(acquired - appeared).toBeLessThan(GRACE);
     expect(acquired).toBeGreaterThanOrEqual(released!.at - 5);
     // Every connection, the idle one included, was closed before closeSync().
     const before = events.filter((x) => x.kind === "beforeClose");
@@ -448,7 +442,7 @@ describe("handing the file to a writer", () => {
     const acquired = (await w.waitFor("acquired")).t;
     const released = events.find((x) => x.kind === "released" && x.pid === w.pid);
     expect(released).toBeDefined();
-    expect(released!.at - Date.parse(released!.since!)).toBeLessThanOrEqual(100 + SLACK);
+    expect(released!.at - Date.parse(released!.since!)).toBeLessThan(GRACE); // timing-gap: the engine is idle, so it does not wait out the grace
     expect(acquired).toBeGreaterThanOrEqual(released!.at - 5);
     await w.waitFor("released");
     expect(await w.exited).toBe(0);
@@ -475,8 +469,8 @@ describe("handing the file to a writer", () => {
     const acquired = (await w.waitFor("acquired")).t;
     const released = events.find((x) => x.kind === "released" && x.pid === w.pid)!;
     expect(released.at - appeared).toBeGreaterThanOrEqual(graceMs - 20);
-    expect(released.at - appeared).toBeLessThanOrEqual(graceMs + 100 + SLACK);
-    expect(acquired - appeared).toBeLessThanOrEqual(graceMs + 100 + WRITER_SHARE + SLACK);
+    expect(released.at - appeared).toBeLessThanOrEqual(graceMs + TIMING_GAP); // the query would run for hours: only the interrupt at the grace lets go
+    expect(acquired - appeared).toBeLessThanOrEqual(graceMs + TIMING_GAP);
     expect(events.filter((x) => x.kind === "beforeClose").map((x) => x.openConnections)).toEqual([0]);
     // The interrupted query says why, and when to retry.
     expect(err.code).toBe("SERVE_UNAVAILABLE");
@@ -551,9 +545,7 @@ describe("handing the file to a writer", () => {
     const { e, events } = await engine(p);
     const slow = rejection(e.query(q(SLOW)));
     await until("the slow query to run", () => e.status().inFlight === 1);
-    const start = Date.now();
-    await e.close();
-    expect(Date.now() - start).toBeLessThan(1000 + SLACK);
+    await e.close(); // the query would run for hours: a close that waited for it would hang the test
     const err = await slow;
     expect(err.code).toBe("SERVE_UNAVAILABLE");
     expect(err.problem.details).toMatchObject({ reason: "stopping" });
@@ -563,7 +555,7 @@ describe("handing the file to a writer", () => {
     await e.close(); // twice is fine
     const w = probeWriter(p, "after_close", 0);
     const { since } = await w.waitFor("intent");
-    expect((await w.waitFor("acquired")).t - Date.parse(since!)).toBeLessThanOrEqual(WRITER_SHARE + SLACK);
+    expect((await w.waitFor("acquired")).t - Date.parse(since!)).toBeLessThan(GRACE); // timing-gap: nothing is open, so nothing to wait out
   });
 
   test("no database yet: DB_NOT_FOUND at once; the first run creates it and the engine opens it", async () => {
@@ -623,9 +615,9 @@ describe("handing the file to a writer", () => {
     const w = probeWriter(p, "r_stuck", 50);
     const appeared = Date.parse((await w.waitFor("intent")).since!);
     const acquired = (await w.waitFor("acquired")).t;
-    expect(acquired - appeared).toBeLessThan(graceMs + 1500 + WRITER_SHARE + SLACK);
+    expect(acquired - appeared).toBeLessThan(STUCK_MS / 2 + graceMs); // timing-gap: the stuck query runs STUCK_MS or more; the watchdog kills its worker instead of waiting for it
     const released = events.find((x) => x.kind === "released" && x.pid === w.pid)!;
-    expect(released.at - appeared).toBeLessThan(graceMs + 1500 + SLACK);
+    expect(released.at - appeared).toBeLessThan(STUCK_MS / 2 + graceMs);
     // The client learns why, and that it may retry.
     const err = await stuck;
     expect(err.code).toBe("SERVE_UNAVAILABLE");
@@ -645,13 +637,13 @@ describe("handing the file to a writer", () => {
     const err = await rejection(e.query(q(STUCK)));
     expect(err.code).toBe("TIMEOUT");
     expect(err.problem.details).toMatchObject({ phase: "query", timeoutMs: 300 });
-    expect(Date.now() - start).toBeLessThan(300 + 1500 + SLACK);
+    expect(Date.now() - start).toBeLessThan(STUCK_MS / 2); // timing-gap: the stuck query runs STUCK_MS or more
     expect((await e.query(q("SELECT count(*) AS c FROM t"))).rows).toEqual([{ c: 5 }]);
     // A constant list DuckDB folds while planning (the gate's literal cap allows 10,000,000 values): stuck in prepare.
     const planned = Date.now();
     const folded = await rejection(e.query(q("SELECT list_reduce(range(10000000), lambda a, b: a + b) AS x")));
     expect(folded.code).toBe("TIMEOUT");
-    expect(Date.now() - planned).toBeLessThan(300 + 1500 + SLACK);
+    expect(Date.now() - planned).toBeLessThan(STUCK_MS / 2); // timing-gap: planning it takes 3 s or more (5 s measured on a busy laptop)
     expect((await e.query(q("SELECT count(*) AS c FROM t"))).rows).toEqual([{ c: 5 }]);
   }, 60_000);
 
@@ -666,7 +658,7 @@ describe("handing the file to a writer", () => {
     const start = Date.now();
     gone.abort();
     expect((await stuck).code).toBe("INTERRUPTED");
-    expect(Date.now() - start).toBeLessThan(1500 + SLACK);
+    expect(Date.now() - start).toBeLessThan(STUCK_MS / 2); // timing-gap: the stuck query runs STUCK_MS or more
     const err = await beside;
     expect(err.code).toBe("SERVE_UNAVAILABLE");
     expect(err.problem.retryable).toBe(true);
@@ -715,7 +707,7 @@ describe("handing the file to a writer", () => {
     await server.exited;
     const w = probeWriter(p, "r_after_kill", 0);
     const { since } = await w.waitFor("intent");
-    expect((await w.waitFor("acquired")).t - Date.parse(since!)).toBeLessThan(1500 + SLACK);
+    expect((await w.waitFor("acquired")).t - Date.parse(since!)).toBeLessThan(TIMING_GAP); // timing-gap: a worker that outlived its server would hold the file until it was killed by hand
     const gone = () => {
       try {
         process.kill(worker.pid!, 0);

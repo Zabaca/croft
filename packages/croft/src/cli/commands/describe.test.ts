@@ -411,14 +411,13 @@ describe("croft describe while a run holds the warehouse", () => {
       inputsSeen: { github_issues: { seenLoadedAt: "2026-09-22T17:30:00.000000Z", seenKey: null, inputLastLoadedAt: "2026-09-22T17:30:00.000000Z" } },
     });
     db.close();
-    const holder = spawnHolder(p.database, 20_000);
+    // The holder keeps the lock until it is killed below: a describe that waited past its busy wait for it would hang and fail by this test's timeout.
+    const holder = spawnHolder(p.database, "release");
     await holder.waitFor("held");
     const saved = DESCRIBE_TIMING.busyWaitMs;
     DESCRIBE_TIMING.busyWaitMs = 300;
     try {
-      const started = performance.now();
       const r = await cli(["describe", "github_issues", "--json"], { cwd: p.root, env: ENV });
-      expect(performance.now() - started).toBeLessThan(3000);
       expect(r.exit).toBe(0);
       expect(r.json.data).toMatchObject({
         source: "catalog", rows: 18556, samples: [], recentWrites: [], builtWithCodeHash: "hash-1",
@@ -442,7 +441,7 @@ describe("croft describe while a run holds the warehouse", () => {
       DESCRIBE_TIMING.busyWaitMs = saved;
       holder.proc.kill("SIGKILL");
     }
-  });
+  }, 20_000);
 
   test("a lookup read in full each run has nothing pending, even from the catalog", async () => {
     const p = await issues({ "assets/issue_triage.ts": LOOKUP_TS }, TEAMS_SEED);
@@ -455,7 +454,7 @@ describe("croft describe while a run holds the warehouse", () => {
       },
     });
     db.close();
-    const holder = spawnHolder(p.database, 20_000);
+    const holder = spawnHolder(p.database, "release"); // held until killed below: a describe that waited past its busy wait would hang the test
     await holder.waitFor("held");
     const saved = DESCRIBE_TIMING.busyWaitMs;
     DESCRIBE_TIMING.busyWaitMs = 300;
@@ -472,7 +471,7 @@ describe("croft describe while a run holds the warehouse", () => {
       DESCRIBE_TIMING.busyWaitMs = saved;
       holder.proc.kill("SIGKILL");
     }
-  });
+  }, 20_000);
 });
 
 describe("helpers", () => {

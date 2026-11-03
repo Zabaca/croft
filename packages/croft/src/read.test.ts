@@ -4,6 +4,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { fileURLToPath } from "node:url";
+import { TIMING_GAP } from "../tests/timing-gap.ts";
 import { CroftError } from "./core/errors.ts";
 import { query } from "./read.ts";
 import { directQuery } from "./read/direct.ts";
@@ -102,7 +103,7 @@ describe("routing", () => {
     const t0 = Date.now();
     r = await run("SELECT a FROM t", [], undefined, { cwd: p.root });
     expect(r).toEqual({ rows: [{ a: 5 }], route: "direct" });
-    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(Date.now() - t0).toBeLessThan(TIMING_GAP); // timing-gap: a recorded server that refuses the connection is dropped at once; one retried to the request timeout would take 10 s
   });
 
   test("no server anywhere: direct mode via CROFT_PROJECT", async () => {

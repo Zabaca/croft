@@ -203,15 +203,16 @@ export default ingest({ async *rows() { yield [{ id: 1 }]; throw new TypeError("
     api.state.retryAfter = "3600";
     try {
       const root = makeProject({ "assets/limited.ts": simpleGet(api.url, "/limited") });
-      const t0 = Date.now();
-      const out = await runIn(root, ["limited"]);
-      expect(Date.now() - t0).toBeLessThan(5000);
+      const before = Date.now();
+      const out = await runIn(root, ["limited"]); // the step ends now: a run that waited the hour out would hang the test
+      const after = Date.now();
       expect(out.exit).toBe(1);
       const s = out.data.steps[0]!;
       expect(s).toMatchObject({ status: "failed", attempt: 1, maxAttempts: 3 });
       expect(s.error).toMatchObject({ code: "HTTP_ERROR", details: { status: 429, retryAfterMs: 3_600_000 } });
       const at = Date.parse(s.nextRetryAt!);
-      expect(Math.abs(at - (Date.now() + 3_600_000))).toBeLessThan(10_000);
+      expect(at).toBeGreaterThanOrEqual(before + 3_600_000 - 1000); // an hour on from the moment the 429 came, which was between before and after
+      expect(at).toBeLessThanOrEqual(after + 3_600_000);
       expect(api.state.log.filter((l) => l.path === "/limited")).toHaveLength(1);
       expect(out.next).toContainEqual({ command: "croft run limited", reason: `the API asks to wait; run it again after ${s.nextRetryAt}` });
     } finally {
@@ -258,13 +259,16 @@ export default ingest({ async *rows() { yield [{ id: 1 }]; throw new TypeError("
     api.state.items = Array.from({ length: 6 }, (_, i) => ({ id: i + 1 }));
     const host = new URL(api.url).host;
     const root = makeProject({ "assets/items.ts": linkItems(api.url) }, { config: { http: { budgets: { [host]: { perHour: 2 } } } } });
+    const before = Date.now();
     const out = await runIn(root, ["items"]);
+    const after = Date.now();
     expect(out.exit).toBe(1);
     expect(api.state.log.filter((l) => l.path === "/items")).toHaveLength(2);
     const s = out.data.steps[0]!;
     expect(s).toMatchObject({ status: "failed", attempt: 1 });
     expect(s.error).toMatchObject({ code: "HTTP_BUDGET_SPENT", retryable: true, details: { host, window: "hour", limit: 2, used: 2, requestIndex: 3 } });
-    expect(Math.abs(Date.parse(s.nextRetryAt!) - (Date.now() + 3_600_000))).toBeLessThan(10_000);
+    expect(Date.parse(s.nextRetryAt!)).toBeGreaterThanOrEqual(before + 3_600_000 - 1000); // the budget's window is an hour from the first request, made after `before`
+    expect(Date.parse(s.nextRetryAt!)).toBeLessThanOrEqual(after + 3_600_000);
     expect(out.next).toContainEqual({ command: "croft run items", reason: `its request budget frees at ${s.nextRetryAt}; run it again after that` });
     const db = runsDb(root);
     try {
@@ -1456,16 +1460,14 @@ describe("a lock wait and Ctrl-C", () => {
       await new Promise<void>((resolve) => holder.stdout!.on("data", (d) => String(d).includes("held") && resolve()));
       const ac = new AbortController();
       setTimeout(() => ac.abort(), 300);
-      const started = Date.now();
-      const out = await runIn(root, ["zones"], { signal: ac.signal });
-      expect(Date.now() - started).toBeLessThan(5000);
+      const out = await runIn(root, ["zones"], { signal: ac.signal }); // the wait is 90 s: one the signal did not end hangs the test
       expect(out.exit).toBe(130);
       expect(out.data.status).toBe("interrupted");
       expect(out.data.steps[0]!.error?.code).toBe("INTERRUPTED");
     } finally {
       holder.kill("SIGKILL");
     }
-  });
+  }, 30_000);
 
   // DESIGN §5 "Lock conflicts": after 2 s the holder is printed.
   test("a run waiting for the file names its holder after 2 s: a waiting event, in events.ndjson for a detached run's id", async () => {
@@ -1729,19 +1731,17 @@ describe("sources, JSON keys, --no-wait and staging", () => {
     const { spawnHolder, cleanup } = await import("../read/testkit.ts");
     api.state.zones = [{ zone: 1 }];
     const root = makeProject({ "assets/zones.ts": simpleGet(api.url, "/zones") });
-    const holder = spawnHolder(join(root, "warehouse.duckdb"), 30_000);
+    const holder = spawnHolder(join(root, "warehouse.duckdb"), "release"); // never lets go: a run that waited would hang the test
     try {
       await holder.waitFor("held");
-      const t0 = Date.now();
       const out = await runIn(root, ["zones"], { noWait: true });
       expect(out.exit).toBe(4);
       expect(out.data.steps[0]).toMatchObject({ status: "failed", attempt: 1 });
       expect(out.data.steps[0]!.error!.code).toBe("DB_HELD_BY_OTHER_PROGRAM");
-      expect(Date.now() - t0).toBeLessThan(5000);
     } finally {
       cleanup();
     }
-  });
+  }, 30_000);
 
   test("staging of runs that ended more than 3 days ago is pruned; running and recent ones stay", async () => {
     const { mkdirSync, utimesSync } = await import("node:fs");
