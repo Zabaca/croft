@@ -73,6 +73,10 @@ async function lakeFiles(conn: DuckDBConnection): Promise<string[] | null> {
   const lakes = (await conn.runAndReadAll("SELECT database_name, path FROM duckdb_databases() WHERE type = 'ducklake'")).getRowsJS();
   if (!lakes.length) return null;
   const out: string[] = [];
+  // The CA file httpfs checks the store's certificate against (D160) is allowed to the instance and is not SQL's: not to read, and above all not
+  // to overwrite (nothing but this gate stands between a COPY and the file). It is only set when the lake's bucket is reached over TLS.
+  const ca = (await conn.runAndReadAll("SELECT value FROM duckdb_settings() WHERE name = 'ca_cert_file'")).getRowsJS()[0]?.[0];
+  if (typeof ca === "string" && ca !== "") out.push(ca);
   for (const [name, path] of lakes) {
     const catalog = typeof path === "string" && path.startsWith("sqlite:") ? path.slice("sqlite:".length) : null;
     if (catalog) out.push(catalog, `${catalog}-wal`, `${catalog}-shm`, `${catalog}-journal`);

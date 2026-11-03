@@ -192,6 +192,10 @@
               "type": "boolean",
               "default": true
             },
+            "sslRootCert": {
+              "description": "a PEM file of the certificate authorities the store's certificate is signed by, relative to the project folder; for a store with a private authority's certificate (default: this machine's CA bundle)",
+              "type": "string"
+            },
             "writer": {
               "description": "the bucket key croft writes with, by the names of the secrets that hold it",
               "type": "object",

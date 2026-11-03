@@ -147,3 +147,12 @@ describe("croft doctor on a lake", () => {
     expect((await records()).map((r) => r.n).sort((x, y) => x - y)).toEqual([1, 3, 4]); // this machine 1, b 3, a 4: the order of the commits
   }, 240_000);
 });
+
+describe("doctor's time for comparing tables (D166)", () => {
+  test("a lake over a network gets more than the file's 400 ms, which never compared more than the first of its tables; one on this machine keeps the file's", async () => {
+    const { lakeScanMs, TABLE_SCAN_LAKE_MS, TABLE_SCAN_MS } = await import("./doctor.ts");
+    expect(lakeScanMs("postgres")).toBe(TABLE_SCAN_LAKE_MS);
+    expect(TABLE_SCAN_LAKE_MS).toBeGreaterThanOrEqual(10 * TABLE_SCAN_MS);
+    expect(lakeScanMs("local")).toBe(TABLE_SCAN_MS);
+  });
+});

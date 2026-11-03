@@ -49,6 +49,10 @@ export interface LakeBucket {
   region?: string;
   urlStyle?: "path" | "vhost";
   useSsl?: boolean;
+  /** The PEM file of certificate authorities the store's certificate is checked against, an absolute path (db/store-tls.ts finds it). DuckDB
+   *  may read no file once locked, so the file is allowed by name and httpfs is pointed at it; without one, an https store fails with
+   *  "Cannot read a CA certificate bundle". Absent when the store is not reached over TLS. */
+  caFile?: string;
 }
 
 /** A lake attached read-write (the writing machine's login and key) or read-only (everything that only reads). */
@@ -56,6 +60,9 @@ export interface LakeSpec {
   catalog: LakePostgres;
   data: LakeBucket;
   access: "write" | "read";
+  /** Only the bucket: its secret and CA file are made and nothing is attached, so no catalog is reached. For croft doctor's probe of the
+   *  bucket (db/lake-probe.ts), which must work before a lake exists. */
+  storeOnly?: true;
 }
 
 /** A local lake: a SQLite catalog file and a local data folder in place of Postgres and the bucket. For croft's own suite and
@@ -140,7 +147,10 @@ export function modeDirectories(mode: ModeSpec | undefined): string[] {
 
 /** The single file paths (not folders) a mode's SQL may reach: the read copy, for the readers' process. */
 export function modePaths(mode: ModeSpec | undefined): string[] {
-  return mode?.kind === "readers" ? [mode.copy] : [];
+  if (mode?.kind === "readers") return [mode.copy];
+  // A store over TLS: the one CA file httpfs reads to check its certificate (D160). Nothing else of the machine's files.
+  if ((mode?.kind === "lake" || mode?.kind === "lake-readers") && mode.lake.data.caFile) return [mode.lake.data.caFile];
+  return [];
 }
 
 /** The local-folder profiles each mode may run under: the readers' processes reach no folder but their own. A lake behind a
@@ -159,7 +169,7 @@ export function modeIdentity(mode: ModeSpec): unknown {
   if (mode.kind === "readers") return { ...base, copy: mode.copy };
   if (mode.kind === "lake-local") return { ...base, catalog: mode.lake.catalog.path, dataPath: mode.lake.dataPath, access: mode.lake.access };
   const { catalog, data, access } = mode.lake;
-  return { ...base, catalog: [catalog.host, catalog.port, catalog.database, catalog.user, catalog.sslMode ?? null, catalog.sslRootCert ?? null], data: [data.path, data.endpoint ?? null, data.region ?? null, data.urlStyle ?? null, data.useSsl ?? null], access };
+  return { ...base, catalog: [catalog.host, catalog.port, catalog.database, catalog.user, catalog.sslMode ?? null, catalog.sslRootCert ?? null], data: [data.path, data.endpoint ?? null, data.region ?? null, data.urlStyle ?? null, data.useSsl ?? null, data.caFile ?? null], access, storeOnly: mode.lake.storeOnly ?? null };
 }
 
 /** A digest of the mode's credentials, compared but never printed: a different password or key is a different instance. */
@@ -257,6 +267,16 @@ async function attachLake(conn: DuckDBConnection, lake: LakeSpec, secrets: strin
     `USE_SSL ${data.useSsl === false ? "false" : "true"}`,
   ];
   await attempt(conn, `CREATE OR REPLACE TEMPORARY SECRET ${LAKE_BUCKET_SECRET} (${opts.join(", ")})`, fail);
+  // A store over TLS is checked, always (D160). DuckDB 2.0's `enable_server_cert_verification` defaults to false, and its httplib client then
+  // read a self-signed store with no CA or the wrong one, verifying nothing [V: 2.0.0]; the curl client checks regardless. Both are pinned
+  // here, before the lock, so neither a default nor a setting of the machine's changes it.
+  if (data.useSsl !== false) {
+    await attempt(conn, `SET GLOBAL enable_server_cert_verification = true`, fail);
+    await attempt(conn, `SET GLOBAL httpfs_client_implementation = 'curl'`, fail);
+  }
+  // httpfs checks the store's certificate against this file, and may read it only because modePaths allows it (D160).
+  if (data.caFile)await attempt(conn, `SET GLOBAL ca_cert_file = ${q(data.caFile)}`, fail);
+  if (lake.storeOnly) return; // croft doctor's probe of the bucket (D165): the store's secret and CA, no catalog is reached
   await attempt(conn, `ATTACH 'ducklake:postgres:' AS ${LAKE_ALIAS} (DATA_PATH ${q(data.path)}, META_SECRET ${LAKE_CATALOG_SECRET}, DUCKLAKE_VERSION ${q(DUCKLAKE_FORMAT)}${access === "read" ? ", READ_ONLY" : ""})`, fail);
 }
 

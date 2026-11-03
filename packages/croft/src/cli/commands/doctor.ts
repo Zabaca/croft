@@ -122,6 +122,10 @@ export interface DoctorDeps {
 
 /** The tables line compares no more tables once this has passed, so doctor stays quick on a big warehouse. */
 export const TABLE_SCAN_MS = 400;
+/** The same for a lake whose store and catalog are over a network (D166): comparing one table takes several round trips of 50 to 700 ms, so 400 ms
+ *  never compared more than the first (the first real-lake trial compared none of 6). A lake on this machine keeps the file's budget. */
+export const TABLE_SCAN_LAKE_MS = 8_000;
+export const lakeScanMs = (kind: "postgres" | "local"): number => (kind === "postgres" ? TABLE_SCAN_LAKE_MS : TABLE_SCAN_MS);
 
 export function defaultDeps(env: Record<string, string | undefined>): DoctorDeps {
   return {
@@ -171,7 +175,15 @@ function nextFor(problems: Problem[]): { command: string; reason: string }[] {
 
 // ---------------------------------------------------------------------------------------------
 
+/** One ProjectEnv for a whole doctor run, so a secretsFrom command that a lake's secrets make croft run is run once, whichever check asks (D163). */
+function envOf(r: Report, d: DoctorDeps, project: Project): ProjectEnv {
+  r.env ??= ProjectEnv.load(project.root, d.env);
+  return r.env;
+}
+
 class Report {
+  /** The run's ProjectEnv (envOf). */
+  env: ProjectEnv | undefined;
   readonly checks: DoctorCheck[] = [];
   readonly problems: Problem[] = [];
   add(section: Section, id: string, status: CheckStatus, text: string, p?: Problem, details?: Record<string, unknown>): void {
@@ -534,7 +546,7 @@ async function checkWarehouse(r: Report, d: DoctorDeps, project: Project, bindin
 async function checkCatalogTls(r: Report, d: DoctorDeps, project: Project, catalog: { host: string; sslMode: CatalogSslMode; sslRootCert?: string }): Promise<void> {
   const { host, sslMode } = catalog;
   const { catalogTls } = await import("../../db/catalog-tls.ts");
-  const fromEnv = ProjectEnv.load(project.root, d.env).lookup("SSL_CERT_FILE")?.value;
+  const fromEnv = envOf(r, d, project).lookup("SSL_CERT_FILE")?.value;
   let ca: string | undefined;
   try {
     ca = catalogTls(catalog, project.root, { env: { SSL_CERT_FILE: fromEnv } }).sslRootCert;
@@ -553,6 +565,59 @@ async function checkCatalogTls(r: Report, d: DoctorDeps, project: Project, catal
     r.add("environment", "lake.catalog.tls", "warn",
       `the catalog connection to ${host} does not check the server's certificate (sslMode ${sslMode}): whoever sits between this machine and the catalog could read its password and rows; set "lake.catalog.sslMode" to "verify-full" if the catalog's certificate can be checked (croft docs lake)`, undefined, details);
   }
+}
+
+/**
+ * The bucket (D165): croft's own locked instance, with the read-only key and the CA file the project chose, lists the lake's folder and reads
+ * the footer of one data file when there is one, whether or not the lake is made yet. It writes nothing. Before this, doctor said "no problems
+ * found" about a lake whose bucket could not be read or written at all (the first real-lake trial), because with no lake yet it touched no byte of it.
+ */
+async function checkLakeStore(r: Report, d: DoctorDeps, project: Project): Promise<void> {
+  const lake = project.config.lake!;
+  const folder = lake.kind === "postgres" ? bucketPath(lake.bucket) : "";
+  const details: Record<string, unknown> = { folder };
+  try {
+    const { probeStore } = await import("../../db/lake-probe.ts");
+    const p = await probeStore(project, envOf(r, d, project));
+    const ca = p.caFile ? ` against ${p.caFile}` : "";
+    const text = p.empty
+      ? `the bucket answers (listed in ${p.listMs} ms${ca}): ${p.folder} is empty, which the first croft run changes`
+      : p.many ? `the bucket answers (a page of ${p.folder} listed in ${p.listMs} ms${ca}): it holds more than 1,000 objects, which croft's locked instance does not list further`
+      : `the bucket answers: ${p.folder} listed in ${p.listMs} ms${p.sample ? `, the footer of ${p.sample.file} read in ${p.sample.readMs} ms` : ", no data file to read yet"}${ca}`;
+    r.add("environment", "lake.store", "ok", text, undefined, { ...details, empty: p.empty, many: p.many, listMs: p.listMs, sample: p.sample, caFile: p.caFile });
+  } catch (e) {
+    if (e instanceof CroftError) {
+      r.add("environment", "lake.store", "error", e.problem.message, e.problem, details);
+    } else {
+      const first = String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 200);
+      r.add("environment", "lake.store", "info", `the bucket was not probed (${first})`, undefined, details);
+    }
+  }
+}
+
+/** Hosts that are this machine: a catalog there crosses no network. */
+function isThisMachine(host: string): boolean {
+  const h = host.replace(/^\[|\]$/g, "").toLowerCase();
+  return h === "localhost" || h === "::1" || /^127\.\d+\.\d+\.\d+$/.test(h);
+}
+
+/**
+ * Whether the catalog's connection is encrypted (D165), as the server reports it for this connection. libpq's default `sslmode` (prefer) falls
+ * back to plain text without a word when the server offers no TLS, and the first real-lake trial found its password and rows crossing a private
+ * network that way. Plain text to another machine is a warning; to this machine, a note.
+ */
+export function catalogEncryptionLine(host: string, enc: { encrypted: boolean; version: string | null }): { status: "ok" | "info" | "warn"; text: string } {
+  if (enc.encrypted) return { status: "ok", text: `the catalog connection to ${host} is encrypted${enc.version ? ` (${enc.version})` : ""}` };
+  if (isThisMachine(host)) return { status: "info", text: `the catalog connection to ${host} is not encrypted; the catalog is on this machine` };
+  return {
+    status: "warn",
+    text: `the catalog connection to ${host} is NOT encrypted: its password and every row cross the network in plain text, because the server offered no TLS and the client fell back without saying so; turn TLS on at the Postgres server (croft docs lake)`,
+  };
+}
+
+function checkCatalogEncryption(r: Report, host: string, enc: import("../../db/lake-probe.ts").CatalogEncryption): void {
+  const line = catalogEncryptionLine(host, enc);
+  r.add("environment", "lake.catalog.encrypted", line.status, line.text, undefined, { host, encrypted: enc.encrypted, tls: enc.version, cipher: enc.cipher });
 }
 
 /**
@@ -575,6 +640,9 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
     r.add("environment", "warehouse", "info", `${label} · not opened (the DuckDB binding does not load)`, undefined, details);
     return;
   }
+  // The bucket, before the lake: it is asked whether or not the lake is made yet (D165).
+  if (lake.kind === "postgres") await checkLakeStore(r, d, project);
+  const seen: { encryption: import("../../db/lake-probe.ts").CatalogEncryption | null } = { encryption: null };
   let w: import("../../db/warehouse.ts").DuckWarehouse | undefined;
   try {
     const { openWarehouse } = await import("../../db/warehouse.ts");
@@ -583,13 +651,14 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
     const { lakeOption, machineId, writerReport } = await import("../../db/lake.ts");
     w = openWarehouse({
       path: project.paths.database, mode: "read_only", profile: "query", timezone: project.timezone, root: project.root, stateDir: project.paths.stateDir,
-      ...lakeOption(project, ProjectEnv.load(project.root, d.env)), isTTY: false, register: false, noticeAfterMs: Number.MAX_SAFE_INTEGER,
+      ...lakeOption(project, envOf(r, d, project)), isTTY: false, register: false, noticeAfterMs: Number.MAX_SAFE_INTEGER,
     });
     const meta = await w.read(async (db) => {
       const m = await readMeta(db);
+      if (lake.kind === "postgres") seen.encryption = await (await import("../../db/lake-probe.ts")).catalogEncryption(db);
       if (m.format_version) {
         try {
-          found.scan = await scanTables(db, { budgetMs: d.tableScanMs ?? TABLE_SCAN_MS });
+          found.scan = await scanTables(db, { budgetMs: d.tableScanMs ?? lakeScanMs(lake.kind) });
         } catch (e) {
           found.scan = e instanceof Error ? e : new Error(String(e));
         }
@@ -613,6 +682,7 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
       parts.push(mine ? `last written ${when(mine.at)} by this machine` : newest ? `last written ${when(newest.at)} by ${newest.host || newest.machine}; this machine has not written it` : "no write recorded yet");
       r.add("environment", "warehouse", "ok", parts.join(" · "), undefined, details);
     }
+    if (lake.kind === "postgres" && seen.encryption) checkCatalogEncryption(r, lake.catalog.host, seen.encryption);
     if (meta.format_version) await checkLakeMaintenance(r, d, project, w);
   } catch (e) {
     if (!(e instanceof CroftError)) {
@@ -641,7 +711,7 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
 async function checkLakeMaintenance(r: Report, d: DoctorDeps, project: Project, w: import("../../db/warehouse.ts").DuckWarehouse): Promise<void> {
   const lake = project.config.lake!;
   const { lakeStats, ageBasedExpiryOptions } = await import("../../db/lake-maintenance.ts");
-  const { maintenanceView, readState } = await import("../../db/lake-maintenance-state.ts");
+  const { failedPassProblem, maintenanceView, readState } = await import("../../db/lake-maintenance-state.ts");
   const at = now(d.env);
   let seen;
   try {
@@ -668,10 +738,7 @@ async function checkLakeMaintenance(r: Report, d: DoctorDeps, project: Project, 
       : `every ${view.everyHours} h; no pass yet${view.nextDueAt ? ` (the first is due ${Date.parse(view.nextDueAt) <= at.getTime() ? "now" : `at ${clockText(view.nextDueAt, project.timezone, at)}`})` : ""}`;
   const details = { ...view, lake: s, expiryOptions: seen.options };
   if (view.lastError) {
-    const p = { ...problem("LAKE_MAINTENANCE_FAILED", {
-      message: `the last maintenance pass failed${view.lastError.step ? ` at the ${view.lastError.step} step` : ""} ${agoText(view.lastError.at, at)}: ${view.lastError.message}`,
-      hint: "the lake is usable and nothing was lost; croft tries again within the hour, or croft maintain now (croft docs LAKE_MAINTENANCE_FAILED)", retryable: true,
-    }), severity: "warning" as const };
+    const p = failedPassProblem(view.lastError, agoText(view.lastError.at, at));
     r.add("environment", "lake.maintenance", "warn", `maintenance: ${last} · ${p.message} · ${held}`, p, details);
   } else {
     r.add("environment", "lake.maintenance", "ok", `maintenance: ${last} · ${held}`, undefined, details);
@@ -940,7 +1007,7 @@ async function checkAssets(r: Report, d: DoctorDeps, project: Project, bindingOk
   let assets: number;
   try {
     const { validateProject } = await import("./validate.ts");
-    const report = await validateProject({ project, env: ProjectEnv.load(project.root, d.env), importTimeoutMs: 5000, addons: false });
+    const report = await validateProject({ project, env: envOf(r, d, project), importTimeoutMs: 5000, addons: false });
     problems = report.problems;
     assets = report.data.assets.length;
   } catch (e) {
@@ -1139,8 +1206,9 @@ function checkTables(r: Report, scan: TableScanResult): void {
       { checked: scan.checked });
   }
   if (scan.skipped > 0) {
-    r.add("project", "tables", "info", `tables: ${formatCount(scan.skipped)} more not compared with croft's record in the time doctor allows`
-      + " (the next run of each asset compares its table)", undefined, { skipped: scan.skipped });
+    const allowed = scan.budgetMs !== undefined ? ` (${scan.budgetMs < 1000 ? `${scan.budgetMs} ms` : `${scan.budgetMs / 1000} s`}${scan.budgetMs > TABLE_SCAN_MS ? ", more than a file gets, since a lake's tables are read over the network" : ""})` : "";
+    r.add("project", "tables", "info", `tables: ${formatCount(scan.skipped)} more not compared with croft's record in the time doctor allows${allowed}`
+      + `${allowed ? "; the" : " (the"} next run of each asset compares its table${allowed ? "" : ")"}`, undefined, { skipped: scan.skipped, ...(scan.budgetMs !== undefined ? { budgetMs: scan.budgetMs } : {}) });
   }
   for (const f of scan.findings) {
     if (f.outOfBand) r.add("project", "tables", "warn", f.outOfBand.problem.message, f.outOfBand.problem, { asset: f.asset });
@@ -1274,21 +1342,21 @@ async function checkSecrets(r: Report, d: DoctorDeps, project: Project, bindingO
   let declared: Record<string, string[]>;
   try {
     const { discoverAssets } = await import("../../project/discover.ts");
-    const { loadConfigs, secretsByAsset } = await import("./describe.ts");
+    const { loadConfigs, secretsByAsset, withLakeSecrets } = await import("./describe.ts");
     const { assets } = await discoverAssets(project.root, { assetsDir: project.paths.assetsDir });
-    declared = secretsByAsset(await loadConfigs(project, assets.filter((a) => a.kind === "ts"), { importTimeoutMs: 5000 }));
+    declared = withLakeSecrets(secretsByAsset(await loadConfigs(project, assets.filter((a) => a.kind === "ts"), { importTimeoutMs: 5000 })), project);
   } catch (e) {
     r.add("project", "secrets", "info", `declared secrets not checked: ${String((e as Error)?.message ?? e).split("\n")[0]!.slice(0, 200)}`);
     return;
   }
   let env: ProjectEnv;
   try {
-    env = ProjectEnv.load(project.root, d.env);
+    env = envOf(r, d, project);
   } catch {
     return;                          // .env cannot be read: checkEnvFiles already says so
   }
   const list = env.listSecrets(declared);
-  if (env.secretsFrom) checkSecretsCommand(r, d, project, env.secretsFrom, list.filter((s) => s.status === "unchecked").map((s) => s.name));
+  if (env.secretsFrom) checkSecretsCommand(r, d, project, env.secretsFrom, list.filter((s) => s.status === "unchecked").map((s) => s.name), env.commandRan);
   if (list.length === 0) return;
   const missing = list.filter((s) => s.status === "missing");
   for (const s of missing) {
@@ -1307,13 +1375,14 @@ async function checkSecrets(r: Report, d: DoctorDeps, project: Project, bindingO
 }
 
 /**
- * croft.json's secretsFrom (D108), without running it (doctor never reads a secret): the names only it can supply,
+ * croft.json's secretsFrom (D108), which doctor does not run itself (it never reads a secret for its own sake; in a lake project opening the lake
+ * asks for the lake's secrets, which runs it once when the shell and .env lack one, and `ran` says so): the names only it can supply,
  * and whether its program is found, on this PATH and on the one scheduled runs get (register.ts jobPath: Bun's
  * folder, /opt/homebrew/bin on macOS, /usr/local/bin and the system folders). A program found on neither is
  * SECRETS_COMMAND_FAILED as a warning, since a run that needs it would fail; one only this shell finds is the same
  * warning about scheduled runs, with the absolute path as the fix.
  */
-function checkSecretsCommand(r: Report, d: DoctorDeps, project: Project, from: SecretsFrom, unchecked: string[]): void {
+function checkSecretsCommand(r: Report, d: DoctorDeps, project: Project, from: SecretsFrom, unchecked: string[], ran: boolean): void {
   const program = from.command[0]!;
   const shown = commandText(from.command);
   const scheduled = jobPath(dirname(process.execPath), d.platform);
@@ -1335,7 +1404,9 @@ function checkSecretsCommand(r: Report, d: DoctorDeps, project: Project, from: S
     warn(`secretsFrom: ${program} is found here (${here}) but not on the PATH scheduled runs get (${scheduled})`,
       `write "${here}" as the first element of secretsFrom.command in croft.json`, `use "${here}" in croft.json's secretsFrom.command`);
   } else {
-    r.add("project", "secrets-from", "info", `secretsFrom: ${shown} (${here}), not run by doctor${names}`, undefined, { command: from.command, found: here, unchecked });
+    // doctor runs the command only for a lake: opening it asks for the lake's secrets, and the command runs, once, when the shell and .env lack one (D163).
+    const what = ran ? "run once by doctor, for the lake's secrets" : project.config.lake ? "not run: the shell and .env set every secret the lake names" : "not run by doctor";
+    r.add("project", "secrets-from", "info", `secretsFrom: ${shown} (${here}), ${what}${names}`, undefined, { command: from.command, found: here, unchecked, ran });
   }
 }
 

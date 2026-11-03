@@ -1,10 +1,13 @@
 // What croft remembers of a lake's maintenance, and when the next pass is due (DESIGN.md D150; option 07, slice 3). It lives in runs.sqlite
 // (setting `lake.maintenance`), so `croft status`, the scheduler's tick and the run that has just ended can ask without opening the lake or
 // the DuckDB library. The pass itself is db/lake-pass.ts.
+import { problem } from "../core/errors.ts";
 import { type ProcessIdentity, recordAlive } from "../core/proc.ts";
+import type { Problem } from "../core/types.ts";
 import type { RunsDb } from "../history/runs-db.ts";
 import type { LakeMaintenanceConfig } from "../project/lake-config.ts";
 import type { LakeStats, StepName } from "./lake-maintenance.ts";
+import { storeTlsProblem } from "./store-tls.ts";
 
 export const MAINTENANCE_SETTING = "lake.maintenance";
 
@@ -112,5 +115,27 @@ export function maintenanceView(state: MaintenanceState | null, cfg: LakeMainten
     nextDueAt: !cfg.enabled ? null : due.due ? now.toISOString() : due.at,
     lastPass: state?.last ? { tookMs: state.last.tookMs, expired: state.last.expired, before: state.last.before, after: state.last.after, ok: state.last.ok } : null,
     lastError: state?.lastError ?? null,
+  };
+}
+
+/** What a failed pass promises about trying again, said so that it is true: nothing runs by itself unless a croft command or the scheduler does
+ *  (D164). A pass is due an hour after one that failed (RETRY_AFTER_FAILURE_MS). */
+export const MAINTENANCE_RETRY = "a pass is due again an hour after one that failed, and the next croft run (or the scheduler's next tick, when croft schedule is on) makes it; croft maintain now makes it at once";
+
+/**
+ * The problem for the last pass's failure, as `croft status` and `croft doctor` show it (a warning: the data is as the last run left it).
+ * A pass that stopped because the store's certificate did not check out is LAKE_STORE_TLS, with its fix, like every other command that meets it.
+ */
+export function failedPassProblem(e: NonNullable<MaintenanceState["lastError"]>, when: string): Problem {
+  const parts = [e.step ? `at the ${e.step} step` : "", when].filter(Boolean).join(" ");
+  const where = parts ? ` ${parts}` : "";
+  const tls = e.code === "LAKE_STORE_TLS" ? storeTlsProblem(new Error(e.message)) : null;
+  if (tls) return { ...tls, message: `the last maintenance pass failed${where}: ${e.message}`, severity: "warning" };
+  return {
+    ...problem("LAKE_MAINTENANCE_FAILED", {
+      message: `the last maintenance pass failed${where}: ${e.message}`,
+      hint: `the lake is usable and nothing was lost; ${MAINTENANCE_RETRY} (croft docs LAKE_MAINTENANCE_FAILED)`, retryable: true,
+    }),
+    severity: "warning",
   };
 }

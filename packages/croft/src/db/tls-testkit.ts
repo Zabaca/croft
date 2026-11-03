@@ -22,7 +22,7 @@ export function certsReady(): { ready: boolean; skipReason: string } {
   return { ready: false, skipReason: msg };
 }
 
-function req(dir: string, name: string, cn: string, san: string | null): { cert: string; key: string } {
+export function req(dir: string, name: string, cn: string, san: string | null): { cert: string; key: string } {
   const cnf = join(dir, `${name}.cnf`);
   writeFileSync(cnf, `[req]\ndistinguished_name=dn\nx509_extensions=v3\nprompt=no\n[dn]\nCN=${cn}\n[v3]\n${san ? `subjectAltName=${san}\n` : ""}basicConstraints=critical,CA:TRUE\n`);
   const cert = join(dir, `${name}.crt`);

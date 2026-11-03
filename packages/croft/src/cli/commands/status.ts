@@ -59,7 +59,7 @@ import type { AddonView, AssetKind, Problem, Reason } from "../../core/types.ts"
 import { addonLine, addonsNeeded, inspectAddons } from "../../db/addon-status.ts";
 import type { ExtensionSearch } from "../../db/extension-files.ts";
 import { assessCopyPolicy, type CloneProbe, copyCostlyProblem, notClonedProblem, type ProbeOptions } from "../../db/copy-policy.ts";
-import { type MaintenanceView, maintenanceView, readState } from "../../db/lake-maintenance-state.ts";
+import { failedPassProblem, type MaintenanceView, maintenanceView, readState } from "../../db/lake-maintenance-state.ts";
 import { readCopyStatus, readCopyView, type ReadCopyView, readCopyWords } from "../../db/readcopy.ts";
 import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
 import { type DriftEntry, driftNote, recentDrift } from "../../history/drift.ts";
@@ -736,11 +736,7 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
         };
         // A pass that failed is a warning here, not an unhealthy lake: the data is as the last run left it, and the pass is tried again.
         if (view.lastError) {
-          addonProblems.push({ ...problem("LAKE_MAINTENANCE_FAILED", {
-            message: `the lake's last maintenance pass failed${view.lastError.step ? ` at the ${view.lastError.step} step` : ""}: ${view.lastError.message}`,
-            hint: "the lake is usable and nothing was lost; croft tries again within the hour, or croft maintain now (croft docs LAKE_MAINTENANCE_FAILED)",
-            retryable: true,
-          }), severity: "warning" });
+          addonProblems.push(failedPassProblem(view.lastError, ""));
         }
       }
       addonProblems.push(...addons.problems);

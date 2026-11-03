@@ -111,6 +111,7 @@ export const CODES = {
   EXTENSION_LOAD_FAILED: { category: "environment", severity: "error", exit: 2 },
   LAKE_ATTACH_FAILED: { category: "environment", severity: "error", exit: 2 },
   LAKE_BACKUP_TOOL_MISSING: { category: "environment", severity: "error", exit: 2 },
+  LAKE_STORE_TLS: { category: "environment", severity: "error", exit: 2 },
   SERVER_MODE_COPY_COSTLY: { category: "environment", severity: "error", exit: 2 },
   QUACK_LISTEN_FAILED: { category: "environment", severity: "error", exit: 2 },
   QUACK_PLAINTEXT_NOT_ACCEPTED: { category: "environment", severity: "error", exit: 2 },

@@ -426,7 +426,9 @@ export function formatRun(d: RunData, ctx?: Pick<Ctx, "render">): string {
   }
   lines.push(bold(`run ${d.runId} · ${plural(d.steps.length, "asset")}`));
   for (const s of d.steps) lines.push(...stepLines(s));
-  const took = d.steps.reduce((m, s) => Math.max(m, s.durationMs), 0);
+  // The whole run, as it took (D164). A summary stored before the run recorded it has only its steps' times, which overlap while rows are fetched:
+  // the longest is the least the run took.
+  const took = d.durationMs ?? d.steps.reduce((m, s) => Math.max(m, s.durationMs), 0);
   const updated = d.steps.filter((s) => s.status === "ok" && s.rows.added + s.rows.updated + s.rows.deleted > 0).length;
   const failed = d.steps.filter((s) => s.status === "failed").length;
   lines.push(`${d.status === "interrupted" ? "interrupted" : "done"} ${formatDuration(took)} · ${formatCount(updated)} updated · ${formatCount(failed)} failed`);

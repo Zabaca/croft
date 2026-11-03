@@ -150,6 +150,8 @@ export interface RunData {
   status: RunStatus;
   progress?: ProgressSnapshot;
   steps: StepResult[];
+  /** How long the whole run took, from its start to its end (D164). Absent from the summary of a run that was still going, and from runs.sqlite rows made before it. */
+  durationMs?: number;
 }
 
 /** A run's whole command result: what `croft run` prints, stored in runs.summary for `croft wait`. */
@@ -697,6 +699,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
       ...(o.runId ? { id: o.runId } : {}), trigger: o.trigger ?? "manual", human: o.human ?? true, argv: [...o.argv], timeZone: project.timezone,
     });
     const runId = run.id;
+    const runStartedMs = Date.now();
     const events = eventLog ?? new EventLog(paths.stateDir, runId, o.onEvent, redact);
     eventLog = events;
     const runAc = new AbortController();
@@ -749,7 +752,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
       const clean = dedupe(problems);
       const confirmation = confirms.pending;
       const summary: RunSummary = jsonSafe({
-        data: { runId, status, steps },
+        data: { runId, status, steps, durationMs: Date.now() - runStartedMs },
         problems: clean,
         next: nextSteps(steps, clean, confirms.deferred, { fromSkipped: o.from === undefined ? [] : skippedReaders(steps) }),
         ...(confirmation ? { confirmation } : {}),
@@ -759,7 +762,9 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
       release(runs, runId);
       const stored = redactValue(summary, env);
       runs.finishRun(runId, status, stored);
-      if (status === "succeeded") rmSync(join(paths.stateDir, "staging", runId), { recursive: true, force: true });
+      // Whatever the run's end: a failed run kept its staging for 3 days "for inspection" (7 MB in a lake trial), and nothing reads it: the
+      // error is in `croft logs`, and a rerun extracts again. What a process that died leaves is reconcile's and pruneStaging's (D164).
+      rmSync(join(paths.stateDir, "staging", runId), { recursive: true, force: true });
       events.emit({ type: "run", runId, status, exit: summary.exit });
       return stored;
     };
@@ -1353,7 +1358,8 @@ async function lateWarnings(i: WarningInput, out: StepOutcome, previous: string[
   }
 }
 
-/** Staging of a failed run is kept for inspection for this long (§5 step 4). */
+/** Staging that a run left because its process died, and chunks waiting for a commit, are kept this long (§5 step 4; a run that ends, failed or not,
+ *  removes its own staging, D164). */
 export const STAGING_KEEP_MS = 3 * 86_400_000;
 
 /** <state>/staging/_chunks: incremental transforms' chunks staged and not yet committed (transform.ts). */

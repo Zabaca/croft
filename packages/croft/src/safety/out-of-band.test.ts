@@ -99,8 +99,8 @@ describe("scanTables (doctor)", () => {
   test("a time budget stops it starting new tables; the rest are counted as skipped", async () => {
     const w = warehouse();
     await setup(w);
-    expect(await w.read((db) => scanTables(db, { budgetMs: 0 }), { purpose: "t" })).toEqual({ checked: 0, skipped: 3, findings: [] });
-    expect(await w.read((db) => scanTables(db, { budgetMs: 60_000 }), { purpose: "t" })).toEqual({ checked: 3, skipped: 0, findings: [] });
+    expect(await w.read((db) => scanTables(db, { budgetMs: 0 }), { purpose: "t" })).toEqual({ checked: 0, skipped: 3, findings: [], budgetMs: 0 });
+    expect(await w.read((db) => scanTables(db, { budgetMs: 60_000 }), { purpose: "t" })).toEqual({ checked: 3, skipped: 0, findings: [], budgetMs: 60_000 });
   });
 
   test("every recorded table is compared: rows, stamps, columns and a dropped table; tables croft has no record of are not", async () => {

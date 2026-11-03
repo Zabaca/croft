@@ -39,6 +39,12 @@ const fill = (text: string, v: Record<string, string>): string => text.replace(/
   return v[k]!;
 });
 
+/** `<data_path>` of the recipe: the lake's folder as croft.json writes it and `croft doctor` prints it, `s3://bucket/folder/` with one slash at the end. */
+const dataPath = (lake: { block: Record<string, unknown> }): string => {
+  const b = lake.block.bucket as { name: string; folder: string };
+  return `s3://${b.name}/${b.folder}`;
+};
+
 /** The statements of a block: split where a semicolon ends a line, or a line holds several INSTALLs. */
 const statements = (text: string): string[] => text.split(/;\s*(?:\n|$)|;\s+(?=INSTALL)/).map((s) => s.trim()).filter(Boolean);
 
@@ -50,7 +56,7 @@ describe("the docs' recipe for reading a lake from your own DuckDB", () => {
     const v = {
       analyst: "analyst_reader", analyst_password: "test-analyst-password", database, writer: WRITER_LOGIN.user,
       host: rig.pg.host, port: String(rig.pg.port), key_id: READER_KEY.id, key_secret: READER_KEY.secret, endpoint: rig.s3.endpoint,
-      use_ssl: "false", bucket: lake.bucket, folder: lake.folder,
+      use_ssl: "false", data_path: dataPath(lake),
       // The rig's Postgres is on this machine and offers no TLS: the docs' "same machine" values, with a file that exists.
       sslmode: "prefer", ca_file: import.meta.path,
     };
@@ -60,6 +66,10 @@ describe("the docs' recipe for reading a lake from your own DuckDB", () => {
     // The analyst, in their own DuckDB (not croft's connection: no sandbox, no lockdown, only their own SQL). INSTALL becomes a LOAD of the
     // pinned file of the same extension.
     const platform = hostPlatform()!;
+    // The folder as croft.json writes it ends in one slash; the recipe adds none (a second made `s3://bucket/folder//`, where counts worked and
+    // every read of a data file was a 404, D163).
+    expect((lake.block.bucket as { folder: string }).folder).toMatch(/[^/]\/$/);
+    expect(fill(block("duckdb-reader"), v).replaceAll("s3://", "")).not.toContain("//");
     const instance = await DuckDBInstance.create(":memory:", { autoinstall_known_extensions: "false", autoload_known_extensions: "false" });
     const c = await instance.connect();
     try {
@@ -102,7 +112,7 @@ describe("the docs' recipe for reading a lake from your own DuckDB", () => {
     const v = {
       analyst: "old_reader", analyst_password: "test-analyst-password", database, writer: WRITER_LOGIN.user,
       host: rig.pg.host, port: String(rig.pg.port), key_id: READER_KEY.id, key_secret: READER_KEY.secret, endpoint: rig.s3.endpoint,
-      use_ssl: "false", bucket: lake.bucket, folder: lake.folder,
+      use_ssl: "false", data_path: dataPath(lake),
       // The rig's Postgres is on this machine and offers no TLS: the docs' "same machine" values, with a file that exists.
       sslmode: "prefer", ca_file: import.meta.path,
     };

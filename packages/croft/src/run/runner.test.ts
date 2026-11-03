@@ -5,6 +5,8 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DuckDBInstance } from "@duckdb/node-api";
+import { formatRun } from "../cli/commands/run.ts";
+import { formatDuration } from "../cli/render.ts";
 import { closeAllWarehouses, openWarehouse } from "../db/warehouse.ts";
 import { getCatalog } from "../history/catalog.ts";
 import { acquire } from "../history/leases.ts";
@@ -1988,6 +1990,24 @@ describe("the project clock", () => {
     } finally {
       db.close();
     }
+  });
+
+  test("a run that failed leaves no staging behind (it was 7 MB of a lake trial's failed run), and the run says how long it took as a whole (D164)", async () => {
+    const root = makeProject({
+      "assets/rows.ts": `import { ingest } from "@zabaca/croft";
+export default ingest({ key: "id", checks: ["id > 5"], async *rows() { yield [{ id: 1 }, { id: 2 }, { id: 3 }]; } });
+`,
+      "assets/slow.sql": "-- key: id\nSELECT range AS id FROM range(3)\n",
+    });
+    const out = await runIn(root, []);
+    expect(out.exit).not.toBe(0);
+    expect(out.data.status).toBe("failed");
+    expect(out.data.steps.find((s) => s.asset === "rows")?.status).toBe("failed");
+    expect(existsSync(join(root, ".croft", "staging", out.data.runId))).toBe(false);
+    // The whole run, which is at least its longest step (the summary used to say that and no more).
+    const longest = Math.max(...out.data.steps.map((s) => s.durationMs));
+    expect(out.data.durationMs).toBeGreaterThanOrEqual(longest);
+    expect(formatRun(out.data)).toContain(`done ${formatDuration(out.data.durationMs!)}`);
   });
 
   test("a failed run's staging is kept 3 days on the clock that stamped it", async () => {

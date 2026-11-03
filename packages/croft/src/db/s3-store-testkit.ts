@@ -1,9 +1,9 @@
 // A minimal S3-compatible object store for croft's lake-mode tests (DESIGN.md D118). Run as a child process of the
 // test (see mode-testkit.ts), never installed and never left running:
 //
-//   bun s3-store-testkit.ts --root <dir> --bucket <name> --key <id>:rw --key <id>:ro [--port 0]
+//   bun s3-store-testkit.ts --root <dir> --bucket <name> --key <id>:rw --key <id>:ro [--port 0] [--tls-cert <pem> --tls-key <pem>]
 //
-// It prints `LISTENING <port>` once it serves. It speaks the part of S3 that DuckDB's httpfs uses against a bucket
+// With a certificate and key (PEM files) it serves HTTPS, as a real store does; without them, plain HTTP. It prints `LISTENING <port>` once it serves. It speaks the part of S3 that DuckDB's httpfs uses against a bucket
 // in path style over plain HTTP: HEAD, GET (with Range), PUT, DELETE, the ListObjectsV2 listing, multipart upload and
 // the multi-object delete. It checks only WHO is asking, not the request signature: an access key id it does not
 // know gets 403 InvalidAccessKeyId, and a read-only key that writes gets 403 AccessDenied, each echoing the key id
@@ -53,9 +53,13 @@ function listFiles(dir: string): string[] {
   return out;
 }
 
+const tlsCert = arg("tls-cert")[0];
+const tlsKey = arg("tls-key")[0];
+
 const server = Bun.serve({
   port: Number(arg("port")[0] ?? 0),
   hostname: "127.0.0.1",
+  ...(tlsCert && tlsKey ? { tls: { cert: Bun.file(tlsCert), key: Bun.file(tlsKey) } } : {}),
   async fetch(req) {
     const url = new URL(req.url);
     const m = req.method;
