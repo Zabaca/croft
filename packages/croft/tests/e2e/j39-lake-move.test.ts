@@ -114,7 +114,7 @@ if (!LAKE) {
   const statusOf = async (p: Project): Promise<unknown> => {
     const r = await p.json(["status"]);
     expect(r.code, show(r)).toBe(0);
-    const { lake: _l, serverMode: _s, ...rest } = r.json.data;
+    const { lake: _l, lakeMove: _m, serverMode: _s, ...rest } = r.json.data;
     const data = JSON.parse(JSON.stringify(rest));
     for (const a of data.assets ?? []) delete a.lastRun;
     return data;

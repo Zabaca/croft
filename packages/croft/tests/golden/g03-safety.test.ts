@@ -2,7 +2,8 @@
 // schema: delete (rows and a whole table) and restore, each asking for a token off a TTY, confirm carrying the token
 // out (and refusing a spent one), a shrink and a rebuild confirmed through croft run, and rename; and backup, the
 // copy that keeps what they could lose (D109); and maintain, the lake's housekeeping, which a project that keeps a file is told
-// it does not need (a lake's own payloads are validated by the lake journey, tests/e2e/j38-lake-maintenance.test.ts).
+// it does not need (a lake's own payloads are validated by the lake journey, tests/e2e/j38-lake-maintenance.test.ts); and move-to-lake, which a project
+// with no lake to move into is refused (the move's own payloads are validated by tests/e2e/j39-lake-move.test.ts).
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { cleanupAll, initProject, type Project, schedulerEnv } from "../e2e/harness.ts";
 import { golden } from "./kit.ts";
@@ -85,6 +86,12 @@ test("rename, and a rename onto a name that is taken", async () => {
 test("maintain: a project that keeps a file is told so (exit 2, no data)", async () => {
   const r = golden("maintain", await p.croft(["maintain", "--json"], { env }), { failed: true, exit: 2 });
   expect(r.problems[0]).toMatchObject({ code: "MAINTAIN_NEEDS_LAKE", effect: "nothing was changed" });
+}, 60_000);
+
+test("move-to-lake: a project with no lake to move into is told so (exit 2, no data); the lake's own payloads are the lake journey's", async () => {
+  const r = golden("move-to-lake", await p.croft(["move-to-lake", "--json"], { env }), { failed: true, exit: 2 });
+  // On a file project there is no lake block (no_lake); with every journey's warehouse in a lake (CROFT_E2E_LAKE) the project is in one already.
+  expect(r.problems[0]).toMatchObject({ code: "MOVE_NEEDS_LAKE", effect: "nothing was changed", details: { reason: expect.stringMatching(/^(no_lake|already_in_lake)$/) } });
 }, 60_000);
 
 test("backup: a new folder each time, with the trash; a folder inside the state folder is refused", async () => {

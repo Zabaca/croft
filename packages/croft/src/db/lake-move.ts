@@ -76,7 +76,7 @@ function stateColumns(t: Exclude<StateTableName, "meta">): string[] {
 }
 
 /** The latest rows of a `_croft` table in `pre` (a database alias with a dot, or ""): a plain SELECT for the file adapter, the log's newest
- *  row of each key for the log adapter. Spelled out because a view of an attached database may bind its tables in the database that attaches it. */
+ *  row of each key for the log adapter. Spelled out, with the row id as the tiebreak, because the view of a file made before D154 breaks a tie as DuckDB happens to. */
 function latestRows(pre: string, t: Exclude<StateTableName, "meta">, log: boolean): string {
   if (!log) return `SELECT * FROM ${pre}_croft.${t}`;
   const key = STATE_SPECS[t].key.join(", ");
@@ -180,10 +180,12 @@ export interface InexactColumn {
  * - an INTERVAL loses the microseconds under a millisecond (1.000003 s comes back as 1 s);
  * - a TIMETZ comes back as the same time at offset 0 (10:11:12+02 as 08:11:12+00), which is not the value that went in.
  * Every other type, DECIMAL(38,0) and TIMESTAMP_NS included, comes back as it went in. So a column of those four types is checked
- * value by value (top level only: one inside a STRUCT, LIST or MAP is left to the proof after the copy, which names it).
+ * value by value (top level only: one inside a STRUCT, LIST or MAP is left to the proof after the copy, which names it). `alias`: an attached
+ * copy of the file, else the connection's own database.
  */
-export async function inexactColumns(sql: Sql, inv: MoveInventory): Promise<InexactColumn[]> {
+export async function inexactColumns(sql: Sql, inv: MoveInventory, alias: string | null = null): Promise<InexactColumn[]> {
   const found: InexactColumn[] = [];
+  const pre = alias ? `${quoteIdent(alias)}.` : "";
   for (const t of inv.tables) {
     for (const c of t.columns) {
       const q = quoteIdent(c.name);
@@ -196,7 +198,7 @@ export async function inexactColumns(sql: Sql, inv: MoveInventory): Promise<Inex
         case "TIME WITH TIME ZONE": kind = "TIMETZ"; bad = `datepart('timezone', ${q}) <> 0`; break;
         default: continue;
       }
-      const from = `main.${quoteIdent(t.name)}`;
+      const from = `${pre}main.${quoteIdent(t.name)}`;
       const [n] = await sql.all<{ n: number | bigint }>(`SELECT count(*) AS n FROM ${from} WHERE ${q} IS NOT NULL AND (${bad})`);
       if (num(n?.n) === 0) continue;
       const [e] = await sql.all<{ v: string }>(`SELECT ${q}::VARCHAR AS v FROM ${from} WHERE ${q} IS NOT NULL AND (${bad}) LIMIT 1`);

@@ -236,7 +236,7 @@ describe("the golden tests", () => {
   test("run every command with a schema", () => {
     const dir = join(SCHEMAS_OUT, "..", "tests", "golden");
     const text = readdirSync(dir).filter((f) => f.endsWith(".test.ts")).map((f) => readFileSync(join(dir, f), "utf8")).join("\n");
-    const covered = new Set([...text.matchAll(/\bgolden\("([a-z]+)"/g)].map((m) => m[1]!));
+    const covered = new Set([...text.matchAll(/\bgolden\("([a-z-]+)"/g)].map((m) => m[1]!));
     expect(SCHEMA_COMMANDS.filter((c) => !covered.has(c))).toEqual([]);
   });
 });

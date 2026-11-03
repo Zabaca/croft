@@ -89,3 +89,11 @@ of the warehouse as it was; ask the user before deleting one.
 
 The trash and these backups live in .croft/, next to the warehouse. A copy of the whole project's data, on another
 disk if you like, is croft backup (croft docs backup).
+
+## After a move into a lake
+
+The trash does not move when a project moves into a lake (croft docs lake): its versions stay the local files they were,
+and croft restore brings one back into the lake. A version from the file's days has no lake snapshot to pin, so the lake's
+maintenance holds nothing for it and the trash's own 30 days or 5 versions apply. A version whose table has a column a
+lake cannot store (ENUM, UNION, VARINT, BIT, a fixed-size ARRAY) is named in the move's question: restore it on the file
+before the move, or it will not restore into the lake as it is.

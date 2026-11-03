@@ -87,6 +87,54 @@
               ],
               "additionalProperties": false
             },
+            "lakeMove": {
+              "type": "object",
+              "properties": {
+                "state": {
+                  "enum": [
+                    "back",
+                    "idle",
+                    "moved"
+                  ]
+                },
+                "lake": {
+                  "type": "string"
+                },
+                "at": {
+                  "type": [
+                    "null",
+                    "string"
+                  ]
+                },
+                "tables": {
+                  "type": [
+                    "null",
+                    "number"
+                  ]
+                },
+                "rows": {
+                  "type": [
+                    "null",
+                    "number"
+                  ]
+                },
+                "fileSha256": {
+                  "type": [
+                    "null",
+                    "string"
+                  ]
+                }
+              },
+              "required": [
+                "state",
+                "lake",
+                "at",
+                "tables",
+                "rows",
+                "fileSha256"
+              ],
+              "additionalProperties": false
+            },
             "lake": {
               "type": "object",
               "properties": {

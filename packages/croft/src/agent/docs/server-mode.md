@@ -82,3 +82,9 @@ add-on, an npm package the project installs once with `bun add @zabaca/croft-add
 the project's node_modules (croft docs addons). A missing or different file is EXTENSION_MISSING, EXTENSION_CHECKSUM_MISMATCH
 or EXTENSION_WRONG_BUILD, `croft validate` and `croft doctor` report it with the install command as the fix, and croft serve
 does not start (croft docs EXTENSION_MISSING). croft's own tests and builders use a folder instead ($CROFT_EXTENSION_DIR).
+
+## A project that moves into a lake
+
+Server mode over a lake is not built yet, so croft move-to-lake refuses a project with serverMode.enabled on
+(MOVE_BLOCKED) and leaves its keys, serve.sharedTables and settings exactly as they are. Keep such a project on its file
+until server mode over a lake exists, or ask the user whether to turn server mode off first.

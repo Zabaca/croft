@@ -20,7 +20,7 @@ import { basename, join } from "node:path";
 import { CroftError } from "../../core/errors.ts";
 import type { LockHolder, Problem } from "../../core/types.ts";
 import { acquire, release } from "../../history/leases.ts";
-import { stashMirror } from "../../history/mirror-home.ts";
+import { type MoveRecord, MOVE_SETTING, stashMirror } from "../../history/mirror-home.ts";
 import {
   configWritable, copyIntoLake, fingerprints, inexactColumns, inspectLake, inventoryOf, type LakeInspection, lakeHandles, lakeProjectOf, type LakeHandles,
   type MoveInventory, type MoveMarker, type NotMoved, newMoveTag, refuseInexact, refuseMoveTypes, switchLakeOn, undoCopy, verifyLake,
@@ -338,9 +338,6 @@ async function move(ctx: Ctx, s: Session, handles: LakeHandles, p: Preflight, ru
   return { backup, file: { path: project.databaseLabel, sha256: orig.sha256, bytes: orig.bytes, unchanged: true }, verified: { tables: proof.tables, rows: proof.rows, bookkeepingRows: proof.bookkeepingRows } };
 }
 
-/** The settings row `lake.move` that `croft status` and `croft doctor` show, and that going back to the file reads (D158). */
-export interface MoveRecord { at: string; runId: string; lake: string; tables: number; rows: number; fileSha256: string; fileBytes: number; backup: string }
-
 export const moveToLake: CommandImpl<MoveToLakeData> = {
   async run(ctx): Promise<CommandResult<MoveToLakeData>> {
     const project = ctx.project;
@@ -403,6 +400,11 @@ export const moveToLake: CommandImpl<MoveToLakeData> = {
   },
 };
 
+/** A path as the project's folder names it when it is inside it. */
+function shownIn(project: Project, path: string): string {
+  return path.startsWith(`${project.root}/`) ? path.slice(project.root.length + 1) : path;
+}
+
 // ---- Carrying it out -----------------------------------------------------------------------------------------------
 
 /**
@@ -448,9 +450,9 @@ async function carryOut(ctx: Ctx, s: Session, handles: LakeHandles, p: Preflight
     try {
       const record: MoveRecord = {
         at: ctx.now().toISOString(), runId, lake: lakeProjectOf(project).databaseLabel, tables: now.inv.tables.length, rows: now.inv.tables.reduce((n, t) => n + t.rows, 0),
-        fileSha256: out.file.sha256, fileBytes: out.file.bytes, backup: out.backup.path,
+        fileSha256: out.file.sha256, fileBytes: out.file.bytes, backup: shownIn(project, out.backup.path),
       };
-      s.runs.setSetting("lake.move", record);
+      s.runs.setSetting(MOVE_SETTING, record);
       s.runs.finishRun(runId, "succeeded", { data: { runId, status: "succeeded", steps: [] }, problems: [], next: [], exit: 0, ok: true });
     } catch {
       // See above.

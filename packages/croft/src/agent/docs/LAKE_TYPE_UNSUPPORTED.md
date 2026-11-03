@@ -1,14 +1,15 @@
 # LAKE_TYPE_UNSUPPORTED: a column's type cannot be stored in a lake
 
 A lake (croft docs lake) is a DuckLake, and DuckLake stores no ENUM, UNION, VARINT, BIT or fixed-size ARRAY
-(`INTEGER[3]`; a list, `INTEGER[]`, is fine) column, also not inside a STRUCT, a LIST or a MAP. The result of the asset has
-one, so croft stopped before it wrote anything: details.columns lists each column with its type, and details.kind the
-first kind found. A file warehouse stores these types; only a project with a `lake` block refuses them.
+(`INTEGER[3]`; a list, `INTEGER[]`, is fine) column, also not inside a STRUCT, a LIST or a MAP. The result of the
+asset has one, so croft stopped before it wrote anything: details.columns lists each column with its type, and
+details.kind the first kind found. A file warehouse stores these types; only a project with a `lake` block refuses
+them.
 
 Nothing was written, no row, no table and no bookkeeping.
 
-`croft move-to-lake` finds these in the tables of a file warehouse before it starts (details.tables names each table and
-its columns), and changes nothing until they are fixed.
+`croft move-to-lake` finds these in the tables of a file warehouse before it starts (details.tables names each table
+and its columns), and changes nothing until they are fixed.
 
 What to do: cast the column in the SELECT, or in the code that makes it, to a type a lake stores.
 - ENUM: `CAST(status AS VARCHAR) AS status`.

@@ -83,3 +83,24 @@ export function settleMirrorFor(stateDir: string, home: string, hasLake: boolean
     return null;
   }
 }
+
+/** The setting that remembers a move into a lake (runs.sqlite `lake.move`): when, which lake, how much, and the file's bytes. */
+export const MOVE_SETTING = "lake.move";
+
+export interface MoveRecord {
+  at: string;
+  runId: string;
+  /** The lake, with no credential. */
+  lake: string;
+  tables: number;
+  rows: number;
+  /** The sha256 and size of the file as the move left it, and where its backup is. */
+  fileSha256: string;
+  fileBytes: number;
+  backup: string;
+}
+
+export function readMoveRecord(db: RunsDb): MoveRecord | null {
+  const v = db.getSetting<Partial<MoveRecord>>(MOVE_SETTING);
+  return v && typeof v.at === "string" && typeof v.fileSha256 === "string" ? (v as MoveRecord) : null;
+}
