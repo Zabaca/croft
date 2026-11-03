@@ -25,7 +25,7 @@ import {
   configWritable, copyIntoLake, fingerprints, inexactColumns, inspectLake, inventoryOf, type LakeInspection, lakeHandles, lakeProjectOf, type LakeHandles,
   type MoveInventory, type MoveMarker, type NotMoved, newMoveTag, refuseInexact, refuseMoveTypes, switchLakeOn, undoCopy, verifyLake,
 } from "../../db/lake-move.ts";
-import { lakeRefusedColumns } from "../../db/lake.ts";
+import { lakeInexactColumns, lakeRefusedColumns } from "../../db/lake.ts";
 import { backupProject, type ProjectBackup } from "../../db/backup.ts";
 import { CROFT_VERSION } from "../../db/state.ts";
 import { discoverAssets } from "../../project/discover.ts";
@@ -58,7 +58,7 @@ export interface MoveToLakeData {
   bookkeeping: { table: string; rows: number }[];
   /** What the file holds that a lake project has no place for; it stays in the file. */
   notMoved: NotMoved[];
-  /** The trash stays where it is, and restores into the lake; these versions hold columns a lake cannot store and would not restore as they are. */
+  /** The trash stays where it is, and restores into the lake; these versions hold columns a lake cannot store, or would store inexactly (D162), and would not restore as they are. */
   trash: { versions: number; cannotRestore: { asset: string; trashedAt: string; columns: string[] }[] };
   /** The backup made first (the file, run history and the trash), and what a move needs of it; null before the move runs. */
   backup: { path: string; bytes: number } | null;
@@ -150,7 +150,7 @@ function words(d: MoveToLakeData, backups: string): { head: string; first: strin
     `does not come along: time travel (a file keeps none, so the lake's history starts with the move) and the file's own earlier states${d.notMoved.length ? `; ${notMovedWords(d.notMoved)} stay${d.notMoved.length === 1 ? "s" : ""} in the file` : ""}`,
   ];
   if (d.trash.cannotRestore.length) {
-    then.push(`${plural(d.trash.cannotRestore.length, "trashed version")} hold${d.trash.cannotRestore.length === 1 ? "s" : ""} columns a lake cannot store (${names(d.trash.cannotRestore.slice(0, 3).map((t) => `${t.asset}: ${t.columns.join(", ")}`))}${d.trash.cannotRestore.length > 3 ? ", ..." : ""}); restoring ${d.trash.cannotRestore.length === 1 ? "it" : "them"} into the lake fails until ${d.trash.cannotRestore.length === 1 ? "it is" : "they are"} restored on the file, before the move`);
+    then.push(`${plural(d.trash.cannotRestore.length, "trashed version")} hold${d.trash.cannotRestore.length === 1 ? "s" : ""} columns a lake cannot store, or would store inexactly (${names(d.trash.cannotRestore.slice(0, 3).map((t) => `${t.asset}: ${t.columns.join(", ")}`))}${d.trash.cannotRestore.length > 3 ? ", ..." : ""}); restoring ${d.trash.cannotRestore.length === 1 ? "it" : "them"} into the lake fails until ${d.trash.cannotRestore.length === 1 ? "it is" : "they are"} restored on the file, before the move`);
   }
   then.push("from then on this machine is the one machine that writes the lake, and croft backup, croft serve and croft maintain work on the lake");
   return { head, first, then };
@@ -220,7 +220,7 @@ async function trashReport(s: Session, project: Project): Promise<MoveToLakeData
       const bad = await s.warehouse.read((sql) => withTrashFile(sql, v.path, async (alias) => {
         const cols = await sql.all<{ name: string; type: string }>(
           `SELECT column_name AS name, data_type AS type FROM duckdb_columns() WHERE database_name = $1 AND schema_name = 'main' ORDER BY table_name, column_index`, [alias]);
-        return lakeRefusedColumns(cols);
+        return [...lakeRefusedColumns(cols), ...lakeInexactColumns(cols)];
       }), { purpose: "move into the lake: the trash" });
       if (bad.length) cannotRestore.push({ asset: v.asset, trashedAt: v.trashedAt, columns: bad.map((c) => c.name) });
     } catch {

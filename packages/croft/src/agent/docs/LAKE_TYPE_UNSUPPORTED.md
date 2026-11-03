@@ -14,7 +14,7 @@ and its columns), and changes nothing until they are fixed.
 What to do: cast the column in the SELECT, or in the code that makes it, to a type a lake stores.
 - ENUM: `CAST(status AS VARCHAR) AS status`.
 - UNION: `CAST(value AS VARCHAR) AS value`, or `to_json(value) AS value` to keep its structure as JSON.
-- VARINT: `CAST(big AS HUGEINT) AS big`, or `AS VARCHAR` when it can be larger than a HUGEINT holds.
+- VARINT: `CAST(big AS DECIMAL(38,0)) AS big`, or `AS VARCHAR` when it can have more than 38 digits.
 - BIT: `CAST(flags AS VARCHAR) AS flags` (the bits as text).
 - A fixed-size ARRAY: `CAST(pair AS DOUBLE[]) AS pair`, the same element type as a list.
 - Inside a STRUCT, LIST or MAP, cast the inner value, or turn the whole column into JSON with `to_json(col)`.

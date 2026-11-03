@@ -53,7 +53,7 @@ import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } 
 import { CroftError, problem } from "../core/errors.ts";
 import type { Fix, Problem, Sql, ValueKind } from "../core/types.ts";
 import { canonicalPath, openMemory } from "../db/connect.ts";
-import { bookkeepingOf, stateObjects } from "../db/bookkeeping.ts";
+import { bookkeepingOf, inLake, stateObjects } from "../db/bookkeeping.ts";
 import { ensureState } from "../db/state.ts";
 import { LeaseSql } from "../db/warehouse.ts";
 import { excerpt, parseRetryAfter } from "../http/http.ts";
@@ -1552,7 +1552,7 @@ async function typeRaw(tx: Sql, raw: RawRelation, o: TypeRawOptions): Promise<{ 
   });
 
   const pins = normalizePins(o.pins as Record<string, string | Pin> | undefined);
-  const plan = evolve(known, incoming, pins);
+  const plan = evolve(known, incoming, pins, { lake: await inLake(tx) });
   const colOf = new Map(raw.columns.map((c) => [c.name.toLowerCase(), c]));
   const col = (d: ColumnDecision) => colOf.get(d.column.toLowerCase());
   const incomingOf = new Map(incoming.map((c) => [c.name.toLowerCase(), c]));

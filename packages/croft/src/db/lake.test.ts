@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
-import { isCommitFailure, isConflict, isConnectionError, lakeRefusedColumns, LakeWriteLock, machineId, newCommitTag, parseWriter, refuseLakeTypes, writerRecord, writerReport } from "./lake.ts";
+import { isCommitFailure, isConflict, isConnectionError, lakeInexactColumns, lakeRefusedColumns, refuseInexactTypes, LakeWriteLock, machineId, newCommitTag, parseWriter, refuseLakeTypes, writerRecord, writerReport } from "./lake.ts";
 
 const made: string[] = [];
 afterAll(() => {
@@ -78,7 +78,7 @@ describe("the types a lake cannot hold", () => {
     expect(p.code).toBe("LAKE_TYPE_UNSUPPORTED");
     expect(p.message).toContain("status is ENUM('open','closed')");
     expect(p.hint).toContain("CAST(status AS VARCHAR) AS status");
-    expect(p.hint).toContain("CAST(big AS HUGEINT) AS big");
+    expect(p.hint).toContain("CAST(big AS DECIMAL(38,0)) AS big");
     expect(p.hint).toContain("CAST(flags AS VARCHAR) AS flags");
     expect(p.hint).toContain("CAST(xy AS DOUBLE[]) AS xy");
     expect(p.effect).toBe("nothing was written");
@@ -282,5 +282,43 @@ describe("croft's lock on the writes of a machine", () => {
     expect(lock.holder()).toBeNull();
     writeFileSync(join(dir, "other"), "x");
     (await lock.acquire({ waitMs: 1000, label: "next", busy, aborted }))();
+  });
+});
+
+describe("the types a lake stores inexactly (D162)", () => {
+  test("HUGEINT, UHUGEINT, INTERVAL and TIMETZ, also inside a STRUCT, a LIST or a MAP, by the column's type", () => {
+    const cols = [
+      { name: "a", type: "HUGEINT" }, { name: "b", type: "UHUGEINT" }, { name: "c", type: "INTERVAL" }, { name: "d", type: "TIME WITH TIME ZONE" },
+      { name: "e", type: "STRUCT(h HUGEINT, n INTEGER)" }, { name: "f", type: "HUGEINT[]" }, { name: "g", type: "MAP(VARCHAR, INTERVAL)" },
+      { name: "h", type: "DECIMAL(38,0)" }, { name: "i", type: "BIGINT" }, { name: "j", type: "STRUCT(interval VARCHAR)" }, { name: "k", type: "TIME" },
+      { name: "l", type: "TIMESTAMP WITH TIME ZONE" },
+    ];
+    expect(lakeInexactColumns(cols).map((c) => [c.name, c.kind, c.nested])).toEqual([
+      ["a", "HUGEINT", false], ["b", "UHUGEINT", false], ["c", "INTERVAL", false], ["d", "TIMETZ", false],
+      ["e", "HUGEINT", true], ["f", "HUGEINT", true], ["g", "INTERVAL", true],
+    ]);
+  });
+
+  test("LAKE_VALUES_INEXACT names every column and the cast that keeps it exact, and that nothing was written", () => {
+    let caught: unknown;
+    try {
+      refuseInexactTypes("totals", [{ name: "big", type: "HUGEINT" }, { name: "gap", type: "INTERVAL" }, { name: "at", type: "TIME WITH TIME ZONE" }, { name: "st", type: "STRUCT(h HUGEINT)" }, { name: "ok", type: "BIGINT" }], "assets/totals.sql");
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(CroftError);
+    const p = (caught as CroftError).problem;
+    expect(p.code).toBe("LAKE_VALUES_INEXACT");
+    expect(p.message).toContain("big is HUGEINT");
+    expect(p.hint).toContain("CAST(big AS DECIMAL(38,0)) AS big");
+    expect(p.hint).toContain("CAST(gap AS VARCHAR) AS gap");
+    expect(p.hint).toContain("CAST(at AS TIME) AS at");
+    expect(p.hint).toContain("to_json(st)");
+    expect(p.effect).toBe("nothing was written");
+    expect(p.file).toBe("assets/totals.sql");
+    expect(() => refuseInexactTypes("totals", [{ name: "ok", type: "DECIMAL(38,0)" }])).not.toThrow();
+    // A write that has both kinds is told the unsupported ones first, and the inexact ones once they are fixed.
+    expect(() => refuseLakeTypes("t", [{ name: "e", type: "ENUM('a')" }, { name: "h", type: "HUGEINT" }])).toThrow(/cannot store/);
+    expect(() => refuseLakeTypes("t", [{ name: "h", type: "HUGEINT" }])).toThrow(/differently from the ones written/);
   });
 });

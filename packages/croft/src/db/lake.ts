@@ -176,8 +176,8 @@ export function newCommitTag(): string {
 
 /** The column types DuckLake refuses: ENUM, UNION, VARINT (DuckDB 2.0 spells it BIGNUM when it names the type of a column), BIT and a fixed-size
  *  ARRAY (`INTEGER[3]`; a LIST, `INTEGER[]`, is fine), also inside a STRUCT, LIST or MAP [V: 2.0.0, DuckLake 1.0, every other type round-trips:
- *  the probe of option 07 slice 4 copied BOOLEAN, every integer width, HUGEINT and UHUGEINT, FLOAT, DOUBLE, DECIMAL, VARCHAR, BLOB, DATE, TIME,
- *  TIMETZ, every TIMESTAMP, INTERVAL, UUID, JSON, STRUCT, LIST, MAP and TIME_NS out of a file and back with no difference]. The first three are
+ *  the probe of option 07 slice 4 copied BOOLEAN, every integer width, FLOAT, DOUBLE, DECIMAL, VARCHAR, BLOB, DATE, TIME, every TIMESTAMP, UUID,
+ *  JSON, STRUCT, LIST, MAP and TIME_NS out of a file and back with no difference; HUGEINT, UHUGEINT, INTERVAL and TIMETZ it changes, below]. The first three are
  *  matched whatever the case; DuckDB writes BIT in capitals, so a STRUCT field named "bit" is not taken for one. */
 const LAKE_TYPE = /\b(ENUM|UNION|VARINT|BIGNUM)\b/i;
 const LAKE_BIT = /\bBIT\b/;
@@ -202,7 +202,7 @@ export function lakeCastFix(c: { name: string; type: string; kind: LakeRefusedKi
     case "BIT":
       return `CAST(${c.name} AS VARCHAR) AS ${c.name}`;
     case "VARINT":
-      return `CAST(${c.name} AS HUGEINT) AS ${c.name}, or AS VARCHAR when it can be larger`;
+      return `CAST(${c.name} AS DECIMAL(38,0)) AS ${c.name}, or AS VARCHAR when it can be larger`;
     case "ARRAY":
       // A fixed-size array becomes a list of the same element type: INTEGER[3] → INTEGER[].
       return `CAST(${c.name} AS ${c.type.replace(/\[\d+\]/g, "[]")}) AS ${c.name}`;
@@ -211,13 +211,77 @@ export function lakeCastFix(c: { name: string; type: string; kind: LakeRefusedKi
   }
 }
 
+// ---- Types a lake stores inexactly ------------------------------------------------------------------------------
+
+/**
+ * The types DuckLake 1.0 (DuckDB 2.0.0) changes on the way into a Parquet file [V: 2.0.0, option 07 slice 4's probe, 400 rows of each type so that
+ * a file is written; a few rows stay in the catalog and read back exactly, which hides it]: HUGEINT and UHUGEINT are stored as DOUBLE (a value past
+ * 2^53 comes back changed, and one near the top of the range cannot be read at all), an INTERVAL keeps its milliseconds and loses the microseconds
+ * under them, a TIMETZ comes back at offset 0; also inside a STRUCT, a LIST or a MAP. Every other type round-trips. A lake write therefore refuses
+ * these by the column's TYPE, not by its values (D162): whether a value survives depends on where its rows are kept, which changes under a table
+ * (the maintenance flush moves rows from the catalog into files). DuckDB writes the type names in capitals, so a STRUCT field named "interval" is
+ * not taken for one.
+ */
+export type LakeInexactKind = "HUGEINT" | "UHUGEINT" | "INTERVAL" | "TIMETZ";
+
+const INEXACT: readonly [LakeInexactKind, RegExp][] = [
+  ["UHUGEINT", /\bUHUGEINT\b/], ["HUGEINT", /\bHUGEINT\b/], ["INTERVAL", /\bINTERVAL\b/], ["TIMETZ", /\bTIME WITH TIME ZONE\b|\bTIMETZ\b/],
+];
+
+export interface LakeInexactColumn { name: string; type: string; kind: LakeInexactKind; nested: boolean }
+
+/** The columns among `columns` whose type a lake would store inexactly (the first kind found in a type), and whether it is inside a STRUCT, LIST or MAP. */
+export function lakeInexactColumns(columns: readonly { name: string; type: string }[]): LakeInexactColumn[] {
+  const plain: Record<LakeInexactKind, RegExp> = { HUGEINT: /^HUGEINT$/, UHUGEINT: /^UHUGEINT$/, INTERVAL: /^INTERVAL$/, TIMETZ: /^(TIME WITH TIME ZONE|TIMETZ)$/ };
+  return columns.flatMap((c) => {
+    for (const [kind, re] of INEXACT) if (re.test(c.type)) return [{ name: c.name, type: c.type, kind, nested: !plain[kind].test(c.type.trim()) }];
+    return [];
+  });
+}
+
+/** The SELECT expression that stores a column of an inexact type in a type a lake keeps exactly. */
+export function lakeInexactFix(c: LakeInexactColumn): string {
+  if (c.nested) return `cast the inner value, or turn the whole column into JSON with to_json(${c.name}) AS ${c.name}`;
+  switch (c.kind) {
+    case "HUGEINT": return `CAST(${c.name} AS DECIMAL(38,0)) AS ${c.name} (exact up to 38 digits), or AS VARCHAR`;
+    case "UHUGEINT": return `CAST(${c.name} AS VARCHAR) AS ${c.name}`;
+    case "INTERVAL": return `CAST(${c.name} AS VARCHAR) AS ${c.name}, or the length as a whole number of milliseconds`;
+    case "TIMETZ": return `CAST(${c.name} AS VARCHAR) AS ${c.name}, or CAST(${c.name} AS TIME) AS ${c.name} when the offset does not matter`;
+  }
+}
+
+export const LAKE_INEXACT_WHY: Record<LakeInexactKind, string> = {
+  HUGEINT: "a lake stores a HUGEINT as a DOUBLE, which changes a value past 2^53 (9007199254740993 comes back 9007199254740992) and cannot read one near the top of the range at all",
+  UHUGEINT: "a lake stores a UHUGEINT as a DOUBLE, which changes a value past 2^53 and cannot read one near the top of the range at all",
+  INTERVAL: "a lake keeps an INTERVAL to the millisecond, so 1.000003 seconds comes back 1 second",
+  TIMETZ: "a lake stores a TIMETZ as the same time at offset 0, so 10:11:12+02 comes back 08:11:12+00",
+};
+
+/**
+ * LAKE_VALUES_INEXACT for a result that has a column of a type a lake would store inexactly, before anything is written. Nothing, for a column list a
+ * lake keeps exactly.
+ */
+export function refuseInexactTypes(asset: string, columns: readonly { name: string; type: string }[], file?: string): void {
+  const bad = lakeInexactColumns(columns);
+  if (!bad.length) return;
+  const kinds = [...new Set(bad.map((c) => c.kind))];
+  throw new CroftError("LAKE_VALUES_INEXACT", {
+    asset, ...(file ? { file } : {}),
+    message: `${asset}: ${bad.map((c) => `${c.name} is ${c.type.length > 60 ? `${c.type.slice(0, 57)}...` : c.type}`).join("; ")}; a lake would store ${bad.length === 1 ? "its values" : "their values"} differently from the ones written`,
+    hint: `${kinds.map((k) => LAKE_INEXACT_WHY[k]).join("; ")}; store ${bad.length === 1 ? "it" : "them"} in a type a lake keeps exactly, in the SELECT or the pin that sets the type: ${bad.map(lakeInexactFix).join("; ")}`,
+    fix: { kind: "manual", description: `cast ${bad.map((c) => c.name).join(", ")} to a type a lake keeps exactly (DECIMAL(38,0) or VARCHAR for a HUGEINT, VARCHAR for an INTERVAL or a TIMETZ) in ${file ?? `${asset}'s code`}` },
+    effect: "nothing was written",
+    details: { columns: bad.map((c) => ({ name: c.name, type: c.type, kind: c.kind, fix: lakeInexactFix(c) })), kind: bad[0]!.kind },
+  });
+}
+
 /**
  * LAKE_TYPE_UNSUPPORTED for a result that has a column a lake cannot hold, before anything is written: croft's code and the cast that
  * fixes it, not DuckDB's error from the middle of a write. Nothing, for a column list the lake takes.
  */
 export function refuseLakeTypes(asset: string, columns: readonly { name: string; type: string }[], file?: string): void {
   const bad = lakeRefusedColumns(columns);
-  if (!bad.length) return;
+  if (!bad.length) return refuseInexactTypes(asset, columns, file);
   const first = bad[0]!;
   const fixes = bad.map(lakeCastFix);
   throw new CroftError("LAKE_TYPE_UNSUPPORTED", {

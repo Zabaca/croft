@@ -87,7 +87,10 @@ for (const kind of ["local", "postgres"] as const) {
            '340282366920938463463374607431768211455'::UHUGEINT - range::UHUGEINT AS ubig FROM range(5)`,
       ]);
       const found = await l.w.read((sql) => withTrashFile(sql, file, async (alias) => inexactColumns(sql, await inventoryOf(sql, alias), alias)), { purpose: "test" });
-      expect(found.map((c) => `${c.table}.${c.column}:${c.kind}:${c.values}`)).toEqual(["risky.big:HUGEINT:4", "risky.iv:INTERVAL:4", "risky.tz:TIMETZ:5", "risky.ubig:UHUGEINT:5"]);
+      // By the column's type (a lake write refuses it whatever the values), with the values that would change now: none for `fine`, `days` and `utc`.
+      expect(found.map((c) => `${c.table}.${c.column}:${c.kind}:${c.values}`)).toEqual([
+        "numbers.h:HUGEINT:0", "risky.big:HUGEINT:4", "risky.fine:HUGEINT:0", "risky.iv:INTERVAL:4", "risky.days:INTERVAL:0", "risky.tz:TIMETZ:5", "risky.utc:TIMETZ:0", "risky.ubig:UHUGEINT:5",
+      ]);
       let caught: unknown;
       try {
         refuseInexact(found, new Map([["risky", "assets/risky.sql"]]));
@@ -97,7 +100,8 @@ for (const kind of ["local", "postgres"] as const) {
       expect(caught).toBeInstanceOf(CroftError);
       const p = (caught as CroftError).problem;
       expect(p.code).toBe("LAKE_VALUES_INEXACT");
-      expect(p.message).toContain("risky.big (HUGEINT): 4 values such as");
+      expect(p.message).toContain("risky.big (HUGEINT): 4 values would change, such as");
+      expect(p.message).toContain("numbers.h (HUGEINT)");
       expect(p.hint).toContain("CAST(big AS DECIMAL(38,0)) AS big");
       expect(p.hint).toContain("assets/risky.sql");
       expect(p.hint).toContain("CAST(tz AS VARCHAR) AS tz");
@@ -186,8 +190,9 @@ for (const kind of ["local", "postgres"] as const) {
         `CREATE TABLE nested AS SELECT range AS id, {'h': range::HUGEINT * 9007199254740993} AS st, [range::HUGEINT * 9007199254740993] AS lst, {'t': TIMETZ '10:11:12+02'} AS tz FROM range(400)`,
       ]);
       const inv = await l.w.read((sql) => withTrashFile(sql, file, (alias) => inventoryOf(sql, alias)), { purpose: "test" });
-      // Not found by value (they are nested), found by the proof.
-      expect(await l.w.read((sql) => withTrashFile(sql, file, (alias) => inexactColumns(sql, inv, alias)), { purpose: "test" })).toEqual([]);
+      // Found by their type, nested or not (their values are not counted), and, were the move to go on, by the proof.
+      const found = await l.w.read((sql) => withTrashFile(sql, file, (alias) => inexactColumns(sql, inv, alias)), { purpose: "test" });
+      expect(found.filter((c) => c.table === "nested").map((c) => [c.column, c.kind, c.nested, c.values])).toEqual([["st", "HUGEINT", true, null], ["lst", "HUGEINT", true, null], ["tz", "TIMETZ", true, null]]);
       await copyIntoLake(l.w, file, inv, marker(inv.tables.map((t) => ({ name: t.name, rows: t.rows }))), { runId: "r_move", label: "the lake" });
       const proof = await verifyLake(l.reader, file, inv).catch((e: unknown) => e);
       // A HUGEINT near the top of the range cannot even be read back; these are inside the range, so they read, changed.

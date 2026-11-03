@@ -34,7 +34,7 @@ import { CONFIG_FILE, parseConfig, type Project } from "../project/root.ts";
 import { quoteIdent, quoteLiteral } from "../load/evolve.ts";
 import { withTrashFile } from "../safety/trash.ts";
 import { ASSET_TABLES, bookkeepingOf, STATE_SPECS, type StateTableName } from "./bookkeeping.ts";
-import { lakeCastFix, lakeOption, lakeRefusedColumns, type LakeRefusedKind } from "./lake.ts";
+import { LAKE_INEXACT_WHY, lakeCastFix, lakeInexactColumns, lakeInexactFix, type LakeInexactKind, lakeOption, lakeRefusedColumns, type LakeRefusedKind } from "./lake.ts";
 import { ensureState } from "./state.ts";
 import { type DuckWarehouse, openWarehouse } from "./warehouse.ts";
 
@@ -161,81 +161,59 @@ export function refuseMoveTypes(inv: MoveInventory, files: ReadonlyMap<string, s
   });
 }
 
-/** A column whose values a lake would keep inexactly, with how many and one example. */
+/** A column of a type a lake would store inexactly (D162), with, for a top-level column, how many of the file's values would change now and one example. */
 export interface InexactColumn {
   table: string;
   column: string;
   type: string;
-  kind: "HUGEINT" | "UHUGEINT" | "INTERVAL" | "TIMETZ";
-  values: number;
+  kind: LakeInexactKind;
+  /** Inside a STRUCT, a LIST or a MAP: its values are not counted. */
+  nested: boolean;
+  /** The values that would come back different if the rows were in a Parquet file; 0 when none would yet. Null for a nested column. */
+  values: number | null;
   example: string | null;
 }
 
 /**
- * DuckLake 1.0 (DuckDB 2.0.0) keeps what fits a Parquet file's own types exactly, and the rest it changes on the way in, silently [V: 2.0.0,
- * option 07 slice 4's probe, 400 rows of each type so that a file is written; a few rows stay in the catalog and read back exactly, which
- * hides it]:
- * - HUGEINT and UHUGEINT are stored as DOUBLE: a value a DOUBLE cannot hold (past 2^53, or 9007199254740993 for one) comes back changed
- *   (9007199254740992), and one near the top of the range cannot be read at all (the whole table fails to read);
- * - an INTERVAL loses the microseconds under a millisecond (1.000003 s comes back as 1 s);
- * - a TIMETZ comes back as the same time at offset 0 (10:11:12+02 as 08:11:12+00), which is not the value that went in.
- * Every other type, DECIMAL(38,0) and TIMESTAMP_NS included, comes back as it went in. So a column of those four types is checked
- * value by value (top level only: one inside a STRUCT, LIST or MAP is left to the proof after the copy, which names it). `alias`: an attached
- * copy of the file, else the connection's own database.
+ * The columns of the file whose TYPE a lake stores inexactly (db/lake.ts lakeInexactColumns): the same test a lake write applies (D162), because a
+ * table the move makes in the lake is written by croft's runs afterwards, and a run would refuse it. For a top-level column the values that would
+ * change are counted too, as news for the person (a column with none yet is still refused: where its rows are kept changes under a table, and
+ * the maintenance flush moves them into files). `alias`: an attached copy of the file, else the connection's own database.
  */
 export async function inexactColumns(sql: Sql, inv: MoveInventory, alias: string | null = null): Promise<InexactColumn[]> {
   const found: InexactColumn[] = [];
   const pre = alias ? `${quoteIdent(alias)}.` : "";
   for (const t of inv.tables) {
-    for (const c of t.columns) {
-      const q = quoteIdent(c.name);
-      let kind: InexactColumn["kind"];
-      let bad: string;
-      switch (c.type) {
-        case "HUGEINT": kind = "HUGEINT"; bad = `try_cast(try_cast(${q} AS DOUBLE) AS HUGEINT) IS DISTINCT FROM ${q}`; break;
-        case "UHUGEINT": kind = "UHUGEINT"; bad = `try_cast(try_cast(${q} AS DOUBLE) AS UHUGEINT) IS DISTINCT FROM ${q}`; break;
-        case "INTERVAL": kind = "INTERVAL"; bad = `datepart('microsecond', ${q}) % 1000 <> 0`; break;
-        case "TIME WITH TIME ZONE": kind = "TIMETZ"; bad = `datepart('timezone', ${q}) <> 0`; break;
-        default: continue;
+    for (const c of lakeInexactColumns(t.columns)) {
+      if (c.nested) {
+        found.push({ table: t.name, column: c.name, type: c.type, kind: c.kind, nested: true, values: null, example: null });
+        continue;
       }
+      const q = quoteIdent(c.name);
+      const bad = c.kind === "HUGEINT" ? `try_cast(try_cast(${q} AS DOUBLE) AS HUGEINT) IS DISTINCT FROM ${q}`
+        : c.kind === "UHUGEINT" ? `try_cast(try_cast(${q} AS DOUBLE) AS UHUGEINT) IS DISTINCT FROM ${q}`
+          : c.kind === "INTERVAL" ? `datepart('microsecond', ${q}) % 1000 <> 0` : `datepart('timezone', ${q}) <> 0`;
       const from = `${pre}main.${quoteIdent(t.name)}`;
       const [n] = await sql.all<{ n: number | bigint }>(`SELECT count(*) AS n FROM ${from} WHERE ${q} IS NOT NULL AND (${bad})`);
-      if (num(n?.n) === 0) continue;
-      const [e] = await sql.all<{ v: string }>(`SELECT ${q}::VARCHAR AS v FROM ${from} WHERE ${q} IS NOT NULL AND (${bad}) LIMIT 1`);
-      found.push({ table: t.name, column: c.name, type: c.type, kind, values: num(n?.n), example: e?.v ?? null });
+      const [e] = num(n?.n) > 0 ? await sql.all<{ v: string }>(`SELECT ${q}::VARCHAR AS v FROM ${from} WHERE ${q} IS NOT NULL AND (${bad}) LIMIT 1`) : [undefined];
+      found.push({ table: t.name, column: c.name, type: c.type, kind: c.kind, nested: false, values: num(n?.n), example: e?.v ?? null });
     }
   }
   return found;
 }
 
-/** The SELECT expression that stores a column of an inexact type in a type a lake keeps exactly. */
-function inexactFix(c: InexactColumn): string {
-  switch (c.kind) {
-    case "HUGEINT": return `CAST(${c.column} AS DECIMAL(38,0)) AS ${c.column} (exact up to 38 digits), or AS VARCHAR`;
-    case "UHUGEINT": return `CAST(${c.column} AS VARCHAR) AS ${c.column}`;
-    case "INTERVAL": return `CAST(${c.column} AS VARCHAR) AS ${c.column}, or the length as a whole number of milliseconds`;
-    case "TIMETZ": return `CAST(${c.column} AS VARCHAR) AS ${c.column}, or CAST(${c.column} AS TIME) AS ${c.column} when the offset does not matter`;
-  }
-}
-
-const INEXACT_WHY: Record<InexactColumn["kind"], string> = {
-  HUGEINT: "a lake stores a HUGEINT as a DOUBLE, which changes a value past 2^53 (9007199254740993 comes back 9007199254740992) and cannot read one near the top of the range at all",
-  UHUGEINT: "a lake stores a UHUGEINT as a DOUBLE, which changes a value past 2^53 and cannot read one near the top of the range at all",
-  INTERVAL: "a lake keeps an INTERVAL to the millisecond, so 1.000003 seconds comes back 1 second",
-  TIMETZ: "a lake stores a TIMETZ as the same time at offset 0, so 10:11:12+02 comes back 08:11:12+00",
-};
-
-/** LAKE_VALUES_INEXACT for every column whose values a lake would change, with the cast for each; nothing, when there is none. */
+/** LAKE_VALUES_INEXACT for every column of the file of a type a lake would store inexactly, with the cast for each; nothing, when there is none. */
 export function refuseInexact(found: readonly InexactColumn[], files: ReadonlyMap<string, string>): void {
   if (!found.length) return;
-  const words = found.map((c) => `${c.table}.${c.column} (${c.type}): ${c.values} value${c.values === 1 ? "" : "s"} such as ${c.example}`);
+  const words = found.map((c) => `${c.table}.${c.column} (${c.type})${c.values ? `: ${c.values} value${c.values === 1 ? "" : "s"} would change, such as ${c.example}` : ""}`);
   const kinds = [...new Set(found.map((c) => c.kind))];
+  const fixOf = (c: InexactColumn) => lakeInexactFix({ name: c.column, type: c.type, kind: c.kind, nested: c.nested });
   throw new CroftError("LAKE_VALUES_INEXACT", {
-    message: `a lake would store ${found.length === 1 ? "a column" : `${found.length} columns`} of the file inexactly, so the move cannot start: ${words.slice(0, 5).join("; ")}${found.length > 5 ? `; and ${found.length - 5} more` : ""}`,
-    hint: `${kinds.map((k) => INEXACT_WHY[k]).join("; ")}; change what makes ${found.length === 1 ? "the column" : "each column"} so the table stores a type a lake keeps exactly, in the asset's SELECT (${found.slice(0, 5).map((c) => `${files.get(c.table) ?? `${c.table}'s code`}: ${inexactFix(c)}`).join(" | ")}) or in the pin that sets its type, run the asset again, then move again; the file was not touched`,
+    message: `a lake would store ${found.length === 1 ? "a column" : `${found.length} columns`} of the file inexactly, so the move cannot start: ${words.slice(0, 10).join("; ")}${found.length > 10 ? `; and ${found.length - 10} more` : ""}`,
+    hint: `${kinds.map((k) => LAKE_INEXACT_WHY[k]).join("; ")}; a lake write refuses a column of such a type whatever its values are, so change what makes ${found.length === 1 ? "the column" : "each column"} to a type a lake keeps exactly, in the asset's SELECT (${found.slice(0, 10).map((c) => `${files.get(c.table) ?? `${c.table}'s code`}: ${fixOf(c)}`).join(" | ")}) or in the pin that sets its type, run the asset again, then move again; the file was not touched`,
     fix: { kind: "manual", description: "cast the columns above to types a lake keeps exactly, run the assets, then run croft move-to-lake again" },
     effect: "nothing was changed: the file and the lake are as they were",
-    details: { columns: found.map((c) => ({ table: c.table, column: c.column, type: c.type, values: c.values, example: c.example, fix: inexactFix(c) })) },
+    details: { columns: found.map((c) => ({ table: c.table, column: c.column, type: c.type, kind: c.kind, nested: c.nested, values: c.values, example: c.example, fix: fixOf(c) })) },
   });
 }
 

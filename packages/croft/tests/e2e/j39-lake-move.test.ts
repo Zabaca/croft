@@ -30,11 +30,11 @@ const KITCHEN = `-- description: one column of every type a lake stores
 -- key: id
 SELECT range AS id,
   (range * 7 % 128 - 64)::TINYINT AS t8, (range * 31)::SMALLINT AS t16, (range * 100003)::INTEGER AS t32, (range * 10000000019)::BIGINT AS t64,
-  range::HUGEINT * 1000000007 AS t128, (range * 12345678901234567890123)::DECIMAL(38, 0) AS d0, TIMETZ '10:11:12.345678+00' AS tt, (range % 200)::UTINYINT AS u8, (range * 3)::UBIGINT AS u64,
+  (range::HUGEINT * 1000000007)::DECIMAL(38, 0) AS t128, (range * 12345678901234567890123)::DECIMAL(38, 0) AS d0, CAST(TIMETZ '10:11:12.345678+02' AS VARCHAR) AS tt, (range % 200)::UTINYINT AS u8, (range * 3)::UBIGINT AS u64,
   (range / 7.0)::FLOAT AS f32, (range / 3.0)::DOUBLE AS f64, (range / 7.0)::DECIMAL(18, 3) AS d18, (range * 12345678901.123456789)::DECIMAL(38, 10) AS d38,
   'name ' || range || ' ünïcode' AS s, encode('blob' || range) AS b, DATE '2026-01-01' + range::INTEGER AS dt, TIME '10:11:12.345678' AS tm,
   TIMESTAMP '2026-01-02 03:04:05.123456' + INTERVAL (range) MINUTE AS ts, TIMESTAMPTZ '2026-01-02 03:04:05.123456+00' + INTERVAL (range) HOUR AS tz,
-  INTERVAL (range) DAY + INTERVAL (range * 1003) MILLISECOND AS iv, CAST(md5(range::VARCHAR) AS UUID) AS u, ('{"n": ' || range || ', "tags": ["a", "b"]}')::JSON AS j,
+  CAST(INTERVAL (range) DAY + INTERVAL (range * 1003) MICROSECOND AS VARCHAR) AS iv, CAST(md5(range::VARCHAR) AS UUID) AS u, ('{"n": ' || range || ', "tags": ["a", "b"]}')::JSON AS j,
   [range, range + 1, NULL] AS lst, {'a': range, 'b': 'x' || range} AS st, map {'k' || (range % 5): range} AS mp, range % 3 = 0 AS flag,
   CASE WHEN range % 4 = 0 THEN NULL ELSE range END AS maybe
 FROM range(300)
@@ -383,6 +383,23 @@ if (!LAKE) {
       expect(await q.rows("select * from big order by id")).toEqual(rows);
       expect((await q.rows("select huge::VARCHAR as h from big where id = 4"))[0]).toEqual({ h: "36028797018963972" });
     }, 600_000);
+
+    test("a2. a trashed version with a column a lake would store inexactly is named in the question, and is refused on restore, not changed", async () => {
+      const q = await small("trashy", { assets: { "h.sql": "-- description: a HUGEINT\n-- key: id\nSELECT range AS id, range::HUGEINT AS v FROM range(3)\n" } });
+      await confirmed(q, ["delete", "h"]);
+      q.write("assets/h.sql", "-- description: an integer\n-- key: id\nSELECT range AS id, range::INTEGER AS v FROM range(3)\n");
+      expect((await q.json(["run", "h"])).code).toBe(0);
+      const asked = await q.json(["move-to-lake"]);
+      expect(asked.code, show(asked)).toBe(5);
+      expect(asked.json.data.trash.cannotRestore).toEqual([expect.objectContaining({ asset: "h", columns: ["v"] })]);
+      expect(asked.json.problems[0].hint).toContain("would store inexactly");
+      const done = await q.croft(["confirm", asked.json.confirmation.token, "--json"]);
+      expect(done.code, show(done)).toBe(0);
+      const restore = await q.json(["restore", "h"]);
+      expect(restore.code, show(restore)).not.toBe(0);
+      expect(restore.json.problems[0]).toMatchObject({ code: "LAKE_VALUES_INEXACT" });
+      expect((await q.rows("select count(*)::INT as n from h"))[0]).toEqual({ n: 3 });
+    }, 300_000);
 
     test("b. a lake that holds anything is refused, and so is one that holds the copy of another file", async () => {
       const a = await small("lake-a");

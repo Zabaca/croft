@@ -11,6 +11,7 @@
 // timestamps as epoch instants). Any loss fails the load: TYPE_CONFLICT, or TYPE_PIN_VIOLATION /
 // PIN_ROUNDED for pinned columns.
 import { CroftError, problem } from "../core/errors.ts";
+import { inLake } from "../db/bookkeeping.ts";
 import type { CursorType, Fix, Problem, Sql, StageManifest } from "../core/types.ts";
 import type { ColumnPin } from "../types.ts";
 import { didYouMean } from "../project/suggest.ts";
@@ -197,7 +198,7 @@ export async function buildTypedBatch(tx: Sql, o: BuildTypedBatchOptions): Promi
 
   // 3c: plan.
   const pins = normalizePins(o.pins as Record<string, string | Pin> | undefined);
-  const plan = evolve(known, incoming, pins);
+  const plan = evolve(known, incoming, pins, { lake: await inLake(tx) });
   const byName = new Map(incoming.map((c) => [c.name, c]));
 
   if ((o.source ?? "json") === "json") {

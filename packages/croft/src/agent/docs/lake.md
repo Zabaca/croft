@@ -218,15 +218,17 @@ DuckLake stores no ENUM, UNION, VARINT, BIT or fixed-size ARRAY (`INTEGER[3]`) c
 anything is written, with LAKE_TYPE_UNSUPPORTED and the cast that fixes it (`CAST(col AS VARCHAR)`).
 
 Four types it stores, but not exactly once its rows are in a Parquet file (a few rows stay in the catalog, which hides
-it), measured on DuckDB 2.0.0 with DuckLake 1.0: a HUGEINT or UHUGEINT is stored as a DOUBLE, so a value past 2^53 comes
+it, and the maintenance pass then moves them into files), measured on DuckDB 2.0.0 with DuckLake 1.0: a HUGEINT or UHUGEINT is stored as a DOUBLE, so a value past 2^53 comes
 back changed (9007199254740993 as 9007199254740992) and one near the top of the range cannot be read at all; an INTERVAL
 keeps its milliseconds and loses the microseconds under them; a TIMETZ comes back as the same time at offset 0
 (10:11:12+02 as 08:11:12+00); and so does one inside a STRUCT, a LIST or a MAP. Every other type a croft table has is
 stored exactly: all the integer widths, DECIMAL (DECIMAL(38,0) holds any 38-digit whole number, so it is the cast for a
 HUGEINT), FLOAT and DOUBLE with NaN and infinity, VARCHAR, BLOB, DATE, TIME, every TIMESTAMP, UUID, JSON, STRUCT, LIST and MAP.
-`croft move-to-lake` finds these columns by their values before it starts (LAKE_VALUES_INEXACT) and proves every value
-equal afterwards. A croft run in a lake does not check them yet: keep a column of those types to values that survive, or
-cast it.
+So a lake never gets a column of those types: a run that would write one is refused by the column's type, whatever its
+values are, before anything is written (LAKE_VALUES_INEXACT, with the cast: DECIMAL(38,0) or text for a HUGEINT, text for
+the others), and croft's own type inference makes a column of integers past 64 bits DECIMAL(38,0), which is exact, in
+place of HUGEINT. `croft move-to-lake` finds such columns in the file before it starts and proves every value equal
+afterwards. A file keeps HUGEINT as it was.
 
 ## Moving an existing project into a lake
 
@@ -265,7 +267,7 @@ not come along: time travel (a file keeps none, so the lake's history starts wit
 is not a table of `main` (views, macros, sequences, indexes, types, tables of other schemas), which the question names.
 
 Before it starts, the move refuses, with the fix: a column a lake cannot store (LAKE_TYPE_UNSUPPORTED, every table at
-once), values a lake would store inexactly (LAKE_VALUES_INEXACT), a lake that holds anything (MOVE_LAKE_NOT_EMPTY), no
+once), columns of a type a lake would store inexactly (LAKE_VALUES_INEXACT), a lake that holds anything (MOVE_LAKE_NOT_EMPTY), no
 lake block or a project already in the lake (MOVE_NEEDS_LAKE), and server mode, a read copy, a running croft serve, a
 rename that did not finish or a croft.json it cannot rewrite (MOVE_BLOCKED). It then changes nothing.
 
