@@ -255,7 +255,7 @@ What the move does, in order, and what it proves:
   lake transaction, so the lake holds the whole copy or nothing.
 - It then proves it, with a new connection that uses the READ-ONLY login and key (so the reader's credentials are
   proved too): every table's columns and types, its row count and its rows (EXCEPT ALL against the backup's), and every
-  `_croft` table. Any difference takes the copy out of the lake again (MOVE_NOT_EQUAL) and the project stays on the file.
+  `_croft` table (a floating-point column bit for bit, so a -0.0 that became 0.0 is a difference). Any difference takes the copy out of the lake again (MOVE_NOT_EQUAL) and the project stays on the file.
 - It fingerprints the file (sha256, by a child process, never by this one) before and after: if anything wrote it
   meanwhile, the copy is taken out again (MOVE_FILE_CHANGED).
 - Last, it sets `"enabled": true` in croft.json: one token replaced in your text, written whole by a rename.
@@ -269,14 +269,15 @@ is not a table of `main` (views, macros, sequences, indexes, types, tables of ot
 Before it starts, the move refuses, with the fix: a column a lake cannot store (LAKE_TYPE_UNSUPPORTED, every table at
 once), columns of a type a lake would store inexactly (LAKE_VALUES_INEXACT), a lake that holds anything (MOVE_LAKE_NOT_EMPTY), no
 lake block or a project already in the lake (MOVE_NEEDS_LAKE), and server mode, a read copy, a running croft serve, a
-rename that did not finish or a croft.json it cannot rewrite (MOVE_BLOCKED). It then changes nothing.
+rename that did not finish, a write-ahead log the file still holds (run croft backup, which folds it in) or a croft.json
+it cannot rewrite (MOVE_BLOCKED). It then changes nothing.
 
 The way back is the setting: `"enabled": false`, and the project is on the file again, byte for byte as the move left it
 (the question and the result give its sha256). Writes made in the lake since are not carried back; they stay in the lake,
 and the setting `true` brings them back. croft keeps the catalog mirror in runs.sqlite for the warehouse the project is on,
 so going back restores the file's own mirror and status, the plan and the next run read the file. A move into the same lake
-after going back is refused if the lake was written since; if not, the lake already holds an equal copy and the move only
-proves it again and switches.
+after going back is refused (MOVE_LAKE_NOT_EMPTY), written since or not: that move finished, and croft never merges into
+a lake or writes over one. To use that lake again set `"enabled": true` by hand; to move the file again, name a new lake.
 
 If the move stops (a kill, a lost connection), the project is on the file or in the lake, never between. The next
 `croft move-to-lake` recognises the copy it left in the lake (a marker row in `_croft.meta`, and its commit being the

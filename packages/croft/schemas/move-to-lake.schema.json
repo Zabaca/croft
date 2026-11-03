@@ -176,13 +176,17 @@
                     },
                     "unchanged": {
                       "type": "boolean"
+                    },
+                    "checkpointed": {
+                      "type": "boolean"
                     }
                   },
                   "required": [
                     "path",
                     "sha256",
                     "bytes",
-                    "unchanged"
+                    "unchanged",
+                    "checkpointed"
                   ],
                   "additionalProperties": false
                 },
