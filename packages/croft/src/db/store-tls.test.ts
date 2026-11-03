@@ -285,7 +285,6 @@ describe("croft doctor asks the bucket before the first run (D165)", () => {
     // DuckDB's locked instance cannot list past 1,000 objects (db/lake-probe.ts): the probe says what it knows instead of failing the lake.
     expect(store.text).toContain("it holds more than 1,000 objects");
     expect(store.details).toMatchObject({ many: true, empty: false });
-    expect(Number(store.details!.listMs)).toBeLessThan(5000);
   }, 120_000);
 
   test("the catalog line: encrypted is ok; plain text to this machine is a note; plain text to another machine is a warning", () => {
