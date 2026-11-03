@@ -96,6 +96,8 @@ export interface TableScan {
   /** Tables left out because the time budget ran out (the next write of each still compares it). */
   skipped: number;
   findings: TableFinding[];
+  /** The time budget the scan was given (ms), when it had one. */
+  budgetMs?: number;
 }
 
 /**
@@ -123,5 +125,5 @@ export async function scanTables(sql: Sql, o: { budgetMs?: number } = {}): Promi
     if (outOfBand || schema) findings.push({ asset, outOfBand, schema });
     checked++;
   }
-  return { checked, skipped: assets.length - checked, findings };
+  return { checked, skipped: assets.length - checked, findings, ...(o.budgetMs !== undefined ? { budgetMs: o.budgetMs } : {}) };
 }

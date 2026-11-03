@@ -40,6 +40,7 @@ import { RESERVED } from "../../load/contract.ts";
 import { quoteIdent } from "../../load/evolve.ts";
 import { discoverAssets, type DiscoveredAsset, NAME_PATTERN } from "../../project/discover.ts";
 import { staticSecrets } from "../../project/env.ts";
+import { lakeSecretNames } from "../../project/lake-config.ts";
 import { type ResolvedAsset, type ResolvedProject, sniffKind } from "../../project/resolve.ts";
 import type { Project } from "../../project/root.ts";
 import { parseSqlHeader } from "../../project/sql-asset.ts";
@@ -181,6 +182,20 @@ export function secretsByAsset(configs: readonly AssetConfig[]): Record<string, 
   const out: Record<string, string[]> = {};
   for (const c of configs) if (c.secrets.length) out[c.name] = [...c.secrets];
   return out;
+}
+
+/** What the secrets listings call the lake when they say who uses a secret. */
+export const LAKE_USER = "the lake (croft.json)";
+
+/**
+ * The secrets of the lake block of croft.json (the six or seven names of its logins and keys) as a user of its own, added to the assets' for
+ * `croft secrets` and `croft doctor`: a lake project's most important secrets are not any asset's, and the listing said "no asset declares a
+ * secret" (D-R4).
+ */
+export function withLakeSecrets(declared: Record<string, string[]>, project: Project): Record<string, string[]> {
+  const lake = project.config.lake;
+  const names = lake ? lakeSecretNames(lake) : [];
+  return names.length ? { ...declared, [LAKE_USER]: names } : declared;
 }
 
 /** Declare every secret the project's assets name, so data redaction hides their values whatever they look

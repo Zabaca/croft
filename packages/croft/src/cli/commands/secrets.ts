@@ -20,7 +20,7 @@ import { commandText, parseDotenv, type SecretStatus } from "../../project/env.t
 import { discoverAssets } from "../../project/discover.ts";
 import type { CommandImpl, Ctx } from "../command.ts";
 import { table } from "../render.ts";
-import { loadConfigs, secretsByAsset } from "./describe.ts";
+import { loadConfigs, secretsByAsset, withLakeSecrets } from "./describe.ts";
 
 export interface SecretSetData {
   name: string;
@@ -241,7 +241,7 @@ export const secrets: CommandImpl<SecretsData> = {
     const project = ctx.project;
     const discovery = await discoverAssets(project.root, { assetsDir: project.paths.assetsDir });
     const configs = await loadConfigs(project, discovery.assets, { importTimeoutMs: 5000 });
-    const declared = secretsByAsset(configs);
+    const declared = withLakeSecrets(secretsByAsset(configs), project);
 
     if (sub === undefined) {
       // The secretsFrom command runs only for a name the shell and .env lack (D108).

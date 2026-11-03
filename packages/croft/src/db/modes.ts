@@ -60,6 +60,9 @@ export interface LakeSpec {
   catalog: LakePostgres;
   data: LakeBucket;
   access: "write" | "read";
+  /** Only the bucket: its secret and CA file are made and nothing is attached, so no catalog is reached. For croft doctor's probe of the
+   *  bucket (db/lake-probe.ts), which must work before a lake exists. */
+  storeOnly?: true;
 }
 
 /** A local lake: a SQLite catalog file and a local data folder in place of Postgres and the bucket. For croft's own suite and
@@ -166,7 +169,7 @@ export function modeIdentity(mode: ModeSpec): unknown {
   if (mode.kind === "readers") return { ...base, copy: mode.copy };
   if (mode.kind === "lake-local") return { ...base, catalog: mode.lake.catalog.path, dataPath: mode.lake.dataPath, access: mode.lake.access };
   const { catalog, data, access } = mode.lake;
-  return { ...base, catalog: [catalog.host, catalog.port, catalog.database, catalog.user, catalog.sslMode ?? null, catalog.sslRootCert ?? null], data: [data.path, data.endpoint ?? null, data.region ?? null, data.urlStyle ?? null, data.useSsl ?? null, data.caFile ?? null], access };
+  return { ...base, catalog: [catalog.host, catalog.port, catalog.database, catalog.user, catalog.sslMode ?? null, catalog.sslRootCert ?? null], data: [data.path, data.endpoint ?? null, data.region ?? null, data.urlStyle ?? null, data.useSsl ?? null, data.caFile ?? null], access, storeOnly: mode.lake.storeOnly ?? null };
 }
 
 /** A digest of the mode's credentials, compared but never printed: a different password or key is a different instance. */
@@ -266,6 +269,7 @@ async function attachLake(conn: DuckDBConnection, lake: LakeSpec, secrets: strin
   await attempt(conn, `CREATE OR REPLACE TEMPORARY SECRET ${LAKE_BUCKET_SECRET} (${opts.join(", ")})`, fail);
   // httpfs checks the store's certificate against this file, and may read it only because modePaths allows it (D-R1).
   if (data.caFile) await attempt(conn, `SET GLOBAL ca_cert_file = ${q(data.caFile)}`, fail);
+  if (lake.storeOnly) return; // croft doctor's probe of the bucket (D-R6): the store's secret and CA, no catalog is reached
   await attempt(conn, `ATTACH 'ducklake:postgres:' AS ${LAKE_ALIAS} (DATA_PATH ${q(data.path)}, META_SECRET ${LAKE_CATALOG_SECRET}, DUCKLAKE_VERSION ${q(DUCKLAKE_FORMAT)}${access === "read" ? ", READ_ONLY" : ""})`, fail);
 }
 

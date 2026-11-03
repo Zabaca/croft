@@ -6,6 +6,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { catalogEncryptionLine } from "../cli/commands/doctor.ts";
 import { cleanup, cli, makeProject } from "../cli/commands/inspect-testkit.ts";
 import { ORDERS_SQL } from "../cli/commands/lake-project-testkit.ts";
 import { CroftError } from "../core/errors.ts";
@@ -133,6 +134,61 @@ describe("a lake whose store is served over HTTPS", () => {
     expect(codes).toContain("CONFIG_INVALID");
     expect(JSON.stringify(r.json)).toContain("lake.bucket.sslRootCert");
   }, 60_000);
+});
+
+type Check = { id: string; status: string; text: string; code?: string; details?: Record<string, unknown> };
+const checksOf = (json: unknown): Check[] => (json as { data: { checks: Check[] } }).data.checks;
+const filesIn = (dir: string): string[] => (existsSync(dir) ? readdirSync(dir, { recursive: true }).map(String).sort() : []);
+
+describe("croft doctor asks the bucket before the first run (D-R6)", () => {
+  maybe("a lake nobody has made yet: with the CA the bucket answers and the folder is empty; without it doctor says LAKE_STORE_TLS, not 'no problems found'", async () => {
+    const lake = await rig!.lake();
+    const p = project(lake, certs!.cert);
+    const ok = await cli(["doctor", "--json"], { cwd: p.root, env: p.env });
+    await closeAllWarehouses();
+    const store = checksOf(ok.json).find((c) => c.id === "lake.store")!;
+    expect(store, ok.stdout.slice(0, 800)).toMatchObject({ status: "ok" });
+    expect(store.text).toContain("is empty");
+    expect(store.details).toMatchObject({ listed: 0, caFile: certs!.cert });
+    // Doctor wrote nothing into the lake's folder (not even the folder).
+    expect(filesIn(lake.files)).toEqual([]);
+    expect(checksOf(ok.json).find((c) => c.id === "warehouse")!.text).toContain("not created yet");
+
+    // The trial's case: the first run could write nothing, and doctor said all was well.
+    p.use(undefined);
+    const bad = await cli(["doctor", "--json"], { cwd: p.root, env: p.env });
+    await closeAllWarehouses();
+    const broken = checksOf(bad.json).find((c) => c.id === "lake.store")!;
+    expect(broken, bad.stdout.slice(0, 800)).toMatchObject({ status: "error", code: "LAKE_STORE_TLS" });
+    expect(bad.exit).not.toBe(0);
+  }, 120_000);
+
+  maybe("after a run it lists the folder and reads the footer of a data file, writes nothing, and says whether the catalog connection is encrypted", async () => {
+    const lake = await rig!.lake();
+    const p = project(lake, certs!.cert);
+    expect((await cli(["run", "--foreground", "--json"], { cwd: p.root, env: p.env })).exit).toBe(0);
+    await closeAllWarehouses();
+    const before = filesIn(lake.files);
+    const r = await cli(["doctor", "--json"], { cwd: p.root, env: p.env });
+    await closeAllWarehouses();
+    const checks = checksOf(r.json);
+    const store = checks.find((c) => c.id === "lake.store")!;
+    expect(store, r.stdout.slice(0, 800)).toMatchObject({ status: "ok" });
+    expect(store.text).toMatch(/objects? under s3:\/\/lakeb\/proj\d+\/ listed in \d+ ms, the footer of \S+\.parquet read in \d+ ms/);
+    expect(filesIn(lake.files)).toEqual(before);
+    // The rig's Postgres offers no TLS and is on this machine: said, as a note.
+    expect(checks.find((c) => c.id === "lake.catalog.encrypted")).toMatchObject({ status: "info" });
+    expect(checks.find((c) => c.id === "lake.catalog.encrypted")!.text).toContain("not encrypted; the catalog is on this machine");
+  }, 120_000);
+
+  test("the catalog line: encrypted is ok; plain text to this machine is a note; plain text to another machine is a warning", () => {
+    expect(catalogEncryptionLine("db.example.com", { encrypted: true, version: "TLSv1.3" })).toMatchObject({ status: "ok", text: expect.stringContaining("(TLSv1.3)") });
+    expect(catalogEncryptionLine("127.0.0.1", { encrypted: false, version: null }).status).toBe("info");
+    expect(catalogEncryptionLine("localhost", { encrypted: false, version: null }).status).toBe("info");
+    const warn = catalogEncryptionLine("db.internal", { encrypted: false, version: null });
+    expect(warn.status).toBe("warn");
+    expect(warn.text).toContain("NOT encrypted");
+  });
 });
 
 describe("the pieces", () => {
