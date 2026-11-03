@@ -82,7 +82,7 @@ function lakeMode(lake: LakeConfig, project: Project, access: "write" | "read", 
   const key = access === "write" ? lake.bucket.writer : lake.bucket.reader;
   const b = lake.bucket;
   const tls = catalogTls(lake.catalog, project.root, { env: tlsEnv });
-  const caFile = storeCaFile(b, project.root);
+  const caFile = storeCaFile(b, project.root, { env: tlsEnv });
   return {
     ...base,
     kind: "lake",

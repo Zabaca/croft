@@ -110,7 +110,7 @@ async function get(a: S3Access, key: string, query: Record<string, string>): Pro
       tls: { rejectUnauthorized: true, ...(a.caFile ? { ca: Bun.file(a.caFile) } : {}) } });
   } catch (e) {
     // The store's certificate not checking out is LAKE_STORE_TLS here as it is for DuckDB (D-R1), not a failure of the backup's folder.
-    throw storeTlsError(e, { named: !!a.caFile }) ?? e;
+    throw storeTlsError(e, { ...(a.caFile ? { caFile: a.caFile } : {}) }) ?? e;
   }
   if (!res.ok) {
     // The store's error code names what went wrong (AccessDenied, NoSuchKey); its body may echo the key id, so only the code is kept.

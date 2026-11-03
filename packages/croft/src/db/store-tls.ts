@@ -11,27 +11,36 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { CroftError, problem } from "../core/errors.ts";
 import type { Problem } from "../core/types.ts";
+import { CA_BUNDLES, findCaBundle } from "./ca-bundle.ts";
 
 const isFile = (p: string): boolean => {
   try { return statSync(p).isFile(); } catch { return false; }
 };
 
 /**
- * The CA file a store over TLS is checked against, as an absolute path, or undefined when the store is not reached over TLS (or, until the
- * machine's own bundle is found, when the project names none: DuckDB's refusal is then LAKE_STORE_TLS, below). `sslRootCert` is the file the
- * project names (relative to the project folder, `~/` for the home folder), for a store with a certificate of a private authority; a name
- * that is not a file is CONFIG_INVALID, naming the setting, before anything is attached.
+ * The CA file a store over TLS is checked against, as an absolute path, or undefined when the store is not reached over TLS. In this order:
+ * `sslRootCert`, the file the project names (relative to the project folder, `~/` for the home folder; a name that is not a file is
+ * CONFIG_INVALID, naming the setting, before anything is attached); else this machine's CA bundle, found by `findCaBundle` (db/ca-bundle.ts, the
+ * one the catalog's TLS uses): `$SSL_CERT_FILE` of the project's environment (`o.env`), then the usual places. A machine with none is
+ * LAKE_STORE_TLS (`no-ca-file`) naming where it looked and the setting that fixes it, before anything is attached, not DuckDB's refusal later.
  */
 export function storeCaFile(
   bucket: { useSsl: boolean; sslRootCert?: string },
   root: string,
-  o: { home?: string; file?: (p: string) => boolean } = {},
+  o: { home?: string; file?: (p: string) => boolean; env?: NodeJS.ProcessEnv } = {},
 ): string | undefined {
   if (!bucket.useSsl) return undefined;
   const file = o.file ?? isFile;
   const home = o.home ?? homedir();
   const named = bucket.sslRootCert;
-  if (named === undefined) return undefined;
+  if (named === undefined) {
+    try {
+      return findCaBundle({ needs: `"lake.bucket.useSsl" is true, so croft checks the store's certificate`, setting: "lake.bucket.sslRootCert", env: o.env ?? {}, file });
+    } catch (e) {
+      if (!(e instanceof CroftError)) throw e;
+      throw noCaBundle(e);
+    }
+  }
   const path = resolve(root, named === "~" ? home : named.startsWith("~/") ? join(home, named.slice(2)) : named);
   if (!file(path)) {
     throw new CroftError("CONFIG_INVALID", {
@@ -41,6 +50,18 @@ export function storeCaFile(
     });
   }
   return path;
+}
+
+/** The refusal for a machine on which findCaBundle found no bundle: LAKE_STORE_TLS, kind `no-ca-file`, with where it looked. */
+function noCaBundle(missed: CroftError): CroftError {
+  return new CroftError("LAKE_STORE_TLS", {
+    message: `croft found no CA bundle on this machine to check the lake's bucket against (looked at $SSL_CERT_FILE and ${((missed.problem.details?.looked as string[] | undefined) ?? CA_BUNDLES).join(", ")})`,
+    hint: `${CONFIGURE}, or put the path of a bundle in $SSL_CERT_FILE; trying again will not help`,
+    fix: { kind: "manual", description: `ask the user for a PEM file of trusted certificate authorities and set "lake.bucket.sslRootCert" to it`, requiresHuman: true },
+    retryable: false,
+    effect: "nothing was read from or written to the bucket",
+    details: { tls: true, kind: "no-ca-file", key: "lake.bucket.sslRootCert", looked: missed.problem.details?.looked ?? [...CA_BUNDLES] },
+  });
 }
 
 /** DuckDB's words (httpfs, libcurl and OpenSSL) for a check of the store's certificate that could not be made or failed: the CA file may not be
@@ -53,13 +74,13 @@ export function isStoreTls(e: unknown): boolean {
   return STORE_TLS.test(e instanceof Error ? e.message : String(e));
 }
 
-const CONFIGURE = `ask the user to set "lake.bucket.sslRootCert" in croft.json to the PEM file of the certificate authorities the store's certificate is signed by (the file the store's provider publishes, or a private authority's; for a public certificate, this machine's own bundle, such as /etc/ssl/cert.pem); croft docs LAKE_STORE_TLS. Do not turn "lake.bucket.useSsl" off or skip the check`;
+const CONFIGURE = `ask the user to set "lake.bucket.sslRootCert" in croft.json to the PEM file of the certificate authorities the store's certificate is signed by (the file the store's provider publishes, or a private authority's); without the setting croft uses $SSL_CERT_FILE, then this machine's CA bundle; croft docs LAKE_STORE_TLS. Do not turn "lake.bucket.useSsl" off or skip the check`;
 
 /**
  * LAKE_STORE_TLS for the failure of the check of the store's certificate, with DuckDB's first line (credentials already taken out by the
- * caller); null for any other error. `named`: the project names its own CA file (then the file is the thing to look at, not the machine's).
+ * caller); null for any other error. `caFile`: the file the check was made against, when known.
  */
-export function storeTlsProblem(e: unknown, o: { named?: boolean } = {}): Problem | null {
+export function storeTlsProblem(e: unknown, o: { caFile?: string } = {}): Problem | null {
   const text = e instanceof Error ? e.message : String(e);
   if (!STORE_TLS.test(text)) return null;
   const first = text.split("\n").find((l) => STORE_TLS.test(l)) ?? text.split("\n")[0]!;
@@ -71,18 +92,16 @@ export function storeTlsProblem(e: unknown, o: { named?: boolean } = {}): Proble
       : `the store's certificate did not check out, so croft cannot read or write the lake's bucket (${detail})`,
     hint: unreadable
       ? `${CONFIGURE}; trying again will not help`
-      : o.named
-        ? `the store's certificate is not signed by an authority in the file "lake.bucket.sslRootCert" names, or is for another name than "lake.bucket.endpoint": ${CONFIGURE}; trying again will not help`
-        : `the store's certificate is not signed by an authority in this machine's CA bundle, or is for another name than "lake.bucket.endpoint": ${CONFIGURE}; trying again will not help`,
+      : `the store's certificate is not signed by an authority in ${o.caFile ? `the CA file croft checked it against (${o.caFile})` : "the CA file croft checked it against"}, or is for another name than "lake.bucket.endpoint": ${CONFIGURE}; trying again will not help`,
     fix: { kind: "manual", description: `ask the user for the store's CA file and set "lake.bucket.sslRootCert" to it`, requiresHuman: true },
     retryable: false,
     effect: "nothing was read from or written to the bucket",
-    details: { tls: true, kind: unreadable ? "no-ca-file" : "untrusted", duckdb: detail },
+    details: { tls: true, kind: unreadable ? "no-ca-file" : "untrusted", ...(o.caFile ? { caFile: o.caFile } : {}), duckdb: detail },
   });
 }
 
 /** The error to throw for it, or null. */
-export function storeTlsError(e: unknown, o: { named?: boolean } = {}): CroftError | null {
+export function storeTlsError(e: unknown, o: { caFile?: string } = {}): CroftError | null {
   const p = storeTlsProblem(e, o);
   if (!p) return null;
   const { severity: _s, code: _c, docs: _d, ...init } = p;

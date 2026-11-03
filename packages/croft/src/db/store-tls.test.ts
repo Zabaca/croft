@@ -94,25 +94,49 @@ describe("a lake whose store is served over HTTPS", () => {
     expect(readFileSync(certs!.cert, "utf8")).toContain("BEGIN CERTIFICATE");
   }, 180_000);
 
+  // No sslRootCert: the CA is found the way the catalog's is, $SSL_CERT_FILE of the project's environment first (db/ca-bundle.ts, D-R1).
+  maybe("a CA bundle found by the finder ($SSL_CERT_FILE) is allowed and used: every command works with no sslRootCert in croft.json", async () => {
+    const lake = await rig!.lake();
+    const p = project(lake, undefined);
+    const env = { ...p.env, SSL_CERT_FILE: certs!.cert };
+    expect((await cli(["run", "--foreground", "--json"], { cwd: p.root, env })).exit).toBe(0);
+    await closeAllWarehouses();
+    expect(filesIn(lake.files).some((f) => f.endsWith(".parquet"))).toBe(true);
+    for (const argv of [["query", "select max(note) from orders"], ["maintain"], ["backup"], ["doctor"]]) {
+      const r = await cli([...argv, "--json"], { cwd: p.root, env });
+      expect(r.exit, `${argv[0]}: ${r.stdout.slice(0, 500)}`).toBe(0);
+      if (argv[0] === "doctor") expect(checksOf(r.json).find((c) => c.id === "lake.store")!.details).toMatchObject({ caFile: certs!.cert });
+      await closeAllWarehouses();
+    }
+  }, 180_000);
+
   maybe("without the CA, every command that meets the store says LAKE_STORE_TLS and the fix, and none says INTERNAL_ERROR, QUERY_FAILED or LAKE_MAINTENANCE_FAILED", async () => {
     const lake = await rig!.lake();
     const p = project(lake, certs!.cert);
     expect((await cli(["run", "--foreground", "--json"], { cwd: p.root, env: p.env })).exit).toBe(0);
     await closeAllWarehouses();
-    // The project drops the setting (or names a CA that does not vouch for the store): the machine's own bundle does not know the store's authority.
-    for (const cert of [undefined, certs!.otherCa]) {
-      p.use(cert);
+    // The CA the check uses does not vouch for the store: a bundle $SSL_CERT_FILE names, a file the project names, or (nothing named) this machine's own
+    // bundle, which does not know the store's authority; on a machine with no bundle at all the refusal is the same code, kind no-ca-file.
+    const cases: { label: string; cert?: string; env: Record<string, string> }[] = [
+      { label: "$SSL_CERT_FILE names a bundle that does not vouch for the store", env: { SSL_CERT_FILE: certs!.otherCa } },
+      { label: "the project names another CA", cert: certs!.otherCa, env: {} },
+      { label: "this machine's own bundle", env: { SSL_CERT_FILE: "/no/such/bundle.pem" } },
+    ];
+    for (const c of cases) {
+      p.use(c.cert);
+      const env = { ...p.env, ...c.env };
       for (const argv of [["run", "orders", "--foreground"], ["query", "select max(note) from orders"], ["describe", "orders"], ["maintain"], ["backup"]]) {
-        const r = await cli([...argv, "--json"], { cwd: p.root, env: p.env });
+        const r = await cli([...argv, "--json"], { cwd: p.root, env });
         const codes = problemsOf(r.json).map((x) => x.code);
-        expect(codes, `${cert ? "another CA" : "no CA"}: croft ${argv[0]}: ${r.stdout.slice(0, 600)}`).toContain("LAKE_STORE_TLS");
+        expect(codes, `${c.label}: croft ${argv[0]}: ${r.stdout.slice(0, 600)}`).toContain("LAKE_STORE_TLS");
         for (const bad of ["INTERNAL_ERROR", "QUERY_FAILED", "LAKE_MAINTENANCE_FAILED"]) expect(codes, `croft ${argv[0]}`).not.toContain(bad);
         const tls = problemsOf(r.json).find((x) => x.code === "LAKE_STORE_TLS")!;
         expect(tls.hint, argv[0]).toContain("lake.bucket.sslRootCert");
+        expect(["untrusted", "no-ca-file"], c.label).toContain(String(tls.details?.kind));
         await closeAllWarehouses();
       }
-      const doctor = await cli(["doctor", "--json"], { cwd: p.root, env: p.env });
-      expect(problemsOf(doctor.json).map((x) => x.code), "croft doctor").toContain("LAKE_STORE_TLS");
+      const doctor = await cli(["doctor", "--json"], { cwd: p.root, env });
+      expect(problemsOf(doctor.json).map((x) => x.code), `croft doctor, ${c.label}`).toContain("LAKE_STORE_TLS");
       await closeAllWarehouses();
     }
   }, 240_000);
@@ -298,13 +322,30 @@ describe("the pieces", () => {
     expect((err as CroftError).message).toContain("lake.bucket.sslRootCert");
   });
 
+  test("storeCaFile finds the machine's bundle with the catalog's finder: $SSL_CERT_FILE first, then the usual places; none is LAKE_STORE_TLS, no-ca-file, before anything is attached", () => {
+    const has = (...files: string[]) => (p: string) => files.includes(p);
+    const bucket = { useSsl: true };
+    expect(storeCaFile(bucket, "/proj", { env: { SSL_CERT_FILE: "/corp/ca.pem" }, file: has("/corp/ca.pem", "/etc/ssl/cert.pem") })).toBe("/corp/ca.pem");
+    expect(storeCaFile(bucket, "/proj", { env: {}, file: has("/etc/ssl/certs/ca-certificates.crt") })).toBe("/etc/ssl/certs/ca-certificates.crt");
+    // A named setting beats the environment; a store without TLS needs none.
+    expect(storeCaFile({ useSsl: true, sslRootCert: "mine.pem" }, "/proj", { env: { SSL_CERT_FILE: "/corp/ca.pem" }, file: has("/corp/ca.pem", "/proj/mine.pem") })).toBe("/proj/mine.pem");
+    expect(storeCaFile({ useSsl: false }, "/proj", { env: {}, file: has() })).toBeUndefined();
+    let err: unknown;
+    try { storeCaFile(bucket, "/proj", { env: { SSL_CERT_FILE: "/gone.pem" }, file: has() }); } catch (e) { err = e; }
+    expect(err).toBeInstanceOf(CroftError);
+    expect((err as CroftError).code).toBe("LAKE_STORE_TLS");
+    expect((err as CroftError).problem).toMatchObject({ retryable: false, details: { kind: "no-ca-file", key: "lake.bucket.sslRootCert" } });
+    expect((err as CroftError).problem.details!.looked).toContain("/etc/ssl/cert.pem");
+    expect((err as CroftError).problem.hint).toContain("lake.bucket.sslRootCert");
+  });
+
   test("DuckDB's words for a certificate that does not check out, and only those, are LAKE_STORE_TLS", () => {
     const refused = "Permission Error: Cannot read a CA certificate bundle: file system access is restricted by configuration. Add one of /etc/ssl/cert.pem to allowed_paths";
     const bad = 'IO Error: S3 upload request for "s3://b/f/x.parquet" could not be completed: SSL peer certificate or SSH remote key was not OK';
     expect(isStoreTls(new Error(refused))).toBe(true);
     expect(isStoreTls(new Error(bad))).toBe(true);
     expect(storeTlsProblem(new Error(refused))).toMatchObject({ code: "LAKE_STORE_TLS", retryable: false, details: { kind: "no-ca-file" } });
-    expect(storeTlsProblem(new Error(bad), { named: true })).toMatchObject({ code: "LAKE_STORE_TLS", details: { kind: "untrusted" } });
+    expect(storeTlsProblem(new Error(bad), { caFile: "/etc/ssl/cert.pem" })).toMatchObject({ code: "LAKE_STORE_TLS", details: { kind: "untrusted" } });
     expect(storeTlsProblem(new Error(bad))!.hint).toContain("lake.bucket.sslRootCert");
     for (const other of ["HTTP Error: HTTP GET error reading 's3://b/f/x.parquet' (HTTP 403 Forbidden)", "IO Error: Connection refused", "Invalid Input Error: nothing"]) {
       expect(isStoreTls(new Error(other)), other).toBe(false);

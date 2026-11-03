@@ -58,10 +58,11 @@ lake add-on, which carries DuckDB's ducklake, httpfs and postgres extensions (cr
     bun add @zabaca/croft-addon-lake@<version>
     croft validate && croft doctor && croft run
 
-The store is reached over HTTPS, and croft checks its certificate against a CA file it lets DuckDB read: the file
-`lake.bucket.sslRootCert` names (relative to the project folder), for a store whose certificate a private authority signed
-or whose provider publishes a root file. Without a usable CA file every read and write of the bucket fails with
-LAKE_STORE_TLS, in whichever command meets it. `croft doctor` lists the bucket's folder and reads the footer of one data
+The store is reached over HTTPS, and croft checks its certificate against one CA file it lets DuckDB read: the file
+`lake.bucket.sslRootCert` names (relative to the project folder), for a store whose certificate a private authority signed;
+else the file `$SSL_CERT_FILE` names (in `.env` or the shell); else this machine's own CA bundle, which is all a store with
+a public certificate (R2, S3) needs. A certificate that does not check out, or a machine with no bundle, fails every read
+and write of the bucket with LAKE_STORE_TLS, in whichever command meets it. `croft doctor` lists the bucket's folder and reads the footer of one data
 file with the read-only key before the first run, so a store croft cannot reach is found before `croft run` fails on it;
 it writes nothing, and says whether the catalog's connection is encrypted (a Postgres that offers no TLS is reached in
 plain text, without a word from the client, unless the connection is made to require it).

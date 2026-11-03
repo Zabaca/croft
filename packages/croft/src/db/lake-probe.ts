@@ -82,7 +82,7 @@ export async function probeStore(project: Project, env: ProjectEnv, o: { timeout
     }
     return { folder, empty: !first.file && !first.many, many: first.many, listMs, sample, caFile: mode.lake.data.caFile ?? null };
   } catch (e) {
-    throw probeFailure(e, secrets, folder, !!mode.lake.data.caFile);
+    throw probeFailure(e, secrets, folder, mode.lake.data.caFile);
   } finally {
     if (timer) clearTimeout(timer);
     memory.close();
@@ -90,10 +90,10 @@ export async function probeStore(project: Project, env: ProjectEnv, o: { timeout
 }
 
 /** The probe's failure, as a coded error with every credential taken out of DuckDB's words. */
-function probeFailure(e: unknown, secrets: readonly string[], folder: string, named: boolean): CroftError {
+function probeFailure(e: unknown, secrets: readonly string[], folder: string, caFile: string | undefined): CroftError {
   const clean = scrubThrown(e, secrets);
   if (clean instanceof CroftError) return clean;
-  const tls = storeTlsError(clean, { named });
+  const tls = storeTlsError(clean, { ...(caFile ? { caFile } : {}) });
   if (tls) return tls;
   const raw = clean.message.split("\n")[0]!.slice(0, 300);
   if (/interrupt/i.test(raw)) {

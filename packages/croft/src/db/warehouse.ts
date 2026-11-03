@@ -510,7 +510,8 @@ export class DuckWarehouse implements Warehouse {
     // unknown error (INTERNAL_ERROR, QUERY_FAILED).
     if (this.lake && !(clean instanceof CroftError)) {
       const m = this.spec.mode;
-      return storeTlsError(clean, { named: (m?.kind === "lake" || m?.kind === "lake-readers") && !!m.lake.data.caFile }) ?? clean;
+      const caFile = m?.kind === "lake" || m?.kind === "lake-readers" ? m.lake.data.caFile : undefined;
+      return storeTlsError(clean, { ...(caFile ? { caFile } : {}) }) ?? clean;
     }
     return clean;
   }

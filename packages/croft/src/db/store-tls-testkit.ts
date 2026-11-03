@@ -1,12 +1,12 @@
 // Certificates for the tests of a store served over HTTPS (DESIGN.md D-R1): made with the openssl program, in a temporary folder, for the
 // S3-compatible test store (mode-testkit.ts startS3 with `tls`), which a real store's certificate stands in for. Test support, left out of the
-// published package (package.json "files").
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+// published package (package.json "files"). The openssl helper is the catalog's (tls-testkit.ts), which makes the same kind of certificate.
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { IN_CI } from "./extension-dir-testkit.ts";
 import { type LakeRig, READER_KEY, startLakeRig, WRITER_KEY } from "./lake-testkit.ts";
 import { startS3, type TestS3 } from "./mode-testkit.ts";
+import { certsReady, req } from "./tls-testkit.ts";
 
 export interface StoreCerts {
   /** The store's certificate, self-signed, so it is also the CA file a client trusts it by. Issued for localhost and 127.0.0.1. */
@@ -17,24 +17,6 @@ export interface StoreCerts {
   /** A certificate for a name that is not the store's address (`not-the-store.example`), with its key: a store that serves it fails the name check. */
   wrongName: { cert: string; key: string };
   remove(): void;
-}
-
-/** Whether openssl is here. Locally a missing one skips with a reason; in CI it throws. */
-export function storeCertsReady(): { ready: boolean; skipReason: string } {
-  if (Bun.which("openssl")) return { ready: true, skipReason: "" };
-  const msg = "the openssl program is not installed";
-  if (IN_CI) throw new Error(`CI must have openssl for the store TLS tests: ${msg}`);
-  return { ready: false, skipReason: msg };
-}
-
-function req(dir: string, name: string, cn: string, san: string | null): { cert: string; key: string } {
-  const cnf = join(dir, `${name}.cnf`);
-  writeFileSync(cnf, `[req]\ndistinguished_name=dn\nx509_extensions=v3\nprompt=no\n[dn]\nCN=${cn}\n[v3]\n${san ? `subjectAltName=${san}\n` : ""}basicConstraints=critical,CA:TRUE\n`);
-  const cert = join(dir, `${name}.crt`);
-  const key = join(dir, `${name}.key`);
-  const r = Bun.spawnSync(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert, "-days", "2", "-config", cnf], { stdout: "ignore", stderr: "pipe" });
-  if (r.exitCode !== 0) throw new Error(`openssl req failed: ${r.stderr.toString()}`);
-  return { cert, key };
 }
 
 /**
@@ -64,6 +46,9 @@ export async function startTlsLakeRig(tls: { cert: string; key: string }): Promi
     },
   };
 }
+
+/** Whether openssl is here (the catalog tests' check: locally a missing one skips with a reason, in CI it throws). */
+export const storeCertsReady = certsReady;
 
 export function makeStoreCerts(): StoreCerts {
   const dir = mkdtempSync(join(tmpdir(), "croft-store-tls-"));
