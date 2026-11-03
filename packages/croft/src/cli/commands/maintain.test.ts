@@ -59,7 +59,7 @@ describe("croft maintain", () => {
     const ran = await run(["maintain"]);
     expect(ran.exit, ran.stdout + ran.stderr).toBe(0);
     expect(ran.json.data.status).toBe("ran");
-    expect(ran.json.data.report.steps.map((s: { step: string; status: string }) => `${s.step}:${s.status}`)).toEqual(["flush:ok", "expire:ok", "merge:ok", "rewrite:ok", "cleanup:ok"]);
+    expect(ran.json.data.report.steps.map((s: { step: string; status: string }) => `${s.step}:${s.status}`)).toEqual(["prune:ok", "flush:ok", "expire:ok", "merge:ok", "rewrite:ok", "cleanup:ok"]);
     expect(ran.json.data.report.before.snapshots).toBe(snapshots);
     // A pass makes snapshots of its own (a flush, a merge), and expires none of a lake that is hours old.
     expect(ran.json.data.report.plan.expired).toBe(0);
@@ -140,7 +140,9 @@ describe("croft maintain", () => {
     const asked = await run(["maintain", "--orphans"]);
     expect(asked.exit, asked.stdout + asked.stderr).toBe(5);
     expect(asked.json.data.status).toBe("needs_confirmation");
-    expect(asked.json.confirmation).toMatchObject({ command: "croft maintain --orphans", impact: { rows: 1, unit: "file", asset: "the lake's folder" } });
+    expect(asked.json.confirmation).toMatchObject({ command: "croft maintain --orphans", impact: { files: 1, rows: 0, asset: "the lake's folder" } });
+    // The cutoff the list was made with is the confirmation's, and the listing says it too.
+    expect(asked.json.confirmation.impact.asOf).toBe(asked.json.data.orphans.olderThan);
     expect(asked.json.problems[0]).toMatchObject({ code: "CONFIRMATION_REQUIRED", effect: "nothing was changed" });
     expect(existsSync(old1)).toBe(true);
     // A file that appears before the yes makes the token stale.
@@ -153,7 +155,7 @@ describe("croft maintain", () => {
     // Asked again, and confirmed for the list that was shown.
     const again = await run(["maintain", "--orphans"]);
     expect(again.exit).toBe(5);
-    expect(again.json.confirmation.impact.rows).toBe(2);
+    expect(again.json.confirmation.impact.files).toBe(2);
     const done = await run(["confirm", again.json.confirmation.token]);
     expect(done.exit, done.stdout + done.stderr).toBe(0);
     expect(done.json.data.outcome).toBe("used");
@@ -186,6 +188,56 @@ describe("croft maintain", () => {
     await closeAllWarehouses();
     expect(after.exit, after.stdout).toBe(0);
   }, 120_000);
+
+  maybe("a backup that takes its dump while a pass waits for the lock keeps the pass, and the deletion of strays, from running; each backup removes only its own marker", async () => {
+    const l = await lakeProject("local", { extensionDir: ready.dir });
+    const { backupRunning, lakeOption, markBackupRunning } = await import("../../db/lake.ts");
+    const { orphanCutoff } = await import("../../db/lake-maintenance.ts");
+    const { deleteOrphansOf, maintainProject } = await import("../../db/lake-pass.ts");
+    const { openWarehouse } = await import("../../db/warehouse.ts");
+    const stateDir = l.p.stateDir;
+    // Two backups, each with its marker; one ends, the other is still copying.
+    const first = markBackupRunning(stateDir);
+    const second = markBackupRunning(stateDir);
+    first();
+    expect(backupRunning(stateDir)).not.toBeNull();
+    second();
+    expect(backupRunning(stateDir)).toBeNull();
+    // A backup's dump is taken under the lock. The pass looked for a backup before it waited for the lock, and found none; the backup marks itself
+    // with the lock held and keeps holding the folder; the pass, getting the lock, looks again.
+    const { ProjectEnv } = await import("../../project/env.ts");
+    const env = ProjectEnv.load(l.p.root, l.env);
+    const holder = openWarehouse({
+      path: l.project.paths.database, mode: "read_write", timezone: l.project.timezone, root: l.project.root, stateDir, ...lakeOption(l.project, env),
+      isTTY: false, register: false,
+    });
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let inside!: () => void;
+    const entered = new Promise<void>((r) => (inside = r));
+    let unmark: (() => void) | undefined;
+    const dumping = holder.write("lake backup", async () => {
+      inside();
+      await held;
+      unmark = markBackupRunning(stateDir);
+    }, { runId: "", transaction: false, touchesLake: false });
+    await entered;
+    const pass = maintainProject(l.project, env, { now: new Date(Date.now() + 40 * 86_400_000), isTTY: false });
+    const strays = deleteOrphansOf(l.project, env, [], orphanCutoff(new Date()), { isTTY: false }).catch((e: unknown) => e);
+    await Bun.sleep(600); // both are past their first look and queued for the lock
+    release();
+    await dumping;
+    const outcome = await pass;
+    expect(outcome.status).toBe("backup_running");
+    expect(outcome.report).toBeUndefined();
+    const refused = await strays;
+    expect(refused).toMatchObject({ code: "DB_BUSY" });
+    // Nothing was done meanwhile; when the backup is over the pass runs.
+    unmark!();
+    const after = await maintainProject(l.project, env, { now: new Date(Date.now() + 40 * 86_400_000), isTTY: false });
+    await closeAllWarehouses();
+    expect(after.status).toBe("ran");
+  }, 180_000);
 
   maybe("a run starts the pass when one is due, after the run, and a trashed version pins the snapshot it was taken from", async () => {
     const l = await lakeProject("local", { extensionDir: ready.dir });

@@ -83,11 +83,15 @@
                     },
                     "deleted": {
                       "type": "number"
+                    },
+                    "olderThan": {
+                      "type": "string"
                     }
                   },
                   "required": [
                     "files",
-                    "deleted"
+                    "deleted",
+                    "olderThan"
                   ],
                   "additionalProperties": false
                 },
@@ -316,8 +320,11 @@
         "estimatedRequests": {
           "type": "number"
         },
-        "unit": {
-          "const": "file"
+        "files": {
+          "type": "number"
+        },
+        "asOf": {
+          "type": "string"
         }
       },
       "required": [
@@ -438,6 +445,9 @@
           "items": {
             "$ref": "#/$defs/ExpiryOption"
           }
+        },
+        "supersededLogRows": {
+          "type": "number"
         }
       },
       "required": [
@@ -448,7 +458,8 @@
         "because",
         "assets",
         "pins",
-        "expiryOptions"
+        "expiryOptions",
+        "supersededLogRows"
       ],
       "additionalProperties": false
     },
@@ -528,6 +539,7 @@
                     "expire",
                     "flush",
                     "merge",
+                    "prune",
                     "rewrite",
                     null
                   ]
@@ -724,6 +736,7 @@
             "expire",
             "flush",
             "merge",
+            "prune",
             "rewrite"
           ]
         },

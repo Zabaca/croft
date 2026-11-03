@@ -20,9 +20,10 @@ import { join } from "node:path";
 import { CroftError, problem } from "../../core/errors.ts";
 import type { LockHolder, Problem } from "../../core/types.ts";
 import { RunsDb, RUNS_DB_FILE } from "../../history/runs-db.ts";
-import { deleteOrphansOf, listOrphansOf, type MaintenancePlan, maintainIfDue, maintainProject, type PassOutcome, planProject } from "../../db/lake-pass.ts";
+import { deleteOrphansOf, listOrphansOf, type MaintenancePlan, maintainIfDue, maintainProject, type PassOutcome, planProject, retryKnob } from "../../db/lake-pass.ts";
+import { orphanCutoff } from "../../db/lake-maintenance.ts";
 import { type MaintenanceView, maintenanceView, readState } from "../../db/lake-maintenance-state.ts";
-import { DEFAULT_RETRY, type LakeStats, type PassReport, type RetryPolicy, type StepReport } from "../../db/lake-maintenance.ts";
+import type { LakeStats, PassReport, StepReport } from "../../db/lake-maintenance.ts";
 import { Confirmations, type HashedImpact } from "../../safety/confirm.ts";
 import type { CommandImpl, CommandResult, Ctx } from "../command.ts";
 import { dispatchOf } from "../main.ts";
@@ -42,8 +43,8 @@ export interface MaintainData {
   report: PassReport | null;
   /** --dry-run: what a pass would expire and keep, and the lake's counts now. */
   plan: MaintenancePlan | null;
-  /** --orphans: the files that are not the lake's own (a day old or more), and how many were deleted. */
-  orphans: { files: string[]; deleted: number } | null;
+  /** --orphans: the files that are not the lake's own and older than `olderThan` (a day before the list was made), and how many were deleted. */
+  orphans: { files: string[]; deleted: number; olderThan: string } | null;
   /** Whether croft runs passes by itself, when the last worked and when the next is due. */
   auto: MaintenanceView;
 }
@@ -98,12 +99,6 @@ export const maintain: CommandImpl<MaintainData> = {
   },
 };
 
-/** Test knob: CROFT_MAINTAIN_RETRY_MS="5" makes a step's retries wait 5 ms, then 10, 20 (default 750 ms, doubling), instead of seconds. */
-function retryKnob(env: Record<string, string | undefined>): { retry?: RetryPolicy } {
-  const ms = Number(env.CROFT_MAINTAIN_RETRY_MS);
-  return Number.isFinite(ms) && ms > 0 ? { retry: { ...DEFAULT_RETRY, baseMs: ms } } : {};
-}
-
 function fromOutcome(ctx: Ctx, o: PassOutcome): CommandResult<MaintainData> {
   const d = data(ctx, o.status, { report: o.report ?? null });
   switch (o.status) {
@@ -147,17 +142,33 @@ export function expiryOptionProblem(options: readonly { name: string; value: str
 
 const hashFiles = (files: readonly string[]): string => createHash("sha256").update(JSON.stringify(files)).digest("hex");
 
-function orphanImpact(files: readonly string[]): HashedImpact {
-  return { asset: "the lake's folder", action: "delete files the lake does not own from", rows: files.length, unit: "file", downstream: [], generation: hashFiles(files) };
+function orphanImpact(files: readonly string[], cutoff: Date): HashedImpact {
+  return {
+    asset: "the lake's folder", action: "delete files the lake does not own from", rows: 0, files: files.length, asOf: cutoff.toISOString(), downstream: [],
+    generation: hashFiles([cutoff.toISOString(), ...files]),
+  };
 }
 
 async function orphans(ctx: Ctx): Promise<CommandResult<MaintainData>> {
   const project = ctx.project;
-  const found = await listOrphansOf(project, ctx.env);
-  if (found === null) return { data: data(ctx, "no_lake"), problems: [], next: [{ command: "croft run", reason: "the first run creates the lake" }] };
-  const listed = { files: found, deleted: 0 };
-  if (found.length === 0 || ctx.values["dry-run"] === true) return { data: data(ctx, "orphans", { orphans: listed }), problems: [], next: [] };
   const stateDir = project.paths.stateDir;
+  const token = dispatchOf(ctx)?.confirmToken;
+  // The age a file must be older than is fixed when the list is made, and the confirmation carries it: confirming lists and deletes with the
+  // cutoff the person was shown, not with a clock that has moved on.
+  let cutoff = orphanCutoff(ctx.now());
+  if (token !== undefined && existsSync(join(stateDir, RUNS_DB_FILE))) {
+    const peek = RunsDb.open(stateDir);
+    try {
+      const asOf = new Confirmations(peek).get(token)?.impact.asOf;
+      if (asOf !== undefined && !Number.isNaN(Date.parse(asOf))) cutoff = new Date(asOf);
+    } finally {
+      peek.close();
+    }
+  }
+  const found = await listOrphansOf(project, ctx.env, cutoff);
+  if (found === null) return { data: data(ctx, "no_lake"), problems: [], next: [{ command: "croft run", reason: "the first run creates the lake" }] };
+  const listed = { files: found, deleted: 0, olderThan: cutoff.toISOString() };
+  if (found.length === 0 || ctx.values["dry-run"] === true) return { data: data(ctx, "orphans", { orphans: listed }), problems: [], next: [] };
   const runs = RunsDb.open(stateDir);
   try {
     const confirmations = new Confirmations(runs);
@@ -166,7 +177,7 @@ async function orphans(ctx: Ctx): Promise<CommandResult<MaintainData>> {
     const head = `delete ${plural(found.length, "file")} from the lake's folder that the lake does not own (older than a day)`;
     if (token === undefined) {
       if (!ask) {
-        const c = confirmations.create({ command: COMMAND, impact: orphanImpact(found) });
+        const c = confirmations.create({ command: COMMAND, impact: orphanImpact(found, cutoff) });
         return {
           data: data(ctx, "needs_confirmation", { orphans: listed }),
           problems: [confirmationProblem(c, head, null, "they are gone for good: they are not in the trash, and not in any snapshot")],
@@ -177,9 +188,9 @@ async function orphans(ctx: Ctx): Promise<CommandResult<MaintainData>> {
       if (!(await prompter.ask(question))) return { data: data(ctx, "declined", { orphans: listed }), problems: [], next: [], ok: false, exit: 1 };
     } else {
       // The list as it is now, against the one the person was shown: a different list is CONFIRMATION_STALE and nothing is deleted.
-      await confirmations.consume(token, async () => orphanImpact((await listOrphansOf(project, ctx.env)) ?? []));
+      await confirmations.consume(token, async () => orphanImpact((await listOrphansOf(project, ctx.env, cutoff)) ?? [], cutoff));
     }
-    const done = await deleteOrphansOf(project, ctx.env, found, { isTTY: ctx.isTTY.stdin && ctx.isTTY.stdout });
+    const done = await deleteOrphansOf(project, ctx.env, found, cutoff, { isTTY: ctx.isTTY.stdin && ctx.isTTY.stdout });
     if (done === null) {
       throw new CroftError("CONFIRMATION_STALE", {
         message: "the files in the lake's folder changed while you were answering; nothing was deleted",
@@ -194,7 +205,7 @@ async function orphans(ctx: Ctx): Promise<CommandResult<MaintainData>> {
         // The files are gone; a token left open meets a changed list.
       }
     }
-    return { data: data(ctx, "orphans_deleted", { orphans: { files: done, deleted: done.length } }), problems: [], next: [] };
+    return { data: data(ctx, "orphans_deleted", { orphans: { files: done, deleted: done.length, olderThan: cutoff.toISOString() } }), problems: [], next: [] };
   } finally {
     runs.close();
   }
@@ -203,6 +214,7 @@ async function orphans(ctx: Ctx): Promise<CommandResult<MaintainData>> {
 // ---- Words --------------------------------------------------------------------------------------------------------
 
 const STEP_WORDS: Record<string, (s: StepReport) => string> = {
+  prune: (s) => `${plural(s.did.rows ?? 0, "superseded bookkeeping row")} removed from ${plural(s.did.tables ?? 0, "log")}`,
   flush: (s) => `${plural(s.did.rows ?? 0, "row")} of ${plural(s.did.tables ?? 0, "table")} moved out of the catalog into files`,
   expire: (s) => `${plural(s.did.snapshots ?? 0, "snapshot")} expired`,
   merge: (s) => `${plural(s.did.merged ?? 0, "file")} merged into ${s.did.created ?? 0}`,

@@ -46,9 +46,9 @@ describe("croft maintain against a store that fails a delete", () => {
     expect(failed.exit, failed.stdout).toBe(1);
     expect(failed.json.data.status).toBe("failed");
     const steps = failed.json.data.report.steps as { step: string; status: string; attempts: number; error?: string }[];
-    expect(steps.map((s) => `${s.step}:${s.status}`)).toEqual(["flush:ok", "expire:ok", "merge:ok", "rewrite:ok", "cleanup:failed"]);
-    expect(steps[4]!.attempts).toBe(4);
-    expect(steps[4]!.error).toContain("HTTP 500");
+    expect(steps.map((s) => `${s.step}:${s.status}`)).toEqual(["prune:ok", "flush:ok", "expire:ok", "merge:ok", "rewrite:ok", "cleanup:failed"]);
+    expect(steps[5]!.attempts).toBe(4);
+    expect(steps[5]!.error).toContain("HTTP 500");
     expect(failed.json.problems[0]).toMatchObject({ code: "LAKE_MAINTENANCE_FAILED", retryable: true });
     expect(failed.json.data.report.after.pendingDeletion).toBeGreaterThan(0);
     // The lake is usable and has lost nothing.
@@ -77,6 +77,42 @@ describe("croft maintain against a store that fails a delete", () => {
     expect(clean.json.problems.filter((p: { code: string }) => p.code === "LAKE_MAINTENANCE_FAILED")).toEqual([]);
     const doctor2 = await run(["doctor"]);
     expect((doctor2.json.data.checks as { id: string; status: string }[]).find((c) => c.id === "lake.maintenance")!.status).toBe("ok");
+  }, 300_000);
+
+  maybe("a pass that fails after a run never fails the run: the run's result is as if there had been no pass, and the failure is kept", async () => {
+    const l = await lakeProject("postgres", { extensionDir: ready.dir, rig });
+    const exec = async (args: string[], later = false) => {
+      // A run reads the project's clock and the retry knob from the process, as the real CLI's child does.
+      if (later) process.env.CROFT_NOW = new Date(Date.now() + 25 * 3_600_000).toISOString();
+      process.env.CROFT_MAINTAIN_RETRY_MS = "1";
+      try {
+        const r = await cli([...args, "--json"], { cwd: l.p.root, env: { ...l.env, ...(later ? { CROFT_NOW: process.env.CROFT_NOW } : {}) } });
+        await closeAllWarehouses();
+        return r;
+      } finally {
+        delete process.env.CROFT_NOW;
+        delete process.env.CROFT_MAINTAIN_RETRY_MS;
+      }
+    };
+    for (const n of [5, 4, 3]) {
+      writeFileSync(join(l.p.root, "assets", "orders.sql"), ORDERS_SQL.replace("range % 7", `range % ${n}`));
+      expect((await exec(["run", "orders", "--foreground"])).exit).toBe(0);
+    }
+    await rig.s3.failDeletes(1000, 500);
+    writeFileSync(join(l.p.root, "assets", "orders.sql"), ORDERS_SQL.replace("range % 7", "range % 2"));
+    const run = await exec(["run", "orders", "--foreground"], true); // a day on: a pass is due after this run, and the store refuses its deletes
+    await rig.s3.failDeletes(0, 500);
+    expect(run.exit, run.stdout + run.stderr).toBe(0);
+    expect(run.json.ok).toBe(true);
+    expect(run.json.data.status).toBe("succeeded");
+    expect(run.json.problems).toEqual([]);
+    expect(run.json.data.steps[0]).toMatchObject({ asset: "orders", status: "ok" });
+    for (const secret of RIG_SECRETS) expect(run.stdout + run.stderr).not.toContain(secret);
+    // The table is what the run made, and the failure of the pass after it is kept for status and doctor.
+    expect((await exec(["query", "select count(distinct k)::INT as k from orders"])).json.data.rows).toEqual([{ k: 2 }]);
+    const status = await exec(["status"]);
+    expect(status.json.data.lake.maintenance.lastError).toMatchObject({ step: "cleanup" });
+    expect(status.json.problems.find((p: { code: string }) => p.code === "LAKE_MAINTENANCE_FAILED")).toMatchObject({ severity: "warning" });
   }, 300_000);
 
   maybe("a catalog that cannot be reached is a failed attempt too: kept, shown as a warning, and tried again within the hour", async () => {

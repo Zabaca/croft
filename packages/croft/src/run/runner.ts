@@ -610,8 +610,8 @@ async function afterRun(o: RunnerOptions, out: RunOutcome): Promise<void> {
     const now = (o.now ?? clockNow)();
     await quietly(async () => {
       if (o.hooks?.maintainLake) return o.hooks.maintainLake(o.project, o.env, now);
-      const { maintainIfDue } = await import("../db/lake-pass.ts");
-      return maintainIfDue(o.project, o.env, { now, isTTY: false });
+      const { maintainIfDue, retryKnob } = await import("../db/lake-pass.ts");
+      return maintainIfDue(o.project, o.env, { now, isTTY: false, ...retryKnob(process.env) });
     });
   };
   if (o.trigger === "schedule") {

@@ -21,7 +21,7 @@ import type { Project } from "../project/root.ts";
 import { pinnedSnapshots, pruneTrash } from "../safety/trash.ts";
 import { backupRunning, lakeOption, MAINTENANCE_LOCK_LABEL } from "./lake.ts";
 import {
-  ageBasedExpiryOptions, deleteOrphans, type ExpiryOption, lakeStats, type LakeStats, listOrphans, type PassReport, planExpiry, type RetryPolicy, readPlanInput, runPass,
+  ageBasedExpiryOptions, countSuperseded, DEFAULT_RETRY, deleteOrphans, type ExpiryOption, lakeStats, type LakeStats, listOrphans, type PassReport, planExpiry, type RetryPolicy, readPlanInput, runPass,
   type StepName,
 } from "./lake-maintenance.ts";
 import { ensureState, maintenanceDue, type MaintenanceState, type PassSummary, writeState } from "./lake-maintenance-state.ts";
@@ -60,6 +60,12 @@ export interface MaintainInput {
   retry?: RetryPolicy;
   onStep?: (step: StepName) => void | Promise<void>;
   onWait?: (holder: LockHolder, waitedMs: number) => void;
+}
+
+/** Test knob: CROFT_MAINTAIN_RETRY_MS="5" makes a step's retries wait 5 ms, then 10, 20 (default 750 ms, doubling), instead of seconds. */
+export function retryKnob(env: Record<string, string | undefined>): { retry?: RetryPolicy } {
+  const ms = Number(env.CROFT_MAINTAIN_RETRY_MS);
+  return Number.isFinite(ms) && ms > 0 ? { retry: { ...DEFAULT_RETRY, baseMs: ms } } : {};
 }
 
 /** A pass summary without the details only the report has. */
@@ -109,10 +115,17 @@ export async function maintainProject(project: Project, env: ProjectEnv, o: Main
       } catch {
         // Housekeeping; the next trash or croft doctor tries again.
       }
-      const pins = pinnedSnapshots(stateDir);
-      const report = await warehouse.write(MAINTENANCE_LOCK_LABEL, (sql) => runPass(sql, {
+      const pins = pinnedSnapshots(stateDir, { now: o.now });
+      // The backup is looked for again with the lock held: one that took its dump while this pass waited for the lock is mirroring the folder
+      // now, and a pass would delete files it has yet to copy (a backup marks itself under the lock, so this cannot miss one).
+      const report = await warehouse.write(MAINTENANCE_LOCK_LABEL, async (sql) => (backupRunning(stateDir) ? null : runPass(sql, {
         now: o.now, pins, ...(o.retry ? { retry: o.retry } : {}), ...(o.onStep ? { onStep: o.onStep } : {}),
-      }), { runId: "maintenance", transaction: false, touchesLake: false, ...(o.waitMs !== undefined ? { waitMs: o.waitMs } : {}) });
+      })), { runId: "maintenance", transaction: false, touchesLake: false, ...(o.waitMs !== undefined ? { waitMs: o.waitMs } : {}) });
+      if (report === null) {
+        attempted = false;
+        outcome = { status: "backup_running" };
+        return outcome;
+      }
       // A step's error reached us as text the lake's own code produced: the credentials are taken out before it is kept or shown.
       for (const s of report.steps) if (s.error) s.error = warehouse.redact(s.error);
       outcome = { status: report.ok ? "ran" : "failed", report };
@@ -241,6 +254,8 @@ export interface MaintenancePlan {
   pins: number[];
   /** Expiry options another tool stored on the lake: a CHECKPOINT by anyone would expire by them. */
   expiryOptions: ExpiryOption[];
+  /** Rows of croft's bookkeeping log that a newer row of the same key has superseded: what the pass's first step removes (D154). */
+  supersededLogRows: number;
 }
 
 /** Read the lake with the read-only login and say what a pass would expire; nothing is written. Null when nobody has written the lake. */
@@ -259,7 +274,8 @@ export async function planProject(project: Project, env: ProjectEnv, o: { now: D
       const { snapshots, tables } = await readPlanInput(db);
       const plan = planExpiry(snapshots, tables, { now: o.now, pins });
       const expiryOptions = await ageBasedExpiryOptions(db);
-      return { stats, expire: plan.expire.length, total: plan.total, kept: plan.kept, because: plan.because, assets: plan.assets, pins, expiryOptions };
+      const supersededLogRows = await countSuperseded(db);
+      return { stats, expire: plan.expire.length, total: plan.total, kept: plan.kept, because: plan.because, assets: plan.assets, pins, expiryOptions, supersededLogRows };
     }, { purpose: "lake maintenance", waitMs: 60_000 });
   } catch (e) {
     if (e instanceof CroftError && e.code === "DB_NOT_FOUND" && e.problem.details?.notCreated === true) return null;
@@ -271,8 +287,9 @@ export async function planProject(project: Project, env: ProjectEnv, o: { now: D
 
 // ---- Files that are not the lake's own ---------------------------------------------------------------------------------
 
-/** The files in the lake's folder that the catalog does not name and that are a day old, listed and not touched. The read-only login lists. */
-export async function listOrphansOf(project: Project, env: ProjectEnv, o: { retry?: RetryPolicy } = {}): Promise<string[] | null> {
+/** The files in the lake's folder that the catalog does not name and that are older than `cutoff` (orphanCutoff), listed and not touched.
+ *  The read-only login lists. */
+export async function listOrphansOf(project: Project, env: ProjectEnv, cutoff: Date, o: { retry?: RetryPolicy } = {}): Promise<string[] | null> {
   const { join } = await import("node:path");
   const stateDir = project.paths.stateDir;
   const w = openWarehouse({
@@ -280,7 +297,7 @@ export async function listOrphansOf(project: Project, env: ProjectEnv, o: { retr
     ...lakeOption(project, env), isTTY: false, register: false, noticeAfterMs: Number.MAX_SAFE_INTEGER,
   });
   try {
-    return await w.read((db) => listOrphans(db, o.retry).then((r) => r.files), { purpose: "lake orphans", waitMs: 60_000 });
+    return await w.read((db) => listOrphans(db, cutoff, o.retry).then((r) => r.files), { purpose: "lake orphans", waitMs: 60_000 });
   } catch (e) {
     if (e instanceof CroftError && e.code === "DB_NOT_FOUND" && e.problem.details?.notCreated === true) return null;
     throw e;
@@ -289,17 +306,21 @@ export async function listOrphansOf(project: Project, env: ProjectEnv, o: { retr
   }
 }
 
-/** Delete the orphans the person was shown, under croft's lock on the lake's writes; null when the files found now are not exactly those. */
-export async function deleteOrphansOf(project: Project, env: ProjectEnv, shown: readonly string[], o: { isTTY: boolean; waitMs?: number; retry?: RetryPolicy }): Promise<string[] | null> {
+/** Delete the orphans the person was shown (listed with this `cutoff`), under croft's lock on the lake's writes; null when the files found now
+ *  with the same cutoff are not exactly those. */
+export async function deleteOrphansOf(project: Project, env: ProjectEnv, shown: readonly string[], cutoff: Date, o: { isTTY: boolean; waitMs?: number; retry?: RetryPolicy }): Promise<string[] | null> {
   const stateDir = project.paths.stateDir;
-  if (backupRunning(stateDir)) {
-    throw new CroftError("DB_BUSY", { message: "a backup of the lake is copying its bucket now", hint: "run croft maintain --orphans again when it has finished", retryable: true });
-  }
+  const busy = () => new CroftError("DB_BUSY", { message: "a backup of the lake is copying its bucket now", hint: "run croft maintain --orphans again when it has finished", retryable: true });
+  if (backupRunning(stateDir)) throw busy();
   const warehouse = openWarehouse({
     path: project.paths.database, mode: "read_write", timezone: project.timezone, root: project.root, stateDir, ...lakeOption(project, env), isTTY: o.isTTY, register: false,
   });
   try {
-    const done = await warehouse.write(MAINTENANCE_LOCK_LABEL, (sql) => deleteOrphans(sql, shown, o.retry), {
+    const done = await warehouse.write(MAINTENANCE_LOCK_LABEL, async (sql) => {
+      // Looked for again under the lock, as a pass does.
+      if (backupRunning(stateDir)) throw busy();
+      return deleteOrphans(sql, shown, cutoff, o.retry);
+    }, {
       runId: "maintenance", transaction: false, touchesLake: false, ...(o.waitMs !== undefined ? { waitMs: o.waitMs } : {}),
     });
     return done ? done.files : null;

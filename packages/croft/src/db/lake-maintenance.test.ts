@@ -1,7 +1,7 @@
 // A lake's maintenance (db/lake-maintenance.ts; DESIGN.md D149 to D152; option 07, slice 3). First the promise as a pure function over literal
 // snapshots; then the steps against a real lake.
 import { describe, expect, test } from "bun:test";
-import { assetsChanged, isTransientStorage, type LakeTable, parseChanges, planExpiry, type SnapshotInfo } from "./lake-maintenance.ts";
+import { assetsChanged, isTransientStorage, type LakeTable, parseChanges, planExpiry, type SnapshotInfo, tablesByLatestName, WINDOW_SKEW_MS } from "./lake-maintenance.ts";
 
 const DAY = 86_400_000;
 const NOW = new Date("2026-11-02T12:00:00Z");
@@ -119,6 +119,42 @@ describe("the promise: 30 days or 5 versions per asset", () => {
   test("a lake of one snapshot, or none, expires nothing", () => {
     expect(planExpiry([], TABLES, { now: NOW }).expire).toEqual([]);
     expect(planExpiry([snap(1, 100, { schemas_created: ["main"] })], TABLES, { now: NOW }).expire).toEqual([]);
+  });
+});
+
+describe("a table that was renamed", () => {
+  test("goes by the name it has now: of the rows one table id has, the one that begins last wins, whatever the order they come in", () => {
+    const rows = [
+      { id: 1, schema: "main", name: "b", begin: 40 }, { id: 1, schema: "main", name: "a", begin: 1 }, { id: 4, schema: "main", name: "a", begin: 41 },
+    ];
+    const byId = (t: LakeTable[]) => [...t].sort((x, y) => x.id - y.id);
+    expect(byId(tablesByLatestName(rows))).toEqual([{ id: 1, schema: "main", name: "b" }, { id: 4, schema: "main", name: "a" }]);
+    expect(byId(tablesByLatestName([...rows].reverse()))).toEqual(byId(tablesByLatestName(rows)));
+  });
+
+  test("its versions are counted under the new name, and a new table of the old name has versions of its own", () => {
+    const tables = tablesByLatestName([{ id: 1, schema: "main", name: "a", begin: 1 }, { id: 1, schema: "main", name: "b", begin: 20 }, { id: 5, schema: "main", name: "a", begin: 21 }]);
+    const snaps: SnapshotInfo[] = [
+      ...Array.from({ length: 8 }, (_, i) => snap(i + 1, 90 - i, { tables_inserted_into: ["1"] })), // 1..8, the table that is b now
+      snap(9, 80, { tables_altered: ["1"] }), // the rename
+      snap(10, 79, { tables_created: ["main.a"], tables_inserted_into: ["5"] }),
+      snap(11, 78, { tables_inserted_into: ["5"] }),
+      snap(12, 1, { inlined_insert: ["3"] }),
+    ];
+    const plan = planExpiry(snaps, tables, { now: NOW });
+    expect(plan.assets).toEqual({ b: 5, a: 2 });
+    expect(plan.expire).toEqual([1, 2, 3, 4]); // b keeps 5 to 8 and the rename; the new a keeps both of its versions
+  });
+});
+
+describe("the edge of the window", () => {
+  test("is an hour wider than 30 days, so a clock a little off does not move it", () => {
+    expect(WINDOW_SKEW_MS).toBe(3_600_000);
+    const inside = snap(2, 30 + 0.5 / 24, { inlined_insert: ["3"] }); // 30 days and half an hour old
+    const outside = snap(1, 30 + 2 / 24, { inlined_insert: ["3"] }); // 30 days and two hours old
+    const plan = planExpiry([outside, inside, snap(3, 1, { inlined_insert: ["3"] })], TABLES, { now: NOW });
+    expect(plan.because.window).toBe(2); // the half hour past 30 days is still the window
+    expect(plan.expire).toEqual([]); // and the older one is the state when the window began
   });
 });
 

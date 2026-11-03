@@ -345,8 +345,11 @@
         "estimatedRequests": {
           "type": "number"
         },
-        "unit": {
-          "const": "file"
+        "files": {
+          "type": "number"
+        },
+        "asOf": {
+          "type": "string"
         }
       },
       "required": [

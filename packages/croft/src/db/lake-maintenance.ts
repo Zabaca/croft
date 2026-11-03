@@ -7,8 +7,9 @@
 //
 // croft never calls CHECKPOINT on a lake and never sets an expiry option on it (a test reads the source for both). CHECKPOINT runs all of
 // DuckLake's maintenance from the lake's stored options, so an age-based expiry set by anyone expires a snapshot the trash pinned (the
-// spike's follow-up f1), and it deletes any file in the data folder the lake does not own. Each step is run by name instead, in this
-// order:
+// follow-up spike recorded in option 07, item 1 of "What the follow-ups settled"), and it deletes any file in the data folder the lake does not
+// own. Each step is run by name instead, in this order:
+//   0. prune    croft's own bookkeeping log loses the rows a newer row of the same key has superseded (D154);
 //   1. flush    the rows DuckLake held inside the catalog become files;
 //   2. expire   the snapshots outside the promise, by an explicit list of ids croft computes (planExpiry);
 //   3. merge    small files become fewer, larger ones (time travel is kept: the merged file remembers each row's snapshot);
@@ -22,6 +23,7 @@
 // snapshot a trashed version was taken from), or is the newest snapshot. Everything else is expired.
 import type { Sql } from "../core/types.ts";
 import { TRASH_RETENTION } from "../safety/trash.ts";
+import { ASSET_TABLES, kindOfObjects, STATE_SPECS, stateObjects } from "./bookkeeping.ts";
 import { isConnectionError } from "./lake.ts";
 import { LAKE_ALIAS } from "./modes.ts";
 
@@ -29,6 +31,9 @@ import { LAKE_ALIAS } from "./modes.ts";
 export const METADATA_ALIAS = `__ducklake_metadata_${LAKE_ALIAS}`;
 
 const DAY_MS = 86_400_000;
+/** The margin on the edge of the 30 days: croft's clock and the catalog's (a Postgres on another machine stamps the snapshots) may differ, and
+ *  the promise is "30 days", so a snapshot a clock's skew away from the edge stays. */
+export const WINDOW_SKEW_MS = 3_600_000;
 
 // ---- The plan: which snapshots the promise lets go ---------------------------------------------------------------
 
@@ -111,7 +116,7 @@ export function planExpiry(snapshots: readonly SnapshotInfo[], tables: readonly 
   const perAsset = o.versions ?? TRASH_RETENTION.versions;
   const byId = new Map(tables.map((t) => [t.id, t]));
   const sorted = [...snapshots].sort((a, b) => a.id - b.id);
-  const cutoff = o.now.getTime() - days * DAY_MS;
+  const cutoff = o.now.getTime() - days * DAY_MS - WINDOW_SKEW_MS;
   const keep = new Map<number, Set<"window" | "windowStart" | "versions" | "pinned" | "latest">>();
   const mark = (id: number, why: "window" | "windowStart" | "versions" | "pinned" | "latest") => {
     const s = keep.get(id) ?? new Set();
@@ -197,16 +202,77 @@ export async function lakeStats(sql: Sql): Promise<LakeStats> {
   };
 }
 
+/**
+ * The name each table id goes by. A table that was renamed has a row of `ducklake_table` for each name it had, under one id, and the table is
+ * the asset of the name it has now: the row that begins last wins. (A `CREATE OR REPLACE` or a new table of an old name has an id of its own.)
+ */
+export function tablesByLatestName(rows: readonly (LakeTable & { begin: number })[]): LakeTable[] {
+  const byId = new Map<number, LakeTable & { begin: number }>();
+  for (const r of rows) {
+    const seen = byId.get(r.id);
+    if (!seen || r.begin >= seen.begin) byId.set(r.id, r);
+  }
+  return [...byId.values()].map(({ id, schema, name }) => ({ id, schema, name }));
+}
+
 /** The lake's snapshots and tables, as planExpiry reads them. */
 export async function readPlanInput(sql: Sql): Promise<{ snapshots: SnapshotInfo[]; tables: LakeTable[] }> {
   const snaps = await sql.all<{ id: unknown; ms: unknown; changes: unknown }>(
     `SELECT snapshot_id AS id, epoch_ms(snapshot_time::TIMESTAMPTZ) AS ms, to_json(changes)::VARCHAR AS changes FROM ducklake_snapshots('${LAKE_ALIAS}') ORDER BY snapshot_id`);
-  const tables = await sql.all<{ id: unknown; name: unknown; schema: unknown }>(
-    `SELECT t.table_id AS id, t.table_name AS name, s.schema_name AS schema FROM ${M}.ducklake_table t JOIN ${M}.ducklake_schema s ON s.schema_id = t.schema_id`);
+  const tables = await sql.all<{ id: unknown; name: unknown; schema: unknown; begin: unknown }>(
+    `SELECT t.table_id AS id, t.table_name AS name, s.schema_name AS schema, t.begin_snapshot AS begin
+     FROM ${M}.ducklake_table t JOIN ${M}.ducklake_schema s ON s.schema_id = t.schema_id`);
   return {
     snapshots: snaps.map((s) => ({ id: num(s.id), ms: num(s.ms), changes: typeof s.changes === "string" ? s.changes : "" })),
-    tables: tables.map((t) => ({ id: num(t.id), name: String(t.name), schema: String(t.schema) })),
+    tables: tablesByLatestName(tables.map((t) => ({ id: num(t.id), name: String(t.name), schema: String(t.schema), begin: num(t.begin) }))),
   };
+}
+
+// ---- croft's bookkeeping log ----------------------------------------------------------------------------------------
+
+/** The statement that selects the rows of a bookkeeping log a pass may delete: every row a newer row of its key has superseded, and every row of
+ *  a key whose newest row is a closing row (the view over the log shows neither). "Newest" is the view's own order, `seq` descending with NULL last. */
+function supersededRows(t: (typeof ASSET_TABLES)[number]): string {
+  const key = STATE_SPECS[t].key.join(", ");
+  return `SELECT rowid AS rid FROM (
+    SELECT rowid, closed, row_number() OVER (PARTITION BY ${key} ORDER BY seq DESC NULLS LAST) AS rn FROM _croft.${t}_log
+  ) WHERE rn > 1 OR coalesce(closed, false)`;
+}
+
+/** Whether the lake's bookkeeping is the log (a lake nobody has written, or a file's tables, has nothing to prune). */
+async function hasLog(sql: Sql): Promise<boolean> {
+  return kindOfObjects(await stateObjects(sql)) === "log";
+}
+
+/** How many rows of croft's bookkeeping log a pass would remove. */
+export async function countSuperseded(sql: Sql): Promise<number> {
+  if (!(await hasLog(sql))) return 0;
+  let n = 0;
+  for (const t of ASSET_TABLES) n += num((await sql.all<{ n: unknown }>(`SELECT count(*) AS n FROM (${supersededRows(t)})`))[0]?.n);
+  return n;
+}
+
+/**
+ * Remove the rows of croft's bookkeeping log that nothing reads (D154). Every run appends a row per asset to `_croft.assets_log` and its
+ * kin; the view `_croft.<t>` shows the newest row of each key, so a superseded row is read by nothing, yet every read of the view and every
+ * numbering of a write scans the whole log, which only grows. Nothing is lost that a person can ask for: the view's rows are the same before
+ * and after (a test compares them), the trash holds copies of the view's rows and a restore numbers the rows it puts back above the rest, and
+ * the lake's snapshots inside the window still hold the old rows for time travel. The log's `seq` stays ordered: a surviving row of a key is
+ * its newest, so a new row, numbered above the highest left, is newer than it; a key whose newest row was a closing row is removed whole, so
+ * no older row of it is left to come back; and a log emptied that way numbers from 1 with no row of any key before it. One DELETE per log,
+ * each atomic by itself; the pass holds croft's lock, so no croft write runs meanwhile.
+ */
+export async function pruneBookkeeping(sql: Sql): Promise<{ tables: number; rows: number }> {
+  if (!(await hasLog(sql))) return { tables: 0, rows: 0 };
+  let rows = 0;
+  let tables = 0;
+  for (const t of ASSET_TABLES) {
+    const done = await sql.all<{ Count: unknown }>(`DELETE FROM _croft.${t}_log WHERE rowid IN (${supersededRows(t)})`);
+    const n = num(done[0]?.Count);
+    if (n > 0) tables++;
+    rows += n;
+  }
+  return { tables, rows };
 }
 
 /** Options another tool stored on the lake that would make a CHECKPOINT expire what the trash promises: an expiry by age. */
@@ -256,8 +322,8 @@ async function withRetry<T>(policy: RetryPolicy, fn: (attempt: number) => Promis
 
 // ---- The pass -----------------------------------------------------------------------------------------------------
 
-export type StepName = "flush" | "expire" | "merge" | "rewrite" | "cleanup";
-export const STEPS: readonly StepName[] = ["flush", "expire", "merge", "rewrite", "cleanup"];
+export type StepName = "prune" | "flush" | "expire" | "merge" | "rewrite" | "cleanup";
+export const STEPS: readonly StepName[] = ["prune", "flush", "expire", "merge", "rewrite", "cleanup"];
 
 export interface StepReport {
   step: StepName;
@@ -325,6 +391,7 @@ export async function runPass(sql: Sql, o: PassOptions): Promise<PassReport> {
       });
     }
   };
+  await step("prune", async () => pruneBookkeeping(sql));
   await step("flush", async () => {
     const rows = await sql.all<{ rows_flushed: unknown }>(`CALL ducklake_flush_inlined_data('${LAKE_ALIAS}')`);
     return { tables: rows.length, rows: rows.reduce((n, r) => n + num(r.rows_flushed), 0) };
@@ -377,23 +444,31 @@ export async function runPass(sql: Sql, o: PassOptions): Promise<PassReport> {
 
 /** How old a stray file must be to be listed: a write in flight on a machine that is not this one has made files its commit has not yet
  *  named, and a day is longer than any write. */
-export const ORPHAN_MIN_AGE = "1 day";
+export const ORPHAN_MIN_AGE_MS = DAY_MS;
+
+/** The instant a stray file must be older than to be listed, fixed when the list is made (to the second) and carried by the confirmation
+ *  that deletes them, so the delete is for the files that were shown. */
+export function orphanCutoff(now: Date): Date {
+  return new Date(Math.floor((now.getTime() - ORPHAN_MIN_AGE_MS) / 1000) * 1000);
+}
 
 export interface Orphans { files: string[] }
 
-/** The files in the lake's folder that the catalog does not name and that are older than a day, without deleting any (a dry run). */
-export async function listOrphans(sql: Sql, retry: RetryPolicy = DEFAULT_RETRY): Promise<Orphans> {
+const olderThan = (cutoff: Date): string => `'${cutoff.toISOString()}'::TIMESTAMPTZ`;
+
+/** The files in the lake's folder that the catalog does not name and that are older than `cutoff`, without deleting any (a dry run). */
+export async function listOrphans(sql: Sql, cutoff: Date, retry: RetryPolicy = DEFAULT_RETRY): Promise<Orphans> {
   const { value } = await withRetry(retry, () => sql.all<{ path: string }>(
-    `CALL ducklake_delete_orphaned_files('${LAKE_ALIAS}', dry_run => true, older_than => now() - INTERVAL ${ORPHAN_MIN_AGE})`));
+    `CALL ducklake_delete_orphaned_files('${LAKE_ALIAS}', dry_run => true, older_than => ${olderThan(cutoff)})`));
   return { files: value.map((r) => String(r.path)).sort() };
 }
 
-/** Delete those files. The caller has shown the list from listOrphans() and been told yes; it passes that list, and this deletes
- *  nothing when the files found now are not exactly those (returns null). */
-export async function deleteOrphans(sql: Sql, shown: readonly string[], retry: RetryPolicy = DEFAULT_RETRY): Promise<Orphans | null> {
-  const now = await listOrphans(sql, retry);
+/** Delete those files. The caller has shown the list from listOrphans() with this `cutoff` and been told yes; this deletes nothing when the
+ *  files found now, with the same cutoff, are not exactly that list (returns null). */
+export async function deleteOrphans(sql: Sql, shown: readonly string[], cutoff: Date, retry: RetryPolicy = DEFAULT_RETRY): Promise<Orphans | null> {
+  const now = await listOrphans(sql, cutoff, retry);
   if (now.files.length !== shown.length || now.files.some((f, i) => f !== shown[i])) return null;
   const { value } = await withRetry(retry, () => sql.all<{ path: string }>(
-    `CALL ducklake_delete_orphaned_files('${LAKE_ALIAS}', older_than => now() - INTERVAL ${ORPHAN_MIN_AGE})`));
+    `CALL ducklake_delete_orphaned_files('${LAKE_ALIAS}', older_than => ${olderThan(cutoff)})`));
   return { files: value.map((r) => String(r.path)).sort() };
 }

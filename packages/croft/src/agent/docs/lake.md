@@ -69,6 +69,7 @@ catalog, and a replaced file stays until a snapshot expiry and a cleanup say so:
 five assets left 849 snapshots, 841 files, 176 tables of rows kept in the catalog and a 12 MB catalog. So croft runs the
 lake's maintenance itself, one step at a time, in this order:
 
+  prune     croft's own bookkeeping log loses the rows a newer row of the same key has superseded
   flush     the rows DuckLake kept inside the catalog become files
   expire    the snapshots outside the promise go, by an explicit list croft computes
   merge     small files become fewer, larger ones (every version still reads back)
@@ -76,7 +77,7 @@ lake's maintenance itself, one step at a time, in this order:
   cleanup   the files nothing refers to are deleted at once (DuckLake waits 2 days by default)
 
 What a pass keeps is the trash's promise (croft docs trash), and it is not a setting: every snapshot of the last 30
-days, the newest snapshot before them (the state when the window began), each asset's 5 newest versions however old (a
+days (and an hour more, so that a clock a little off, croft's or the catalog's, does not move the edge), the newest snapshot before them (the state when the window began), each asset's 5 newest versions however old (a
 version is a snapshot in which the asset's table changed), and every snapshot the trash pins (the one a trashed version
 was taken from). Everything else is expired. Nothing the promise keeps is ever deleted: a kept version reads back
 exactly, and a version outside both limits is gone. A person reads one with `AT (TIMESTAMP => '2026-10-20 12:00')` in
@@ -93,8 +94,9 @@ tries again within the hour. A store that answers HTTP 500, or a connection that
 
   croft maintain               a pass now, whatever the interval; --json has each step, the lake's counts before and after
   croft maintain --dry-run     what a pass would expire and keep, from the read-only login; nothing changes
-  croft maintain --orphans     the files in the lake's folder that the lake does not own and that are a day old: listed,
-                               and deleted only through croft confirm, for exactly that list
+  croft maintain --orphans     the files in the lake's folder that the lake does not own and that are older than a day (the
+                               cutoff is fixed when the list is made and kept by the confirmation): listed, and deleted
+                               only through croft confirm, for exactly that list
 
 `croft maintain` removes nothing the promise keeps, so it needs no confirmation. Deleting files that are not the lake's
 own does, because croft cannot vouch for them: a pass never does it, and they are gone for good.
@@ -103,6 +105,11 @@ croft never calls CHECKPOINT on a lake and never sets an option on one (a test h
 statements). CHECKPOINT runs DuckLake's maintenance from the lake's stored options, so an age-based expiry set by anyone
 would expire a snapshot the trash pinned, and it deletes any file in the folder that is not the lake's. `croft doctor`
 warns with LAKE_EXPIRY_OPTION when an age-based expiry is set on the lake; croft's own pass ignores it.
+
+The prune step is croft's own housekeeping: every run appends a row for each asset's state to the bookkeeping log, and the
+views croft reads show only the newest row of each key, so the older rows are read by nothing and make every read and write
+scan more. The step removes them (and the rows of a key that was closed, a renamed or deleted asset's old name), so the log
+is one row for each live key; what the views show is the same before and after, and the trash and restore are unaffected.
 
 `croft doctor` and `croft status` show when maintenance last worked and what the lake holds: snapshots, files, the
 tables that keep small inserts inside the catalog, and files freed but not yet deleted. What it does to a lake of five

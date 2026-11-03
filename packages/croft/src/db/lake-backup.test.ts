@@ -60,6 +60,27 @@ function tree(dir: string): Record<string, number> {
   return out;
 }
 
+/** `croft docs backup`'s steps into a fresh database and a fresh bucket folder of the rig: the project pointed at them, as a project of its own. */
+async function restoreBackup(l: LakeProject, backup: string): Promise<LakeProject> {
+  const fresh = await rig.lake();
+  const pgRestore = join(dirname(pgDump!), "pg_restore");
+  const restored = Bun.spawnSync([pgRestore, "--no-owner", "--host", rig.pg.host, "--port", String(rig.pg.port), "--username", WRITER_LOGIN.user, "--dbname", fresh.db, join(backup, "catalog.dump")],
+    { env: { PATH: "/usr/bin:/bin", PGPASSWORD: WRITER_LOGIN.password }, stdout: "pipe", stderr: "pipe" });
+  expect(restored.exitCode, restored.stderr.toString()).toBe(0);
+  cpSync(join(backup, "lake-data"), join(rig.s3.root, fresh.bucket, fresh.folder), { recursive: true });
+  await rig.pg.sql(`UPDATE ducklake_metadata SET value = 's3://${fresh.bucket}/${fresh.folder}/' WHERE key = 'data_path'`, fresh.db);
+  const root2 = join(dirname(l.p.root), `${basename(l.p.root)}-restored-${Math.random().toString(36).slice(2, 8)}`);
+  mkdirSync(join(root2, ".croft"), { recursive: true });
+  cpSync(join(l.p.root, "assets"), join(root2, "assets"), { recursive: true });
+  mkdirSync(join(root2, "node_modules", "@zabaca"), { recursive: true });
+  cpSync(join(l.p.root, "node_modules", "@zabaca"), join(root2, "node_modules", "@zabaca"), { recursive: true, verbatimSymlinks: true });
+  cpSync(join(backup, "runs.sqlite"), join(root2, ".croft", "runs.sqlite"));
+  const config = JSON.parse(readFileSync(join(l.p.root, "croft.json"), "utf8"));
+  writeFileSync(join(root2, "croft.json"), JSON.stringify({ ...config, lake: fresh.block }));
+  writeFileSync(join(root2, ".env"), Object.entries(fresh.env).map(([k, v]) => `${k}=${v}`).join("\n") + "\n");
+  return { ...l, p: { ...l.p, root: root2 }, env: { CROFT_EXTENSION_DIR: ready.dir }, shared: fresh };
+}
+
 describe("croft backup of a lake", () => {
   maybe("a local lake: the catalog, the folder, run history and the trash are copied as one moment, and put back into a fresh lake they read back equal", async () => {
     const l = await lakeProject("local", { extensionDir: ready.dir });
@@ -124,31 +145,48 @@ describe("croft backup of a lake", () => {
     expect(second.json.data.lake.snapshot).toBeGreaterThan(a.lake.snapshot);
     // Put back, as `croft docs backup` says: a fresh database and a fresh folder, the dump restored as the writer, the files copied, the stored
     // folder changed, and a project pointed at them.
-    const fresh = await rig.lake();
-    const bin = dirname(pgDump!);
-    const pgRestore = join(bin, "pg_restore");
-    const restored = Bun.spawnSync([pgRestore, "--no-owner", "--host", rig.pg.host, "--port", String(rig.pg.port), "--username", WRITER_LOGIN.user, "--dbname", fresh.db, join(second.json.data.path, "catalog.dump")],
-      { env: { PATH: "/usr/bin:/bin", PGPASSWORD: WRITER_LOGIN.password }, stdout: "pipe", stderr: "pipe" });
-    expect(restored.exitCode, restored.stderr.toString()).toBe(0);
-    const target = join(rig.s3.root, fresh.bucket, fresh.folder);
-    cpSync(join(second.json.data.path, "lake-data"), target, { recursive: true });
-    await rig.pg.sql(`UPDATE ducklake_metadata SET value = 's3://${fresh.bucket}/${fresh.folder}/' WHERE key = 'data_path'`, fresh.db);
-    const root2 = join(dirname(l.p.root), `${basename(l.p.root)}-restored`);
-    mkdirSync(join(root2, ".croft"), { recursive: true });
-    cpSync(join(l.p.root, "assets"), join(root2, "assets"), { recursive: true });
-    mkdirSync(join(root2, "node_modules", "@zabaca"), { recursive: true });
-    cpSync(join(l.p.root, "node_modules", "@zabaca"), join(root2, "node_modules", "@zabaca"), { recursive: true, verbatimSymlinks: true });
-    cpSync(join(second.json.data.path, "runs.sqlite"), join(root2, ".croft", "runs.sqlite"));
-    const config = JSON.parse(readFileSync(join(l.p.root, "croft.json"), "utf8"));
-    writeFileSync(join(root2, "croft.json"), JSON.stringify({ ...config, lake: fresh.block }));
-    writeFileSync(join(root2, ".env"), Object.entries(fresh.env).map(([k, v]) => `${k}=${v}`).join("\n") + "\n");
-    const l2: LakeProject = { ...l, p: { ...l.p, root: root2 }, env: { CROFT_EXTENSION_DIR: ready.dir }, shared: fresh };
+    const l2 = await restoreBackup(l, second.json.data.path);
     expect(await snapshotOf(l2)).toEqual(after);
+    // The stored folder was changed with one UPDATE, and nothing in the restored lake looks like a file the lake does not own: two days on
+    // (every file is then old enough to be listed), the lake lists none.
+    const twoDays = { CROFT_NOW: new Date(Date.now() + 2 * 86_400_000).toISOString() };
+    const clean = await run(l2, ["maintain", "--orphans", "--dry-run"], twoDays);
+    expect(clean.exit, clean.stdout + clean.stderr).toBe(0);
+    expect(clean.json.data.orphans.files).toEqual([]);
     // The restored lake is a lake like any: a run changes nothing, and writes go to the fresh bucket only.
     const again = await run(l2, ["run", "orders", "--foreground"]);
     expect(again.exit, again.stdout + again.stderr).toBe(0);
     expect(again.json.data.steps[0]).toMatchObject({ asset: "orders", rows: { added: 0, updated: 0, deleted: 0, unchanged: 20 } });
-    rmSync(root2, { recursive: true, force: true });
+    rmSync(l2.p.root, { recursive: true, force: true });
+  }, 420_000);
+
+  maybePg("files written after the dump are in the mirror and, restored, are the only files the lake does not own", async () => {
+    const l = await lakeProject("postgres", { extensionDir: ready.dir, rig });
+    const { backupLake } = await import("./lake-backup.ts");
+    const { ProjectEnv } = await import("../project/env.ts");
+    const { loadProject } = await import("../project/root.ts");
+    const folder = join(rig.s3.root, l.shared!.bucket, l.shared!.folder);
+    let atDump: string[] = [];
+    // A run lands between the dump and the copy of the folder (the lock is free then; a backup lets writes go on).
+    const made = await backupLake(loadProject({ root: l.p.root }), ProjectEnv.load(l.p.root, l.env), {
+      processEnv: { ...process.env, CROFT_PG_DUMP: pgDump! },
+      afterDump: async () => {
+        atDump = Object.keys(tree(folder));
+        writeFileSync(join(l.p.root, "assets", "orders.sql"), ORDERS_SQL.replace("range % 7", "range % 4"));
+        expect((await run(l, ["run", "orders", "--foreground"])).exit).toBe(0);
+      },
+    });
+    await closeAllWarehouses();
+    const mirrored = Object.keys(tree(join(made.path, "lake-data")));
+    const written = mirrored.filter((f) => !atDump.includes(f));
+    expect(written.length).toBeGreaterThan(0);
+    const l2 = await restoreBackup(l, made.path);
+    const twoDays = { CROFT_NOW: new Date(Date.now() + 2 * 86_400_000).toISOString() };
+    const listed = await run(l2, ["maintain", "--orphans", "--dry-run"], twoDays);
+    expect(listed.exit, listed.stdout + listed.stderr).toBe(0);
+    const names = (listed.json.data.orphans.files as string[]).map((f) => f.slice(f.indexOf(l2.shared!.folder) + l2.shared!.folder.length + 1)).sort();
+    expect(names).toEqual([...written].sort());
+    rmSync(l2.p.root, { recursive: true, force: true });
   }, 420_000);
 
   maybePg("a project with no pg_dump is told before anything is written; a lake nobody has written has nothing to back up; a backup copying keeps passes away", async () => {

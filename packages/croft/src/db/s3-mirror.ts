@@ -98,7 +98,8 @@ async function get(a: S3Access, key: string, query: Record<string, string>): Pro
     ...(a.sessionToken ? { sessionToken: a.sessionToken } : {}), region: a.region, service: "s3", amzDate,
   });
   const qs = Object.keys(query).sort().map((k) => `${enc(k)}=${enc(query[k]!)}`).join("&");
-  const res = await fetch(`${t.base}${qs ? `?${qs}` : ""}`, { method: "GET", headers });
+  // A redirect would send the signed request, and the key's signature with it, somewhere the store did not name: refused.
+  const res = await fetch(`${t.base}${qs ? `?${qs}` : ""}`, { method: "GET", headers, redirect: "error" });
   if (!res.ok) {
     // The store's error code names what went wrong (AccessDenied, NoSuchKey); its body may echo the key id, so only the code is kept.
     const code = /<Code>([^<]*)<\/Code>/.exec(await res.text().catch(() => ""))?.[1] ?? "";

@@ -128,7 +128,7 @@ if (!LAKE) {
       expect(before.rows).toEqual([{ n: 12 }]);
       const ran = golden("maintain", await p.croft(["maintain", "--json"], { env: { CROFT_NOW: iso(T) } }));
       expect(ran.data.status).toBe("ran");
-      expect(ran.data.report.steps.map((s: { status: string }) => s.status)).toEqual(["ok", "ok", "ok", "ok", "ok"]);
+      expect(ran.data.report.steps.map((s: { status: string }) => s.status)).toEqual(["ok", "ok", "ok", "ok", "ok", "ok"]);
       expect(ran.data.report.plan.expired).toBeGreaterThan(0);
       expect(ran.data.report.after.snapshots).toBeLessThan(ran.data.report.before.snapshots);
       expect(ran.data.report.plan.assets).toMatchObject({ orders: 5, rowsdel: 5 });

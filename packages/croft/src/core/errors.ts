@@ -61,7 +61,6 @@ export const CODES = {
   LAKE_TYPE_UNSUPPORTED: { category: "run", severity: "error", exit: 1 },
   LAKE_CONNECTION_LOST: { category: "run", severity: "error", exit: 1 },
   LAKE_COMMIT_UNCERTAIN: { category: "run", severity: "error", exit: 1 },
-  LAKE_MAINTENANCE_FAILED: { category: "run", severity: "error", exit: 1 },
   LAKE_BACKUP_FAILED: { category: "run", severity: "error", exit: 1 },
   HTTP_ERROR: { category: "run", severity: "error", exit: 1 },
   HTTP_BUDGET_SPENT: { category: "run", severity: "error", exit: 1 },
@@ -152,6 +151,7 @@ export const CODES = {
   SERVER_MODE_OFF_FOR_KEYS: { category: "warning", severity: "warning", exit: 0 },
   LAKE_OTHER_WRITER: { category: "warning", severity: "warning", exit: 0 },
   LAKE_EXPIRY_OPTION: { category: "warning", severity: "warning", exit: 0 },
+  LAKE_MAINTENANCE_FAILED: { category: "warning", severity: "warning", exit: 0 },
 } as const satisfies Record<string, CodeInfo>;
 
 export type Code = keyof typeof CODES;

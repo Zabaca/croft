@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, w
 import { join, relative } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import { lakeRigReady, type LakeRig, openTestLake, startLakeRig, type TestLake, type TestLakeKind } from "./lake-testkit.ts";
-import { ageBasedExpiryOptions, deleteOrphans, listOrphans, type PassReport, runPass, type RetryPolicy } from "./lake-maintenance.ts";
+import { ageBasedExpiryOptions, deleteOrphans, listOrphans, orphanCutoff, type PassReport, runPass, type RetryPolicy } from "./lake-maintenance.ts";
 import { MAINTENANCE_LOCK_LABEL } from "./lake.ts";
 import { closeAllWarehouses, openWarehouse, refuseOnLake } from "./warehouse.ts";
 
@@ -85,7 +85,7 @@ for (const kind of ["local", "postgres"] as const) {
       const h = await history(l);
       const report = await pass(l);
       expect(report.ok, JSON.stringify(report.steps)).toBe(true);
-      expect(report.steps.map((s) => [s.step, s.status])).toEqual([["flush", "ok"], ["expire", "ok"], ["merge", "ok"], ["rewrite", "ok"], ["cleanup", "ok"]]);
+      expect(report.steps.map((s) => [s.step, s.status])).toEqual([["prune", "ok"], ["flush", "ok"], ["expire", "ok"], ["merge", "ok"], ["rewrite", "ok"], ["cleanup", "ok"]]);
       // Fewer snapshots, and the promise's own count of what stays.
       expect(report.after.snapshots).toBeLessThan(report.before.snapshots);
       expect(report.plan.expired).toBeGreaterThan(0);
@@ -173,7 +173,8 @@ for (const kind of ["local", "postgres"] as const) {
       const old = stray(l, "left-by-a-crashed-write.parquet", 3);
       const young = stray(l, "written-a-minute-ago.parquet", 0);
       const asked = { runId: "m", transaction: false, touchesLake: false } as const;
-      const found = (await l.w.write(MAINTENANCE_LOCK_LABEL, (sql) => listOrphans(sql, QUICK), asked)).files;
+      const cutoff = orphanCutoff(new Date());
+      const found = (await l.w.write(MAINTENANCE_LOCK_LABEL, (sql) => listOrphans(sql, cutoff, QUICK), asked)).files;
       expect(found.length).toBe(1);
       expect(found[0]).toContain("left-by-a-crashed-write.parquet");
       // The dry run touched nothing, and a pass leaves the file alone.
@@ -181,9 +182,17 @@ for (const kind of ["local", "postgres"] as const) {
       await pass(l);
       expect(existsSync(old)).toBe(true);
       // A list that is not what is found now deletes nothing.
-      expect(await l.w.write(MAINTENANCE_LOCK_LABEL, (sql) => deleteOrphans(sql, ["somewhere/else.parquet"], QUICK), asked)).toBeNull();
+      expect(await l.w.write(MAINTENANCE_LOCK_LABEL, (sql) => deleteOrphans(sql, ["somewhere/else.parquet"], cutoff, QUICK), asked)).toBeNull();
       expect(existsSync(old)).toBe(true);
-      const done = await l.w.write(MAINTENANCE_LOCK_LABEL, (sql) => deleteOrphans(sql, found, QUICK), asked);
+      // A file that was too young to be listed and has since grown old (its mtime moved, a copy that kept an old time) is not in the list the
+      // person saw: the same cutoff finds it now, and nothing is deleted.
+      const aged = new Date(Date.now() - 4 * DAY);
+      utimesSync(young, aged, aged);
+      expect(await l.w.write(MAINTENANCE_LOCK_LABEL, (sql) => deleteOrphans(sql, found, cutoff, QUICK), asked)).toBeNull();
+      expect(existsSync(old) && existsSync(young)).toBe(true);
+      const now = new Date();
+      utimesSync(young, now, now);
+      const done = await l.w.write(MAINTENANCE_LOCK_LABEL, (sql) => deleteOrphans(sql, found, cutoff, QUICK), asked);
       expect(done?.files).toEqual(found);
       expect(existsSync(old)).toBe(false);
       expect(existsSync(young)).toBe(true);
@@ -229,12 +238,55 @@ for (const kind of ["local", "postgres"] as const) {
       expect((waiting as CroftError).code).toBe("DB_BUSY");
       expect((waiting as CroftError).message).toContain("croft is running the lake's maintenance");
       expect((waiting as CroftError).problem.details?.holder).toMatchObject({ action: "maintenance" });
+      // A write that is willing to wait waits through the pass, and then goes through (the second half of acceptance 8).
+      let wrote = false;
+      const patient = b.write("a run's step", (tx) => tx.exec("INSERT INTO orders VALUES (101)"), { runId: "r_next", waitMs: 20_000 }).then(() => { wrote = true; });
+      await Bun.sleep(700);
+      expect(wrote, "the write waits while the pass holds the lock").toBe(false);
+      expect(await rowsAt(a, "orders")).toBe(21);
       go();
       expect((await running).ok).toBe(true);
-      // Once the pass is over the write goes through.
-      await b.write("a run's step", (tx) => tx.exec("INSERT INTO orders VALUES (101)"), { runId: "r_next", waitMs: 5000 });
+      await patient;
+      expect(wrote).toBe(true);
       expect(await rowsAt(a, "orders")).toBe(22);
       await b.close();
+    }, 120_000);
+  });
+}
+
+for (const kind of ["local", "postgres"] as const) {
+  const maybe = ready.ready ? test : test.skip;
+
+  describe(`a table that was renamed, on a ${kind} lake`, () => {
+    maybe("is counted under the name it has now: its 5 newest versions stay, and a new table of its old name keeps its own 5 (not the renamed one's)", async () => {
+      const l = await fresh(kind);
+      const old: number[] = [];
+      for (let k = 1; k <= 8; k++) {
+        old.push(await version(l, "a", async (tx) => {
+          if (k === 1) await tx.exec("CREATE TABLE a (id INTEGER, v INTEGER)");
+          await tx.exec(`INSERT INTO a SELECT range, ${k} FROM range(12)`);
+        }, 70 - k));
+      }
+      const renamed = await version(l, "a", (tx) => tx.exec("ALTER TABLE a RENAME TO b"), 60);
+      const fresh_: number[] = [];
+      for (let k = 1; k <= 8; k++) {
+        fresh_.push(await version(l, "a", async (tx) => {
+          if (k === 1) await tx.exec("CREATE TABLE a (id INTEGER, v INTEGER)");
+          await tx.exec(`INSERT INTO a SELECT range, ${100 + k} FROM range(12)`);
+        }, 59 - k));
+      }
+      await version(l, "note", (tx) => tx.exec("CREATE TABLE note AS SELECT 1 AS x"), 1);
+      const report = await pass(l);
+      expect(report.ok, JSON.stringify(report.steps)).toBe(true);
+      expect(report.plan.assets).toMatchObject({ b: 5, a: 5 });
+      // b's five newest: the rename and the four inserts before it (read by the name the table had then); the four oldest are gone.
+      expect(await readable(l, "b", renamed)).toBe(true);
+      for (let k = 5; k <= 8; k++) expect(await rowsAt(l, "a", old[k - 1]), `b before its rename, v${k}`).toBe(12 * k);
+      for (let k = 1; k <= 4; k++) expect(await readable(l, "a", old[k - 1]!), `b before its rename, v${k} is past both limits`).toBe(false);
+      // The new a keeps its own five.
+      for (let k = 4; k <= 8; k++) expect(await rowsAt(l, "a", fresh_[k - 1]), `the new a, v${k}`).toBe(12 * k);
+      for (let k = 1; k <= 3; k++) expect(await readable(l, "a", fresh_[k - 1]!), `the new a, v${k} is past both limits`).toBe(false);
+      expect(await rowsAt(l, "b")).toBe(96);
     }, 120_000);
   });
 }
@@ -259,9 +311,9 @@ describe("a store that answers HTTP 500 to a bulk delete (R2 did, three times in
     await store.failDeletes(1000, 500);
     const failed = await pass(l2);
     expect(failed.ok).toBe(false);
-    expect(failed.steps.map((s) => s.status)).toEqual(["ok", "ok", "ok", "ok", "failed"]);
-    expect(failed.steps[4]!.attempts).toBe(3);
-    expect(failed.steps[4]!.error).toContain("HTTP 500");
+    expect(failed.steps.map((s) => s.status)).toEqual(["ok", "ok", "ok", "ok", "ok", "failed"]);
+    expect(failed.steps[5]!.attempts).toBe(3);
+    expect(failed.steps[5]!.error).toContain("HTTP 500");
     expect(failed.after.pendingDeletion).toBeGreaterThan(0);
     // The lake is usable: reads, a write, and the kept versions.
     expect(await rowsAt(l2, "orders")).toBe(96);

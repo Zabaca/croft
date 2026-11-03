@@ -83,6 +83,8 @@ croft docs lake: a writer and a read-only login, a writer and a read-only key). 
    keys in .env), and copy runs.sqlite into the state folder and trash/ into its trash/ if this is a new project folder.
 6. croft doctor, then croft status: the tables, their rows and croft's bookkeeping are as they were at createdAt (the
    snapshot in backup.json), and the next croft run fetches what is newer.
+   Files that were written after the dump are in lake-data/ and not in the catalog; `croft maintain --orphans` lists them (a day
+   after they were written), and nothing else: a restored lake with the stored folder changed has no other file it does not own.
 
 A backup test does exactly these steps into a fresh catalog and bucket and compares every table and every bookkeeping
 row.
