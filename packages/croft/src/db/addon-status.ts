@@ -46,7 +46,7 @@ export function inspectAddons(addons: readonly AddonName[], s: ExtensionSearch =
       // a file for this machine did not come with it. Nothing is installed where files are missing and no package says otherwise:
       // an unpinned platform, an empty folder, a wrong file in the builders' cache, one file found alone that another add-on shares.
       // With every file found, the add-on is installed only when its own package supplied them: files from $CROFT_EXTENSION_DIR or the builders'
-      // cache work, and that is not the add-on being installed (D-R5).
+      // cache work, and that is not the add-on being installed (D164).
       installed: failures.length === 0 ? extensions.every((x) => x.source === "addon")
         : failures.some((f) => (f.problem.details as { installed?: boolean } | undefined)?.installed === true)
         || failures.every((f) => {

@@ -1,4 +1,4 @@
-// A lake whose store is reached over HTTPS (DESIGN.md D-R1): the first real-lake trial (R2) could neither read nor write a byte of it, because
+// A lake whose store is reached over HTTPS (DESIGN.md D160): the first real-lake trial (R2) could neither read nor write a byte of it, because
 // croft's lockdown never let DuckDB read a CA file, and the one failure surfaced as INTERNAL_ERROR, QUERY_FAILED or LAKE_MAINTENANCE_FAILED by
 // where it was met. The test rig's store is served over HTTPS with a self-signed certificate (store-tls-testkit.ts), which is what the suite
 // never had: with the CA the project names every command works; without it, or with another's, or for another name, every command says
@@ -83,7 +83,7 @@ describe("a lake whose store is served over HTTPS", () => {
     expect((q.json as { data: { rows: { n: number }[] } }).data.rows[0]!.n).toBe(20);
     await closeAllWarehouses();
     // The CA file is the only file of the machine DuckDB may read, and it is the instance's, not SQL's: the gate refuses a query that names it,
-    // to read or to overwrite, as it refuses one that names any other file (D-R1).
+    // to read or to overwrite, as it refuses one that names any other file (D160).
     for (const sql of [`copy (select 1) to '${certs!.cert}'`, `select * from read_text('${certs!.cert}')`, `select * from read_text('/etc/hosts')`]) {
       const r = await cli(["query", sql, "--json"], { cwd: p.root, env: p.env });
       expect(r.exit, sql).not.toBe(0);
@@ -94,7 +94,7 @@ describe("a lake whose store is served over HTTPS", () => {
     expect(readFileSync(certs!.cert, "utf8")).toContain("BEGIN CERTIFICATE");
   }, 180_000);
 
-  // No sslRootCert: the CA is found the way the catalog's is, $SSL_CERT_FILE of the project's environment first (db/ca-bundle.ts, D-R1).
+  // No sslRootCert: the CA is found the way the catalog's is, $SSL_CERT_FILE of the project's environment first (db/ca-bundle.ts, D160).
   maybe("a CA bundle found by the finder ($SSL_CERT_FILE) is allowed and used: every command works with no sslRootCert in croft.json", async () => {
     const lake = await rig!.lake();
     const p = project(lake, undefined);
@@ -153,7 +153,7 @@ describe("a lake whose store is served over HTTPS", () => {
 
   // DuckDB 2.0's enable_server_cert_verification defaults to false, and its httplib client then reads a store with a certificate nobody vouches for
   // (measured: no CA and the wrong CA both read and wrote). croft pins the check on and the curl client; a prepare hook that runs before the lock
-  // forces httplib back, as a default or a setting of the machine's could, and the read must still be refused (D-R1).
+  // forces httplib back, as a default or a setting of the machine's could, and the read must still be refused (D160).
   maybe("with the httplib client forced, the wrong CA is still refused, and the right one works", async () => {
     const { mkdtempSync, mkdirSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
@@ -198,7 +198,7 @@ describe("a lake whose store is served over HTTPS", () => {
 
   // Bun's fetch honours NODE_TLS_REJECT_UNAUTHORIZED=0 (measured: it read a self-signed store with the wrong CA), and croft backup's mirror uses
   // fetch. The mirror names rejectUnauthorized, which beats the variable, so a machine that turned checking off for its other tools still has
-  // the bucket's certificate checked by croft (D-R1). The variable is read when the process starts, so the mirror runs in a child that has it set.
+  // the bucket's certificate checked by croft (D160). The variable is read when the process starts, so the mirror runs in a child that has it set.
   maybe("with NODE_TLS_REJECT_UNAUTHORIZED=0 set, the backup mirror still refuses a store whose certificate the CA does not vouch for", async () => {
     const script = `import { listObjects } from ${JSON.stringify(join(import.meta.dir, "s3-mirror.ts"))};
 const a = { endpoint: "127.0.0.1:" + process.env.STORE_PORT, region: "auto", useSsl: true, urlStyle: "path", bucket: "lakeb", keyId: "RKEYID0123456789", secretKey: "x", caFile: process.env.STORE_CA };
@@ -229,7 +229,7 @@ type Check = { id: string; status: string; text: string; code?: string; details?
 const checksOf = (json: unknown): Check[] => (json as { data: { checks: Check[] } }).data.checks;
 const filesIn = (dir: string): string[] => (existsSync(dir) ? readdirSync(dir, { recursive: true }).map(String).sort() : []);
 
-describe("croft doctor asks the bucket before the first run (D-R6)", () => {
+describe("croft doctor asks the bucket before the first run (D165)", () => {
   maybe("a lake nobody has made yet: with the CA the bucket answers and the folder is empty; without it doctor says LAKE_STORE_TLS, not 'no problems found'", async () => {
     const lake = await rig!.lake();
     const p = project(lake, certs!.cert);

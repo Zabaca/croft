@@ -305,7 +305,7 @@ function bucketConfig(raw: unknown, c: LakeChecks): LakeBucketConfig | null {
     add("lake.bucket.folder", `"lake.bucket.folder" must be a folder path like "croft/orders/"; found ${show(raw.folder)}`, `give a folder inside the bucket`);
   } else {
     // Trailing slashes are the folder's own ("trial-1", "trial-1/" and "trial-1//" are one folder: `s3://bucket/trial-1/`, never `trial-1//`,
-    // which names another place); an empty part inside it is not (D-R4).
+    // which names another place); an empty part inside it is not (D163).
     const parts = raw.folder.replace(/\/+$/, "").split("/");
     if (!parts.length || parts.some((s) => !FOLDER_SEGMENT.test(s) || s === "." || s === "..")) {
       add("lake.bucket.folder", `"lake.bucket.folder" must be a folder inside the bucket, like "croft/orders/" (not the bucket's top, no leading slash, no ".." and no empty parts); found ${show(raw.folder)}`,

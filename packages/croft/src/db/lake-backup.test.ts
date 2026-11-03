@@ -94,7 +94,7 @@ describe("croft backup of a lake", () => {
     expect(Object.keys(tree(b.path)).sort()).toEqual(expect.arrayContaining(["backup.json", "catalog.sqlite", "runs.sqlite"]));
     const manifest = JSON.parse(readFileSync(join(b.path, "backup.json"), "utf8"));
     expect(manifest.lake).toMatchObject({ kind: "local", snapshot: b.lake.snapshot });
-    // The manifest names the lake, not the warehouse.duckdb that croft.json says and a lake does not have (D-R5).
+    // The manifest names the lake, not the warehouse.duckdb that croft.json says and a lake does not have (D164).
     expect(manifest.project.database).toBe(l.project.databaseLabel);
     expect(manifest.project.database).not.toContain("warehouse.duckdb");
     expect(JSON.stringify(manifest)).not.toMatch(/password|secret/i);

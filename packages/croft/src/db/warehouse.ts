@@ -506,7 +506,7 @@ export class DuckWarehouse implements Warehouse {
   /** The lake's error with its credentials taken out: the password, the key id and secret and the session token. */
   private scrub(e: unknown): unknown {
     const clean = this.spec.mode ? scrubThrown(e, modeSecrets(this.spec.mode)) : e;
-    // The check of the store's certificate failing is one code wherever a command meets it (D-R1), not whatever the command makes of an
+    // The check of the store's certificate failing is one code wherever a command meets it (D160), not whatever the command makes of an
     // unknown error (INTERNAL_ERROR, QUERY_FAILED).
     if (this.lake && !(clean instanceof CroftError)) {
       const m = this.spec.mode;

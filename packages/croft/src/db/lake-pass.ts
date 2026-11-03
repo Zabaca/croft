@@ -133,7 +133,7 @@ export async function maintainProject(project: Project, env: ProjectEnv, o: Main
       if (!report.ok) {
         const bad = report.steps.find((s) => s.status === "failed");
         const tls = bad?.error ? storeTlsProblem(new Error(bad.error)) : null;
-        // A store whose certificate does not check out is the same clear code and fix as in every other command (D-R1); a pass is a warning.
+        // A store whose certificate does not check out is the same clear code and fix as in every other command (D160); a pass is a warning.
         outcome.problem = tls ? { ...tls, severity: "warning" } : problem("LAKE_MAINTENANCE_FAILED", {
           message: `the lake's maintenance pass failed at the ${bad?.step ?? "first"} step after ${bad?.attempts ?? 1} ${bad?.attempts === 1 ? "try" : "tries"}: ${bad?.error ?? "unknown"}`,
           hint: `the lake is usable and nothing was lost; ${MAINTENANCE_RETRY} (croft docs LAKE_MAINTENANCE_FAILED)`,

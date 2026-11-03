@@ -1,9 +1,9 @@
-// What a lake's first maintenance pass does to croft's own speed, against a store a long way off (DESIGN.md D-R3; the first real-lake trial,
+// What a lake's first maintenance pass does to croft's own speed, against a store a long way off (DESIGN.md D162; the first real-lake trial,
 // 2026-11-02, found a run with nothing new going from 3.8 s before the first pass to 8.7 to 9.1 s after it, on R2).
 //
 // The pass's flush moved croft's own bookkeeping (`_croft`, a few rows at a time, kept inside the catalog) into tiny Parquet files in the
 // bucket, and every read of it then cost a listing and a range read or two against the store. This measures a run with nothing new, which is
-// mostly those reads, in three states of the same project: before any pass; after a pass that flushes every schema (what croft did until D-R3,
+// mostly those reads, in three states of the same project: before any pass; after a pass that flushes every schema (what croft did until D162,
 // reproduced here with DuckLake's own call, since croft no longer makes it); and after croft's pass as it is now (only the assets' schema).
 //
 // The store is the test rig's, on this machine, behind a TCP proxy that holds every chunk back half of `--rtt` milliseconds in each direction
@@ -121,8 +121,8 @@ async function croft(root: string, args: string[], e: Record<string, string>): P
   return { ms: performance.now() - t0, code, err: code === 0 ? "" : `${out}\n${err}`.slice(0, 600) };
 }
 
-type State = "before any pass" | "after a pass that flushes every schema (until D-R3)" | "after croft's pass (assets only)";
-const STATES: State[] = ["before any pass", "after a pass that flushes every schema (until D-R3)", "after croft's pass (assets only)"];
+type State = "before any pass" | "after a pass that flushes every schema (until D162)" | "after croft's pass (assets only)";
+const STATES: State[] = ["before any pass", "after a pass that flushes every schema (until D162)", "after croft's pass (assets only)"];
 
 async function main(): Promise<void> {
   const ready = lakeRigReady();

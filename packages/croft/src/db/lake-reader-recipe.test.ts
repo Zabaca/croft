@@ -67,7 +67,7 @@ describe("the docs' recipe for reading a lake from your own DuckDB", () => {
     // pinned file of the same extension.
     const platform = hostPlatform()!;
     // The folder as croft.json writes it ends in one slash; the recipe adds none (a second made `s3://bucket/folder//`, where counts worked and
-    // every read of a data file was a 404, D-R4).
+    // every read of a data file was a 404, D163).
     expect((lake.block.bucket as { folder: string }).folder).toMatch(/[^/]\/$/);
     expect(fill(block("duckdb-reader"), v).replaceAll("s3://", "")).not.toContain("//");
     const instance = await DuckDBInstance.create(":memory:", { autoinstall_known_extensions: "false", autoload_known_extensions: "false" });

@@ -1992,7 +1992,7 @@ describe("the project clock", () => {
     }
   });
 
-  test("a run that failed leaves no staging behind (it was 7 MB of a lake trial's failed run), and the run says how long it took as a whole (D-R5)", async () => {
+  test("a run that failed leaves no staging behind (it was 7 MB of a lake trial's failed run), and the run says how long it took as a whole (D164)", async () => {
     const root = makeProject({
       "assets/rows.ts": `import { ingest } from "@zabaca/croft";
 export default ingest({ key: "id", checks: ["id > 5"], async *rows() { yield [{ id: 1 }, { id: 2 }, { id: 3 }]; } });

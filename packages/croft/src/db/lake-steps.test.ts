@@ -136,7 +136,7 @@ for (const kind of ["local", "postgres"] as const) {
       }
     }, 120_000);
 
-    maybe("the flush leaves croft's own bookkeeping in the catalog: only the assets' rows become files (D-R3)", async () => {
+    maybe("the flush leaves croft's own bookkeeping in the catalog: only the assets' rows become files (D162)", async () => {
       const l = await fresh(kind);
       await version(l, "ticks", async (tx) => {
         await tx.exec("CREATE TABLE ticks (n INTEGER)");

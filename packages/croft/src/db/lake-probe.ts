@@ -1,4 +1,4 @@
-// What `croft doctor` asks of a lake before anything is run (DESIGN.md D-R6): does the bucket answer, and is the catalog's connection encrypted.
+// What `croft doctor` asks of a lake before anything is run (DESIGN.md D165): does the bucket answer, and is the catalog's connection encrypted.
 //
 // The first real-lake trial had doctor say "no problems found" before a first run that could write nothing: the lake did not exist yet, so
 // doctor attached nothing and touched no byte of the bucket, and the bucket was exactly what was wrong. So the probe goes through croft's own

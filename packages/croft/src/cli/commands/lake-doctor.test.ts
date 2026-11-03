@@ -148,7 +148,7 @@ describe("croft doctor on a lake", () => {
   }, 240_000);
 });
 
-describe("doctor's time for comparing tables (D-R7)", () => {
+describe("doctor's time for comparing tables (D166)", () => {
   test("a lake over a network gets more than the file's 400 ms, which never compared more than the first of its tables; one on this machine keeps the file's", async () => {
     const { lakeScanMs, TABLE_SCAN_LAKE_MS, TABLE_SCAN_MS } = await import("./doctor.ts");
     expect(lakeScanMs("postgres")).toBe(TABLE_SCAN_LAKE_MS);

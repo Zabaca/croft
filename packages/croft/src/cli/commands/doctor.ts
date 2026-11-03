@@ -122,7 +122,7 @@ export interface DoctorDeps {
 
 /** The tables line compares no more tables once this has passed, so doctor stays quick on a big warehouse. */
 export const TABLE_SCAN_MS = 400;
-/** The same for a lake whose store and catalog are over a network (D-R7): comparing one table takes several round trips of 50 to 700 ms, so 400 ms
+/** The same for a lake whose store and catalog are over a network (D166): comparing one table takes several round trips of 50 to 700 ms, so 400 ms
  *  never compared more than the first (the first real-lake trial compared none of 6). A lake on this machine keeps the file's budget. */
 export const TABLE_SCAN_LAKE_MS = 8_000;
 export const lakeScanMs = (kind: "postgres" | "local"): number => (kind === "postgres" ? TABLE_SCAN_LAKE_MS : TABLE_SCAN_MS);
@@ -175,7 +175,7 @@ function nextFor(problems: Problem[]): { command: string; reason: string }[] {
 
 // ---------------------------------------------------------------------------------------------
 
-/** One ProjectEnv for a whole doctor run, so a secretsFrom command that a lake's secrets make croft run is run once, whichever check asks (D-R4). */
+/** One ProjectEnv for a whole doctor run, so a secretsFrom command that a lake's secrets make croft run is run once, whichever check asks (D163). */
 function envOf(r: Report, d: DoctorDeps, project: Project): ProjectEnv {
   r.env ??= ProjectEnv.load(project.root, d.env);
   return r.env;
@@ -568,7 +568,7 @@ async function checkCatalogTls(r: Report, d: DoctorDeps, project: Project, catal
 }
 
 /**
- * The bucket (D-R6): croft's own locked instance, with the read-only key and the CA file the project chose, lists the lake's folder and reads
+ * The bucket (D165): croft's own locked instance, with the read-only key and the CA file the project chose, lists the lake's folder and reads
  * the footer of one data file when there is one, whether or not the lake is made yet. It writes nothing. Before this, doctor said "no problems
  * found" about a lake whose bucket could not be read or written at all (the first real-lake trial), because with no lake yet it touched no byte of it.
  */
@@ -602,7 +602,7 @@ function isThisMachine(host: string): boolean {
 }
 
 /**
- * Whether the catalog's connection is encrypted (D-R6), as the server reports it for this connection. libpq's default `sslmode` (prefer) falls
+ * Whether the catalog's connection is encrypted (D165), as the server reports it for this connection. libpq's default `sslmode` (prefer) falls
  * back to plain text without a word when the server offers no TLS, and the first real-lake trial found its password and rows crossing a private
  * network that way. Plain text to another machine is a warning; to this machine, a note.
  */
@@ -640,7 +640,7 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
     r.add("environment", "warehouse", "info", `${label} · not opened (the DuckDB binding does not load)`, undefined, details);
     return;
   }
-  // The bucket, before the lake: it is asked whether or not the lake is made yet (D-R6).
+  // The bucket, before the lake: it is asked whether or not the lake is made yet (D165).
   if (lake.kind === "postgres") await checkLakeStore(r, d, project);
   const seen: { encryption: import("../../db/lake-probe.ts").CatalogEncryption | null } = { encryption: null };
   let w: import("../../db/warehouse.ts").DuckWarehouse | undefined;
@@ -1404,7 +1404,7 @@ function checkSecretsCommand(r: Report, d: DoctorDeps, project: Project, from: S
     warn(`secretsFrom: ${program} is found here (${here}) but not on the PATH scheduled runs get (${scheduled})`,
       `write "${here}" as the first element of secretsFrom.command in croft.json`, `use "${here}" in croft.json's secretsFrom.command`);
   } else {
-    // doctor runs the command only for a lake: opening it asks for the lake's secrets, and the command runs, once, when the shell and .env lack one (D-R4).
+    // doctor runs the command only for a lake: opening it asks for the lake's secrets, and the command runs, once, when the shell and .env lack one (D163).
     const what = ran ? "run once by doctor, for the lake's secrets" : project.config.lake ? "not run: the shell and .env set every secret the lake names" : "not run by doctor";
     r.add("project", "secrets-from", "info", `secretsFrom: ${shown} (${here}), ${what}${names}`, undefined, { command: from.command, found: here, unchecked, ran });
   }

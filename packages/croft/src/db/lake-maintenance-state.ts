@@ -119,7 +119,7 @@ export function maintenanceView(state: MaintenanceState | null, cfg: LakeMainten
 }
 
 /** What a failed pass promises about trying again, said so that it is true: nothing runs by itself unless a croft command or the scheduler does
- *  (D-R5). A pass is due an hour after one that failed (RETRY_AFTER_FAILURE_MS). */
+ *  (D164). A pass is due an hour after one that failed (RETRY_AFTER_FAILURE_MS). */
 export const MAINTENANCE_RETRY = "a pass is due again an hour after one that failed, and the next croft run (or the scheduler's next tick, when croft schedule is on) makes it; croft maintain now makes it at once";
 
 /**

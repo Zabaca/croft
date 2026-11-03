@@ -190,7 +190,7 @@ export const LAKE_USER = "the lake (croft.json)";
 /**
  * The secrets of the lake block of croft.json (the six or seven names of its logins and keys) as a user of its own, added to the assets' for
  * `croft secrets` and `croft doctor`: a lake project's most important secrets are not any asset's, and the listing said "no asset declares a
- * secret" (D-R4).
+ * secret" (D163).
  */
 export function withLakeSecrets(declared: Record<string, string[]>, project: Project): Record<string, string[]> {
   const lake = project.config.lake;

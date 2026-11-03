@@ -106,10 +106,10 @@ async function get(a: S3Access, key: string, query: Record<string, string>): Pro
   try {
     res = await fetch(`${t.base}${qs ? `?${qs}` : ""}`, { method: "GET", headers, redirect: "error",
       // Always checked: Bun's fetch honours NODE_TLS_REJECT_UNAUTHORIZED=0 and then reads a store with any certificate or none vouching for it,
-      // CA file or not [V: 1.3.14]; naming `rejectUnauthorized` beats the variable (D-R1).
+      // CA file or not [V: 1.3.14]; naming `rejectUnauthorized` beats the variable (D160).
       tls: { rejectUnauthorized: true, ...(a.caFile ? { ca: Bun.file(a.caFile) } : {}) } });
   } catch (e) {
-    // The store's certificate not checking out is LAKE_STORE_TLS here as it is for DuckDB (D-R1), not a failure of the backup's folder.
+    // The store's certificate not checking out is LAKE_STORE_TLS here as it is for DuckDB (D160), not a failure of the backup's folder.
     throw storeTlsError(e, { ...(a.caFile ? { caFile: a.caFile } : {}) }) ?? e;
   }
   if (!res.ok) {

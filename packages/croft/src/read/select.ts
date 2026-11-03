@@ -29,7 +29,7 @@ export function mapQueryError(err: unknown, profile: Profile): unknown {
   if (err instanceof CroftError) return err;
   const mapped = mapSandboxError(err, profile);
   if (mapped !== err) return mapped;
-  // A store whose certificate cannot be checked is not a problem with the query (D-R1).
+  // A store whose certificate cannot be checked is not a problem with the query (D160).
   const tls = storeTlsError(err);
   if (tls) return tls;
   if (!(err instanceof Error)) return err;

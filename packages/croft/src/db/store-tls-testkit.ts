@@ -1,4 +1,4 @@
-// Certificates for the tests of a store served over HTTPS (DESIGN.md D-R1): made with the openssl program, in a temporary folder, for the
+// Certificates for the tests of a store served over HTTPS (DESIGN.md D160): made with the openssl program, in a temporary folder, for the
 // S3-compatible test store (mode-testkit.ts startS3 with `tls`), which a real store's certificate stands in for. Test support, left out of the
 // published package (package.json "files"). The openssl helper is the catalog's (tls-testkit.ts), which makes the same kind of certificate.
 import { mkdtempSync, rmSync } from "node:fs";

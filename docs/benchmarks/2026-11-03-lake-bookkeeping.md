@@ -1,4 +1,4 @@
-# What the first maintenance pass did to croft's own speed against a distant store (D-R3)
+# What the first maintenance pass did to croft's own speed against a distant store (D162)
 
 `packages/croft/scripts/bench-lake-bookkeeping.ts`, run on 2026-11-03 on macOS arm64 (bun 1.3.14, DuckDB 2.0.0, a Postgres 17 and an S3-compatible store started by the test rig, all on this machine). The project is a file ingest (120 rows) and a SQL asset over it; it has had three runs, the second with a changed file, as a project in use would. The measured run is `croft run --foreground` with nothing new to do (the file is unchanged, so every step is read, compared and skipped), the real CLI in a process of its own; each cell is the median of 3.
 
@@ -9,13 +9,13 @@ The first real-lake trial (2026-11-02, R2) saw a run with nothing new go from 3.
 | round trip to the store | state | run with nothing new, s | store requests in it |
 |---:|---|---:|---:|
 | 0 ms | before any pass | 0.5 | 0 |
-| 0 ms | after a pass that flushes every schema (until D-R3) | 0.6 | 6 |
+| 0 ms | after a pass that flushes every schema (until D162) | 0.6 | 6 |
 | 0 ms | after croft's pass (assets only) | 0.6 | 0 |
 | 100 ms | before any pass | 0.6 | 0 |
-| 100 ms | after a pass that flushes every schema (until D-R3) | 1.1 | 6 |
+| 100 ms | after a pass that flushes every schema (until D162) | 1.1 | 6 |
 | 100 ms | after croft's pass (assets only) | 0.5 | 0 |
 | 250 ms | before any pass | 0.5 | 0 |
-| 250 ms | after a pass that flushes every schema (until D-R3) | 2.1 | 6 |
+| 250 ms | after a pass that flushes every schema (until D162) | 2.1 | 6 |
 | 250 ms | after croft's pass (assets only) | 0.6 | 0 |
 
 What it shows:

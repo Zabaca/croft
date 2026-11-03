@@ -131,7 +131,7 @@ export interface AddonView {
   /** Every extension it carries is found and matches its pin. */
   ok: boolean;
   /** Its own package is in the project (or a file of it is there and wrong, or missing for this machine). False when its files, all found,
-   *  came from $CROFT_EXTENSION_DIR or the builders' cache: the mode runs, and the add-on is not installed (D-R5). */
+   *  came from $CROFT_EXTENSION_DIR or the builders' cache: the mode runs, and the add-on is not installed (D164). */
   installed: boolean;
   /** The command that installs it into this project; null where nothing can. */
   install: string | null;

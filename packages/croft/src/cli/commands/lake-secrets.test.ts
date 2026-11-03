@@ -1,4 +1,4 @@
-// The secretsFrom command in a lake project (DESIGN.md D-R4): the lake's secrets (two logins' passwords, two keys) may live only in the store the
+// The secretsFrom command in a lake project (DESIGN.md D163): the lake's secrets (two logins' passwords, two keys) may live only in the store the
 // command reads, so every command that opens the lake runs it, once, and the docs and doctor say so. The first real-lake trial found doctor saying
 // "not run by doctor" while it ran it, and `croft secrets` listing none of the lake's names.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";

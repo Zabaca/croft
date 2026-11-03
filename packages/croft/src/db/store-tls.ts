@@ -1,4 +1,4 @@
-// The TLS of a lake's bucket (DESIGN.md D-R1): the certificate authorities the store's certificate is checked against, and the one clear
+// The TLS of a lake's bucket (DESIGN.md D160): the certificate authorities the store's certificate is checked against, and the one clear
 // error for every way that check fails.
 //
 // Once croft locks a DuckDB instance it may read no file but those it names, and httpfs checks an https store's certificate against a CA

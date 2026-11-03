@@ -150,7 +150,7 @@ export interface RunData {
   status: RunStatus;
   progress?: ProgressSnapshot;
   steps: StepResult[];
-  /** How long the whole run took, from its start to its end (D-R5). Absent from the summary of a run that was still going, and from runs.sqlite rows made before it. */
+  /** How long the whole run took, from its start to its end (D164). Absent from the summary of a run that was still going, and from runs.sqlite rows made before it. */
   durationMs?: number;
 }
 
@@ -763,7 +763,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
       const stored = redactValue(summary, env);
       runs.finishRun(runId, status, stored);
       // Whatever the run's end: a failed run kept its staging for 3 days "for inspection" (7 MB in a lake trial), and nothing reads it: the
-      // error is in `croft logs`, and a rerun extracts again. What a process that died leaves is reconcile's and pruneStaging's (D-R5).
+      // error is in `croft logs`, and a rerun extracts again. What a process that died leaves is reconcile's and pruneStaging's (D164).
       rmSync(join(paths.stateDir, "staging", runId), { recursive: true, force: true });
       events.emit({ type: "run", runId, status, exit: summary.exit });
       return stored;
@@ -1359,7 +1359,7 @@ async function lateWarnings(i: WarningInput, out: StepOutcome, previous: string[
 }
 
 /** Staging that a run left because its process died, and chunks waiting for a commit, are kept this long (§5 step 4; a run that ends, failed or not,
- *  removes its own staging, D-R5). */
+ *  removes its own staging, D164). */
 export const STAGING_KEEP_MS = 3 * 86_400_000;
 
 /** <state>/staging/_chunks: incremental transforms' chunks staged and not yet committed (transform.ts). */

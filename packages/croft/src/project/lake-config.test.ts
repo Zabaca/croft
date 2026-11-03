@@ -88,7 +88,7 @@ describe("a shared lake", () => {
     }
   });
 
-  test("the folder is one folder however many slashes end it: trial-1, trial-1/ and trial-1// are s3://bucket/trial-1/, never trial-1// (D-R4)", () => {
+  test("the folder is one folder however many slashes end it: trial-1, trial-1/ and trial-1// are s3://bucket/trial-1/, never trial-1// (D163)", () => {
     for (const written of ["trial-1", "trial-1/", "trial-1//", "a/b", "a/b/", "a/b///"]) {
       const r = validateConfig({ ...tz, lake: shared({ bucket: { folder: written } }) });
       expect(r.ok, written).toBe(true);
