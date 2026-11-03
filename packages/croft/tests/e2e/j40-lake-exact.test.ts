@@ -5,8 +5,9 @@
 //   a. a JSON ingest of integers past 64 bits (450 rows, so a Parquet file is written; and 5 rows, which stay in the catalog) lands as DECIMAL(38,0)
 //      with every digit, and the maintenance pass, which moves the catalog's rows into files, changes none of them;
 //   b. a CSV file ingest of the same, and a later batch with a fraction in such a column does not round it;
-//   c. a SQL transform whose output has a HUGEINT, an INTERVAL, a TIMETZ or one inside a STRUCT is refused before anything is written, with the cast
-//      that fixes it, and the fix runs; a pin to HUGEINT is refused the same way.
+//   c. a SQL transform whose output has a UHUGEINT, an INTERVAL, a TIMETZ or a HUGEINT inside a STRUCT is refused before anything is written, with the cast
+//      that fixes it, and the fix runs; d. a pin to HUGEINT is refused the same way; c2. a top-level HUGEINT result (sum() of integers) is stored as
+//      DECIMAL(38,0), with every digit, before and after the maintenance pass.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { lakeRigReady, type LakeRig, localLakeBlock, startLakeRig, useLake } from "../../src/db/lake-testkit.ts";
@@ -104,7 +105,7 @@ for (const kind of ["local", "postgres"] as const) {
       const writes = async () => (await run(p, ["query", "select count(*)::INT as n from _croft.writes"])).json.data.rows;
       const before = await writes();
       const cases: [string, string, string][] = [
-        ["a HUGEINT", "range::HUGEINT AS v", "CAST(v AS DECIMAL(38,0)) AS v"],
+        ["a HUGEINT past 38 digits, which DECIMAL(38,0) cannot hold", "100000000000000000000000000000000000000::HUGEINT + range::HUGEINT AS v", "CAST(v AS DECIMAL(38,0)) AS v"],
         ["a UHUGEINT", "range::UHUGEINT AS v", "CAST(v AS VARCHAR) AS v"],
         ["an INTERVAL", "INTERVAL (range) MICROSECOND AS v", "CAST(v AS VARCHAR) AS v"],
         ["a TIMETZ", "TIMETZ '10:11:12+02' AS v", "CAST(v AS TIME) AS v"],
@@ -126,6 +127,23 @@ for (const kind of ["local", "postgres"] as const) {
       expect(fixed.code, show(fixed)).toBe(0);
       expect((await run(p, ["query", "select v::VARCHAR as v from odd order by id"])).json.data.rows.map((r: { v: string }) => r.v)).toEqual(["0", big(1), big(2)]);
     }, 300_000);
+
+    test("c2. a HUGEINT result of a SQL transform (sum of integers) is stored as DECIMAL(38,0) with every digit, also after the maintenance pass", async () => {
+      p.write("assets/sums.sql", `-- description: sums that are HUGEINT in DuckDB
+-- key: id
+SELECT range AS id, sum(range::BIGINT * 9000000000000000) OVER () AS total, (range::HUGEINT * 123456789012345678901) AS wide FROM range(450)`);
+      const r = await run(p, ["run", "sums"]);
+      expect(r.code, show(r)).toBe(0);
+      const type = async (c: string) => (await run(p, ["describe", "sums"])).json.data.columns.find((x: { name: string }) => x.name === c).type;
+      expect(await type("total")).toBe("DECIMAL(38,0)");
+      expect(await type("wide")).toBe("DECIMAL(38,0)");
+      const read = async () => (await run(p, ["query", "select wide::VARCHAR as w from sums order by wide", "--limit", "1000"])).json.data.rows.map((x: { w: string }) => x.w);
+      const want = Array.from({ length: 450 }, (_, i) => String(BigInt(i) * UNIT));
+      expect(await read()).toEqual(want);
+      const pass = await run(p, ["maintain"]);
+      expect(pass.code, show(pass)).toBe(0);
+      expect(await read()).toEqual(want);
+    }, 240_000);
 
     test("d. a pin to HUGEINT is refused the same way, and a pin to DECIMAL(38,0) is the fix", async () => {
       p.write("assets/pinned.ts", `import { ingest } from "@zabaca/croft";

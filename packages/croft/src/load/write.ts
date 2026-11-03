@@ -201,6 +201,26 @@ async function readAssetState(tx: Sql, asset: string): Promise<AssetState | null
 
 let tempSeq = 0;
 
+/**
+ * A SQL or TypeScript transform's top-level HUGEINT columns, retyped to DECIMAL(38,0) in the batch before it is written
+ * to a lake: sum() and the like return a HUGEINT, a lake would keep it as a DOUBLE, and the DECIMAL holds the same whole
+ * number exactly. A value that does not fit (past 38 digits) leaves the column as it is, to be refused with the cast
+ * (refuseLakeTypes), never changed.
+ */
+async function widenHugeResults(tx: Sql, temp: string, columns: { name: string; type: string }[]): Promise<{ name: string; type: string }[]> {
+  const huge = columns.filter((c) => normalizeType(c.type) === "HUGEINT" && !isReservedColumn(c.name));
+  if (huge.length === 0) return columns;
+  let changed = false;
+  for (const c of huge) {
+    const [over] = await tx.all<{ n: number | bigint }>(
+      `SELECT count(*) AS n FROM ${tempRef(temp)} WHERE abs(${quoteIdent(c.name)}) >= 100000000000000000000000000000000000000::HUGEINT`);
+    if (Number(over!.n) > 0) continue;
+    await tx.exec(`ALTER TABLE ${tempRef(temp)} ALTER ${quoteIdent(c.name)} SET DATA TYPE DECIMAL(38,0)`);
+    changed = true;
+  }
+  return changed ? (await readTableSchema(tx, temp, "temp"))! : columns;
+}
+
 /** Write a typed batch into its asset's table. Call inside warehouse.write(); it never commits itself. */
 export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<WriteResult> {
   const { batch, target } = input;
@@ -225,7 +245,9 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
     if (p) warnings.push(p);
   }
 
-  const batchCols = await readTableSchema(tx, batch.temp, "temp");
+  let batchCols = await readTableSchema(tx, batch.temp, "temp");
+  // In a lake a transform's HUGEINT result (sum() of integers is one) is stored as DECIMAL(38,0), which keeps every digit (D162).
+  if (batchCols && (kind === "sql" || kind === "ts") && (await inLake(tx))) batchCols = await widenHugeResults(tx, batch.temp, batchCols);
   if (!batchCols) throw new CroftError("INTERNAL_ERROR", { message: `the batch table ${batch.temp} does not exist`, hint: "report this croft bug", asset });
   const inBatch = (name: string) => batchCols.find((c) => sameName(c.name, name));
   // A lake cannot store an ENUM, a UNION or a VARINT: refused here, before anything is written, with the cast that fixes it (D142).

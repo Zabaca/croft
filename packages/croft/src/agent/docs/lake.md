@@ -227,7 +227,7 @@ HUGEINT), FLOAT and DOUBLE with NaN and infinity, VARCHAR, BLOB, DATE, TIME, eve
 So a lake never gets a column of those types: a run that would write one is refused by the column's type, whatever its
 values are, before anything is written (LAKE_VALUES_INEXACT, with the cast: DECIMAL(38,0) or text for a HUGEINT, text for
 the others), and croft's own type inference makes a column of integers past 64 bits DECIMAL(38,0), which is exact, in
-place of HUGEINT. `croft move-to-lake` finds such columns in the file before it starts and proves every value equal
+place of HUGEINT; a SQL or TypeScript transform's HUGEINT column (`sum()` of integers) becomes DECIMAL(38,0) the same way. `croft move-to-lake` finds such columns in the file before it starts and proves every value equal
 afterwards. A file keeps HUGEINT as it was.
 
 ## Moving an existing project into a lake

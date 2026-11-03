@@ -15,15 +15,18 @@ Nothing was written, and the file and the lake are as they were.
 What to do: store the column in a type a lake keeps exactly, in the asset's SELECT or in the pin that sets its type, run
 the asset (a SQL asset is rebuilt at no cost), and run the command again.
 - HUGEINT: `CAST(x AS DECIMAL(38,0)) AS x` holds any whole number of up to 38 digits exactly; otherwise `AS VARCHAR`.
+  A SQL or TypeScript transform that returns a HUGEINT column (`sum()` of integers does) does not need this: croft
+  stores it as DECIMAL(38,0) itself, and refuses only when a value has more than 38 digits.
 - UHUGEINT: `CAST(x AS VARCHAR) AS x`.
 - INTERVAL: `CAST(x AS VARCHAR) AS x`, or the length as a whole number of milliseconds.
 - TIMETZ: `CAST(x AS VARCHAR) AS x`, or `CAST(x AS TIME) AS x` when the offset does not matter.
 - Inside a STRUCT, LIST or MAP: cast the inner value, or turn the whole column into JSON with `to_json(x) AS x`.
 - A pin to HUGEINT (`columns: { x: "HUGEINT" }`): pin it to DECIMAL(38,0) instead.
 
-You do not need this for integers past 64 bits that arrive from an API, a CSV file or a Parquet file: in a lake croft
-stores them as DECIMAL(38,0) by itself, with every digit. A table restored from the trash of the file's days that has
-such a column is refused the same way, before anything is replaced; restore it on the file before the move.
+You do not need this for integers past 64 bits that arrive from an API, a CSV file or a Parquet file, or for a HUGEINT
+that a SQL or TypeScript transform returns: in a lake croft stores them as DECIMAL(38,0) by itself, with every digit.
+A table restored from the trash of the file's days that has such a column is refused the same way, before anything is
+replaced; restore it on the file before the move.
 
 When croft move-to-lake reports it, details.columns also says how many of the file's values would change now (none, for
 a column whose values happen to be exact: it is refused anyway, because a later write would be).
