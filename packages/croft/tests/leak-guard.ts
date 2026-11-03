@@ -111,7 +111,7 @@ export async function assertNoLeaks(file: string, before: ReadonlySet<number>, o
   }
   // CROFT_LEAK_GUARD_REPORT=1 says which files still had a process running after their last test and were let off because it was gone within the grace.
   if (leaks.length === 0 && first.length > 0 && process.env.CROFT_LEAK_GUARD_REPORT === "1") {
-    console.warn(`leak guard: ${file}: ${first.length} process${first.length === 1 ? "" : "es"} still exiting after the last test, gone after ${Date.now() - started} ms: ${first.map((p) => p.command.slice(0, 100)).join(" | ")}`);
+    console.warn(`leak guard: ${file}: ${first.length} process${first.length === 1 ? "" : "es"} still exiting after the last test, gone after ${Date.now() - started} ms: ${first.map((p) => p.command.slice(-260)).join(" | ")}`);
   }
   if (leaks.length === 0) return;
   killAll(leaks);

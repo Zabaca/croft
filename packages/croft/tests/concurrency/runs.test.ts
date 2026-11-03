@@ -190,10 +190,11 @@ describe("runs and readers (slow: real processes)", () => {
     expect(busy.json.data.steps.map((s: { status: string }) => s.status)).toEqual(["skipped"]);
 
     // A second run without --no-wait waits for the lease: no request of its own until the first run is done.
+    const startedAt = Date.now();
     const second = p.start(["run", "feed", "--json", "--follow", "60s"]);
     await sleep(800);
     expect(second.proc.exitCode).toBeNull();
-    expect(api.requests("/c3/feed").length).toBe(1);
+    expect(api.requests("/c3/feed").length, `the feed was asked at ${JSON.stringify(api.requests("/c3/feed").map((r) => r.at - startedAt))} ms from the second run's start`).toBe(1);
     const openedAt = Date.now();
     gate.open();
     const r = await second.done;
