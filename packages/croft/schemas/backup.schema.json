@@ -129,6 +129,9 @@
                 "string"
               ]
             },
+            "lake": {
+              "$ref": "#/$defs/LakeBackupInfo"
+            },
             "redactedValues": {
               "const": true
             }
@@ -333,6 +336,12 @@
         },
         "estimatedRequests": {
           "type": "number"
+        },
+        "files": {
+          "type": "number"
+        },
+        "asOf": {
+          "type": "string"
         }
       },
       "required": [
@@ -340,6 +349,75 @@
         "action",
         "rows",
         "downstream"
+      ],
+      "additionalProperties": false
+    },
+    "LakeBackupInfo": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "enum": [
+            "local",
+            "postgres"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "snapshot": {
+          "type": "number"
+        },
+        "catalog": {
+          "type": "object",
+          "properties": {
+            "file": {
+              "type": "string"
+            },
+            "bytes": {
+              "type": "number"
+            },
+            "tool": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "file",
+            "bytes",
+            "tool"
+          ],
+          "additionalProperties": false
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "dir": {
+              "type": "string"
+            },
+            "files": {
+              "type": "number"
+            },
+            "bytes": {
+              "type": "number"
+            },
+            "reused": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "dir",
+            "files",
+            "bytes",
+            "reused"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "kind",
+        "source",
+        "snapshot",
+        "catalog",
+        "data"
       ],
       "additionalProperties": false
     },

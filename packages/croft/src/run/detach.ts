@@ -21,6 +21,7 @@
 // runs the project's croft, so the launcher has nothing to decide.
 import { type ChildProcess, spawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CroftError, problem } from "../core/errors.ts";
 import { defaultOutputRedactor, keepFdsCaptured } from "../core/output.ts";
@@ -131,6 +132,27 @@ export function spawnDetachedRun(i: SpawnInput): Spawned {
     }
   }
   return { child, pid: child.pid ?? -1, output, exited };
+}
+
+/**
+ * Start `croft maintain --due` in its own session, detached and unref'd, for the scheduler's tick: a lake's pass can take longer than a tick may
+ * (a tick only plans and spawns, schedule/tick.ts). It decides for itself whether a pass is due, takes the lake's lock, and records how it ended
+ * in runs.sqlite; what it prints goes to <state>/logs/maintain.log. Returns the child's pid.
+ */
+export function spawnDetachedMaintain(i: { root: string; stateDir: string; env: Record<string, string | undefined>; execPath?: string; entry?: string }): number {
+  mkdirSync(join(i.stateDir, "logs"), { recursive: true });
+  const fd = openSync(join(i.stateDir, "logs", "maintain.log"), "a", 0o600);
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(i.env)) if (v !== undefined) env[k] = v;
+  let child: ChildProcess;
+  try {
+    child = spawn(i.execPath ?? process.execPath, ["--no-env-file", i.entry ?? ENTRY, "maintain", "--due"], { cwd: i.root, env, detached: true, stdio: ["ignore", fd, fd] });
+  } finally {
+    closeSync(fd);
+  }
+  child.once("error", () => {});
+  child.unref();
+  return child.pid ?? -1;
 }
 
 export function pickRunId(timezone: string, now: Date = new Date()): string {

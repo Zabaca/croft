@@ -33,17 +33,26 @@ export interface LakeBucketConfig {
   reader: LakeKey;
 }
 
+/**
+ * When croft runs the lake's maintenance by itself (D150; option 07, slice 3): after a run, and from the scheduler, once the last
+ * pass is `everyHours` old. What a pass keeps is not a setting: it is the trash's promise, 30 days or 5 versions per asset (§6).
+ */
+export interface LakeMaintenanceConfig { enabled: boolean; everyHours: number }
+export const DEFAULT_MAINTENANCE: LakeMaintenanceConfig = { enabled: true, everyHours: 24 };
+
 /** A shared lake: a Postgres catalog and a bucket. */
 export interface SharedLakeConfig {
   kind: "postgres";
   catalog: { host: string; port: number; database: string; writer: LakeLogin; reader: LakeLogin };
   bucket: LakeBucketConfig;
+  maintenance: LakeMaintenanceConfig;
 }
 /** A local lake: a SQLite catalog file and a data folder, both as written (relative to the project folder, or absolute). */
 export interface LocalLakeConfig {
   kind: "local";
   catalog: { path: string };
   dataPath: string;
+  maintenance: LakeMaintenanceConfig;
 }
 export type LakeConfig = SharedLakeConfig | LocalLakeConfig;
 
@@ -59,7 +68,8 @@ export interface LakeChecks {
   count(): number;
 }
 
-export const LAKE_KEYS = ["catalog", "bucket", "dataPath"];
+export const LAKE_KEYS = ["catalog", "bucket", "dataPath", "maintenance"];
+const MAINTENANCE_KEYS = ["enabled", "everyHours"];
 const CATALOG_KEYS = ["kind", "host", "port", "database", "writer", "reader", "path"];
 const LOGIN_KEYS = ["user", "passwordSecret"];
 const BUCKET_KEYS = ["name", "folder", "endpoint", "region", "urlStyle", "useSsl", "writer", "reader"];
@@ -114,8 +124,22 @@ export function validateLake(raw: unknown, c: LakeChecks): LakeConfig | null {
       `use a Postgres catalog: "kind": "postgres" with a bucket (croft docs lake)`);
     return null;
   }
-  const result = kind === "postgres" ? sharedLake(raw, cat, c) : localLake(raw, cat, c);
+  const maintenance = maintenanceConfig(raw.maintenance, c);
+  const result = kind === "postgres" ? sharedLake(raw, cat, c, maintenance) : localLake(raw, cat, c, maintenance);
   return issueCount(c) > before ? null : result;
+}
+
+function maintenanceConfig(raw: unknown, c: LakeChecks): LakeMaintenanceConfig {
+  if (raw === undefined) return { ...DEFAULT_MAINTENANCE };
+  if (!isObject(raw)) {
+    c.add("lake.maintenance", `"lake.maintenance" must be an object like {"enabled": true, "everyHours": 24}; found ${c.show(raw)}`, `write it as {"enabled": …, "everyHours": …}, or leave it out`);
+    return { ...DEFAULT_MAINTENANCE };
+  }
+  c.unknownKeys(raw, MAINTENANCE_KEYS, "lake.maintenance");
+  return {
+    enabled: c.bool(raw, "lake.maintenance.enabled", "enabled", DEFAULT_MAINTENANCE.enabled),
+    everyHours: c.int(raw, "lake.maintenance.everyHours", "everyHours", DEFAULT_MAINTENANCE.everyHours, 1, 24 * 30),
+  };
 }
 
 const issueCount = (c: LakeChecks): number => c.count();
@@ -174,7 +198,7 @@ function bucketKey(c: LakeChecks, parent: Record<string, unknown>, path: string,
   return id && key ? { keyIdSecret: id, secretKeySecret: key, ...(token ? { sessionTokenSecret: token } : {}) } : null;
 }
 
-function sharedLake(raw: Record<string, unknown>, cat: Record<string, unknown>, c: LakeChecks): SharedLakeConfig | null {
+function sharedLake(raw: Record<string, unknown>, cat: Record<string, unknown>, c: LakeChecks, maintenance: LakeMaintenanceConfig): SharedLakeConfig | null {
   const { add, show } = c;
   if (cat.path !== undefined) add("lake.catalog.path", `"lake.catalog.path" is for a SQLite catalog; a Postgres catalog is found by "host" and "database"`, `remove "path", or set "kind" to "sqlite"`);
   if (raw.dataPath !== undefined) add("lake.dataPath", `"lake.dataPath" is for a local lake; a Postgres catalog keeps its files in a bucket`, `remove "dataPath" and describe the bucket in "lake.bucket"`);
@@ -203,7 +227,7 @@ function sharedLake(raw: Record<string, unknown>, cat: Record<string, unknown>, 
     }
   }
   const bucket = bucketConfig(raw.bucket, c);
-  return host && database && writer && reader && bucket ? { kind: "postgres", catalog: { host, port, database, writer, reader }, bucket } : null;
+  return host && database && writer && reader && bucket ? { kind: "postgres", catalog: { host, port, database, writer, reader }, bucket, maintenance } : null;
 }
 
 function bucketConfig(raw: unknown, c: LakeChecks): LakeBucketConfig | null {
@@ -266,7 +290,7 @@ function bucketConfig(raw: unknown, c: LakeChecks): LakeBucketConfig | null {
   return name && folder && writer && reader ? { name, folder, ...(endpoint ? { endpoint } : {}), ...(region ? { region } : {}), urlStyle, useSsl, writer, reader } : null;
 }
 
-function localLake(raw: Record<string, unknown>, cat: Record<string, unknown>, c: LakeChecks): LocalLakeConfig | null {
+function localLake(raw: Record<string, unknown>, cat: Record<string, unknown>, c: LakeChecks, maintenance: LakeMaintenanceConfig): LocalLakeConfig | null {
   const { add, show } = c;
   for (const k of ["host", "port", "database", "writer", "reader"]) {
     if (cat[k] !== undefined) add(joinPath("lake.catalog", k), `"lake.catalog.${k}" is for a Postgres catalog; a SQLite catalog is one file, "path"`, `remove "${k}", or set "kind" to "postgres"`);
@@ -280,7 +304,7 @@ function localLake(raw: Record<string, unknown>, cat: Record<string, unknown>, c
   if (raw.dataPath === undefined) add("lake.dataPath", `a local lake needs "dataPath": the folder that holds its Parquet files and nothing else`, `add "dataPath": "lake/data"`);
   else if (typeof raw.dataPath !== "string" || raw.dataPath.trim() === "") add("lake.dataPath", `"lake.dataPath" must be a folder path; found ${show(raw.dataPath)}`, `use a path such as "lake/data"`);
   else dataPath = raw.dataPath;
-  return path && dataPath ? { kind: "local", catalog: { path }, dataPath } : null;
+  return path && dataPath ? { kind: "local", catalog: { path }, dataPath, maintenance } : null;
 }
 
 // ---- Where a local lake's files may be ----------------------------------------------------------------------

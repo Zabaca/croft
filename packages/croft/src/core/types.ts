@@ -62,7 +62,12 @@ export interface Problem {
   fix?: Fix; effect?: string; retryable?: boolean; details?: Record<string, unknown>;
 }
 export interface Impact { asset: string; action: string; rows: number; bytes?: number; trashPath?: string;
-  downstream: string[]; estimatedRequests?: number }
+  downstream: string[]; estimatedRequests?: number;
+  /** For a command that deletes files and no rows (croft maintain --orphans): how many files; `rows` is then 0. */
+  files?: number;
+  /** The instant the impact was counted as of, when the count depends on one: the cutoff of the files croft maintain --orphans lists, which the
+   *  confirmation carries so that the deletion is for the files that were shown. */
+  asOf?: string }
 export interface Confirmation { token: string; expiresAt: string; command: string; impact: Impact }
 export interface Envelope<T> { schemaVersion: 1; ok: boolean; command: string; croftVersion: string;
   database: string; timezone: string; durationMs: number; data: T; problems: Problem[];

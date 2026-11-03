@@ -230,6 +230,18 @@ const backup = lazyCommand({
   maxPositionals: 1,
 }, async () => (await import("./backup.ts")).backup);
 
+const maintain = lazyCommand({
+  name: "maintain",
+  summary: "a lake project: run the lake's maintenance now (expire what the trash does not promise, merge files, clean up); --orphans lists and, after confirmation, deletes files the lake does not own",
+  usage: "croft maintain [--dry-run] [--orphans]",
+  options: {
+    "dry-run": { type: "boolean", description: "say what a pass would expire and keep (or, with --orphans, only list the files) without changing anything" },
+    orphans: { type: "boolean", description: "files in the lake's folder that the lake does not own and that are a day old: list them, then delete them only after croft confirm" },
+    due: { type: "boolean", hidden: true, description: "only if a pass is due (set by croft tick)" },
+  },
+  maxPositionals: 0,
+}, async () => (await import("./maintain.ts")).maintain);
+
 const newCmd = lazyCommand({
   name: "new",
   summary: "write a commented, working template for a new asset; --list shows the kinds",
@@ -243,5 +255,5 @@ const newCmd = lazyCommand({
 
 export const COMMANDS: readonly Command[] = [
   docs, help, version, init, doctor, validate, preview, run, wait, status, query, describe, context, logs, secrets, confirm,
-  schedule, serve, tick, rename, del, restore, backup, newCmd,
+  schedule, serve, tick, rename, del, restore, backup, maintain, newCmd,
 ];

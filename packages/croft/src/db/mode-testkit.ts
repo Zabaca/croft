@@ -134,6 +134,10 @@ export interface TestS3 {
   endpoint: string; // host:port, for httpfs's ENDPOINT
   port: number;
   root: string;
+  /** The next `n` requests that delete objects answer HTTP `status` and delete nothing (R2 answered 500 to bulk deletes on a real lake). */
+  failDeletes(n: number, status?: number): Promise<void>;
+  /** How many requests asked to delete, how many were refused by failDeletes, and how many objects went. */
+  stats(): Promise<{ deleteRequests: number; failedDeletes: number; objectsDeleted: number }>;
   stop(): Promise<void>;
 }
 
@@ -150,6 +154,12 @@ export async function startS3(o: { buckets: string[]; keys: Record<string, "rw" 
     endpoint: `127.0.0.1:${port}`,
     port,
     root,
+    async failDeletes(n, status = 500) {
+      await fetch(`http://127.0.0.1:${port}/__control?failDeletes=${n}&status=${status}`, { method: "POST" });
+    },
+    async stats() {
+      return (await (await fetch(`http://127.0.0.1:${port}/__control`)).json()) as { deleteRequests: number; failedDeletes: number; objectsDeleted: number };
+    },
     async stop() {
       await stop(child);
       rmSync(root, { recursive: true, force: true });

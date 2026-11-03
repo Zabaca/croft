@@ -139,6 +139,8 @@ export interface RunHooks {
   notifyScheduledFailure?: (root: string, failure: ScheduledFailure) => Promise<void>;
   /** .croft/types from the catalog mirror the run left (project/types-gen.ts). */
   generateInputTypes?: (root: string, stateDir: string) => unknown;
+  /** The lake's maintenance, when the project has a lake and a pass is due (db/lake-pass.ts maintainIfDue). */
+  maintainLake?: (project: Project, env: ProjectEnv, now: Date) => Promise<unknown>;
 }
 
 export interface Next { command: string; reason: string }
@@ -601,6 +603,17 @@ async function afterRun(o: RunnerOptions, out: RunOutcome): Promise<void> {
     const stateDir = o.project.paths.stateDir;
     await quietly(async () => (o.hooks?.generateInputTypes ?? ((r: string, s: string) => generateInputTypes(r, { stateDir: s })))(root, stateDir));
   }
+  // A lake keeps itself short (D150): a pass runs here when the last one is old enough. It never fails the run; a pass that fails is kept
+  // for croft status and croft doctor. It comes last, so the run's own result and its notification never wait for it.
+  const maintain = async () => {
+    if (!o.project.config.lake) return;
+    const now = (o.now ?? clockNow)();
+    await quietly(async () => {
+      if (o.hooks?.maintainLake) return o.hooks.maintainLake(o.project, o.env, now);
+      const { maintainIfDue, retryKnob } = await import("../db/lake-pass.ts");
+      return maintainIfDue(o.project, o.env, { now, isTTY: false, ...retryKnob(process.env) });
+    });
+  };
   if (o.trigger === "schedule") {
     const failed = out.data.steps.filter((s) => s.status === "failed").map((s) => ({ asset: s.asset, error: s.error ?? null }));
     if (failed.length > 0) {
@@ -610,6 +623,7 @@ async function afterRun(o: RunnerOptions, out: RunOutcome): Promise<void> {
         : notifyScheduledFailure(root, { project: root, runId: out.data.runId, failed }, { env: o.env }));
     }
   }
+  await maintain();
 }
 
 async function runSteps(o: RunnerOptions): Promise<RunOutcome> {

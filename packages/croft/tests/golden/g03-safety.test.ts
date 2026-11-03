@@ -1,7 +1,8 @@
 // Golden: the commands that change or remove data (DESIGN.md §4.3, §6), each --json envelope validated against its
 // schema: delete (rows and a whole table) and restore, each asking for a token off a TTY, confirm carrying the token
 // out (and refusing a spent one), a shrink and a rebuild confirmed through croft run, and rename; and backup, the
-// copy that keeps what they could lose (D109).
+// copy that keeps what they could lose (D109); and maintain, the lake's housekeeping, which a project that keeps a file is told
+// it does not need (a lake's own payloads are validated by the lake journey, tests/e2e/j38-lake-maintenance.test.ts).
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { cleanupAll, initProject, type Project, schedulerEnv } from "../e2e/harness.ts";
 import { golden } from "./kit.ts";
@@ -80,6 +81,11 @@ test("rename, and a rename onto a name that is taken", async () => {
   golden("rename", await p.croft(["rename", "region_sales", "example_sales", "--json"], { env }), { failed: true, exit: 2 });
   golden("describe", await p.croft(["describe", "region_sales", "--json"], { env }));
 }, 120_000);
+
+test("maintain: a project that keeps a file is told so (exit 2, no data)", async () => {
+  const r = golden("maintain", await p.croft(["maintain", "--json"], { env }), { failed: true, exit: 2 });
+  expect(r.problems[0]).toMatchObject({ code: "MAINTAIN_NEEDS_LAKE", effect: "nothing was changed" });
+}, 60_000);
 
 test("backup: a new folder each time, with the trash; a folder inside the state folder is refused", async () => {
   const first = golden("backup", await p.croft(["backup", "--json"], { env })).data;

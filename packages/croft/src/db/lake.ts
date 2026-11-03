@@ -10,7 +10,7 @@
 // - One writing machine, one write at a time on it: a lock of croft's own in the state folder, in place of the file's lock (LakeWriteLock).
 // - Which machines wrote is a row of _croft.meta for each (writerKey), so croft doctor can warn when another machine has written since.
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -307,6 +307,8 @@ export function writerReport(meta: Readonly<Record<string, string | undefined>>,
 interface LockRecord { pid: number; procStart: string; bootId: string; runId: string | null; asset?: string; label: string; since: string }
 
 const LOCK_FOLDER = "lake-write.lock";
+/** The label a lake maintenance pass takes the lock with (db/lake-pass.ts): the holder is then told as `maintenance`, not as a write. */
+export const MAINTENANCE_LOCK_LABEL = "lake maintenance";
 /** A lock folder whose holder file never appeared (its taker died between the mkdir and the write) is stale after this long. */
 const HOLDERLESS_STALE_MS = 10_000;
 /** The lock a reclaimer holds while it removes a dead holder's lock is stale after this long. */
@@ -334,7 +336,10 @@ export class LakeWriteLock {
       this.reclaim(rec);
       return null;
     }
-    return { pid: rec.pid, program: "croft", ...(rec.runId ? { runId: rec.runId } : {}), ...(rec.asset ? { asset: rec.asset } : {}), action: "write", since: rec.since };
+    return {
+      pid: rec.pid, program: "croft", ...(rec.runId ? { runId: rec.runId } : {}), ...(rec.asset ? { asset: rec.asset } : {}),
+      action: rec.label === MAINTENANCE_LOCK_LABEL ? "maintenance" : "write", since: rec.since,
+    };
   }
 
   /**
@@ -456,4 +461,54 @@ function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
     const timer = setTimeout(done, Math.max(1, ms));
     signal?.addEventListener("abort", done, { once: true });
   });
+}
+
+// ---- A backup copying the bucket ---------------------------------------------------------------------------------
+
+/** The folder in the state folder that holds a marker for each backup that is copying. */
+const BACKUP_MARKERS = "lake-backups";
+
+interface BackupMarker { pid: number; procStart: string; bootId: string; since: string }
+
+/**
+ * `croft backup` of a lake takes the catalog's dump under croft's lock on the lake's writes, then lets writes go on while it copies the
+ * bucket (a slow copy must not hold up runs). A write only adds files, but a maintenance pass deletes them, and the dump names files the
+ * pass may free; so while a backup copies, its marker in the state folder keeps this machine's passes, and the deletion of files that are not
+ * the lake's own, from running (db/lake-pass.ts, which looks again with the lock held). Each backup has a marker of its own, so one that
+ * finishes removes its own and no other; a marker whose process is gone is no marker. Returns what removes it.
+ */
+export function markBackupRunning(stateDir: string): () => void {
+  const id = currentIdentity();
+  const dir = join(stateDir, BACKUP_MARKERS);
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, `${id.pid}-${randomUUID()}.json`);
+  const rec: BackupMarker = { pid: id.pid, procStart: id.procStart, bootId: id.bootId, since: new Date().toISOString() };
+  writeFileSync(`${file}.tmp`, JSON.stringify(rec));
+  renameSync(`${file}.tmp`, file);
+  return () => rmSync(file, { force: true });
+}
+
+/** A backup that is copying this lake's bucket now, or null. The markers of processes that are gone are removed on the way. */
+export function backupRunning(stateDir: string): { pid: number; since: string } | null {
+  const dir = join(stateDir, BACKUP_MARKERS);
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return null;
+  }
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const file = join(dir, name);
+    try {
+      const rec = JSON.parse(readFileSync(file, "utf8")) as Partial<BackupMarker>;
+      if (typeof rec.pid === "number" && typeof rec.procStart === "string" && typeof rec.bootId === "string") {
+        if (recordAlive({ pid: rec.pid, procStart: rec.procStart, bootId: rec.bootId })) return { pid: rec.pid, since: String(rec.since ?? "") };
+      }
+      rmSync(file, { force: true });
+    } catch {
+      // Being written or removed meanwhile.
+    }
+  }
+  return null;
 }

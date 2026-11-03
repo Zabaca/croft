@@ -11,12 +11,12 @@ croft needs to carry on, as one consistent moment:
 Each backup is a new folder, <project>-<time>/ (the time in UTC, to the second; -2, -3… when that name is taken).
 croft never overwrites a backup and never deletes one. Inside:
 
-  warehouse.duckdb    every table, with croft's state for it, as of createdAt
+  warehouse.duckdb    every table, with croft's state for it, as of createdAt (a lake: see below)
   runs.sqlite         run history, schedules and their approvals, the catalog
   trash/              the versions croft restore can bring back
   backup.json         when, which croft and DuckDB wrote it, the project's paths, and every file with its size
 
-Left out: the asset files and lib/ (keep them in git), .env (secrets are never copied), files/ (the input files),
+A lake project's backup holds the lake in two parts instead of the warehouse file (see "A lake" below). Left out: the asset files and lib/ (keep them in git), .env (secrets are never copied), files/ (the input files),
 and croft's logs and other derived files under .croft/.
 
 ## Safe while croft works
@@ -45,6 +45,49 @@ elsewhere afterwards: it is a folder of closed files, so any copy tool, cloud st
 Drive, Dropbox) suits it. Only the live warehouse must stay out of synced folders (croft docs DB_ON_SYNCED_FOLDER).
 
 croft does not make backups on a schedule or remove old ones; delete old folders by hand, after asking the user.
+
+## A lake
+
+A lake is a catalog (a Postgres database) and a bucket folder, so its backup has:
+
+  catalog.dump        the catalog, from pg_dump in its custom format, as the read-only login
+  lake-data/          a mirror of the lake's bucket folder, read with the read-only key
+  runs.sqlite         run history, schedules and their approvals, the catalog mirror
+  trash/              the versions croft restore can bring back
+  backup.json         when, the lake's snapshot the catalog holds, where it came from (no credential), every file
+
+It needs pg_dump on the machine (LAKE_BACKUP_TOOL_MISSING says how to get it; CROFT_PG_DUMP names a pg_dump that is not on the
+PATH). The dump, run history and trash are taken at one moment, with the lake's writes held for the seconds that
+takes; the folder is then copied with runs going on. A file of a lake never changes once written, so a backup links, as a
+hard link, the same file of the last backup of this lake when its size is the same, and downloads only what is new
+(data.lake.data.reused counts them): a daily backup costs what the day wrote. A backup that is copying keeps this
+machine's lake maintenance from running. Files that appeared after the dump are in the mirror and not in the catalog; once
+restored they are files the lake does not own, which `croft maintain --orphans` lists.
+
+A local lake (croft's own tests) has catalog.sqlite in place of catalog.dump.
+
+## Putting a lake backup back
+
+Ask the user first: restoring needs a new database and a new bucket folder, made by whoever runs them (the setup in
+croft docs lake: a writer and a read-only login, a writer and a read-only key). It does not touch the old lake.
+
+1. Make an empty database with the same two logins, and an empty bucket folder.
+2. Restore the catalog as the writer: pg_restore -O -h <host> -p <port> -U <writer> -d <new database> catalog.dump (the
+   password in PGPASSWORD, not on the command line). Tables the writer creates are readable by the read-only login by
+   the setup's default privileges; without them, GRANT SELECT again as the setup does.
+3. Copy lake-data/ into the new bucket folder with the tool you use for buckets (aws s3 sync, rclone, mc), keeping the
+   names; the folder must then hold the lake and nothing else.
+4. The catalog stores where the data is; tell it the new place, as the writer, in the new database:
+   UPDATE ducklake_metadata SET value = 's3://<new bucket>/<new folder>/' WHERE key = 'data_path';
+5. Point the project at them: the lake block of croft.json (the new host, database, bucket and folder; the logins and
+   keys in .env), and copy runs.sqlite into the state folder and trash/ into its trash/ if this is a new project folder.
+6. croft doctor, then croft status: the tables, their rows and croft's bookkeeping are as they were at createdAt (the
+   snapshot in backup.json), and the next croft run fetches what is newer.
+   Files that were written after the dump are in lake-data/ and not in the catalog; `croft maintain --orphans` lists them (a day
+   after they were written), and nothing else: a restored lake with the stored folder changed has no other file it does not own.
+
+A backup test does exactly these steps into a fresh catalog and bucket and compares every table and every bookkeeping
+row.
 
 ## Putting a backup back
 

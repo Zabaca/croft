@@ -26,6 +26,7 @@ import type { doctor } from "./commands/doctor.ts";
 import type { help } from "./commands/help.ts";
 import type { init } from "./commands/init.ts";
 import type { logs } from "./commands/logs.ts";
+import type { maintain } from "./commands/maintain.ts";
 import type { newAsset } from "./commands/new.ts";
 import type { preview } from "./commands/preview.ts";
 import type { query } from "./commands/query.ts";
@@ -72,6 +73,7 @@ export interface CommandData {
   restore: DataOf<typeof restore>;
   new: DataOf<typeof newAsset>;
   backup: DataOf<typeof backup>;
+  maintain: DataOf<typeof maintain>;
 }
 
 /** The envelope every command prints, whatever its data (schemas/envelope.schema.json). */
@@ -80,7 +82,7 @@ export type AnyEnvelope = Envelope<unknown>;
 /** The commands with a schema, in the order of CommandData. */
 export const SCHEMA_COMMANDS = [
   "init", "doctor", "docs", "help", "version", "secrets", "context", "status", "describe", "query", "logs",
-  "run", "wait", "confirm", "validate", "preview", "schedule", "serve", "rename", "delete", "restore", "new", "backup",
+  "run", "wait", "confirm", "validate", "preview", "schedule", "serve", "rename", "delete", "restore", "new", "backup", "maintain",
 ] as const satisfies readonly (keyof CommandData)[];
 
 export type SchemaCommand = (typeof SCHEMA_COMMANDS)[number];

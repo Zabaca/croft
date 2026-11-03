@@ -234,6 +234,25 @@
           "description": "a local lake's folder for its Parquet files, relative to the project folder, e.g. \"lake/data\"; it holds nothing else",
           "type": "string",
           "minLength": 1
+        },
+        "maintenance": {
+          "description": "when croft runs the lake's maintenance by itself (croft docs lake)",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "description": "lake mode: croft runs the lake's maintenance by itself (flush, expire, merge, rewrite, clean up) after a run and from the scheduler; false leaves it to croft maintain by hand",
+              "type": "boolean",
+              "default": true
+            },
+            "everyHours": {
+              "description": "lake mode: how many hours after the last pass the next one is due (1 to 720); what a pass keeps is the trash's promise, 30 days or 5 versions per asset, and is not a setting",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 720,
+              "default": 24
+            }
+          }
         }
       }
     },

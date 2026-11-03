@@ -29,7 +29,7 @@ export function formatTick(d: TickResult): string {
   const started = d.spawned.length
     ? d.spawned.map((s) => `started ${s.runId} (${s.assets.join(", ")})`).join("; ")
     : "nothing due";
-  const lines = [`tick: ${started}${d.importedAssetCode ? " · read changed asset files" : ""} (${d.tookMs} ms)`];
+  const lines = [`tick: ${started}${d.importedAssetCode ? " · read changed asset files" : ""}${d.maintenance ? " · started the lake's maintenance" : ""} (${d.tookMs} ms)`];
   for (const h of d.held) lines.push(`  held ${h.asset} (${h.code}): ${h.reason}`);
   return lines.join("\n");
 }

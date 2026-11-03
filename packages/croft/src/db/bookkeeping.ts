@@ -100,7 +100,7 @@ export function logDdl(): { name: string; ddl: string }[] {
     out.push({
       name: t,
       ddl: `CREATE VIEW IF NOT EXISTS _croft.${t} AS SELECT * EXCLUDE (seq, closed) FROM ${logOf(t)}
-    QUALIFY row_number() OVER (PARTITION BY ${keyOf(t).join(", ")} ORDER BY seq DESC NULLS LAST) = 1 AND NOT coalesce(closed, false)`,
+    QUALIFY row_number() OVER (PARTITION BY ${keyOf(t).join(", ")} ORDER BY seq DESC NULLS LAST, rowid DESC) = 1 AND NOT coalesce(closed, false)`,
     });
   }
   return out;

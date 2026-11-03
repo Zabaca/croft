@@ -36,7 +36,7 @@ import * as intents from "./intent.ts";
 import {
   isCommitFailure, isConflict, isConnectionError, LAKE_RETRY, type LakeConnection, lakeBackoffMs, landedTag, LakeWriteLock, newCommitTag, TX_VARIABLE, WRITER_PREFIX, writerKey, writerRecord,
 } from "./lake.ts";
-import { LAKE_ALIAS, modeSecrets, scrubThrown } from "./modes.ts";
+import { LAKE_ALIAS, modeSecrets, scrub, scrubThrown } from "./modes.ts";
 import { now as clockNow } from "../core/time.ts";
 import { checkFormat, ensureState, hasState } from "./state.ts";
 import { TxGuard } from "./tx-guard.ts";
@@ -160,6 +160,8 @@ export class LeaseSql implements Sql {
   /** A lake write whose body begins and commits its own transactions (`transaction: false`): what croft does as it begins one (forget the
    *  log numbers of an earlier one) and just before it commits (tag the commit, record the machine). */
   hooks: { begin?: () => Promise<void>; commit?: () => Promise<void> } | null = null;
+  /** The statements of a lake warehouse: croft never runs CHECKPOINT on a lake, sets one of its options or expires its snapshots by age (D149). */
+  lake = false;
 
   constructor(readonly connection: DuckDBConnection, private readonly ctx: RenderContext, private readonly guard: TxGuard | null) {}
 
@@ -199,6 +201,7 @@ export class LeaseSql implements Sql {
         throw new CroftError("INTERNAL_ERROR", { message: "write() owns the transaction; do not BEGIN, COMMIT or ROLLBACK inside it", hint: "report this croft bug" });
       }
       this.guard?.check(type, sql);
+      if (this.lake) refuseOnLake(sql);
       const word = this.hooks && type === StatementType.TRANSACTION ? /^\s*(\w+)/.exec(sql)?.[1]?.toUpperCase() : undefined;
       if (word === "COMMIT") await this.hooks!.commit?.();
       let out: DuckDBResultReader | undefined;
@@ -215,6 +218,23 @@ export class LeaseSql implements Sql {
     } finally {
       stmt.destroySync();
     }
+  }
+}
+
+/**
+ * What croft never runs on a lake (DESIGN.md D149). CHECKPOINT runs all of DuckLake's maintenance from the lake's stored options, so an
+ * age-based expiry set by anyone expires a snapshot the trash pinned; an option set by croft would be one; an expiry that is not by an
+ * explicit list of versions is by age. croft runs each maintenance step itself (db/lake-maintenance.ts), and this keeps every other
+ * path of croft from issuing any of the three, whatever its caller thought it was doing.
+ */
+const NEVER_ON_A_LAKE = /^\s*(?:FORCE\s+)?CHECKPOINT\b|\bset_option\s*\(|ducklake_expire_snapshots\s*\((?![^)]*\bversions\s*=>)/i;
+export function refuseOnLake(sql: string): void {
+  if (NEVER_ON_A_LAKE.test(sql)) {
+    throw new CroftError("INTERNAL_ERROR", {
+      message: "croft does not run CHECKPOINT on a lake, set an option of it, or expire its snapshots by age",
+      hint: "report this croft bug: it would let DuckLake expire versions the trash promises to keep",
+      details: { sql: sql.slice(0, 120) },
+    });
   }
 }
 
@@ -274,6 +294,13 @@ export class DuckWarehouse implements Warehouse {
     this.key = this.lake ? `lake:${this.path}` : this.path;
   }
 
+  /** The Sql over a connection of this warehouse; a lake's refuses what croft never runs on one (refuseOnLake). */
+  private sqlOver(conn: DuckDBConnection, guard: TxGuard | null): LeaseSql {
+    const sql = new LeaseSql(conn, this.renderCtx(), guard);
+    sql.lake = this.lake !== null;
+    return sql;
+  }
+
   /** Whether this warehouse is a lake. */
   get isLake(): boolean {
     return this.lake !== null;
@@ -290,7 +317,7 @@ export class DuckWarehouse implements Warehouse {
   }
 
   read<T>(fn: (db: LeaseSql) => Promise<T>, o?: ReadOptions): Promise<T> {
-    return this.lease("read", o?.waitMs, (conn) => fn(new LeaseSql(conn, this.renderCtx(), null)), undefined, o?.signal);
+    return this.lease("read", o?.waitMs, (conn) => fn(this.sqlOver(conn, null)), undefined, o?.signal);
   }
 
   write<T>(label: string, fn: (tx: LeaseSql) => Promise<T>, o?: WriteOptions): Promise<T> {
@@ -304,7 +331,7 @@ export class DuckWarehouse implements Warehouse {
       started = true;
       return this.lease("write", o?.waitMs, async (conn) => {
         if (this.lake) return this.lakeWrite(conn, label, fn, o);
-        if (o?.transaction === false) return fn(new LeaseSql(conn, this.renderCtx(), null));
+        if (o?.transaction === false) return fn(this.sqlOver(conn, null));
         // DuckDB names a file database after its stem, so `warehouse.t` means main.t in warehouse.duckdb.
         const tx = new LeaseSql(conn, this.renderCtx(), new TxGuard({ database: basename(this.path, extname(this.path)) }));
         await conn.run("BEGIN TRANSACTION");
@@ -480,6 +507,11 @@ export class DuckWarehouse implements Warehouse {
     return this.spec.mode ? scrubThrown(e, modeSecrets(this.spec.mode)) : e;
   }
 
+  /** Text (a step's error that a body caught and reports itself) with the lake's credentials taken out. */
+  redact(text: string): string {
+    return this.spec.mode ? scrub(text, modeSecrets(this.spec.mode)) : text;
+  }
+
   /**
    * A lease on the lake: a connection (the first one attaches the lake, retried when the catalog was unreachable for a moment), working in
    * the lake, and the body. A read whose catalog or store connection dropped is tried again; a write does its own retrying
@@ -519,7 +551,7 @@ export class DuckWarehouse implements Warehouse {
       try {
         if (!this.formatChecked) {
           // Refuse a lake from a newer croft before touching it (DB_NEWER_FORMAT); once per process.
-          await checkFormat(new LeaseSql(conn, this.renderCtx(), null));
+          await checkFormat(this.sqlOver(conn, null));
           this.formatChecked = true;
         }
         return await body(conn);
@@ -569,7 +601,7 @@ export class DuckWarehouse implements Warehouse {
     });
     try {
       const own = o?.transaction === false;
-      if (own && o?.touchesLake === false) return await fn(new LeaseSql(conn, this.renderCtx(), null));
+      if (own && o?.touchesLake === false) return await fn(this.sqlOver(conn, null));
       const tagged = (tag: string) => `CALL ${LAKE_ALIAS}.set_commit_message('croft', '${tag}')`;
       const reset = async (tag: string) => {
         for (const stmt of seqResetSql()) await conn.run(stmt);
@@ -585,7 +617,7 @@ export class DuckWarehouse implements Warehouse {
       });
       for (let attempt = 0; ; attempt++) {
         const tag = o?.commitTag ?? newCommitTag();
-        const tx = new LeaseSql(conn, this.renderCtx(), own ? null : new TxGuard({ database: LAKE_ALIAS }));
+        const tx = this.sqlOver(conn, own ? null : new TxGuard({ database: LAKE_ALIAS }));
         let result: T | undefined;
         let ran = false;
         /** Just before the commit: this machine's record, the tag. */
@@ -628,7 +660,7 @@ export class DuckWarehouse implements Warehouse {
           if (maybe.length) {
             let landed: string | null;
             try {
-              landed = await landedTag(new LeaseSql(conn, this.renderCtx(), null), maybe.map((m) => m.tag));
+              landed = await landedTag(this.sqlOver(conn, null), maybe.map((m) => m.tag));
             } catch (check) {
               throw uncertain(`write "${label}" was committing when croft lost its connection to the lake, and croft could not find out whether it landed: ${(check instanceof Error ? check.message : String(check)).split("\n")[0]!.slice(0, 200)}`);
             }
@@ -858,7 +890,10 @@ export class DuckWarehouse implements Warehouse {
       });
     }
     let who: string;
-    if (holder.program === "croft's read server") who = `croft's read server (pid ${holder.pid}) has not stepped aside`;
+    if (holder.action === "maintenance") {
+      const since = holder.since ? `, ${Math.max(0, Math.round((Date.now() - Date.parse(holder.since)) / 1000))} s` : "";
+      who = `croft is running the lake's maintenance (pid ${holder.pid}${since})`;
+    } else if (holder.program === "croft's read server") who = `croft's read server (pid ${holder.pid}) has not stepped aside`;
     else if (holder.runId) {
       const since = holder.since ? `, ${Math.max(0, Math.round((Date.now() - Date.parse(holder.since)) / 1000))} s` : "";
       who = `croft run ${holder.runId}${holder.asset ? `, writing ${holder.asset}` : ""}${since}`;

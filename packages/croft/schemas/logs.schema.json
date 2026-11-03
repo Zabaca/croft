@@ -313,6 +313,12 @@
         },
         "estimatedRequests": {
           "type": "number"
+        },
+        "files": {
+          "type": "number"
+        },
+        "asOf": {
+          "type": "string"
         }
       },
       "required": [
