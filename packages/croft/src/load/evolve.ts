@@ -13,6 +13,7 @@
 import { CroftError } from "../core/errors.ts";
 import type { ColumnPlan, SchemaChange, Sql } from "../core/types.ts";
 import { inLake } from "../db/bookkeeping.ts";
+import { TX_VARIABLE } from "../db/lake.ts";
 import { RESERVED } from "./contract.ts";
 
 /** A column as the database reports it, with the type normalized (see normalizeType). */
@@ -136,18 +137,44 @@ export const lakePromotes = (c: Retype): boolean => c.using === undefined && LAK
  * read a table back in a transaction that changed it ("Table 0 does not exist" after an ALTER, a missing data file after a rewrite) [V: 2.0.0,
  * DuckLake 1.0, probed in the transaction with 2 and with 50 rows], so a rewrite is the first change to a table in its write, and a second
  * one is refused here with a croft code instead of that. An ALTER after the rewrite is fine.
+ *
+ * The refusal is croft's own count, not DuckLake's error: whether a second rewrite fails there depends on timing (a CI run on a slow runner
+ * found it succeeding where every local run failed), and one that succeeds by luck must not be allowed. The count is a variable of the
+ * connection, `croft_changed_<table>`, holding the name of the transaction (`croft_tx`, set as a lake write begins) that last changed the
+ * table here by an ALTER or a rewrite; a rewrite finding its own transaction's name there is refused before it runs.
  */
 export async function retypeColumns(tx: Sql, o: { ref: string; table: string; db: string; changes: readonly Retype[] }): Promise<void> {
   if (o.changes.length === 0) return;
   const lake = await inLake(tx);
+  // In a lake: the name of this write's transaction, and whether this table was changed in it already.
+  const changedVar = `croft_changed_${o.table.replace(/[^A-Za-z0-9_]/g, "_")}`;
+  let txName: string | null = null;
+  let changedBefore = false;
+  if (lake) {
+    const [r] = await tx.all<{ tx: string | null; c: string | null }>(`SELECT getvariable('${TX_VARIABLE}') AS tx, getvariable('${changedVar}') AS c`);
+    txName = r?.tx ?? null;
+    changedBefore = txName !== null && r?.c === txName;
+  }
+  const mark = async () => {
+    if (txName !== null) await tx.exec(`SET VARIABLE ${changedVar} = '${txName}'`);
+  };
+  const refused = () => new CroftError("LAKE_UNSUPPORTED", {
+    message: `${o.table} cannot be retyped (${o.changes.map((c) => `${c.column} to ${c.to}`).join(", ")}) in the same write that already changed it: a lake rewrites a table for this change, and cannot do it after another change to the table`,
+    hint: "make one change at a time: run once with the pin or the new data that retypes the column, then again with the other change",
+    fix: { kind: "manual", description: "split the change over two runs; nothing was written by this one", requiresHuman: false },
+    effect: "nothing was written",
+    details: { table: o.table, columns: o.changes.map((c) => c.column) },
+  });
   if (!lake || o.changes.every(lakePromotes)) {
     for (const c of o.changes) {
       await tx.exec(c.using === undefined
         ? `ALTER TABLE ${o.ref} ALTER COLUMN ${quoteIdent(c.column)} TYPE ${c.to}`
         : `ALTER TABLE ${o.ref} ALTER COLUMN ${quoteIdent(c.column)} SET DATA TYPE ${c.to} USING ${c.using}`);
     }
+    if (lake) await mark();
     return;
   }
+  if (changedBefore) throw refused();
   const columns = await readTableSchema(tx, o.table, o.db);
   if (!columns) throw new CroftError("INTERNAL_ERROR", { message: `cannot retype ${o.changes[0]!.column}: ${o.table} does not exist`, hint: "report this croft bug" });
   const select = columns.map((c) => {
@@ -157,15 +184,11 @@ export async function retypeColumns(tx: Sql, o: { ref: string; table: string; db
   try {
     await tx.exec(`CREATE OR REPLACE TABLE ${o.ref} AS SELECT ${select.join(", ")} FROM ${o.ref}`);
   } catch (e) {
+    // The count above is what refuses a second change; this is for a change DuckLake cannot read back that croft did not count (another DDL).
     if (!/Table \d+ does not exist|Cannot open file|NoSuchKey|HTTP 404/.test(e instanceof Error ? e.message : String(e))) throw e;
-    throw new CroftError("LAKE_UNSUPPORTED", {
-      message: `${o.table} cannot be retyped (${o.changes.map((c) => `${c.column} to ${c.to}`).join(", ")}) in the same write that already changed it: a lake rewrites a table for this change, and cannot do it after another change to the table`,
-      hint: "make one change at a time: run once with the pin or the new data that retypes the column, then again with the other change",
-      fix: { kind: "manual", description: "split the change over two runs; nothing was written by this one", requiresHuman: false },
-      effect: "nothing was written",
-      details: { table: o.table, columns: o.changes.map((c) => c.column) },
-    });
+    throw refused();
   }
+  await mark();
 }
 
 export interface EvolveInput {

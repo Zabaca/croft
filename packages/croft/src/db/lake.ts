@@ -154,6 +154,13 @@ export async function landedTag(sql: Sql, tags: readonly string[], o: { settleMs
   throw last;
 }
 
+/**
+ * The connection variable that names the write transaction in progress (its commit tag): set as a lake write begins, so a change that must
+ * happen once per transaction (a table's rewrite, load/evolve.ts retypeColumns) can be counted by croft and not found out from DuckLake's
+ * error, which comes or not by timing. A variable of the connection is seen by every wrapper around the transaction's Sql.
+ */
+export const TX_VARIABLE = "croft_tx";
+
 /** A fresh tag for one commit. */
 export function newCommitTag(): string {
   return `croft:${process.pid}:${randomUUID()}`;

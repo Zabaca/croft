@@ -7,6 +7,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
+import type { Sql } from "../core/types.ts";
 import { retypeColumns } from "../load/evolve.ts";
 import { lakeRigReady, type LakeRig, RIG_SECRETS, rigConnection, startLakeRig, WRITER_KEY, WRITER_LOGIN } from "./lake-testkit.ts";
 import { bookkeepingOf } from "./bookkeeping.ts";
@@ -307,6 +308,44 @@ describe("a warehouse that is a lake", () => {
     expect((err as CroftError).code).toBe("LAKE_COMMIT_UNCERTAIN");
     expect((err as CroftError).problem.details).toMatchObject({ landed: true });
     expect(await a.r.read(async (db) => Number((await db.all<{ n: number | bigint }>("SELECT count(*) AS n FROM t WHERE a = 8"))[0]!.n), { purpose: "test" })).toBe(1);
+  }, 120_000);
+
+  maybe("a second change of a table in one write is refused by croft's own count, whether or not DuckLake would have read the table back (small tables, wrappers, an ALTER first)", async () => {
+    const { w } = await fresh();
+    const ref = { ref: "lake.main.u", table: "u", db: "lake" };
+    // Three rows stay inlined in the catalog, where DuckLake itself reads a rewritten table back: the refusal must not depend on that.
+    await w.write("make u", async (tx) => {
+      await tx.exec("CREATE TABLE u (id INTEGER, s VARCHAR, n BIGINT)");
+      await tx.exec("INSERT INTO u VALUES (1, '7', 10), (2, '8', 20), (3, '9', 30)");
+    }, { runId: "r1" });
+    const shape = async () => (await w.read((db) => db.all<{ column_name: string; column_type: string }>("SELECT column_name, column_type FROM (DESCRIBE u)"), { purpose: "test" })).map((c) => [c.column_name, c.column_type]);
+    const refused = async (what: string, body: (tx: Parameters<Parameters<typeof w.write>[1]>[0]) => Promise<unknown>) => {
+      const err = await w.write(what, body as never, { runId: "r2" }).catch((e: unknown) => e);
+      expect(err, what).toBeInstanceOf(CroftError);
+      expect((err as CroftError).code, what).toBe("LAKE_UNSUPPORTED");
+      expect((err as CroftError).problem.effect, what).toBe("nothing was written");
+      expect(await shape(), what).toEqual([["id", "INTEGER"], ["s", "VARCHAR"], ["n", "BIGINT"]]);
+    };
+    await refused("two rewrites", async (tx) => {
+      await retypeColumns(tx, { ...ref, changes: [{ column: "s", from: "VARCHAR", to: "BIGINT" }] });
+      await retypeColumns(tx, { ...ref, changes: [{ column: "n", from: "BIGINT", to: "VARCHAR" }] });
+    });
+    await refused("two rewrites through a wrapper of the transaction's Sql", async (tx) => {
+      const wrapped: Sql = { all: <T,>(q: string, p?: unknown[]) => tx.all<T>(q, p), exec: (q: string, p?: unknown[]) => tx.exec(q, p) };
+      await retypeColumns(tx, { ...ref, changes: [{ column: "s", from: "VARCHAR", to: "BIGINT" }] });
+      await retypeColumns(wrapped, { ...ref, changes: [{ column: "n", from: "BIGINT", to: "VARCHAR" }] });
+    });
+    await refused("an ALTER, then a rewrite", async (tx) => {
+      await retypeColumns(tx, { ...ref, changes: [{ column: "id", from: "INTEGER", to: "BIGINT" }] });
+      await retypeColumns(tx, { ...ref, changes: [{ column: "s", from: "VARCHAR", to: "BIGINT" }] });
+    });
+    // A rewrite and then an ALTER is fine, and the next write may rewrite again: the count is of one transaction.
+    await w.write("a rewrite, then an ALTER", async (tx) => {
+      await retypeColumns(tx, { ...ref, changes: [{ column: "s", from: "VARCHAR", to: "BIGINT" }] });
+      await retypeColumns(tx, { ...ref, changes: [{ column: "id", from: "INTEGER", to: "BIGINT" }] });
+    }, { runId: "r3" });
+    await w.write("another write, another rewrite", (tx) => retypeColumns(tx, { ...ref, changes: [{ column: "n", from: "BIGINT", to: "VARCHAR" }] }), { runId: "r4" });
+    expect(await shape()).toEqual([["id", "BIGINT"], ["s", "BIGINT"], ["n", "VARCHAR"]]);
   }, 120_000);
 
   maybe("a column's type changes in a lake: a widening is an ALTER, anything else is one rewrite with the same columns, order and rows (retypeColumns)", async () => {
