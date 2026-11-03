@@ -242,6 +242,14 @@ const maintain = lazyCommand({
   maxPositionals: 0,
 }, async () => (await import("./maintain.ts")).maintain);
 
+const moveToLake = lazyCommand({
+  name: "move-to-lake",
+  summary: "move this project's file warehouse into the lake named by croft.json's lake block (\"enabled\": false): back it up, copy it, prove the copy equal, switch (needs confirmation)",
+  usage: "croft move-to-lake",
+  options: {},
+  maxPositionals: 0,
+}, async () => (await import("./move-to-lake.ts")).moveToLake);
+
 const newCmd = lazyCommand({
   name: "new",
   summary: "write a commented, working template for a new asset; --list shows the kinds",
@@ -255,5 +263,5 @@ const newCmd = lazyCommand({
 
 export const COMMANDS: readonly Command[] = [
   docs, help, version, init, doctor, validate, preview, run, wait, status, query, describe, context, logs, secrets, confirm,
-  schedule, serve, tick, rename, del, restore, backup, maintain, newCmd,
+  schedule, serve, tick, rename, del, restore, backup, maintain, moveToLake, newCmd,
 ];

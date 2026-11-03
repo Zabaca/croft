@@ -56,19 +56,20 @@ describe("telling a lake's errors apart", () => {
 });
 
 describe("the types a lake cannot hold", () => {
-  test("ENUM, UNION and VARINT, also inside a STRUCT, a LIST or a MAP, and nothing else", () => {
+  test("ENUM, UNION, VARINT, BIT and a fixed-size ARRAY, also inside a STRUCT, a LIST or a MAP, and nothing else", () => {
     const cols = [
       { name: "a", type: "ENUM('x', 'y')" }, { name: "b", type: "UNION(num INTEGER, str VARCHAR)" }, { name: "c", type: "VARINT" },
       { name: "d", type: "STRUCT(s ENUM('p', 'q'), n INTEGER)" }, { name: "e", type: "ENUM('a')[]" }, { name: "f", type: "MAP(VARCHAR, UNION(i INTEGER))" },
       { name: "g", type: "VARCHAR" }, { name: "h", type: "BIGINT[]" }, { name: "i", type: "STRUCT(enumeration VARCHAR)" }, { name: "j", type: "HUGEINT" }, { name: "k", type: "BIGNUM" },
+      { name: "l", type: "BIT" }, { name: "m", type: "INTEGER[3]" }, { name: "n", type: "STRUCT(a VARCHAR[2])" }, { name: "o", type: "STRUCT(bit INTEGER)" }, { name: "p", type: "BIGINT[][]" },
     ];
-    expect(lakeRefusedColumns(cols).map((c) => [c.name, c.kind])).toEqual([["a", "ENUM"], ["b", "UNION"], ["c", "VARINT"], ["d", "ENUM"], ["e", "ENUM"], ["f", "UNION"], ["k", "VARINT"]]);
+    expect(lakeRefusedColumns(cols).map((c) => [c.name, c.kind])).toEqual([["a", "ENUM"], ["b", "UNION"], ["c", "VARINT"], ["d", "ENUM"], ["e", "ENUM"], ["f", "UNION"], ["k", "VARINT"], ["l", "BIT"], ["m", "ARRAY"], ["n", "ARRAY"]]);
   });
 
   test("LAKE_TYPE_UNSUPPORTED names every column, the cast that fixes each, and that nothing was written", () => {
     let caught: unknown;
     try {
-      refuseLakeTypes("orders", [{ name: "status", type: "ENUM('open','closed')" }, { name: "big", type: "VARINT" }, { name: "ok", type: "INTEGER" }], "assets/orders.sql");
+      refuseLakeTypes("orders", [{ name: "status", type: "ENUM('open','closed')" }, { name: "big", type: "VARINT" }, { name: "flags", type: "BIT" }, { name: "xy", type: "DOUBLE[2]" }, { name: "ok", type: "INTEGER" }], "assets/orders.sql");
     } catch (e) {
       caught = e;
     }
@@ -78,6 +79,8 @@ describe("the types a lake cannot hold", () => {
     expect(p.message).toContain("status is ENUM('open','closed')");
     expect(p.hint).toContain("CAST(status AS VARCHAR) AS status");
     expect(p.hint).toContain("CAST(big AS HUGEINT) AS big");
+    expect(p.hint).toContain("CAST(flags AS VARCHAR) AS flags");
+    expect(p.hint).toContain("CAST(xy AS DOUBLE[]) AS xy");
     expect(p.effect).toBe("nothing was written");
     expect(p.file).toBe("assets/orders.sql");
     expect(p.fix).toMatchObject({ kind: "manual" });

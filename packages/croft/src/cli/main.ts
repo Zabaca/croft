@@ -54,6 +54,23 @@ export function dispatchOf(ctx: object): Dispatch | undefined {
   return dispatches.get(ctx);
 }
 
+/**
+ * First thing a command does in a project that has anything to do with a lake: the catalog mirror in runs.sqlite is put at home with the
+ * warehouse the project is on now (history/mirror-home.ts, D158), so a project switched back from a lake to its file reads the file's records
+ * and not the lake's. Nothing for the commands that need no project; never fails the command.
+ */
+async function settleCatalogMirror(ctx: CliContext, command: string): Promise<void> {
+  if (command === "docs" || command === "help" || command === "version" || command === "init") return;
+  try {
+    const p = ctx.findProject();
+    if (!p) return;
+    const { settleMirrorFor } = await import("../history/mirror-home.ts");
+    settleMirrorFor(p.paths.stateDir, p.databaseLabel, p.config.lake !== null || p.config.idleLake !== null);
+  } catch {
+    // A broken croft.json or runs.sqlite is the command's own to report.
+  }
+}
+
 /** Where the command name sits in argv and which global flags are present. Global flags may appear
  *  anywhere before a bare `--`; the first argument that is not a flag names the command. */
 export function scanArgv(argv: readonly string[]): { name?: string; index: number; json: boolean; help: boolean; version: boolean } {
@@ -128,6 +145,7 @@ export async function main(argv: readonly string[], io: MainIO = {}): Promise<nu
     ctx.positionals = parsed.positionals;
     // A lazily registered command's module is imported only now, once its flags are known to be good.
     if (cmd.load) cmd = await cmd.load();
+    await settleCatalogMirror(ctx, cmd.name);
     result = await cmd.run(ctx);
     if (io.dispatch) io.dispatch.result = result;
   } catch (e) {

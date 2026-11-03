@@ -174,17 +174,41 @@ export function newCommitTag(): string {
 
 // ---- Types a lake cannot hold -----------------------------------------------------------------------------------
 
-/** The column types DuckLake refuses (DuckLake 1.0 stores neither an ENUM, a UNION nor a VARINT), also inside a STRUCT, LIST or MAP. DuckDB 2.0
- *  spells a VARINT BIGNUM when it names the type of a column [V: 2.0.0]. */
+/** The column types DuckLake refuses: ENUM, UNION, VARINT (DuckDB 2.0 spells it BIGNUM when it names the type of a column), BIT and a fixed-size
+ *  ARRAY (`INTEGER[3]`; a LIST, `INTEGER[]`, is fine), also inside a STRUCT, LIST or MAP [V: 2.0.0, DuckLake 1.0, every other type round-trips:
+ *  the probe of option 07 slice 4 copied BOOLEAN, every integer width, HUGEINT and UHUGEINT, FLOAT, DOUBLE, DECIMAL, VARCHAR, BLOB, DATE, TIME,
+ *  TIMETZ, every TIMESTAMP, INTERVAL, UUID, JSON, STRUCT, LIST, MAP and TIME_NS out of a file and back with no difference]. The first three are
+ *  matched whatever the case; DuckDB writes BIT in capitals, so a STRUCT field named "bit" is not taken for one. */
 const LAKE_TYPE = /\b(ENUM|UNION|VARINT|BIGNUM)\b/i;
+const LAKE_BIT = /\bBIT\b/;
+const LAKE_ARRAY = /\[\d+\]/;
+
+export type LakeRefusedKind = "ENUM" | "UNION" | "VARINT" | "BIT" | "ARRAY";
 
 /** The columns among `columns` whose type a lake cannot hold, with the word that says so. */
-export function lakeRefusedColumns(columns: readonly { name: string; type: string }[]): { name: string; type: string; kind: "ENUM" | "UNION" | "VARINT" }[] {
+export function lakeRefusedColumns(columns: readonly { name: string; type: string }[]): { name: string; type: string; kind: LakeRefusedKind }[] {
   return columns.flatMap((c) => {
     const word = LAKE_TYPE.exec(c.type)?.[1]?.toUpperCase();
-    const kind = word === "BIGNUM" ? "VARINT" : (word as "ENUM" | "UNION" | "VARINT" | undefined);
+    const kind: LakeRefusedKind | undefined = word === "BIGNUM" ? "VARINT" : word ? (word as "ENUM" | "UNION" | "VARINT")
+      : LAKE_BIT.test(c.type) ? "BIT" : LAKE_ARRAY.test(c.type) ? "ARRAY" : undefined;
     return kind ? [{ name: c.name, type: c.type, kind }] : [];
   });
+}
+
+/** The SELECT expression that stores a refused column in a type a lake takes. */
+export function lakeCastFix(c: { name: string; type: string; kind: LakeRefusedKind }): string {
+  switch (c.kind) {
+    case "ENUM":
+    case "BIT":
+      return `CAST(${c.name} AS VARCHAR) AS ${c.name}`;
+    case "VARINT":
+      return `CAST(${c.name} AS HUGEINT) AS ${c.name}, or AS VARCHAR when it can be larger`;
+    case "ARRAY":
+      // A fixed-size array becomes a list of the same element type: INTEGER[3] → INTEGER[].
+      return `CAST(${c.name} AS ${c.type.replace(/\[\d+\]/g, "[]")}) AS ${c.name}`;
+    default:
+      return `CAST(${c.name} AS VARCHAR) AS ${c.name}, or to_json(${c.name}) AS ${c.name}`;
+  }
 }
 
 /**
@@ -195,14 +219,12 @@ export function refuseLakeTypes(asset: string, columns: readonly { name: string;
   const bad = lakeRefusedColumns(columns);
   if (!bad.length) return;
   const first = bad[0]!;
-  const fixes = bad.map((c) => c.kind === "ENUM" ? `CAST(${c.name} AS VARCHAR) AS ${c.name}`
-    : c.kind === "VARINT" ? `CAST(${c.name} AS HUGEINT) AS ${c.name}, or AS VARCHAR when it can be larger`
-    : `CAST(${c.name} AS VARCHAR) AS ${c.name}, or to_json(${c.name}) AS ${c.name}`);
+  const fixes = bad.map(lakeCastFix);
   throw new CroftError("LAKE_TYPE_UNSUPPORTED", {
     asset, ...(file ? { file } : {}),
     message: `${asset}: ${bad.map((c) => `${c.name} is ${c.type.length > 60 ? `${c.type.slice(0, 57)}...` : c.type}`).join("; ")}; a lake cannot store ${[...new Set(bad.map((c) => c.kind))].join(", ")} columns`,
     hint: `cast ${bad.length === 1 ? "it" : "them"} in the SELECT: ${fixes.join("; ")}`,
-    fix: { kind: "manual", description: `cast ${bad.map((c) => c.name).join(", ")} to a type a lake stores (VARCHAR, or HUGEINT for a VARINT) in ${file ?? `${asset}'s code`}` },
+    fix: { kind: "manual", description: `cast ${bad.map((c) => c.name).join(", ")} to a type a lake stores (VARCHAR, or HUGEINT for a VARINT, a list for a fixed-size array) in ${file ?? `${asset}'s code`}` },
     effect: "nothing was written",
     details: { columns: bad.map((c) => ({ name: c.name, type: c.type })), kind: first.kind },
   });

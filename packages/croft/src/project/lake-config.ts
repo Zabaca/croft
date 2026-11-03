@@ -52,6 +52,9 @@ export const SSL_MODES: readonly CatalogSslMode[] = ["verify-full", "require", "
  *  (isLoopbackHost). `sslRootCert` is as written (relative to the project folder, or absolute), present only with `verify-full`. */
 export interface SharedLakeConfig {
   kind: "postgres";
+  /** `lake.enabled` (default true). False: the block names a lake the project is not in (yet): the warehouse is still the file, and
+   *  `croft move-to-lake` moves it into this lake (D155). */
+  enabled: boolean;
   catalog: { host: string; port: number; database: string; sslMode: CatalogSslMode; sslRootCert?: string; writer: LakeLogin; reader: LakeLogin };
   bucket: LakeBucketConfig;
   maintenance: LakeMaintenanceConfig;
@@ -59,6 +62,7 @@ export interface SharedLakeConfig {
 /** A local lake: a SQLite catalog file and a data folder, both as written (relative to the project folder, or absolute). */
 export interface LocalLakeConfig {
   kind: "local";
+  enabled: boolean;
   catalog: { path: string };
   dataPath: string;
   maintenance: LakeMaintenanceConfig;
@@ -77,7 +81,7 @@ export interface LakeChecks {
   count(): number;
 }
 
-export const LAKE_KEYS = ["catalog", "bucket", "dataPath", "maintenance"];
+export const LAKE_KEYS = ["enabled", "catalog", "bucket", "dataPath", "maintenance"];
 const MAINTENANCE_KEYS = ["enabled", "everyHours"];
 const CATALOG_KEYS = ["kind", "host", "port", "database", "sslMode", "sslRootCert", "writer", "reader", "path"];
 const LOGIN_KEYS = ["user", "passwordSecret"];
@@ -143,7 +147,8 @@ export function validateLake(raw: unknown, c: LakeChecks): LakeConfig | null {
     return null;
   }
   const maintenance = maintenanceConfig(raw.maintenance, c);
-  const result = kind === "postgres" ? sharedLake(raw, cat, c, maintenance) : localLake(raw, cat, c, maintenance);
+  const enabled = c.bool(raw, "lake.enabled", "enabled", true);
+  const result = kind === "postgres" ? sharedLake(raw, cat, c, maintenance, enabled) : localLake(raw, cat, c, maintenance, enabled);
   return issueCount(c) > before ? null : result;
 }
 
@@ -216,7 +221,7 @@ function bucketKey(c: LakeChecks, parent: Record<string, unknown>, path: string,
   return id && key ? { keyIdSecret: id, secretKeySecret: key, ...(token ? { sessionTokenSecret: token } : {}) } : null;
 }
 
-function sharedLake(raw: Record<string, unknown>, cat: Record<string, unknown>, c: LakeChecks, maintenance: LakeMaintenanceConfig): SharedLakeConfig | null {
+function sharedLake(raw: Record<string, unknown>, cat: Record<string, unknown>, c: LakeChecks, maintenance: LakeMaintenanceConfig, enabled: boolean): SharedLakeConfig | null {
   const { add, show } = c;
   if (cat.path !== undefined) add("lake.catalog.path", `"lake.catalog.path" is for a SQLite catalog; a Postgres catalog is found by "host" and "database"`, `remove "path", or set "kind" to "sqlite"`);
   if (raw.dataPath !== undefined) add("lake.dataPath", `"lake.dataPath" is for a local lake; a Postgres catalog keeps its files in a bucket`, `remove "dataPath" and describe the bucket in "lake.bucket"`);
@@ -247,7 +252,7 @@ function sharedLake(raw: Record<string, unknown>, cat: Record<string, unknown>, 
   }
   const bucket = bucketConfig(raw.bucket, c);
   return host && database && writer && reader && bucket && tls
-    ? { kind: "postgres", catalog: { host, port, database, sslMode: tls.sslMode, ...(tls.sslRootCert ? { sslRootCert: tls.sslRootCert } : {}), writer, reader }, bucket, maintenance } : null;
+    ? { kind: "postgres", enabled, catalog: { host, port, database, sslMode: tls.sslMode, ...(tls.sslRootCert ? { sslRootCert: tls.sslRootCert } : {}), writer, reader }, bucket, maintenance } : null;
 }
 
 /** `sslMode` and `sslRootCert` (D159). Without `sslMode` a catalog on this machine keeps libpq's `prefer` (what croft did before the
@@ -353,7 +358,7 @@ function bucketConfig(raw: unknown, c: LakeChecks): LakeBucketConfig | null {
   return name && folder && writer && reader ? { name, folder, ...(endpoint ? { endpoint } : {}), ...(region ? { region } : {}), urlStyle, useSsl, ...(sslRootCert ? { sslRootCert } : {}), writer, reader } : null;
 }
 
-function localLake(raw: Record<string, unknown>, cat: Record<string, unknown>, c: LakeChecks, maintenance: LakeMaintenanceConfig): LocalLakeConfig | null {
+function localLake(raw: Record<string, unknown>, cat: Record<string, unknown>, c: LakeChecks, maintenance: LakeMaintenanceConfig, enabled: boolean): LocalLakeConfig | null {
   const { add, show } = c;
   for (const k of ["host", "port", "database", "sslMode", "sslRootCert", "writer", "reader"]) {
     if (cat[k] !== undefined) add(joinPath("lake.catalog", k), `"lake.catalog.${k}" is for a Postgres catalog; a SQLite catalog is one file, "path"`, `remove "${k}", or set "kind" to "postgres"`);
@@ -367,7 +372,7 @@ function localLake(raw: Record<string, unknown>, cat: Record<string, unknown>, c
   if (raw.dataPath === undefined) add("lake.dataPath", `a local lake needs "dataPath": the folder that holds its Parquet files and nothing else`, `add "dataPath": "lake/data"`);
   else if (typeof raw.dataPath !== "string" || raw.dataPath.trim() === "") add("lake.dataPath", `"lake.dataPath" must be a folder path; found ${show(raw.dataPath)}`, `use a path such as "lake/data"`);
   else dataPath = raw.dataPath;
-  return path && dataPath ? { kind: "local", catalog: { path }, dataPath, maintenance } : null;
+  return path && dataPath ? { kind: "local", enabled, catalog: { path }, dataPath, maintenance } : null;
 }
 
 // ---- Where a local lake's files may be ----------------------------------------------------------------------

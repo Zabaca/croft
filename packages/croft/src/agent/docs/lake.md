@@ -213,8 +213,10 @@ the lake's own functions and the bucket's files (`read_parquet('s3://...')` and 
 
 ## Types a lake cannot store
 
-DuckLake stores no ENUM, UNION or VARINT column. A result that has one fails before anything is written, with
-LAKE_TYPE_UNSUPPORTED and the cast that fixes it (`CAST(col AS VARCHAR)`).
+DuckLake stores no ENUM, UNION, VARINT, BIT or fixed-size ARRAY (`INTEGER[3]`) column. A result that has one fails before
+anything is written, with LAKE_TYPE_UNSUPPORTED and the cast that fixes it (`CAST(col AS VARCHAR)`). Every other type a
+croft table can have (all the integer widths, HUGEINT, DECIMAL, the TIMESTAMPs, INTERVAL, UUID, JSON, BLOB, STRUCT, LIST and
+MAP) is stored exactly.
 
 ## Not in this release
 

@@ -56,6 +56,9 @@ export interface CroftConfig {
   serverMode: ServerModeConfig;
   /** Lake mode (option 07, D138): the warehouse is a DuckLake, not `database`. Null: the file, as ever. */
   lake: LakeConfig | null;
+  /** A `lake` block with `"enabled": false` (D155): a lake the project is not in. The warehouse is still the file, which `croft move-to-lake`
+   *  moves into this lake. Null when the block is absent or on. */
+  idleLake: LakeConfig | null;
   notify: NotifyConfig;
   concurrency: number;               // parallel extractions in one run
   http: HttpConfig;
@@ -85,6 +88,7 @@ export const CONFIG_KEYS: { key: string; type: string; default: string; descript
   { key: "serverMode.quackPort", type: "integer", default: String(DEFAULTS.serverMode.quackPort), description: "the port for Quack; 0 picks a free one and the banner says which" },
   { key: "serverMode.quackPlaintextOnNetwork", type: "boolean", default: "false", description: "accept that a quackHost other than loopback carries keys and queries in plaintext, behind an HTTPS reverse proxy of your own; without this croft serve refuses to start with such an address (ask the user first)" },
   { key: "serverMode.quackMaxConcurrent", type: "integer", default: String(DEFAULTS.serverMode.quackMaxConcurrent), description: "Quack queries running at once, over all sessions; past it a query is refused with a retryable answer (1-64)" },
+  { key: "lake.enabled", type: "boolean", default: "true", description: "lake mode: false names a lake the project is not in yet; the warehouse stays the file until croft move-to-lake copies it into the lake and sets this to true. Setting it back to false returns to the untouched file (writes made in the lake since are not carried back)" },
   { key: "lake.catalog.kind", type: "\"postgres\" | \"sqlite\"", default: "(none: no lake)", description: "lake mode: keep the warehouse in a DuckLake. \"postgres\" is a shared lake (a Postgres catalog and a bucket); \"sqlite\" is a local one for development (croft docs lake)" },
   { key: "lake.catalog.host", type: "string", default: "(required, postgres)", description: "the Postgres server that holds the lake's catalog, e.g. \"db.example.com\"" },
   { key: "lake.catalog.port", type: "integer", default: "5432", description: "the Postgres server's port" },
@@ -292,8 +296,10 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined, p
   }
 
   // lake (D138): a DuckLake instead of the file. Off unless the project names one.
-  const lake = validateLake(raw.lake, { add, unknownKeys, str, bool, int, show, count: () => issues.length });
-  if (raw.lake !== undefined) {
+  const block = validateLake(raw.lake, { add, unknownKeys, str, bool, int, show, count: () => issues.length });
+  const lake = block && block.enabled ? block : null;
+  const idleLake = block && !block.enabled ? block : null;
+  if (lake) {
     if (serverMode.enabled) {
       add("serverMode.enabled", `"serverMode.enabled" cannot be on in a project with a lake yet: server mode over a lake is a later part of lake mode`,
         'turn "serverMode" off, or remove "lake"; croft serve still reads a lake without it');
@@ -424,11 +430,11 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined, p
   }
 
   if (place && !issues.length) {
-    for (const i of locationIssues(database, stateDir, place, lake)) add(i.path, i.message, i.hint);
+    for (const i of locationIssues(database, stateDir, place, block)) add(i.path, i.message, i.hint);
   }
 
   if (issues.length) return { ok: false, issues };
-  return { ok: true, config: { database, timezone, readCopy: readCopy || serverMode.enabled, serverMode, lake, notify: { desktop, webhook }, concurrency, http: { budgets }, serve, stateDir, secretsFrom } };
+  return { ok: true, config: { database, timezone, readCopy: readCopy || serverMode.enabled, serverMode, lake, idleLake, notify: { desktop, webhook }, concurrency, http: { budgets }, serve, stateDir, secretsFrom } };
 }
 
 /**
