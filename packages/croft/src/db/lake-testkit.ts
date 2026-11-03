@@ -6,6 +6,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { extensionsReady, IN_CI } from "./extension-dir-testkit.ts";
+import type { CatalogSslMode } from "../project/lake-config.ts";
 import type { LakeConnection } from "./lake.ts";
 import type { ModeSpec } from "./modes.ts";
 import type { DuckWarehouse } from "./warehouse.ts";
@@ -60,8 +61,8 @@ export function lakeRigReady(): { ready: boolean; dir: string; skipReason: strin
 
 let n = 0;
 
-export async function startLakeRig(): Promise<LakeRig> {
-  const pg = await startPostgres();
+export async function startLakeRig(o: { tls?: { cert: string; key: string } } = {}): Promise<LakeRig> {
+  const pg = await startPostgres(o);
   let s3: TestS3;
   try {
     s3 = await startS3({ buckets: ["lakeb", "other"], keys: { [WRITER_KEY.id]: "rw", [READER_KEY.id]: "ro" } });
@@ -106,12 +107,13 @@ export async function startLakeRig(): Promise<LakeRig> {
  * A rig lake as a warehouse opens it, with no project: the modes for each access, built from the rig's own values. For tests of the
  * warehouse itself (db/lake-warehouse.test.ts). `extensionDir` is the folder of pinned extension files.
  */
-export function rigConnection(rig: LakeRig, lake: RigLake, o: { stateDir: string; extensionDir: string; override?: { writerPassword?: string; port?: number } }): LakeConnection {
+export function rigConnection(rig: LakeRig, lake: RigLake, o: { stateDir: string; extensionDir: string; override?: { writerPassword?: string; port?: number }; catalog?: { host?: string; sslMode?: CatalogSslMode; sslRootCert?: string } }): LakeConnection {
   const mode = (access: "write" | "read"): ModeSpec => ({
     kind: "lake", extensionDir: o.extensionDir, secretDir: join(o.stateDir, "lake-secrets"),
     lake: {
       catalog: {
-        kind: "postgres", host: rig.pg.host, port: o.override?.port ?? rig.pg.port, database: lake.db,
+        kind: "postgres", host: o.catalog?.host ?? rig.pg.host, port: o.override?.port ?? rig.pg.port, database: lake.db,
+        ...(o.catalog?.sslMode ? { sslMode: o.catalog.sslMode } : {}), ...(o.catalog?.sslRootCert ? { sslRootCert: o.catalog.sslRootCert } : {}),
         user: access === "write" ? WRITER_LOGIN.user : READER_LOGIN.user,
         password: access === "write" ? o.override?.writerPassword ?? WRITER_LOGIN.password : READER_LOGIN.password,
       },

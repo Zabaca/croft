@@ -34,6 +34,24 @@ The project names them in croft.json, by the NAMES of the secrets that hold the 
       }
     }
 
+The catalog's connection uses TLS, and which check croft makes is a setting of the catalog block (`sslMode`, `sslRootCert`):
+
+- `"verify-full"`: encrypt, and check that the server's certificate is signed by a certificate authority croft trusts and was
+  issued for the name in `host`. This is the default for any catalog that is not on this machine, and the right choice for a
+  hosted Postgres (Neon, Supabase, RDS): the password and every catalog row cross the internet, and an unchecked certificate
+  lets anyone in the path read them. croft trusts this machine's CA bundle (`$SSL_CERT_FILE`, else /etc/ssl/cert.pem on macOS,
+  /etc/ssl/certs/ca-certificates.crt on Debian and Ubuntu, /etc/pki/tls/certs/ca-bundle.crt on Fedora and RHEL), or the PEM file
+  `"sslRootCert"` names (relative to the project folder; `~/` is the home folder). With neither, croft refuses with CONFIG_INVALID naming the setting; it
+  never skips the check. Use the host name the certificate was issued for (a provider's direct endpoint, not an IP address).
+- `"require"`: encrypt, and do not check the host name (libpq also verifies the certificate chain if a root.crt exists in
+  the user's ~/.postgresql, which croft does not set up). `"prefer"`: encrypt when the server offers TLS, otherwise go on in plaintext (what croft did
+  before this setting, and the default for `localhost` and `127.x.x.x`). `"disable"`: never encrypt. `croft doctor` warns about
+  each of these on a catalog that is on another machine. A catalog with no TLS (a Postgres you run yourself) needs one of them
+  written down, with the user's say-so: it is a decision that its password may be read on the network, and croft will not make it
+  by itself. A failed check is LAKE_ATTACH_FAILED with `details.tls: true`, not retryable.
+
+    "catalog": { "kind": "postgres", "host": "ep-example-123456.c-4.us-west-2.aws.neon.tech", "database": "croft_lake", "sslMode": "verify-full", … }
+
 The secrets live in .env, the shell or the secretsFrom command, like any other (croft docs secrets). Then install the
 lake add-on, which carries DuckDB's ducklake, httpfs and postgres extensions (croft docs addons), and check:
 
@@ -148,11 +166,16 @@ ALTER DEFAULT PRIVILEGES FOR ROLE <writer> IN SCHEMA public GRANT SELECT ON TABL
 
 ```sql duckdb-reader
 INSTALL ducklake; INSTALL postgres; INSTALL httpfs;
-CREATE SECRET lake_catalog (TYPE postgres, HOST '<host>', PORT <port>, DATABASE '<database>', USER '<analyst>', PASSWORD '<analyst_password>');
+CREATE SECRET lake_catalog (TYPE postgres, HOST '<host>', PORT <port>, DATABASE '<database>', USER '<analyst>', PASSWORD '<analyst_password>', SSLMODE '<sslmode>', SSLROOTCERT '<ca_file>');
 CREATE SECRET lake_files (TYPE s3, KEY_ID '<key_id>', SECRET '<key_secret>', ENDPOINT '<endpoint>', URL_STYLE 'path', USE_SSL <use_ssl>, SCOPE 's3://<bucket>/<folder>/');
 ATTACH 'ducklake:postgres:' AS lake (META_SECRET lake_catalog, DATA_PATH 's3://<bucket>/<folder>/', READ_ONLY);
 USE lake;
 ```
+
+  For a catalog on another machine, `<sslmode>` is `verify-full` and `<ca_file>` is a file of trusted certificate authorities
+  (/etc/ssl/cert.pem on macOS, /etc/ssl/certs/ca-certificates.crt on Debian and Ubuntu): without them the analyst's DuckDB does not
+  check the server it sends the password to. For a catalog on the same machine, `<sslmode>` is `prefer` and `<ca_file>` is any
+  existing file. DuckDB's libpq takes both options as they are, and `sslrootcert=system` is not a form to rely on.
 
   They then query the tables, and `FROM lake.snapshots()` or `SELECT ... FROM t AT (VERSION => <n>)` show the lake as it
   was, for every version the maintenance keeps (30 days, and each table's 5 newest versions). An attempt to write a table, or a file in the bucket, is refused (by the attach, by the store, by Postgres).

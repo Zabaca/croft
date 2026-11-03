@@ -102,6 +102,16 @@
               "type": "string",
               "pattern": "^[A-Za-z_][A-Za-z0-9_$-]*$"
             },
+            "sslMode": {
+              "description": "how croft uses TLS to the catalog: \"verify-full\" checks the server's certificate and host name (the right choice for any catalog on another machine), \"require\" encrypts and does not check the host name, \"prefer\" encrypts when the server offers it, \"disable\" never encrypts (croft docs lake)",
+              "type": "string",
+              "enum": ["verify-full", "require", "prefer", "disable"]
+            },
+            "sslRootCert": {
+              "description": "with \"verify-full\": the PEM file of certificate authorities the catalog's certificate must be signed by, relative to the project folder, `~/` for the home folder; leave it out to use the operating system's bundle (a hosted Postgres such as Neon)",
+              "type": "string",
+              "minLength": 1
+            },
             "writer": {
               "description": "the login croft writes the catalog with",
               "type": "object",

@@ -55,7 +55,7 @@ import { listLeases } from "../../history/leases.ts";
 import { RUNS_DB_FILE, RunsDb } from "../../history/runs-db.ts";
 import { commandText, ProjectEnv } from "../../project/env.ts";
 import { appRootOf, relocationPlan } from "../../project/init.ts";
-import { bucketPath } from "../../project/lake-config.ts";
+import { bucketPath, type CatalogSslMode, isLoopbackHost } from "../../project/lake-config.ts";
 import { configProblems, findRoot, loadProject, syncedLocation, type ConfigIssue, type Project, type SecretsFrom } from "../../project/root.ts";
 import { croftHome, type CroftHome } from "../../schedule/home.ts";
 import { jobPath } from "../../schedule/register.ts";
@@ -528,6 +528,34 @@ async function checkWarehouse(r: Report, d: DoctorDeps, project: Project, bindin
 }
 
 /**
+ * The catalog's TLS (D159): the check croft makes and, for verify-full, the CA file it will trust and what chose it, found the way the
+ * attach finds it; or the refusal the attach would give. A warning when the password and rows cross a network with no certificate check.
+ */
+async function checkCatalogTls(r: Report, d: DoctorDeps, project: Project, catalog: { host: string; sslMode: CatalogSslMode; sslRootCert?: string }): Promise<void> {
+  const { host, sslMode } = catalog;
+  const { catalogTls } = await import("../../db/catalog-tls.ts");
+  const fromEnv = ProjectEnv.load(project.root, d.env).lookup("SSL_CERT_FILE")?.value;
+  let ca: string | undefined;
+  try {
+    ca = catalogTls(catalog, project.root, { env: { SSL_CERT_FILE: fromEnv } }).sslRootCert;
+  } catch (e) {
+    if (!(e instanceof CroftError)) throw e;
+    r.add("environment", "lake.catalog.tls", "error", `${e.problem.message}; ${e.problem.hint}`, undefined, { host, sslMode, ...(catalog.sslRootCert ? { sslRootCert: catalog.sslRootCert } : {}) });
+    return;
+  }
+  const details = { host, sslMode, ...(ca ? { sslRootCert: ca } : {}) };
+  if (sslMode === "verify-full") {
+    const why = catalog.sslRootCert ? "named by lake.catalog.sslRootCert" : fromEnv && fromEnv === ca ? "chosen by $SSL_CERT_FILE" : "this machine's CA bundle";
+    r.add("environment", "lake.catalog.tls", "ok", `the catalog connection checks the server's certificate and host name (sslMode verify-full) against ${ca} (${why})`, undefined, details);
+  } else if (isLoopbackHost(host)) {
+    r.add("environment", "lake.catalog.tls", "info", `the catalog is on this machine; its connection uses sslMode ${sslMode}`, undefined, details);
+  } else {
+    r.add("environment", "lake.catalog.tls", "warn",
+      `the catalog connection to ${host} does not check the server's certificate (sslMode ${sslMode}): whoever sits between this machine and the catalog could read its password and rows; set "lake.catalog.sslMode" to "verify-full" if the catalog's certificate can be checked (croft docs lake)`, undefined, details);
+  }
+}
+
+/**
  * The lake line (lake mode, D138 to D144): the warehouse of a project with a `lake` block is attached read-only, with the read-only login
  * and bucket key, like any command that only reads, and not held: there is no file to be kept out of, so no writer's intent matters.
  * It says where the lake is and whether it is made yet, the croft format and bookkeeping kind in it, and who wrote it last (a write
@@ -542,6 +570,7 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
   const details: Record<string, unknown> = { lake: lake.kind, folder };
   r.add("environment", "lake.folder", "info",
     `the lake's folder (${folder}) must hold nothing but this lake: DuckLake's own cleanup deletes any file in it that it does not recognise`, undefined, details);
+  if (lake.kind === "postgres") await checkCatalogTls(r, d, project, lake.catalog);
   if (!bindingOk) {
     r.add("environment", "warehouse", "info", `${label} · not opened (the DuckDB binding does not load)`, undefined, details);
     return;

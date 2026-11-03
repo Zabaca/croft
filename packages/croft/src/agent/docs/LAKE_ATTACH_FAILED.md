@@ -13,6 +13,12 @@ Which kind it is shows in details and in `retryable`:
   wrong password, a login that does not exist, a key the store does not know). Trying again will not change it. The
   secret is the user's to fix: ask for the right one. Never print a secret to look at it, and never write one into a
   file the project commits.
+- `details.tls: true` (`retryable: false`): the catalog's TLS check failed. Its certificate is not signed by a CA in
+  the file `lake.catalog.sslRootCert` names (or this machine's CA bundle), was not issued for the name in
+  `lake.catalog.host`, or the catalog offers no TLS and `lake.catalog.sslMode` requires it; the message names which. Fix
+  the catalog's certificate or those two settings. Lowering `lake.catalog.sslMode` (to `require`, `prefer` or `disable`)
+  means the catalog's password may be read on the network: it is the user's call, never yours to make to get past the
+  error. `croft docs lake` says what each mode checks.
 - `details.notCreated: true` (`retryable: false`): a reader (`croft query`, `croft serve`, `croft doctor`) found a lake
   nobody has written yet. The machine that writes creates it with its first `croft run`. The commands that read report
   this as DB_NOT_FOUND.

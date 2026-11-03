@@ -71,6 +71,8 @@ const sharedLake = (over: Record<string, unknown> = {}) => ({
 const localLake = (over: Record<string, unknown> = {}) => ({ catalog: { kind: "sqlite", path: "lake/catalog.sqlite" }, dataPath: "lake/data", ...over });
 const VALID: unknown[] = [
   { ...tz, lake: sharedLake() }, { ...tz, lake: localLake() }, { ...tz, lake: localLake({ catalog: { kind: "sqlite", path: "/var/croft/catalog.sqlite" }, dataPath: "~/croft/data/" }) },
+  { ...tz, lake: sharedLake({ catalog: { ...sharedLake().catalog, sslMode: "verify-full", sslRootCert: "certs/neon-root.pem" } }) },
+  { ...tz, lake: sharedLake({ catalog: { ...sharedLake().catalog, sslMode: "disable" } }) },
   { ...tz, lake: sharedLake({ bucket: { name: "b-1", folder: "a", writer: { keyIdSecret: "A1", secretKeySecret: "B1" }, reader: { keyIdSecret: "A2", secretKeySecret: "B2" } } }) },
   { database: "warehouse.duckdb", timezone: "UTC" },
   { $schema: "./node_modules/@zabaca/croft/croft.schema.json", database: "warehouse.duckdb", timezone: "America/Los_Angeles" },
@@ -108,6 +110,8 @@ const INVALID: unknown[] = [
   { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, useSsl: "yes" } }) }, { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, writer: { keyIdSecret: "A" } } }) },
   { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, writer: { keyIdSecret: "A", secretKeySecret: "B", secret: "sk" } } }) },
   { ...tz, lake: localLake({ dataPath: "" }) }, { ...tz, lake: localLake({ catalog: { kind: "sqlite", path: "" } }) },
+  { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, sslMode: "verify" } }) }, { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, sslMode: true } }) },
+  { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, sslRootCert: "" } }) }, { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, sslRootCert: 7 } }) },
   { ...tz, lake: { ...sharedLake(), extra: 1 } },
   [], "croft", null, 42,
   {},
@@ -172,6 +176,8 @@ const SCHEMA_ACCEPTS_VALIDATOR_REJECTS: unknown[] = [
   { ...tz, lake: { catalog: { kind: "postgres", host: "h" }, bucket: sharedBucket } },          // a Postgres catalog needs its database and logins
   { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, reader: sharedCatalog.writer } }) }, // the read-only login is not the writer's
   { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, reader: sharedBucket.writer } }) },    // nor is the read-only bucket key
+  { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, sslMode: "require", sslRootCert: "ca.pem" } }) },  // a root certificate is for verify-full
+  { ...tz, lake: localLake({ catalog: { kind: "sqlite", path: "c.sqlite", sslMode: "disable" } }) },          // a SQLite catalog has no TLS
   { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, folder: "../other/" } }) },            // the folder stays inside the bucket
   { ...tz, lake: sharedLake(), serverMode: { enabled: true } }, { ...tz, lake: sharedLake(), readCopy: true }, // server mode over a lake is a later slice; no read copy of a lake
 ];

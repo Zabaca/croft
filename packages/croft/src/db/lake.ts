@@ -21,7 +21,8 @@ import type { ProjectEnv } from "../project/env.ts";
 import { bucketPath, type LakeConfig, lakeSecretNames, localLakePaths } from "../project/lake-config.ts";
 import type { Project } from "../project/root.ts";
 import { setTimeout as sleep } from "node:timers/promises";
-import { LAKE_ALIAS, type ModeSpec, REFUSED } from "./modes.ts";
+import { catalogTls } from "./catalog-tls.ts";
+import { LAKE_ALIAS, type ModeSpec, REFUSED, TLS_REFUSED } from "./modes.ts";
 import { CROFT_VERSION } from "./state.ts";
 
 /** What a warehouse needs to attach the project's lake: its label, and the mode (extensions, credentials, attach) for an access. */
@@ -55,7 +56,7 @@ export function lakeConnection(project: Project, env: ProjectEnv, o: { extension
     kind: lake.kind,
     secretDir,
     secretNames: names,
-    mode: (access) => lakeMode(lake, project, access, base, secret),
+    mode: (access) => lakeMode(lake, project, access, base, secret, { SSL_CERT_FILE: env.lookup("SSL_CERT_FILE")?.value }),
   };
 }
 
@@ -65,7 +66,8 @@ export function lakeOption(project: Project, env: ProjectEnv): { lake?: LakeConn
   return lake ? { lake } : {};
 }
 
-function lakeMode(lake: LakeConfig, project: Project, access: "write" | "read", base: Pick<ModeSpec, "projectRoot" | "secretDir" | "extensionDir">, secret: (name: string) => string): ModeSpec {
+function lakeMode(lake: LakeConfig, project: Project, access: "write" | "read", base: Pick<ModeSpec, "projectRoot" | "secretDir" | "extensionDir">, secret: (name: string) => string,
+  tlsEnv: NodeJS.ProcessEnv): ModeSpec {
   if (lake.kind === "local") {
     const { catalog, data } = localLakePaths(lake, project.root);
     // A reader never makes the lake; the machine that writes does, with the folders it needs.
@@ -78,11 +80,12 @@ function lakeMode(lake: LakeConfig, project: Project, access: "write" | "read", 
   const login = access === "write" ? lake.catalog.writer : lake.catalog.reader;
   const key = access === "write" ? lake.bucket.writer : lake.bucket.reader;
   const b = lake.bucket;
+  const tls = catalogTls(lake.catalog, project.root, { env: tlsEnv });
   return {
     ...base,
     kind: "lake",
     lake: {
-      catalog: { kind: "postgres", host: lake.catalog.host, port: lake.catalog.port, database: lake.catalog.database, user: login.user, password: secret(login.passwordSecret) },
+      catalog: { kind: "postgres", host: lake.catalog.host, port: lake.catalog.port, database: lake.catalog.database, user: login.user, password: secret(login.passwordSecret), ...tls },
       data: {
         path: bucketPath(b), keyId: secret(key.keyIdSecret), secretKey: secret(key.secretKeySecret),
         ...(key.sessionTokenSecret ? { sessionToken: secret(key.sessionTokenSecret) } : {}),
@@ -103,7 +106,7 @@ const CONNECTION = /server closed the connection|no connection to the server|con
 export function isConnectionError(e: unknown): boolean {
   const text = messageOf(e);
   // A server that answered and refused the login or the key is not a connection that dropped: waiting does not change its answer.
-  return CONNECTION.test(text) && !REFUSED.test(text);
+  return CONNECTION.test(text) && !REFUSED.test(text) && !TLS_REFUSED.test(text);
 }
 
 /** A commit DuckLake could not finish. Its cause may be a dropped connection or a conflict, and whether it landed is not known. */
