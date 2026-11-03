@@ -66,9 +66,9 @@ describe("which workflows can publish", () => {
     expect(JSON.stringify(log)).toContain("CROFT_EXTENSION_DIR");
   });
 
-  test("the full-suite jobs run in shards: the matrix lists 1 to N, the name says which, and the test step runs that one of N (DESIGN.md §10)", () => {
+  test("the jobs of the suite run in shards: the matrix lists 1 to N, the name says which, and the test step runs that one of N (DESIGN.md §10)", () => {
     const { doc } = load("ci.yml");
-    for (const name of ["test", "test-log"]) {
+    for (const name of ["test", "test-log", "test-lake-local", "test-lake-postgres"]) {
       const job = doc.jobs[name];
       const shards: number[] = job.strategy.matrix.shard;
       expect(shards.length, name).toBeGreaterThan(1);
@@ -76,12 +76,12 @@ describe("which workflows can publish", () => {
       expect(job.strategy["fail-fast"], `${name}: one shard failing must not hide the other's result`).toBe(false);
       expect(job.name, name).toContain(`shard \${{ matrix.shard }}/${shards.length}`);
       const steps: { name?: string; run?: string; if?: string }[] = job.steps;
-      const testSteps = steps.filter((st) => /\bbun test\b/.test(st.run ?? ""));
-      expect(testSteps.length, `${name}: one step runs the suite`).toBe(1);
-      expect(testSteps[0]!.run, name).toContain(`--shard=\${{ matrix.shard }}/${shards.length}`);
-      expect(testSteps[0]!.run, name).toContain("--timeout 60000");
-      // The typecheck does not depend on the shard: one shard runs it, in the matrix job that has one.
-      for (const st of steps.filter((x) => /typecheck/.test(x.run ?? ""))) expect(st.if, `${name}: typecheck`).toBe("matrix.shard == 1");
+      const sharded = steps.filter((st) => /--shard=/.test(st.run ?? ""));
+      expect(sharded.length, `${name}: one step runs the shard`).toBe(1);
+      expect(sharded[0]!.run, name).toContain(`--shard=\${{ matrix.shard }}/${shards.length}`);
+      expect(sharded[0]!.run, name).toContain("--timeout 60000");
+      // What does not depend on the shard (the typecheck, the run against an older DuckDB) is done once, by shard 1.
+      for (const st of steps.filter((x) => x !== sharded[0] && /\bbun (test|run typecheck)\b/.test(x.run ?? ""))) expect(st.if, `${name}: ${st.name}`).toBe("matrix.shard == 1");
     }
     // Both shards of every platform are in the matrix, so the whole suite runs on each.
     expect(doc.jobs.test.strategy.matrix.os).toEqual(["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15"]);

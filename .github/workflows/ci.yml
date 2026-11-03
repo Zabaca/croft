@@ -183,14 +183,19 @@ jobs:
 
   # The end-to-end journeys again with every project's warehouse in a lake (DESIGN.md D146): a SQLite catalog and a local folder in one job,
   # a Postgres catalog and an S3-compatible store (children of the test, never services) in the other. Each is a job of its own with its own
-  # timeout, beside the others, so no run lengthens another. A journey that is about the warehouse file or about server mode says so
+  # timeout, beside the others, so no run lengthens another, and each in two shards (DESIGN.md §10 "Test strategy"): the Postgres one took
+  # 29 minutes whole. A journey that is about the warehouse file or about server mode says so
   # (fileOnly in tests/e2e/harness.ts) and does not run on a lake. One platform is enough: what differs from the other jobs is the lake.
   test-lake-local:
-    name: ubuntu-24.04 · bun 1.3.14 · journeys on a local lake
+    name: ubuntu-24.04 · bun 1.3.14 · journeys on a local lake · shard ${{ matrix.shard }}/2
     needs: changes
     if: needs.changes.outputs.croft == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -238,14 +243,18 @@ jobs:
           CROFT_CI: "1"
           CROFT_E2E_LAKE: local
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
-        run: bun test --timeout 60000 tests/e2e
+        run: bun test --timeout 60000 --shard=${{ matrix.shard }}/2 tests/e2e
 
   test-lake-postgres:
-    name: ubuntu-24.04 · bun 1.3.14 · journeys on a Postgres lake
+    name: ubuntu-24.04 · bun 1.3.14 · journeys on a Postgres lake · shard ${{ matrix.shard }}/2
     needs: changes
     if: needs.changes.outputs.croft == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -293,10 +302,11 @@ jobs:
           CROFT_CI: "1"
           CROFT_E2E_LAKE: postgres
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
-        run: bun test --timeout 60000 tests/e2e
+        run: bun test --timeout 60000 --shard=${{ matrix.shard }}/2 tests/e2e
       # A lake croft wrote is read by DuckDB 1.5 as well (the lake is format 1.0, D137, acceptance 11): an older DuckDB and its extension files
       # are fetched into a folder of the runner and the recipe of `croft docs lake` is run with them.
       - name: a lake read by DuckDB 1.5.5
+        if: matrix.shard == 1
         working-directory: packages/croft
         env:
           CROFT_CI: "1"
