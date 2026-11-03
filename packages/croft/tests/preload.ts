@@ -19,3 +19,26 @@ process.env.CROFT_TEST_HARNESS = "1";
 // for a bare `bun test <one file>`, and the files that start real processes set their own default as well.
 import { setDefaultTimeout } from "bun:test";
 setDefaultTimeout(60_000);
+
+// The leak guard (tests/leak-guard.ts, DESIGN.md §10): every test file gets a last afterAll that fails the file, by name, when a process it
+// started is still running. A hook registered here belongs to the run, not to a file [V: Bun 1.3.14, a preload afterAll ran once, after the
+// last file], so the plugin appends an import of tests/file-guard.ts to each test file as it loads; the query makes that a module of its
+// own per file. At the end of the file, line numbers stay what they were, and the import (a dynamic one, after the file's own hooks have
+// registered) puts the check last, after the file's own afterAll hooks, which stop what the file started.
+import { plugin } from "bun";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+const FILE_GUARD = join(import.meta.dir, "file-guard.ts");
+if (process.platform !== "win32") { // croft does not run natively on Windows (DESIGN.md §2); the guard reads `ps`
+  plugin({
+    name: "croft-leak-guard",
+    setup(build) {
+      build.onLoad({ filter: /\.test\.ts$/ }, ({ path }) => {
+        if (path.includes("/node_modules/")) return undefined;
+        const source = readFileSync(path, "utf8");
+        return { contents: `${source}\nawait import(${JSON.stringify(`${FILE_GUARD}?f=${Buffer.from(path).toString("hex")}`)});\n`, loader: "ts" };
+      });
+    },
+  });
+}
