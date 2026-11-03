@@ -134,6 +134,13 @@ for (const kind of ["local", "postgres"] as const) {
 SELECT range AS id, sum(range::BIGINT * 9000000000000000) OVER () AS total, (range::HUGEINT * 123456789012345678901) AS wide FROM range(450)`);
       const r = await run(p, ["run", "sums"]);
       expect(r.code, show(r)).toBe(0);
+      // Said once, when the table is made; the second run finds the table with the type and says nothing.
+      const widened = (x: typeof r) => (x.json.problems ?? []).filter((q: { code: string }) => q.code === "TYPE_WIDENED").map((q: { details: { column: string; from: string; to: string } }) => `${q.details.column}:${q.details.from}>${q.details.to}`).sort();
+      expect(widened(r)).toEqual(["total:HUGEINT>DECIMAL(38,0)", "wide:HUGEINT>DECIMAL(38,0)"]);
+      p.edit("assets/sums.sql", "-- key: id", "-- key: id\n-- (run again)");
+      const again = await run(p, ["run", "sums"]);
+      expect(again.code, show(again)).toBe(0);
+      expect(widened(again)).toEqual([]);
       const type = async (c: string) => (await run(p, ["describe", "sums"])).json.data.columns.find((x: { name: string }) => x.name === c).type;
       expect(await type("total")).toBe("DECIMAL(38,0)");
       expect(await type("wide")).toBe("DECIMAL(38,0)");

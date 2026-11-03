@@ -82,7 +82,7 @@ describe("the catalog mirror and the warehouse it describes", () => {
     expect(readMoveRecord(db)).toBeNull();
     db.setSetting("lake.move", { nonsense: true });
     expect(readMoveRecord(db)).toBeNull();
-    const record = { at: "2026-11-02T00:00:00.000Z", runId: "r_1", lake: "lake x", tables: 2, rows: 47, fileSha256: "a".repeat(64), fileBytes: 10, backup: ".croft/backups/x" };
+    const record = { at: "2026-11-02T00:00:00.000Z", runId: "r_1", tag: "croft:1:move:x", lake: "lake x", tables: 2, rows: 47, fileSha256: "a".repeat(64), fileBytes: 10, backup: ".croft/backups/x" };
     db.setSetting("lake.move", record);
     expect(readMoveRecord(db)).toEqual(record);
     db.close();

@@ -8,6 +8,9 @@ hint gives the fix for it). Nothing was changed: the file, the lake and croft.js
   settings as they are; keep it on the file until it is built, or ask the user whether to turn server mode off first.
 - The read copy is on (`readCopy`): a lake has no file to copy. Ask the user, then remove it and read through
   croft serve.
+- The file has a write-ahead log: a croft that stopped before it checkpointed left writes that are not yet folded into
+  the file, and the backup that starts the move would fold them in and change the file's bytes. Run croft backup (it
+  checkpoints the file), then move.
 - croft serve is running: it would go on serving and scheduling for the file after the move. Stop it, move, start it
   again.
 - A croft rename did not finish: finish it first (croft rename <old> <new>).

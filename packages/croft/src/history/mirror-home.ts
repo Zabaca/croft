@@ -90,6 +90,8 @@ export const MOVE_SETTING = "lake.move";
 export interface MoveRecord {
   at: string;
   runId: string;
+  /** The tag of the copy the move made in the lake (its marker's): a lake that holds this copy was filled by a move that finished. */
+  tag: string;
   /** The lake, with no credential. */
   lake: string;
   tables: number;
@@ -102,5 +104,5 @@ export interface MoveRecord {
 
 export function readMoveRecord(db: RunsDb): MoveRecord | null {
   const v = db.getSetting<Partial<MoveRecord>>(MOVE_SETTING);
-  return v && typeof v.at === "string" && typeof v.fileSha256 === "string" ? (v as MoveRecord) : null;
+  return v && typeof v.at === "string" && typeof v.fileSha256 === "string" && typeof v.tag === "string" ? (v as MoveRecord) : null;
 }

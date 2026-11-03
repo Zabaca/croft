@@ -201,6 +201,22 @@ for (const kind of ["local", "postgres"] as const) {
       expect(v.columns.map((c) => `${c.table}.${c.column}`)).toEqual(["nested.st", "nested.lst", "nested.tz"]);
     }, 240_000);
 
+    maybe("the proof is bit-exact for floating-point columns: a -0.0 that became 0.0 is a difference, a -0.0 that stayed is not", async () => {
+      const l = await fresh(kind);
+      const file = await sourceFile(l, [
+        `CREATE TABLE floaty AS SELECT range AS id, CASE WHEN range = 3 THEN CAST('-0.0' AS DOUBLE) WHEN range = 4 THEN CAST('0.0' AS DOUBLE) WHEN range = 5 THEN CAST('NaN' AS DOUBLE) ELSE range / 7.0 END AS d, CAST(range AS FLOAT) / 3 AS f FROM range(20)`,
+      ]);
+      const inv = await l.w.read((sql) => withTrashFile(sql, file, (alias) => inventoryOf(sql, alias)), { purpose: "test" });
+      await copyIntoLake(l.w, file, inv, marker(inv.tables.map((t) => ({ name: t.name, rows: t.rows }))), { runId: "r_move", label: "the lake" });
+      // As copied (the sign of the zero and the NaN included) the lake is the file's.
+      expect((await verifyLake(l.reader, file, inv)).differences).toEqual([]);
+      // 0.0 where the file has -0.0: equal by value (DuckDB takes them for the same number), not the same bits.
+      await l.w.write("tamper", (tx) => tx.exec("UPDATE floaty SET d = CAST('0.0' AS DOUBLE) WHERE id = 3"), { runId: "r_tamper" });
+      const proof = await verifyLake(l.reader, file, inv);
+      expect(proof.differences).toEqual([expect.stringContaining("floaty: 1 rows hold a floating-point value that is not the file's bits: d (DOUBLE) holds 1 value")]);
+      expect(proof.columns).toEqual([{ table: "floaty", column: "d", type: "DOUBLE" }]);
+    }, 240_000);
+
     maybe("the lake reports what it holds: absent, empty, marked, used", async () => {
       const l = await fresh(kind);
       expect((await inspectLake(l.reader)).state).toBe("absent");

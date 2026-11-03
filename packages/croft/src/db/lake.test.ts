@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
-import { isCommitFailure, isConflict, isConnectionError, lakeInexactColumns, lakeRefusedColumns, refuseInexactTypes, LakeWriteLock, machineId, newCommitTag, parseWriter, refuseLakeTypes, writerRecord, writerReport } from "./lake.ts";
+import { isCommitFailure, isConflict, isConnectionError, lakeInexactColumns, lakeRefusedColumns, refuseInexactTypes, LakeWriteLock, machineId, newCommitTag, parseWriter, refuseUnfitLakeColumns, writerRecord, writerReport } from "./lake.ts";
 
 const made: string[] = [];
 afterAll(() => {
@@ -69,7 +69,7 @@ describe("the types a lake cannot hold", () => {
   test("LAKE_TYPE_UNSUPPORTED names every column, the cast that fixes each, and that nothing was written", () => {
     let caught: unknown;
     try {
-      refuseLakeTypes("orders", [{ name: "status", type: "ENUM('open','closed')" }, { name: "big", type: "VARINT" }, { name: "flags", type: "BIT" }, { name: "xy", type: "DOUBLE[2]" }, { name: "ok", type: "INTEGER" }], "assets/orders.sql");
+      refuseUnfitLakeColumns("orders", [{ name: "status", type: "ENUM('open','closed')" }, { name: "big", type: "VARINT" }, { name: "flags", type: "BIT" }, { name: "xy", type: "DOUBLE[2]" }, { name: "ok", type: "INTEGER" }], "assets/orders.sql");
     } catch (e) {
       caught = e;
     }
@@ -84,7 +84,7 @@ describe("the types a lake cannot hold", () => {
     expect(p.effect).toBe("nothing was written");
     expect(p.file).toBe("assets/orders.sql");
     expect(p.fix).toMatchObject({ kind: "manual" });
-    expect(() => refuseLakeTypes("orders", [{ name: "ok", type: "INTEGER" }])).not.toThrow();
+    expect(() => refuseUnfitLakeColumns("orders", [{ name: "ok", type: "INTEGER" }])).not.toThrow();
   });
 });
 
@@ -318,7 +318,7 @@ describe("the types a lake stores inexactly (D162)", () => {
     expect(p.file).toBe("assets/totals.sql");
     expect(() => refuseInexactTypes("totals", [{ name: "ok", type: "DECIMAL(38,0)" }])).not.toThrow();
     // A write that has both kinds is told the unsupported ones first, and the inexact ones once they are fixed.
-    expect(() => refuseLakeTypes("t", [{ name: "e", type: "ENUM('a')" }, { name: "h", type: "HUGEINT" }])).toThrow(/cannot store/);
-    expect(() => refuseLakeTypes("t", [{ name: "h", type: "HUGEINT" }])).toThrow(/differently from the ones written/);
+    expect(() => refuseUnfitLakeColumns("t", [{ name: "e", type: "ENUM('a')" }, { name: "h", type: "HUGEINT" }])).toThrow(/cannot store/);
+    expect(() => refuseUnfitLakeColumns("t", [{ name: "h", type: "HUGEINT" }])).toThrow(/differently from the ones written/);
   });
 });

@@ -62,7 +62,7 @@ import { CroftError, problem } from "../core/errors.ts";
 import type { AssetKind, ColumnPlan, CursorType, Problem, SchemaChange, Sql, StepResult, ValueKind } from "../core/types.ts";
 import { type InstantInput, now as clockNow, toEpochMicros } from "../core/time.ts";
 import { bookkeepingOf } from "../db/bookkeeping.ts";
-import { refuseLakeTypes } from "../db/lake.ts";
+import { LAKE_HUGE, refuseUnfitLakeColumns } from "../db/lake.ts";
 import { inLake } from "../db/bookkeeping.ts";
 import { ensureState } from "../db/state.ts";
 import { assertNoShrink, type ExtractInfo, isoMicros, readStoredColumns, type StoredColumn, tableStats,
@@ -205,20 +205,20 @@ let tempSeq = 0;
  * A SQL or TypeScript transform's top-level HUGEINT columns, retyped to DECIMAL(38,0) in the batch before it is written
  * to a lake: sum() and the like return a HUGEINT, a lake would keep it as a DOUBLE, and the DECIMAL holds the same whole
  * number exactly. A value that does not fit (past 38 digits) leaves the column as it is, to be refused with the cast
- * (refuseLakeTypes), never changed.
+ * (refuseUnfitLakeColumns), never changed.
  */
-async function widenHugeResults(tx: Sql, temp: string, columns: { name: string; type: string }[]): Promise<{ name: string; type: string }[]> {
+async function widenHugeResults(tx: Sql, temp: string, columns: { name: string; type: string }[]): Promise<{ columns: { name: string; type: string }[]; widened: string[] }> {
   const huge = columns.filter((c) => normalizeType(c.type) === "HUGEINT" && !isReservedColumn(c.name));
-  if (huge.length === 0) return columns;
-  let changed = false;
+  const widened: string[] = [];
   for (const c of huge) {
+    const q = quoteIdent(c.name);
     const [over] = await tx.all<{ n: number | bigint }>(
-      `SELECT count(*) AS n FROM ${tempRef(temp)} WHERE abs(${quoteIdent(c.name)}) >= 100000000000000000000000000000000000000::HUGEINT`);
+      `SELECT count(*) AS n FROM ${tempRef(temp)} WHERE ${q} >= 100000000000000000000000000000000000000::HUGEINT OR ${q} <= -100000000000000000000000000000000000000::HUGEINT`);
     if (Number(over!.n) > 0) continue;
-    await tx.exec(`ALTER TABLE ${tempRef(temp)} ALTER ${quoteIdent(c.name)} SET DATA TYPE DECIMAL(38,0)`);
-    changed = true;
+    await tx.exec(`ALTER TABLE ${tempRef(temp)} ALTER ${q} SET DATA TYPE ${LAKE_HUGE}`);
+    widened.push(c.name);
   }
-  return changed ? (await readTableSchema(tx, temp, "temp"))! : columns;
+  return { columns: widened.length ? (await readTableSchema(tx, temp, "temp"))! : columns, widened };
 }
 
 /** Write a typed batch into its asset's table. Call inside warehouse.write(); it never commits itself. */
@@ -247,11 +247,12 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
 
   let batchCols = await readTableSchema(tx, batch.temp, "temp");
   // In a lake a transform's HUGEINT result (sum() of integers is one) is stored as DECIMAL(38,0), which keeps every digit (D162).
-  if (batchCols && (kind === "sql" || kind === "ts") && (await inLake(tx))) batchCols = await widenHugeResults(tx, batch.temp, batchCols);
+  let widenedHuge: string[] = [];
+  if (batchCols && (kind === "sql" || kind === "ts") && (await inLake(tx))) ({ columns: batchCols, widened: widenedHuge } = await widenHugeResults(tx, batch.temp, batchCols));
   if (!batchCols) throw new CroftError("INTERNAL_ERROR", { message: `the batch table ${batch.temp} does not exist`, hint: "report this croft bug", asset });
   const inBatch = (name: string) => batchCols.find((c) => sameName(c.name, name));
   // A lake cannot store an ENUM, a UNION or a VARINT: refused here, before anything is written, with the cast that fixes it (D142).
-  if (await inLake(tx)) refuseLakeTypes(asset, batchCols, input.file);
+  if (await inLake(tx)) refuseUnfitLakeColumns(asset, batchCols, input.file);
   if (!inBatch(RESERVED.seq)) {
     throw new CroftError("INTERNAL_ERROR", { message: `the batch table ${batch.temp} has no ${RESERVED.seq} column`, hint: "report this croft bug", asset });
   }
@@ -296,6 +297,15 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
     if (kind === "ingest") pinned = await applyPinChanges(tx, { asset, real: before.exists ? before.columns : null, stored, pins: input.pins, plans: batch.columns });
     // 3g: every ALTER before any DML.
     evo = await evolveTable(tx, { table: asset, plans: pinned?.plans ?? batch.columns, batchColumns: batchCols });
+  }
+  // Said when the table is made or remade with the wider type, not on every run of a table that already has it.
+  if (createWithRows || evo.created) {
+    for (const column of widenedHuge) {
+      warnings.push(problem("TYPE_WIDENED", {
+        asset, message: `column ${column} widened from HUGEINT to ${LAKE_HUGE}: a lake would store a HUGEINT as a DOUBLE and change large values`,
+        hint: `every digit is kept; SQL that reads ${column} now sees ${LAKE_HUGE}`, details: { column, from: "HUGEINT", to: LAKE_HUGE },
+      }));
+    }
   }
   for (const c of evo.changes) {
     if (c.kind === "widen" && !warned("TYPE_WIDENED", c.column)) {

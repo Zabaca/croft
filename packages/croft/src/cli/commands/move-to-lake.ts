@@ -15,12 +15,12 @@
 // A project the move cannot start on is refused before anything is touched: no lake block, a lake already on, server mode or a read copy
 // (until server mode over a lake), a croft serve running (it would go on serving and scheduling for the file), a rename that did not
 // finish, a croft.json that cannot be rewritten, columns a lake cannot store, a lake that holds anything. Each refusal names its fix.
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { CroftError } from "../../core/errors.ts";
 import type { LockHolder, Problem } from "../../core/types.ts";
 import { acquire, release } from "../../history/leases.ts";
-import { type MoveRecord, MOVE_SETTING, stashMirror } from "../../history/mirror-home.ts";
+import { type MoveRecord, MOVE_SETTING, readMoveRecord, stashMirror } from "../../history/mirror-home.ts";
 import {
   configWritable, copyIntoLake, fingerprints, inexactColumns, inspectLake, inventoryOf, type LakeInspection, lakeHandles, lakeProjectOf, type LakeHandles,
   type MoveInventory, type MoveMarker, type NotMoved, newMoveTag, refuseInexact, refuseMoveTypes, switchLakeOn, undoCopy, verifyLake,
@@ -62,8 +62,10 @@ export interface MoveToLakeData {
   trash: { versions: number; cannotRestore: { asset: string; trashedAt: string; columns: string[] }[] };
   /** The backup made first (the file, run history and the trash), and what a move needs of it; null before the move runs. */
   backup: { path: string; bytes: number } | null;
-  /** The file's bytes, before and after: `unchanged` is what the move proved. Null before the move runs. */
-  file: { path: string; sha256: string; bytes: number; unchanged: boolean } | null;
+  /** The file's bytes as the copy has them, and whether they are the bytes the file had before the backup: `unchanged` is what the move proved,
+   *  `checkpointed` is true when the backup's checkpoint changed them (a move refuses a file with a pending write-ahead log, so this is a file that
+   *  was written to by something else between the question and the backup). Null before the move runs. */
+  file: { path: string; sha256: string; bytes: number; unchanged: boolean; checkpointed: boolean } | null;
   /** What the proof compared: tables, their rows, and the bookkeeping rows, all equal. Null before the move runs. */
   verified: { tables: number; rows: number; bookkeepingRows: number } | null;
   /** croft.json was changed: `lake.enabled` is now true. */
@@ -81,6 +83,15 @@ function blocked(reasons: { reason: string; fix: string }[], effect = "nothing w
     fix: { kind: "manual", requiresHuman: true, description: reasons.map((r) => r.fix).join("; then ") },
     details: { reasons: reasons.map((r) => r.reason) },
   });
+}
+
+/** The size of a DuckDB file's write-ahead log: 0 when there is none (a stat, not a read, so the file's lock is not touched). */
+function walBytes(database: string): number {
+  try {
+    return statSync(`${database}.wal`).size;
+  } catch {
+    return 0;
+  }
 }
 
 /** What can be told from croft.json, the state folder and the disk alone: no DuckDB is opened for any of it. */
@@ -113,6 +124,14 @@ function refuseUnlessReady(project: Project): void {
   }
   if (config.readCopy) {
     reasons.push({ reason: 'the read copy is on ("readCopy"), and a lake has no file to copy', fix: 'ask the user: remove "readCopy" from croft.json, and read through croft serve instead' });
+  }
+  // A process that stopped before it checkpointed leaves its writes in a write-ahead log, and the next program that opens the file for writing (the
+  // backup that starts the move is one) folds them into it. Said before the question, so that "not one byte changed" is true of the file as shown.
+  if (walBytes(project.paths.database) > 0) {
+    reasons.push({
+      reason: `${project.databaseLabel} has writes that are not yet folded into it (a write-ahead log, left by a croft that stopped before it checkpointed); the backup that starts the move would fold them in and change the file's bytes`,
+      fix: "run croft backup (it checkpoints the file, and the backup is kept), then run croft move-to-lake again",
+    });
   }
   const serve = readServeRecord(project.paths.stateDir);
   if (serve && isServeAlive(serve)) {
@@ -192,12 +211,15 @@ async function preflight(ctx: Ctx, s: Session, handles: LakeHandles): Promise<Pr
   const label = lakeProjectOf(project).databaseLabel;
   let mode: "copy" | "finish" = "copy";
   // An interrupted move left the copy in the lake: it is finished only if it is a copy of this file (the bytes the marker names).
-  const ofThisFile = lake.state === "marked" && lake.unchanged ? (await fingerprints([project.paths.database]))[0]?.sha256 === lake.marker!.fileSha256 : false;
+  // Not one whose move finished: the project was switched back to the file since (the record of the move names the copy it made), and a lake
+  // that a move filled and the project used is a lake that holds something (D161).
+  const finished = lake.state === "marked" && lake.marker !== null && readMoveRecord(s.runs)?.tag === lake.marker.tag;
+  const ofThisFile = lake.state === "marked" && lake.unchanged && !finished ? (await fingerprints([project.paths.database]))[0]?.sha256 === lake.marker!.fileSha256 : false;
   if (ofThisFile) mode = "finish";
   else if (lake.state === "marked" || lake.state === "used") {
     throw new CroftError("MOVE_LAKE_NOT_EMPTY", {
       message: lake.state === "marked"
-        ? `${label} holds a copy that a move made on ${lake.marker?.at ?? "an earlier day"}, and ${lake.unchanged ? "it is a copy of a file that is not this one" : "it has been written since"}`
+        ? `${label} holds a copy that a move made on ${lake.marker?.at ?? "an earlier day"}, and ${finished ? "that move finished and the project was switched back to the file since" : lake.unchanged ? "it is a copy of a file that is not this one" : "it has been written since"}`
         : `${label} already holds ${lake.tables.length ? `${plural(lake.tables.length, "table")} (${lake.tables.slice(0, 5).join(", ")}${lake.tables.length > 5 ? ", ..." : ""})` : `${plural(lake.bookkeepingRows, "bookkeeping row")}`}; a move only fills a lake that holds nothing`,
       hint: lake.state === "marked"
         ? 'to use that lake again set "lake.enabled": true in croft.json by hand (what was written there since stays there); to move the file again, name a new catalog database and bucket folder in the lake block'
@@ -257,12 +279,15 @@ function changed(why: string, details: Record<string, unknown> = {}): CroftError
   });
 }
 
-interface MoveOutcome { backup: ProjectBackup; file: { path: string; sha256: string; bytes: number; unchanged: boolean }; verified: { tables: number; rows: number; bookkeepingRows: number } }
+interface MoveOutcome { backup: ProjectBackup; tag: string; file: { path: string; sha256: string; bytes: number; unchanged: boolean; checkpointed: boolean }; verified: { tables: number; rows: number; bookkeepingRows: number } }
 
 async function move(ctx: Ctx, s: Session, handles: LakeHandles, p: Preflight, runId: string, onProgress: (text: string) => void): Promise<MoveOutcome> {
   const project = ctx.project;
   const database = project.paths.database;
   const wantFault = ctx.processEnv.CROFT_FAULT;
+  // 0. The file as it is, with its write-ahead log, before the backup: the backup's checkpoint folds a pending log into the file, which changes the
+  // file's bytes (not its values), and the move says so instead of calling it untouched.
+  const [before, beforeLog] = await fingerprints([database, `${database}.wal`]);
   // 1. The backup: croft's own, the file checkpointed and cloned under its lock, with run history and the trash.
   onProgress("backing up the warehouse");
   const backup = await backupProject(project, {
@@ -276,6 +301,7 @@ async function move(ctx: Ctx, s: Session, handles: LakeHandles, p: Preflight, ru
   const [orig, copy] = await fingerprints([database, backupFile]);
   if (!orig || !copy) throw changed("the file or its backup cannot be read");
   if (orig.sha256 !== copy.sha256) throw changed("the file is not the bytes the backup copied", { fileSha256: orig.sha256, backupSha256: copy.sha256 });
+  const checkpointed = (beforeLog?.bytes ?? 0) > 0 || before?.sha256 !== orig.sha256;
   // The backup is what is copied, so it is what is counted: it must be what the person was asked about.
   const inv = await s.warehouse.read((sql) => withTrashFile(sql, backupFile, (alias) => inventoryOf(sql, alias)), { purpose: "move into the lake: what the backup holds" });
   if (inv.generation !== p.inv.generation) throw changed("the tables or their records differ from what was shown");
@@ -335,7 +361,7 @@ async function move(ctx: Ctx, s: Session, handles: LakeHandles, p: Preflight, ru
   stashMirror(s.runs, project.databaseLabel);
   switchLakeOn(project);
   fault("move_after_switch", wantFault);
-  return { backup, file: { path: project.databaseLabel, sha256: orig.sha256, bytes: orig.bytes, unchanged: true }, verified: { tables: proof.tables, rows: proof.rows, bookkeepingRows: proof.bookkeepingRows } };
+  return { backup, tag: marker.tag, file: { path: project.databaseLabel, sha256: orig.sha256, bytes: orig.bytes, unchanged: !checkpointed, checkpointed }, verified: { tables: proof.tables, rows: proof.rows, bookkeepingRows: proof.bookkeepingRows } };
 }
 
 export const moveToLake: CommandImpl<MoveToLakeData> = {
@@ -390,7 +416,11 @@ export const moveToLake: CommandImpl<MoveToLakeData> = {
       case "moved": {
         const lines = [`ok    moved into the lake ${d.lake}: ${tablesWord(d.tables.length)}, ${plural(d.rows, "row")}, and croft's records of them (${plural(d.bookkeeping.reduce((n, b) => n + b.rows, 0), "row")})`];
         if (d.verified) lines.push(`      proved equal to the file from the lake's read-only login: ${tablesWord(d.verified.tables)} row for row, ${plural(d.verified.bookkeepingRows, "record")}`);
-        if (d.file) lines.push(`      the file is untouched (sha256 ${d.file.sha256.slice(0, 16)}..., ${formatBytes(d.file.bytes)}): the way back is "lake.enabled": false in croft.json`);
+        if (d.file) {
+          lines.push(`      ${d.file.checkpointed
+            ? "the file holds the same values, checkpointed by the backup (its pending write-ahead log was folded into it; its bytes are the ones now named, and are not changed again)"
+            : "the file is untouched"} (sha256 ${d.file.sha256.slice(0, 16)}..., ${formatBytes(d.file.bytes)}): the way back is "lake.enabled": false in croft.json`);
+        }
         if (d.backup) lines.push(`      backed up first: ${ctx.project.root && d.backup.path.startsWith(ctx.project.root) ? d.backup.path.slice(ctx.project.root.length + 1) : d.backup.path} (${formatBytes(d.backup.bytes)})`);
         lines.push('      croft.json now has "lake.enabled": true; commit it, and give the lake\'s secrets to whoever else runs this project');
         for (const t of w.then.slice(1)) lines.push(`      ${t}`);
@@ -449,7 +479,7 @@ async function carryOut(ctx: Ctx, s: Session, handles: LakeHandles, p: Preflight
     // It committed: from here on, bookkeeping trouble must not report the command as failed.
     try {
       const record: MoveRecord = {
-        at: ctx.now().toISOString(), runId, lake: lakeProjectOf(project).databaseLabel, tables: now.inv.tables.length, rows: now.inv.tables.reduce((n, t) => n + t.rows, 0),
+        at: ctx.now().toISOString(), runId, tag: out.tag, lake: lakeProjectOf(project).databaseLabel, tables: now.inv.tables.length, rows: now.inv.tables.reduce((n, t) => n + t.rows, 0),
         fileSha256: out.file.sha256, fileBytes: out.file.bytes, backup: shownIn(project, out.backup.path),
       };
       s.runs.setSetting(MOVE_SETTING, record);

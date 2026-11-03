@@ -477,6 +477,47 @@ if (!LAKE) {
     }, 300_000);
   });
 
+  describe(`journey 39 (${LAKE} lake): a move that finished, and a file with a pending log`, () => {
+    test("a. moved, switched back with no writes, then moved again: refused, not finished (the move already finished)", async () => {
+      const q = await small("again");
+      const done = await moveAndConfirm(q);
+      expect(done.code, show(done)).toBe(0);
+      q.edit("croft.json", '"enabled": true', '"enabled": false');
+      const sha0 = sha(warehouse(q));
+      const cfg0 = q.read("croft.json");
+      const again = await q.json(["move-to-lake"]);
+      expect(again.code, show(again)).toBe(2);
+      expect(again.json.problems[0]).toMatchObject({ code: "MOVE_LAKE_NOT_EMPTY", effect: "nothing was changed" });
+      expect(again.json.problems[0].message).toContain("that move finished and the project was switched back to the file since");
+      expect(again.json.problems[0].hint).toContain('"lake.enabled": true');
+      expect(sha(warehouse(q))).toBe(sha0);
+      expect(q.read("croft.json")).toBe(cfg0);
+    }, 600_000);
+
+    test("b. a file whose write-ahead log is pending is refused with its fix (croft backup checkpoints it), and then the file is byte for byte as it was shown", async () => {
+      const q = await small("walled", { run: false });
+      const killed = await q.croft(["run", "--foreground", "--json"], { env: { CROFT_FAULT: "after_commit_before_sqlite" } });
+      expect(killed.signal === "SIGKILL" || killed.code === 137, show(killed)).toBe(true);
+      expect(existsSync(`${warehouse(q)}.wal`), "the kill left a write-ahead log").toBe(true);
+      const cfg0 = q.read("croft.json");
+      const refused = await q.json(["move-to-lake"]);
+      expect(refused.code, show(refused)).toBe(2);
+      expect(refused.json.problems[0]).toMatchObject({ code: "MOVE_BLOCKED", effect: "nothing was changed" });
+      expect(refused.json.problems[0].message).toContain("write-ahead log");
+      expect(refused.json.problems[0].hint).toContain("croft backup");
+      expect(q.read("croft.json")).toBe(cfg0);
+      // The fix: the backup checkpoints the file, the log is gone, and the move goes on.
+      const backup = await q.json(["backup"]);
+      expect(backup.code, show(backup)).toBe(0);
+      expect(existsSync(`${warehouse(q)}.wal`), "the backup folded the log into the file").toBe(false);
+      const shown = sha(warehouse(q));
+      const done = await moveAndConfirm(q);
+      expect(done.code, show(done)).toBe(0);
+      expect(JSON.parse(done.stdout).data.result).toMatchObject({ status: "moved", file: { sha256: shown, checkpointed: false, unchanged: true } });
+      expect(sha(warehouse(q))).toBe(shown);
+    }, 600_000);
+  });
+
   describe(`journey 39 (${LAKE} lake): a kill -9 at each point of the move`, () => {
     for (const point of ["move_after_backup", "move_after_copy", "move_before_switch", "move_after_switch"] as const) {
       test(`${point}: the project is on the file or in the lake, never between, and the next move finishes it without copying twice`, async () => {

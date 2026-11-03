@@ -12,6 +12,7 @@
 // mixed fractions became VARCHAR, day/month order flipped with the rows present) [V], so two loads of the
 // same source could type differently. These rules depend only on the kinds of values seen.
 import { problem } from "../core/errors.ts";
+import { LAKE_HUGE } from "../db/lake.ts";
 import type { ColumnPlan, Problem, ValueKind } from "../core/types.ts";
 
 export const VALUE_KINDS: readonly ValueKind[] = [
@@ -302,8 +303,6 @@ export interface EvolveOptions {
   lake?: boolean;
 }
 
-/** The type croft's inference gives integers past 64 bits in a lake. */
-export const LAKE_HUGE = "DECIMAL(38,0)";
 
 /**
  * One column's decision (the §7 evolution table). `existing` is undefined for a new column, `incoming`

@@ -431,6 +431,8 @@ export interface Verified {
   columns: { table: string; column: string; type: string }[];
 }
 
+const FLOAT_TYPE = /\b(DOUBLE|FLOAT|REAL)\b/;
+
 /**
  * The lake against the backup's copy of the file, as the read-only login sees it: every table's columns and types, its row count and its
  * rows (EXCEPT ALL, the file's rows against the lake's, which with equal counts is multiset equality); every `_croft` table's latest rows
@@ -473,7 +475,28 @@ export async function verifyLake(reader: DuckWarehouse, backupFile: string, inv:
           }
         }
         differences.push(`${t.name}: ${num(d?.n)} rows of the file are not in the lake as they were${named.length ? `: ${named.join("; ")}` : ""}`);
-      } else rows += t.rows;
+      } else {
+        // Equal by value is not yet the same bits: DuckDB takes -0.0 for 0.0, so a table with a floating-point column is compared by the text of its
+        // rows as well (the text of -0.0 is "-0.0", of NaN "nan", and a float's text is the shortest that reads back as the same float).
+        const floats = t.columns.filter((c) => FLOAT_TYPE.test(c.type));
+        const [x] = floats.length
+          ? await sql.all<{ n: number | bigint }>(`SELECT count(*) AS n FROM (SELECT CAST(r AS VARCHAR) AS s FROM ${pre}main.${quoteIdent(t.name)} AS r EXCEPT ALL SELECT CAST(r AS VARCHAR) FROM main.${quoteIdent(t.name)} AS r)`)
+          : [{ n: 0 }];
+        if (num(x?.n) === 0) {
+          rows += t.rows;
+          continue;
+        }
+        const named: string[] = [];
+        for (const c of floats) {
+          const q = quoteIdent(c.name);
+          const [y] = await sql.all<{ n: number | bigint }>(`SELECT count(*) AS n FROM (SELECT CAST(${q} AS VARCHAR) FROM ${pre}main.${quoteIdent(t.name)} EXCEPT ALL SELECT CAST(${q} AS VARCHAR) FROM main.${quoteIdent(t.name)})`);
+          if (num(y?.n) > 0) {
+            named.push(`${c.name} (${c.type}) holds ${num(y?.n)} value${num(y?.n) === 1 ? "" : "s"} equal to the file's but not the same bits (-0.0 and 0.0)`);
+            columns.push({ table: t.name, column: c.name, type: c.type });
+          }
+        }
+        differences.push(`${t.name}: ${num(x?.n)} rows hold a floating-point value that is not the file's bits${named.length ? `: ${named.join("; ")}` : ""}`);
+      }
     }
     for (const name of lakeTables.keys()) if (!inv.tables.some((t) => t.name === name)) differences.push(`${name}: in the lake and not in the file`);
 

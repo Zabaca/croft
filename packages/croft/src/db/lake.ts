@@ -202,7 +202,7 @@ export function lakeCastFix(c: { name: string; type: string; kind: LakeRefusedKi
     case "BIT":
       return `CAST(${c.name} AS VARCHAR) AS ${c.name}`;
     case "VARINT":
-      return `CAST(${c.name} AS DECIMAL(38,0)) AS ${c.name}, or AS VARCHAR when it can be larger`;
+      return `CAST(${c.name} AS ${LAKE_HUGE}) AS ${c.name}, or AS VARCHAR when it can have more than 38 digits`;
     case "ARRAY":
       // A fixed-size array becomes a list of the same element type: INTEGER[3] → INTEGER[].
       return `CAST(${c.name} AS ${c.type.replace(/\[\d+\]/g, "[]")}) AS ${c.name}`;
@@ -222,6 +222,9 @@ export function lakeCastFix(c: { name: string; type: string; kind: LakeRefusedKi
  * (the maintenance flush moves rows from the catalog into files). DuckDB writes the type names in capitals, so a STRUCT field named "interval" is
  * not taken for one.
  */
+/** The type a lake keeps a whole number of up to 38 digits in exactly, where DuckDB would use a HUGEINT (D162). */
+export const LAKE_HUGE = "DECIMAL(38,0)";
+
 export type LakeInexactKind = "HUGEINT" | "UHUGEINT" | "INTERVAL" | "TIMETZ";
 
 const INEXACT: readonly [LakeInexactKind, RegExp][] = [
@@ -243,7 +246,7 @@ export function lakeInexactColumns(columns: readonly { name: string; type: strin
 export function lakeInexactFix(c: LakeInexactColumn): string {
   if (c.nested) return `cast the inner value, or turn the whole column into JSON with to_json(${c.name}) AS ${c.name}`;
   switch (c.kind) {
-    case "HUGEINT": return `CAST(${c.name} AS DECIMAL(38,0)) AS ${c.name} (exact up to 38 digits), or AS VARCHAR`;
+    case "HUGEINT": return `CAST(${c.name} AS ${LAKE_HUGE}) AS ${c.name} (exact up to 38 digits), or AS VARCHAR`;
     case "UHUGEINT": return `CAST(${c.name} AS VARCHAR) AS ${c.name}`;
     case "INTERVAL": return `CAST(${c.name} AS VARCHAR) AS ${c.name}, or the length as a whole number of milliseconds`;
     case "TIMETZ": return `CAST(${c.name} AS VARCHAR) AS ${c.name}, or CAST(${c.name} AS TIME) AS ${c.name} when the offset does not matter`;
@@ -269,7 +272,7 @@ export function refuseInexactTypes(asset: string, columns: readonly { name: stri
     asset, ...(file ? { file } : {}),
     message: `${asset}: ${bad.map((c) => `${c.name} is ${c.type.length > 60 ? `${c.type.slice(0, 57)}...` : c.type}`).join("; ")}; a lake would store ${bad.length === 1 ? "its values" : "their values"} differently from the ones written`,
     hint: `${kinds.map((k) => LAKE_INEXACT_WHY[k]).join("; ")}; store ${bad.length === 1 ? "it" : "them"} in a type a lake keeps exactly, in the SELECT or the pin that sets the type: ${bad.map(lakeInexactFix).join("; ")}`,
-    fix: { kind: "manual", description: `cast ${bad.map((c) => c.name).join(", ")} to a type a lake keeps exactly (DECIMAL(38,0) or VARCHAR for a HUGEINT, VARCHAR for an INTERVAL or a TIMETZ) in ${file ?? `${asset}'s code`}` },
+    fix: { kind: "manual", description: `cast ${bad.map((c) => c.name).join(", ")} to a type a lake keeps exactly (${LAKE_HUGE} or VARCHAR for a HUGEINT, VARCHAR for an INTERVAL or a TIMETZ) in ${file ?? `${asset}'s code`}` },
     effect: "nothing was written",
     details: { columns: bad.map((c) => ({ name: c.name, type: c.type, kind: c.kind, fix: lakeInexactFix(c) })), kind: bad[0]!.kind },
   });
@@ -279,7 +282,7 @@ export function refuseInexactTypes(asset: string, columns: readonly { name: stri
  * LAKE_TYPE_UNSUPPORTED for a result that has a column a lake cannot hold, before anything is written: croft's code and the cast that
  * fixes it, not DuckDB's error from the middle of a write. Nothing, for a column list the lake takes.
  */
-export function refuseLakeTypes(asset: string, columns: readonly { name: string; type: string }[], file?: string): void {
+export function refuseUnfitLakeColumns(asset: string, columns: readonly { name: string; type: string }[], file?: string): void {
   const bad = lakeRefusedColumns(columns);
   if (!bad.length) return refuseInexactTypes(asset, columns, file);
   const first = bad[0]!;
@@ -288,7 +291,7 @@ export function refuseLakeTypes(asset: string, columns: readonly { name: string;
     asset, ...(file ? { file } : {}),
     message: `${asset}: ${bad.map((c) => `${c.name} is ${c.type.length > 60 ? `${c.type.slice(0, 57)}...` : c.type}`).join("; ")}; a lake cannot store ${[...new Set(bad.map((c) => c.kind))].join(", ")} columns`,
     hint: `cast ${bad.length === 1 ? "it" : "them"} in the SELECT: ${fixes.join("; ")}`,
-    fix: { kind: "manual", description: `cast ${bad.map((c) => c.name).join(", ")} to a type a lake stores (VARCHAR, or HUGEINT for a VARINT, a list for a fixed-size array) in ${file ?? `${asset}'s code`}` },
+    fix: { kind: "manual", description: `cast ${bad.map((c) => c.name).join(", ")} to a type a lake stores (VARCHAR, or ${LAKE_HUGE} for a VARINT, a list for a fixed-size array) in ${file ?? `${asset}'s code`}` },
     effect: "nothing was written",
     details: { columns: bad.map((c) => ({ name: c.name, type: c.type })), kind: first.kind },
   });
