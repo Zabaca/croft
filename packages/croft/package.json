@@ -16,7 +16,7 @@
   "files": ["bin", "src", "dist", "schemas", "croft.schema.json", "!src/**/*.test.ts", "!src/**/testkit.ts", "!src/**/*-testkit.ts", "!src/**/fixtures"],
   "engines": { "bun": ">=1.3.14" },
   "scripts": {
-    "test": "bun test --timeout 60000",
+    "test": "bun test --timeout 60000 --no-orphans",
     "typecheck": "tsc --noEmit -p .",
     "eval": "bun evals/run.ts",
     "build": "bun scripts/build-read.ts",

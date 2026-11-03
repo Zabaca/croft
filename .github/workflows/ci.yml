@@ -42,9 +42,10 @@ jobs:
           if [ -n "$rest" ]; then echo "croft=true" >> "$GITHUB_OUTPUT"; else echo "croft=false" >> "$GITHUB_OUTPUT"; fi
           echo "outside the site and infra: ${rest:-nothing}"
 
-  # Tier 1 (DESIGN.md §10 item 8): macOS arm64, Linux x64 glibc and Linux arm64, on the Bun floor and latest.
+  # Tier 1 (DESIGN.md §10 item 8): macOS arm64, Linux x64 glibc and Linux arm64, on the Bun floor and latest. The suite runs in two
+  # shards per platform and Bun (DESIGN.md §10 "Test strategy"): one job of the whole suite ran 31 to 40 minutes against its 45.
   test:
-    name: ${{ matrix.os }} · bun ${{ matrix.bun }}
+    name: ${{ matrix.os }} · bun ${{ matrix.bun }} · shard ${{ matrix.shard }}/2
     needs: changes
     if: needs.changes.outputs.croft == 'true'
     runs-on: ${{ matrix.os }}
@@ -54,6 +55,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
         bun: ["1.3.14", "latest"]
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -98,7 +100,9 @@ jobs:
               bun scripts/check-mode-tools.ts
             fi
           fi
+      # The typecheck is the same in every shard, so one shard of each platform and Bun runs it.
       - name: typecheck
+        if: matrix.shard == 1
         working-directory: packages/croft
         run: bun run typecheck
       - name: test
@@ -107,18 +111,26 @@ jobs:
           CROFT_CI: "1"
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
         # --timeout: the default timeout tests/preload.ts sets reaches the first test file of a run only (DESIGN.md §10 "Test strategy").
-        run: bun test --timeout 60000
+        # --no-orphans: when this step is cancelled or killed, the test run and every process a test started go with it, as a cancelled
+        # run once left croft serve processes behind on the runner. --shard: Bun's own split of the test files, the same two halves in every
+        # job (tests/workflows.test.ts, tests/shards.test.ts).
+        run: bun test --timeout 60000 --no-orphans --shard=${{ matrix.shard }}/2
 
   # The whole suite again with croft's bookkeeping kept as a lake keeps it, an append-only log on a plain DuckDB file
   # (DESIGN.md D132): no Postgres for the lake, no lake. A job of its own, beside the matrix, so neither run lengthens the
   # other: both full suites in one job went past its 45 minutes. One platform is enough, since the log is the same everywhere.
+  # Split in two like the matrix (DESIGN.md §10 "Test strategy": sharding), so each half runs in about half the time.
   # CROFT_BOOKKEEPING is set here and nowhere else; tests/preload.ts adds the mark that lets it take effect (db/bookkeeping.ts).
   test-log:
-    name: ubuntu-24.04 · bun 1.3.14 · bookkeeping as a log
+    name: ubuntu-24.04 · bun 1.3.14 · bookkeeping as a log · shard ${{ matrix.shard }}/2
     needs: changes
     if: needs.changes.outputs.croft == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -169,7 +181,7 @@ jobs:
           CROFT_CI: "1"
           CROFT_BOOKKEEPING: log
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
-        run: bun test --timeout 60000
+        run: bun test --timeout 60000 --no-orphans --shard=${{ matrix.shard }}/2
 
   # The end-to-end journeys again with every project's warehouse in a lake (DESIGN.md D146): a SQLite catalog and a local folder in one job,
   # a Postgres catalog and an S3-compatible store (children of the test, never services) in the other. Each is a job of its own with its own
@@ -228,7 +240,7 @@ jobs:
           CROFT_CI: "1"
           CROFT_E2E_LAKE: local
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
-        run: bun test --timeout 60000 tests/e2e
+        run: bun test --timeout 60000 --no-orphans tests/e2e
 
   test-lake-postgres:
     name: ubuntu-24.04 · bun 1.3.14 · journeys on a Postgres lake
@@ -283,7 +295,7 @@ jobs:
           CROFT_CI: "1"
           CROFT_E2E_LAKE: postgres
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
-        run: bun test --timeout 60000 tests/e2e
+        run: bun test --timeout 60000 --no-orphans tests/e2e
       # A lake croft wrote is read by DuckDB 1.5 as well (the lake is format 1.0, D137, acceptance 11): an older DuckDB and its extension files
       # are fetched into a folder of the runner and the recipe of `croft docs lake` is run with them.
       - name: a lake read by DuckDB 1.5.5
@@ -293,7 +305,7 @@ jobs:
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
         run: |
           bun scripts/fetch-old-duckdb.ts "$RUNNER_TEMP/old-duckdb"
-          CROFT_TEST_OLD_DUCKDB="$RUNNER_TEMP/old-duckdb/node" CROFT_TEST_OLD_EXTENSIONS="$RUNNER_TEMP/old-duckdb/ext" bun test --timeout 60000 src/db/lake-reader-recipe.test.ts src/db/old-extension-pins.test.ts
+          CROFT_TEST_OLD_DUCKDB="$RUNNER_TEMP/old-duckdb/node" CROFT_TEST_OLD_EXTENSIONS="$RUNNER_TEMP/old-duckdb/ext" bun test --timeout 60000 --no-orphans src/db/lake-reader-recipe.test.ts src/db/old-extension-pins.test.ts
 
   # Smoke: Alpine (musl) installs and prints its version, and a fresh project runs its example and answers a query.
   alpine:

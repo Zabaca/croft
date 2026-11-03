@@ -66,6 +66,34 @@ describe("which workflows can publish", () => {
     expect(JSON.stringify(log)).toContain("CROFT_EXTENSION_DIR");
   });
 
+  test("the full-suite jobs run in shards: the matrix lists 1 to N, the name says which, and the test step runs that one of N (DESIGN.md §10)", () => {
+    const { doc } = load("ci.yml");
+    for (const name of ["test", "test-log"]) {
+      const job = doc.jobs[name];
+      const shards: number[] = job.strategy.matrix.shard;
+      expect(shards.length, name).toBeGreaterThan(1);
+      expect(shards, name).toEqual(shards.map((_, i) => i + 1));
+      expect(job.strategy["fail-fast"], `${name}: one shard failing must not hide the other's result`).toBe(false);
+      expect(job.name, name).toContain(`shard \${{ matrix.shard }}/${shards.length}`);
+      const steps: { name?: string; run?: string; if?: string }[] = job.steps;
+      const testSteps = steps.filter((st) => /\bbun test\b/.test(st.run ?? ""));
+      expect(testSteps.length, `${name}: one step runs the suite`).toBe(1);
+      expect(testSteps[0]!.run, name).toContain(`--shard=\${{ matrix.shard }}/${shards.length}`);
+      expect(testSteps[0]!.run, name).toContain("--timeout 60000");
+      // The typecheck does not depend on the shard: one shard runs it, in the matrix job that has one.
+      for (const st of steps.filter((x) => /typecheck/.test(x.run ?? ""))) expect(st.if, `${name}: typecheck`).toBe("matrix.shard == 1");
+    }
+    // Every run of croft's suite in ci.yml takes its processes with it when the step is cancelled or killed (--no-orphans).
+    for (const [name, job] of Object.entries<any>(doc.jobs)) {
+      for (const st of job.steps as { run?: string }[]) {
+        for (const line of (st.run ?? "").split("\n").filter((l) => /\bbun test --timeout 60000\b/.test(l))) expect(line, `${name}: ${line.trim()}`).toContain("--no-orphans");
+      }
+    }
+    // Both shards of every platform are in the matrix, so the whole suite runs on each.
+    expect(doc.jobs.test.strategy.matrix.os).toEqual(["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15"]);
+    expect(doc.jobs.test.strategy.matrix.bun).toEqual(["1.3.14", "latest"]);
+  });
+
   test("the journeys run on a lake of each kind in jobs of their own, beside the others, each with its own timeout (DESIGN.md D146)", () => {
     const { doc } = load("ci.yml");
     for (const [job, kind] of [["test-lake-local", "local"], ["test-lake-postgres", "postgres"]] as const) {
