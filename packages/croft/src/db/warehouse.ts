@@ -34,7 +34,7 @@ import { type AccessMode, canonicalPath, connect, type LockConflict, lockConflic
 import { bookkeepingOf, seqResetSql } from "./bookkeeping.ts";
 import * as intents from "./intent.ts";
 import {
-  isCommitFailure, isConflict, isConnectionError, LAKE_RETRY, type LakeConnection, lakeBackoffMs, landedTag, LakeWriteLock, newCommitTag, WRITER_PREFIX, writerKey, writerRecord,
+  isCommitFailure, isConflict, isConnectionError, LAKE_RETRY, type LakeConnection, lakeBackoffMs, landedTag, LakeWriteLock, newCommitTag, TX_VARIABLE, WRITER_PREFIX, writerKey, writerRecord,
 } from "./lake.ts";
 import { LAKE_ALIAS, modeSecrets, scrubThrown } from "./modes.ts";
 import { now as clockNow } from "../core/time.ts";
@@ -571,8 +571,9 @@ export class DuckWarehouse implements Warehouse {
       const own = o?.transaction === false;
       if (own && o?.touchesLake === false) return await fn(new LeaseSql(conn, this.renderCtx(), null));
       const tagged = (tag: string) => `CALL ${LAKE_ALIAS}.set_commit_message('croft', '${tag}')`;
-      const reset = async () => {
+      const reset = async (tag: string) => {
         for (const stmt of seqResetSql()) await conn.run(stmt);
+        await conn.run(`SET VARIABLE ${TX_VARIABLE} = '${tag}'`); // this transaction's name, for what may happen once in it
       };
       /** The attempts whose commit may yet land, with what their body returned. */
       const maybe: { tag: string; result: T | undefined }[] = [];
@@ -594,12 +595,12 @@ export class DuckWarehouse implements Warehouse {
           await this.o.beforeLakeCommit?.({ attempt, tag });
           await conn.run(tagged(tag));
         };
-        if (own) tx.hooks = { begin: reset, commit: beforeCommit };
+        if (own) tx.hooks = { begin: () => reset(tag), commit: beforeCommit };
         try {
           if (!own) {
             await conn.run("BEGIN TRANSACTION");
             // The numbers the log adapter kept (D145) are this transaction's: forget those of an earlier one, or of a rolled-back one.
-            await reset();
+            await reset(tag);
           }
           result = await fn(tx);
           if (!own) {
