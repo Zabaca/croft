@@ -328,6 +328,32 @@ describe("a store that answers HTTP 500 to a bulk delete (R2 did, three times in
   }, 180_000);
 });
 
+describe("the bookkeeping log's prune and a tie", () => {
+  (ready.ready ? test : test.skip)("rows that tie for newest are all kept, the view picks one of them by the row id, and only strictly older rows go", async () => {
+    const l = await fresh("local");
+    const { ensureState } = await import("./state.ts");
+    await l.w.write("state", (tx) => ensureState(tx as never, { bookkeeping: "log" }), { runId: "r" });
+    const insert = "INSERT INTO _croft.columns_log (asset, name, type, seq, closed) VALUES";
+    await l.w.write("by hand", async (tx) => {
+      // Two rows with one number (c), two with none (d), an older and a newer (e), a key whose rows tie and are both closed (f), and one tied and half closed (g).
+      await tx.exec(`${insert} ('a', 'c', 'FIRST', 5, false), ('a', 'c', 'SECOND', 5, false), ('a', 'd', 'FIRST', NULL, false), ('a', 'd', 'SECOND', NULL, false),
+        ('a', 'e', 'OLD', 1, false), ('a', 'e', 'NEW', 2, false), ('a', 'f', 'X', 7, true), ('a', 'f', 'Y', 7, true), ('a', 'g', 'X', 8, true), ('a', 'g', 'Y', 8, false)`);
+    }, { runId: "r" });
+    const view = () => l.r.read((db) => db.all<{ name: string; type: string }>("SELECT name, type FROM _croft.columns ORDER BY name"), { purpose: "test" });
+    const log = () => l.r.read((db) => db.all<{ name: string; type: string }>("SELECT name, type FROM _croft.columns_log ORDER BY name, type"), { purpose: "test" });
+    const before = await view();
+    // The view takes the later row of a tie; a key whose newest rows are all closing rows is not shown; one that is half closed is.
+    expect(before).toEqual([{ name: "c", type: "SECOND" }, { name: "d", type: "SECOND" }, { name: "e", type: "NEW" }, { name: "g", type: "Y" }]);
+    const report = await pass(l);
+    expect(report.steps[0]).toMatchObject({ step: "prune", status: "ok" });
+    expect(await view()).toEqual(before);
+    expect(await log()).toEqual([
+      { name: "c", type: "FIRST" }, { name: "c", type: "SECOND" }, { name: "d", type: "FIRST" }, { name: "d", type: "SECOND" }, { name: "e", type: "NEW" },
+      { name: "g", type: "X" }, { name: "g", type: "Y" },
+    ]);
+  }, 60_000);
+});
+
 describe("what croft never runs on a lake", () => {
   test("CHECKPOINT, an option set on the lake and an expiry that is not by an explicit list are refused (acceptance 4)", () => {
     for (const sql of ["CHECKPOINT", "checkpoint lake", "FORCE CHECKPOINT", "CALL lake.set_option('expire_older_than', '3 days')",

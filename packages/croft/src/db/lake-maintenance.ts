@@ -230,13 +230,20 @@ export async function readPlanInput(sql: Sql): Promise<{ snapshots: SnapshotInfo
 
 // ---- croft's bookkeeping log ----------------------------------------------------------------------------------------
 
-/** The statement that selects the rows of a bookkeeping log a pass may delete: every row a newer row of its key has superseded, and every row of
- *  a key whose newest row is a closing row (the view over the log shows neither). "Newest" is the view's own order, `seq` descending with NULL last. */
+/**
+ * The statement that selects the rows of a bookkeeping log a pass may delete: every row a strictly newer row of its key has superseded, and
+ * every row of a key whose newest rows are all closing rows (the view over the log shows neither). "Newest" is the view's own order, `seq`
+ * descending with NULL last; the view breaks a tie by the row id (a log made before that was added breaks it as DuckDB happens to), and
+ * croft never writes two rows of a key with one number, but a row somebody inserted by hand might tie: the rows that tie for newest are all
+ * kept, whichever of them the view shows, and a key is removed whole only when every one of them is a closing row.
+ */
 function supersededRows(t: (typeof ASSET_TABLES)[number]): string {
   const key = STATE_SPECS[t].key.join(", ");
   return `SELECT rowid AS rid FROM (
-    SELECT rowid, closed, row_number() OVER (PARTITION BY ${key} ORDER BY seq DESC NULLS LAST) AS rn FROM _croft.${t}_log
-  ) WHERE rn > 1 OR coalesce(closed, false)`;
+    SELECT rowid, rk, bool_and(coalesce(closed, false)) FILTER (WHERE rk = 1) OVER (PARTITION BY ${key}) AS dead FROM (
+      SELECT rowid, closed, ${key}, rank() OVER (PARTITION BY ${key} ORDER BY seq DESC NULLS LAST) AS rk FROM _croft.${t}_log
+    )
+  ) WHERE rk > 1 OR dead`;
 }
 
 /** Whether the lake's bookkeeping is the log (a lake nobody has written, or a file's tables, has nothing to prune). */
