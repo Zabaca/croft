@@ -522,8 +522,8 @@ describe("aborting a wait (Ctrl-C)", () => {
     const pending = rejection(w.write("blocked", async () => {
       throw new Error("the body must not run");
     }, { runId: "r_parent", signal: ac.signal }));
-    await sleep(150);
-    expect(heldCount(p.stateDir)).toBe(1); // waiting, with its intent announced
+    for (let i = 0; heldCount(p.stateDir) < 1 && i < 2000; i++) await sleep(10); // until it waits, with its intent announced
+    expect(heldCount(p.stateDir)).toBe(1);
     ac.abort(reason);
     expect(await pending).toBe(reason); // the wait was a minute long: one that the signal did not end would hang the test
     expect(heldCount(p.stateDir)).toBe(0);

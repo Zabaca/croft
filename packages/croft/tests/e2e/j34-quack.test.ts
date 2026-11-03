@@ -18,7 +18,7 @@ beforeAll(() => {
   api = mockApi();
 });
 afterAll(async () => {
-  clients.close();
+  await clients.close();
   api.stop();
   await cleanupAll();
 });

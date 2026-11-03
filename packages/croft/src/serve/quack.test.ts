@@ -17,7 +17,7 @@ const { ext, withExt } = extensionFiles("quack.test");
 const engines: ServeEngine[] = [];
 const clients = new QuackClients();
 afterAll(async () => {
-  clients.close();
+  await clients.close();
   for (const e of engines) await e.close().catch(() => {});
   await closeAllWarehouses();
   cleanup();

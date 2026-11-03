@@ -72,9 +72,13 @@ export class QuackClients {
     return client;
   }
 
-  /** Kill every client this started. */
-  close(): void {
-    for (const c of this.children) c.kill("SIGKILL");
+  /** Kill every client this started, and wait until each has exited (a test file that ends with a client still exiting is the leak guard's to name). */
+  async close(): Promise<void> {
+    await Promise.all(this.children.map((c) => new Promise<void>((resolve) => {
+      if (c.exitCode !== null || c.signalCode !== null) return resolve();
+      c.once("exit", () => resolve());
+      c.kill("SIGKILL");
+    })));
   }
 }
 
