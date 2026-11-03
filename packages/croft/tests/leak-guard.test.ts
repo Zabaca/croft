@@ -51,7 +51,9 @@ async function runFiles(files: Record<string, string>): Promise<{ code: number |
   for (const [name, text] of Object.entries(files)) writeFileSync(join(dir, name), text);
   const proc = Bun.spawn([process.execPath, "test", "--timeout", "60000"], {
     cwd: dir,
-    env: { ...process.env, CROFT_LEAK_GRACE_MS: "1500", NO_COLOR: "1" },
+    // Bun 1.4 sets BUN_FEATURE_FLAG_NO_ORPHANS in the children of a `bun test --no-orphans` run, and every Bun process that has it kills what its own
+    // children left behind when they exit: the fixtures here would be reaped before the guard looked, so the throwaway run is without it.
+    env: { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "BUN_FEATURE_FLAG_NO_ORPHANS")), CROFT_LEAK_GRACE_MS: "1500", NO_COLOR: "1" },
     stdout: "pipe",
     stderr: "pipe",
   });
