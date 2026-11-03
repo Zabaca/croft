@@ -1,4 +1,4 @@
-// Moving a project's file warehouse into a lake (DESIGN.md D155 to D161; option 07, slice 4). The work behind `croft move-to-lake`
+// Moving a project's file warehouse into a lake (DESIGN.md D167 to D173; option 07, slice 4). The work behind `croft move-to-lake`
 // (cli/commands/move-to-lake.ts), which owns the question, the confirmation and the run record.
 //
 // The file is the way back, so nothing here ever writes it. The whole move reads a *backup* of the file, made by croft's own backup first
@@ -161,7 +161,7 @@ export function refuseMoveTypes(inv: MoveInventory, files: ReadonlyMap<string, s
   });
 }
 
-/** A column of a type a lake would store inexactly (D162), with, for a top-level column, how many of the file's values would change now and one example. */
+/** A column of a type a lake would store inexactly (D174), with, for a top-level column, how many of the file's values would change now and one example. */
 export interface InexactColumn {
   table: string;
   column: string;
@@ -175,7 +175,7 @@ export interface InexactColumn {
 }
 
 /**
- * The columns of the file whose TYPE a lake stores inexactly (db/lake.ts lakeInexactColumns): the same test a lake write applies (D162), because a
+ * The columns of the file whose TYPE a lake stores inexactly (db/lake.ts lakeInexactColumns): the same test a lake write applies (D174), because a
  * table the move makes in the lake is written by croft's runs afterwards, and a run would refuse it. For a top-level column the values that would
  * change are counted too, as news for the person (a column with none yet is still refused: where its rows are kept changes under a table, and
  * the maintenance flush moves them into files). `alias`: an attached copy of the file, else the connection's own database.

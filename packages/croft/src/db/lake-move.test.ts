@@ -1,4 +1,4 @@
-// The pieces of moving a file warehouse into a lake (db/lake-move.ts; DESIGN.md D155 to D161; option 07, slice 4), against a real lake: a local one (a
+// The pieces of moving a file warehouse into a lake (db/lake-move.ts; DESIGN.md D167 to D173; option 07, slice 4), against a real lake: a local one (a
 // SQLite catalog and a folder) and a Postgres catalog with an S3-compatible store, started as children of this test. What is under test is the copy, the
 // proof and the undo, and what DuckLake changes on the way in, with no project and no CLI; the command is cli/commands/move-to-lake.test.ts and the
 // journey tests/e2e/j39-lake-move.test.ts.

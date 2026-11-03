@@ -427,7 +427,7 @@ function bindingsPresent(croftRoot: string): string[] {
 }
 
 /**
- * The project and a lake it was moved to or may be moved to (option 07, slice 4; D155 to D158), from croft.json and runs.sqlite alone: a lake
+ * The project and a lake it was moved to or may be moved to (option 07, slice 4; D167 to D170), from croft.json and runs.sqlite alone: a lake
  * block that is switched off says how to move into it; a project that is in the lake it was moved into says that the file is the way back and
  * how; one that was moved and is on the file again says what the file lacks.
  */

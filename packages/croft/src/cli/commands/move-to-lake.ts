@@ -1,4 +1,4 @@
-// croft move-to-lake (DESIGN.md §4.1, §6 "Moving a project into a lake", D155 to D161; option 07, slice 4): copy the project's file
+// croft move-to-lake (DESIGN.md §4.1, §6 "Moving a project into a lake", D167 to D173; option 07, slice 4): copy the project's file
 // warehouse, with croft's own records of it, into the lake named by the `lake` block of croft.json (the one with "enabled": false), prove
 // the copy equal to the file, and switch the project to the lake. Its spec (usage) is in commands/index.ts; the work is db/lake-move.ts.
 //
@@ -58,7 +58,7 @@ export interface MoveToLakeData {
   bookkeeping: { table: string; rows: number }[];
   /** What the file holds that a lake project has no place for; it stays in the file. */
   notMoved: NotMoved[];
-  /** The trash stays where it is, and restores into the lake; these versions hold columns a lake cannot store, or would store inexactly (D162), and would not restore as they are. */
+  /** The trash stays where it is, and restores into the lake; these versions hold columns a lake cannot store, or would store inexactly (D174), and would not restore as they are. */
   trash: { versions: number; cannotRestore: { asset: string; trashedAt: string; columns: string[] }[] };
   /** The backup made first (the file, run history and the trash), and what a move needs of it; null before the move runs. */
   backup: { path: string; bytes: number } | null;
@@ -212,7 +212,7 @@ async function preflight(ctx: Ctx, s: Session, handles: LakeHandles): Promise<Pr
   let mode: "copy" | "finish" = "copy";
   // An interrupted move left the copy in the lake: it is finished only if it is a copy of this file (the bytes the marker names).
   // Not one whose move finished: the project was switched back to the file since (the record of the move names the copy it made), and a lake
-  // that a move filled and the project used is a lake that holds something (D161).
+  // that a move filled and the project used is a lake that holds something (D173).
   const finished = lake.state === "marked" && lake.marker !== null && readMoveRecord(s.runs)?.tag === lake.marker.tag;
   const ofThisFile = lake.state === "marked" && lake.unchanged && !finished ? (await fingerprints([project.paths.database]))[0]?.sha256 === lake.marker!.fileSha256 : false;
   if (ofThisFile) mode = "finish";

@@ -225,7 +225,7 @@ async function impactOn(sql: Sql, v: TrashEntry, alias: string): Promise<Restore
     });
   }
   const kind = await kindOf(sql, alias);
-  // A lake stores some types inexactly or not at all (D142, D162): a version from the file's days that has such a column cannot come back as it was.
+  // A lake stores some types inexactly or not at all (D142, D174): a version from the file's days that has such a column cannot come back as it was.
   if (kind === "table" && (await inLake(sql))) refuseUnfitLakeColumns(asset, (await readTableSchema(sql, asset, alias)) ?? []);
   const exists = (await readTableSchema(sql, asset)) !== null;
   const currentRows = exists ? await count(sql, `main.${quoteIdent(asset)}`) : null;

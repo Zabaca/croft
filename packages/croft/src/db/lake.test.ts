@@ -285,7 +285,7 @@ describe("croft's lock on the writes of a machine", () => {
   });
 });
 
-describe("the types a lake stores inexactly (D162)", () => {
+describe("the types a lake stores inexactly (D174)", () => {
   test("HUGEINT, UHUGEINT, INTERVAL and TIMETZ, also inside a STRUCT, a LIST or a MAP, by the column's type", () => {
     const cols = [
       { name: "a", type: "HUGEINT" }, { name: "b", type: "UHUGEINT" }, { name: "c", type: "INTERVAL" }, { name: "d", type: "TIME WITH TIME ZONE" },

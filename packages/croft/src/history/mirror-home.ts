@@ -1,4 +1,4 @@
-// Which warehouse the catalog mirror describes (DESIGN.md §5 "Where state lives", D158; option 07, slice 4).
+// Which warehouse the catalog mirror describes (DESIGN.md §5 "Where state lives", D170; option 07, slice 4).
 //
 // The catalog mirror in runs.sqlite is a copy of each asset's `_croft` state, so `croft status`, `croft run --dry-run` and the run planner never
 // open the warehouse. It describes ONE warehouse. A project that moves into a lake and is switched back to its file (`"lake.enabled": false`) has

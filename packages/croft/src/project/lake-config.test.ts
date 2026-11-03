@@ -34,7 +34,7 @@ const folder = (): string => {
   return d;
 };
 
-describe("a lake block that is switched off (D155)", () => {
+describe("a lake block that is switched off (D167)", () => {
   test("names a lake the project is not in: the file is still the warehouse, and the block is kept for croft move-to-lake", () => {
     const r = validateConfig({ ...tz, lake: { ...shared(), enabled: false } });
     expect(r.ok).toBe(true);

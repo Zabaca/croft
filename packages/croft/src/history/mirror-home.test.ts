@@ -1,4 +1,4 @@
-// Which warehouse the catalog mirror describes (history/mirror-home.ts; DESIGN.md D158; option 07, slice 4): runs.sqlite only, no warehouse.
+// Which warehouse the catalog mirror describes (history/mirror-home.ts; DESIGN.md D170; option 07, slice 4): runs.sqlite only, no warehouse.
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";

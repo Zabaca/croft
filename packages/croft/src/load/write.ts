@@ -246,7 +246,7 @@ export async function writeBatch(tx: Sql, input: WriteBatchInput): Promise<Write
   }
 
   let batchCols = await readTableSchema(tx, batch.temp, "temp");
-  // In a lake a transform's HUGEINT result (sum() of integers is one) is stored as DECIMAL(38,0), which keeps every digit (D162).
+  // In a lake a transform's HUGEINT result (sum() of integers is one) is stored as DECIMAL(38,0), which keeps every digit (D174).
   let widenedHuge: string[] = [];
   if (batchCols && (kind === "sql" || kind === "ts") && (await inLake(tx))) ({ columns: batchCols, widened: widenedHuge } = await widenHugeResults(tx, batch.temp, batchCols));
   if (!batchCols) throw new CroftError("INTERNAL_ERROR", { message: `the batch table ${batch.temp} does not exist`, hint: "report this croft bug", asset });

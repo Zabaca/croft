@@ -1,4 +1,4 @@
-// Journey 39: moving an existing project into a lake (DESIGN.md D155 to D161; option 07, slice 4), on the lake of the job that runs it. It runs only
+// Journey 39: moving an existing project into a lake (DESIGN.md D167 to D173; option 07, slice 4), on the lake of the job that runs it. It runs only
 // when the journeys are run on a lake (CROFT_E2E_LAKE=local or postgres; the two lake jobs of ci.yml): it moves a real-sized project (thousands of
 // rows, several assets of every kind, a trash with versions, a run history), and the jobs that run every test on every platform have no time to spare.
 //

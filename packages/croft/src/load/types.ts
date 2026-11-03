@@ -296,7 +296,7 @@ export function pinFor(pins: Record<string, Pin>, column: string, sourceName?: s
   return undefined;
 }
 
-/** What evolution does differently in a lake (D162). */
+/** What evolution does differently in a lake (D174). */
 export interface EvolveOptions {
   /** The warehouse is a lake: it stores a HUGEINT as a DOUBLE, so croft's own inference makes a column of integers past 64 bits DECIMAL(38,0) (exact up
    *  to 38 digits), and a stored unpinned DECIMAL(38,0) is that column, with a HUGEINT's rules (it takes integers, widens to DOUBLE for fractions). */

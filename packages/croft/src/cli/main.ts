@@ -56,7 +56,7 @@ export function dispatchOf(ctx: object): Dispatch | undefined {
 
 /**
  * First thing a command does in a project that has anything to do with a lake: the catalog mirror in runs.sqlite is put at home with the
- * warehouse the project is on now (history/mirror-home.ts, D158), so a project switched back from a lake to its file reads the file's records
+ * warehouse the project is on now (history/mirror-home.ts, D170), so a project switched back from a lake to its file reads the file's records
  * and not the lake's. Nothing for the commands that need no project; never fails the command.
  */
 async function settleCatalogMirror(ctx: CliContext, command: string): Promise<void> {

@@ -1,4 +1,4 @@
-// croft move-to-lake (DESIGN.md D155 to D161; option 07, slice 4), run in this process against a local lake (a SQLite catalog and a folder): what it
+// croft move-to-lake (DESIGN.md D167 to D173; option 07, slice 4), run in this process against a local lake (a SQLite catalog and a folder): what it
 // refuses and says before it changes anything, the question on a terminal, the confirmation that goes stale or waits for a run, and the happy path in
 // miniature. The move of a real-sized project, on both kinds of lake, with a kill at each point, is the journey (tests/e2e/j39-lake-move.test.ts, run
 // by the two lake jobs of ci.yml); the pieces are db/lake-move.test.ts.

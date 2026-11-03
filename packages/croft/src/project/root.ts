@@ -56,7 +56,7 @@ export interface CroftConfig {
   serverMode: ServerModeConfig;
   /** Lake mode (option 07, D138): the warehouse is a DuckLake, not `database`. Null: the file, as ever. */
   lake: LakeConfig | null;
-  /** A `lake` block with `"enabled": false` (D155): a lake the project is not in. The warehouse is still the file, which `croft move-to-lake`
+  /** A `lake` block with `"enabled": false` (D167): a lake the project is not in. The warehouse is still the file, which `croft move-to-lake`
    *  moves into this lake. Null when the block is absent or on. */
   idleLake: LakeConfig | null;
   notify: NotifyConfig;

@@ -218,11 +218,11 @@ export function lakeCastFix(c: { name: string; type: string; kind: LakeRefusedKi
  * a file is written; a few rows stay in the catalog and read back exactly, which hides it]: HUGEINT and UHUGEINT are stored as DOUBLE (a value past
  * 2^53 comes back changed, and one near the top of the range cannot be read at all), an INTERVAL keeps its milliseconds and loses the microseconds
  * under them, a TIMETZ comes back at offset 0; also inside a STRUCT, a LIST or a MAP. Every other type round-trips. A lake write therefore refuses
- * these by the column's TYPE, not by its values (D162): whether a value survives depends on where its rows are kept, which changes under a table
+ * these by the column's TYPE, not by its values (D174): whether a value survives depends on where its rows are kept, which changes under a table
  * (the maintenance flush moves rows from the catalog into files). DuckDB writes the type names in capitals, so a STRUCT field named "interval" is
  * not taken for one.
  */
-/** The type a lake keeps a whole number of up to 38 digits in exactly, where DuckDB would use a HUGEINT (D162). */
+/** The type a lake keeps a whole number of up to 38 digits in exactly, where DuckDB would use a HUGEINT (D174). */
 export const LAKE_HUGE = "DECIMAL(38,0)";
 
 export type LakeInexactKind = "HUGEINT" | "UHUGEINT" | "INTERVAL" | "TIMETZ";

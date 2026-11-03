@@ -53,7 +53,7 @@ export const SSL_MODES: readonly CatalogSslMode[] = ["verify-full", "require", "
 export interface SharedLakeConfig {
   kind: "postgres";
   /** `lake.enabled` (default true). False: the block names a lake the project is not in (yet): the warehouse is still the file, and
-   *  `croft move-to-lake` moves it into this lake (D155). */
+   *  `croft move-to-lake` moves it into this lake (D167). */
   enabled: boolean;
   catalog: { host: string; port: number; database: string; sslMode: CatalogSslMode; sslRootCert?: string; writer: LakeLogin; reader: LakeLogin };
   bucket: LakeBucketConfig;

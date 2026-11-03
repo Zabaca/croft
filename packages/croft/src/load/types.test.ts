@@ -373,7 +373,7 @@ describe("CSV text rules", () => {
   });
 });
 
-describe("in a lake, integers past 64 bits are DECIMAL(38,0), not HUGEINT (D162)", () => {
+describe("in a lake, integers past 64 bits are DECIMAL(38,0), not HUGEINT (D174)", () => {
   const lake = { lake: true };
   test("a new column, a widened integer column and a placeholder that gets its first values", () => {
     expect(planColumn(undefined, inc("n", ["integer", "bigint"]))).toMatchObject({ decision: "add", target: "HUGEINT" });

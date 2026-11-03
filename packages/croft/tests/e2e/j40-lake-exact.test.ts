@@ -1,4 +1,4 @@
-// Journey 40: a lake never silently changes a value (DESIGN.md D162; option 07, slice 4's follow-up). DuckLake 1.0 stores a HUGEINT or a UHUGEINT as a
+// Journey 40: a lake never silently changes a value (DESIGN.md D174; option 07, slice 4's follow-up). DuckLake 1.0 stores a HUGEINT or a UHUGEINT as a
 // DOUBLE, an INTERVAL to the millisecond and a TIMETZ at offset 0 once a table's rows are in a Parquet file, so croft's lake writes refuse a column of
 // those types by its TYPE (LAKE_VALUES_INEXACT, with the cast), and croft's own type inference makes an integer past 64 bits DECIMAL(38,0) instead of
 // HUGEINT in a lake. The real croft CLI against a local lake (a SQLite catalog and a folder) and a Postgres catalog with an S3-compatible store:
