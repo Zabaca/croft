@@ -267,7 +267,7 @@ describe("croft doctor asks the bucket before the first run (D165)", () => {
     expect(filesIn(lake.files)).toEqual(before);
     // The rig's Postgres offers no TLS and is on this machine: said, as a note.
     expect(checks.find((c) => c.id === "lake.catalog.encrypted")).toMatchObject({ status: "info" });
-    expect(checks.find((c) => c.id === "lake.catalog.encrypted")!.text).toContain("not encrypted; the catalog is on this machine");
+    expect(checks.find((c) => c.id === "lake.catalog.encrypted")!.text).toContain("not encrypted: the server offers no TLS; the catalog is on this machine");
   }, 120_000);
 
   maybe("a folder of more than a page of objects (6,000) still answers: the first page proves the key, the endpoint and the certificate, and it is said so", async () => {
@@ -287,13 +287,31 @@ describe("croft doctor asks the bucket before the first run (D165)", () => {
     expect(store.details).toMatchObject({ many: true, empty: false });
   }, 120_000);
 
-  test("the catalog line: encrypted is ok; plain text to this machine is a note; plain text to another machine is a warning", () => {
-    expect(catalogEncryptionLine("db.example.com", { encrypted: true, version: "TLSv1.3" })).toMatchObject({ status: "ok", text: expect.stringContaining("(TLSv1.3)") });
-    expect(catalogEncryptionLine("127.0.0.1", { encrypted: false, version: null }).status).toBe("info");
-    expect(catalogEncryptionLine("localhost", { encrypted: false, version: null }).status).toBe("info");
-    const warn = catalogEncryptionLine("db.internal", { encrypted: false, version: null });
-    expect(warn.status).toBe("warn");
-    expect(warn.text).toContain("NOT encrypted");
+  test("the catalog line is the client's side: the setting for verify-full, require and disable, the server's offer for prefer, and nothing false when it cannot be known", () => {
+    // The second real-lake trial's hosted catalog: verify-full to a pooler. libpq would have ended the connection had it not been encrypted, whatever
+    // the database behind the pooler sees; the line used to ask the database and said "NOT encrypted".
+    for (const mode of ["verify-full", "require"] as const) {
+      const line = catalogEncryptionLine("ep-x.c-4.us-west-2.aws.example.tech", mode);
+      expect(line.status).toBe("ok");
+      expect(line.text).toContain("is encrypted");
+      expect(line.text).not.toMatch(/NOT|not encrypted/);
+    }
+    // disable is the setting's doing, not a fallback; to another machine it is a warning, to this one a note.
+    const off = catalogEncryptionLine("db.internal", "disable");
+    expect(off.status).toBe("warn");
+    expect(off.text).toContain('because sslMode is "disable"');
+    expect(off.text).not.toMatch(/fell back|without saying/);
+    expect(catalogEncryptionLine("127.0.0.1", "disable").status).toBe("info");
+    // prefer takes TLS when the server offers it.
+    expect(catalogEncryptionLine("db.internal", "prefer", "offered")).toMatchObject({ status: "ok", text: expect.stringContaining("the server offers TLS and sslMode prefer takes it") });
+    expect(catalogEncryptionLine("db.internal", "prefer", "refused")).toMatchObject({ status: "warn", text: expect.stringContaining("NOT encrypted") });
+    expect(catalogEncryptionLine("localhost", "prefer", "refused").status).toBe("info");
+    expect(catalogEncryptionLine("::1", "prefer", "refused").status).toBe("info");
+    // A server that could not be asked is a note, never a warning.
+    const unknown = catalogEncryptionLine("db.internal", "prefer", "unknown");
+    expect(unknown.status).toBe("info");
+    expect(unknown.text).toContain("could not be checked");
+    expect(catalogEncryptionLine("db.internal", "prefer").status).toBe("info");
   });
 });
 

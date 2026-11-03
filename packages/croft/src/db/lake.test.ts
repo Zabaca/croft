@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
+import { catalogMismatch } from "./modes.ts";
 import { isCommitFailure, isConflict, isConnectionError, lakeInexactColumns, lakeRefusedColumns, refuseInexactTypes, LakeWriteLock, machineId, newCommitTag, parseWriter, refuseUnfitLakeColumns, writerRecord, writerReport } from "./lake.ts";
 
 const made: string[] = [];
@@ -19,6 +20,26 @@ const folder = (): string => {
 };
 
 describe("telling a lake's errors apart", () => {
+  test("a catalog database that holds another lake is told by DuckLake's words: another format (older or newer) or another folder, never retried", () => {
+    const where = { host: "db.example.test", port: 5432, database: "croft_lake" };
+    // What the second real-lake trial's Neon database said (a lake at 0.3), word for word, and what a lake DuckDB 2.0 made at its default says.
+    const older = catalogMismatch("Invalid Input Error: DuckLake catalog version mismatch: catalog version is 0.3, but the extension requires version 1.0. To automatically migrate, set AUTOMATIC_MIGRATION to TRUE when attaching.", [], where);
+    expect(older?.code).toBe("LAKE_CATALOG_MISMATCH");
+    expect(older?.problem).toMatchObject({ retryable: false, details: { kind: "format", catalogFormat: "0.3", croftFormat: "1.0" } });
+    expect(older?.message).toContain("db.example.test:5432/croft_lake");
+    expect(older?.message).toContain("never migrates");
+    expect(`${older?.message} ${older?.problem.hint}`).not.toMatch(/AUTOMATIC_MIGRATION|set .* to TRUE/i);
+    const newer = catalogMismatch("Invalid Input Error: DuckLake catalog version is '1.1', which is newer than the requested version '1.0'. Cannot downgrade a DuckLake catalog.", [], where);
+    expect(newer?.problem).toMatchObject({ retryable: false, details: { kind: "format", catalogFormat: "1.1", croftFormat: "1.0" } });
+    const folderMismatch = catalogMismatch('Invalid Configuration Error: DATA_PATH parameter "s3://b/new/" does not match existing data path in the catalog "s3://b/old/". You can override the DATA_PATH by setting OVERRIDE_DATA_PATH to True.', [], where);
+    expect(folderMismatch?.problem).toMatchObject({ retryable: false, details: { kind: "data_path", catalogDataPath: "s3://b/old/", settingsDataPath: "s3://b/new/" } });
+    expect(folderMismatch?.problem.hint).not.toContain("OVERRIDE_DATA_PATH");
+    // Anything else DuckLake says is not this.
+    for (const m of ["IO Error: Failed to attach DuckLake MetaData: connection refused", "password authentication failed", "Existing DuckLake at x does not exist - and creating a new DuckLake is explicitly disabled"]) {
+      expect(catalogMismatch(m, [], where), m).toBeNull();
+    }
+  });
+
   test("a connection that dropped, as the real ones said it", () => {
     for (const m of [
       'TransactionContext Error: Failed to commit: Failed to commit DuckLake transaction.\nFailed to get global stats information from DuckLake: Failed to prepare COPY "COPY (SELECT ...) TO STDOUT (FORMAT "binary");": server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally',

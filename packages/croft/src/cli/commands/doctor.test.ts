@@ -688,7 +688,7 @@ export default ingest({ secrets: names, key: "id", async *rows() { await Bun.wri
       expect(existsSync(join(root, "ran-command"))).toBe(false);
       expect(ok.problems.filter((p) => p.code === "SECRET_MISSING" || p.code === "SECRETS_COMMAND_FAILED")).toEqual([]);
       expect(ok.data.checks.filter((c) => c.id === "secrets" || c.id === "secrets-from").map((c) => [c.status, c.text])).toEqual([
-        ["info", `secretsFrom: ${process.execPath} -e "require('node:fs').writeFileSync('ran-command', 'x')" (${process.execPath}), not run by doctor; GH_TOKEN can only come from it (croft secrets runs it to check)`],
+        ["info", `secretsFrom: ${process.execPath} -e "require('node:fs').writeFileSync('ran-command', 'x')", not run by doctor; GH_TOKEN can only come from it (croft secrets runs it to check)`],
         ["ok", "secrets: STRIPE_KEY set"],
       ]);
 

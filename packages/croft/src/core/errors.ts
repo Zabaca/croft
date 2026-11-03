@@ -116,6 +116,7 @@ export const CODES = {
   EXTENSION_WRONG_BUILD: { category: "environment", severity: "error", exit: 2 },
   EXTENSION_LOAD_FAILED: { category: "environment", severity: "error", exit: 2 },
   LAKE_ATTACH_FAILED: { category: "environment", severity: "error", exit: 2 },
+  LAKE_CATALOG_MISMATCH: { category: "environment", severity: "error", exit: 2 },
   LAKE_BACKUP_TOOL_MISSING: { category: "environment", severity: "error", exit: 2 },
   LAKE_STORE_TLS: { category: "environment", severity: "error", exit: 2 },
   SERVER_MODE_COPY_COSTLY: { category: "environment", severity: "error", exit: 2 },
@@ -158,6 +159,7 @@ export const CODES = {
   SERVER_MODE_OFF_FOR_KEYS: { category: "warning", severity: "warning", exit: 0 },
   LAKE_OTHER_WRITER: { category: "warning", severity: "warning", exit: 0 },
   LAKE_EXPIRY_OPTION: { category: "warning", severity: "warning", exit: 0 },
+  LAKE_BOOKKEEPING_IN_FILES: { category: "warning", severity: "warning", exit: 0 },
   LAKE_MAINTENANCE_FAILED: { category: "warning", severity: "warning", exit: 0 },
 } as const satisfies Record<string, CodeInfo>;
 

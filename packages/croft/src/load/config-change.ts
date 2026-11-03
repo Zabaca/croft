@@ -396,13 +396,23 @@ export async function applyPinChanges(tx: Sql, o: ApplyPinsInput): Promise<Appli
 // Reading the state (runIngest, before it fetches)
 
 export interface ConfigState {
-  /** Rows in the table (0 when there is none). */
+  /** Rows in the table (0 when there is none), counted only when something is to be decided by it: a behavior or a lossy pin that changed. A table
+   *  that is as its code says is not scanned (D-T2: on a lake that scan was a third of a run with nothing new). */
   rows: number;
   change: BehaviorChange | null;
   /** Present when change.appendGainsKey. */
   conversion?: KeyConversion;
   /** Pins that differ from their column's stored type. */
   pins: PinChange[];
+  /** What was read of the asset's record on the way, for whoever reads the same next in the same lease (runIngest's state): the row of
+   *  _croft.assets and the asset's stored columns. Absent when nothing was read (a rebuild, a table never built). */
+  record?: AssetRecord;
+}
+
+/** The asset's row of _croft.assets, null when it has none, and its stored columns. */
+export interface AssetRecord {
+  asset: { kind: string | null; write_mode: string | null; key_columns: string[] | null; behavior_hash: string | null; cursor_value: string | null; cursor_type: string | null; row_count: number | bigint | null } | null;
+  columns: StoredColumn[];
 }
 
 export interface ReadConfigInput {
@@ -424,19 +434,24 @@ export async function readConfigState(sql: Sql, o: ReadConfigInput): Promise<Con
   const columns = await readTableSchema(sql, o.asset, db);
   if (!columns) return { rows: 0, change: null, pins: [] };
   const ref = tableRef(db, o.asset);
-  const [n] = await sql.all<{ n: number | bigint }>(`SELECT count(*) AS n FROM ${ref}`);
-  const rows = Number(n!.n);
-  const [a] = await sql.all<{ kind: string | null; write_mode: string | null; key_columns: string[] | null; behavior_hash: string | null }>(
-    `SELECT kind, write_mode, key_columns, behavior_hash FROM _croft.assets WHERE name = $1`, [o.asset]);
-  const change = a && rows > 0
-    ? behaviorChange({ kind: a.kind, write: a.write_mode as WriteMode | null, key: a.key_columns ?? [], behaviorHash: a.behavior_hash }, o.now)
-    : null;
-  const pins = await planPinChanges(sql, { asset: o.asset, real: columns, stored: await readStoredColumns(sql, o.asset), pins: o.pins, resolved });
+  const [a] = await sql.all<AssetRecord["asset"] & object>(
+    `SELECT kind, write_mode, key_columns, behavior_hash, cursor_value, cursor_type, row_count FROM _croft.assets WHERE name = $1`, [o.asset]);
+  const stored = await readStoredColumns(sql, o.asset);
+  const record: AssetRecord = { asset: a ?? null, columns: stored };
+  const recorded = a ? behaviorChange({ kind: a.kind, write: a.write_mode as WriteMode | null, key: a.key_columns ?? [], behaviorHash: a.behavior_hash }, o.now) : null;
+  const pins = await planPinChanges(sql, { asset: o.asset, real: columns, stored, pins: o.pins, resolved });
+  // The table is counted only when a change or a lossy pin needs it: an empty table takes any change directly, and a table as its code says is not read.
+  let rows = 0;
+  if (recorded || pins.some((c) => c.changed > 0)) {
+    const [n] = await sql.all<{ n: number | bigint }>(`SELECT count(*) AS n FROM ${ref}`);
+    rows = Number(n!.n);
+  }
+  const change = recorded && rows > 0 ? recorded : null;
   // The conversion retypes first: the key is counted as its pins make it.
   const conversion = change?.appendGainsKey
     ? await countConversion(sql, { ref, key: change.to.key, columns, pins, ...(o.cursor ? { cursor: o.cursor } : {}) })
     : undefined;
-  return { rows, change, ...(conversion ? { conversion } : {}), pins };
+  return { rows, change, ...(conversion ? { conversion } : {}), pins, record };
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -600,6 +615,8 @@ export interface ConfigSettled {
   trashed?: TrashEntry;
   /** For the step's reason. */
   note?: string;
+  /** What `alsoRead` read in the lease that checked the config, when settling applied nothing (so it is still current); see settleConfig. */
+  read?: unknown;
 }
 
 /** The confirmation command: `croft run x` itself asks, since the edit changed what it does. */
@@ -623,16 +640,25 @@ function changeConfirmation(c: Confirmation, what: string): Problem {
  * PIN_CHANGES_DATA or ASSET_INVALID; returns `{ outcome }` for a confirmation that is waiting (the step is skipped),
  * or what was applied. `hashWith` is the planner's behaviorHash with the step's incremental setting.
  */
-export async function settleConfig(i: IngestInput, o: { started: number; hashWith: BehaviorNow["hashWith"] }): Promise<{ outcome: IngestOutcome } | ConfigSettled> {
+export async function settleConfig<R = undefined>(
+  i: IngestInput, o: { started: number; hashWith: BehaviorNow["hashWith"]; alsoRead?: (db: Sql, record: AssetRecord | undefined) => Promise<R> },
+): Promise<{ outcome: IngestOutcome } | (ConfigSettled & { read?: R })> {
   const { step, warehouse, log, signal, runId } = i;
   const asset = step.asset;
   const inc = step.incremental;
   const cursor = inc.kind === "cursor" ? inc.field : undefined;
   const rebuild = i.rebuild === true || step.reasons.includes("rebuild");
-  const state = await warehouse.read((db) => readConfigState(db, {
-    asset, file: step.file, pins: step.spec?.pins ?? {}, rebuild, ...(cursor ? { cursor } : {}),
-    now: { write: step.write, key: step.key, behaviorHash: step.behaviorHash, hashWith: o.hashWith },
-  }), { purpose: `check how ${asset}'s rows are written`, signal });
+  // `alsoRead`: the step's own state, read in this lease as well. On a lake each lease costs the catalog a transaction and the first look at every
+  // table, 1 s at the distance the second real-lake trial measured, and a run with nothing new reads the same tables in the next lease; when
+  // settling changes nothing (nearly always) what was read here is what that lease would read.
+  const read = await warehouse.read(async (db) => {
+    const config = await readConfigState(db, {
+      asset, file: step.file, pins: step.spec?.pins ?? {}, rebuild, ...(cursor ? { cursor } : {}),
+      now: { write: step.write, key: step.key, behaviorHash: step.behaviorHash, hashWith: o.hashWith },
+    });
+    return { config, also: o.alsoRead ? await o.alsoRead(db, config.record) : undefined };
+  }, { purpose: `check how ${asset}'s rows are written`, signal });
+  const state = read.config;
   const { change, conversion } = state;
   const lossy = state.pins.filter((c) => c.changed > 0);
   const owner = { asset, file: step.file };
@@ -647,7 +673,7 @@ export async function settleConfig(i: IngestInput, o: { started: number; hashWit
   const convert = change && conversion ? conversion : undefined;
   if ((!convert || convert.removed === 0) && lossy.length === 0) {
     if (convert) log.write(`${asset} gains the key ${convert.key.join(", ")}: every stored row already has its own, so the rows are kept as they are`);
-    return { schemaChanges: [], warnings: [] };
+    return { schemaChanges: [], warnings: [], ...(read.also !== undefined ? { read: read.also as R } : {}) };
   }
 
   // Destructive: one question for everything this step would change (§6: one token per run).

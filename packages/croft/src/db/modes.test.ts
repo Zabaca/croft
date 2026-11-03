@@ -604,7 +604,7 @@ describe("lake test profile (a SQLite catalog and a local folder)", () => {
     await c.run("DETACH trash");
   });
 
-  withExt("the format is pinned: a new lake is made at 1.0, and a catalog of another format is refused with DuckDB's words, never migrated (D137)", async () => {
+  withExt("the format is pinned: a new lake is made at 1.0, and a catalog of another format is LAKE_CATALOG_MISMATCH, never migrated (D137, D-T3)", async () => {
     const { Database } = await import("bun:sqlite");
     const versionOf = (catalog: string): string => {
       const db = new Database(catalog, { readonly: true });
@@ -634,8 +634,9 @@ describe("lake test profile (a SQLite catalog and a local folder)", () => {
     for (const access of ["write", "read"] as const) {
       const err = await open(lakeTest(q, access)).catch((e: unknown) => e);
       expect(err, access).toBeInstanceOf(CroftError);
-      expect((err as CroftError).code).toBe("LAKE_ATTACH_FAILED");
-      expect(JSON.stringify((err as CroftError).problem), access).toMatch(/downgrade/i);
+      expect((err as CroftError).code).toBe("LAKE_CATALOG_MISMATCH"); // not LAKE_ATTACH_FAILED, which says "check the host": the second real-lake trial
+      expect((err as CroftError).problem, access).toMatchObject({ retryable: false, details: { kind: "format", catalogFormat: "1.1", croftFormat: "1.0" } });
+      expect(JSON.stringify((err as CroftError).problem), access).toMatch(/another format \(1\.1\)/);
     }
     expect(versionOf(join(q.state, "meta.sqlite"))).toBe("1.1");
   });

@@ -7,8 +7,10 @@
 //   d. a wrong password, a bucket key the store refuses, an unreachable host: nothing croft printed, logged or recorded holds the password, the
 //      access key id or the secret key, and duckdb_databases() cannot be queried (acceptance 6).
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { DuckDBInstance } from "@duckdb/node-api";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { extensionPath, hostPlatform } from "../../src/db/extension-files.ts";
 import { lakeRigReady, type LakeRig, localLakeBlock, READER_KEY, READER_LOGIN, RIG_SECRETS, startLakeRig, useLake, WRITER_KEY, WRITER_LOGIN } from "../../src/db/lake-testkit.ts";
 import { cleanupAll, type Envelope, initProject, json, type MockApi, mockApi, type Project, show, until } from "./harness.ts";
 
@@ -274,5 +276,58 @@ maybe("journey 37 (postgres lake): credentials never leave", () => {
     expect(existsSync(dir) ? readdirSync(dir) : []).toEqual([]);
     assertClean(recorded(p));
     void READER_KEY; void READER_LOGIN; void WRITER_KEY; void WRITER_LOGIN;
+  }, 180_000);
+});
+
+maybe("journey 37 (postgres lake): a lake that cannot be attached ends every step with its own error (the second real-lake trial)", () => {
+  /** A project with two ingests that run side by side and a SQL asset over one, as the trial's had. */
+  async function twoIngests(): Promise<Project> {
+    const { project: p } = await initProject();
+    p.write("files/events.csv", "event_id,kind\n1,view\n2,click\n3,buy\n");
+    p.write("assets/events.ts", `import { ingest } from "@zabaca/croft";\nexport default ingest({ description: "events", file: "files/events.csv", key: "event_id" });\n`);
+    p.write("assets/daily_events.sql", "-- key: kind\nSELECT kind, count(*) AS n FROM events GROUP BY kind\n");
+    return p;
+  }
+  const steps = (r: { json: Envelope }): { asset: string; status: string; attempt: number }[] => r.json.data.steps;
+
+  test("a wrong password: each ingest says LAKE_ATTACH_FAILED once, and none says INTERNAL_ERROR or is called temporary", async () => {
+    const p = await twoIngests();
+    useLake(p.root, await rig!.lake({ writerPassword: "test-wrong-password" }));
+    const r = await run(p, ["run"]);
+    expect(r.code, show(r)).toBe(2);
+    const text = JSON.stringify(r.json);
+    expect(text).not.toContain("INTERNAL_ERROR");
+    expect(text).not.toContain("left part set up");
+    expect(text).not.toMatch(/the error is temporary/);
+    const failed = steps(r).filter((s) => s.status === "failed");
+    expect(failed.map((s) => s.asset).sort()).toEqual(["events", "example_sales"]);
+    for (const s of failed) expect(s.attempt, show(r)).toBe(1);
+  }, 180_000);
+
+  test("a database that holds another lake (DuckLake 1.1): LAKE_CATALOG_MISMATCH, not retried, not called temporary, and no migration advice", async () => {
+    const lake = await rig!.lake();
+    const platform = hostPlatform()!;
+    const foreign = await DuckDBInstance.create(":memory:", { autoinstall_known_extensions: "false", autoload_known_extensions: "false" });
+    const fc = await foreign.connect();
+    try {
+      for (const name of ["httpfs", "postgres", "ducklake"] as const) await fc.run(`LOAD '${extensionPath(ready.dir, name, platform)}'`);
+      await fc.run(`CREATE SECRET pg (TYPE postgres, HOST '${rig!.pg.host}', PORT ${rig!.pg.port}, DATABASE '${lake.db}', USER '${WRITER_LOGIN.user}', PASSWORD '${WRITER_LOGIN.password}', SSLMODE 'disable')`);
+      await fc.run(`ATTACH 'ducklake:postgres:' AS other (META_SECRET pg, DATA_PATH 's3://${lake.bucket}/another-tool/', DUCKLAKE_VERSION '1.1')`);
+      await fc.run("CREATE TABLE other.t AS SELECT 1 AS a");
+    } finally {
+      fc.disconnectSync();
+      foreign.closeSync();
+    }
+    const p = await twoIngests();
+    useLake(p.root, lake);
+    const r = await run(p, ["run"]);
+    expect(r.code, show(r)).toBe(2);
+    const text = JSON.stringify(r.json);
+    expect(text).toContain("LAKE_CATALOG_MISMATCH");
+    expect(text).not.toContain("INTERNAL_ERROR");
+    expect(text).not.toMatch(/AUTOMATIC_MIGRATION|the error is temporary/);
+    for (const s of steps(r).filter((x) => x.status === "failed")) expect(s.attempt, show(r)).toBe(1);
+    const d = await run(p, ["doctor"]);
+    expect(JSON.stringify(d.json)).toContain("LAKE_CATALOG_MISMATCH");
   }, 180_000);
 });

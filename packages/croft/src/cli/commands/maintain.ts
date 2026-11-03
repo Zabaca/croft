@@ -213,8 +213,10 @@ async function orphans(ctx: Ctx): Promise<CommandResult<MaintainData>> {
 
 // ---- Words --------------------------------------------------------------------------------------------------------
 
-const STEP_WORDS: Record<string, (s: StepReport) => string> = {
-  prune: (s) => `${plural(s.did.rows ?? 0, "superseded bookkeeping row")} removed from ${plural(s.did.tables ?? 0, "log")}`,
+export const STEP_WORDS: Record<string, (s: StepReport) => string> = {
+  prune: (s) => `${plural(s.did.rows ?? 0, "superseded bookkeeping row")} removed from ${plural(s.did.tables ?? 0, "log")}`
+    + (s.did.reinlined ? `; ${plural(s.did.reinlinedRows ?? 0, "row")} of ${plural(s.did.reinlined, "bookkeeping table")} brought back into the catalog from files` : "")
+    + (s.did.leftInFiles ? `; ${plural(s.did.leftInFiles, "bookkeeping table")} left in files (too many rows to rewrite)` : ""),
   flush: (s) => `${plural(s.did.rows ?? 0, "row")} of ${plural(s.did.tables ?? 0, "table")} moved out of the catalog into files`,
   expire: (s) => `${plural(s.did.snapshots ?? 0, "snapshot")} expired`,
   merge: (s) => `${plural(s.did.merged ?? 0, "file")} merged into ${s.did.created ?? 0}`,

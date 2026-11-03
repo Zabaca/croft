@@ -8,7 +8,8 @@ import { resolveProject } from "../../project/resolve.ts";
 import type { Command } from "../command.ts";
 import { COMMANDS } from "./index.ts";
 import { cleanup, cli, makeProject, PKG, runsDb, type TestProject, writeFiles } from "./inspect-testkit.ts";
-import { newRowsCalls, parseTsc, validate, validateProject } from "./validate.ts";
+import { lakeFileProblems, newRowsCalls, parseTsc, validate, validateProject } from "./validate.ts";
+import { validateConfig } from "../../project/root.ts";
 
 afterAll(async () => {
   await cleanup();
@@ -665,5 +666,35 @@ export default ingest({ ${config} async *rows() { yield []; } });
     const lookback = makeProject({ files: { "assets/events.ts": EVENTS_TS(`write: "append", incremental: { field: "seq", lookback: "1 day" },`) } });
     catalog(lookback, [{ ...EVENTS_BUILT, cursor: { field: "seq", value: "2026-09-01T00:00:00Z", type: "timestamp", unit: null } }]);
     expect(codes((await check(lookback)).problems)).toEqual([]);
+  });
+});
+
+describe("the CA files a lake's settings name (the second real-lake trial)", () => {
+  const lakeBlock = (over: { catalog?: Record<string, unknown>; bucket?: Record<string, unknown> }) => ({
+    timezone: "UTC",
+    lake: {
+      catalog: { kind: "postgres", host: "db.example.com", database: "croft_lake", writer: { user: "w", passwordSecret: "P1" }, reader: { user: "r", passwordSecret: "P2" }, ...over.catalog },
+      bucket: { name: "my-bucket", folder: "f", writer: { keyIdSecret: "K1", secretKeySecret: "K2" }, reader: { keyIdSecret: "K3", secretKeySecret: "K4" }, ...over.bucket },
+    },
+  });
+  const problemsOf = (over: Parameters<typeof lakeBlock>[0], root: string) => {
+    const r = validateConfig(lakeBlock(over));
+    if (!r.ok) throw new Error(JSON.stringify(r.issues));
+    return lakeFileProblems(r.config, root, ProjectEnv.load(root, {}));
+  };
+
+  test("a catalog CA file that is not there is CONFIG_INVALID, and one that is there is not", () => {
+    const p = makeProject({ files: { "certs/ca.pem": "-----BEGIN CERTIFICATE-----\n" } });
+    const missing = problemsOf({ catalog: { sslMode: "verify-full", sslRootCert: "certs/nowhere.pem" } }, p.root);
+    expect(missing).toEqual([expect.objectContaining({ code: "CONFIG_INVALID", severity: "error", message: expect.stringContaining('"lake.catalog.sslRootCert" is "certs/nowhere.pem", which is not a file') })]);
+    expect(problemsOf({ catalog: { sslMode: "verify-full", sslRootCert: "certs/ca.pem" } }, p.root)).toEqual([]);
+  });
+
+  test("the store's CA file is checked the same way; a lake that names none is not asked about a bundle (that is doctor's line)", () => {
+    const p = makeProject({});
+    expect(problemsOf({ bucket: { sslRootCert: "certs/store.pem" } }, p.root)).toEqual([expect.objectContaining({ code: "CONFIG_INVALID", message: expect.stringContaining('"lake.bucket.sslRootCert"') })]);
+    expect(problemsOf({}, p.root)).toEqual([]);
+    const both = problemsOf({ catalog: { sslMode: "verify-full", sslRootCert: "a.pem" }, bucket: { sslRootCert: "b.pem" } }, p.root);
+    expect(both.map((x) => x.code)).toEqual(["CONFIG_INVALID", "CONFIG_INVALID"]);
   });
 });
