@@ -57,7 +57,9 @@ A lake is a catalog (a Postgres database) and a bucket folder, so its backup has
   backup.json         when, the lake's snapshot the catalog holds, where it came from (no credential), every file
 
 It needs pg_dump on the machine (LAKE_BACKUP_TOOL_MISSING says how to get it; CROFT_PG_DUMP names a pg_dump that is not on the
-PATH). The dump, run history and trash are taken at one moment, with the lake's writes held for the seconds that
+PATH). pg_dump checks the catalog as the lake does: it is given the project's lake.catalog.sslMode and
+lake.catalog.sslRootCert (as PGSSLMODE and PGSSLROOTCERT, over any in the environment), and a catalog whose certificate does not check out
+is LAKE_BACKUP_FAILED, never dumped in plain text. The dump, run history and trash are taken at one moment, with the lake's writes held for the seconds that
 takes; the folder is then copied with runs going on. A file of a lake never changes once written, so a backup links, as a
 hard link, the same file of the last backup of this lake when its size is the same, and downloads only what is new
 (data.lake.data.reused counts them): a daily backup costs what the day wrote. A backup that is copying keeps this
@@ -73,7 +75,8 @@ croft docs lake: a writer and a read-only login, a writer and a read-only key). 
 
 1. Make an empty database with the same two logins, and an empty bucket folder.
 2. Restore the catalog as the writer: pg_restore -O -h <host> -p <port> -U <writer> -d <new database> catalog.dump (the
-   password in PGPASSWORD, not on the command line). Tables the writer creates are readable by the read-only login by
+   password in PGPASSWORD, not on the command line; for a catalog on another machine also PGSSLMODE=verify-full and
+   PGSSLROOTCERT=<the CA file>, the same sslmode the project uses, or the password and the catalog cross the network unprotected). Tables the writer creates are readable by the read-only login by
    the setup's default privileges; without them, GRANT SELECT again as the setup does.
 3. Copy lake-data/ into the new bucket folder with the tool you use for buckets (aws s3 sync, rclone, mc), keeping the
    names; the folder must then hold the lake and nothing else.

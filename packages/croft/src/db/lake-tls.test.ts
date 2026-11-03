@@ -4,15 +4,16 @@
 // a refusal is a stable error that names the setting and is never retried; that the CA file stays out of SQL's reach; and the project
 // path (croft.json, $SSL_CERT_FILE, croft doctor). Nothing here reaches a network.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { lakeProject } from "../cli/commands/lake-project-testkit.ts";
 import { cleanup as cleanupProjects, cli } from "../cli/commands/inspect-testkit.ts";
 import { CroftError } from "../core/errors.ts";
 import type { CatalogSslMode } from "../project/lake-config.ts";
+import { findPgDump, pgDumpTo } from "./lake-backup.ts";
 import { isConnectionError } from "./lake.ts";
-import { lakeRigReady, type LakeRig, rigConnection, startLakeRig } from "./lake-testkit.ts";
+import { lakeRigReady, type LakeRig, READER_LOGIN, rigConnection, startLakeRig } from "./lake-testkit.ts";
 import { readListening, startPostgres, type TestPostgres } from "./mode-testkit.ts";
 import { certsReady, makeCerts, type TestCerts } from "./tls-testkit.ts";
 import { closeAllWarehouses, openWarehouse } from "./warehouse.ts";
@@ -165,6 +166,61 @@ describe("the catalog connection's TLS, in the warehouse", () => {
     const sql = (q: string) => w.read((db) => db.all(q), { purpose: "test" }).then(() => "allowed", (e: Error) => e.message);
     expect(await sql(`SELECT * FROM read_text('${tls.cert}')`)).toMatch(/Permission|not allowed|allowed_directories|access/i);
     expect(await sql(`SELECT * FROM read_text('/etc/ssl/cert.pem')`)).toMatch(/Permission|not allowed|allowed_directories|access|No files/i);
+  }, 60_000);
+});
+
+// The dump of `croft backup` is a connection of its own (pg_dump, not DuckDB's), and it checks the catalog as the attach does (D159): the project's
+// sslMode and sslRootCert go to pg_dump as PGSSLMODE and PGSSLROOTCERT, over whatever the user's environment says. Without them a hosted catalog was
+// dumped with libpq's prefer, which verifies nothing and falls back to plain text, and the read-only password and the whole catalog went unprotected.
+describe("the catalog's TLS, in the backup's pg_dump", () => {
+  const pgDump = findPgDump(process.env);
+  const maybeDump = certs.ready && pgDump ? test : test.skip;
+  if (certs.ready && !pgDump) console.warn("[lake-tls.test] SKIPPING the backup's TLS tests: pg_dump is not installed");
+
+  /** pg_dump of a new lake's catalog as the read-only login, with `catalog`'s TLS and the user's `env`; resolves to the dump file or rejects with the error. */
+  async function dump(catalog: Catalog, o: { port?: number; env?: Record<string, string> } = {}) {
+    const lake = await rig.lake();
+    const dir = mkdtempSync(join(tmpdir(), "croft-dumptls-"));
+    made.push(dir);
+    const to = join(dir, "catalog.dump");
+    const spec = { host: catalog.host ?? "127.0.0.1", port: o.port ?? rig.pg.port, database: lake.db, user: READER_LOGIN.user, password: READER_LOGIN.password,
+      ...(catalog.sslMode ? { sslMode: catalog.sslMode } : {}), ...(catalog.sslRootCert ? { sslRootCert: catalog.sslRootCert } : {}) };
+    await pgDumpTo(pgDump!, spec, to, { processEnv: o.env ?? {}, secrets: [READER_LOGIN.password] });
+    return to;
+  }
+  const refused = async (p: Promise<unknown>): Promise<CroftError> => {
+    const e = await p.then(() => null, (x: unknown) => x);
+    expect(e).toBeInstanceOf(CroftError);
+    expect((e as CroftError).code).toBe("LAKE_BACKUP_FAILED");
+    return e as CroftError;
+  };
+
+  maybeDump("verify-full with the right CA dumps the catalog", async () => {
+    expect(existsSync(await dump({ host: "localhost", sslMode: "verify-full", sslRootCert: tls.cert }))).toBe(true);
+  }, 60_000);
+
+  maybeDump("verify-full with another authority's CA is refused, not dumped: the certificate is checked, and it is said so (not retryable)", async () => {
+    const e = await refused(dump({ host: "localhost", sslMode: "verify-full", sslRootCert: tls.otherCa }));
+    expect(e.problem.message).toContain("certificate verify failed");
+    expect(e.problem.retryable).toBe(false);
+    expect(e.problem.hint).toContain("lake.catalog.sslMode");
+    expect(e.problem.hint).toContain("lake.catalog.sslRootCert");
+  }, 60_000);
+
+  maybeDump("the project's setting wins over the user's environment: PGSSLMODE=disable and PGSSLROOTCERT of another authority change nothing", async () => {
+    const env = { PGSSLMODE: "disable", PGSSLROOTCERT: tls.cert };
+    // The control: with no setting in the project the environment is libpq's to read, and plain text dumps.
+    expect(existsSync(await dump({ host: "127.0.0.1" }, { env }))).toBe(true);
+    const e = await refused(dump({ host: "localhost", sslMode: "verify-full", sslRootCert: tls.otherCa }, { env }));
+    expect(e.problem.message).toContain("certificate verify failed");
+  }, 60_000);
+
+  maybeDump("verify-full against a catalog that offers no TLS is refused, never dumped in plain text; the host name is checked too", async () => {
+    const e = await refused(dump({ host: "127.0.0.1", sslMode: "verify-full", sslRootCert: tls.cert }, { port: plain.port }));
+    expect(e.problem.message).toContain("server does not support SSL");
+    expect(e.problem.retryable).toBe(false);
+    const name = await refused(dump({ host: "127.0.0.1", sslMode: "verify-full", sslRootCert: tls.cert }));
+    expect(name.problem.message).toMatch(/does not match host name/);
   }, 60_000);
 });
 

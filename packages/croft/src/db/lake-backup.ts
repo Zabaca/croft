@@ -33,7 +33,7 @@ import {
 } from "./backup.ts";
 import { lakeOption, markBackupRunning } from "./lake.ts";
 import { lakeExists } from "./lake-pass.ts";
-import { type ModeSpec, scrub } from "./modes.ts";
+import { type ModeSpec, scrub, TLS_REFUSED } from "./modes.ts";
 import { downloadObject, listObjects, type S3Access, S3Failure } from "./s3-mirror.ts";
 import { CROFT_VERSION } from "./state.ts";
 
@@ -223,10 +223,15 @@ function pgDumpMissing(): CroftError {
 
 /** Dump the catalog database to `to`, as the read-only login, in a child process with a fixed environment (the password is in it, never in
  *  an argument). Returns the tool's own version line. */
-async function pgDumpTo(pgDump: string, catalog: { host: string; port: number; database: string; user: string; password: string }, to: string,
+export async function pgDumpTo(pgDump: string, catalog: { host: string; port: number; database: string; user: string; password: string; sslMode?: string; sslRootCert?: string }, to: string,
   o: { processEnv: Record<string, string | undefined>; secrets: string[]; signal?: AbortSignal }): Promise<string> {
   const env: Record<string, string> = { PATH: "/usr/bin:/bin", LC_ALL: "C", PGPASSWORD: catalog.password };
   for (const k of ["PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGCONNECT_TIMEOUT"]) if (o.processEnv[k]) env[k] = o.processEnv[k]!;
+  // The catalog's own TLS, as the attach has it (D159): the project's setting wins over the user's environment, so a dump is checked as the lake is.
+  // Without this a hosted catalog was dumped with libpq's `prefer`, which verifies nothing and goes on in plain text when TLS is not offered:
+  // the read-only password and the whole catalog crossed the network unprotected.
+  if (catalog.sslMode) env.PGSSLMODE = catalog.sslMode;
+  if (catalog.sslRootCert) env.PGSSLROOTCERT = catalog.sslRootCert;
   // -Fc: the custom format; -O: no owners; -x: no privileges (the restore's setup grants them again). Short flags, as pg_dump has them.
   const args = ["-Fc", "-O", "-x", "-h", catalog.host, "-p", String(catalog.port), "-U", catalog.user, "-d", catalog.database, "-f", to];
   const version = (await run(pgDump, ["-V"], { PATH: "/usr/bin:/bin", LC_ALL: "C" })).stdout.trim() || "pg_dump";
@@ -239,9 +244,10 @@ async function pgDumpTo(pgDump: string, catalog: { host: string; port: number; d
     throw new CroftError("LAKE_BACKUP_FAILED", {
       message: `pg_dump could not dump the lake's catalog: ${text.split("\n").slice(0, 3).join(" ").slice(0, 400)}`,
       hint: mismatch ? "this pg_dump is older than the catalog's Postgres: install the client tools of the server's version (or newer) and name it in CROFT_PG_DUMP"
+        : TLS_REFUSED.test(text) ? `the catalog's certificate did not check out (or the catalog offers no TLS) with lake.catalog.sslMode "${catalog.sslMode ?? "prefer"}": check lake.catalog.sslMode and lake.catalog.sslRootCert (croft docs lake); trying again will not help`
         : /permission denied/i.test(text) ? "the read-only login must be able to SELECT every table of the catalog database (the setup in croft docs lake grants it)"
           : "check that the catalog is reachable from this machine and that the read-only login works (croft doctor), then run croft backup again",
-      retryable: !mismatch, effect: "nothing was written: no partial backup is left",
+      retryable: !mismatch && !TLS_REFUSED.test(text), effect: "nothing was written: no partial backup is left",
     });
   }
   return version;
