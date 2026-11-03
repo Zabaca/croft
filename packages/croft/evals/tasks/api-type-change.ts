@@ -146,7 +146,7 @@ export const apiTypeChange: EvalTask = {
     f.secret("SHOP_TOKEN", SHOP_TOKEN);
     f.write("assets/shop_orders.ts", INGEST(f.api.url));
     f.write("assets/daily_revenue.sql", DAILY_REVENUE);
-    f.clock = new Date(Date.now() - 3 * 86_400_000).toISOString();
+    f.clock = new Date(f.now() - 3 * 86_400_000).toISOString();
   },
 
   async after(f) {
@@ -156,7 +156,7 @@ export const apiTypeChange: EvalTask = {
     // The new API version, and what the shop did since.
     shop.textTotals = true;
     shop.orders = afterChange(shop.orders);
-    f.clock = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    f.clock = new Date(f.now() - 2 * 3_600_000).toISOString();
     const run = await f.croft(["run", "--json"]);
     const step = (run.json?.data?.steps ?? []).find((s: { asset: string }) => s.asset === "shop_orders");
     if (step?.status !== "failed" || step.error?.code !== "TYPE_CONFLICT") throw new Error(`this morning's run did not fail as the task's story says\n${show(run)}`);
