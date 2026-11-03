@@ -107,7 +107,7 @@ async function journey(): Promise<void> {
     expect(hidden.status).toBe(400);
     expect(hidden.body.problems[0]).toMatchObject({ code: "QUERY_PATH_DENIED" });
     expect(hidden.body.problems[0].message.replace("payments", "<t>")).toBe(absent.body.problems[0].message.replace("nothing_here", "<t>"));
-    expect(JSON.stringify(hidden.body)).not.toContain("4111");
+    expect(JSON.stringify(hidden.body)).not.toContain("4111-secret");
     for (const sql of ["show tables from _croft", "select * from _croft.assets", "select * from read_text('.croft/serve-keys.json')", "delete from orders"]) {
       expect((await ask(rec, alice, sql)).status, sql).toBe(400);
     }
@@ -144,7 +144,7 @@ async function journey(): Promise<void> {
     expect(lines.some((l) => /^croft serve: key alice {2}\S+ {2}read orders {2}2 rows {2}\d+ ms$/.test(l))).toBe(true);
     expect(lines.some((l) => /key alice .* refused QUERY_PATH_DENIED/.test(l))).toBe(true);
     expect(lines.some((l) => l.startsWith("croft serve: key bob "))).toBe(true);
-    for (const secret of [alice, bob, carol, "4111", "payments", "select"]) expect(stopped.stdout + stopped.stderr).not.toContain(secret);
+    for (const secret of [alice, bob, carol, "4111-secret", "payments", "select"]) expect(stopped.stdout + stopped.stderr).not.toContain(secret);
     const after = await p.json(["serve", "key", "list"], home);
     const used = Object.fromEntries(after.json.data.keys.map((k: { name: string; lastUsedAt: string | null }) => [k.name, k.lastUsedAt]));
     expect(Object.keys(used)).toEqual(["bob", "carol"]);

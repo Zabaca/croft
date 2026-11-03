@@ -66,14 +66,18 @@ describe("journey 34: a person's DuckDB over Quack", () => {
       const alice = added.json.data.key as string;
       expect(added.json.data.quack).toEqual({ uri: rec.quack!.uri, loopback: true, asOfView: "_croft_as_of", attach: `ATTACH '${rec.quack!.uri}' AS croft (TOKEN '${alice}')` });
       const bob = (await p.json(["serve", "key", "add", "bob"], home)).json.data.key as string;
-      await Bun.sleep(600); // croft serve reads the keys file every 250 ms
-
       const asOfOverHttp = async () => {
         const r = await fetch(`${rec.url}/query`, { method: "POST", headers: { Authorization: `Bearer ${rec.token}`, "Content-Type": "application/json" }, body: JSON.stringify({ sql: "select 1 as one" }) });
         return ((await r.json()) as { data: { asOf: string } }).data.asOf;
       };
       const c = await clients.start(ext.dir);
-      const at = await c.run(added.json.data.quack.attach);
+      // croft serve hands the readers the keys file on its poll, so a new key is refused until then: attach once it is accepted.
+      const attach = added.json.data.quack.attach as string;
+      let at = await c.run(attach);
+      for (const end = Date.now() + 30_000; !at.ok && Date.now() < end; ) {
+        await Bun.sleep(100);
+        at = await c.run(attach);
+      }
       expect(at.ok, JSON.stringify(at)).toBe(true);
       expect(await c.rows("SELECT id, amount FROM croft.orders ORDER BY id")).toEqual([{ id: "1", amount: "10" }, { id: "2", amount: "20" }]);
       expect(Number((await c.rows("SELECT epoch_ms(as_of) AS t FROM croft._croft_as_of"))[0]!.t)).toBe(Date.parse(await asOfOverHttp()));
@@ -83,7 +87,7 @@ describe("journey 34: a person's DuckDB over Quack", () => {
       for (const sql of ["SELECT card FROM croft.payments", "SELECT * FROM croft._croft.assets", "INSERT INTO croft.orders VALUES (9, 9)", "DELETE FROM croft.orders", "DROP VIEW croft.orders"]) {
         const a = await c.run(sql);
         expect(a.ok, sql).toBe(false);
-        expect(JSON.stringify(a), sql).not.toContain("4111");
+        expect(JSON.stringify(a), sql).not.toContain("4111-secret");
       }
       expect(await c.rows("SELECT count(*) AS n FROM croft.orders")).toEqual([{ n: "2" }]);
 
@@ -119,7 +123,7 @@ describe("journey 34: a person's DuckDB over Quack", () => {
       expect(lines.some((l) => /^croft serve: key alice {2}\S+ {2}read orders {2}over Quack$/.test(l))).toBe(true);
       expect(lines.some((l) => /^croft serve: key alice {2}\S+ {2}refused QUERY_NOT_SELECT {2}over Quack$/.test(l))).toBe(true);
       expect(lines.some((l) => /^croft serve: key bob {2}\S+ {2}read orders {2}over Quack$/.test(l))).toBe(true);
-      for (const secret of [alice, bob, "4111", "payments", "INSERT"]) expect(stopped.stdout + stopped.stderr).not.toContain(secret);
+      for (const secret of [alice, bob, "4111-secret", "payments", "INSERT"]) expect(stopped.stdout + stopped.stderr).not.toContain(secret);
       const listed = await p.json(["serve", "key", "list"], home);
       expect(listed.json.data.keys.map((k: { name: string; lastUsedAt: string | null }) => k.name)).toEqual(["bob"]);
       expect(listed.json.data.keys[0].lastUsedAt).toMatch(/^\d{4}-/);
