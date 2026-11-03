@@ -82,11 +82,13 @@ describe("a lake whose store is served over HTTPS", () => {
     const q = await cli(["query", "select count(*) as n from orders", "--json"], { cwd: p.root, env: p.env });
     expect((q.json as { data: { rows: { n: number }[] } }).data.rows[0]!.n).toBe(20);
     await closeAllWarehouses();
-    // The CA file is the only file of the machine DuckDB may read, and SQL cannot change it or reach another: a write to it, and a read of any
-    // other file, are refused. (SQL can read the CA file itself, a file of public certificates.)
-    for (const sql of [`copy (select 1) to '${certs!.cert}'`, `select * from read_text('/etc/hosts')`]) {
+    // The CA file is the only file of the machine DuckDB may read, and it is the instance's, not SQL's: the gate refuses a query that names it,
+    // to read or to overwrite, as it refuses one that names any other file (D-R1).
+    for (const sql of [`copy (select 1) to '${certs!.cert}'`, `select * from read_text('${certs!.cert}')`, `select * from read_text('/etc/hosts')`]) {
       const r = await cli(["query", sql, "--json"], { cwd: p.root, env: p.env });
       expect(r.exit, sql).not.toBe(0);
+      expect(problemsOf(r.json).map((x) => x.code), sql).toContain(sql.includes("COPY") || sql.startsWith("copy") ? "QUERY_NOT_SELECT" : "QUERY_PATH_DENIED");
+      expect(JSON.stringify(r.json), sql).not.toContain("BEGIN CERTIFICATE");
       await closeAllWarehouses();
     }
     expect(readFileSync(certs!.cert, "utf8")).toContain("BEGIN CERTIFICATE");
@@ -125,6 +127,69 @@ describe("a lake whose store is served over HTTPS", () => {
     expect(tls!.details).toMatchObject({ kind: "untrusted" });
   }, 120_000);
 
+  // DuckDB 2.0's enable_server_cert_verification defaults to false, and its httplib client then reads a store with a certificate nobody vouches for
+  // (measured: no CA and the wrong CA both read and wrote). croft pins the check on and the curl client; a prepare hook that runs before the lock
+  // forces httplib back, as a default or a setting of the machine's could, and the read must still be refused (D-R1).
+  maybe("with the httplib client forced, the wrong CA is still refused, and the right one works", async () => {
+    const { mkdtempSync, mkdirSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { openWarehouse } = await import("./warehouse.ts");
+    const { rigConnection } = await import("./lake-testkit.ts");
+    const lake = await rig!.lake();
+    const open = (caFile: string) => {
+      const root = mkdtempSync(join(tmpdir(), "croft-httplib-"));
+      const stateDir = join(root, ".croft");
+      mkdirSync(stateDir, { recursive: true });
+      const base = rigConnection(rig!, lake, { stateDir, extensionDir: ready.dir });
+      const conn = {
+        ...base,
+        mode: (access: "write" | "read") => {
+          const m = base.mode(access);
+          if (m.kind !== "lake") throw new Error("expected a lake mode");
+          return {
+            ...m,
+            // httplib also sends to a proxy named in the environment, even for 127.0.0.1 (HTTPS_PROXY made it fail with "Proxy connection failed"
+            // before it reached the certificate); the test is about the certificate.
+            prepare: async (c: { run(sql: string): Promise<unknown> }) => { await c.run("SET GLOBAL httpfs_client_implementation = 'httplib'"); await c.run("SET GLOBAL http_proxy = ''"); },
+            lake: { ...m.lake, data: { ...m.lake.data, useSsl: true, caFile } },
+          };
+        },
+      };
+      return openWarehouse({ path: join(root, "w.duckdb"), mode: "read_write", timezone: "UTC", root, stateDir, lake: conn, isTTY: false, register: false });
+    };
+    const write = (w: ReturnType<typeof open>) => w.write("x", (tx) => tx.exec("CREATE TABLE t AS SELECT range AS id FROM range(50)"), { runId: "r_test" });
+    const wrong = open(certs!.otherCa);
+    const refused = await write(wrong).then(() => null, (e: unknown) => e);
+    await wrong.close();
+    await closeAllWarehouses();
+    expect(refused, "the wrong CA must not be able to write").toBeInstanceOf(CroftError);
+    expect((refused as CroftError).code).toBe("LAKE_STORE_TLS");
+    expect(filesIn(lake.files), "nothing reached the store").toEqual([]);
+    const right = open(certs!.cert);
+    await write(right);
+    await right.close();
+    await closeAllWarehouses();
+    expect(filesIn(lake.files).some((f) => f.endsWith(".parquet"))).toBe(true);
+  }, 120_000);
+
+  // Bun's fetch honours NODE_TLS_REJECT_UNAUTHORIZED=0 (measured: it read a self-signed store with the wrong CA), and croft backup's mirror uses
+  // fetch. The mirror names rejectUnauthorized, which beats the variable, so a machine that turned checking off for its other tools still has
+  // the bucket's certificate checked by croft (D-R1). The variable is read when the process starts, so the mirror runs in a child that has it set.
+  maybe("with NODE_TLS_REJECT_UNAUTHORIZED=0 set, the backup mirror still refuses a store whose certificate the CA does not vouch for", async () => {
+    const script = `import { listObjects } from ${JSON.stringify(join(import.meta.dir, "s3-mirror.ts"))};
+const a = { endpoint: "127.0.0.1:" + process.env.STORE_PORT, region: "auto", useSsl: true, urlStyle: "path", bucket: "lakeb", keyId: "RKEYID0123456789", secretKey: "x", caFile: process.env.STORE_CA };
+try { for await (const o of listObjects(a, "")) void o; console.log("READ"); } catch (e) { console.log("REFUSED " + (e as { code?: string }).code); }`;
+    const run = async (ca: string) => {
+      const env = { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "", NODE_TLS_REJECT_UNAUTHORIZED: "0", STORE_PORT: String(rig!.s3.port), STORE_CA: ca };
+      const proc = Bun.spawn([process.execPath, "-e", script], { env, stdout: "pipe", stderr: "pipe" });
+      const out = await new Response(proc.stdout).text();
+      await proc.exited;
+      return out.trim();
+    };
+    expect(await run(certs!.otherCa)).toBe("REFUSED LAKE_STORE_TLS");
+    expect(await run(certs!.cert)).toBe("READ");
+  }, 60_000);
+
   maybe("a CA file the project names that is not a file is CONFIG_INVALID before anything is attached", async () => {
     const lake = await rig!.lake();
     const p = project(lake, "certs/no-such-ca.pem");
@@ -149,7 +214,7 @@ describe("croft doctor asks the bucket before the first run (D-R6)", () => {
     const store = checksOf(ok.json).find((c) => c.id === "lake.store")!;
     expect(store, ok.stdout.slice(0, 800)).toMatchObject({ status: "ok" });
     expect(store.text).toContain("is empty");
-    expect(store.details).toMatchObject({ listed: 0, caFile: certs!.cert });
+    expect(store.details).toMatchObject({ empty: true, caFile: certs!.cert });
     // Doctor wrote nothing into the lake's folder (not even the folder).
     expect(filesIn(lake.files)).toEqual([]);
     expect(checksOf(ok.json).find((c) => c.id === "warehouse")!.text).toContain("not created yet");
@@ -174,11 +239,29 @@ describe("croft doctor asks the bucket before the first run (D-R6)", () => {
     const checks = checksOf(r.json);
     const store = checks.find((c) => c.id === "lake.store")!;
     expect(store, r.stdout.slice(0, 800)).toMatchObject({ status: "ok" });
-    expect(store.text).toMatch(/objects? under s3:\/\/lakeb\/proj\d+\/ listed in \d+ ms, the footer of \S+\.parquet read in \d+ ms/);
+    expect(store.text).toMatch(/s3:\/\/lakeb\/proj\d+\/ listed in \d+ ms, the footer of \S+\.parquet read in \d+ ms/);
     expect(filesIn(lake.files)).toEqual(before);
     // The rig's Postgres offers no TLS and is on this machine: said, as a note.
     expect(checks.find((c) => c.id === "lake.catalog.encrypted")).toMatchObject({ status: "info" });
     expect(checks.find((c) => c.id === "lake.catalog.encrypted")!.text).toContain("not encrypted; the catalog is on this machine");
+  }, 120_000);
+
+  maybe("a folder of more than a page of objects (6,000) still answers: the first page proves the key, the endpoint and the certificate, and it is said so", async () => {
+    const { mkdirSync } = await import("node:fs");
+    const lake = await rig!.lake();
+    const p = project(lake, certs!.cert);
+    expect((await cli(["run", "--foreground", "--json"], { cwd: p.root, env: p.env })).exit).toBe(0);
+    await closeAllWarehouses();
+    mkdirSync(join(lake.files, "main", "many"), { recursive: true });
+    for (let i = 0; i < 6000; i++) writeFileSync(join(lake.files, "main", "many", `f${i}.txt`), "x");
+    const r = await cli(["doctor", "--json"], { cwd: p.root, env: p.env });
+    await closeAllWarehouses();
+    const store = checksOf(r.json).find((c) => c.id === "lake.store")!;
+    expect(store, r.stdout.slice(0, 600)).toMatchObject({ status: "ok" });
+    // DuckDB's locked instance cannot list past 1,000 objects (db/lake-probe.ts): the probe says what it knows instead of failing the lake.
+    expect(store.text).toContain("it holds more than 1,000 objects");
+    expect(store.details).toMatchObject({ many: true, empty: false });
+    expect(Number(store.details!.listMs)).toBeLessThan(5000);
   }, 120_000);
 
   test("the catalog line: encrypted is ok; plain text to this machine is a note; plain text to another machine is a warning", () => {

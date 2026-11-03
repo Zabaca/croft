@@ -143,8 +143,10 @@ is one row for each live key; what the views show is the same before and after, 
 tables that keep small inserts inside the catalog, and files freed but not yet deleted. What it does to a lake of five
 assets run hourly: after a week the catalog held 842 snapshots, 839 files and 181 inlined tables; a pass takes about a
 second and leaves, once the week is older than 30 days, 28 snapshots, 26 files and 18 tables, and in a steady state
-(30 days of hourly runs kept) it takes 0.2 to 0.5 s. The catalog's size on disk is Postgres's to give back (VACUUM FULL);
-the rows it holds are what fall.
+(30 days of hourly runs kept) it takes 0.2 to 0.5 s. Those figures were measured when the flush took every schema; the
+fall in tables that keep rows inside the catalog now holds for the assets' schema (`main`) only. croft's own bookkeeping
+tables (`_croft`) stay inlined, so a count of such tables from `croft doctor` includes them and is that much higher than
+those figures. The catalog's size on disk is Postgres's to give back (VACUUM FULL); the rows it holds are what fall.
 
 ## Backups of a lake
 

@@ -104,7 +104,10 @@ async function get(a: S3Access, key: string, query: Record<string, string>): Pro
   // A redirect would send the signed request, and the key's signature with it, somewhere the store did not name: refused.
   let res: Response;
   try {
-    res = await fetch(`${t.base}${qs ? `?${qs}` : ""}`, { method: "GET", headers, redirect: "error", ...(a.caFile ? { tls: { ca: Bun.file(a.caFile) } } : {}) });
+    res = await fetch(`${t.base}${qs ? `?${qs}` : ""}`, { method: "GET", headers, redirect: "error",
+      // Always checked: Bun's fetch honours NODE_TLS_REJECT_UNAUTHORIZED=0 and then reads a store with any certificate or none vouching for it,
+      // CA file or not [V: 1.3.14]; naming `rejectUnauthorized` beats the variable (D-R1).
+      tls: { rejectUnauthorized: true, ...(a.caFile ? { ca: Bun.file(a.caFile) } : {}) } });
   } catch (e) {
     // The store's certificate not checking out is LAKE_STORE_TLS here as it is for DuckDB (D-R1), not a failure of the backup's folder.
     throw storeTlsError(e, { named: !!a.caFile }) ?? e;

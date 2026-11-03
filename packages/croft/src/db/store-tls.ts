@@ -46,7 +46,7 @@ export function storeCaFile(
 /** DuckDB's words (httpfs, libcurl and OpenSSL) for a check of the store's certificate that could not be made or failed: the CA file may not be
  *  read (the lockdown), the certificate is not signed by a CA in the file, or it is for another name [V: 2.0.0, a store over HTTPS with a
  *  self-signed certificate: "SSL peer certificate or SSH remote key was not OK"]. */
-const STORE_TLS = /Cannot read a CA certificate bundle|SSL peer certificate|SSL certificate problem|SSL connect error|SSL CA cert|certificate verify failed|self[- ]signed certificate|unable to get (?:local )?issuer certificate|server certificate verification failed|no alternative certificate subject name|unable to verify the (?:first|leaf) certificate|certificate has expired|does not match certificate's altnames|DEPTH_ZERO_SELF_SIGNED_CERT|ERR_TLS_CERT_ALTNAME_INVALID/i;
+const STORE_TLS = /Cannot read a CA certificate bundle|SSL peer certificate|SSL certificate problem|SSL connect error|SSL CA cert|certificate verify failed|SSL server verification failed|self[- ]signed certificate|unable to get (?:local )?issuer certificate|server certificate verification failed|no alternative certificate subject name|unable to verify the (?:first|leaf) certificate|certificate has expired|does not match certificate's altnames|DEPTH_ZERO_SELF_SIGNED_CERT|ERR_TLS_CERT_ALTNAME_INVALID/i;
 
 /** Whether an error is the check of a store's certificate failing. Waiting does not change its answer, so it is not retried. */
 export function isStoreTls(e: unknown): boolean {

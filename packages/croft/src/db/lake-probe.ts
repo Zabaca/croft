@@ -22,8 +22,10 @@ export const PROBE_MS = 15_000;
 export interface StoreProbe {
   /** The lake's folder, `s3://bucket/folder/`. */
   folder: string;
-  /** Objects found under it. */
-  listed: number;
+  /** Whether the folder holds anything. The listing stops at the first object: a lake of 100,000 files is not listed to say that it answers. */
+  empty: boolean;
+  /** The folder holds more than one page of the store's listing (1,000 objects): the first page answered, and no sample file is named. */
+  many: boolean;
   listMs: number;
   /** One data file whose footer was read, and how long that took; null when the folder holds none. */
   sample: { file: string; readMs: number } | null;
@@ -54,16 +56,31 @@ export async function probeStore(project: Project, env: ProjectEnv, o: { timeout
     timer = setTimeout(() => c.interrupt(), o.timeoutMs ?? PROBE_MS);
     const q = (s: string) => `'${s.replaceAll("'", "''")}'`;
     const t0 = performance.now();
-    const files = (await c.runAndReadAll(`SELECT file FROM glob(${q(`${folder}**`)})`)).getRowsJS().map((r) => String(r[0]));
+    // The first object of the listing, or none. DuckDB 2.0 under croft's lock lists one page (1,000 objects) and fails on the next, with
+    // `Cannot access "s3://<bucket>/"` [V: 2.0.0, a folder of 1,100 objects, LIMIT 1 or not]: that error is proof that the first page came back
+    // (the key, the endpoint and the certificate are right), and it says the folder holds more than a page.
+    const listed = async (pattern: string): Promise<{ file: string | null; many: boolean }> => {
+      try {
+        const rows = (await c.runAndReadAll(`SELECT file FROM glob(${q(pattern)}) LIMIT 1`)).getRowsJS();
+        return { file: typeof rows[0]?.[0] === "string" ? rows[0][0] : null, many: false };
+      } catch (e) {
+        if (/Cannot access "s3:\/\/[^/"]+\/" - file system operations are disabled/.test(e instanceof Error ? e.message : String(e))) return { file: null, many: true };
+        throw e;
+      }
+    };
+    const first = await listed(`${folder}**`);
     const listMs = Math.round(performance.now() - t0);
-    const data = files.find((f) => f.endsWith(".parquet") && !f.endsWith("-delete.parquet"));
     let sample: StoreProbe["sample"] = null;
-    if (data) {
-      const t1 = performance.now();
-      await c.runAndReadAll(`SELECT count(*) FROM parquet_metadata(${q(data)})`);
-      sample = { file: data.slice(folder.length), readMs: Math.round(performance.now() - t1) };
+    if (first.file) {
+      // One data file is enough to read a footer from.
+      const data = await listed(`${folder}**/*.parquet`);
+      if (data.file) {
+        const t1 = performance.now();
+        await c.runAndReadAll(`SELECT count(*) FROM parquet_metadata(${q(data.file)})`);
+        sample = { file: data.file.slice(folder.length), readMs: Math.round(performance.now() - t1) };
+      }
     }
-    return { folder, listed: files.length, listMs, sample, caFile: mode.lake.data.caFile ?? null };
+    return { folder, empty: !first.file && !first.many, many: first.many, listMs, sample, caFile: mode.lake.data.caFile ?? null };
   } catch (e) {
     throw probeFailure(e, secrets, folder, !!mode.lake.data.caFile);
   } finally {

@@ -580,10 +580,11 @@ async function checkLakeStore(r: Report, d: DoctorDeps, project: Project): Promi
     const { probeStore } = await import("../../db/lake-probe.ts");
     const p = await probeStore(project, envOf(r, d, project));
     const ca = p.caFile ? ` against ${p.caFile}` : "";
-    const text = p.listed === 0
+    const text = p.empty
       ? `the bucket answers (listed in ${p.listMs} ms${ca}): ${p.folder} is empty, which the first croft run changes`
-      : `the bucket answers: ${formatCount(p.listed)} object${p.listed === 1 ? "" : "s"} under ${p.folder} listed in ${p.listMs} ms${p.sample ? `, the footer of ${p.sample.file} read in ${p.sample.readMs} ms` : ", no data file to read yet"}${ca}`;
-    r.add("environment", "lake.store", "ok", text, undefined, { ...details, listed: p.listed, listMs: p.listMs, sample: p.sample, caFile: p.caFile });
+      : p.many ? `the bucket answers (a page of ${p.folder} listed in ${p.listMs} ms${ca}): it holds more than 1,000 objects, which croft's locked instance does not list further`
+      : `the bucket answers: ${p.folder} listed in ${p.listMs} ms${p.sample ? `, the footer of ${p.sample.file} read in ${p.sample.readMs} ms` : ", no data file to read yet"}${ca}`;
+    r.add("environment", "lake.store", "ok", text, undefined, { ...details, empty: p.empty, many: p.many, listMs: p.listMs, sample: p.sample, caFile: p.caFile });
   } catch (e) {
     if (e instanceof CroftError) {
       r.add("environment", "lake.store", "error", e.problem.message, e.problem, details);

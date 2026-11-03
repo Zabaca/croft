@@ -267,8 +267,15 @@ async function attachLake(conn: DuckDBConnection, lake: LakeSpec, secrets: strin
     `USE_SSL ${data.useSsl === false ? "false" : "true"}`,
   ];
   await attempt(conn, `CREATE OR REPLACE TEMPORARY SECRET ${LAKE_BUCKET_SECRET} (${opts.join(", ")})`, fail);
+  // A store over TLS is checked, always (D-R1). DuckDB 2.0's `enable_server_cert_verification` defaults to false, and its httplib client then
+  // read a self-signed store with no CA or the wrong one, verifying nothing [V: 2.0.0]; the curl client checks regardless. Both are pinned
+  // here, before the lock, so neither a default nor a setting of the machine's changes it.
+  if (data.useSsl !== false) {
+    await attempt(conn, `SET GLOBAL enable_server_cert_verification = true`, fail);
+    await attempt(conn, `SET GLOBAL httpfs_client_implementation = 'curl'`, fail);
+  }
   // httpfs checks the store's certificate against this file, and may read it only because modePaths allows it (D-R1).
-  if (data.caFile) await attempt(conn, `SET GLOBAL ca_cert_file = ${q(data.caFile)}`, fail);
+  if (data.caFile)await attempt(conn, `SET GLOBAL ca_cert_file = ${q(data.caFile)}`, fail);
   if (lake.storeOnly) return; // croft doctor's probe of the bucket (D-R6): the store's secret and CA, no catalog is reached
   await attempt(conn, `ATTACH 'ducklake:postgres:' AS ${LAKE_ALIAS} (DATA_PATH ${q(data.path)}, META_SECRET ${LAKE_CATALOG_SECRET}, DUCKLAKE_VERSION ${q(DUCKLAKE_FORMAT)}${access === "read" ? ", READ_ONLY" : ""})`, fail);
 }
