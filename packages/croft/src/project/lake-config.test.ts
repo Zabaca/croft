@@ -88,6 +88,25 @@ describe("a shared lake", () => {
     }
   });
 
+  test("the folder is one folder however many slashes end it: trial-1, trial-1/ and trial-1// are s3://bucket/trial-1/, never trial-1// (D-R4)", () => {
+    for (const written of ["trial-1", "trial-1/", "trial-1//", "a/b", "a/b/", "a/b///"]) {
+      const r = validateConfig({ ...tz, lake: shared({ bucket: { folder: written } }) });
+      expect(r.ok, written).toBe(true);
+      if (!r.ok || r.config.lake?.kind !== "postgres") continue;
+      const want = `${written.replace(/\/+$/, "")}/`;
+      expect(r.config.lake.bucket.folder, written).toBe(want);
+      expect(bucketPath(r.config.lake.bucket), written).toBe(`s3://my-bucket/${want}`);
+      expect(bucketPath(r.config.lake.bucket).replace("s3://", ""), written).not.toContain("//");
+    }
+  });
+
+  test("the store's CA file: sslRootCert is a path, only with TLS", () => {
+    const ok = validateConfig({ ...tz, lake: shared({ bucket: { sslRootCert: "certs/store-ca.pem" } }) });
+    expect(ok.ok && ok.config.lake?.kind === "postgres" ? ok.config.lake.bucket.sslRootCert : null).toBe("certs/store-ca.pem");
+    expect(messages({ lake: shared({ bucket: { sslRootCert: 5 } }) })).toEqual([expect.stringContaining('"lake.bucket.sslRootCert" must be the path of a PEM file')]);
+    expect(messages({ lake: shared({ bucket: { sslRootCert: "ca.pem", useSsl: false } }) })).toEqual([expect.stringContaining("useSsl\" is false")]);
+  });
+
   test("a secret is named, never given: a value that is not a name is refused without being printed back as one", () => {
     const m = messages({ lake: shared({ catalog: { writer: { user: "w", passwordSecret: "hunter2 and more" } } }) });
     expect(m).toEqual([expect.stringContaining("must be the NAME of a secret")]);

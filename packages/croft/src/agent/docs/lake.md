@@ -58,6 +58,14 @@ lake add-on, which carries DuckDB's ducklake, httpfs and postgres extensions (cr
     bun add @zabaca/croft-addon-lake@<version>
     croft validate && croft doctor && croft run
 
+The store is reached over HTTPS, and croft checks its certificate against a CA file it lets DuckDB read: the file
+`lake.bucket.sslRootCert` names (relative to the project folder), for a store whose certificate a private authority signed
+or whose provider publishes a root file. Without a usable CA file every read and write of the bucket fails with
+LAKE_STORE_TLS, in whichever command meets it. `croft doctor` lists the bucket's folder and reads the footer of one data
+file with the read-only key before the first run, so a store croft cannot reach is found before `croft run` fails on it;
+it writes nothing, and says whether the catalog's connection is encrypted (a Postgres that offers no TLS is reached in
+plain text, without a word from the client, unless the connection is made to require it).
+
 The first `croft run` creates the lake, at DuckLake format 1.0 (so DuckDB 1.5 can read it too). croft never lets
 DuckLake migrate a catalog by itself. The writer's login and key are used only by commands that write; `croft serve`,
 `croft query`, `croft status`, `croft doctor` and the rest attach read-only with the read-only login and key. The
@@ -88,7 +96,8 @@ five assets left 849 snapshots, 841 files, 176 tables of rows kept in the catalo
 lake's maintenance itself, one step at a time, in this order:
 
   prune     croft's own bookkeeping log loses the rows a newer row of the same key has superseded
-  flush     the rows DuckLake kept inside the catalog become files
+  flush     the rows DuckLake kept inside the catalog become files (the assets' tables only: croft's own bookkeeping,
+            `_croft`, stays in the catalog, where reading it is one round trip, not a listing and a read of the store)
   expire    the snapshots outside the promise go, by an explicit list croft computes
   merge     small files become fewer, larger ones (every version still reads back)
   rewrite   files that are mostly deleted rows are rewritten
@@ -107,8 +116,9 @@ old (24; an hour after a pass that failed). A lake croft has not seen before is 
 a new lake is not maintained on its first day. `lake.maintenance.enabled: false` stops this, and `croft maintain` still
 runs a pass by hand. A pass takes croft's lock on the lake's writes for its whole body: it never runs while a write holds
 the lock, and a write waits for it (a pass takes seconds; a long one shows in the wait's message). A pass that fails
-never fails a run: the failure shows in `croft status` and `croft doctor` (LAKE_MAINTENANCE_FAILED, a warning) and croft
-tries again within the hour. A store that answers HTTP 500, or a connection that drops, is tried again four times first.
+never fails a run: the failure shows in `croft status` and `croft doctor` (LAKE_MAINTENANCE_FAILED, a warning). Another
+pass is due an hour after the failed one, and the next croft run, or the scheduler's next tick when `croft schedule` is
+on, makes it; nothing runs by itself otherwise, so `croft maintain` makes it at once. A store that answers HTTP 500, or a connection that drops, is tried again four times first.
 
   croft maintain               a pass now, whatever the interval; --json has each step, the lake's counts before and after
   croft maintain --dry-run     what a pass would expire and keep, from the read-only login; nothing changes
@@ -162,13 +172,16 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO <analyst>;
 ALTER DEFAULT PRIVILEGES FOR ROLE <writer> IN SCHEMA public GRANT SELECT ON TABLES TO <analyst>;
 ```
 
-  and by the analyst, in DuckDB 2.0 (INSTALL fetches the extensions once; croft is not involved):
+  and by the analyst, in DuckDB 2.0 (INSTALL fetches the extensions once; croft is not involved). `<data_path>` is the
+  lake's folder exactly as `croft doctor` prints it, `s3://<bucket>/<folder>/`, with ONE slash at the end: a second
+  slash (`.../trial-1//`) names another place in the bucket, where the catalog still answers a count but every read of
+  a data file is a 404.
 
 ```sql duckdb-reader
 INSTALL ducklake; INSTALL postgres; INSTALL httpfs;
 CREATE SECRET lake_catalog (TYPE postgres, HOST '<host>', PORT <port>, DATABASE '<database>', USER '<analyst>', PASSWORD '<analyst_password>', SSLMODE '<sslmode>', SSLROOTCERT '<ca_file>');
-CREATE SECRET lake_files (TYPE s3, KEY_ID '<key_id>', SECRET '<key_secret>', ENDPOINT '<endpoint>', URL_STYLE 'path', USE_SSL <use_ssl>, SCOPE 's3://<bucket>/<folder>/');
-ATTACH 'ducklake:postgres:' AS lake (META_SECRET lake_catalog, DATA_PATH 's3://<bucket>/<folder>/', READ_ONLY);
+CREATE SECRET lake_files (TYPE s3, KEY_ID '<key_id>', SECRET '<key_secret>', ENDPOINT '<endpoint>', URL_STYLE 'path', USE_SSL <use_ssl>, SCOPE '<data_path>');
+ATTACH 'ducklake:postgres:' AS lake (META_SECRET lake_catalog, DATA_PATH '<data_path>', READ_ONLY);
 USE lake;
 ```
 
@@ -176,6 +189,12 @@ USE lake;
   (/etc/ssl/cert.pem on macOS, /etc/ssl/certs/ca-certificates.crt on Debian and Ubuntu): without them the analyst's DuckDB does not
   check the server it sends the password to. For a catalog on the same machine, `<sslmode>` is `prefer` and `<ca_file>` is any
   existing file. DuckDB's libpq takes both options as they are, and `sslrootcert=system` is not a form to rely on.
+
+  INSTALL downloads each extension from DuckDB's repository, extensions.duckdb.org, over plain HTTP, and fails behind a
+  proxy or firewall that refuses plain HTTP. Fetch the three files where plain HTTP is allowed, or take them from the
+  croft add-on (`bun add @zabaca/croft-addon-lake` puts them in `node_modules/@zabaca/croft-ext-<extension>-<platform>/`,
+  the same files for the same DuckDB 2.0), and `LOAD '/path/to/ducklake.duckdb_extension'` (likewise
+  `postgres_scanner.duckdb_extension` and `httpfs.duckdb_extension`) in place of each INSTALL.
 
   They then query the tables, and `FROM lake.snapshots()` or `SELECT ... FROM t AT (VERSION => <n>)` show the lake as it
   was, for every version the maintenance keeps (30 days, and each table's 5 newest versions). An attempt to write a table, or a file in the bucket, is refused (by the attach, by the store, by Postgres).
@@ -200,6 +219,6 @@ LAKE_TYPE_UNSUPPORTED and the cast that fixes it (`CAST(col AS VARCHAR)`).
 - A lake on one machine with no Postgres (a SQLite catalog and a folder). It exists for croft's own tests, and croft.json refuses it
   otherwise; it may be offered later as its own decision.
 
-Codes: LAKE_ATTACH_FAILED, LAKE_CONNECTION_LOST, LAKE_COMMIT_UNCERTAIN, LAKE_TYPE_UNSUPPORTED, LAKE_DIRECT_READ,
+Codes: LAKE_ATTACH_FAILED, LAKE_STORE_TLS, LAKE_CONNECTION_LOST, LAKE_COMMIT_UNCERTAIN, LAKE_TYPE_UNSUPPORTED, LAKE_DIRECT_READ,
 LAKE_UNSUPPORTED, LAKE_OTHER_WRITER, LAKE_MAINTENANCE_FAILED, LAKE_EXPIRY_OPTION, LAKE_BACKUP_FAILED,
 LAKE_BACKUP_TOOL_MISSING, MAINTAIN_NEEDS_LAKE (croft docs <CODE>), and EXTENSION_MISSING when the add-on is not installed.

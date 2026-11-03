@@ -10,11 +10,14 @@ password and key taken out. The steps after it did not run.
 
 Nothing is lost and the lake is usable. Each step can be run again from where the last one stopped: files that a failed
 cleanup did not delete stay listed as waiting for deletion, and the next pass deletes them. Runs, reads and writes carry
-on; a failed pass never fails a run. `croft status` and `croft doctor` show it as a warning until a pass works, and
-croft tries again within the hour.
+on; a failed pass never fails a run. `croft status` and `croft doctor` show it as a warning until a pass works.
+Another pass is due an hour after the failed one. Nothing runs by itself: the next croft run (or the scheduler's next
+tick, when `croft schedule` is on) makes it, so on a lake nobody runs, `croft maintain` is what tries again.
 
 What to do:
-- Usually nothing: look at `croft doctor` after an hour. A pass that worked clears the warning.
+- Usually nothing: the next croft run after an hour makes another pass, and `croft doctor` shows whether it worked. A
+  pass that worked clears the warning.
+- When the message is about the store's certificate, it is LAKE_STORE_TLS instead (croft docs LAKE_STORE_TLS).
 - A pass that keeps failing is almost always the store or the catalog (a bucket key that lost its right to delete, a
   full or unreachable Postgres): the message says which. `croft doctor` checks both. Ask the user to look at the
   bucket key (it needs to delete in the lake's folder) rather than changing croft's settings.

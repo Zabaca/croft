@@ -125,7 +125,7 @@ export const TABLE_SCAN_MS = 400;
 /** The same for a lake whose store and catalog are over a network (D-R7): comparing one table takes several round trips of 50 to 700 ms, so 400 ms
  *  never compared more than the first (the first real-lake trial compared none of 6). A lake on this machine keeps the file's budget. */
 export const TABLE_SCAN_LAKE_MS = 8_000;
-const lakeScanMs = (kind: "postgres" | "local"): number => (kind === "postgres" ? TABLE_SCAN_LAKE_MS : TABLE_SCAN_MS);
+export const lakeScanMs = (kind: "postgres" | "local"): number => (kind === "postgres" ? TABLE_SCAN_LAKE_MS : TABLE_SCAN_MS);
 
 export function defaultDeps(env: Record<string, string | undefined>): DoctorDeps {
   return {
@@ -1207,7 +1207,7 @@ function checkTables(r: Report, scan: TableScanResult): void {
   if (scan.skipped > 0) {
     const allowed = scan.budgetMs !== undefined ? ` (${scan.budgetMs < 1000 ? `${scan.budgetMs} ms` : `${scan.budgetMs / 1000} s`}${scan.budgetMs > TABLE_SCAN_MS ? ", more than a file gets, since a lake's tables are read over the network" : ""})` : "";
     r.add("project", "tables", "info", `tables: ${formatCount(scan.skipped)} more not compared with croft's record in the time doctor allows${allowed}`
-      + " (the next run of each asset compares its table)", undefined, { skipped: scan.skipped, ...(scan.budgetMs !== undefined ? { budgetMs: scan.budgetMs } : {}) });
+      + `${allowed ? "; the" : " (the"} next run of each asset compares its table${allowed ? "" : ")"}`, undefined, { skipped: scan.skipped, ...(scan.budgetMs !== undefined ? { budgetMs: scan.budgetMs } : {}) });
   }
   for (const f of scan.findings) {
     if (f.outOfBand) r.add("project", "tables", "warn", f.outOfBand.problem.message, f.outOfBand.problem, { asset: f.asset });

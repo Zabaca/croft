@@ -1240,8 +1240,8 @@ describe("tables changed outside croft, drift and backups (§5 \"Out-of-band cha
     const { data, problems } = await runDoctor(root, deps({ tableScanMs: 0 }));
     expect(problems).toEqual([]);
     expect(data.checks.filter((c) => c.id === "tables")).toEqual([{
-      id: "tables", section: "project", status: "info", details: { skipped: 2 },
-      text: "tables: 2 more not compared with croft's record in the time doctor allows (the next run of each asset compares its table)",
+      id: "tables", section: "project", status: "info", details: { skipped: 2, budgetMs: 0 },
+      text: "tables: 2 more not compared with croft's record in the time doctor allows (0 ms); the next run of each asset compares its table",
     }]);
   });
 

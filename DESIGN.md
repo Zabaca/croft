@@ -2427,7 +2427,7 @@ croft status                # failed, stale, held, never run, edited since its l
   `croft doctor`, tell the user, run again when they are reachable. LAKE_COMMIT_UNCERTAIN: look at `croft status` before running
   again. LAKE_OTHER_WRITER: tell the user; do not run from this machine until they decide which machine writes.
 - Lake maintenance: croft runs it by itself (croft docs lake); `croft maintain --dry-run` says what a pass would expire,
-  `croft maintain` runs one. LAKE_MAINTENANCE_FAILED is a warning (the lake is fine, croft tries again within the hour).
+  `croft maintain` runs one. LAKE_MAINTENANCE_FAILED is a warning (the lake is fine; the next croft run or scheduler tick tries again once an hour has passed).
   A version of a table in a lake older than a few days is read with `AT (VERSION => n)` or `AT (TIMESTAMP => ...)` in
   `croft query`, within the 30 days or the table's 5 newest versions.
 - Backup: croft backup (into .croft/backups/), or croft backup <folder> on another disk; safe while croft serve

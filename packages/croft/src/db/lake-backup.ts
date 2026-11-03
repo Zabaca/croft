@@ -151,7 +151,7 @@ export async function backupLake(project: Project, env: ProjectEnv, o: LakeBacku
     const { version } = await import("@duckdb/node-api");
     const manifest: BackupManifest & { lake: LakeBackupInfo & { folder: string } } = {
       croftBackup: 1, createdAt: leased.createdAt.toISOString(), croftVersion: CROFT_VERSION, duckdb: version(), formatVersion: leased.formatVersion,
-      project: { root: project.root, database, stateDir, timezone: project.timezone }, files,
+      project: { root: project.root, database: project.databaseLabel, stateDir, timezone: project.timezone }, files,
       restore: "croft docs backup: restore the catalog into a new database, copy lake-data/ into the new bucket folder, and point the project at them",
       lake: { ...info, folder: shared ? `s3://${lake.bucket.name}/${lake.bucket.folder}` : localLakePaths(lake as never, project.root).data },
     };
