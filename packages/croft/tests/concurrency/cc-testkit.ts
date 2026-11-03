@@ -5,8 +5,8 @@
 // and an app is the public query() of @zabaca/croft/read.
 //
 // Timing budgets are DESIGN's. Every duration is measured from the event it times (a writer's intent `since`,
-// stamped by the writer itself), so a slow child start never counts. CROFT_CI=1 adds SLACK to each budget for
-// CPU-starved runners.
+// stamped by the writer itself), so a slow child start never counts. A latency is bounded far above its budget, by what the code does
+// when it is wrong (TIMING_GAP, or the grace it was meant to skip): a bound at the budget is a bound on the machine (DESIGN.md §10).
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -18,10 +18,7 @@ export {
 } from "../e2e/harness.ts";
 
 export const CI = process.env.CROFT_CI === "1";
-/** Extra time CPU-starved CI runners get on every timing budget. */
-export const SLACK = CI ? 600 : 0;
-/** The probe writer's own share of a handoff: its 5 ms lock retries and its scheduling. */
-export const WRITER_SHARE = 150;
+export { TIMING_GAP } from "../timing-gap.ts";
 /** DESIGN §5: a running query may finish for 2 s before it is interrupted for a writer. */
 export const GRACE_MS = 2000;
 

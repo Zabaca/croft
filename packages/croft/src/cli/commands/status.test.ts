@@ -352,16 +352,14 @@ describe("croft status never waits on DuckDB", () => {
   test("it answers while another process holds the warehouse write lock", async () => {
     const p = await scenario({ warehouse: false });
     await seed(p.database, ISSUES_SEED);
-    const holder = spawnHolder(p.database, 20_000);
+    // The holder keeps the lock until it is killed below: a status that waited for it would hang and fail by this test's timeout.
+    const holder = spawnHolder(p.database, "release");
     await holder.waitFor("held");
-    const started = performance.now();
     const r = await cli(["status", "--json"], { cwd: p.root, env: ENV });
-    const took = performance.now() - started;
+    holder.proc.kill("SIGKILL");
     expect(r.exit).toBe(0);
     expect(r.json.data.assets).toHaveLength(6);
-    expect(took).toBeLessThan(1500);
-    holder.proc.kill("SIGKILL");
-  });
+  }, 20_000);
 
   test("it never opens the warehouse: a file that is not a database changes nothing", async () => {
     const p = await scenario();

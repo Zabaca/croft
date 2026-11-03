@@ -8,7 +8,7 @@
 // The long queries are interruptible cross joins (LONG_QUERY); a query that spends its time inside one scalar or
 // list expression cannot be interrupted (review finding R31-01) and is fixed and tested elsewhere.
 //
-// Slow suite (real processes, ~20 s): it runs in the whole `bun test`. CROFT_CI=1 adds SLACK to every budget.
+// Slow suite (real processes, ~20 s): it runs in the whole `bun test`. Latencies are bounded far above their budgets (DESIGN.md §10).
 import { afterAll, describe, expect, test } from "bun:test";
 import { DuckDBInstance } from "@duckdb/node-api";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -18,7 +18,7 @@ import { bootId } from "../../src/core/proc.ts";
 import { listIntents } from "../../src/db/intent.ts";
 import {
   addSale, cleanupAll, foreignHolder, GRACE_MS, initProject, intentFiles, killChildren, LONG_QUERY, placeOf, probeWriter,
-  type Project, type Reply, rowsVia, type Serve, show, SLACK, sleep, slowSqlAsset, startServe, stopServes, until, WRITER_SHARE,
+  type Project, type Reply, rowsVia, type Serve, show, sleep, slowSqlAsset, startServe, stopServes, TIMING_GAP, until,
   writerTimes,
 } from "./cc-testkit.ts";
 
@@ -85,7 +85,7 @@ describe("croft serve with writers (slow: real processes)", () => {
     for (let i = 0; i < 2; i++) {
       const w = probeWriter(placeOf(p), `r_idle_${i}`, 100);
       const t = await writerTimes(w);
-      expect(t.latency, `writer ${i} got the file ${t.latency} ms after its intent`).toBeLessThanOrEqual(100 + WRITER_SHARE + SLACK);
+      expect(t.latency, `writer ${i} got the file ${t.latency} ms after its intent`).toBeLessThan(GRACE_MS); // timing-gap: no query is in flight, so no grace to wait out (the budget is 100 ms)
       await w.waitFor("released");
       await until(async () => (await s.engine()).state === "open", 5000, 20);
     }
@@ -97,7 +97,7 @@ describe("croft serve with writers (slow: real processes)", () => {
     const w = probeWriter(placeOf(p), "r_long", 100);
     const t = await writerTimes(w);
     expect(t.latency, `the writer got the file ${t.latency} ms after its intent`).toBeGreaterThanOrEqual(GRACE_MS - 50);
-    expect(t.latency, `the writer got the file ${t.latency} ms after its intent`).toBeLessThanOrEqual(GRACE_MS + 100 + WRITER_SHARE + SLACK);
+    expect(t.latency, `the writer got the file ${t.latency} ms after its intent`).toBeLessThanOrEqual(GRACE_MS + TIMING_GAP); // timing-gap: the long query runs for hours
     const interrupted = await long;
     expect(interrupted.status).toBe(503);
     expect(Number(interrupted.retryAfter)).toBeGreaterThanOrEqual(1);
@@ -136,7 +136,7 @@ describe("croft serve with writers (slow: real processes)", () => {
     const bAcquired = (await b.waitFor("acquired")).t;
     // A's intent went while B's stayed: the server stayed closed, and B got the file at its next try.
     expect([...states]).toEqual(["closed_for_write"]);
-    expect(bAcquired - aReleased, `B got the file ${bAcquired - aReleased} ms after A released`).toBeLessThanOrEqual(retryMs + WRITER_SHARE + SLACK);
+    expect(bAcquired - aReleased, `B got the file ${bAcquired - aReleased} ms after A released`).toBeLessThanOrEqual(retryMs + TIMING_GAP); // timing-gap: a server that took the file in the window would hold it until it was asked to step aside again
     await b.waitFor("released");
     expect(await rowsVia(s, "SELECT who FROM probe_log ORDER BY stamp")).toEqual([{ who: "A" }, { who: "B" }]);
     await steady.stop();
@@ -176,12 +176,12 @@ describe("croft serve with writers (slow: real processes)", () => {
 
     const w = probeWriter(placeOf(p), "r_16", "stdin");
     const t = await writerTimes(w);
-    expect(t.latency, `the writer got the file ${t.latency} ms after its intent`).toBeLessThanOrEqual(GRACE_MS + 100 + WRITER_SHARE + SLACK);
+    expect(t.latency, `the writer got the file ${t.latency} ms after its intent`).toBeLessThanOrEqual(GRACE_MS + TIMING_GAP); // timing-gap: sixteen queries that run for hours
     // The file is free only once every connection is closed: the engine reports none, and queues the rest.
     const during = await s.engine();
     expect(during).toMatchObject({ state: "closed_for_write", openConnections: 0, inFlight: 0, queued: 12, writeIntent: { runId: "r_16" } });
     // The four that ran were interrupted and told to retry; the twelve queued ones are still waiting.
-    await until(() => answered.length >= 4, 3000 + SLACK, 10);
+    await until(() => answered.length >= 4, 30_000, 10);
     await sleep(50);
     expect(answered.length).toBe(4);
     for (const r of answered) {
@@ -224,13 +224,13 @@ describe("croft serve with writers (slow: real processes)", () => {
     const t0 = Date.now();
     const r = await s.query(COUNT);
     expect(r.status).toBe(200);
-    expect(Date.now() - t0).toBeLessThanOrEqual(1000 + SLACK);
-    await until(() => !existsSync(file), 2000 + SLACK, 20);
+    expect(Date.now() - t0).toBeLessThan(TIMING_GAP); // timing-gap: a stale intent kept honored would hold the query until the engine's queueMs
+    await until(() => !existsSync(file), 30_000, 20);
     // It may have stepped aside for a moment (the PID exists); it reopens as soon as the start time proves it dead.
     await until(async () => {
       const e = await s.engine();
       return e.state === "open" && e.writeIntent === null;
-    }, 1000 + SLACK, 20);
+    }, 30_000, 20);
 
     // A server started while such an intent exists opens at once, and removes it.
     await s.stop();
@@ -239,7 +239,7 @@ describe("croft serve with writers (slow: real processes)", () => {
     const t1 = Date.now();
     const r2 = await s2.query(COUNT);
     expect(r2.status).toBe(200);
-    expect(Date.now() - t1).toBeLessThanOrEqual(1000 + SLACK);
+    expect(Date.now() - t1).toBeLessThan(TIMING_GAP); // timing-gap: as above
     expect(existsSync(again)).toBe(false);
   }, 60_000);
 
@@ -270,11 +270,11 @@ describe("croft serve with writers (slow: real processes)", () => {
       }
     })();
     // Starting the run is not what is measured: under load it can take seconds.
-    await until(() => since !== null, 30_000 + SLACK, 10);
+    await until(() => since !== null, 30_000, 10);
 
     // A query every 150 ms while the run waits for the foreign program, until five were answered after the withdrawal.
     const replies: (Reply & { at: number })[] = [];
-    const deadline = since! + 15_000 + SLACK;
+    const deadline = since! + 15_000 + TIMING_GAP;
     while (Date.now() < deadline && (withdrawnAt === null || replies.filter((r) => r.at > withdrawnAt!).length < 5)) {
       const at = Date.now();
       replies.push({ ...(await s.query(COUNT)), at });
@@ -290,7 +290,7 @@ describe("croft serve with writers (slow: real processes)", () => {
     expect(withdrawnAt! - since!).toBeGreaterThanOrEqual(2000);
     // The queries sent after it were answered promptly.
     const late = replies.filter((r) => r.at > withdrawnAt!);
-    expect(Math.max(...late.map((r) => r.ms)), JSON.stringify(replies.map((r) => [r.at - since!, Math.round(r.ms)]))).toBeLessThanOrEqual(2500 + SLACK);
+    expect(Math.max(...late.map((r) => r.ms)), JSON.stringify(replies.map((r) => [r.at - since!, Math.round(r.ms)]))).toBeLessThanOrEqual(TIMING_GAP); // timing-gap: a query queued behind the run's wait for the foreign program would take its whole 15 s
 
     holder.send();
     const r = await run.done;
@@ -309,7 +309,7 @@ describe("croft serve with writers (slow: real processes)", () => {
     const r = await p.json(["backup"]);
     expect(r.code, show(r)).toBe(0);
     expect(r.json!.data).toMatchObject({ sameDisk: true, warehouse: { file: "warehouse.duckdb" } });
-    expect(r.json!.data.heldMs).toBeLessThan(2000);
+    expect(r.json!.data.heldMs).toBeLessThan(TIMING_GAP); // timing-gap: the hold is a checkpoint and a clone of a 120-row file
     await until(async () => (await s.engine()).state === "open", 5000, 20);
     await steady.stop();
     expect(steady.failures, JSON.stringify(steady.failures.slice(0, 3))).toEqual([]);

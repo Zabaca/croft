@@ -189,7 +189,8 @@ describe("the registry lock", () => {
     writeFileSync(registryLockPath(home), "999999999\n");   // no such pid
     const t0 = Date.now();
     addProject(home, { root: project("a"), via: "os-job" }, { now: AT });
-    expect(Date.now() - t0).toBeLessThan(1000);
+    // timing-gap: the call is synchronous, so a hang cannot be ended by the test's timeout; a lock treated as live would be waited out to LOCK_STALE_MS.
+    expect(Date.now() - t0).toBeLessThan(LOCK_STALE_MS / 2);
     expect(existsSync(registryLockPath(home))).toBe(false);
   });
 
@@ -362,7 +363,8 @@ describe("the OS lock", () => {
     expect(existsSync(registryLockPath(home))).toBe(true);           // its lock file, with a dead pid
     const t0 = Date.now();
     addProject(home, { root: project("a"), via: "os-job" }, { now: AT });
-    expect(Date.now() - t0).toBeLessThan(2000);
+    // timing-gap: synchronous, as above; a dead holder's lock treated as live would be waited out to LOCK_STALE_MS.
+    expect(Date.now() - t0).toBeLessThan(LOCK_STALE_MS / 2);
     expect(listProjects(home)).toHaveLength(1);
     expect(existsSync(registryLockPath(home))).toBe(false);
   });

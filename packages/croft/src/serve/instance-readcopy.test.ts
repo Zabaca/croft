@@ -13,8 +13,6 @@ import { openServeEngine, type ServeEngineInternals } from "./instance.ts";
 import { type RunningServer, startServer } from "./server.ts";
 import type { ServeEngine, ServeEngineOptions, ServeQueryData } from "./types.ts";
 
-const CI = process.env.CROFT_CI === "1";
-const SLACK = CI ? 600 : 0;
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** What serve/types.ts ServeQueryData carries for an answer from the read copy. */
@@ -154,9 +152,7 @@ describe("readCopy on", () => {
     const w = writer(p, "r_write", 1500);
     await w.waitFor("acquired");
     await until("the server to step aside", () => e.status().state === "closed_for_write");
-    const started = Date.now();
-    const during = await ask(e, "SELECT count(*)::INTEGER AS c, max(n)::INTEGER AS top FROM t");
-    expect(Date.now() - started).toBeLessThan(500 + SLACK); // answered, not queued behind the writer
+    const during = await ask(e, "SELECT count(*)::INTEGER AS c, max(n)::INTEGER AS top FROM t"); // answered from the copy, stale: true, not queued behind the writer (a queued query is answered live, after it)
     expect(during).toMatchObject({ rows: [{ c: 5, top: 4 }], rowCount: 1, stale: true, asOf: "2026-09-23T03:00:00-07:00" });
     expect(during.columns).toEqual([{ name: "c", type: "INTEGER" }, { name: "top", type: "INTEGER" }]);
     // The same gate and limits as the live file.
@@ -221,7 +217,8 @@ describe("readCopy on", () => {
     await until("the server to step aside", () => e.status().state === "closed_for_write");
     expect(await ask(e, "SELECT count(*)::INTEGER AS c FROM t")).toMatchObject({ rows: [{ c: 5 }], asOf: "2026-09-23T03:00:00-07:00" });
     await replaceCopy(p, ["INSERT INTO t VALUES (7), (8)"], "2026-09-24T12:00:00Z");
-    await sleep(200); // past the linger of the old copy's instance
+    // The old copy answers until its instance has lingered out and its queries have ended; then the new one does.
+    for (const end = Date.now() + 20_000; (await ask(e, "SELECT count(*)::INTEGER AS c FROM t")).rows[0]!.c !== 7; await sleep(20)) if (Date.now() > end) throw new Error("the replaced copy was never picked up");
     expect(await ask(e, "SELECT count(*)::INTEGER AS c FROM t")).toMatchObject({ rows: [{ c: 7 }], stale: true, asOf: "2026-09-24T05:00:00-07:00" });
     await w.waitFor("released");
   }, 60_000);

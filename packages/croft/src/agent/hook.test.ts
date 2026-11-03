@@ -416,9 +416,7 @@ describe("hookTarget", () => {
     expect(await readAll(closed, 1000)).toBe(edit("/p/assets/é.sql"));
     let canceled = false;
     const open = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(bytes.slice(0, 5)); }, cancel() { canceled = true; } });
-    const t0 = performance.now();
-    expect(await readAll(open, 50)).toBeNull();
-    expect(performance.now() - t0).toBeLessThan(1000);
+    expect(await readAll(open, 50)).toBeNull(); // given up at the deadline: a read that waited for the stream to close would hang the test
     expect(canceled).toBe(true);                                             // the read is given up, so the process can exit
     expect(HOOK_IO.stdinTimeoutMs).toBe(5000);
   });

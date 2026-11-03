@@ -244,11 +244,10 @@ describe("croft schedule on", () => {
 
   test("CROFT_HEARTBEAT_WAIT_MS shortens the wait (the tests' knob)", async () => {
     const { heartbeatWaitMs: _w, ...d } = deps().deps;
-    const t0 = Date.now();
+    // Without the knob the wait is the default's, far past this test's timeout.
     const r = await sched(["on", "--json"], d, { env: { ...env, CROFT_HEARTBEAT_WAIT_MS: "30" } });
-    expect(Date.now() - t0).toBeLessThan(5000);
     expect(r.json.data.firstTick.ok).toBe(false);
-  });
+  }, 20_000);
 
   test("on a TTY it says it is waiting (on stderr); off a TTY it does not", async () => {
     const tty = await sched(["on"], deps({ tick: true }).deps, { tty: true });

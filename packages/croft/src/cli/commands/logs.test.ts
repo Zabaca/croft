@@ -193,6 +193,11 @@ describe("croft logs: human output", () => {
   });
 });
 
+/** Wait until what a follow has printed is what the test needs next (a follow polls the log file; the poll is its own, and a busy machine is late for it). */
+async function printed(cond: () => boolean): Promise<void> {
+  for (const end = Date.now() + 20_000; !cond(); await Bun.sleep(10)) if (Date.now() > end) throw new Error("the follow never printed what the test waited for");
+}
+
 describe("croft logs --follow", () => {
   test("prints a running step's new lines until the step ends", async () => {
     const p = makeProject();
@@ -204,11 +209,9 @@ describe("croft logs --follow", () => {
     w.log("first");
     const out: string[] = [];
     const done = cli(["logs", "sales", "--follow"], { cwd: p.root, stdout: (t) => out.push(t) });
-    await Bun.sleep(300);
-    expect(out.join("")).toContain("first");
+    await printed(() => out.join("").includes("first"));
     appendFileSync(path, "second\nthird\n");
-    await Bun.sleep(300);
-    expect(out.join("")).toContain("third");
+    await printed(() => out.join("").includes("third"));
     db.finishStep("r_0922_1300_live", "sales", 1, { status: "ok" });
     db.finishRun("r_0922_1300_live", "succeeded");
     const r = await done;
@@ -229,9 +232,9 @@ describe("croft logs --follow", () => {
     w.log("one");
     const err: string[] = [];
     const done = cli(["logs", "r_0922_1300_json", "--follow", "--json"], { cwd: p.root, stderr: (t) => err.push(t) });
-    await Bun.sleep(250);
+    await printed(() => err.join("").includes("one"));
     w.log("two");
-    await Bun.sleep(250);
+    await printed(() => err.join("").includes("two"));
     db.finishStep("r_0922_1300_json", "sales", 1, { status: "ok" });
     db.finishRun("r_0922_1300_json", "succeeded");
     const r = await done;
@@ -243,9 +246,8 @@ describe("croft logs --follow", () => {
 
   test("a finished step is shown once, without waiting", async () => {
     const p = project();
-    const started = performance.now();
+    // Following a step that is already finished returns; one that waited for more output would hang and fail by this test's timeout.
     const r = await cli(["logs", "github_issues", "--follow", "--json"], { cwd: p.root, env: ENV });
-    expect(performance.now() - started).toBeLessThan(1000);
     expect(r.json.data.steps[0].lines).toEqual(["nothing new"]);
-  });
+  }, 20_000);
 });

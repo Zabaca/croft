@@ -473,12 +473,11 @@ describe("--dry-run, --only and --upstream", () => {
     expect((await inProcess(root, ["run", "zones", "--only", "--foreground", "--json"])).exit).toBe(0);
     const runs = withRuns(root, (db) => db.listRuns().length);
     api.state.log.length = 0;
-    const holder = spawnHolder(join(root, "warehouse.duckdb"), 20_000);
+    // The holder keeps the lock until it is killed below: a dry run that waited for it would hang and fail by this test's timeout.
+    const holder = spawnHolder(join(root, "warehouse.duckdb"), "release");
     await holder.waitFor("held");
     try {
-      const started = performance.now();
       const r = await inProcess(root, ["run", "--dry-run", "--json"]);
-      expect(performance.now() - started).toBeLessThan(5_000);
       expect(r.exit).toBe(0);
       expect(r.json).toMatchObject({ ok: true, command: "run", problems: [], next: [{ command: "croft run", reason: "run it" }] });
       expect(r.json.data).toMatchObject({ dryRun: true, order: ["consts", "zones", "zone_count"] });

@@ -9,6 +9,7 @@ import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { TIMING_GAP } from "../../tests/timing-gap.ts";
 import { CroftError } from "../core/errors.ts";
 import { bootId, currentIdentity } from "../core/proc.ts";
 import { query } from "../read.ts";
@@ -32,7 +33,6 @@ afterAll(async () => {
 
 const TOKEN = "s3cret-token-value";
 /** Extra time CPU-starved CI runners get on timing budgets. */
-const SLACK_MS = process.env.CROFT_CI === "1" ? 600 : 0;
 
 interface FakeEngine extends ServeEngine {
   calls: ServeQuery[];
@@ -451,7 +451,7 @@ describe("envelopes", () => {
       const timer = setTimeout(() => {
         socket.destroy();
         resolve({ answeredAt, closedAt: null });
-      }, 9000 + SLACK_MS);
+      }, 9000 + TIMING_GAP);
       socket.on("close", () => {
         clearTimeout(timer);
         resolve({ answeredAt, closedAt: Date.now() - t0 });
@@ -463,7 +463,7 @@ describe("envelopes", () => {
     // Answered after the idle timeout had passed (the query is exempt), then closed once idle.
     expect(answered.answeredAt).toBeGreaterThanOrEqual(1100);
     expect(answered.closedAt).not.toBeNull();
-    expect(answered.closedAt! - answered.answeredAt).toBeLessThan(6000 + SLACK_MS);
+    expect(answered.closedAt! - answered.answeredAt).toBeLessThan(6000 + TIMING_GAP); // timing-gap: a connection kept open by a stalled client is closed by the idle timeout, not held for ever
     expect(stalled.closedAt).not.toBeNull();
     // A client that went away before its body came is no bug of croft's: nothing for the server's log.
     await Bun.sleep(50);
@@ -493,7 +493,7 @@ describe("envelopes", () => {
     // The third sends its headers and only part of its body: the answer comes anyway, at once.
     const start = Date.now();
     const third = await rawLines(s.port, `POST /query HTTP/1.1\r\nHost: 127.0.0.1:${s.port}\r\nAuthorization: Bearer ${TOKEN}\r\nContent-Type: application/json\r\nContent-Length: ${big.length}\r\n\r\n${big.slice(0, 1000)}`);
-    expect(Date.now() - start).toBeLessThan(1000 + SLACK_MS);
+    expect(Date.now() - start).toBeLessThan(TIMING_GAP); // timing-gap: its body never completes; a server that waited for it would answer at the idle timeout
     expect(third.status).toBe(503);
     expect(third.headers["retry-after"]).toBe("1");
     expect(third.json.problems[0]).toMatchObject({ code: "SERVE_UNAVAILABLE", retryable: true });

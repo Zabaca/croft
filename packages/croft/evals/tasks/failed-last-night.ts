@@ -33,9 +33,19 @@ export const CHECKS = {
   green: "the pipeline is green: croft status is healthy",
 } as const;
 
-/** "Last night" as the user means it: 23:40 of yesterday in the fixture's zone; `daysBefore` nights earlier. */
-function lastNight(now = Date.now(), daysBefore = 0): { day: string; at: string } {
-  const day = localDay(now - (1 + daysBefore) * 86_400_000);
+/** A calendar day (YYYY-MM-DD) `n` days from another, counted in days and not in 24 hours: a day of the fixture's zone can be 23 or 25 hours long. */
+export function shiftDay(day: string, n: number): string {
+  const [y, m, d] = day.split("-").map(Number);
+  return new Date(Date.UTC(y!, m! - 1, d! + n)).toISOString().slice(0, 10);
+}
+
+/**
+ * "Last night" as the user means it: 23:40 of yesterday in the fixture's zone; `daysBefore` nights earlier. The days are counted on the calendar:
+ * taking `now` less 24 or 48 hours put "the night before" on the same day as "last night" between 23:00 and midnight on the day after
+ * the clocks went back (a day of 25 hours), and both runs of the story at one instant.
+ */
+export function lastNight(now: number, daysBefore = 0): { day: string; at: string } {
+  const day = shiftDay(localDay(now), -(1 + daysBefore));
   return { day, at: localTime(day, "23:40:00") };
 }
 
@@ -213,7 +223,7 @@ export const failedLastNight: EvalTask = {
   transforms: ["daily_revenue"],
 
   setup(f) {
-    const night = lastNight();
+    const night = lastNight(f.now());
     const shop = makeShop(night.day);
     STATE.set(f, shop);
     shopRoutes(f, shop);
@@ -222,14 +232,14 @@ export const failedLastNight: EvalTask = {
     f.write("assets/shop_order_items.ts", itemsAsset(f.api.url));
     f.write("assets/daily_revenue.sql", DAILY_REVENUE);
     // The night before: the last run that went through, with 97 orders.
-    f.clock = lastNight(Date.now(), 1).at;
+    f.clock = lastNight(f.now(), 1).at;
   },
 
   async after(f) {
     // Last night: five more orders, the shop's 101st and 102nd among them, and the run that failed.
     const shop = STATE.get(f)!;
     shop.visible = shop.orders.length;
-    f.clock = lastNight().at;
+    f.clock = lastNight(f.now()).at;
     const run = await f.croft(["run", "--json"]);
     const step = (run.json?.data?.steps ?? []).find((s: { asset: string }) => s.asset === "shop_order_items");
     if (step?.status !== "failed" || step.error?.code !== "CHECK_FAILED") throw new Error(`last night's run did not fail as the task's story says\n${show(run)}`);

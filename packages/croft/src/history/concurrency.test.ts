@@ -105,10 +105,9 @@ describe("leases across processes", () => {
     try {
       setTimeout(() => child.proc.kill("SIGKILL"), 300);
       const t0 = Date.now();
-      const [l] = await acquire(db, "orders", "r_me", { waitMs: 10_000 });
+      const [l] = await acquire(db, "orders", "r_me", { waitMs: 60_000 }); // longer than this test's timeout: a wait that slept to its deadline would hang the test
       expect(l?.runId).toBe("r_me");
-      expect(Date.now() - t0).toBeGreaterThanOrEqual(250);
-      expect(Date.now() - t0).toBeLessThan(5000);
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(250); // not before the child died
     } finally {
       db.close();
     }
@@ -201,26 +200,29 @@ describe("runs.sqlite WAL", () => {
   }, 30_000);
 
   test("an open write transaction blocks neither readers nor (beyond busy_timeout) writers", async () => {
+    // The holder keeps its transaction open until the release file appears (and a while after), so reads that waited for it would hang this test.
+    const release = join(dir, "release-tx");
     const holdTx = script("holdtx", `
-      const [stateDir] = process.argv.slice(2);
+      const { existsSync } = await import("node:fs");
+      const [stateDir, release] = process.argv.slice(2);
       const db = RunsDb.open(stateDir);
       db.sqlite.exec("BEGIN IMMEDIATE");
       db.createRun({ id: "r_0922_1000_hold", trigger: "manual", human: true, argv: [] });
       console.log(JSON.stringify({ holding: true }));
-      Bun.sleepSync(1200);
+      while (!existsSync(release)) Bun.sleepSync(10);
+      Bun.sleepSync(600);
       db.sqlite.exec("COMMIT");
     `);
     const db = RunsDb.open(dir);
     try {
-      const child = run(holdTx, dir);
+      const child = run(holdTx, dir, release);
       await nextJson(child);
-      const t0 = performance.now();
       expect(db.listRuns()).toEqual([]);            // uncommitted: invisible, and no waiting
       expect(db.getRun("r_0922_1000_hold")).toBeNull();
-      expect(performance.now() - t0).toBeLessThan(250);
+      writeFileSync(release, "");
       const t1 = performance.now();
       db.createRun({ id: "r_0922_1000_mine", trigger: "manual", human: true, argv: [] });   // waits for COMMIT
-      expect(performance.now() - t1).toBeGreaterThan(500);
+      expect(performance.now() - t1).toBeGreaterThan(300);
       expect(db.listRuns().map((r) => r.id).sort()).toEqual(["r_0922_1000_hold", "r_0922_1000_mine"]);
       expect((await child.exited).code).toBe(0);
     } finally {

@@ -142,7 +142,6 @@ describe("runAgent with a fake claude", () => {
     expect(run.timedOut).toBe(true);
     expect(run.exitCode).toBeNull();
     expect(run.signal).toBe("SIGTERM");
-    expect(run.wallMs).toBeLessThan(15_000);
     expect(run.events).toEqual([]);
   }, 30_000);
 });

@@ -144,6 +144,23 @@ describe("dead holders", () => {
     expect(tryAcquire(db, "orders", "r_me").ok).toBe(true);
   });
 
+  // The system moves kern.boottime when it steps the clock; a lease written with its seconds (before the boot id was the session UUID) must
+  // not turn into a dead one, for its own process or for another live one (a whole run of the suite saw the seconds move by one).
+  test("a live holder recorded with kern.boottime's seconds keeps its lease, whatever the clock has done since", async () => {
+    const seconds = "1790105420";
+    const own: Lease = { asset: "orders", runId: "r_own", pid: me().pid, procStart: me().procStart, bootId: seconds, since };
+    expect(leaseAlive(own)).toBe(true);
+    const { id, child } = otherLiveProcess();
+    const other: Lease = { asset: "customers", runId: "r_child", ...id, bootId: seconds, since };
+    insertLease(other);
+    expect(leaseAlive(other)).toBe(true);
+    expect(reclaimDead(db)).toEqual([]);
+    await expectCode(acquire(db, "customers", "r_me", { noWait: true }), "ASSET_BUSY");
+    child.kill("SIGKILL");
+    await new Promise((r) => child.on("exit", r));
+    expect(reclaimDead(db).map((l) => l.runId)).toEqual(["r_child"]);
+  });
+
   test("a lease with no identity recorded counts as dead", () => {
     db.sqlite.query("INSERT INTO leases (asset, run_id, pid, since) VALUES ('x', 'r_x', 1, ?)").run(since);
     expect(reclaimDead(db).map((l) => l.asset)).toEqual(["x"]);

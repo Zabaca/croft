@@ -24,12 +24,9 @@ test("journey 7: detached run → exit 6 within --follow → croft wait 0 → cr
   const { project: p } = await initProject();
   p.write("assets/slow_api.ts", slowAsset(api.url));
 
-  const t0 = Date.now();
   const parent = p.start(["run", "slow_api", "--json", "--follow", "1s"]);
   const r = await parent.done;
-  const took = Date.now() - t0;
-  expect(r.code, show(r)).toBe(6);
-  expect(took).toBeLessThan(8_000);
+  expect(r.code, show(r)).toBe(6); // still running when the parent returned: pagesAtExit below says how far it had got
   expect(r.json).toMatchObject({ ok: true, command: "run", data: { status: "running" } });
   const runId = r.json!.data.runId as string;
   expect(runId).toMatch(RUN_ID);

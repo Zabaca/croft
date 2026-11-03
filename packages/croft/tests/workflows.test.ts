@@ -66,6 +66,28 @@ describe("which workflows can publish", () => {
     expect(JSON.stringify(log)).toContain("CROFT_EXTENSION_DIR");
   });
 
+  test("the jobs of the suite run in shards: the matrix lists 1 to N, the name says which, and the test step runs that one of N (DESIGN.md §10)", () => {
+    const { doc } = load("ci.yml");
+    for (const name of ["test", "test-log", "test-lake-local", "test-lake-postgres"]) {
+      const job = doc.jobs[name];
+      const shards: number[] = job.strategy.matrix.shard;
+      expect(shards.length, name).toBeGreaterThan(1);
+      expect(shards, name).toEqual(shards.map((_, i) => i + 1));
+      expect(job.strategy["fail-fast"], `${name}: one shard failing must not hide the other's result`).toBe(false);
+      expect(job.name, name).toContain(`shard \${{ matrix.shard }}/${shards.length}`);
+      const steps: { name?: string; run?: string; if?: string }[] = job.steps;
+      const sharded = steps.filter((st) => /--shard=/.test(st.run ?? ""));
+      expect(sharded.length, `${name}: one step runs the shard`).toBe(1);
+      expect(sharded[0]!.run, name).toContain(`--shard=\${{ matrix.shard }}/${shards.length}`);
+      expect(sharded[0]!.run, name).toContain("--timeout 60000");
+      // What does not depend on the shard (the typecheck, the run against an older DuckDB) is done once, by shard 1.
+      for (const st of steps.filter((x) => x !== sharded[0] && /\bbun (test|run typecheck)\b/.test(x.run ?? ""))) expect(st.if, `${name}: ${st.name}`).toBe("matrix.shard == 1");
+    }
+    // Both shards of every platform are in the matrix, so the whole suite runs on each.
+    expect(doc.jobs.test.strategy.matrix.os).toEqual(["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15"]);
+    expect(doc.jobs.test.strategy.matrix.bun).toEqual(["1.3.14", "latest"]);
+  });
+
   test("the journeys run on a lake of each kind in jobs of their own, beside the others, each with its own timeout (DESIGN.md D146)", () => {
     const { doc } = load("ci.yml");
     for (const [job, kind] of [["test-lake-local", "local"], ["test-lake-postgres", "postgres"]] as const) {
@@ -93,6 +115,8 @@ describe("which workflows can publish", () => {
     expect(Object.keys(doc.on).sort()).toEqual(["push", "workflow_dispatch"]);
     expect(doc.on.push).toEqual({ tags: ["croft-v*"] });
     expect(Object.keys(doc.jobs)).toEqual(["pack", "publish"]);
+    // The release runs the whole suite in this one job (ci.yml splits it in shards): its limit leaves room to grow.
+    expect(doc.jobs.pack["timeout-minutes"]).toBeGreaterThanOrEqual(75);
     // The check that a tag names package.json's version cannot protect a branch, so a manual run from one is skipped whole.
     expect(doc.jobs.pack.if).toBe("github.ref_type == 'tag'");
     expect(doc.jobs.publish.if).toContain("github.ref_type == 'tag'");

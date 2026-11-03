@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { bootId, currentIdentity, isAlive, knownBoot, procStart, recordAlive, sameBoot, UNKNOWN_BOOT } from "./proc.ts";
+import { bootId, currentIdentity, isAlive, knownBoot, macBootId, procStart, recordAlive, sameBoot, UNKNOWN_BOOT } from "./proc.ts";
 
 test("current process is alive", () => {
   expect(isAlive(currentIdentity())).toBe(true);
@@ -26,6 +26,35 @@ test("an unknown start time falls back to PID existence", () => {
   const me = currentIdentity();
   expect(isAlive({ ...me, procStart: "unknown" })).toBe(true);
   expect(isAlive({ pid: 2 ** 22 + 12345, procStart: "unknown", bootId: me.bootId })).toBe(false);
+});
+
+test.skipIf(process.platform !== "darwin")("on macOS the boot id is the boot session UUID, which the clock does not move (kern.boottime does)", () => {
+  expect(bootId()).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+});
+
+test("a boot id of the old macOS kind (boottime seconds) is the same boot when the clock stepped, and is no evidence against a UUID", () => {
+  const UUID_A = "5D5DD5DD-CB11-4C93-A86D-1D64A20EA230";
+  const UUID_B = "0B1CE9A4-2C63-4B8D-8B8D-0A2F7D4A9C11";
+  expect(sameBoot("1790105420", "1790105421")).toBe(true); // a one-second step of the clock, seen in a full run of this suite
+  expect(sameBoot("1790105420", "1790105420")).toBe(true);
+  expect(sameBoot("1790105420", String(1790105420 + 7200))).toBe(false); // two hours on: a machine that restarted
+  expect(sameBoot("1790105420", UUID_A)).toBe(true); // written before the UUID was read: unknown, not another boot
+  expect(sameBoot(UUID_A, "1790105420")).toBe(true);
+  expect(sameBoot(UUID_A, UUID_B)).toBe(false);
+  expect(sameBoot("other-boot", "another-boot")).toBe(false);
+});
+
+test("a step of the clock moves kern.boottime by its seconds and is still one boot: the UUID when sysctl has it, the seconds, tolerated, when it does not", () => {
+  const boottime = (sec: number) => `{ sec = ${sec}, usec = 123 } Tue Sep 22 12:30:21 2026\n`;
+  const withUuid = (sec: number) => macBootId((name) => (name === "kern.bootsessionuuid" ? "5D5DD5DD-CB11-4C93-A86D-1D64A20EA230\n" : boottime(sec)));
+  expect(withUuid(1790105420)).toBe("5D5DD5DD-CB11-4C93-A86D-1D64A20EA230");
+  expect(withUuid(1790105421)).toBe(withUuid(1790105420)); // the boot time moved by a second: the id did not
+  const bare = (sec: number) => macBootId((name) => (name === "kern.boottime" ? boottime(sec) : null));
+  expect(bare(1790105420)).toBe("1790105420");
+  expect(bare(1790105421)).not.toBe(bare(1790105420)); // as they read before: two ids for one boot ...
+  expect(sameBoot(bare(1790105420), bare(1790105421))).toBe(true); // ... that are one boot
+  expect(sameBoot(bare(1790105420), bare(1790105420 + 7200))).toBe(false);
+  expect(macBootId(() => null)).toBe(""); // nothing to read: unknown, which the caller makes UNKNOWN_BOOT
 });
 
 test("the boot id is read, never empty", () => {
@@ -97,7 +126,7 @@ test("start times do not depend on the locale or time zone of the process readin
 test.skipIf(process.platform === "linux")("macOS start times are epoch seconds", () => {
   const start = Number(currentIdentity().procStart);
   expect(Number.isInteger(start)).toBe(true);
-  expect(Math.abs(start - (Date.now() / 1000 - process.uptime()))).toBeLessThan(3);
+  expect(Math.abs(start - (Date.now() / 1000 - process.uptime()))).toBeLessThan(3); // timing-gap: not a duration: two readings of this process's start (ps, and the clock less the uptime) agree to within seconds
 });
 
 // Records written before start times were normalized hold `ps -o lstart` text in the writer's locale and zone.

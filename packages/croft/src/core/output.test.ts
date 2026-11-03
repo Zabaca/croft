@@ -58,9 +58,12 @@ describe("captureOutput: file descriptors 1 and 2", () => {
     const r = await script(`
       out.setOutputRedactor((t) => t.replaceAll("sk_live_123456", "[redacted:KEY]"));
       const a = out.collectingSink(), b = out.collectingSink();
+      // Overlap by events: a prints once b's scope is open, and b's scope stays open until a has printed.
+      let bOpen: () => void, aPrinted: () => void;
+      const bIsOpen = new Promise<void>((r) => (bOpen = r)), aHasPrinted = new Promise<void>((r) => (aPrinted = r));
       await Promise.all([
-        out.captureOutput(a, async () => { await Bun.sleep(30); await $\`echo from a sk_live_123456\`; await Bun.sleep(60); }),
-        out.captureOutput(b, async () => { await Bun.sleep(60); }),
+        out.captureOutput(a, async () => { await bIsOpen; await $\`echo from a sk_live_123456\`; aPrinted(); }),
+        out.captureOutput(b, async () => { bOpen(); await aHasPrinted; }),
       ]);
       process.stdout.write(JSON.stringify({ a: a.lines, b: b.lines }) + "\\n");
     `);
@@ -74,11 +77,13 @@ describe("captureOutput: file descriptors 1 and 2", () => {
     const r = await script(`
       out.keepFdsCaptured();
       out.setOutputRedactor((t) => t.replaceAll("sk_live_123456", "[redacted:KEY]"));
+      let child, timerWrote;
       await out.captureOutput(out.collectingSink(), async () => {
-        Bun.spawn(["sh", "-c", "sleep 0.2; echo late sk_live_123456; echo late stderr >&2"], { stdio: ["ignore", "inherit", "inherit"] });
-        setTimeout(() => void Bun.write(Bun.stdout, "timer sk_live_123456\\n"), 100);
+        child = Bun.spawn(["sh", "-c", "sleep 0.2; echo late sk_live_123456; echo late stderr >&2"], { stdio: ["ignore", "inherit", "inherit"] });
+        timerWrote = new Promise((r) => setTimeout(() => void Bun.write(Bun.stdout, "timer sk_live_123456\\n").then(r), 100));
       });
-      await Bun.sleep(500);
+      await child.exited;
+      await timerWrote;
       process.stdout.write(JSON.stringify({ ok: true }) + "\\n");
       await $\`printf 'no newline at exit'\`;
     `);
@@ -98,8 +103,9 @@ describe("captureOutput: file descriptors 1 and 2", () => {
       let size = -1;
       await out.captureOutput(sink, async () => {
         await Bun.spawn(["sh", "-c", "yes line-${"x".repeat(94)} | head -n 50000"], { stdio: ["ignore", "inherit", "inherit"] }).exited;
-        await Bun.sleep(400);
-        size = fstatSync(1).size;   // fd 1 is the capture file here
+        // fd 1 is the capture file here: it starts over once the pump has read it and it is quiet, so wait for that.
+        for (const end = Date.now() + 30_000; fstatSync(1).size !== 0 && Date.now() < end; ) await Bun.sleep(10);
+        size = fstatSync(1).size;
         await $\`echo after\`;
       });
       const lines = sink.lines.join("\\n").split("\\n");
@@ -126,18 +132,22 @@ describe("captureOutput: file descriptors 1 and 2", () => {
 
   test("a line that never ends is passed on once it is past 64 KB, not held to the end", async () => {
     const r = await script(`
+      const { writeFileSync } = await import("node:fs");
+      const flag = import.meta.path + ".first-chunk";
       const got = [];
-      const start = Date.now();
-      await out.captureOutput({ write: (t) => void got.push({ ms: Date.now() - start, chars: t.length }) }, async () => {
-        await Bun.spawn(["sh", "-c", "head -c 200000 /dev/zero | tr '\\\\\\\\0' x; sleep 1; echo"], { stdio: ["ignore", "inherit", "inherit"] }).exited;
+      let ended = false;
+      // The line stays open until the first chunk has been passed on (or 20 s): the child ends it only then.
+      await out.captureOutput({ write: (t) => { got.push({ during: !ended, chars: t.length }); writeFileSync(flag, ""); } }, async () => {
+        await Bun.spawn(["sh", "-c", "head -c 200000 /dev/zero | tr '\\\\\\\\0' x; i=0; while [ ! -e " + flag + " ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done; echo"], { stdio: ["ignore", "inherit", "inherit"] }).exited;
+        ended = true;
       });
-      process.stdout.write(JSON.stringify({ firstMs: got[0].ms, chars: got.reduce((n, g) => n + g.chars, 0) }) + "\\n");
+      process.stdout.write(JSON.stringify({ firstDuring: got[0].during, chars: got.reduce((n, g) => n + g.chars, 0) }) + "\\n");
     `);
     expect(r.code, r.stderr).toBe(0);
-    const { firstMs, chars } = JSON.parse(r.stdout);
+    const { firstDuring, chars } = JSON.parse(r.stdout);
     expect(chars).toBe(200_000);
-    // It arrived during the second the line stayed open, not when the scope ended.
-    expect(firstMs).toBeLessThan(800);
+    // It arrived while the line was still open, not when the scope ended.
+    expect(firstDuring).toBe(true);
   });
 
   test("a subprocess started at an import's top level goes to the import's sink", async () => {

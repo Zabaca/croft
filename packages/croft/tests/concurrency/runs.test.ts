@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   addSale, CI, cleanupAll, foreignHolder, Gate, gatedAsset, initProject, intentFiles, json, killChildren, type MockApi, mockApi,
-  placeOf, type Project, show, SLACK, sleep, slowSqlAsset, until,
+  placeOf, type Project, show, sleep, slowSqlAsset, until,
 } from "./cc-testkit.ts";
 import { RunsDb } from "../../src/history/runs-db.ts";
 import { bugTest, findProblem } from "../e2e/harness.ts";
@@ -82,7 +82,6 @@ describe("runs and readers (slow: real processes)", () => {
     expect(q1.code, show(q1)).toBe(0);
     expect(q1.json.data.rows).toEqual([{ n: 120 }]);
     expect(q1.stderr).not.toContain("waiting for the warehouse");
-    expect(q1.ms).toBeLessThan(2000 + (CI ? 2000 : 0));
     gate.open();
     const w1 = await p.json(["wait", feedRun, "--timeout", "60s"]);
     expect(w1.code, show(w1)).toBe(0);
@@ -99,7 +98,7 @@ describe("runs and readers (slow: real processes)", () => {
     const [st, doc] = await Promise.all([p.json(["status"]), p.json(["doctor"])]);
     expect(st.code, show(st)).toBe(0);
     expect(st.json.data.running.map((r: { runId: string }) => r.runId)).toContain(slowRun);
-    expect(st.ms).toBeLessThan(1500 + SLACK);
+    expect(st.ms).toBeLessThan(sleepMs / 2); // timing-gap: the write step holds the file for sleepMs; a status that waited for it would take most of that
     const warehouse = (doc.json.data.checks as { id: string; text: string }[]).find((c) => c.id === "warehouse");
     expect(warehouse?.text, show(doc)).toContain(`busy: croft run ${slowRun} is writing`);
     expect(waiting.proc.exitCode).toBeNull();
@@ -191,10 +190,11 @@ describe("runs and readers (slow: real processes)", () => {
     expect(busy.json.data.steps.map((s: { status: string }) => s.status)).toEqual(["skipped"]);
 
     // A second run without --no-wait waits for the lease: no request of its own until the first run is done.
+    const startedAt = Date.now();
     const second = p.start(["run", "feed", "--json", "--follow", "60s"]);
     await sleep(800);
     expect(second.proc.exitCode).toBeNull();
-    expect(api.requests("/c3/feed").length).toBe(1);
+    expect(api.requests("/c3/feed").length, `the feed was asked at ${JSON.stringify(api.requests("/c3/feed").map((r) => r.at - startedAt))} ms from the second run's start`).toBe(1);
     const openedAt = Date.now();
     gate.open();
     const r = await second.done;

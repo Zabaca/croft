@@ -253,9 +253,7 @@ export default transform({
     const db = runsDb(root);
     expect(tryAcquire(db, ["issues"], "r_0924_0900_hold", currentIdentity()).ok).toBe(true);
     db.close();
-    const t0 = Date.now();
-    const out = await runIn(root, ["issues"], { plan, trigger: "schedule", human: false, argv: ["run", "--due", "issues"], now: () => now });
-    expect(Date.now() - t0).toBeLessThan(20_000);
+    const out = await runIn(root, ["issues"], { plan, trigger: "schedule", human: false, argv: ["run", "--due", "issues"], now: () => now }); // at once: one that waited for the lease would hang the test
     expect(out.data.steps.map((s) => [s.asset, s.status, s.skippedBecause])).toEqual([
       ["issues", "skipped", "held: run r_0924_0900_hold holds it; it stays due"],
       ["open_issues", "skipped", "input issues is held: run r_0924_0900_hold holds it; it stays due"],

@@ -309,6 +309,10 @@ export class Fixture {
   /** CROFT_NOW for the croft commands the harness runs, never the session's: a task dates its fixture's history
    *  with it ("last night's run"). setupFixture sets it back to null (the real clock) before the session. */
   clock: string | null = null;
+  /** The instant this fixture takes for "now" (epoch ms) and the real instant it was taken at, or null for the machine's clock:
+   *  tasks read the time through now() and croft commands get it as CROFT_NOW, so a task that dates its fixture by the clock
+   *  ("last night") behaves the same at any hour the self-test is run at (setupFixture's `now`). */
+  private pinned: { at: number; since: number } | null = null;
 
   constructor(
     readonly task: string,
@@ -321,10 +325,21 @@ export class Fixture {
     readonly api: MockApi,
   ) {}
 
+  /** Take `at` (epoch ms) as the time now, and let it run on from there at the machine's speed. */
+  pinNow(at: number): void {
+    this.pinned = { at, since: Date.now() };
+  }
+
+  /** The time now, epoch ms: the machine's, or the pinned instant plus the time that has gone by since it was pinned. */
+  now(): number {
+    return this.pinned ? this.pinned.at + (Date.now() - this.pinned.since) : Date.now();
+  }
+
   /** The environment of croft commands the harness runs. */
   get env(): Record<string, string> {
     const env = croftEnv(this.binDir);
     if (this.clock !== null) env.CROFT_NOW = this.clock;
+    else if (this.pinned) env.CROFT_NOW = new Date(this.now()).toISOString();
     return env;
   }
 
@@ -446,11 +461,12 @@ const INIT_EXAMPLE = ["assets/example_sales.ts", "files/example_sales.csv"];
  * A fresh fixture for a task: init, link, shims, settings, mock API, the task's setup, one `croft run`, and a git
  * baseline. Throws when any of it fails; the temp folder is removed then (unless kept).
  */
-export async function setupFixture(task: EvalTask, o: { keep?: boolean; tmpRoot?: string } = {}): Promise<Fixture> {
+export async function setupFixture(task: EvalTask, o: { keep?: boolean; tmpRoot?: string; now?: number } = {}): Promise<Fixture> {
   const base = realpathSync(mkdtempSync(join(o.tmpRoot ?? tmpdir(), `croft-eval-${task.name}-`)));
   const binDir = join(base, "bin");
   const root = join(base, task.project);
   const f = new Fixture(task.name, base, root, binDir, mockApi());
+  if (o.now !== undefined) f.pinNow(o.now);
   try {
     writeShims(binDir);
     const init = await exec([process.execPath, CROFT_BIN, "init", root, "--no-install", "--json"], { cwd: base, env: f.env, timeoutMs: 120_000 });

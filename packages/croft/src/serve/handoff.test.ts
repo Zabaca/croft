@@ -88,7 +88,7 @@ describe("IntentWatch", () => {
     let ticks = 0;
     const polled = new IntentWatch({ stateDir: state, pollMs: 20, onTick: () => ticks++ });
     polled.start();
-    await sleep(250);
+    for (let i = 0; ticks < 4 && i < 1000; i++) await sleep(10); // four polls, however long a busy machine takes to make them
     polled.stop();
     expect(ticks).toBeGreaterThanOrEqual(4);
     const after = ticks;
@@ -135,9 +135,7 @@ describe("drain", () => {
 
   test("nothing in flight: done at once", async () => {
     const a = admission();
-    const t = Date.now();
-    expect(await drain(a, { graceMs: 2000, reason: "write" })).toEqual({ interrupted: 0 });
-    expect(Date.now() - t).toBeLessThan(50);
+    expect(await drain(a, { graceMs: 600_000, reason: "write" })).toEqual({ interrupted: 0 }); // a grace of ten minutes: a drain that waited for it would hang the test
   });
 
   test("a query that finishes within the grace period is left alone", async () => {

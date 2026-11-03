@@ -4,6 +4,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import type { DuckDBConnection } from "@duckdb/node-api";
 import { CroftError } from "../core/errors.ts";
 import { openMemory, serveResources } from "../db/connect.ts";
+import { STUCK_MS } from "../../tests/timing-gap.ts";
 import { cleanup, makeProject, spawnHolder } from "../read/testkit.ts";
 import { QueryWorker, WorkerConflict, WorkerGone, WorkerStopped } from "./query-worker.ts";
 import { answer, type AnswerOptions, peakRss, Stopped } from "./worker.ts";
@@ -128,7 +129,7 @@ describe("QueryWorker", () => {
     const start = Date.now();
     await w.kill();
     const err = await rejection(stuck);
-    expect(Date.now() - start).toBeLessThan(1000);
+    expect(Date.now() - start).toBeLessThan(STUCK_MS / 2); // timing-gap: the stuck query runs STUCK_MS or more; killing the process ends it
     expect(err).toBeInstanceOf(WorkerGone);
     expect(err.message).toContain("stopped by croft serve");
     expect(await rejection(w.query(3, { sql: "SELECT 1", params: [], limit: 10, maxRows: 100, maxBytes: 1 << 20 }))).toBeInstanceOf(WorkerGone);

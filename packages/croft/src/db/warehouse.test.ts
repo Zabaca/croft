@@ -498,18 +498,16 @@ describe("lock conflicts", () => {
     const e = await rejection(ro.read(async () => {}, { purpose: "query" }));
     const waited = Date.now() - started;
     expect(e.code).toBe("DB_BUSY");
-    expect(waited).toBeGreaterThanOrEqual(140);
-    expect(waited).toBeLessThan(2000);
-    // An explicit waitMs (--no-wait) overrides the cap.
-    const now = Date.now();
-    expect((await rejection(ro.read(async () => {}, { purpose: "q", waitMs: 0 }))).code).toBe("DB_BUSY");
-    expect(Date.now() - now).toBeLessThan(500);
+    expect(waited).toBeGreaterThanOrEqual(140); // the cap was waited out; that it ended there and not at a minute is this test's timeout
+    // An explicit waitMs (--no-wait) overrides the cap: on a warehouse whose cap is a minute, it does not wait for it.
+    const patient = wh(p, { mode: "read_only", isTTY: true, waits: { ttyReadMs: 60_000, ttyWriteMs: 60_000, offTtyMs: 60_000 } });
+    expect((await rejection(patient.read(async () => {}, { purpose: "q", waitMs: 0 }))).code).toBe("DB_BUSY");
     // holder() names the writer from its intent.
     expect(await ro.holder()).toMatchObject({ pid: child.proc.pid, runId: "r_hold", action: "write" });
     writeFileSync(release, "");
     await child.waitFor("released");
     expect(await ro.holder()).toBeNull();
-  });
+  }, 20_000);
 });
 
 describe("aborting a wait (Ctrl-C)", () => {
@@ -524,12 +522,10 @@ describe("aborting a wait (Ctrl-C)", () => {
     const pending = rejection(w.write("blocked", async () => {
       throw new Error("the body must not run");
     }, { runId: "r_parent", signal: ac.signal }));
-    await sleep(150);
-    expect(heldCount(p.stateDir)).toBe(1); // waiting, with its intent announced
-    const aborted = Date.now();
+    for (let i = 0; heldCount(p.stateDir) < 1 && i < 2000; i++) await sleep(10); // until it waits, with its intent announced
+    expect(heldCount(p.stateDir)).toBe(1);
     ac.abort(reason);
-    expect(await pending).toBe(reason);
-    expect(Date.now() - aborted).toBeLessThan(500);
+    expect(await pending).toBe(reason); // the wait was a minute long: one that the signal did not end would hang the test
     expect(heldCount(p.stateDir)).toBe(0);
     expect(liveIntents(p.stateDir).map((i) => i.runId)).toEqual(["r_hold"]);
 
@@ -547,7 +543,7 @@ describe("aborting a wait (Ctrl-C)", () => {
     writeFileSync(release, "");
     await child.waitFor("released");
     expect(await w.read((db) => db.all("SELECT who FROM log"), { purpose: "after" })).toEqual([{ who: "r_hold" }]);
-  });
+  }, 20_000);
 
   test("a lease sharing another's open is not failed by that lease's abort", async () => {
     const p = project();

@@ -149,12 +149,12 @@ describe("write-intent handshake", () => {
     await writer.waitFor("up");
     writeIntent(p.stateDir, writer.pid);
     const t0 = Date.now();
-    const rows = await directQuery(p.project, req("SELECT count(*)::INTEGER AS n FROM sales"), FAST);
+    // An intentWaitMs of its own, not the default's 2000 and not FAST's: the wait asked for is the wait made.
+    const rows = await directQuery(p.project, req("SELECT count(*)::INTEGER AS n FROM sales"), { ...FAST, intentWaitMs: 2500 });
     const waited = Date.now() - t0;
     expect(rows).toEqual([{ n: 2 }]);
-    expect(waited).toBeGreaterThanOrEqual(FAST.intentWaitMs - 20);
-    expect(waited).toBeLessThan(FAST.intentWaitMs + 1500);
-  });
+    expect(waited).toBeGreaterThanOrEqual(2500 - 20); // that it is then given up, and not kept, is this test's timeout
+  }, 20_000);
 
   test("opens as soon as the intent goes away", async () => {
     const p = await makeProject({ seed: SALES });
@@ -163,11 +163,10 @@ describe("write-intent handshake", () => {
     const file = writeIntent(p.stateDir, writer.pid);
     setTimeout(() => rmSync(file), 120);
     const t0 = Date.now();
-    await directQuery(p.project, req("SELECT 1 AS x"), { ...FAST, intentWaitMs: 3000 });
-    const waited = Date.now() - t0;
-    expect(waited).toBeGreaterThanOrEqual(100);
-    expect(waited).toBeLessThan(1500);
-  });
+    // A wait so long that only the intent going away can end it inside this test's timeout.
+    await directQuery(p.project, req("SELECT 1 AS x"), { ...FAST, intentWaitMs: 30_000 });
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(100);
+  }, 20_000);
 
   test("an intent whose process is gone does not delay the query", async () => {
     const p = await makeProject({ seed: SALES });
@@ -176,10 +175,9 @@ describe("write-intent handshake", () => {
     writeIntent(p.stateDir, ghost.pid);
     ghost.proc.kill("SIGKILL");
     await ghost.exited;
-    const t0 = Date.now();
-    await directQuery(p.project, req("SELECT 1 AS x"), { ...FAST, intentWaitMs: 3000 });
-    expect(Date.now() - t0).toBeLessThan(1000);
-  });
+    // A wait so long that only the writer being gone can end it inside this test's timeout.
+    await directQuery(p.project, req("SELECT 1 AS x"), { ...FAST, intentWaitMs: 30_000 });
+  }, 20_000);
 
   test("a query arriving while the file is open and a writer announced itself waits for the close", async () => {
     const p = await makeProject({ seed: ["CREATE TABLE t AS SELECT 1 AS a"] });

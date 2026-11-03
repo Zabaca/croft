@@ -421,11 +421,9 @@ describe("croft validate (the command)", () => {
     catalog(p, [ISSUES_BUILT]);
     writeFileSync(p.database, "not a database");
     const before = readdirSync(p.root, { recursive: true }).map(String).filter((f) => !f.startsWith("node_modules")).sort();
-    const t0 = performance.now();
     const r = await cli(["validate", "--json"], { cwd: p.root });
     expect(r.exit).toBe(0);
     expect(r.json.problems).toEqual([]);
-    expect(performance.now() - t0).toBeLessThan(10_000);
     expect(readdirSync(p.root, { recursive: true }).map(String).filter((f) => !f.startsWith("node_modules")).sort()).toEqual(before);
 
     // A fresh project: no runs.sqlite is created.

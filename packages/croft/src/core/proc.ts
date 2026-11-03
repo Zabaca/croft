@@ -17,7 +17,7 @@ import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 export interface ProcessIdentity {
   pid: number;
   procStart: string; // opaque, stable for the life of the process
-  bootId: string; // changes on every reboot; UNKNOWN_BOOT when it could not be read
+  bootId: string; // changes on every reboot and on nothing else; UNKNOWN_BOOT when it could not be read
 }
 
 /** Where ps and sysctl are looked up by name when their absolute paths are missing. */
@@ -54,11 +54,29 @@ function readBootId(): string {
       return "";
     }
   }
-  // macOS: "{ sec = 1758600000, usec = 123 } Tue Sep 23 ..." — the seconds identify the boot.
-  const res = runTool(SYSCTL, ["-n", "kern.boottime"]);
-  const out = res && res.status === 0 ? res.stdout ?? "" : "";
+  // macOS: kern.bootsessionuuid, a UUID that is the same until the next boot. kern.boottime ("{ sec = 1758600000, usec = 123 } Tue Sep 23 ...")
+  // is not: the system moves it when it steps the clock (time sync, waking from sleep), by the seconds of the step [V: macOS 15, a full suite
+  // run saw 1790105420 become 1790105421 half way through], and every process that read it afterwards saw another boot, so a live run's
+  // lease, intent and record were taken for those of a machine that had restarted. Its seconds remain the fallback, for a macOS without the UUID.
+  return macBootId((name) => {
+    const res = runTool(SYSCTL, ["-n", name]);
+    return res && res.status === 0 ? res.stdout ?? "" : null;
+  });
+}
+
+/** The macOS boot id from what `sysctl -n <name>` prints (null when it could not be run): the UUID, else kern.boottime's seconds. */
+export function macBootId(sysctl: (name: string) => string | null): string {
+  const uuid = (sysctl("kern.bootsessionuuid") ?? "").trim();
+  if (BOOT_UUID.test(uuid)) return uuid;
+  const out = sysctl("kern.boottime") ?? "";
   return out.match(/sec = (\d+)/)?.[1] ?? out.trim();
 }
+
+const BOOT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** A boot id of the old macOS kind: kern.boottime's seconds. */
+const BOOT_SECONDS = /^\d{9,11}$/;
+/** The most the clock is taken to step between two readings of kern.boottime's seconds (the fallback, and records written before the UUID). */
+const BOOT_SECONDS_SLACK = 3600;
 
 /** This machine's boot id, or UNKNOWN_BOOT when it cannot be read; never "". */
 export function bootId(): string {
@@ -77,7 +95,15 @@ export function knownBoot(id: string | null | undefined): boolean {
  */
 export function sameBoot(recorded: string | null | undefined, current: string = bootId()): boolean {
   if (!knownBoot(recorded) || !knownBoot(current)) return true;
-  return recorded === current;
+  if (recorded === current) return true;
+  // A record of the old macOS kind (kern.boottime's seconds) against the UUID read now: nothing to compare, so no evidence of a reboot.
+  const a = recorded!;
+  const aSeconds = BOOT_SECONDS.test(a);
+  const bSeconds = BOOT_SECONDS.test(current);
+  if (aSeconds !== bSeconds && (BOOT_UUID.test(a) || BOOT_UUID.test(current))) return true;
+  // Seconds against seconds: the clock was stepped, not the machine restarted, when they are this close (the PID and start time still decide).
+  if (aSeconds && bSeconds) return Math.abs(Number(a) - Number(current)) <= BOOT_SECONDS_SLACK;
+  return false;
 }
 
 /** Start time recorded when it could not be read even though the process exists. */

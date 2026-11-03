@@ -197,8 +197,7 @@ describe("ending a real refresh in the middle of its copy", () => {
     const t = Date.now();
     await m.stop();
     const took = Date.now() - t;
-    expect(took).toBeGreaterThanOrEqual(500);
-    expect(took).toBeLessThan(10_000);
+    expect(took).toBeGreaterThanOrEqual(500); // the grace was given; that the child is then killed and not waited for is the test's timeout
     expect(alive(pid)).toBe(false);
     expect(done).toHaveLength(1);
     expect(done[0]!.ok).toBe(false);

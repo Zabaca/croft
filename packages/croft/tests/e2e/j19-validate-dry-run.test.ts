@@ -526,7 +526,7 @@ fileOnly("another program holds the warehouse file; a lake has no file to hold")
     for (const args of [["run", "--dry-run"], ["validate"], ["status"]]) {
       const r = await p.json(args);
       expect(r.code, show(r)).toBe(0);
-      expect(r.ms, show(r)).toBeLessThan(15_000);                    // a lock wait is 60 s or more
+      expect(r.ms, show(r)).toBeLessThan(15_000); // timing-gap: a command that waited for the lock would wait 60 s or more
     }
     // The lock really is held: a run that may not wait gives up at once.
     const blocked = await p.json(["run", "open_issues", "--only", "--no-wait"]);

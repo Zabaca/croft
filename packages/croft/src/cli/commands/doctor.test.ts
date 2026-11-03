@@ -115,7 +115,7 @@ describe("croft doctor --json", () => {
     const env = JSON.parse(stdout);
     expect(exit).toBe(0);
     expect(env).toMatchObject({ schemaVersion: 1, ok: true, command: "doctor", database: "warehouse.duckdb", timezone: "Asia/Tokyo", problems: [], next: [] });
-    expect(env.durationMs).toBeLessThan(1000);
+    expect(typeof env.durationMs).toBe("number"); // how long doctor took is reported, never held to a bound by a test (DESIGN.md §10)
     const checks: DoctorCheck[] = env.data.checks;
     expect(checks.map((c) => c.id)).toEqual(["bun", "croft", "duckdb", "warehouse", "serve", "config", "assets", "storage", "writable", "env", "claude", "scheduling"]);
     // The example asset, validated as croft validate does (and within the second).
@@ -415,9 +415,7 @@ describe("warehouse checks", () => {
     });
     children.push(holder);
     await waitForLine(holder, "holding");
-    const started = performance.now();
-    const { data, problems } = await runDoctor(root, deps());
-    expect(performance.now() - started).toBeLessThan(1000);
+    const { data, problems } = await runDoctor(root, deps()); // the holder never lets go: a doctor that waited for the lock would hang the test
     holder.kill("SIGKILL");
     const w = check(data.checks, "warehouse");
     expect(w).toMatchObject({ status: "error", code: "DB_HELD_BY_OTHER_PROGRAM", details: { heldBy: { pid: holder.pid } } });

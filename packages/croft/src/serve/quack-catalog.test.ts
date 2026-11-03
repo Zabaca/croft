@@ -20,8 +20,8 @@ const { ext, withExt } = extensionFiles("quack-catalog.test");
 const clients = new QuackClients();
 const keep: unknown[] = [];
 const dirs: string[] = [];
-afterAll(() => {
-  clients.close();
+afterAll(async () => {
+  await clients.close();
   for (const d of dirs) rmSync(d, { recursive: true, force: true });
   cleanup();
 });

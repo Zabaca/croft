@@ -463,7 +463,7 @@ describe("performance", () => {
       const fires = nextFires(text, tz, after, 3);
       const ms = performance.now() - t0;
       expect(fires.length).toBe(3);
-      expect({ text, tz, fast: ms < FAST_MS }).toEqual({ text, tz, fast: true });
+      expect({ text, tz, fast: ms < FAST_MS }).toEqual({ text, tz, fast: true }); // timing-gap: 200 ms against about 3 ms; a scan minute by minute takes seconds
     }
   });
 
@@ -473,7 +473,7 @@ describe("performance", () => {
       latestFireAtOrBefore(text, LA, now);
       const t0 = performance.now();
       latestFireAtOrBefore(text, LA, now);
-      expect({ text, fast: performance.now() - t0 < FAST_MS }).toEqual({ text, fast: true });
+      expect({ text, fast: performance.now() - t0 < FAST_MS }).toEqual({ text, fast: true }); // timing-gap: as above, 200 ms against about 3 ms
     }
   });
 });

@@ -43,10 +43,8 @@ export default ingest({ async *rows() { yield [{ id: 1 }]; } });
     process.kill(child.pid, "SIGKILL");
     await until(() => !alive(child.pid));
     for (let i = 0; i < 2; i++) {
-      const t0 = Date.now();
       const w = await cli(root, ["wait", runId, "--timeout", "5s", "--json"]);
-      expect(w.code).toBe(1);
-      expect(Date.now() - t0).toBeLessThan(4_000);
+      expect(w.code).toBe(1); // crashed, said at once: a wait that ran out its timeout has another code and status
       expect(w.json).toMatchObject({ ok: false, command: "wait", data: { runId, status: "crashed", steps: [] } });
       expect(w.json!.problems[0]).toMatchObject({ code: "RUN_CRASHED", runId });
     }

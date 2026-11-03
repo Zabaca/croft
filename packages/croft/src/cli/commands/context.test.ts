@@ -214,20 +214,18 @@ describe("croft context when the warehouse file is missing", () => {
 describe("croft context never waits on DuckDB", () => {
   test("while another process holds the warehouse write lock it answers at once, schema changes from the runs", async () => {
     const p = await scenario();
-    const holder = spawnHolder(p.database, 20_000);
+    // The holder keeps the lock until it is killed below, so a context that waited for it would hang and fail by this test's timeout.
+    const holder = spawnHolder(p.database, "release");
     await holder.waitFor("held");
-    const started = performance.now();
     const r = await cli(["context", "--json"], { cwd: p.root, env: ENV });
-    const took = performance.now() - started;
     holder.proc.kill("SIGKILL");
     expect(r.exit).toBe(0);
-    expect(took).toBeLessThan(2000);
     expect(r.json.data.schemaChangesFrom).toBe("runs");
     expect(r.json.data.recentSchemaChanges).toEqual([
       { asset: "github_issues", at: "2026-09-22T11:55:00-07:00", runId: "r_0922_1155_ok01", kind: "add_column", column: "milestone", from: null, to: "JSON", readBy: ["open_issues"] },
     ]);
     expect(r.json.data.assets).toHaveLength(6);
-  });
+  }, 20_000);
 
   test("a warehouse that cannot be read is reported, and the rest of the payload still comes", async () => {
     const p = await scenario({ warehouse: false });

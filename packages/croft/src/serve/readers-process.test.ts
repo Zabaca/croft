@@ -116,9 +116,7 @@ describe("restarting", () => {
       readers: { extensionDir: join(p.root, "no-extensions"), secretDir: join(p.stateDir, "readers-secrets"), shared: [], asOf: "2026-10-30T10:00:00Z" },
     }));
     expect(err.code).toBe("EXTENSION_MISSING");
-    const t = Date.now();
-    await w.exited; // nobody killed it
-    expect(Date.now() - t).toBeLessThan(5000);
+    await w.exited; // nobody killed it: a process that did not exit by itself would hang the test
     await expect(w.query(1, { sql: "SELECT 1", params: [], limit: 1, maxRows: 1, maxBytes: 100 })).rejects.toThrow();
   });
 });

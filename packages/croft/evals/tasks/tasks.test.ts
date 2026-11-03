@@ -11,10 +11,10 @@ import { describe, expect, test } from "bun:test";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { type EvalTask, exec, FIXTURE_SETTINGS, type Fixture, PKG, setupFixture, show, type Verdict } from "../harness.ts";
-import type { SelfTest } from "../verify.ts";
+import { localDay, type SelfTest } from "../verify.ts";
 import { selfTest as apiTypeChange } from "./api-type-change.ts";
 import { selfTest as backfill90d } from "./backfill-90d.ts";
-import { selfTest as failedLastNight } from "./failed-last-night.ts";
+import { selfTest as failedLastNight, lastNight, shiftDay } from "./failed-last-night.ts";
 import { TASKS } from "./index.ts";
 import { selfTest as renameColumn } from "./rename-column.ts";
 import { selfTest as stripeHourly } from "./stripe-hourly.ts";
@@ -64,8 +64,16 @@ async function fixtureIsReady(f: Fixture, spec: SelfTest): Promise<void> {
   }
 }
 
-async function selfTest(task: EvalTask, spec: SelfTest): Promise<void> {
-  const f = await setupFixture(task);
+/**
+ * The tasks that date their story by the clock ("last night", "this week") are run at a time of the test's choosing, at the same time on
+ * every machine, so the hour the suite runs at decides nothing (Fixture.pinNow). A mid-day in the middle of a long summer stretch: no clock
+ * change, no midnight and no month end within the run. The hours that once broke "last night" are run on top of that, below.
+ */
+const PINNED_NOW = Date.parse("2026-06-15T12:00:00-07:00");
+const PINNED_TASKS = new Set(["failed-last-night", "api-type-change"]);
+
+async function selfTest(task: EvalTask, spec: SelfTest, now: number | undefined = PINNED_TASKS.has(task.name) ? PINNED_NOW : undefined): Promise<void> {
+  const f = await setupFixture(task, { now });
   try {
     await fixtureIsReady(f, spec);
 
@@ -78,7 +86,7 @@ async function selfTest(task: EvalTask, spec: SelfTest): Promise<void> {
     // Each plausible wrong solution fails exactly the checks it gets wrong.
     expect(spec.wrong.length).toBeGreaterThan(0);
     for (const w of spec.wrong) {
-      const g = w.fresh ? await setupFixture(task) : f;
+      const g = w.fresh ? await setupFixture(task, { now }) : f;
       try {
         await w.apply(g);
         v = await task.verify(g, w.session ?? spec.session);
@@ -115,4 +123,47 @@ describe("the eval tasks' verifiers", () => {
   for (const task of TASKS) {
     test.concurrent(`${task.name}: the fixture is ready; the verifier fails the untouched fixture and each plausible wrong solution, and passes the scripted one`, () => selfTest(task, SELF_TESTS[task.name]!), TASK_MS);
   }
+});
+
+// The task that dates its story by the clock is also run at the hours a real clock once broke it (now less 24 and 48 hours, DESIGN.md D157):
+// in the fixture's zone, 23:00 to midnight on the day the clocks went back and on the day after (last night was today; the night before last
+// was last night), and midnight to 01:00 on the first two days after they went forward (a night skipped).
+describe("failed-last-night at the hours a clock could break it", () => {
+  const task = TASKS.find((t) => t.name === "failed-last-night")!;
+  for (const [what, at] of [
+    ["23:05 on 2026-11-02, the evening after the day the clocks went back", "2026-11-02T23:05:00-08:00"],
+    ["23:30 on 2026-11-01, the day they went back", "2026-11-01T23:30:00-08:00"],
+    ["00:30 on 2026-03-09, the night after the day they went forward", "2026-03-09T00:30:00-07:00"],
+    ["00:30 on 2026-03-10", "2026-03-10T00:30:00-07:00"],
+  ] as const) {
+    test.concurrent(`${what}: the verifier fails the untouched fixture and each wrong solution, and passes the scripted one`, () => selfTest(task, SELF_TESTS[task.name]!, Date.parse(at)), TASK_MS);
+  }
+});
+
+describe("failed-last-night dates its nights on the calendar", () => {
+  test("shiftDay counts days, over month ends and leap days", () => {
+    expect(shiftDay("2026-11-01", -1)).toBe("2026-10-31");
+    expect(shiftDay("2026-03-01", -1)).toBe("2026-02-28");
+    expect(shiftDay("2028-03-01", -1)).toBe("2028-02-29");
+    expect(shiftDay("2026-12-31", 1)).toBe("2027-01-01");
+  });
+
+  test("at every hour of the days around a clock change, last night is yesterday and the night before is the day before that, at distinct instants", () => {
+    // 2026-11-01 and 2026-03-08 are the days the clocks changed in the fixture's zone (25 and 23 hours); the days after are where 24-hour arithmetic went wrong.
+    for (const first of ["2026-10-31", "2026-11-01", "2026-11-02", "2026-11-03", "2026-03-07", "2026-03-08", "2026-03-09", "2026-03-10"]) {
+      for (let hour = 0; hour < 24; hour++) {
+        for (const minute of [0, 59]) {
+          const at = Date.parse(`${first}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:30Z`); // every UTC hour of those days: every local hour is met
+          const today = localDay(at);
+          const one = lastNight(at);
+          const two = lastNight(at, 1);
+          const why = `${new Date(at).toISOString()} (${today} in the fixture's zone)`;
+          expect(one.day, why).toBe(shiftDay(today, -1));
+          expect(two.day, why).toBe(shiftDay(today, -2));
+          expect(Date.parse(one.at), why).toBeGreaterThan(Date.parse(two.at));
+          expect(Date.parse(one.at), `${why}: last night is in the past`).toBeLessThan(at);
+        }
+      }
+    }
+  });
 });

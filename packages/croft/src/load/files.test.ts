@@ -1138,10 +1138,8 @@ describe("URLs", () => {
     cleanups.push(() => slow.stop(true));
     const ac = new AbortController();
     setTimeout(() => ac.abort(), 50);
-    const started = Date.now();
     const e = await failure(extract(p, { file: `${slow.url.href}x.csv` }, { signal: ac.signal }));
-    expect(e.code).toBe("INTERRUPTED");
-    expect(Date.now() - started).toBeLessThan(2000);
+    expect(e.code).toBe("INTERRUPTED"); // the Retry-After is 5 s: a wait the abort did not stop would end in the retry's own error
   });
 
   test("an HTTP failure is HTTP_ERROR; ctx.http's getBytes is used when it has one", async () => {
@@ -1182,10 +1180,8 @@ describe("URLs", () => {
     cleanups.push(() => slow.stop(true));
     const ac = new AbortController();
     setTimeout(() => ac.abort(), 50);
-    const started = Date.now();
     const e2 = await failure(extract(p, { file: `${slow.url.href}x.csv` }, { signal: ac.signal, http: createHttp({ signal: ac.signal }) }));
     expect(e2.code).toBe("INTERRUPTED");
-    expect(Date.now() - started).toBeLessThan(2000);
   });
 });
 

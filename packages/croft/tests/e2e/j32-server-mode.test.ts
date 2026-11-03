@@ -125,7 +125,7 @@ describe("journey 32: server mode", () => {
     const run = await p.json(["run"], home);
     expect(run.code, show(run)).toBe(0);
     expect(run.json.data.steps.map((s: Envelope) => [s.asset, s.status])).toEqual([["orders", "ok"]]);
-    expect(run.ms).toBeLessThan(20_000);
+    expect(run.ms).toBeLessThan(20_000); // timing-gap: a run that waited for croft serve's lock would wait 60 s or more
     await until(async () => (await engine()).serverMode.swaps >= 1, 10_000);
     expect(app(p).rows).toEqual([{ id: 1, amount: 10 }, { id: 2, amount: 20 }, { id: 3, amount: 30 }]);
     const after = await engine();

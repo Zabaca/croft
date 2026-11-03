@@ -203,10 +203,8 @@ describe("bounds", () => {
     const first = await a.enter({ deadline: soon() });
     const waiting = [a.enter({ deadline: soon() }), a.enter({ deadline: soon() })];
     expect(a.queued).toBe(2);
-    const start = Date.now();
     const err = await rejection(a.enter({ deadline: soon() }));
-    expect(Date.now() - start).toBeLessThan(50);
-    expect(err.message).toBe("queue full");
+    expect(err.message).toBe("queue full"); // refused at once: a request that queued would fail with the wait's own message
     expect(a.queued).toBe(2);
     first.release();
     const second = await waiting[0]!;

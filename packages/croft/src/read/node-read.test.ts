@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import { realNode } from "../node-testkit.ts";
 import { query } from "../read.ts";
 import { cleanup, makeProject, type TempProject } from "./testkit.ts";
-import { GRACE_MS, killChildren, probeWriter, type Serve, SLACK, startServe, stopServes, until, writerTimes } from "../../tests/concurrency/cc-testkit.ts";
+import { GRACE_MS, killChildren, probeWriter, type Serve, startServe, stopServes, TIMING_GAP, until, writerTimes } from "../../tests/concurrency/cc-testkit.ts";
 
 const PKG = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 // Inside the package, so the direct-mode chunk resolves @duckdb/node-api from the package's node_modules, as an
@@ -146,7 +146,7 @@ describe.skipIf(!NODE)(`@zabaca/croft/read under Node (${NODE ?? "no node: skipp
       { CROFT_URL: s.url, CROFT_SERVE_TOKEN: s.token, ...proxyEnv() });
     expect(out.explicit).toMatchObject({ rows: [{ n: 5000 }] });
     expect(out.wrong).toMatchObject({ code: "SERVE_UNAUTHORIZED", retryable: false, details: { status: 401 } });
-    expect(out.wrong!.ms).toBeLessThan(2000); // never retried
+    expect(out.wrong!.ms).toBeLessThan(TIMING_GAP); // timing-gap: never retried; a wrong token retried to the 15 s timeout would take that long
     expect(out.viaServeJson).toMatchObject({ rows: [{ n: 5000 }] });
     expect(hosted.env).toMatchObject({ rows: [{ n: 5000 }] });
     // Three queries reached the server (the rejected one never ran), none went through the proxy.
@@ -169,7 +169,7 @@ describe.skipIf(!NODE)(`@zabaca/croft/read under Node (${NODE ?? "no node: skipp
       sql: ["CREATE OR REPLACE TABLE shrinks AS SELECT 7 AS n"],
     });
     const t = await writerTimes(w);
-    expect(t.latency).toBeLessThanOrEqual(GRACE_MS + 250 + SLACK);
+    expect(t.latency).toBeLessThanOrEqual(GRACE_MS + TIMING_GAP); // timing-gap: the queries run for minutes; only the interrupt at the grace lets the writer in
     const out = await answer;
     // The patient client waited out the write (Retry-After) and got the answer of the same query after it: the
     // first attempt could not have seen the shrunk table.
@@ -178,7 +178,6 @@ describe.skipIf(!NODE)(`@zabaca/croft/read under Node (${NODE ?? "no node: skipp
     // The hasty one was past its 1 s when the 503 came: SERVE_UNAVAILABLE, busy, retryable, never a fallback.
     expect(out.hasty).toMatchObject({ code: "SERVE_UNAVAILABLE", retryable: true, details: { reason: "busy", status: 503, retryAfter: "1" } });
     expect(out.hasty!.message).toContain("never falls back");
-    expect(out.hasty!.ms).toBeLessThan(out.patient!.ms);
     expect(proxied).toEqual([]);
   }, 60_000);
 

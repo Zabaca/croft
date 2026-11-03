@@ -293,7 +293,7 @@ describe("pruning", () => {
     try {
       const t0 = Date.now();
       const r = runTick();
-      expect(Date.now() - t0).toBeLessThan(8000);
+      expect(Date.now() - t0).toBeLessThan(8000); // timing-gap: the tick is synchronous here, so a hang cannot be ended by a timeout; a tick that waited for the lock would wait LOCK_WAIT_MS (12 s)
       expect(r.stdout).toContain("pruning next minute");
       expect(listProjects(home)).toHaveLength(2);
       expect((await invocations(1)).map((i) => i.cwd)).toEqual([kept]);
