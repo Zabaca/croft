@@ -8,7 +8,7 @@
 // opened (db/connect.ts, ahead of the lock), and `croft fetch-extensions`. A locked instance never reaches either; its files
 // were loaded before it locked. $CROFT_NO_FETCH=1 turns the first off (a machine that must not reach the network, croft's tests):
 // a missing file is then EXTENSION_MISSING with the command as its fix.
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { gunzipSync } from "node:zlib";
@@ -22,6 +22,9 @@ export const DEFAULT_REPOSITORY = "https://extensions.duckdb.org";
 
 /** A whole download may take this long (the largest file is 60 MB); a slower link is a failed fetch that can be retried. */
 const DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
+
+/** The body may be this much over the pinned size (gzip headers, and a file that does not compress). */
+const BODY_MARGIN = 1_000_000;
 
 /** The repository to fetch from: $CROFT_EXTENSION_REPO (a mirror, or a stand-in in croft's tests; every file is still checked against the pin), else DuckDB's. */
 export function repositoryOf(env: NodeJS.ProcessEnv = process.env): string {
@@ -100,37 +103,52 @@ async function download(name: ExtensionName, platform: Platform, dir: string, pa
     retryable: true,
     details: { kind: "fetch", extension: name, platform, duckdb: DUCKDB_VERSION, url, ...details },
   });
+  const mismatch = (size: number | null): CroftError => new CroftError("EXTENSION_CHECKSUM_MISMATCH", {
+    message: `the ${name} extension that ${url} sent is not the pinned file (${size === null ? "it is larger than the pinned file" : "its checksum differs"}); nothing was written`,
+    hint: "croft loads only the files it pins; if DuckDB re-released this file, a newer croft pins the new one, otherwise something between this machine and the repository changed the file",
+    fix: { kind: "manual", description: "upgrade croft, or ask the user whether a proxy or mirror in front of the repository can be trusted", requiresHuman: true },
+    retryable: false,
+    details: { kind: "download", extension: name, platform, duckdb: DUCKDB_VERSION, url, bytes: size, expectedBytes: pin.bytes },
+  });
+  // A server that sends more than the file can be (a gzip never grows a file by more than a sliver) is refused before it fills memory or disk.
+  const maxPacked = pin.bytes + BODY_MARGIN;
   let packed: Buffer;
   try {
     const res = await (o.fetch ?? fetch)(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
     if (!res.ok) {
       throw failed(res.status === 404 ? `the repository has no such file (HTTP 404)` : `HTTP ${res.status}`, { status: res.status });
     }
-    packed = Buffer.from(await res.arrayBuffer());
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    if (res.body) {
+      for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+        total += chunk.length;
+        if (total > maxPacked) {
+          void res.body.cancel().catch(() => {});
+          throw mismatch(null);
+        }
+        chunks.push(chunk);
+      }
+    }
+    packed = Buffer.concat(chunks);
   } catch (e) {
     if (e instanceof CroftError) throw e;
     throw failed(e instanceof Error ? e.message : String(e));
   }
   let bytes: Buffer;
   try {
-    bytes = gunzipSync(packed);
+    bytes = gunzipSync(packed, { maxOutputLength: pin.bytes + 1 });
   } catch (e) {
+    if ((e as { code?: string }).code === "ERR_BUFFER_TOO_LARGE") throw mismatch(null);
     throw failed(`the answer is not a gzip file (${e instanceof Error ? e.message : String(e)})`);
   }
   const sha256 = bytes.length === pin.bytes ? createHash("sha256").update(bytes).digest("hex") : null;
-  if (sha256 !== pin.sha256) {
-    throw new CroftError("EXTENSION_CHECKSUM_MISMATCH", {
-      message: `the ${name} extension that ${url} sent is not the pinned file (its checksum differs); nothing was written`,
-      hint: "croft loads only the files it pins; if DuckDB re-released this file, a newer croft pins the new one, otherwise something between this machine and the repository changed the file",
-      fix: { kind: "manual", description: "upgrade croft, or ask the user whether a proxy or mirror in front of the repository can be trusted", requiresHuman: true },
-      retryable: false,
-      details: { kind: "download", extension: name, platform, duckdb: DUCKDB_VERSION, url, bytes: bytes.length, expectedBytes: pin.bytes },
-    });
-  }
+  if (sha256 !== pin.sha256) throw mismatch(bytes.length);
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.part-${process.pid}`;
+  // A random name opened with "wx" (create, never follow or reuse): a symlink planted at a predictable name in a shared folder is not written through.
+  const tmp = `${path}.part-${randomBytes(8).toString("hex")}`;
   try {
-    writeFileSync(tmp, bytes);
+    writeFileSync(tmp, bytes, { flag: "wx", mode: 0o644 });
     renameSync(tmp, path);
   } finally {
     rmSync(tmp, { force: true });

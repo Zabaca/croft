@@ -116,7 +116,7 @@ function refuseUnlessReady(project: Project): void {
   if (!config.idleLake) {
     throw new CroftError("MOVE_NEEDS_LAKE", {
       message: "croft.json names no lake to move into",
-      hint: 'add a "lake" block with "enabled": false (the catalog, the bucket folder, the two logins and the two keys by secret name; croft docs lake), put the secrets in .env, install the lake add-on, then run croft move-to-lake',
+      hint: 'add a "lake" block with "enabled": false (the catalog, the bucket folder, the two logins and the two keys by secret name; croft docs lake), put the secrets in .env, run croft fetch-extensions (or let the first start do it), then run croft move-to-lake',
       fix: { kind: "command", description: "read how a project moves into a lake", command: "croft docs lake" },
       effect: "nothing was changed", details: { reason: "no_lake" },
     });

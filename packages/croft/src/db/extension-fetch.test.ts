@@ -2,7 +2,7 @@
 // 127.0.0.1 (extension-repo-testkit.ts) and to small files pinned in place of DuckDB's; the real servers are reached by hand, once
 // (DESIGN.md D195's record), and never by a test.
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { CroftError } from "../core/errors.ts";
@@ -104,6 +104,38 @@ describe("fetching a file", () => {
     const err = await fetchExtension("httpfs", { dir, env: { CROFT_EXTENSION_REPO: repo.url }, log: () => {} }).catch((e: unknown) => e);
     expect((err as CroftError).code).toBe("EXTENSION_CHECKSUM_MISMATCH");
     expect(existsSync(extensionPath(dir, "httpfs", platform!))).toBe(false);
+  });
+
+  t("a body far larger than the file, and a small gzip that unpacks far larger, are refused as not the pinned file, with nothing written", async () => {
+    const { content } = repoServing();
+    const { gzipSync, randomBytes } = { gzipSync: (await import("node:zlib")).gzipSync, randomBytes: (await import("node:crypto")).randomBytes };
+    const big = randomBytes(4_000_000);
+    const bomb = gzipSync(Buffer.alloc(50_000_000));
+    expect(bomb.length).toBeLessThan(200_000);
+    for (const body of [big, bomb]) {
+      const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(body) });
+      const dir = folder();
+      try {
+        const err = (await fetchExtension("quack", { dir, env: { CROFT_EXTENSION_REPO: `http://127.0.0.1:${server.port}` }, log: () => {} }).catch((e: unknown) => e)) as CroftError;
+        expect(err.code).toBe("EXTENSION_CHECKSUM_MISMATCH");
+        expect(err.problem.details).toMatchObject({ kind: "download", bytes: null, expectedBytes: content.length });
+        expect(existsSync(dirname(extensionPath(dir, "quack", platform!)))).toBe(false);
+      } finally {
+        void server.stop(true);
+      }
+    }
+  });
+
+  t("the temporary file has a random name and is opened exclusively: a symlink planted at the old predictable name is not written through", async () => {
+    const { repo, content } = repoServing();
+    const dir = folder();
+    const path = extensionPath(dir, "quack", platform!);
+    mkdirSync(dirname(path), { recursive: true });
+    const victim = join(folder(), "victim");
+    symlinkSync(victim, `${path}.part-${process.pid}`);
+    await fetchExtension("quack", { dir, env: { CROFT_EXTENSION_REPO: repo.url }, log: () => {} });
+    expect(existsSync(victim)).toBe(false);
+    expect(readFileSync(path).equals(content)).toBe(true);
   });
 
   t("an answer that is not gzip is a failed fetch, not a crash", async () => {
