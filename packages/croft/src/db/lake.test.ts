@@ -22,7 +22,7 @@ const folder = (): string => {
 describe("telling a lake's errors apart", () => {
   test("a catalog database that holds another lake is told by DuckLake's words: another format (older or newer) or another folder, never retried", () => {
     const where = { host: "db.example.test", port: 5432, database: "croft_lake" };
-    // What the second real-lake trial's Neon database said (a lake at 0.3), word for word, and what a lake DuckDB 2.0 made at its default says.
+    // What the second real-lake trial's hosted catalog said (a lake at 0.3), word for word, and what a lake DuckDB 2.0 made at its default says.
     const older = catalogMismatch("Invalid Input Error: DuckLake catalog version mismatch: catalog version is 0.3, but the extension requires version 1.0. To automatically migrate, set AUTOMATIC_MIGRATION to TRUE when attaching.", [], where);
     expect(older?.code).toBe("LAKE_CATALOG_MISMATCH");
     expect(older?.problem).toMatchObject({ retryable: false, details: { kind: "format", catalogFormat: "0.3", croftFormat: "1.0" } });

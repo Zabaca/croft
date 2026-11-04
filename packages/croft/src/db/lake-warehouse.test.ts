@@ -214,6 +214,26 @@ describe("a warehouse that is a lake", () => {
     expect((wrote as CroftError).code).toBe("LAKE_ATTACH_FAILED");
   }, 60_000);
 
+  maybe("the other refusals no waiting mends are not retried either: a wrong password and a database that does not exist say so, and neither is temporary", async () => {
+    const wrongPassword = (await fresh({ writerPassword: "not-the-password-0001" })).w;
+    const lake = await rig.lake();
+    const root = mkdtempSync(join(tmpdir(), "croft-lakewh-"));
+    made.push(root);
+    const stateDir = join(root, ".croft");
+    mkdirSync(stateDir, { recursive: true });
+    const noDatabase = openWarehouse({
+      path: join(root, "w.duckdb"), mode: "read_write", timezone: "UTC", root, stateDir, register: false, isTTY: false,
+      lake: rigConnection(rig, { ...lake, db: "no_such_database" }, { stateDir, extensionDir: ready.dir }),
+    });
+    for (const [what, w] of [["password", wrongPassword], ["database", noDatabase]] as const) {
+      const err = await w.read(async () => 1, { purpose: "test" }).catch((e: unknown) => e);
+      expect(err, what).toBeInstanceOf(CroftError);
+      expect((err as CroftError).code, what).toBe("LAKE_ATTACH_FAILED");
+      expect((err as CroftError).problem, what).toMatchObject({ retryable: false, details: { refused: true } });
+      expect((err as CroftError).problem.hint, what).toContain("trying again will not help");
+    }
+  }, 60_000);
+
   maybe("a catalog database that holds another lake is LAKE_CATALOG_MISMATCH, which is not retried and does not advise a migration (the second real-lake trial)", async () => {
     // Another tool's lake in the database the settings name: DuckLake 1.1, where croft opens 1.0. The trial retried it three times over 154 s,
     // called it temporary, and quoted DuckDB's advice to migrate it.
