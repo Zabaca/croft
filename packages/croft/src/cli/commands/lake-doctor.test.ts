@@ -5,6 +5,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { extensionsReady } from "../../db/extension-dir-testkit.ts";
 import { lakeOption } from "../../db/lake.ts";
+import { lakeRigReady, startLakeRig } from "../../db/lake-testkit.ts";
 import { closeAllWarehouses, openWarehouse } from "../../db/warehouse.ts";
 import { ProjectEnv } from "../../project/env.ts";
 import { cleanup, cli } from "./inspect-testkit.ts";
@@ -148,11 +149,38 @@ describe("croft doctor on a lake", () => {
   }, 240_000);
 });
 
-describe("doctor's time for comparing tables (D166)", () => {
-  test("a lake over a network gets more than the file's 400 ms, which never compared more than the first of its tables; one on this machine keeps the file's", async () => {
-    const { lakeScanMs, TABLE_SCAN_LAKE_MS, TABLE_SCAN_MS } = await import("./doctor.ts");
-    expect(lakeScanMs("postgres")).toBe(TABLE_SCAN_LAKE_MS);
-    expect(TABLE_SCAN_LAKE_MS).toBeGreaterThanOrEqual(10 * TABLE_SCAN_MS);
+describe("doctor's comparison of tables on a lake (D180)", () => {
+  test("a lake with a catalog over a network compares no table unless asked; one on this machine keeps the file's budget", async () => {
+    const { lakeScanMs, TABLE_SCAN_MS } = await import("./doctor.ts");
+    expect(lakeScanMs("postgres")).toBeUndefined();
     expect(lakeScanMs("local")).toBe(TABLE_SCAN_MS);
   });
+
+  const rigReady = lakeRigReady();
+  const maybeRig = rigReady.ready ? test : test.skip;
+  if (!rigReady.ready) console.warn(`[lake-doctor.test] SKIPPING the Postgres lake doctor test: ${rigReady.skipReason}`);
+
+  maybeRig("doctor on a Postgres lake leaves the tables out and says so; --tables compares them", async () => {
+    const rig = await startLakeRig();
+    try {
+      const l = await lakeProject("postgres", { extensionDir: rigReady.dir, rig });
+      type Check = { id: string; status: string; text: string };
+      const tables = async (args: string[]): Promise<Check> => {
+        const r = await cli(["doctor", ...args, "--json"], { cwd: l.p.root, env: l.env });
+        await closeAllWarehouses();
+        expect(r.exit, r.stdout.slice(0, 600)).toBe(0);
+        return (r.json as { data: { checks: Check[] } }).data.checks.find((c) => c.id === "tables")!;
+      };
+      const left = await tables([]);
+      expect(left.status).toBe("info");
+      expect(left.text).toContain("not compared with croft's record on a lake");
+      expect(left.text).toContain("croft doctor --tables");
+      const all = await tables(["--tables"]);
+      expect(all).toMatchObject({ status: "ok" });
+      expect(all.text).toMatch(/tables: 1 as croft last wrote them/);
+    } finally {
+      await closeAllWarehouses();
+      await rig.stop();
+    }
+  }, 240_000);
 });

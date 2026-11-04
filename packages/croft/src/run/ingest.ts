@@ -43,7 +43,7 @@ import type { DuckWarehouse } from "../db/warehouse.ts";
 import { type CatalogAsset, type CatalogBase, getCatalog, putCatalog, readCatalogEntry } from "../history/catalog.ts";
 import { createHttp, displayUrl, excerpt, type HttpClient } from "../http/http.ts";
 import { buildTypedBatch } from "../load/cast.ts";
-import { settleConfig } from "../load/config-change.ts";
+import { type AssetRecord, settleConfig } from "../load/config-change.ts";
 import { RESERVED, type TypedBatch } from "../load/contract.ts";
 import { cursorTypeFor, parseFrom, renderSince } from "../load/cursor.ts";
 import { detectEmptyExtract } from "../load/empty-extract.ts";
@@ -378,23 +378,26 @@ export function bytesTracked(http: Pick<HttpClient, "getBytes">, progress: StepP
   };
 }
 
+/** `record`: the row of _croft.assets and the stored columns, when the lease has read them already (settleConfig's), so they are not read twice. */
+async function readStateOn(db: Sql, asset: string, withFiles: boolean, record?: AssetRecord): Promise<IngestState> {
+  const exists = (await readTableSchema(db, asset)) !== null;
+  if (!(await hasState(db))) return { exists, cursorValue: null, cursorType: null, rowCount: null, known: [], files: [] };
+  const [a] = record ? [record.asset ?? undefined] : await db.all<{ cursor_value: string | null; cursor_type: string | null; row_count: number | bigint | null }>(
+    `SELECT cursor_value, cursor_type, row_count FROM _croft.assets WHERE name = $1`, [asset]);
+  const known = toKnown(record ? record.columns : await readStoredColumns(db, asset));
+  const files = withFiles
+    ? (await db.all<{ path: string; size: number | bigint | null; mtime_us: number | bigint | null; etag: string | null; sha256: string | null }>(
+      `SELECT path, size, epoch_us(mtime) AS mtime_us, etag, sha256 FROM _croft.files WHERE asset = $1 ORDER BY path`, [asset]))
+      .map((f) => ({ path: f.path, size: Number(f.size ?? 0), mtime: f.mtime_us === null ? "" : isoMicros(BigInt(f.mtime_us)), etag: f.etag, sha256: f.sha256 ?? "" }))
+    : [];
+  return {
+    exists, cursorValue: a?.cursor_value ?? null, cursorType: (a?.cursor_type as CursorType | null) ?? null,
+    rowCount: a?.row_count === null || a?.row_count === undefined ? null : Number(a.row_count), known, files,
+  };
+}
+
 async function readState(warehouse: DuckWarehouse, asset: string, withFiles: boolean, signal: AbortSignal): Promise<IngestState> {
-  return warehouse.read(async (db) => {
-    const exists = (await readTableSchema(db, asset)) !== null;
-    if (!(await hasState(db))) return { exists, cursorValue: null, cursorType: null, rowCount: null, known: [], files: [] };
-    const [a] = await db.all<{ cursor_value: string | null; cursor_type: string | null; row_count: number | bigint | null }>(
-      `SELECT cursor_value, cursor_type, row_count FROM _croft.assets WHERE name = $1`, [asset]);
-    const known = toKnown(await readStoredColumns(db, asset));
-    const files = withFiles
-      ? (await db.all<{ path: string; size: number | bigint | null; mtime_us: number | bigint | null; etag: string | null; sha256: string | null }>(
-        `SELECT path, size, epoch_us(mtime) AS mtime_us, etag, sha256 FROM _croft.files WHERE asset = $1 ORDER BY path`, [asset]))
-        .map((f) => ({ path: f.path, size: Number(f.size ?? 0), mtime: f.mtime_us === null ? "" : isoMicros(BigInt(f.mtime_us)), etag: f.etag, sha256: f.sha256 ?? "" }))
-      : [];
-    return {
-      exists, cursorValue: a?.cursor_value ?? null, cursorType: (a?.cursor_type as CursorType | null) ?? null,
-      rowCount: a?.row_count === null || a?.row_count === undefined ? null : Number(a.row_count), known, files,
-    };
-  }, { purpose: `read the state of ${asset}`, signal });
+  return warehouse.read((db) => readStateOn(db, asset, withFiles), { purpose: `read the state of ${asset}`, signal });
 }
 
 /** Saved cursors of these assets, under one short read lease (the --from check before a run starts). */
@@ -589,13 +592,16 @@ export async function runIngest(i: IngestInput): Promise<IngestOutcome> {
   rmSync(stageDir, { recursive: true, force: true });
   const isFile = step.kind === "file";
 
-  // 0. A changed behavior or pin, before anything is fetched (load/config-change.ts).
-  const settled = await settleConfig(i, { started, hashWith: (w, k) => behaviorHash(w, k, step.incremental) });
-  if ("outcome" in settled) return settled.outcome;
   // --rebuild: from scratch, with the old table left in place until the first write replaces it (FreshStart).
   const fresh = i.fresh && !i.fresh.done ? i.fresh : null;
-  // 1. State, under a short read lease.
-  const state = fresh ? NO_STATE : await readState(warehouse, asset, isFile, signal);
+  // 0. A changed behavior or pin, before anything is fetched (load/config-change.ts). The state of step 1 is read in the same lease when there is one.
+  const settled = await settleConfig<IngestState>(i, {
+    started, hashWith: (w, k) => behaviorHash(w, k, step.incremental),
+    ...(fresh ? {} : { alsoRead: (db: Sql, record: AssetRecord | undefined) => readStateOn(db, asset, isFile, record) }),
+  });
+  if ("outcome" in settled) return settled.outcome;
+  // 1. State, under a short read lease (the one of step 0 when that settled nothing).
+  const state = fresh ? NO_STATE : settled.read ?? await readState(warehouse, asset, isFile, signal);
   // 2. since.
   const since = sinceFor(i, state);
   const held = since.holdCursor !== undefined

@@ -3,12 +3,15 @@
 // and no CLI: writes and reads, the lock on writes, a catalog connection that drops (pg_terminate_backend) or a Postgres that restarts, a
 // commit whose outcome is not known, and credentials that never leave in an error.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { DuckDBInstance } from "@duckdb/node-api";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import type { Sql } from "../core/types.ts";
 import { retypeColumns } from "../load/evolve.ts";
+import { delayProxy } from "./delay-proxy-testkit.ts";
+import { extensionPath, hostPlatform } from "./extension-files.ts";
 import { lakeRigReady, type LakeRig, RIG_SECRETS, rigConnection, startLakeRig, WRITER_KEY, WRITER_LOGIN } from "./lake-testkit.ts";
 import { bookkeepingOf } from "./bookkeeping.ts";
 import { columnNames } from "./bookkeeping-testkit.ts";
@@ -33,13 +36,13 @@ afterAll(async () => {
 interface Rig { w: DuckWarehouse; r: DuckWarehouse; root: string; stateDir: string; db: string }
 
 /** A writing warehouse and a read-only one on a new lake, in a new project folder. */
-async function fresh(o: { afterLakeCommit?: () => void | Promise<void>; beforeLakeCommit?: (a: { attempt: number; tag: string }) => void | Promise<void>; waits?: Partial<{ offTtyMs: number }>; stateDir?: string; lake?: Awaited<ReturnType<LakeRig["lake"]>> } = {}): Promise<Rig> {
+async function fresh(o: { afterLakeCommit?: () => void | Promise<void>; beforeLakeCommit?: (a: { attempt: number; tag: string }) => void | Promise<void>; waits?: Partial<{ offTtyMs: number }>; stateDir?: string; lake?: Awaited<ReturnType<LakeRig["lake"]>>; writerPassword?: string } = {}): Promise<Rig> {
   const lake = o.lake ?? await rig.lake();
   const root = mkdtempSync(join(tmpdir(), "croft-lakewh-"));
   made.push(root);
   const stateDir = o.stateDir ?? join(root, ".croft");
   mkdirSync(stateDir, { recursive: true });
-  const conn = rigConnection(rig, lake, { stateDir, extensionDir: ready.dir });
+  const conn = rigConnection(rig, lake, { stateDir, extensionDir: ready.dir, ...(o.writerPassword ? { override: { writerPassword: o.writerPassword } } : {}) });
   const base = { path: join(root, `warehouse-${made.length}.duckdb`), timezone: "UTC", root, stateDir, lake: conn, isTTY: false, register: false };
   const w = openWarehouse({ ...base, mode: "read_write", ...(o.afterLakeCommit ? { afterLakeCommit: o.afterLakeCommit } : {}), ...(o.beforeLakeCommit ? { beforeLakeCommit: o.beforeLakeCommit } : {}), ...(o.waits ? { waits: o.waits } : {}) });
   // The read-only handle is another warehouse of its own, on another path, with the same lake.
@@ -132,17 +135,159 @@ describe("a warehouse that is a lake", () => {
     const { w } = await fresh();
     await w.write("make t", (tx) => tx.exec("CREATE TABLE t AS SELECT range a FROM range(5)"), { runId: "r1" });
     let tries = 0;
+    await w.write("make u", (tx) => tx.exec("CREATE TABLE u AS SELECT range a FROM range(5)"), { runId: "r1b" });
+    // A read is one transaction (D176), so the catalog connection it holds is the one that is ended; the second table is one it has not yet looked at.
     const n = await w.read(async (db) => {
       tries++;
-      await db.exec("BEGIN TRANSACTION");
       await db.all("SELECT count(*) FROM t");
       if (tries === 1) await rig.pg.terminateConnections();
-      const [row] = await db.all<{ n: number | bigint }>("SELECT count(*) AS n FROM t");
-      await db.exec("COMMIT");
+      const [row] = await db.all<{ n: number | bigint }>("SELECT count(*) AS n FROM u");
       return Number(row!.n);
     }, { purpose: "test" });
     expect(n).toBe(5);
     expect(tries).toBe(2);
+  }, 60_000);
+
+  maybe("a read is one transaction: five statements cost the catalog what one costs, not five times it (D176)", async () => {
+    // The second real-lake trial: each statement outside a transaction is a DuckLake transaction of its own, and each costs the catalog a
+    // snapshot lookup and a round trip or more for every table; at 41 ms a no-op run spent 27 s on them. The count is of round trips (the order of
+    // the bytes through a proxy that delays nothing), not of time.
+    const lake = await rig.lake();
+    const proxy = delayProxy(rig.pg.port);
+    try {
+      const root = mkdtempSync(join(tmpdir(), "croft-lakewh-"));
+      made.push(root);
+      const stateDir = join(root, ".croft");
+      mkdirSync(stateDir, { recursive: true });
+      const conn = rigConnection(rig, lake, { stateDir, extensionDir: ready.dir, override: { port: proxy.port } });
+      const w = openWarehouse({ path: join(root, "w.duckdb"), mode: "read_write", timezone: "UTC", root, stateDir, lake: conn, isTTY: false, register: false });
+      await w.write("make t", async (tx) => {
+        await ensureState(tx, { bookkeeping: "log" });
+        await tx.exec("CREATE TABLE t AS SELECT range a FROM range(5)");
+      }, { runId: "r1" });
+      const trips = async (n: number): Promise<number> => {
+        proxy.reset();
+        await w.read(async (db) => {
+          for (let i = 0; i < n; i++) expect(await db.all("SELECT count(*)::INTEGER AS n FROM t")).toEqual([{ n: 5 }]);
+          await db.all("SELECT key FROM _croft.meta");
+        }, { purpose: "test" });
+        return proxy.trips();
+      };
+      await trips(1); // the first lease of the process also checks the format
+      const one = await trips(1);
+      const six = await trips(6);
+      // Each statement of its own cost about 20 round trips (measured: 100 for five reads of one table); in one transaction a statement after the
+      // first costs 4 (the table's files and rows), the snapshot and the catalog having been read once.
+      expect((six - one) / 5).toBeLessThan(10);
+    } finally {
+      proxy.stop();
+    }
+  }, 60_000);
+
+  maybe("a statement DuckDB refuses does not end a read's transaction for the statements after it", async () => {
+    const { w } = await fresh();
+    await w.write("make t", (tx) => tx.exec("CREATE TABLE t AS SELECT range a FROM range(5)"), { runId: "r1" });
+    const n = await w.read(async (db) => {
+      await expect(db.all("SELECT * FROM no_such_table")).rejects.toThrow(/no_such_table/);
+      await expect(db.all("SELEKT 1")).rejects.toThrow();
+      return Number((await db.all<{ n: number | bigint }>("SELECT count(*) AS n FROM t"))[0]!.n);
+    }, { purpose: "test" });
+    expect(n).toBe(5);
+  }, 60_000);
+
+  maybe("a failed attach ends every lease that shared it with its own error, and the next lease attaches again: never INTERNAL_ERROR (the second real-lake trial)", async () => {
+    // Three assets' leases opened together on one instance; the first attach to fail left it part set up, and the others were told "report this
+    // croft bug" about it. A refused login is the permanent kind (no retry), so every lease says that.
+    const { w } = await fresh({ writerPassword: "not-the-password-0000" });
+    const ended = await Promise.all([1, 2, 3].map(() => w.read(async () => 1, { purpose: "test" }).catch((e: unknown) => e)));
+    for (const e of ended) {
+      expect(e).toBeInstanceOf(CroftError);
+      expect((e as CroftError).code).toBe("LAKE_ATTACH_FAILED");
+      expect((e as CroftError).problem.details).toMatchObject({ refused: true });
+    }
+    // A later step opens an instance of its own and fails with the same, not with the leftovers of the first.
+    const next = await w.read(async () => 1, { purpose: "test" }).catch((e: unknown) => e);
+    expect(next).toBeInstanceOf(CroftError);
+    expect((next as CroftError).code).toBe("LAKE_ATTACH_FAILED");
+    // A write meets the same.
+    const wrote = await w.write("w", (tx) => tx.exec("CREATE TABLE t (a INTEGER)"), { runId: "r1" }).catch((e: unknown) => e);
+    expect((wrote as CroftError).code).toBe("LAKE_ATTACH_FAILED");
+  }, 60_000);
+
+  maybe("the other refusals no waiting mends are not retried either: a wrong password and a database that does not exist say so, and neither is temporary", async () => {
+    const wrongPassword = (await fresh({ writerPassword: "not-the-password-0001" })).w;
+    const lake = await rig.lake();
+    const root = mkdtempSync(join(tmpdir(), "croft-lakewh-"));
+    made.push(root);
+    const stateDir = join(root, ".croft");
+    mkdirSync(stateDir, { recursive: true });
+    const noDatabase = openWarehouse({
+      path: join(root, "w.duckdb"), mode: "read_write", timezone: "UTC", root, stateDir, register: false, isTTY: false,
+      lake: rigConnection(rig, { ...lake, db: "no_such_database" }, { stateDir, extensionDir: ready.dir }),
+    });
+    for (const [what, w] of [["password", wrongPassword], ["database", noDatabase]] as const) {
+      const err = await w.read(async () => 1, { purpose: "test" }).catch((e: unknown) => e);
+      expect(err, what).toBeInstanceOf(CroftError);
+      expect((err as CroftError).code, what).toBe("LAKE_ATTACH_FAILED");
+      expect((err as CroftError).problem, what).toMatchObject({ retryable: false, details: { refused: true } });
+      expect((err as CroftError).problem.hint, what).toContain("trying again will not help");
+    }
+  }, 60_000);
+
+  maybe("a catalog database that holds another lake is LAKE_CATALOG_MISMATCH, which is not retried and does not advise a migration (the second real-lake trial)", async () => {
+    // Another tool's lake in the database the settings name: DuckLake 1.1, where croft opens 1.0. The trial retried it three times over 154 s,
+    // called it temporary, and quoted DuckDB's advice to migrate it.
+    const lake = await rig.lake();
+    const platform = hostPlatform()!;
+    const foreign = await DuckDBInstance.create(":memory:", { autoinstall_known_extensions: "false", autoload_known_extensions: "false" });
+    const fc = await foreign.connect();
+    try {
+      for (const name of ["httpfs", "postgres", "ducklake"] as const) await fc.run(`LOAD '${extensionPath(ready.dir, name, platform)}'`);
+      await fc.run(`CREATE SECRET pg (TYPE postgres, HOST '${rig.pg.host}', PORT ${rig.pg.port}, DATABASE '${lake.db}', USER '${WRITER_LOGIN.user}', PASSWORD '${WRITER_LOGIN.password}', SSLMODE 'disable')`);
+      await fc.run(`ATTACH 'ducklake:postgres:' AS other (META_SECRET pg, DATA_PATH '${join(tmpdir(), "croft-foreign-lake")}/', DUCKLAKE_VERSION '1.1')`);
+      await fc.run("CREATE TABLE other.t AS SELECT 1 AS a");
+    } finally {
+      fc.disconnectSync();
+      foreign.closeSync();
+    }
+    const { w, r } = await fresh({ lake });
+    for (const warehouse of [w, r]) {
+      const err = await warehouse.read(async () => 1, { purpose: "test" }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CroftError);
+      const problem = (err as CroftError).problem;
+      expect(problem).toMatchObject({ code: "LAKE_CATALOG_MISMATCH", retryable: false, details: { kind: "format", catalogFormat: "1.1", croftFormat: "1.0" } });
+      expect(`${problem.message} ${problem.hint}`).toMatch(/another format/);
+      expect(`${problem.message} ${problem.hint} ${JSON.stringify(problem.details)}`).not.toMatch(/AUTOMATIC_MIGRATION|set .* to TRUE/i);
+    }
+    // A write finds it as well, at once: no retry (a retry waits at least 150 ms, three times, and says "attempt 3 of 3").
+    const wrote = await w.write("w", (tx) => tx.exec("CREATE TABLE t (a INTEGER)"), { runId: "r1" }).catch((e: unknown) => e);
+    expect((wrote as CroftError).code).toBe("LAKE_CATALOG_MISMATCH");
+  }, 60_000);
+
+  maybe("a lake whose files are in another bucket folder than the settings name is LAKE_CATALOG_MISMATCH too, and nothing is overridden", async () => {
+    const lake = await rig.lake();
+    const first = await fresh({ lake });
+    await first.w.write("make t", (tx) => tx.exec("CREATE TABLE t (a INTEGER)"), { runId: "r1" });
+    await closeAllWarehouses();
+    const root = mkdtempSync(join(tmpdir(), "croft-lakewh-"));
+    made.push(root);
+    const stateDir = join(root, ".croft");
+    mkdirSync(stateDir, { recursive: true });
+    const conn = rigConnection(rig, lake, { stateDir, extensionDir: ready.dir });
+    const elsewhere = `s3://${lake.bucket}/some-other-folder/`;
+    const base = conn.mode;
+    const w = openWarehouse({
+      path: join(root, "w.duckdb"), mode: "read_write", timezone: "UTC", root, stateDir, register: false, isTTY: false,
+      lake: { ...conn, mode: (a) => { const m = base(a); return m.kind === "lake" ? { ...m, lake: { ...m.lake, data: { ...m.lake.data, path: elsewhere } } } : m; } },
+    });
+    const err = await w.read(async () => 1, { purpose: "test" }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CroftError);
+    expect((err as CroftError).problem).toMatchObject({
+      code: "LAKE_CATALOG_MISMATCH", retryable: false,
+      details: { kind: "data_path", catalogDataPath: `s3://${lake.bucket}/${lake.folder}/`, settingsDataPath: elsewhere },
+    });
+    expect((err as CroftError).problem.hint).toContain(lake.folder);
+    expect((err as CroftError).problem.hint).not.toMatch(/OVERRIDE_DATA_PATH/);
   }, 60_000);
 
   maybe("a write whose connection dropped before its commit is run again once, in a new transaction: one row, not two", async () => {

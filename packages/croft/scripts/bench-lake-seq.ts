@@ -15,6 +15,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { extensionsReady } from "../src/db/extension-dir-testkit.ts";
+import { delayProxy } from "../src/db/delay-proxy-testkit.ts";
 import type { LakeConnection } from "../src/db/lake.ts";
 import { lakeRigReady, startLakeRig } from "../src/db/lake-testkit.ts";
 import { bookkeepingOf, logDdl } from "../src/db/bookkeeping.ts";
@@ -27,32 +28,6 @@ const SIZES = arg("sizes", "0,1000,20000").split(",").map(Number);
 const OUT = arg("out", "");
 const LATENCIES = arg("latency", "").split(",").filter(Boolean).map(Number);
 const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]!;
-
-/** A TCP proxy to the local Postgres that holds every chunk back `oneWayMs` in each direction (order kept, as a long cable would). */
-function delayProxy(targetPort: number, oneWayMs: number): { port: number; stop(): void } {
-  type Sock = { write(d: Uint8Array): number; end(): void; data?: { peer?: Sock } };
-  const later = (fn: () => void) => void setTimeout(fn, oneWayMs);
-  const server = Bun.listen<{ peer?: Sock }>({
-    hostname: "127.0.0.1", port: 0,
-    socket: {
-      async open(client) {
-        client.data = {};
-        const upstream = await Bun.connect<{ peer?: Sock }>({
-          hostname: "127.0.0.1", port: targetPort,
-          socket: {
-            open(s) { s.data = { peer: client as unknown as Sock }; },
-            data(s, d) { later(() => (s.data.peer as unknown as Sock | undefined)?.write(d)); },
-            close(s) { later(() => (s.data.peer as unknown as Sock | undefined)?.end()); },
-          },
-        });
-        client.data.peer = upstream as unknown as Sock;
-      },
-      data(client, d) { later(() => client.data.peer?.write(d)); },
-      close(client) { later(() => client.data.peer?.end()); },
-    },
-  });
-  return { port: server.port, stop: () => server.stop(true) };
-}
 
 const COLUMNS = "name, kind, write_mode, key_columns, code_hash, behavior_hash, cursor_value, cursor_type, cursor_unit, last_loaded_at, last_replaced_at, row_count, max_loaded_at, updated_at";
 const row = (name: string, seq: string) => `('${name}', 'ingest', 'replace', ['id'], 'h', 'b', NULL, NULL, NULL, now(), NULL, 10, now(), now(), ${seq}, false)`;

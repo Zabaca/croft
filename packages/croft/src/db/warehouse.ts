@@ -17,7 +17,8 @@
 // A warehouse that is a lake (WarehouseOptions.lake; option 07, D138 to D144) is the same object with another store under it. There is no
 // file: the instance is an in-memory one that attaches the lake when its first connection is made and is then locked, and it stays open
 // for the life of the command (a re-attach after the lock is refused), so nothing lingers and nothing is closed after a lease. Every
-// connection works in the lake (`USE lake`), so the tables, the views and `current_database()` read as they do in a file. There is no
+// connection works in the lake (`USE lake`), so the tables, the views and `current_database()` read as they do in a file, and a read lease is
+// one transaction (the catalog charges round trips for each, D176). There is no
 // file lock and no write intent; the lock on writes is croft's own (db/lake.ts LakeWriteLock), one write at a time on this machine, and
 // croft serve never steps aside. A read whose catalog connection dropped is tried again; a write is tried again as a whole, after its
 // commit is checked by the tag it carries (a commit may have landed without its answer reaching us); every error that leaves a lease has
@@ -30,7 +31,7 @@ import { type DuckDBConnection, type DuckDBInstance, type DuckDBResultReader, ty
 import { CroftError } from "../core/errors.ts";
 import type { LockHolder, Sql, Warehouse } from "../core/types.ts";
 import type { Row } from "../types.ts";
-import { type AccessMode, canonicalPath, connect, type LockConflict, lockConflict, openInstance, openMemoryInstance, type SandboxSpec } from "./connect.ts";
+import { type AccessMode, canonicalPath, connect, type LockConflict, lockConflict, openInstance, openMemoryInstance, type SandboxSpec, startFailure } from "./connect.ts";
 import { bookkeepingOf, seqResetSql } from "./bookkeeping.ts";
 import * as intents from "./intent.ts";
 import {
@@ -102,7 +103,14 @@ export interface WriteOptions {
    *  reason (a run's INTERRUPTED or TIMEOUT), else INTERRUPTED. */
   signal?: AbortSignal;
 }
-export interface ReadOptions { waitMs?: number; purpose: string; signal?: AbortSignal }
+export interface ReadOptions {
+  waitMs?: number;
+  purpose: string;
+  signal?: AbortSignal;
+  /** A lake only: the lease asks no more of the lake than that it can be attached (db/lake-pass.ts lakeExists). No transaction, no `USE`, no check
+   *  of the format, and the body must not query the lake: the three cost the catalog 3 s at 41 ms, for an answer the attach already gave. */
+  attachOnly?: boolean;
+}
 
 /** A wait that ends early, without error, when the signal aborts; the caller checks the signal next. */
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -163,8 +171,16 @@ export class LeaseSql implements Sql {
   hooks: { begin?: () => Promise<void>; commit?: () => Promise<void> } | null = null;
   /** The statements of a lake warehouse: croft never runs CHECKPOINT on a lake, sets one of its options or expires its snapshots by age (D149). */
   lake = false;
+  /** A lake read is one transaction (DuckLake charges the catalog's round trips for each one, D176), and a statement DuckDB refuses aborts it: this
+   *  starts another, so a body that goes on after a refused statement (a table that is not there, a query the user got wrong) is as it was when
+   *  every statement was a transaction of its own. Not called for a connection that dropped: the lease retries the whole body. */
+  recover: (() => Promise<void>) | null = null;
 
   constructor(readonly connection: DuckDBConnection, private readonly ctx: RenderContext, private readonly guard: TxGuard | null) {}
+
+  private async mended(e: unknown): Promise<void> {
+    if (this.recover && !isConnectionError(e)) await this.recover();
+  }
 
   async all<T = Row>(sql: string, params: unknown[] = []): Promise<T[]> {
     return renderRows((await this.run(sql, params, true))!, this.ctx) as T[];
@@ -191,6 +207,7 @@ export class LeaseSql implements Sql {
       stmt = await this.connection.prepare(sql);
     } catch (e) {
       if (this.guard) this.failed ??= e as Error;
+      await this.mended(e);
       if (/Cannot prepare multiple statements/.test((e as Error).message)) {
         throw new CroftError("SQL_NOT_ONE_STATEMENT", { message: "croft runs one SQL statement per call", hint: "report this croft bug", details: { sql: sql.slice(0, 200) } });
       }
@@ -212,6 +229,7 @@ export class LeaseSql implements Sql {
         if (word === "BEGIN") await this.hooks!.begin?.();
       } catch (e) {
         if (this.guard) this.failed ??= e as Error;
+        await this.mended(e);
         throw e;
       }
       this.guard?.record(type, sql);
@@ -296,10 +314,21 @@ export class DuckWarehouse implements Warehouse {
   }
 
   /** The Sql over a connection of this warehouse; a lake's refuses what croft never runs on one (refuseOnLake). */
-  private sqlOver(conn: DuckDBConnection, guard: TxGuard | null): LeaseSql {
+  private sqlOver(conn: DuckDBConnection, guard: TxGuard | null, wholeRead = false): LeaseSql {
     const sql = new LeaseSql(conn, this.renderCtx(), guard);
     sql.lake = this.lake !== null;
+    if (wholeRead && this.lake) sql.recover = () => this.restartRead(conn);
     return sql;
+  }
+
+  /** A lake read's transaction was aborted by a statement DuckDB refused: end it and begin another (the default catalog survives a rollback). */
+  private async restartRead(conn: DuckDBConnection): Promise<void> {
+    try {
+      await conn.run("ROLLBACK");
+      await conn.run("BEGIN TRANSACTION");
+    } catch {
+      // The next statement says what is wrong with the connection.
+    }
   }
 
   /** Whether this warehouse is a lake. */
@@ -318,7 +347,7 @@ export class DuckWarehouse implements Warehouse {
   }
 
   read<T>(fn: (db: LeaseSql) => Promise<T>, o?: ReadOptions): Promise<T> {
-    return this.lease("read", o?.waitMs, (conn) => fn(this.sqlOver(conn, null)), undefined, o?.signal);
+    return this.lease("read", o?.waitMs, (conn) => fn(this.sqlOver(conn, null, o?.attachOnly !== true)), undefined, o?.signal, o?.attachOnly === true);
   }
 
   write<T>(label: string, fn: (tx: LeaseSql) => Promise<T>, o?: WriteOptions): Promise<T> {
@@ -426,7 +455,7 @@ export class DuckWarehouse implements Warehouse {
   }
 
   private async lease<T>(kind: "read" | "write", waitMs: number | undefined, body: (conn: DuckDBConnection) => Promise<T>,
-    runId?: string, signal?: AbortSignal): Promise<T> {
+    runId?: string, signal?: AbortSignal, attachOnly = false): Promise<T> {
     if (signal?.aborted) throw waitAborted(signal);
     this.leases++;
     if (this.closeTimer) clearTimeout(this.closeTimer);
@@ -434,7 +463,7 @@ export class DuckWarehouse implements Warehouse {
     let conn: DuckDBConnection | undefined;
     try {
       const instance = await this.ensureOpen(kind, waitMs ?? this.waitCap(kind), runId, signal);
-      if (this.lake) return await this.inLake(kind, instance, body, signal, (c) => { conn = c; });
+      if (this.lake) return await this.inLake(kind, instance, body, signal, (c) => { conn = c; }, attachOnly);
       conn = await connect(instance, this.spec, this.key);
       this.conns.add(conn);
       if (!this.formatChecked) {
@@ -525,15 +554,25 @@ export class DuckWarehouse implements Warehouse {
    * A lease on the lake: a connection (the first one attaches the lake, retried when the catalog was unreachable for a moment), working in
    * the lake, and the body. A read whose catalog or store connection dropped is tried again; a write does its own retrying
    * (lakeWrite), because it must check its commit first. Every error that leaves is scrubbed.
+   *
+   * A read is one transaction from `USE lake` to the end of its body (D176). Every statement outside a transaction is a DuckLake
+   * transaction of its own, and each of those costs the catalog's round trips (a snapshot lookup, and for each table the files, the stats and
+   * the inlined rows: 9 to 26 of them, 0.4 to 1.1 s at the 41 ms the second real-lake trial measured), so the 11 statements croft ran to
+   * read the state of one asset cost 6 s; in one transaction the snapshot and what DuckLake learned of a table are paid once. Nothing in a
+   * read changes the lake, so the transaction is rolled back at the end, which costs nothing; and a statement DuckDB refuses (which aborts a
+   * transaction) is followed by a new one (LeaseSql.recover), so a body may go on after a failed statement as it could before.
    */
   private async inLake<T>(kind: "read" | "write", first: DuckDBInstance, body: (conn: DuckDBConnection) => Promise<T>, signal: AbortSignal | undefined,
-    give: (conn: DuckDBConnection) => void): Promise<T> {
+    give: (conn: DuckDBConnection) => void, attachOnly = false): Promise<T> {
     let instance = first;
     let conn: DuckDBConnection | undefined;
     for (let attempt = 0; !conn; attempt++) {
       try {
         conn = await connect(instance, this.spec, this.key);
-      } catch (e) {
+      } catch (raised) {
+        // A lease that shared the instance with one whose attach failed is refused by the instance ("left part set up"), and that is not what
+        // went wrong: what stopped the attach is, and it is the same attach.
+        const e = startFailure(instance) ?? raised;
         this.dropInstance(instance);
         const details = e instanceof CroftError && e.code === "LAKE_ATTACH_FAILED" ? e.problem.details : undefined;
         if (details?.notCreated) {
@@ -547,7 +586,8 @@ export class DuckWarehouse implements Warehouse {
         if (details && typeof details.duckdb === "string" && isConnectionError(details.duckdb) && attempt < LAKE_RETRY.connection) {
           await sleep(lakeBackoffMs(attempt));
           if (signal?.aborted) throw waitAborted(signal);
-          instance = await this.openLake();
+          // The instance another lease opened since, or a new one (one open at a time).
+          instance = await this.ensureOpen(kind, 0, undefined, signal);
           continue;
         }
         throw this.scrub(e);
@@ -555,19 +595,31 @@ export class DuckWarehouse implements Warehouse {
     }
     give(conn);
     this.conns.add(conn);
-    await conn.run(`USE ${LAKE_ALIAS}`);
+    if (attachOnly) return await body(conn);
+    const whole = kind === "read";
+    const endRead = async () => {
+      try { await conn!.run("ROLLBACK"); } catch { /* none open, or the connection is gone */ }
+    };
+    let used = false;
     for (let attempt = 0; ; attempt++) {
       try {
+        if (whole) await conn.run("BEGIN TRANSACTION");
+        if (whole || !used) {
+          await conn.run(`USE ${LAKE_ALIAS}`);
+          used = true;
+        }
         if (!this.formatChecked) {
           // Refuse a lake from a newer croft before touching it (DB_NEWER_FORMAT); once per process.
           await checkFormat(this.sqlOver(conn, null));
           this.formatChecked = true;
         }
-        return await body(conn);
+        const out = await body(conn);
+        if (whole) await endRead();
+        return out;
       } catch (e) {
+        if (whole) await endRead();
         if (kind === "read" && isConnectionError(e)) {
           if (attempt < LAKE_RETRY.connection) {
-            try { await conn.run("ROLLBACK"); } catch { /* none open */ }
             await sleep(lakeBackoffMs(attempt));
             continue;
           }

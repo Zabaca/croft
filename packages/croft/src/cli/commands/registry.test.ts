@@ -71,7 +71,7 @@ describe("a DuckDB binding that cannot load", () => {
     const help = broken(BIN, ["help", "--json"], out);
     expect(help.exit).toBe(0);
     expect(help.env.data.commands.map((c: { name: string }) => c.name)).toEqual(COMMANDS.filter((c) => !c.hidden).map((c) => c.name).sort());
-    expect(broken(BIN, ["doctor", "--help", "--json"], out).env.data.command).toMatchObject({ name: "doctor", usage: "croft doctor" });
+    expect(broken(BIN, ["doctor", "--help", "--json"], out).env.data.command).toMatchObject({ name: "doctor", usage: "croft doctor [--tables]" });
     expect(broken(BIN, ["docs", "DUCKDB_BINDING_MISSING", "--json"], out).exit).toBe(0);
   });
 

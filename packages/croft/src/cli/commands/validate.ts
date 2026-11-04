@@ -49,6 +49,8 @@ import { hookContext, hookOutput, hookPaths, hookProblems, hookReport, hookSelec
 import { checkColumns, displayIdent, probeSql } from "../../checks/parse.ts";
 import { type Code, CroftError, CODES, EXIT, isCode, problem } from "../../core/errors.ts";
 import { addonsNeeded, inspectAddons } from "../../db/addon-status.ts";
+import { catalogTls } from "../../db/catalog-tls.ts";
+import { storeCaFile } from "../../db/store-tls.ts";
 import { formatInstant } from "../../core/time.ts";
 import type { Check, Fix, Problem, ValidateAsset, ValidateData } from "../../core/types.ts";
 import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
@@ -89,8 +91,8 @@ export interface ValidateInput {
   selectors?: readonly string[];
   /** Also run the project's tsc --noEmit. */
   types?: boolean;
-  /** Check the add-on of a mode that is on (default true). croft doctor says false: it has a line of its own for the add-on, and its
-   *  count of assets and their errors is about assets. */
+  /** Check the add-on of a mode that is on, and the CA files a lake's settings name (default true). croft doctor says false: it has lines of its own
+   *  for both, and its count of assets and their errors is about assets. */
   addons?: boolean;
   /** A TS asset whose top-level code has not finished after this long is ASSET_INVALID (default 30 s). */
   importTimeoutMs?: number;
@@ -179,6 +181,30 @@ export function nextSteps(r: ValidateReport): Next[] {
 }
 
 /**
+ * The CA files a lake's settings name that are not there (CONFIG_INVALID, the code a command meets when it attaches): `lake.catalog.sslRootCert` and
+ * `lake.bucket.sslRootCert`. The second real-lake trial's validate said all was well for a project whose next query failed on a missing catalog CA
+ * file. Only a file the project names is checked; whether this machine has a bundle of its own is doctor's line, since another machine may (DESIGN.md D181).
+ */
+export function lakeFileProblems(config: NonNullable<Project["config"]>, root: string, env: ProjectEnv): Problem[] {
+  const lake = config.lake;
+  if (!lake || lake.kind !== "postgres") return [];
+  const tlsEnv = { SSL_CERT_FILE: env.lookup("SSL_CERT_FILE")?.value };
+  const out: Problem[] = [];
+  const check = (named: unknown, make: () => unknown): void => {
+    if (named === undefined) return;
+    try {
+      make();
+    } catch (e) {
+      if (!(e instanceof CroftError)) throw e;
+      out.push(e.problem);
+    }
+  };
+  check(lake.catalog.sslRootCert, () => catalogTls(lake.catalog, root, { env: tlsEnv }));
+  check(lake.bucket.sslRootCert, () => storeCaFile(lake.bucket, root, { env: tlsEnv }));
+  return out;
+}
+
+/**
  * Validate a project (or the named assets) without touching the warehouse: static checks, the bind check, and
  * with `types` the project's tsc. Throws USAGE_ERROR for a selector that names no asset; every problem with an
  * asset is a problem of the report.
@@ -225,6 +251,7 @@ export async function validateProject(i: ValidateInput): Promise<ValidateReport>
   const addons = i.addons !== false && i.project.config && !i.select ? inspectAddons(addonsNeeded(i.project.config), { from: root, ...(i.processEnv ? { env: i.processEnv } : {}) }) : null;
   const problems: Problem[] = [
     ...(addons?.problems ?? []),
+    ...(i.addons !== false && i.project.config && !i.select ? lakeFileProblems(i.project.config, root, i.env) : []),
     ...resolved.problems.filter((p) => p.code !== "CYCLE"),
     ...cycles.filter((p) => selected.size === byName.size || cycleNames(p).some((n) => selected.has(n))),
     // A rename that stopped before its new file exists belongs to no asset: the whole project reports it.

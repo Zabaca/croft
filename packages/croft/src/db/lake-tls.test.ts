@@ -13,6 +13,7 @@ import { CroftError } from "../core/errors.ts";
 import type { CatalogSslMode } from "../project/lake-config.ts";
 import { findPgDump, pgDumpTo } from "./lake-backup.ts";
 import { isConnectionError } from "./lake.ts";
+import { serverOffersTls } from "./lake-probe.ts";
 import { lakeRigReady, type LakeRig, READER_LOGIN, rigConnection, startLakeRig } from "./lake-testkit.ts";
 import { readListening, startPostgres, type TestPostgres } from "./mode-testkit.ts";
 import { certsReady, makeCerts, type TestCerts } from "./tls-testkit.ts";
@@ -224,6 +225,47 @@ describe("the catalog's TLS, in the backup's pg_dump", () => {
   }, 60_000);
 });
 
+describe("what the client can know of the catalog connection's encryption (D175)", () => {
+  maybe("a Postgres that offers TLS answers the request libpq makes first with S, one that does not with N", async () => {
+    expect(await serverOffersTls("127.0.0.1", rig.pg.port)).toBe("offered");
+    expect(await serverOffersTls("localhost", plain.port)).toBe("refused");
+  });
+
+  test("a server that cannot be reached, answers something else, or says nothing is unknown, never refused", async () => {
+    // Nothing listens on port 1.
+    expect(await serverOffersTls("127.0.0.1", 1)).toBe("unknown");
+    const serve = (reply: string | null) => Bun.listen({
+      hostname: "127.0.0.1", port: 0,
+      socket: { open() {}, data(s) { if (reply !== null) s.write(reply); }, close() {} },
+    });
+    // A server that answers with an error message (a proxy that does not speak the request) or not at all.
+    const odd = serve("E");
+    const silent = serve(null);
+    try {
+      expect(await serverOffersTls("127.0.0.1", odd.port)).toBe("unknown");
+      expect(await serverOffersTls("127.0.0.1", silent.port, { timeoutMs: 150 })).toBe("unknown");
+    } finally {
+      odd.stop(true);
+      silent.stop(true);
+    }
+  });
+});
+
+describe("the SSL request probe leaves no socket open", () => {
+  test("when its time runs out the connection is closed (the case of a connection made after the end is the open handler's guard, which a local server cannot be slow enough to reach)", async () => {
+    let closed!: () => void;
+    const gone = new Promise<void>((resolve) => (closed = resolve));
+    // A server that never answers, and tells when a client has left.
+    const silent = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { open() {}, data() {}, close() { closed(); } } });
+    try {
+      expect(await serverOffersTls("127.0.0.1", silent.port, { timeoutMs: 0 })).toBe("unknown");
+      await gone; // the test's own timeout ends it if the socket was left open
+    } finally {
+      silent.stop(true);
+    }
+  }, 20_000);
+});
+
 describe("the catalog connection's TLS, from croft.json", () => {
   const writeBlock = (root: string, catalog: Record<string, unknown>) => {
     const file = join(root, "croft.json");
@@ -252,6 +294,9 @@ describe("the catalog connection's TLS, from croft.json", () => {
     expect(line.status).toBe("ok");
     expect(line.text).toContain("checks the server's certificate and host name");
     expect(line.text).toContain(`against ${tls.cert} (named by lake.catalog.sslRootCert)`);
+    // And whether it is encrypted, from the client's side: verify-full would have ended the connection otherwise.
+    const encryptedLine = (d: unknown) => (d as { data: { checks: { id: string; status: string; text: string }[] } }).data.checks.find((c) => c.id === "lake.catalog.encrypted")!;
+    expect(encryptedLine(doctor.json)).toMatchObject({ status: "ok", text: expect.stringContaining("is encrypted: sslMode verify-full") });
 
     // Another authority's CA: refused at the attach, naming the setting.
     writeBlock(l.p.root, { sslRootCert: tls.otherCa });
@@ -266,6 +311,12 @@ describe("the catalog connection's TLS, from croft.json", () => {
     expect(gone.exit).toBe(2);
     expect(JSON.stringify(gone.json)).toContain("CONFIG_INVALID");
     expect(JSON.stringify(gone.json)).toContain("certs/nowhere.pem");
+    // validate finds it first, without attaching anything (the second real-lake trial: validate said all was well, and the next query failed).
+    const validated = await cli(["validate", "--json"], { cwd: l.p.root, env: l.env });
+    expect(validated.exit, validated.stdout).toBe(2);
+    expect(JSON.stringify(validated.json)).toContain("CONFIG_INVALID");
+    expect(JSON.stringify(validated.json)).toContain("lake.catalog.sslRootCert");
+    expect(JSON.stringify(validated.json)).toContain("certs/nowhere.pem");
 
     // Doctor says the same refusal, instead of claiming the check is made.
     const doctorLine = async (env: Record<string, string> = {}) => {
@@ -293,5 +344,7 @@ describe("the catalog connection's TLS, from croft.json", () => {
     const line2 = (doctor2.json as { data: { checks: { id: string; status: string; text: string }[] } }).data.checks.find((c) => c.id === "lake.catalog.tls")!;
     expect(line2.status).toBe("info");
     expect(line2.text).toContain("sslMode prefer");
+    // prefer to a server that offers TLS: libpq takes it, and the line says so (the server's own view of its last hop is not asked).
+    expect(encryptedLine(doctor2.json)).toMatchObject({ status: "ok", text: expect.stringContaining("the server offers TLS and sslMode prefer takes it") });
   }, 180_000);
 });

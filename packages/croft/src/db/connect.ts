@@ -193,7 +193,16 @@ const configuredCredentials = new Map<string, string>();
 // database attached, a listener running) and unlocked, so no later connect may use it or lock it as something else.
 // The mark is on the instance, not its key: callers key by the warehouse path, and a new instance on the same path
 // after a failed start (a catalog that was unreachable for a moment) must work.
-const failedInstances = new WeakMap<DuckDBInstance, string>();
+const failedInstances = new WeakMap<DuckDBInstance, { code: string; error: unknown }>();
+
+/**
+ * What stopped `instance`'s mode from starting, or undefined for an instance that did not fail. A second lease that shared the instance with
+ * the first, whose attach failed, was refused with "left part set up" (an INTERNAL_ERROR, "report this croft bug") although it was the same
+ * attach: the warehouse asks for the cause here and gives the lease that (db/warehouse.ts, the second real-lake trial; DESIGN.md D177).
+ */
+export function startFailure(instance: DuckDBInstance): unknown {
+  return failedInstances.get(instance)?.error;
+}
 const configuring = new Map<string, Promise<unknown>>();
 
 /**
@@ -225,10 +234,10 @@ async function scalar(conn: DuckDBConnection, sql: string): Promise<unknown> {
 }
 
 async function applySandbox(instance: DuckDBInstance, conn: DuckDBConnection, spec: SandboxSpec, key: string): Promise<void> {
-  const failedWith = failedInstances.get(instance);
-  if (failedWith !== undefined) {
+  const failed = failedInstances.get(instance);
+  if (failed !== undefined) {
     throw new CroftError("INTERNAL_ERROR", {
-      message: `the database ${key} was left part set up by a mode that failed to start (${failedWith}), so this instance cannot be used`,
+      message: `the database ${key} was left part set up by a mode that failed to start (${failed.code}), so this instance cannot be used`,
       hint: "open a new DuckDB instance; report this croft bug if a caller reused this one",
     });
   }
@@ -274,7 +283,7 @@ async function applySandbox(instance: DuckDBInstance, conn: DuckDBConnection, sp
     await conn.run("SET enable_external_access = false");
     await conn.run("SET lock_configuration = true");
   } catch (e) {
-    if (spec.mode) failedInstances.set(instance, e instanceof CroftError ? e.code : "error");
+    if (spec.mode) failedInstances.set(instance, { code: e instanceof CroftError ? e.code : "error", error: e });
     throw e;
   }
   configured.set(key, fingerprint);

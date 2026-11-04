@@ -9,7 +9,8 @@
 // DuckLake's maintenance from the lake's stored options, so an age-based expiry set by anyone expires a snapshot the trash pinned (the
 // follow-up spike recorded in option 07, item 1 of "What the follow-ups settled"), and it deletes any file in the data folder the lake does not
 // own. Each step is run by name instead, in this order:
-//   0. prune    croft's own bookkeeping log loses the rows a newer row of the same key has superseded (D154);
+//   0. prune    croft's own bookkeeping log loses the rows a newer row of the same key has superseded (D154), and croft's bookkeeping that an
+//               older pass moved into files is brought back into the catalog (D179);
 //   1. flush    the rows DuckLake held inside the catalog become files, for the assets' schema only: croft's own bookkeeping (`_croft`)
 //               stays in the catalog, because each read of it from a store costs a request or three once it is files (D162);
 //   2. expire   the snapshots outside the promise, by an explicit list of ids croft computes (planExpiry);
@@ -175,6 +176,9 @@ export interface LakeStats {
   inlinedTables: number;
   /** Files freed and waiting for a cleanup to delete them. */
   pendingDeletion: number;
+  /** Data files of croft's own bookkeeping (`_croft`) in the store; a lake nothing flushed has none (bookkeepingInFiles names the tables). Absent from
+   *  the summary of a pass that an older croft stored. */
+  bookkeepingFiles?: number;
   /** The oldest and newest snapshot's time (ISO), or null for a lake with none. */
   oldestSnapshotAt: string | null;
   newestSnapshotAt: string | null;
@@ -193,6 +197,10 @@ export async function lakeStats(sql: Sql): Promise<LakeStats> {
     (SELECT count(*) FROM ${M}.ducklake_delete_file) AS delete_files,
     (SELECT count(*) FROM ${M}.ducklake_inlined_data_tables) AS inlined_tables,
     (SELECT count(*) FROM ${M}.ducklake_files_scheduled_for_deletion) AS pending,
+    (SELECT count(*) FROM ${M}.ducklake_data_file f
+       JOIN ${M}.ducklake_table t ON t.table_id = f.table_id AND t.end_snapshot IS NULL
+       JOIN ${M}.ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL
+       WHERE s.schema_name = '_croft' AND f.end_snapshot IS NULL) AS bookkeeping_files,
     (SELECT min(snapshot_time)::TIMESTAMPTZ::VARCHAR FROM ducklake_snapshots('${LAKE_ALIAS}')) AS oldest,
     (SELECT max(snapshot_time)::TIMESTAMPTZ::VARCHAR FROM ducklake_snapshots('${LAKE_ALIAS}')) AS newest`);
   const iso = (v: unknown): string | null => {
@@ -202,7 +210,7 @@ export async function lakeStats(sql: Sql): Promise<LakeStats> {
   };
   return {
     snapshots: num(r?.snapshots), dataFiles: num(r?.data_files), liveFiles: num(r?.live_files), liveBytes: num(r?.live_bytes),
-    deleteFiles: num(r?.delete_files), inlinedTables: num(r?.inlined_tables), pendingDeletion: num(r?.pending),
+    deleteFiles: num(r?.delete_files), inlinedTables: num(r?.inlined_tables), pendingDeletion: num(r?.pending), bookkeepingFiles: num(r?.bookkeeping_files),
     oldestSnapshotAt: iso(r?.oldest), newestSnapshotAt: iso(r?.newest),
   };
 }
@@ -265,26 +273,133 @@ export async function countSuperseded(sql: Sql): Promise<number> {
 }
 
 /**
- * Remove the rows of croft's bookkeeping log that nothing reads (D154). Every run appends a row per asset to `_croft.assets_log` and its
- * kin; the view `_croft.<t>` shows the newest row of each key, so a superseded row is read by nothing, yet every read of the view and every
- * numbering of a write scans the whole log, which only grows. Nothing is lost that a person can ask for: the view's rows are the same before
- * and after (a test compares them), the trash holds copies of the view's rows and a restore numbers the rows it puts back above the rest, and
- * the lake's snapshots inside the window still hold the old rows for time travel. The log's `seq` stays ordered: a surviving row of a key is
- * its newest, so a new row, numbered above the highest left, is newer than it; a key whose newest row was a closing row is removed whole, so
- * no older row of it is left to come back; and a log emptied that way numbers from 1 with no row of any key before it. One DELETE per log,
- * each atomic by itself; the pass holds croft's lock, so no croft write runs meanwhile.
+ * Remove the rows of croft's bookkeeping log that nothing reads (D154), and bring croft's bookkeeping back into the catalog if it is in files (D179).
+ *
+ * Every run appends a row per asset to `_croft.assets_log` and its kin; the view `_croft.<t>` shows the newest row of each key, so a superseded
+ * row is read by nothing, yet every read of the view and every numbering of a write scans the whole log, which only grows. Nothing is lost that a
+ * person can ask for: the view's rows are the same before and after (a test compares them), the trash holds copies of the view's rows and a
+ * restore numbers the rows it puts back above the rest, and the lake's snapshots inside the window still hold the old rows for time travel. The
+ * log's `seq` stays ordered: a surviving row of a key is its newest, so a new row, numbered above the highest left, is newer than it; a key whose
+ * newest row was a closing row is removed whole, so no older row of it is left to come back; and a log emptied that way numbers from 1 with no row
+ * of any key before it. The pass holds croft's lock, so no croft write runs meanwhile; all of it is one transaction, so a lake at a distance pays
+ * one commit and not six, and a step that fails halfway leaves nothing halfway.
+ *
+ * The second half is for a lake whose bookkeeping an older croft's pass moved into Parquet files (it flushed every schema; D162 stopped that), or
+ * that one big insert wrote there. Every read of such a table costs the store a listing and a range read or two, 200 to 700 ms each on R2, for
+ * ever: a run with nothing new took 9 s and nothing said why (the second real-lake trial). DuckLake has no way to take rows back, so they are
+ * copied out, deleted and inserted again in inserts small enough to stay in the catalog (its inlining limit, 10 rows by default); the file that
+ * held them is then read by nobody, and the pass's `rewrite` step drops it (its rows are all deleted) and `cleanup` deletes it from the store.
+ * Only the rows that are in files are moved (the row ids a live file covers), and at most REINLINE_MAX_ROWS of a table in one pass: that many rows is
+ * a hundred inserts, which a transaction can carry at a distance. A table with more in files comes back over several passes (`_croft.writes_log`
+ * grows with every write and may be one of them); the file keeps what has not moved, and is dropped by the pass whose batch was its last.
  */
-export async function pruneBookkeeping(sql: Sql): Promise<{ tables: number; rows: number }> {
-  if (!(await hasLog(sql))) return { tables: 0, rows: 0 };
-  let rows = 0;
-  let tables = 0;
-  for (const t of ASSET_TABLES) {
-    const done = await sql.all<{ Count: unknown }>(`DELETE FROM _croft.${t}_log WHERE rowid IN (${supersededRows(t)})`);
-    const n = num(done[0]?.Count);
-    if (n > 0) tables++;
-    rows += n;
+export async function pruneBookkeeping(sql: Sql, o: { maxRows?: number; filesInStore?: boolean } = {}): Promise<{ tables: number; rows: number; reinlined: number; reinlinedRows: number; leftInFiles: number }> {
+  const none = { tables: 0, rows: 0, reinlined: 0, reinlinedRows: 0, leftInFiles: 0 };
+  if (!(await hasLog(sql))) return none;
+  // `filesInStore`: what the pass's own count of the lake said (LakeStats.bookkeepingFiles), so a lake with none asks nothing more of the catalog.
+  const limit = o.filesInStore === false ? 0 : await inliningLimit(sql);
+  const inFiles = limit > 0 ? await bookkeepingInFiles(sql) : [];
+  const out = { ...none };
+  await sql.exec("BEGIN TRANSACTION");
+  try {
+    for (const t of ASSET_TABLES) {
+      const done = await sql.all<{ Count: unknown }>(`DELETE FROM _croft.${t}_log WHERE rowid IN (${supersededRows(t)})`);
+      const n = num(done[0]?.Count);
+      if (n > 0) out.tables++;
+      out.rows += n;
+    }
+    const batch = Math.max(1, o.maxRows ?? REINLINE_MAX_ROWS);
+    for (const f of inFiles) {
+      const moved = await reinline(sql, f, batch, limit);
+      if (moved.rows > 0) {
+        out.reinlined++;
+        out.reinlinedRows += moved.rows;
+      }
+      if (moved.more) out.leftInFiles++;
+    }
+    await sql.exec("COMMIT");
+  } catch (e) {
+    try {
+      await sql.exec("ROLLBACK");
+    } catch {
+      // Already rolled back, or the connection is gone: the error is the one that matters.
+    }
+    throw e;
   }
-  return { tables, rows };
+  return out;
+}
+
+/** The most rows of a table of croft's bookkeeping that one pass brings back into the catalog: at DuckLake's 10 rows an insert, a hundred statements. */
+export const REINLINE_MAX_ROWS = 1000;
+
+const quoteIdent = (name: string): string => `"${name.replaceAll('"', '""')}"`;
+
+/** How many rows one insert may have and still stay in the catalog: the lake's own option when it has one, else DuckLake's default (10). 0: none. */
+async function inliningLimit(sql: Sql): Promise<number> {
+  const stored = (await sql.all<{ option_name: string; value: string }>(`SELECT option_name, value FROM ducklake_options('${LAKE_ALIAS}')`))
+    .find((r) => r.option_name === "data_inlining_row_limit");
+  if (stored) return Math.max(0, Math.trunc(Number(stored.value)) || 0);
+  try {
+    const [r] = await sql.all<{ v: unknown }>(`SELECT current_setting('ducklake_default_data_inlining_row_limit') AS v`);
+    const n = Math.trunc(Number(r?.v));
+    return Number.isFinite(n) && n >= 0 ? n : 10;
+  } catch {
+    return 10;
+  }
+}
+
+/**
+ * Bring up to `batch` of a table's rows that are in files back into the catalog (in the caller's transaction): copy them out, delete exactly those
+ * rows and insert them again `limit` rows at a time. The rows in files are those whose row ids a live file covers (`f.ranges`); a row the table
+ * took in the catalog has an id of its own, outside every file's. Returns how many rows moved and whether more are still in files.
+ */
+async function reinline(sql: Sql, f: BookkeepingInFiles, batch: number, limit: number): Promise<{ rows: number; more: boolean }> {
+  const t = `_croft.${quoteIdent(f.table)}`;
+  const keep = quoteIdent(`__croft_keep_${f.table}`);
+  const inFile = f.ranges.map((r) => `(rowid >= ${r.start} AND rowid < ${r.start + r.count})`).join(" OR ");
+  const [there] = await sql.all<{ n: unknown }>(`SELECT count(*) AS n FROM ${t} WHERE ${inFile}`);
+  const inFiles = num(there?.n);
+  const rows = Math.min(inFiles, batch);
+  if (rows === 0) return { rows: 0, more: false };
+  await sql.exec(`CREATE OR REPLACE TEMP TABLE ${keep} AS SELECT row_number() OVER (ORDER BY rowid) AS __n, rowid AS __rid, * FROM ${t} WHERE ${inFile} ORDER BY rowid LIMIT ${rows}`);
+  await sql.exec(`DELETE FROM ${t} WHERE rowid IN (SELECT __rid FROM ${keep})`);
+  for (let from = 0; from < rows; from += limit) {
+    await sql.exec(`INSERT INTO ${t} SELECT * EXCLUDE (__n, __rid) FROM ${keep} WHERE __n > ${from} AND __n <= ${from + limit} ORDER BY __n`);
+  }
+  await sql.exec(`DROP TABLE ${keep}`);
+  return { rows, more: inFiles > rows };
+}
+
+export interface BookkeepingInFiles {
+  table: string;
+  files: number;
+  bytes: number;
+  /** The row ids each live file covers (the first and how many). */
+  ranges: { start: number; count: number }[];
+}
+
+/**
+ * croft's own tables (`_croft`) that have data files in the store, and how many and how large. Empty for a lake whose bookkeeping is where a new
+ * lake's is, inside the catalog. Read through the catalog's own tables, like lakeStats.
+ */
+export async function bookkeepingInFiles(sql: Sql): Promise<BookkeepingInFiles[]> {
+  const rows = await sql.all<{ t: unknown; start: unknown; n: unknown; bytes: unknown }>(
+    `SELECT t.table_name AS t, f.row_id_start AS start, f.record_count AS n, coalesce(f.file_size_bytes, 0) AS bytes
+     FROM ${M}.ducklake_data_file f
+     JOIN ${M}.ducklake_table t ON t.table_id = f.table_id AND t.end_snapshot IS NULL
+     JOIN ${M}.ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL
+     WHERE s.schema_name = '_croft' AND f.end_snapshot IS NULL
+     ORDER BY t.table_name, f.row_id_start`);
+  const byTable = new Map<string, BookkeepingInFiles>();
+  for (const r of rows) {
+    const name = String(r.t);
+    const entry = byTable.get(name) ?? { table: name, files: 0, bytes: 0, ranges: [] };
+    entry.files++;
+    entry.bytes += num(r.bytes);
+    entry.ranges.push({ start: num(r.start), count: num(r.n) });
+    byTable.set(name, entry);
+  }
+  return [...byTable.values()];
 }
 
 /** Options another tool stored on the lake that would make a CHECKPOINT expire what the trash promises: an expiry by age. */
@@ -370,6 +485,8 @@ export interface PassOptions {
   onStep?: (step: StepName) => void | Promise<void>;
   /** Chunk size of the expiry's list of ids. */
   expireChunk?: number;
+  /** The most rows of a table of croft's bookkeeping that one pass brings back into the catalog (REINLINE_MAX_ROWS); tests lower it. */
+  reinlineMaxRows?: number;
 }
 
 /**
@@ -404,7 +521,7 @@ export async function runPass(sql: Sql, o: PassOptions): Promise<PassReport> {
       });
     }
   };
-  await step("prune", async () => pruneBookkeeping(sql));
+  await step("prune", async () => pruneBookkeeping(sql, { filesInStore: (before.bookkeepingFiles ?? 0) > 0, ...(o.reinlineMaxRows !== undefined ? { maxRows: o.reinlineMaxRows } : {}) }));
   await step("flush", async () => {
     // The assets' schema alone (D162): the rows of `_croft` are a few at a time, and read on every run, so they are kept where a read of them is
     // one round trip to the catalog, not a list and a range read of a Parquet file for each table in the store.

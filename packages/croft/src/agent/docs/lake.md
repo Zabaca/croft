@@ -65,13 +65,33 @@ else the file `$SSL_CERT_FILE` names (in `.env` or the shell); else this machine
 a public certificate (R2, S3) needs. A certificate that does not check out, or a machine with no bundle, fails every read
 and write of the bucket with LAKE_STORE_TLS, in whichever command meets it. `croft doctor` lists the bucket's folder and reads the footer of one data
 file with the read-only key before the first run, so a store croft cannot reach is found before `croft run` fails on it;
-it writes nothing, and says whether the catalog's connection is encrypted (a Postgres that offers no TLS is reached in
-plain text, without a word from the client, unless the connection is made to require it).
+it writes nothing, and says whether the catalog's connection is encrypted as the client knows it: `verify-full` and `require`
+make libpq end a connection the server will not encrypt, `disable` never encrypts, and under `prefer` it asks the server the
+question libpq asks first (may we use TLS), because a Postgres that offers no TLS is then reached in plain text without a word
+from the client. It never asks the database whether the connection is encrypted: behind a pooler or a proxy the database sees
+only the last hop, and says plain text of a connection that was checked. When it cannot know it says so and does not warn.
 
 The first `croft run` creates the lake, at DuckLake format 1.0 (so DuckDB 1.5 can read it too). croft never lets
 DuckLake migrate a catalog by itself. The writer's login and key are used only by commands that write; `croft serve`,
 `croft query`, `croft status`, `croft doctor` and the rest attach read-only with the read-only login and key. The
 read-only key is what keeps a reader that got past the gate out of the bucket, so it must not be able to write.
+
+## A catalog far away
+
+A hosted catalog is a round trip away from the machine that runs croft, and DuckLake pays the catalog several round trips for
+every transaction. croft keeps what a command asks of the lake in few transactions: a read is one, an ingest reads its own
+state once, and `croft doctor` reads the lake once. At 41 ms, on a four-asset project, a run with nothing new takes about 5 s,
+a `croft query` about 4 s and `croft doctor` about 5 s (see `docs/benchmarks/2026-11-03-lake-latency.md` in croft's source).
+A command on a lake costs at least 2.7 s at that distance whatever croft does (DuckLake attaches the catalog and loads it
+twice), and a step that writes about 7 s, so put the catalog near the machine that writes it.
+
+`croft doctor` leaves a lake's tables out of its comparison with croft's record (each costs the catalog's round trips);
+`croft doctor --tables` compares them all. If doctor warns with LAKE_BOOKKEEPING_IN_FILES, an older croft moved croft's own
+tables into files of the bucket, where every command reads them over the network: `croft maintain` brings them back.
+
+A catalog database that holds another lake is LAKE_CATALOG_MISMATCH: another DuckLake format, or a lake whose files are in
+another bucket folder than `lake.bucket` names. croft never migrates a lake and never overrides its data path; point
+`lake.catalog.database` at a database of croft's own.
 
 ## One writing machine
 
@@ -289,7 +309,7 @@ lake's newest snapshot) and finishes by proving it and switching, without copyin
 - A lake on one machine with no Postgres (a SQLite catalog and a folder). It exists for croft's own tests, and croft.json refuses it
   otherwise; it may be offered later as its own decision.
 
-Codes: LAKE_ATTACH_FAILED, LAKE_STORE_TLS, LAKE_CONNECTION_LOST, LAKE_COMMIT_UNCERTAIN, LAKE_TYPE_UNSUPPORTED, LAKE_DIRECT_READ,
+Codes: LAKE_ATTACH_FAILED, LAKE_CATALOG_MISMATCH, LAKE_STORE_TLS, LAKE_CONNECTION_LOST, LAKE_COMMIT_UNCERTAIN, LAKE_TYPE_UNSUPPORTED, LAKE_DIRECT_READ,
 LAKE_UNSUPPORTED, LAKE_OTHER_WRITER, LAKE_MAINTENANCE_FAILED, LAKE_EXPIRY_OPTION, LAKE_BACKUP_FAILED,
 LAKE_BACKUP_TOOL_MISSING, LAKE_VALUES_INEXACT, MAINTAIN_NEEDS_LAKE, MOVE_NEEDS_LAKE, MOVE_BLOCKED, MOVE_LAKE_NOT_EMPTY,
 MOVE_NOT_EQUAL, MOVE_FILE_CHANGED (croft docs <CODE>), and EXTENSION_MISSING when the add-on is not installed.

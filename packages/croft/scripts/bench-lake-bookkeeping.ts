@@ -3,8 +3,9 @@
 //
 // The pass's flush moved croft's own bookkeeping (`_croft`, a few rows at a time, kept inside the catalog) into tiny Parquet files in the
 // bucket, and every read of it then cost a listing and a range read or two against the store. This measures a run with nothing new, which is
-// mostly those reads, in three states of the same project: before any pass; after a pass that flushes every schema (what croft did until D162,
-// reproduced here with DuckLake's own call, since croft no longer makes it); and after croft's pass as it is now (only the assets' schema).
+// mostly those reads, in four states of the same project: before any pass; after a pass that flushes every schema (what croft did until D162,
+// reproduced here with DuckLake's own call, since croft no longer makes it); after croft's pass as it is now (only the assets' schema); and
+// after that flush and then croft's pass, which brings the bookkeeping back into the catalog (D179, the second real-lake trial).
 //
 // The store is the test rig's, on this machine, behind a TCP proxy that holds every chunk back half of `--rtt` milliseconds in each direction
 // (as the seq benchmark's proxy does for the catalog, bench-lake-seq.ts). It keeps the order of the bytes and nothing else: no loss, no jitter,
@@ -16,6 +17,7 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { delayProxy } from "../src/db/delay-proxy-testkit.ts";
 import { lakeRigReady, startLakeRig, useLake } from "../src/db/lake-testkit.ts";
 import { closeAllWarehouses, openWarehouse } from "../src/db/warehouse.ts";
 import { lakeConnection } from "../src/db/lake.ts";
@@ -28,67 +30,6 @@ const RUNS = Number(arg("runs", "3"));
 const OUT = arg("out", "");
 const PKG = resolve(import.meta.dir, "..");
 const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]!;
-
-/** A TCP proxy to the store that holds every chunk back `oneWayMs` each way, and counts the HTTP requests that pass. A socket that takes only
- *  part of a write keeps the rest and sends it when it drains (a Parquet file is more than a socket buffer). */
-function delayProxy(targetPort: number, oneWayMs: number): { port: number; requests(): number; reset(): void; stop(): void } {
-  interface Side { write(d: Uint8Array): number; end(): void; data: Link }
-  interface Link { peer?: Side; pending: Uint8Array | null; ending: boolean; early: Uint8Array[] }
-  let requests = 0;
-  const later = (fn: () => void) => (oneWayMs > 0 ? void setTimeout(fn, oneWayMs) : fn());
-  const send = (to: Side | undefined, d: Uint8Array) => {
-    if (!to) return;
-    if (to.data.pending) {
-      const joined = new Uint8Array(to.data.pending.length + d.length);
-      joined.set(to.data.pending);
-      joined.set(d, to.data.pending.length);
-      to.data.pending = joined;
-      return;
-    }
-    const n = to.write(d);
-    if (n < d.length) to.data.pending = d.slice(n);
-  };
-  const drain = (s: Side) => {
-    const p = s.data.pending;
-    if (!p) return;
-    s.data.pending = null;
-    send(s, p);
-    if (!s.data.pending && s.data.ending) s.end();
-  };
-  const close = (to: Side | undefined) => later(() => {
-    if (!to) return;
-    if (to.data.pending) to.data.ending = true;
-    else to.end();
-  });
-  const server = Bun.listen<Link>({
-    hostname: "127.0.0.1", port: 0,
-    socket: {
-      async open(client) {
-        client.data = { pending: null, ending: false, early: [] };
-        const upstream = await Bun.connect<Link>({
-          hostname: "127.0.0.1", port: targetPort,
-          socket: {
-            open(s) { s.data = { peer: client as unknown as Side, pending: null, ending: false, early: [] }; },
-            data(s, d) { later(() => send(s.data.peer, d)); },
-            drain(s) { drain(s as unknown as Side); },
-            close(s) { close(s.data.peer); },
-          },
-        });
-        client.data.peer = upstream as unknown as Side;
-        // What the client sent while the connection to the store was being made.
-        for (const d of client.data.early.splice(0)) later(() => send(client.data.peer, d));
-      },
-      data(client, d) {
-        if (/^(?:GET|HEAD|PUT|POST|DELETE) /.test(Buffer.from(d.subarray(0, 8)).toString("latin1"))) requests++;
-        if (!client.data.peer) client.data.early.push(d.slice());
-        else later(() => send(client.data.peer, d));
-      },
-      drain(client) { drain(client as unknown as Side); },
-      close(client) { close(client.data.peer); },
-    },
-  });
-  return { port: server.port, requests: () => requests, reset: () => { requests = 0; }, stop: () => server.stop(true) };
-}
 
 const ASSET = `import { ingest } from "@zabaca/croft";
 export default ingest({ description: "sales", file: "files/sales.csv", key: "id", checks: ["not_null(region)"] });
@@ -121,8 +62,8 @@ async function croft(root: string, args: string[], e: Record<string, string>): P
   return { ms: performance.now() - t0, code, err: code === 0 ? "" : `${out}\n${err}`.slice(0, 600) };
 }
 
-type State = "before any pass" | "after a pass that flushes every schema (until D162)" | "after croft's pass (assets only)";
-const STATES: State[] = ["before any pass", "after a pass that flushes every schema (until D162)", "after croft's pass (assets only)"];
+type State = "before any pass" | "after a pass that flushes every schema (until D162)" | "after croft's pass (assets only)" | "after that flush, then croft maintain (D179)";
+const STATES: State[] = ["before any pass", "after a pass that flushes every schema (until D162)", "after croft's pass (assets only)", "after that flush, then croft maintain (D179)"];
 
 async function main(): Promise<void> {
   const ready = lakeRigReady();
@@ -155,6 +96,7 @@ async function main(): Promise<void> {
           if (state === "after croft's pass (assets only)") {
             await run(["maintain"]);
           } else {
+            // (the last state flushes as the one before it did, and then mends it with croft's own pass)
             // What croft's flush did before: every schema. DuckLake's own call, as the writer, under no lock of croft's (nothing else runs).
             const project = loadProject({ root });
             const w = openWarehouse({ path: project.paths.database, mode: "read_write", timezone: "UTC", root, stateDir: project.paths.stateDir, lake: lakeConnection(project, ProjectEnv.load(root, e), { extensionDir: ready.dir })!, register: false, isTTY: false });
@@ -164,6 +106,7 @@ async function main(): Promise<void> {
               await w.close();
               await closeAllWarehouses();
             }
+            if (state === "after that flush, then croft maintain (D179)") await run(["maintain"]);
           }
         }
         // Now the same project, with the store a round trip of `rtt` away.

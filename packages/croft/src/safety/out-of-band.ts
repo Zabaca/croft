@@ -98,6 +98,8 @@ export interface TableScan {
   findings: TableFinding[];
   /** The time budget the scan was given (ms), when it had one. */
   budgetMs?: number;
+  /** No table was compared, by choice: a lake's tables cost the catalog's round trips, so doctor leaves them unless asked (--tables). */
+  notCompared?: "lake";
 }
 
 /**

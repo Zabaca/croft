@@ -647,3 +647,44 @@ describe("the problems read as croft's other problems do", () => {
     }
   });
 });
+
+describe("the state of a step is read in the lease that checks its config (D176)", () => {
+  /** The order of the leases a step takes: `read` and `write`, as the warehouse is asked for them. */
+  async function leasesOf(h: H, s: PlannedStep, o: Partial<IngestInput> = {}): Promise<string[]> {
+    const seen: string[] = [];
+    const read = h.w.read.bind(h.w);
+    const write = h.w.write.bind(h.w);
+    h.w.read = ((fn: never, opts: never) => { seen.push("read"); return read(fn, opts); }) as typeof h.w.read;
+    h.w.write = ((label: string, fn: never, opts: never) => { seen.push("write"); return write(label, fn, opts); }) as typeof h.w.write;
+    try {
+      expect((await ingestStep(h, s, o)).result.status).toBe("ok");
+    } finally {
+      h.w.read = read;
+      h.w.write = write;
+    }
+    return seen;
+  }
+
+  test("a step that settles nothing takes one read lease before its first write, not two", async () => {
+    const h = harness({ "assets/events.ts": MERGE });
+    g.__cfg_rows = [{ id: 1, at: at(0), v: "a" }];
+    expect((await ingestStep(h, await plan(h, "events"))).result.status).toBe("ok");
+    g.__cfg_rows = [{ id: 2, at: at(1), v: "b" }];
+    const seen = await leasesOf(h, await plan(h, "events"));
+    expect(seen.slice(0, seen.indexOf("write"))).toEqual(["read"]);
+  });
+
+  test("a step that settles something reads its state again after, so it is the state the settling left", async () => {
+    const h = await appended();
+    g.__cfg_rows = [{ id: 4, at: at(4), v: "d" }];
+    const seen = await leasesOf(h, await plan(h, "events", { key: ["id"] }), { confirmChange: decider("granted").fn });
+    // read (config), the trash and the change (writes), read (state), the step's own write: a read lies between the first write and the last.
+    const firstWrite = seen.indexOf("write");
+    const stateRead = seen.indexOf("read", firstWrite);
+    expect(firstWrite).toBeGreaterThan(0);
+    expect(stateRead).toBeGreaterThan(firstWrite);
+    expect(seen.lastIndexOf("write")).toBeGreaterThan(stateRead);
+    // The conversion kept the latest row of each id (1, 2, 3) and the new row came after it.
+    expect(Number((await all<{ n: number | bigint }>(h, "SELECT count(*) AS n FROM events"))[0]!.n)).toBe(4);
+  });
+});

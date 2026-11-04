@@ -23,9 +23,9 @@ Which kind it is shows in details and in `retryable`:
   nobody has written yet. The machine that writes creates it with its first `croft run`. The commands that read report
   this as DB_NOT_FOUND.
 
-Other causes: the catalog is a different DuckLake format than this croft's (DuckDB's message says "catalog version
-mismatch"; croft creates lakes at format 1.0, never migrates one by itself, and a lake made by another tool at another
-version is not one croft opens), or the database the settings name is not a lake.
+A database that holds a different lake than the settings describe (another DuckLake format, or a lake whose files are
+in another bucket folder) is not this code: it is LAKE_CATALOG_MISMATCH, which croft never retries and never mends (it
+migrates no lake and overrides no data path). A database or login that does not exist is `details.refused`, above.
 
 Nothing was written to the lake or to the project's files.
 

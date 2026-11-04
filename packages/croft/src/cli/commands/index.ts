@@ -29,8 +29,10 @@ const init = lazyCommand({
 const doctor = lazyCommand({
   name: "doctor",
   summary: "check the environment and the project: Bun, DuckDB, the warehouse, storage, Claude files",
-  usage: "croft doctor",
-  options: {},
+  usage: "croft doctor [--tables]",
+  options: {
+    tables: { type: "boolean", description: "also compare every table with croft's record, however long it takes (a lake's tables are left out otherwise: each costs the catalog's round trips)" },
+  },
   maxPositionals: 0,
   humanShowsProblems: true,
 }, async () => (await import("./doctor.ts")).doctor);

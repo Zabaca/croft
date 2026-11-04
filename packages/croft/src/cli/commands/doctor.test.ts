@@ -688,7 +688,7 @@ export default ingest({ secrets: names, key: "id", async *rows() { await Bun.wri
       expect(existsSync(join(root, "ran-command"))).toBe(false);
       expect(ok.problems.filter((p) => p.code === "SECRET_MISSING" || p.code === "SECRETS_COMMAND_FAILED")).toEqual([]);
       expect(ok.data.checks.filter((c) => c.id === "secrets" || c.id === "secrets-from").map((c) => [c.status, c.text])).toEqual([
-        ["info", `secretsFrom: ${process.execPath} -e "require('node:fs').writeFileSync('ran-command', 'x')" (${process.execPath}), not run by doctor; GH_TOKEN can only come from it (croft secrets runs it to check)`],
+        ["info", `secretsFrom: ${process.execPath} -e "require('node:fs').writeFileSync('ran-command', 'x')", not run by doctor; GH_TOKEN can only come from it (croft secrets runs it to check)`],
         ["ok", "secrets: STRIPE_KEY set"],
       ]);
 
@@ -1243,6 +1243,14 @@ describe("tables changed outside croft, drift and backups (§5 \"Out-of-band cha
       id: "tables", section: "project", status: "info", details: { skipped: 2, budgetMs: 0 },
       text: "tables: 2 more not compared with croft's record in the time doctor allows (0 ms); the next run of each asset compares its table",
     }]);
+  });
+
+  test("--tables compares every table, whatever the time doctor allows", async () => {
+    const root = await project();
+    await croftWarehouse(root, [`DELETE FROM orders WHERE id = 3`]);
+    const { data, problems } = await runDoctor(root, { ...deps({ tableScanMs: 0 }), allTables: true });
+    expect(data.checks.filter((c) => c.id === "tables" && c.status === "info")).toEqual([]);
+    expect(problems.map((p) => [p.code, p.asset])).toEqual([["OUT_OF_BAND_CHANGE", "orders"]]);
   });
 
   test("not compared while a croft run writes: the warehouse line says busy and there is no tables line", async () => {

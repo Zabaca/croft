@@ -65,6 +65,8 @@ console.log(Object.entries(secrets).map(([k, v]) => k + "=" + v).join("\\n"));
     const checks = (doctor.json as { data: { checks: { id: string; text: string }[] } }).data.checks;
     expect(checks.find((c) => c.id === "secrets-from")!.text).toContain("run once by doctor, for the lake's secrets");
     expect(checks.find((c) => c.id === "secrets-from")!.text).not.toContain("not run by doctor");
+    // The program's path once: the command already names it, and the line printed it again in brackets (the second real-lake trial).
+    expect(checks.find((c) => c.id === "secrets-from")!.text.split(process.execPath).length - 1).toBe(1);
 
     // croft secrets lists the lake's six names, set from the command, used by the lake.
     const listed = await cli(["secrets", "--json"], { cwd: p.root, env });

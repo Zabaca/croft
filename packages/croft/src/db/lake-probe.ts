@@ -7,13 +7,11 @@
 // nothing but the lake.
 import { type LakeMode, modeSecrets, REFUSED, scrubThrown } from "./modes.ts";
 import { CroftError } from "../core/errors.ts";
-import type { Sql } from "../core/types.ts";
 import type { ProjectEnv } from "../project/env.ts";
 import { bucketPath } from "../project/lake-config.ts";
 import type { Project } from "../project/root.ts";
 import { openMemory } from "./connect.ts";
 import { lakeConnection } from "./lake.ts";
-import { METADATA_ALIAS } from "./lake-maintenance.ts";
 import { storeTlsError } from "./store-tls.ts";
 
 /** How long the probe may take before doctor gives up on the bucket. */
@@ -113,19 +111,46 @@ function probeFailure(e: unknown, secrets: readonly string[], folder: string, ca
   });
 }
 
-/** Whether the catalog's connection is encrypted, as the server sees it (`pg_stat_ssl` for this connection), and with what. */
-export interface CatalogEncryption { encrypted: boolean; version: string | null; cipher: string | null }
+/** What a Postgres server answers to the first thing libpq asks of it, "may we use TLS": it offers it, it does not, or nothing could be learned. */
+export type TlsOffer = "offered" | "refused" | "unknown";
 
-/** Ask the catalog's server about the connection the lake is attached over (the read lease's own; one login, one secret, one way). Null when
- *  the server will not say (a Postgres without the view, a proxy that answers otherwise). */
-export async function catalogEncryption(sql: Sql): Promise<CatalogEncryption | null> {
-  try {
-    const rows = await sql.all<{ ssl: unknown; version: unknown; cipher: unknown }>(
-      `SELECT ssl, version, cipher FROM postgres_query('${METADATA_ALIAS}', 'SELECT ssl, version, cipher FROM pg_stat_ssl WHERE pid = pg_backend_pid()')`);
-    const r = rows[0];
-    if (!r) return null;
-    return { encrypted: r.ssl === true || r.ssl === "t" || r.ssl === "true", version: r.version ? String(r.version) : null, cipher: r.cipher ? String(r.cipher) : null };
-  } catch {
-    return null;
-  }
+/**
+ * Ask a Postgres server the question libpq asks before anything else (an SSLRequest: eight bytes, to which the server answers `S` or `N`), and
+ * nothing more: no login, no certificate check, no data. It is the client's side of the matter, which is what `croft doctor` needs to say whether a
+ * connection is encrypted: the server's own view (`pg_stat_ssl`, which the first version read) is of the last hop of a proxy or a pooler, which
+ * a hosted catalog is, and said "NOT encrypted" about a connection that checked the certificate (the second real-lake trial, DESIGN.md D175). "unknown" for a server that
+ * does not answer in `timeoutMs`, answers anything else, or cannot be reached.
+ */
+export function serverOffersTls(host: string, port: number, o: { timeoutMs?: number } = {}): Promise<TlsOffer> {
+  const request = new Uint8Array([0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f]); // length 8, request code 80877103
+  return new Promise<TlsOffer>((resolve) => {
+    let done = false;
+    let socket: { end(): void } | undefined;
+    const finish = (v: TlsOffer) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { socket?.end(); } catch { /* gone */ }
+      resolve(v);
+    };
+    const timer = setTimeout(() => finish("unknown"), o.timeoutMs ?? 5000);
+    Bun.connect({
+      hostname: host, port,
+      socket: {
+        // A socket that opens after the probe has ended (its time ran out first) is closed here, not left open.
+        open(s) {
+          if (done) {
+            s.end();
+            return;
+          }
+          socket = s;
+          s.write(request);
+        },
+        data(_s, d) { finish(d[0] === 0x53 ? "offered" : d[0] === 0x4e ? "refused" : "unknown"); },
+        error() { finish("unknown"); },
+        close() { finish("unknown"); },
+        connectError() { finish("unknown"); },
+      },
+    }).catch(() => finish("unknown"));
+  });
 }

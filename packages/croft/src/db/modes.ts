@@ -253,7 +253,7 @@ export async function startMode(conn: DuckDBConnection, mode: ModeSpec, files: M
 /** Create the lake's two named secrets and attach it; the password and keys are in the statements below and nowhere else. */
 async function attachLake(conn: DuckDBConnection, lake: LakeSpec, secrets: string[]): Promise<void> {
   const { catalog, data, access } = lake;
-  const fail = (e: unknown) => lakeFailure(e, secrets, access, catalog.sslMode);
+  const fail = (e: unknown) => lakeFailure(e, secrets, access, catalog.sslMode, { host: catalog.host, port: catalog.port, database: catalog.database });
   // sslmode and sslrootcert are libpq connection parameters, which the postgres extension reads from the secret [V: 2.0.0, a Postgres with
   // TLS]. libpq reads the CA file itself, outside DuckDB's file system, so the lock's allowed_directories neither needs nor gets it.
   const tls = [...(catalog.sslMode ? [`SSLMODE ${q(catalog.sslMode)}`] : []), ...(catalog.sslRootCert ? [`SSLROOTCERT ${q(catalog.sslRootCert)}`] : [])];
@@ -299,9 +299,54 @@ export const TLS_REFUSED = /certificate verify failed|does not match host name|s
 
 const TLS_SETTINGS = "lake.catalog.sslMode, lake.catalog.sslRootCert (croft docs lake)";
 
-/** DuckDB's refusal to attach a lake, with every credential taken out of the text. `sslMode` is the catalog's, for the hint of a TLS refusal. */
-function lakeFailure(e: unknown, secrets: readonly string[], access?: "write" | "read", sslMode?: string): CroftError {
+/** The catalog database holds a lake of another format than croft's. DuckLake says "catalog version is 0.3, but the extension requires version 1.0. To
+ *  automatically migrate, set AUTOMATIC_MIGRATION to TRUE when attaching" for an older one, and "catalog version is '1.1', which is newer than the
+ *  requested version '1.0'. Cannot downgrade a DuckLake catalog" for a newer one [V: 2.0.0]. The second real-lake trial pointed croft at a database
+ *  that held another tool's lake, retried it three times over 154 s as if the catalog were down, and quoted the advice to migrate it. */
+const FORMAT_MISMATCH = [
+  /DuckLake catalog version mismatch: catalog version is '?([\w.]+?)'?, but the extension requires version '?([\w.]+?)'?(?:\.\s|\.$|,|\s|$)/i,
+  /DuckLake catalog version is '?([\w.]+?)'?, which is newer than the requested version '?([\w.]+?)'?(?:\.\s|\.$|,|\s|$)/i,
+];
+/** The catalog's lake keeps its files in another folder than the settings name: `DATA_PATH parameter "s3://b/x/" does not match existing data path in the
+ *  catalog "s3://b/y/". You can override the DATA_PATH by setting OVERRIDE_DATA_PATH to True` [V: 2.0.0]. */
+const FOLDER_MISMATCH = /DATA_PATH parameter "([^"]*)" does not match existing data path in the catalog "([^"]*)"/i;
+
+/** The catalog database holds a different lake than the settings describe: its format, or the folder its files are in. Permanent, and croft's to
+ *  report, never to mend (it migrates no lake and overrides no data path; DESIGN.md D178). Null for any other refusal. */
+export function catalogMismatch(raw: string, secrets: readonly string[], catalog?: { host: string; port: number; database: string }): CroftError | null {
+  const where = catalog ? `${catalog.host}:${catalog.port}/${catalog.database}` : "the catalog database";
+  const format = FORMAT_MISMATCH.map((re) => re.exec(raw)).find((m) => m !== null);
+  if (format) {
+    const [, has, wants] = format;
+    return new CroftError("LAKE_CATALOG_MISMATCH", {
+      message: `the catalog database ${where} holds a DuckLake of another format (${has}) than the one croft opens (${wants}): it is another lake, made by another tool or version, and croft never migrates a lake`,
+      hint: "lake.catalog.database must name a database that holds only croft's lake (an empty one the first run fills); a lake of another format belongs to the tool that made it. Do not ask DuckDB to migrate it: that would change a lake something else still reads, and croft has no setting for it; trying again will not help",
+      retryable: false,
+      fix: { kind: "manual", description: "ask the user which database is croft's lake: point lake.catalog.database at an empty database of its own, or use the croft or DuckDB version that made this one", requiresHuman: true },
+      details: { kind: "format", catalogFormat: has, croftFormat: wants },
+    });
+  }
+  const folder = FOLDER_MISMATCH.exec(raw);
+  if (folder) {
+    const [, wanted, held] = folder;
+    return new CroftError("LAKE_CATALOG_MISMATCH", {
+      message: scrub(`the catalog database ${where} holds a lake whose files are in ${held}, and the settings name ${wanted}: it is another lake, or this one under another folder, and croft never overrides a lake's data path`,
+        secrets),
+      hint: `lake.bucket.name and lake.bucket.folder must name ${held} for this catalog database, or lake.catalog.database must name a database of its own for ${wanted}; files already in ${held} would be left behind by a lake that looked in ${wanted}; trying again will not help`,
+      retryable: false,
+      fix: { kind: "manual", description: "ask the user which folder is this lake's: set lake.bucket.name and lake.bucket.folder to it, or use another catalog database", requiresHuman: true },
+      details: { kind: "data_path", catalogDataPath: held, settingsDataPath: wanted },
+    });
+  }
+  return null;
+}
+
+/** DuckDB's refusal to attach a lake, with every credential taken out of the text. `sslMode` is the catalog's, for the hint of a TLS refusal;
+ *  `catalog` names the database, for the mismatch of a lake that is not this one's. */
+function lakeFailure(e: unknown, secrets: readonly string[], access?: "write" | "read", sslMode?: string, catalog?: { host: string; port: number; database: string }): CroftError {
   const raw = e instanceof Error ? e.message : String(e);
+  const mismatch = catalogMismatch(raw, secrets, catalog);
+  if (mismatch) return mismatch;
   const tls = TLS_REFUSED.test(raw);
   // With several addresses for one host name (localhost: ::1 and 127.0.0.1) libpq lists each failure on a line of its own, and DuckDB's
   // first line can be the one about an address nobody listens on; the line about the TLS check is the one that says what to fix.
