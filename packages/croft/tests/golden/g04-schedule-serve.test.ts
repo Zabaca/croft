@@ -130,3 +130,32 @@ test("serve key add and list --json in server mode: data.serverMode and data.qua
   expect(started.quack.uri).toBe(`quack:127.0.0.1:${port}`);
   expect(started.quack).toMatchObject({ loopback: true, asOfView: "_croft_as_of", attach: `ATTACH '${started.quack.uri}' AS croft (TOKEN '<key>')` });
 }, 120_000);
+
+test("fetch-extensions --json: nothing to fetch with no mode on, a named extension from an unreachable repository fails with the code and the command (D195)", async () => {
+  const none = golden("fetch-extensions", await p.croft(["fetch-extensions", "--json"], { env })).data;
+  expect(none.files).toEqual([]);
+  const down = { ...env, CROFT_EXTENSION_DIR: join(p.root, "no-extensions"), CROFT_EXTENSION_REPO: "http://127.0.0.1:9" };
+  const failed = await p.croft(["fetch-extensions", "quack", "--json"], { env: down });
+  golden("fetch-extensions", failed, { failed: true, exit: 2 });
+  expect(JSON.parse(failed.stdout).problems[0]).toMatchObject({ code: "EXTENSION_FETCH_FAILED", fix: { kind: "command", command: "croft fetch-extensions quack" } });
+}, 120_000);
+
+(ext.ready ? test : test.skip)("fetch-extensions --json against a stand-in repository serving DuckDB's real file: fetched once, then already there (D195)", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { extensionPath, hostPlatform } = await import("../../src/db/extension-files.ts");
+  const { repoPath, startStandInRepo } = await import("../../src/db/extension-repo-testkit.ts");
+  const platform = hostPlatform()!;
+  const repo = startStandInRepo();
+  repo.files.set(repoPath("httpfs", platform), readFileSync(extensionPath(ext.dir, "httpfs", platform)));
+  try {
+    const dir = join(p.root, "fetched-extensions");
+    const fetchEnv = { ...env, CROFT_EXTENSION_DIR: dir, CROFT_EXTENSION_REPO: repo.url };
+    const first = golden("fetch-extensions", await p.croft(["fetch-extensions", "httpfs", "--json"], { env: fetchEnv })).data;
+    expect(first).toMatchObject({ platform, dir, repository: repo.url, files: [{ name: "httpfs", downloaded: true }] });
+    const second = golden("fetch-extensions", await p.croft(["fetch-extensions", "httpfs", "--json"], { env: fetchEnv })).data;
+    expect(second.files).toMatchObject([{ name: "httpfs", downloaded: false }]);
+    expect(repo.requests).toHaveLength(1);
+  } finally {
+    repo.stop();
+  }
+}, 120_000);

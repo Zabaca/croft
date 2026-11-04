@@ -53,10 +53,11 @@ The catalog's connection uses TLS, and which check croft makes is a setting of t
 
     "catalog": { "kind": "postgres", "host": "ep-example-123456.c-4.us-west-2.aws.neon.tech", "database": "croft_lake", "sslMode": "verify-full", … }
 
-The secrets live in .env, the shell or the secretsFrom command, like any other (croft docs secrets). Then install the
-lake add-on, which carries DuckDB's ducklake, httpfs and postgres extensions (croft docs addons), and check:
+The secrets live in .env, the shell or the secretsFrom command, like any other (croft docs secrets). The lake loads DuckDB's
+ducklake, httpfs and postgres extensions, which croft fetches from DuckDB's own extension servers the first time the lake
+opens (about 35 MB, once per machine; croft docs extensions). To have them first, and to see what is missing, run:
 
-    bun add @zabaca/croft-addon-lake@<version>
+    croft fetch-extensions
     croft validate && croft doctor && croft run
 
 The store is reached over HTTPS, and croft checks its certificate against one CA file it lets DuckDB read: the file
@@ -217,8 +218,8 @@ USE lake;
   existing file. DuckDB's libpq takes both options as they are, and `sslrootcert=system` is not a form to rely on.
 
   INSTALL downloads each extension from DuckDB's repository, extensions.duckdb.org, over plain HTTP, and fails behind a
-  proxy or firewall that refuses plain HTTP. Fetch the three files where plain HTTP is allowed, or take them from the
-  croft add-on (`bun add @zabaca/croft-addon-lake` puts them in `node_modules/@zabaca/croft-ext-<extension>-<platform>/`,
+  proxy or firewall that refuses plain HTTP. Fetch the three files where plain HTTP is allowed, or take them
+  from the folder where croft keeps them (`croft fetch-extensions` puts them in `~/.cache/croft/extensions/v2.0.0/<platform>/`,
   the same files for the same DuckDB 2.0), and `LOAD '/path/to/ducklake.duckdb_extension'` (likewise
   `postgres_scanner.duckdb_extension` and `httpfs.duckdb_extension`) in place of each INSTALL.
 
@@ -244,8 +245,8 @@ has seen, and `_croft_as_of` holds it for a DuckDB client.
   Quack client within a quarter of a second, and one dropped is gone as fast.
 - Over a bucket the store enforces what the lockdown also refuses: the read-only key cannot write, so even a COPY that got
   past every check would be refused (403). A local lake has no key; its folder is the user's own.
-- The extension files come from both add-ons (`@zabaca/croft-addon-server` and `@zabaca/croft-addon-lake`), and croft doctor and
-  validate name whichever is missing.
+- The extension files are those of both modes (quack, httpfs, ducklake, postgres), fetched from DuckDB the first time they are
+  needed (croft docs extensions), and croft doctor and validate name whichever is missing.
 - Turning it on needs no copy and no 1 GB question. `readCopy` stays refused with a lake.
 - A local lake (a SQLite catalog) lets a writer commit only while no reader has a transaction open, so a long query or a
   Quack client that holds a transaction open makes a run wait there. A Postgres catalog does not.
@@ -286,7 +287,7 @@ back. It is the user's decision, and it ends in `croft confirm`.
 
        "lake": { "enabled": false, "catalog": { ... }, "bucket": { ... } }
 
-   The secrets go in .env, the lake add-on is installed (`bun add @zabaca/croft-addon-lake@<version>`), and croft serve is
+   The secrets go in .env, the lake's extension files are fetched (`croft fetch-extensions`, or on first use), and croft serve is
    stopped if it runs (it would keep serving and scheduling for the file). `readCopy` must be off (a lake has no file to
    copy). Server mode may stay on: it goes with the project, its keys and serve.sharedTables are unchanged, and over the
    lake it needs no copy. The read copy it made on the file stays on disk as it was, no longer refreshed; delete it when
@@ -339,4 +340,4 @@ lake's newest snapshot) and finishes by proving it and switching, without copyin
 Codes: LAKE_ATTACH_FAILED, LAKE_CATALOG_MISMATCH, LAKE_STORE_TLS, LAKE_CONNECTION_LOST, LAKE_COMMIT_UNCERTAIN, LAKE_TYPE_UNSUPPORTED, LAKE_DIRECT_READ,
 LAKE_UNSUPPORTED, LAKE_OTHER_WRITER, LAKE_MAINTENANCE_FAILED, LAKE_EXPIRY_OPTION, LAKE_BACKUP_FAILED,
 LAKE_BACKUP_TOOL_MISSING, LAKE_VALUES_INEXACT, MAINTAIN_NEEDS_LAKE, MOVE_NEEDS_LAKE, MOVE_BLOCKED, MOVE_LAKE_NOT_EMPTY,
-MOVE_NOT_EQUAL, MOVE_FILE_CHANGED (croft docs <CODE>), and EXTENSION_MISSING when the add-on is not installed.
+MOVE_NOT_EQUAL, MOVE_FILE_CHANGED (croft docs <CODE>), and EXTENSION_MISSING when the extension files are not on the machine and fetching is off.

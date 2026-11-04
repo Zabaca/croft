@@ -105,36 +105,28 @@ export interface ValidateAsset {
   schedule?: { text: string; cron: string; next: string[] };
 }
 
-/** One DuckDB extension an add-on carries, as this machine finds it (db/addon-status.ts). */
+/** One DuckDB extension a mode loads, as this machine finds it (db/extension-status.ts). */
 export interface ExtensionView {
   name: "quack" | "httpfs" | "ducklake" | "postgres" | "sqlite";
   /** Found, and the file is the pinned one. */
   ok: boolean;
-  /** Where the file was found: "addon" (a package in node_modules), "dir" ($CROFT_EXTENSION_DIR) or "cache" (builders' cache); null if not found. */
-  source: "addon" | "dir" | "cache" | null;
   /** The file, when found and checked. */
   path: string | null;
   /** When not ok: EXTENSION_MISSING, EXTENSION_CHECKSUM_MISMATCH or EXTENSION_WRONG_BUILD. */
   code: string | null;
 }
 
-/** An add-on package a project needs because it turned a mode on (D134): the DuckDB extension files for that mode. */
-export interface AddonView {
-  addon: "server" | "lake";
-  /** The mode that needs it: "server mode" or "lake mode". */
-  mode: string;
-  /** The npm package, and the version this croft was tested with. */
-  package: string;
-  version: string;
-  /** DuckDB's name for this machine's platform (osx_arm64, osx_amd64, linux_amd64, linux_arm64); null where croft pins no files (musl, Windows), which no install fixes. */
+/** The DuckDB extension files a mode needs, and whether this machine has them (D195). */
+export interface ExtensionFilesView {
+  mode: "server" | "lake";
+  /** "server mode" or "lake mode". */
+  label: string;
+  /** DuckDB's name for this machine's platform (osx_arm64, osx_amd64, linux_amd64, linux_arm64); null where croft pins no files (musl, Windows), which no fetch fixes. */
   platform: string | null;
-  /** Every extension it carries is found and matches its pin. */
+  /** Every extension the mode loads is found and matches its pin. */
   ok: boolean;
-  /** Its own package is in the project (or a file of it is there and wrong, or missing for this machine). False when its files, all found,
-   *  came from $CROFT_EXTENSION_DIR or the builders' cache: the mode runs, and the add-on is not installed (D164). */
-  installed: boolean;
-  /** The command that installs it into this project; null where nothing can. */
-  install: string | null;
+  /** The command that fetches the files that are missing or wrong, from DuckDB's extension servers; null where nothing is missing or nothing can help. */
+  fetch: string | null;
   extensions: ExtensionView[];
 }
 
@@ -147,9 +139,9 @@ export interface ValidateData {
   /** --types only: the project's own `tsc --noEmit`. skipped: no tsc in the project's node_modules (an info
    *  problem says so; croft never installs it). */
   types?: { status: "ok" | "failed" | "skipped"; errors: number };
-  /** With a mode on (serverMode.enabled): each add-on that carries the mode's DuckDB extension files, and whether this
-   *  machine finds them (D134). Absent with no mode on. */
-  addons?: AddonView[];
+  /** With a mode on (serverMode.enabled or a lake block): the DuckDB extension files each mode loads, and whether this
+   *  machine has them (D195). Absent with no mode on. */
+  extensionFiles?: ExtensionFilesView[];
 }
 
 /** A column that differs between the preview table and the live table. */

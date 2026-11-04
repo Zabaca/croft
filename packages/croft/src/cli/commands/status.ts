@@ -55,9 +55,8 @@ import { join } from "node:path";
 import { CroftError, problem } from "../../core/errors.ts";
 import { formatInstant, parseInstant } from "../../core/time.ts";
 import { recordAlive } from "../../core/proc.ts";
-import type { AddonView, AssetKind, Problem, Reason } from "../../core/types.ts";
-import { addonLine, addonsNeeded, inspectAddons } from "../../db/addon-status.ts";
-import type { ExtensionSearch } from "../../db/extension-files.ts";
+import type { AssetKind, ExtensionFilesView, Problem, Reason } from "../../core/types.ts";
+import { type ExtensionSearch, extensionFilesLine, inspectExtensionFiles, modesNeeded } from "../../db/extension-status.ts";
 import { assessCopyPolicy, type CloneProbe, copyCostlyProblem, notClonedProblem, type ProbeOptions } from "../../db/copy-policy.ts";
 import { failedPassProblem, type MaintenanceView, maintenanceView, readState } from "../../db/lake-maintenance-state.ts";
 import { readCopyStatus, readCopyView, type ReadCopyView, readCopyWords } from "../../db/readcopy.ts";
@@ -156,20 +155,20 @@ export interface StatusData {
    *  croft serve runs now (apps read the file directly while it does not). */
   serverMode?: {
     serving: boolean;
-    /** The add-on that carries server mode's DuckDB extension files, and whether this machine finds them (D134). */
-    addons: AddonView[];
+    /** The DuckDB extension files server mode loads, and whether this machine has them (D195). */
+    extensionFiles: ExtensionFilesView[];
   };
   /** The project and a lake it was moved to or may be moved to (option 07, slice 4): `idle` (a lake block with "enabled": false, nothing moved yet),
    *  `moved` (it is in the lake, moved in from the file on `at`; the file is untouched and is the way back) or `back` (it was moved and is on the
    *  file again; what was written in the lake since is not in the file). From croft.json and runs.sqlite alone. */
   lakeMove?: { state: "idle" | "moved" | "back"; lake: string; at: string | null; tables: number | null; rows: number | null; fileSha256: string | null };
-  /** With a `lake` in croft.json (D138): where the warehouse is, and the add-on that carries lake mode's DuckDB extension files. */
+  /** With a `lake` in croft.json (D138): where the warehouse is, and the DuckDB extension files lake mode loads. */
   lake?: {
     /** "postgres": a shared lake (a Postgres catalog and a bucket); "local": a SQLite catalog and a folder. */
     kind: "postgres" | "local";
     /** The lake's folder: `s3://bucket/folder/`, or the local data folder. It holds nothing but the lake. */
     folder: string;
-    addons: AddonView[];
+    extensionFiles: ExtensionFilesView[];
     /** The lake's maintenance (D150), from runs.sqlite alone: whether croft runs it, the last pass, the next, and the last failure. */
     maintenance: MaintenanceView;
   };
@@ -558,7 +557,7 @@ export interface StatusDeps {
   home?: CroftHome;
   /** How the read copy's clone is tried (db/copy-policy.ts): tests give a cp that cannot clone. Default: the real cp. */
   copyProbe?: ProbeOptions & { clone?: CloneProbe };
-  /** Where the add-ons' extension files are looked for (db/extension-files.ts); tests point it at a folder or an empty environment. */
+  /** Where the modes' extension files are looked for (db/extension-status.ts); tests point it at a folder or an empty environment. */
   extensions?: ExtensionSearch;
 }
 
@@ -715,7 +714,7 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
     const serve = serveOf(project.paths.stateDir);
     if (serve) data.serve = serve;
     const copyProblems: Problem[] = [];
-    const addonProblems: Problem[] = [];
+    const modeProblems: Problem[] = [];
     if (project.config.readCopy) {
       const copy = readCopyView(readCopyStatus(project, db ?? undefined), tz);
       if (copy) data.readCopy = copy;
@@ -737,29 +736,29 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       }
     }
     if (project.config.serverMode.enabled || project.config.lake) {
-      // The add-ons with the modes' extension files (D134): croft serve cannot start without them, nor a lake open, so a missing one is a
-      // problem here.
-      const addons = inspectAddons(addonsNeeded(project.config), { from: project.root, ...o.extensions });
+      // The modes' extension files (D195): croft serve cannot start without them, nor a lake open (it fetches them when it first starts,
+      // and fails if it cannot), so a missing one is a problem here.
+      const files = inspectExtensionFiles(modesNeeded(project.config), { ...o.extensions });
       if (project.config.serverMode.enabled) {
-        data.serverMode = { serving: serve !== undefined, addons: addons.views.filter((v) => v.addon === "server") };
+        data.serverMode = { serving: serve !== undefined, extensionFiles: files.views.filter((v) => v.mode === "server") };
       }
       const lake = project.config.lake;
       if (lake) {
         const view = maintenanceView(db ? readState(db) : null, lake.maintenance, now);
         data.lake = {
           kind: lake.kind, folder: lake.kind === "postgres" ? bucketPath(lake.bucket) : lake.dataPath,
-          addons: addons.views.filter((v) => v.addon === "lake"), maintenance: { ...view, lastOkAt: zoned(view.lastOkAt, tz), lastAttemptAt: zoned(view.lastAttemptAt, tz), nextDueAt: zoned(view.nextDueAt, tz),
+          extensionFiles: files.views.filter((v) => v.mode === "lake"), maintenance: { ...view, lastOkAt: zoned(view.lastOkAt, tz), lastAttemptAt: zoned(view.lastAttemptAt, tz), nextDueAt: zoned(view.nextDueAt, tz),
             lastError: view.lastError ? { ...view.lastError, at: zoned(view.lastError.at, tz)! } : null },
         };
         // A pass that failed is a warning here, not an unhealthy lake: the data is as the last run left it, and the pass is tried again.
         if (view.lastError) {
-          addonProblems.push(failedPassProblem(view.lastError, ""));
+          modeProblems.push(failedPassProblem(view.lastError, ""));
         }
       }
-      addonProblems.push(...addons.problems);
+      modeProblems.push(...files.problems);
     }
     // resolveProject's problems are discovery's (all of them: no selectors) and CYCLE.
-    const problems = [...(missing ? [missing] : []), ...(resolved ? resolved.problems : discovery.problems), ...resolution.problems, ...renamed, ...configChanges, ...copyProblems, ...addonProblems];
+    const problems = [...(missing ? [missing] : []), ...(resolved ? resolved.problems : discovery.problems), ...resolution.problems, ...renamed, ...configChanges, ...copyProblems, ...modeProblems];
     // The scheduler: stale (the diagnosis reads files only: no launchctl or crontab here), then the held assets.
     const schedulingProblems: Problem[] = [];
     if (rec.stale) {
@@ -1036,16 +1035,16 @@ export function formatStatus(d: StatusData, now: Date, o: { tz?: string; problem
 
 /** "Read copy warehouse.read.duckdb · as of 11:58 (2 min ago)", and for a warning its hint on the next line. */
 function readCopyLines(d: StatusData, now: Date, tz: string, o: { root?: string; database?: string }): string[] {
-  // A lake has no read copy: its line is the add-on's, when that is not whole (the lake cannot be opened without it).
+  // A lake has no read copy: its line is the extension files', when they are not all there (the lake cannot be opened without them).
   if (d.lake && !d.readCopy) {
     // Server mode over a lake (D183): no copy; croft serve's process reads the lake.
     const mode = d.serverMode
       ? [
         `Server mode on · ${d.serverMode.serving ? "croft serve answers apps and keys from the lake's last snapshot" : "croft serve is not running: nothing answers keys, and apps cannot read the lake until it is"}`,
-        ...d.serverMode.addons.filter((a) => !a.ok).map((a) => `  ${addonLine(a)}`),
+        ...d.serverMode.extensionFiles.filter((a) => !a.ok).map((a) => `  ${extensionFilesLine(a)}`),
       ]
       : [];
-    return [...mode, ...d.lake.addons.filter((a) => !a.ok).map((a) => `Lake mode · ${addonLine(a)}`), maintenanceLine(d.lake.maintenance, now)];
+    return [...mode, ...d.lake.extensionFiles.filter((a) => !a.ok).map((a) => `Lake mode · ${extensionFilesLine(a)}`), maintenanceLine(d.lake.maintenance, now)];
   }
   if (!d.readCopy) return [];
   const root = o.root ?? "";
@@ -1053,7 +1052,7 @@ function readCopyLines(d: StatusData, now: Date, tz: string, o: { root?: string;
   const mode = d.serverMode
     ? [
       `Server mode on · ${d.serverMode.serving ? "croft serve answers from the read copy" : "croft serve is not running: apps read the warehouse file directly"}`,
-      ...d.serverMode.addons.filter((a) => !a.ok).map((a) => `  ${addonLine(a)}`),
+      ...d.serverMode.extensionFiles.filter((a) => !a.ok).map((a) => `  ${extensionFilesLine(a)}`),
     ]
     : [];
   return [...mode, `Read copy ${w.text}`, ...(w.hint ? [`  hint: ${w.hint}`] : [])];

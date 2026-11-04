@@ -89,6 +89,9 @@ export function baseEnv(extra: Record<string, string> = {}): Record<string, stri
     // The tripwires of tests/preload.ts: no journey installs OS jobs or shows notifications.
     CROFT_FORBID_OS_JOBS: "1",
     CROFT_NOTIFY_DRY: "1",
+    // No journey downloads an extension: a missing file is EXTENSION_MISSING (db/extension-fetch.ts, D195).
+    CROFT_NO_FETCH: "1",
+    CROFT_EXTENSION_REPO: "http://127.0.0.1:9",
     // doctor's Bun line: CI runs the newest Bun too, which may be newer than croft's BUN_TESTED (BUN_UNTESTED).
     // A journey about the other checks must not fail on a Bun release; the Bun line has unit tests of its own.
     CROFT_BUN_VERSION: BUN_FLOOR,

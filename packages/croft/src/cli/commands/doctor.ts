@@ -22,9 +22,8 @@
 //
 // With serverMode on (D119) it also says so: a line with the copy's as-of time and whether croft serve is live, and
 // SERVER_MODE_COPY_COSTLY as an error when server mode is refused. croft serve in server mode never holds the live
-// file, so a lock on it is never croft serve's. It also has a line for the add-on that carries the mode's DuckDB extension
-// files (D134): ok when every file is found in the project's node_modules and matches its pin, an error with the install
-// command (EXTENSION_MISSING) when not.
+// file, so a lock on it is never croft serve's. It also has a line for the DuckDB extension files a mode loads (D195): ok
+// when every file is on the machine and matches its pin, an error with the fetch command (EXTENSION_MISSING) when not.
 //
 // The data's health, in the Project section, without writing anything:
 // - tables (§5 "Out-of-band changes"): in the warehouse's read lease, every table croft has a commit of is compared
@@ -44,8 +43,7 @@ import { now, offsetSeconds } from "../../core/time.ts";
 import type { LockHolder, Problem } from "../../core/types.ts";
 import { BACKUPS_KEPT, backupsDir, compareEngineVersions, type EngineRecord, listBackups, listProjectBackups, recordedEngine } from "../../db/backup.ts";
 import { assessCopyPolicy, type CloneProbe, copyCostlyProblem, notClonedProblem, type ProbeOptions } from "../../db/copy-policy.ts";
-import { addonLine, addonsNeeded, inspectAddons } from "../../db/addon-status.ts";
-import type { ExtensionSearch } from "../../db/extension-files.ts";
+import { type ExtensionSearch, extensionFilesLine, inspectExtensionFiles, modesNeeded } from "../../db/extension-status.ts";
 import { filesystemKind, folderKind, type FsKind } from "../../db/fs-kind.ts";
 import { isHolderAlive, liveIntents } from "../../db/intent.ts";
 import type { TlsOffer } from "../../db/lake-probe.ts";
@@ -120,7 +118,7 @@ export interface DoctorDeps {
   allTables?: boolean;
   /** How the read copy's clone is tried (db/copy-policy.ts): tests give a cp that cannot clone. Default: the real cp. */
   copyProbe?: ProbeOptions & { clone?: CloneProbe };
-  /** Where the add-ons' extension files are looked for (db/extension-files.ts); tests point it at a folder or an empty environment. Default: `env`. */
+  /** Where the modes' extension files are looked for (db/extension-status.ts); tests point it at a folder or an empty environment. Default: `env`. */
   extensions?: ExtensionSearch;
 }
 
@@ -219,7 +217,7 @@ export async function runDoctor(cwd: string, d: DoctorDeps): Promise<{ data: Doc
     await checkWarehouse(r, d, project, probe.ok, found);
     await checkServe(r, d, project);
     checkReadCopy(r, d, project);
-    checkAddons(r, d, project);
+    checkExtensionFiles(r, d, project);
     if (probe.ok) await checkTzdata(r, d, project.timezone);
   }
 
@@ -970,17 +968,18 @@ function checkReadCopy(r: Report, d: DoctorDeps, project: Project): void {
 }
 
 /**
- * With a mode on, the add-on that carries its extension files (D134): one check per add-on, "ok" when every file is found
- * and matches its pin and an error with the install command when not. croft serve would not start without it, and
- * saying so here is cheaper than finding out from its failure. A line for each add-on, in `--json` too (details).
+ * With a mode on, the DuckDB extension files it loads (D195): one check per mode, "ok" when every file is on the machine
+ * and matches its pin and an error with the fetch command when not. Doctor fetches nothing; the mode fetches the first time
+ * it starts, and saying here what it will need is cheaper than finding out from a failed fetch. A line for each mode, in
+ * `--json` too (details).
  */
-function checkAddons(r: Report, d: DoctorDeps, project: Project): void {
-  const needed = addonsNeeded(project.config);
+function checkExtensionFiles(r: Report, d: DoctorDeps, project: Project): void {
+  const needed = modesNeeded(project.config);
   if (!needed.length) return;
-  const report = inspectAddons(needed, { from: project.root, env: d.env, ...d.extensions });
+  const report = inspectExtensionFiles(needed, { env: d.env, ...d.extensions });
   for (const v of report.views) {
-    const p = report.problems.find((x) => x.details?.addon === v.addon);
-    r.add("environment", `addon.${v.addon}`, v.ok ? "ok" : "error", addonLine(v), p, { ...v });
+    const p = report.problems.find((x) => x.details?.mode === v.mode);
+    r.add("environment", `extensions.${v.mode}`, v.ok ? "ok" : "error", extensionFilesLine(v), p, { ...v });
   }
 }
 
@@ -1117,7 +1116,7 @@ async function checkAssets(r: Report, d: DoctorDeps, project: Project, bindingOk
   let assets: number;
   try {
     const { validateProject } = await import("./validate.ts");
-    const report = await validateProject({ project, env: envOf(r, d, project), importTimeoutMs: 5000, addons: false });
+    const report = await validateProject({ project, env: envOf(r, d, project), importTimeoutMs: 5000, modeFiles: false });
     problems = report.problems;
     assets = report.data.assets.length;
   } catch (e) {

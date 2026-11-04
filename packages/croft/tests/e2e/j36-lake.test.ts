@@ -63,7 +63,7 @@ for (const kind of ["local", "postgres"] as const) {
     test("a. validate, run, query, describe and status work on a lake, and its bookkeeping is the log", async () => {
       const v = await run(p, ["validate"]);
       expect(v.code, show(v)).toBe(0);
-      expect(v.json.data.addons).toEqual([expect.objectContaining({ addon: "lake", ok: true })]);
+      expect(v.json.data.extensionFiles).toEqual([expect.objectContaining({ mode: "lake", ok: true })]);
       const first = await run(p, ["run"]);
       expect(first.code, show(first)).toBe(0);
       expect(first.json.data.steps[0]).toMatchObject({ asset: "example_sales", status: "ok", rows: { added: 120, total: 120 } });

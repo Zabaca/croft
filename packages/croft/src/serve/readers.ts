@@ -80,7 +80,7 @@ export interface ReadersEngineInternals {
   interruptEveryMs?: number;
   /** COPY_POLL_MS by default. */
   copyPollMs?: number;
-  /** A folder of the pinned extension files, for croft's tests; by default the server add-on in the project's node_modules (D134). */
+  /** A folder of the pinned extension files, for croft's tests; by default $CROFT_EXTENSION_DIR or croft's cache (D195). */
   extensionDir?: string;
   /** Where the readers' process listens for DuckDB clients (serverMode.quackHost and quackPort by default); false: nowhere,
    *  for a test that wants no listener. */
@@ -433,7 +433,7 @@ class ReadersEngine implements ServeEngine {
       opened = await worker.open({
         path: this.copyPath, spec: this.spec, protect: this.protect,
         readers: {
-          ...(this.extensionDir ? { extensionDir: this.extensionDir } : {}), projectRoot: this.project.root, secretDir: this.secretDir, shared: [...this.project.config.serve.sharedTables], asOf,
+          ...(this.extensionDir ? { extensionDir: this.extensionDir } : {}), secretDir: this.secretDir, shared: [...this.project.config.serve.sharedTables], asOf,
           ...(this.quackAt ? { quack: { ...this.quackAt, queryTimeoutMs: this.queryTimeoutMs, keys: this.keys } } : {}),
         },
       });

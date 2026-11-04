@@ -114,6 +114,7 @@ export const CODES = {
   EXTENSION_MISSING: { category: "environment", severity: "error", exit: 2 },
   EXTENSION_CHECKSUM_MISMATCH: { category: "environment", severity: "error", exit: 2 },
   EXTENSION_WRONG_BUILD: { category: "environment", severity: "error", exit: 2 },
+  EXTENSION_FETCH_FAILED: { category: "environment", severity: "error", exit: 2 },
   EXTENSION_LOAD_FAILED: { category: "environment", severity: "error", exit: 2 },
   LAKE_ATTACH_FAILED: { category: "environment", severity: "error", exit: 2 },
   LAKE_CATALOG_MISMATCH: { category: "environment", severity: "error", exit: 2 },

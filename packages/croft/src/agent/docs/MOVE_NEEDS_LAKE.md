@@ -12,6 +12,6 @@ Nothing was changed.
 What to do:
 - no_lake: a lake needs a Postgres, a bucket folder, two logins and two keys, which are the user's to make and to
   decide on (croft docs lake). Never make them yourself. When the user has them, add the `lake` block with
-  `"enabled": false`, put the secrets in .env, install the lake add-on, and run croft move-to-lake again.
+  `"enabled": false`, put the secrets in .env, and run croft move-to-lake again.
 - already_in_lake: nothing; the project is where it should be. If it was meant to move a different file, that is a
   different project.

@@ -92,14 +92,33 @@ describe("checking a file", () => {
       const e = caught as CroftError;
       expect(e.code).toBe("EXTENSION_MISSING");
       expect(e.message).toContain(extensionPath(dir, "quack", platform!));
-      expect(e.problem.fix?.kind).toBe("manual");
+      expect(e.problem.fix).toMatchObject({ kind: "command", command: "croft fetch-extensions quack" });
+      expect(e.problem.details).toMatchObject({ kind: "file", fetch: "croft fetch-extensions quack" });
       expect(e.problem.retryable).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  t("a file of the right name and the wrong content is EXTENSION_CHECKSUM_MISMATCH", () => {
+  t("several missing files are named in one fetch command, on the first one's error", () => {
+    const dir = mkdtempSync(join(tmpdir(), "croft-ext-"));
+    try {
+      let caught: unknown;
+      try {
+        verifyExtensions(dir, ["httpfs", "quack"]);
+      } catch (e) {
+        caught = e;
+      }
+      const e = caught as CroftError;
+      expect(e.code).toBe("EXTENSION_MISSING");
+      expect(e.problem.details).toMatchObject({ extension: "httpfs", missing: ["httpfs", "quack"], fetch: "croft fetch-extensions httpfs quack" });
+      expect(e.problem.fix).toMatchObject({ kind: "command", command: "croft fetch-extensions httpfs quack" });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  t("a file of the right name and the wrong content is EXTENSION_CHECKSUM_MISMATCH, and the fix fetches DuckDB's", () => {
     const dir = mkdtempSync(join(tmpdir(), "croft-ext-"));
     try {
       const file = extensionPath(dir, "httpfs", platform!);
@@ -110,6 +129,7 @@ describe("checking a file", () => {
         verifyExtension(dir, "httpfs");
       } catch (e) {
         expect((e as CroftError).code).toBe("EXTENSION_CHECKSUM_MISMATCH");
+        expect((e as CroftError).problem.fix).toMatchObject({ kind: "command", command: "croft fetch-extensions httpfs" });
       }
     } finally {
       rmSync(dir, { recursive: true, force: true });

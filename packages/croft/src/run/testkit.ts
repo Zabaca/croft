@@ -211,6 +211,8 @@ export function cliEnv(extra: Record<string, string> = {}): Record<string, strin
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", NO_COLOR: "1",
     // The suite also runs on the log adapter; every croft a test spawns follows.
     ...bookkeepingEnv(),
+    // No croft a test spawns downloads an extension (tests/preload.ts).
+    CROFT_NO_FETCH: "1", CROFT_EXTENSION_REPO: "http://127.0.0.1:9",
     ...extra,
   };
 }

@@ -13,6 +13,7 @@ import type { CatalogSslMode } from "../project/lake-config.ts";
 import { connect, instanceConfig, type SandboxSpec } from "./connect.ts";
 import { extensionsReady, IN_CI } from "./extension-dir-testkit.ts";
 import { extensionPath, hostPlatform, verifyExtension } from "./extension-files.ts";
+import { repoPath, type StandInRepo, startStandInRepo } from "./extension-repo-testkit.ts";
 import { DUCKDB_VERSION, type ExtensionName } from "./extension-names.ts";
 import { LAKE_ALIAS, type LakeSpec, lakeReadersMode, MODE_EXTENSIONS, modeCredentialDigest, modeIdentity, type ModeSpec, READ_COPY_ALIAS, scrub, scrubError, scrubThrown, startQuackListener } from "./modes.ts";
 import { freePort, postgresBin, readListening, startPostgres, startS3, track, type TestPostgres, type TestS3 } from "./mode-testkit.ts";
@@ -235,8 +236,9 @@ describe("a file that is not the pinned file loads nothing (acceptance 3)", () =
     expect(e).toBeInstanceOf(CroftError);
     expect(e.code).toBe("EXTENSION_MISSING");
     expect(e.problem.hint.length).toBeGreaterThan(10);
-    expect(e.problem.fix).toMatchObject({ kind: "manual" });
-    expect(e.problem.details).toMatchObject({ kind: "file", extension: "httpfs" });
+    // Fetching is off in the suite (tests/preload.ts), so the mode says what to run instead of downloading.
+    expect(e.problem.fix).toMatchObject({ kind: "command", command: "croft fetch-extensions httpfs quack" });
+    expect(e.problem.details).toMatchObject({ kind: "file", extension: "httpfs", missing: ["httpfs", "quack"] });
     expect(await loadedNames(conn)).toEqual([]);
   });
 
@@ -922,8 +924,8 @@ describe("lake profile (a Postgres catalog and a bucket folder)", () => {
   });
 });
 
-describe("no code path installs an extension or reaches DuckDB's repository (acceptance 7)", () => {
-  test("no source issues INSTALL, names an extension repository, or turns auto-install on", async () => {
+describe("no code path installs an extension, turns off the signature check, or reaches DuckDB's repository but the fetch module (acceptance 7, D195)", () => {
+  test("no source issues INSTALL, allows unsigned extensions, names an extension repository outside extension-fetch.ts, or turns auto-install on", async () => {
     const { sourceFiles, SRC, sourceStrings } = await import("../agent/contract-testkit.ts");
     const ts = (await import("typescript")).default;
     const offenders: string[] = [];
@@ -937,12 +939,14 @@ describe("no code path installs an extension or reaches DuckDB's repository (acc
       const text = readFileSync(file, "utf8");
       for (const s of sourceStrings(file, text)) {
         if (startsWithStatement.test(s.text) || /;\s*(FORCE\s+)?INSTALL\b/i.test(s.text) || statementOnly.test(s.text) || knownName.test(s.text) || /install_extension|\bFROM\s+community\b/i.test(s.text)) offenders.push(`${file}:${s.line}: ${s.text.slice(0, 80)}`);
-        if (/extensions\.duckdb\.org|custom_extension_repository|autoinstall_known_extensions\s*=\s*true|autoload_known_extensions\s*=\s*true/i.test(s.text)) offenders.push(`${file}:${s.line}: ${s.text.slice(0, 80)}`);
+        if (/custom_extension_repository|allow_unsigned_extensions|autoinstall_known_extensions\s*=\s*true|autoload_known_extensions\s*=\s*true/i.test(s.text)) offenders.push(`${file}:${s.line}: ${s.text.slice(0, 80)}`);
+        // DuckDB's own extension servers are named in one file: the one that downloads from them, before any lock (D195).
+        if (/extensions\.duckdb\.org/i.test(s.text) && !file.endsWith("/db/extension-fetch.ts")) offenders.push(`${file}:${s.line}: ${s.text.slice(0, 80)}`);
       }
       // The options as object properties or assignments: { autoinstall_known_extensions: "true" } and friends.
       const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
       const visit = (n: import("typescript").Node): void => {
-        if (ts.isPropertyAssignment(n) && /^(autoinstall_known_extensions|autoload_known_extensions|allow_community_extensions)$/.test(n.name.getText(sf).replace(/["'`]/g, ""))) {
+        if (ts.isPropertyAssignment(n) && /^(autoinstall_known_extensions|autoload_known_extensions|allow_community_extensions|allow_unsigned_extensions)$/.test(n.name.getText(sf).replace(/["'`]/g, ""))) {
           const v = n.initializer;
           const on = v.kind === ts.SyntaxKind.TrueKeyword || ((ts.isStringLiteral(v) || ts.isNoSubstitutionTemplateLiteral(v)) && /^(true|1|on)$/i.test(v.text));
           if (on) offenders.push(`${file}:${sf.getLineAndCharacterOfPosition(n.getStart()).line + 1}: ${n.getText(sf)}`);
@@ -959,5 +963,100 @@ describe("no code path installs an extension or reaches DuckDB's repository (acc
     const c = await open(readers(p));
     expect(await error(c, "INSTALL httpfs FROM 'https://extensions.duckdb.org'")).toMatch(/disabled|Permission/);
     expect(await rows(c, "SELECT current_setting('autoinstall_known_extensions'), current_setting('autoload_known_extensions'), current_setting('allow_community_extensions')")).toEqual([[false, false, false]]);
+  });
+});
+
+describe("a mode fetches what the folder lacks from DuckDB, before it locks (D195)", () => {
+  /** A stand-in for DuckDB's repository that serves the real pinned files, and the environment that points croft at it. */
+  async function realRepo(): Promise<{ repo: StandInRepo; restore: () => void }> {
+    const repo = startStandInRepo();
+    const platform = hostPlatform()!;
+    for (const n of ["httpfs", "quack"] as const) repo.files.set(repoPath(n, platform), readFileSync(extensionPath(ext.dir, n, platform)));
+    const saved = { off: process.env.CROFT_NO_FETCH, repo: process.env.CROFT_EXTENSION_REPO };
+    process.env.CROFT_NO_FETCH = "";
+    process.env.CROFT_EXTENSION_REPO = repo.url;
+    return {
+      repo,
+      restore: () => {
+        repo.stop();
+        process.env.CROFT_NO_FETCH = saved.off;
+        process.env.CROFT_EXTENSION_REPO = saved.repo;
+      },
+    };
+  }
+
+  withExt("opening a readers' mode on an empty folder fetches its files, loads them with DuckDB's signature check on, and works", async () => {
+    const { repo, restore } = await realRepo();
+    try {
+      const empty = mkdtempSync(join(tmpdir(), "croft-extdir-fetch-"));
+      cleanup.push(() => rmSync(empty, { recursive: true, force: true }));
+      const p = await project();
+      const c = await open(readers(p, { extensionDir: empty }));
+      expect(repo.requests.sort()).toEqual([repoPath("httpfs", hostPlatform()!), repoPath("quack", hostPlatform()!)]);
+      expect(await loaded(c)).toEqual(expect.arrayContaining(["quack", "httpfs"]));
+      expect(await rows(c, `SELECT count(*) FROM ${READ_COPY_ALIAS}.main.t`)).toEqual([[5n]]);
+    } finally {
+      restore();
+    }
+  });
+
+  withExt("a locked instance never fetches: reopening it asks the repository for nothing, even with its files gone", async () => {
+    const { repo, restore } = await realRepo();
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "croft-extdir-fetch-"));
+      cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+      const p = await project();
+      const instance = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
+      cleanup.push(() => instance.closeSync());
+      const spec = readers(p, { extensionDir: dir });
+      const key = `:memory:locked${++seq}`;
+      const first = await connect(instance, spec, key);
+      cleanup.push(() => first.disconnectSync());
+      expect(repo.requests).toHaveLength(2);
+      rmSync(dir, { recursive: true, force: true });
+      const again = await connect(instance, spec, key);
+      cleanup.push(() => again.disconnectSync());
+      expect(await rows(again, "SELECT 1")).toEqual([[1]]);
+      expect(repo.requests).toHaveLength(2);
+    } finally {
+      restore();
+    }
+  });
+
+  withExt("a mode that does not fit its profile is refused before anything is downloaded", async () => {
+    const { repo, restore } = await realRepo();
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "croft-extdir-fetch-"));
+      cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+      const p = await project();
+      const instance = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
+      cleanup.push(() => instance.closeSync());
+      const spec: SandboxSpec = { ...readers(p, { extensionDir: dir }), profile: "warehouse" };
+      await expect(connect(instance, spec, `:memory:badfit${++seq}`)).rejects.toThrow(/profile/);
+      expect(repo.requests).toEqual([]);
+    } finally {
+      restore();
+    }
+  });
+
+  withExt("a file that is there but wrong is refused, not replaced behind the user's back", async () => {
+    const { repo, restore } = await realRepo();
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "croft-extdir-fetch-"));
+      cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+      const bad = extensionPath(dir, "httpfs", hostPlatform()!);
+      mkdirSync(dirname(bad), { recursive: true });
+      writeFileSync(bad, "tampered");
+      const p = await project();
+      const instance = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
+      cleanup.push(() => instance.closeSync());
+      const err = await connect(instance, readers(p, { extensionDir: dir }), `:memory:wrong${++seq}`).catch((e: unknown) => e);
+      expect((err as CroftError).code).toBe("EXTENSION_CHECKSUM_MISMATCH");
+      expect(readFileSync(extensionPath(dir, "httpfs", hostPlatform()!), "utf8")).toBe("tampered");
+      // Only the file that was absent was asked for.
+      expect(repo.requests).toEqual([repoPath("quack", hostPlatform()!)]);
+    } finally {
+      restore();
+    }
   });
 });

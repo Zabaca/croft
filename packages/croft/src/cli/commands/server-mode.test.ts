@@ -186,7 +186,7 @@ describe("croft status", () => {
     const json = await cli(["status", "--json"], { cwd: p.root, env });
     const body = JSON.parse(json.stdout);
     expect(body.data.serverMode.serving).toBe(false);
-    expect(body.data.serverMode.addons[0]).toMatchObject({ addon: "server", ok: true });
+    expect(body.data.serverMode.extensionFiles[0]).toMatchObject({ mode: "server", ok: true });
     expect(body.data.readCopy).toMatchObject({ asOf: "2026-09-24T10:00:00-07:00", health: "ok" });
     const human = await cli(["status"], { cwd: p.root, env });
     const lines = human.stdout.split("\n");

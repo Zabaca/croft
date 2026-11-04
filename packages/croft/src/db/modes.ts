@@ -20,8 +20,8 @@ import type { Fix } from "../core/types.ts";
 import type { CatalogSslMode } from "../project/lake-config.ts";
 import type { Profile } from "./connect.ts";
 import { type ExtensionName } from "./extension-names.ts";
-import { addonFor } from "./addons.ts";
-import { verifyModeExtensions } from "./extension-files.ts";
+import { fetchMissingModeFiles } from "./extension-fetch.ts";
+import { resolveExtensionDir, verifyExtensions } from "./extension-files.ts";
 
 /** The Postgres catalog a lake keeps its metadata in, with one login. Credentials live only in a named secret. */
 export interface LakePostgres {
@@ -79,11 +79,9 @@ export interface LakeLocalSpec {
 }
 
 interface ModeBase {
-  /** A folder holding the pinned extension files in DuckDB's layout (extension-files.ts): croft's tests and builders name
-   *  one, or set $CROFT_EXTENSION_DIR. Without either, the files come from the mode's add-on package (addons.ts). */
+  /** A folder holding the pinned extension files in DuckDB's layout (extension-files.ts): croft's tests name one. Without it,
+   *  $CROFT_EXTENSION_DIR, else croft's cache folder; a file the folder lacks is fetched from DuckDB before the lock (D195). */
   extensionDir?: string;
-  /** The project's root, from which the add-on package is found in node_modules (D134). */
-  projectRoot?: string;
   /** DuckDB's secret folder for this instance, inside croft's state folder. */
   secretDir: string;
   /** Runs after the mode's attaches and before the lock: register hooks, start the listener. */
@@ -112,7 +110,7 @@ export function lakeReadersMode(mode: LakeMode | LakeLocalMode, prepare?: ModeBa
   if (mode.lake.access !== "read") {
     throw new CroftError("INTERNAL_ERROR", { message: "a lake behind croft serve is attached read-only", hint: "report this croft bug" });
   }
-  const base = { ...(mode.extensionDir ? { extensionDir: mode.extensionDir } : {}), ...(mode.projectRoot ? { projectRoot: mode.projectRoot } : {}), secretDir: mode.secretDir, ...(prepare ? { prepare } : {}) };
+  const base = { ...(mode.extensionDir ? { extensionDir: mode.extensionDir } : {}), secretDir: mode.secretDir, ...(prepare ? { prepare } : {}) };
   return mode.kind === "lake"
     ? { ...base, kind: "lake-readers", lake: { ...mode.lake, access: "read" } }
     : { ...base, kind: "lake-local-readers", lake: { ...mode.lake, access: "read" } };
@@ -190,7 +188,7 @@ export const MODE_PROFILES: Readonly<Record<ModeKind, readonly Profile[]>> = {
 
 /** Everything about a mode that is not a secret, as the sandbox fingerprint holds it: two requests that differ in any of it must not share an instance. */
 export function modeIdentity(mode: ModeSpec): unknown {
-  const base = { kind: mode.kind, extensionDir: mode.extensionDir ?? null, projectRoot: mode.projectRoot ?? null, secretDir: mode.secretDir };
+  const base = { kind: mode.kind, extensionDir: mode.extensionDir ?? null, secretDir: mode.secretDir };
   if (mode.kind === "readers") return { ...base, copy: mode.copy };
   if (mode.kind === "lake-local" || mode.kind === "lake-local-readers") return { ...base, catalog: mode.lake.catalog.path, dataPath: mode.lake.dataPath, access: mode.lake.access };
   const { catalog, data, access } = mode.lake;
@@ -202,11 +200,8 @@ export function modeCredentialDigest(mode: ModeSpec): string {
   return createHash("sha256").update(JSON.stringify(modeSecrets(mode))).digest("hex");
 }
 
-/**
- * Steps 0 and 1: the mode fits its profile and every file checks. Touches nothing, so a refusal leaves the instance as it
- * was and a retry can succeed. Returns the verified files.
- */
-export function checkMode(mode: ModeSpec, profile: Profile): Map<ExtensionName, string> {
+/** The mode fits its profile. */
+function checkFit(mode: ModeSpec, profile: Profile): void {
   if (!MODE_PROFILES[mode.kind].includes(profile)) {
     throw new CroftError("INTERNAL_ERROR", {
       message: `the ${mode.kind} mode runs under the ${MODE_PROFILES[mode.kind].join(" or ")} profile, not ${profile}`,
@@ -216,10 +211,26 @@ export function checkMode(mode: ModeSpec, profile: Profile): Map<ExtensionName, 
   if ((mode.kind === "lake-readers" || mode.kind === "lake-local-readers") && mode.lake.access !== "read") {
     throw new CroftError("INTERNAL_ERROR", { message: "a lake behind croft serve is attached read-only", hint: "report this croft bug" });
   }
-  return verifyModeExtensions(MODE_EXTENSIONS[mode.kind], (n) => addonFor(mode.kind, n), {
-    ...(mode.extensionDir ? { dir: mode.extensionDir } : {}),
-    ...(mode.projectRoot ? { from: mode.projectRoot } : {}),
-  });
+}
+
+/**
+ * Steps 0 and 1: the mode fits its profile and every file checks. Touches nothing, so a refusal leaves the instance as it
+ * was and a retry can succeed. Returns the verified files. Never fetches (prepareMode does, before this).
+ */
+export function checkMode(mode: ModeSpec, profile: Profile): Map<ExtensionName, string> {
+  checkFit(mode, profile);
+  return verifyExtensions(mode.extensionDir ?? resolveExtensionDir(), MODE_EXTENSIONS[mode.kind]);
+}
+
+/**
+ * checkMode, after fetching what the folder lacks from DuckDB's extension servers (D195). The only place an instance's open
+ * fetches, and it is before the lock: connect.ts calls it for an instance that is not locked yet, so a locked one never reaches it.
+ * A mode that does not fit its profile is refused before anything is downloaded.
+ */
+export async function prepareMode(mode: ModeSpec, profile: Profile): Promise<Map<ExtensionName, string>> {
+  checkFit(mode, profile);
+  await fetchMissingModeFiles(MODE_EXTENSIONS[mode.kind], mode.extensionDir ? { dir: mode.extensionDir } : {});
+  return checkMode(mode, profile);
 }
 
 const LOAD_FIX: Fix = {

@@ -25,7 +25,7 @@ import { CROFT_VERSION } from "./version.ts";
 export const CROFT_PACKAGE = "@zabaca/croft";
 
 /** Commands that work without a project. */
-export const OUTSIDE_PROJECT: readonly string[] = ["init", "doctor", "docs", "version", "help"];
+export const OUTSIDE_PROJECT: readonly string[] = ["init", "doctor", "docs", "version", "help", "fetch-extensions"];
 
 /** Environment variables the launcher sets for the pinned copy it starts. */
 export const LAUNCH_ENV = {

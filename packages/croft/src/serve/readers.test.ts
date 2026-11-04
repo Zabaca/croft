@@ -5,11 +5,12 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, truncateSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { installFakeAddon } from "../db/addon-testkit.ts";
+import { dirname, join } from "node:path";
 import { logDdl } from "../db/bookkeeping.ts";
+import { extensionPath, hostPlatform } from "../db/extension-files.ts";
+import { DUCKDB_VERSION } from "../db/extension-names.ts";
 import { LOG_FORMAT_VERSION } from "../db/state.ts";
 import { closeAllWarehouses } from "../db/warehouse.ts";
 import { cleanup, seed, type TempProject } from "../read/testkit.ts";
@@ -105,15 +106,17 @@ describe("starting", () => {
     expect(await count(e)).toBe(10);
   });
 
-  withExt("with no extension folder named, the readers' process loads quack and httpfs from the server add-on in the project's node_modules (D134)", async () => {
+  withExt("with no extension folder named, the readers' process loads quack and httpfs from croft's cache folder (D195)", async () => {
     const p = await project({ n: 10 });
-    installFakeAddon(p.root, "server", { from: ext.dir });
-    // The child inherits this environment: no folder named, and a cache that holds nothing, so only the add-on can be where the files come from.
+    // The child inherits this environment: no $CROFT_EXTENSION_DIR, and a cache laid out as croft's with the real files linked in.
     const saved = { dir: process.env.CROFT_EXTENSION_DIR, cache: process.env.XDG_CACHE_HOME };
-    const emptyCache = realpathSync(mkdtempSync(join(tmpdir(), "croft-nocache-")));
-    scratchDirs.push(emptyCache);
+    const cache = realpathSync(mkdtempSync(join(tmpdir(), "croft-cache-")));
+    scratchDirs.push(cache);
+    const platform = hostPlatform()!;
+    mkdirSync(join(cache, "croft", "extensions", `v${DUCKDB_VERSION}`), { recursive: true });
+    symlinkSync(dirname(extensionPath(ext.dir, "quack", platform)), join(cache, "croft", "extensions", `v${DUCKDB_VERSION}`, platform));
     delete process.env.CROFT_EXTENSION_DIR;
-    process.env.XDG_CACHE_HOME = emptyCache;
+    process.env.XDG_CACHE_HOME = cache;
     try {
       const e = await openReadersEngine({ root: p.root, copyPollMs: 25 });
       engines.push(e);
@@ -125,7 +128,7 @@ describe("starting", () => {
     }
   });
 
-  test("with the server add-on not installed and no folder named, croft serve does not start, and the error is the install command (EXTENSION_MISSING)", async () => {
+  test("with no files on the machine and fetching off, croft serve does not start, and the error is the fetch command (EXTENSION_MISSING)", async () => {
     const p = await project();
     const saved = { dir: process.env.CROFT_EXTENSION_DIR, cache: process.env.XDG_CACHE_HOME };
     const emptyCache = realpathSync(mkdtempSync(join(tmpdir(), "croft-nocache-")));
@@ -135,8 +138,8 @@ describe("starting", () => {
     try {
       const err = await rejection(openReadersEngine({ root: p.root, copyPollMs: 25 }));
       expect(err.code).toBe("EXTENSION_MISSING");
-      expect(err.problem.details).toMatchObject({ kind: "addon", addon: "server", installed: false });
-      expect(err.problem.fix).toMatchObject({ kind: "command", command: expect.stringContaining("bun add @zabaca/croft-addon-server@") });
+      expect(err.problem.details).toMatchObject({ kind: "file", missing: ["httpfs", "quack"] });
+      expect(err.problem.fix).toMatchObject({ kind: "command", command: "croft fetch-extensions httpfs quack" });
     } finally {
       if (saved.dir !== undefined) process.env.CROFT_EXTENSION_DIR = saved.dir;
       if (saved.cache === undefined) delete process.env.XDG_CACHE_HOME;

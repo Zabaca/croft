@@ -23,6 +23,7 @@ import type { del } from "./commands/delete.ts";
 import type { describe } from "./commands/describe.ts";
 import type { docs } from "./commands/docs.ts";
 import type { doctor } from "./commands/doctor.ts";
+import type { fetchExtensionsCommand } from "./commands/fetch-extensions.ts";
 import type { help } from "./commands/help.ts";
 import type { init } from "./commands/init.ts";
 import type { logs } from "./commands/logs.ts";
@@ -76,6 +77,7 @@ export interface CommandData {
   backup: DataOf<typeof backup>;
   maintain: DataOf<typeof maintain>;
   "move-to-lake": DataOf<typeof moveToLake>;
+  "fetch-extensions": DataOf<typeof fetchExtensionsCommand>;
 }
 
 /** The envelope every command prints, whatever its data (schemas/envelope.schema.json). */
@@ -84,7 +86,7 @@ export type AnyEnvelope = Envelope<unknown>;
 /** The commands with a schema, in the order of CommandData. */
 export const SCHEMA_COMMANDS = [
   "init", "doctor", "docs", "help", "version", "secrets", "context", "status", "describe", "query", "logs",
-  "run", "wait", "confirm", "validate", "preview", "schedule", "serve", "rename", "delete", "restore", "new", "backup", "maintain", "move-to-lake",
+  "run", "wait", "confirm", "validate", "preview", "schedule", "serve", "rename", "delete", "restore", "new", "backup", "maintain", "move-to-lake", "fetch-extensions",
 ] as const satisfies readonly (keyof CommandData)[];
 
 export type SchemaCommand = (typeof SCHEMA_COMMANDS)[number];

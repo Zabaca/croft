@@ -1,8 +1,8 @@
-// What can publish to npm from this repository (DESIGN.md D135; option 06, slice 5). Two workflows publish, each its own package set,
-// and nothing else does: a release of @zabaca/croft is the `croft-v*` tag (and publish-npm.yml's manual run from a tag's ref), the
-// add-on packages are publish-addons.yml's manual run behind a typed confirmation, and no tag, push or pull request reaches the
-// second. This test reads the workflow files and the scripts they run, so adding a trigger that publishes, or a third workflow that
-// does (by npm, Bun, pnpm, Yarn, a release tool, a publishing action or a script), fails here and has to be decided.
+// What can publish to npm from this repository (DESIGN.md D135, D195). One workflow publishes, one package, and nothing else does: a
+// release of @zabaca/croft is the `croft-v*` tag (and publish-npm.yml's manual run from a tag's ref). The DuckDB extension files are
+// DuckDB's own, fetched from DuckDB's servers (D195), so no other package is published. This test reads the workflow files and the
+// scripts they run, so adding a trigger that publishes, or a second workflow that does (by npm, Bun, pnpm, Yarn, a release tool, a
+// publishing action or a script), fails here and has to be decided.
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { existsSync } from "node:fs";
@@ -35,8 +35,8 @@ const load = (file: string) => {
 describe("which workflows can publish", () => {
   const files = readdirSync(WORKFLOWS).filter((f) => f.endsWith(".yml"));
 
-  test("only publish-npm.yml and publish-addons.yml can publish, by npm, Bun, pnpm, Yarn, a release tool, an action or a script", () => {
-    expect(files.filter((f) => canPublish(load(f).text)).sort()).toEqual(["publish-addons.yml", "publish-npm.yml"]);
+  test("only publish-npm.yml can publish, by npm, Bun, pnpm, Yarn, a release tool, an action or a script", () => {
+    expect(files.filter((f) => canPublish(load(f).text)).sort()).toEqual(["publish-npm.yml"]);
   });
 
   test("the detector sees each way of publishing it is meant to", () => {
@@ -156,9 +156,9 @@ describe("which workflows can publish", () => {
     expect(JSON.stringify(doc.jobs["test-lake-postgres"])).toContain("CROFT_TEST_OLD_DUCKDB");
   });
 
-  test("no workflow but those two can mint an OIDC token, which is what trusted publishing publishes with", () => {
+  test("no workflow but publish-npm.yml can mint an OIDC token, which is what trusted publishing publishes with", () => {
     const withToken = files.filter((f) => /id-token:\s*write/.test(withoutComments(load(f).text)));
-    expect(withToken.sort()).toEqual(["publish-addons.yml", "publish-npm.yml"]);
+    expect(withToken.sort()).toEqual(["publish-npm.yml"]);
   });
 
   test("@zabaca/croft's release path is the croft-v* tag, and a manual run from a tag's ref; a branch publishes nothing", () => {
@@ -174,40 +174,14 @@ describe("which workflows can publish", () => {
     expect(doc.jobs.publish.needs).toBe("pack");
   });
 
-  test("the add-ons publish from a manual run and nothing else: no tag, push or pull request, and the croft-v* tag does not reach them", () => {
-    const { doc } = load("publish-addons.yml");
-    expect(Object.keys(doc.on)).toEqual(["workflow_dispatch"]);
-    expect(doc.on.workflow_dispatch.inputs.publish.default).toBe("build-only");
-    expect(doc.on.workflow_dispatch.inputs.publish.options).toEqual(["build-only", "publish"]);
-    // A tag glob that would match the add-ons' own would be the way to fire it by accident.
-    expect(JSON.stringify(doc.on)).not.toContain("tags");
+  test("the workflow carries no npm token: it publishes by trusted publishing only", () => {
+    const text = load("publish-npm.yml").text;
+    expect(text).not.toMatch(/NPM_TOKEN|NODE_AUTH_TOKEN|_authToken|secrets\./);
+    expect(text).toContain("id-token: write");
   });
 
-  test("the add-ons' publish job needs the typed confirmation, the exact version, main, and the approval environment", () => {
-    const { doc } = load("publish-addons.yml");
-    expect(Object.keys(doc.jobs)).toEqual(["build", "publish"]);
-    const job = doc.jobs.publish;
-    expect(job.needs).toBe("build");
-    expect(job.if).toContain("github.ref == 'refs/heads/main'");
-    expect(job.if).toContain("inputs.publish == 'publish'");
-    expect(job.if).toContain("inputs.confirm == format('publish croft add-ons {0}', inputs.version)");
-    expect(job.environment).toBe("npm-addons");
-    // The build job, which a plain run does, publishes nothing and has no token or OIDC permission.
-    const build = doc.jobs.build;
-    expect(JSON.stringify(build)).not.toMatch(/npm publish|id-token/);
-  });
-
-  test("neither workflow carries an npm token: they publish by trusted publishing only", () => {
-    for (const f of ["publish-npm.yml", "publish-addons.yml"]) {
-      const text = load(f).text;
-      expect(text, f).not.toMatch(/NPM_TOKEN|NODE_AUTH_TOKEN|_authToken|secrets\./);
-      expect(text, f).toContain("id-token: write");
-    }
-  });
-
-  test("the version a run asks for is read from the same line the code defines it on", () => {
-    const code = readFileSync(resolve(import.meta.dir, "../src/db/addons.ts"), "utf8");
-    expect(code).toMatch(/^export const ADDON_VERSION = "\d+\.\d+\.\d+";$/m);
-    expect(load("publish-addons.yml").text).toContain("s/^export const ADDON_VERSION = ");
+  test("no workflow publishes the extension files: they are DuckDB's, fetched from DuckDB's servers (D195)", () => {
+    expect(files).not.toContain("publish-addons.yml");
+    for (const f of files) expect(load(f).text, f).not.toMatch(/croft-addon|croft-ext-|npm-addons/);
   });
 });
