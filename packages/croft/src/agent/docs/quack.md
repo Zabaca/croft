@@ -79,6 +79,11 @@ listens, and never a wrong answer. It carries on by attaching again:
 which takes about 12 to 40 ms. With `serverMode.quackPort` set to 0 the new process picks a new port, so use a fixed port
 wherever clients are meant to come back.
 
+Over a lake there is no copy to swap: each view reads the lake's last snapshot whenever it is read, so a session sees every
+commit on its next query. A DuckDB client reads the list of the server's tables when it attaches, so a shared table that a
+run makes later is not in an open session's list (its query says the table does not exist); it is there for an ATTACH made
+after croft serve's next look at the lake (250 ms), and for a query sent as written with `quack_query`.
+
 A swap of a refreshed copy does not drop sessions and fails no query: the new copy is attached beside the old one, the
 views move to it in one transaction, and only then is the old one detached.
 
