@@ -109,3 +109,9 @@ it replaces the warehouse with the backup's, and what was written since is lost 
 A backup opens with the DuckDB of backup.json's duckdb or a newer one (a newer one backs the file up again before
 it first writes, croft docs trash). To look inside one without putting it back, open its warehouse.duckdb
 read-only (duckdb -readonly <file>): a tool that opens it read-write changes the backup.
+
+## Before a move into a lake
+
+`croft move-to-lake` makes this backup first, in .croft/backups/, and copies from it, never from the live file. The
+file stays untouched afterwards, and with the backup it is the way back (croft docs lake). The backup is on the project's
+disk like any other: copy it to another disk with croft backup <folder> if the move should survive a lost disk.

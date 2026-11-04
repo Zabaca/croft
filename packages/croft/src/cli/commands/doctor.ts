@@ -52,6 +52,7 @@ import { readCopyStatus, readCopySummary } from "../../db/readcopy.ts";
 import { AGENT_PATH, CLAUDE_MD, claudeBlock, findBlock, SKILL_PATH, skillStamp } from "../../agent/templates.ts";
 import { type DriftEntry, driftTexts, recentDrift } from "../../history/drift.ts";
 import { listLeases } from "../../history/leases.ts";
+import { type MoveRecord, readMoveRecord } from "../../history/mirror-home.ts";
 import { RUNS_DB_FILE, RunsDb } from "../../history/runs-db.ts";
 import { commandText, ProjectEnv } from "../../project/env.ts";
 import { appRootOf, relocationPlan } from "../../project/init.ts";
@@ -425,12 +426,52 @@ function bindingsPresent(croftRoot: string): string[] {
   }
 }
 
+/**
+ * The project and a lake it was moved to or may be moved to (option 07, slice 4; D167 to D170), from croft.json and runs.sqlite alone: a lake
+ * block that is switched off says how to move into it; a project that is in the lake it was moved into says that the file is the way back and
+ * how; one that was moved and is on the file again says what the file lacks.
+ */
+function lakeMoveCheck(r: Report, project: Project): void {
+  const lake = project.config.lake ?? project.config.idleLake;
+  if (!lake) return;
+  let moved: MoveRecord | null = null;
+  if (existsSync(join(project.paths.stateDir, RUNS_DB_FILE))) {
+    try {
+      const runs = RunsDb.open(project.paths.stateDir);
+      try {
+        moved = readMoveRecord(runs);
+      } finally {
+        runs.close();
+      }
+    } catch {
+      // runs.sqlite is reported elsewhere.
+    }
+  }
+  const where = lake.kind === "postgres" ? bucketPath(lake.bucket) : lake.dataPath;
+  const fmt = (at: string) => { try { return clockText(at, project.timezone, now(process.env)); } catch { return at; } };
+  if (project.config.lake) {
+    if (!moved) return;
+    r.add("environment", "lake.move", "info",
+      `moved in from the file on ${fmt(moved.at)} (${formatCount(moved.tables)} tables, ${formatCount(moved.rows)} rows); the file is untouched (sha256 ${moved.fileSha256.slice(0, 16)}..., ${formatBytes(moved.fileBytes)}) and is the way back: "lake.enabled": false; what is written in the lake after the move is not carried back; the backup made first: ${moved.backup}`,
+      undefined, { ...moved, state: "moved" });
+  } else if (moved) {
+    r.add("environment", "lake.move", "info",
+      `back on the file; it was moved into ${where} on ${fmt(moved.at)} (${formatCount(moved.tables)} tables), and what was written there since is not in the file; "lake.enabled": true goes back to the lake`,
+      undefined, { ...moved, state: "back" });
+  } else {
+    r.add("environment", "lake.move", "info",
+      `${where} is named in croft.json and switched off ("enabled": false); croft move-to-lake moves this project into it (it asks first, and the file stays as the way back)`,
+      undefined, { lake: where, state: "idle" });
+  }
+}
+
 /** What the warehouse's read lease found of tables changed outside croft (safety/out-of-band.ts scanTables), for the
  *  Project section: null when the warehouse was not opened or has no croft state, an Error when the comparison failed. */
 type TableScanResult = import("../../safety/out-of-band.ts").TableScan | Error | null;
 
 /** The warehouse line. In the same read lease, the tables croft has a record of are compared with it (`found.scan`). */
 async function checkWarehouse(r: Report, d: DoctorDeps, project: Project, bindingOk: boolean, found: { scan: TableScanResult }): Promise<void> {
+  lakeMoveCheck(r, project);
   if (project.config.lake) return checkLake(r, d, project, bindingOk, found);
   const path = project.paths.database;
   const label = project.databaseLabel;
@@ -694,6 +735,12 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
       r.add("environment", "warehouse", "error", p.message, p, details);
     } else if (e.code === "DB_NOT_FOUND" && e.problem.details?.notCreated === true) {
       r.add("environment", "warehouse", "ok", `${label} not created yet (the first croft run creates it)`, undefined, { ...details, exists: false });
+      // A file warehouse next to a lake nobody has written: the first run would build the project again from its sources, in the lake.
+      if (existsSync(project.paths.database)) {
+        r.add("environment", "lake.file_left", "warn",
+          `${project.databaseLabel} is a lake nobody has written, and ${relative(project.root, project.paths.database) || project.paths.database} still holds the project's data: a croft run now builds the project again from its sources, in the lake. To move the data instead, set "enabled": false in the lake block and run croft move-to-lake (croft docs lake)`,
+          undefined, { file: project.paths.database });
+      }
     } else {
       r.add("environment", "warehouse", "error", `${label} · ${e.problem.message}`, e.problem, details);
     }

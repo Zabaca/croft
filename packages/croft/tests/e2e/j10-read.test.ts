@@ -90,7 +90,7 @@ describe("journey 10: @zabaca/croft/read", () => {
     await setup();
     const types = await project.json(["query", "describe events"]);
     const t = Object.fromEntries(types.json.data.rows.map((r: { column_name: string; column_type: string }) => [r.column_name, r.column_type]));
-    expect(t).toMatchObject({ big: "HUGEINT", ratio: "DOUBLE", at: "TIMESTAMP WITH TIME ZONE", local: "TIMESTAMP", day: "DATE", payload: "JSON", ok: "BOOLEAN" });
+    expect(t).toMatchObject({ big: LAKE ? "DECIMAL(38,0)" : "HUGEINT", ratio: "DOUBLE", at: "TIMESTAMP WITH TIME ZONE", local: "TIMESTAMP", day: "DATE", payload: "JSON", ok: "BOOLEAN" });
     const m = await project.json(["query", "describe money"]);
     const mt = Object.fromEntries(m.json.data.rows.map((r: { column_name: string; column_type: string }) => [r.column_name, r.column_type]));
     expect(mt.price).toMatch(/^DECIMAL\(18,\s?2\)$/);

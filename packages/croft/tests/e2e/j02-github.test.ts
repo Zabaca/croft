@@ -6,7 +6,7 @@
 //   merges by id while unchanged rows keep their _loaded_at.
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { at, BIG, githubAsset, githubRoute, issue, TOKEN } from "./fixtures.ts";
-import { cleanupAll, findProblem, initProject, type MockApi, mockApi, show } from "./harness.ts";
+import { cleanupAll, findProblem, initProject, LAKE, type MockApi, mockApi, show } from "./harness.ts";
 
 let api: MockApi;
 beforeAll(() => {
@@ -52,7 +52,8 @@ test("journey 2: GitHub-like keyset ingest: secret, 429 retry, big integers, inc
   const q = await p.json(["query", "select id, external_id, closed_at, labels->>'$[*].name' as labels, \"user\"->>'login' as login from github_issues order by id"]);
   expect(q.code, show(q)).toBe(0);
   const types = Object.fromEntries(q.json.data.columns.map((c: { name: string; type: string }) => [c.name, c.type]));
-  expect(types.external_id).toBe("HUGEINT");
+  // In a lake the same digits are DECIMAL(38,0): a lake would store a HUGEINT as a DOUBLE (D174).
+  expect(types.external_id).toBe(LAKE ? "DECIMAL(38,0)" : "HUGEINT");
   expect(q.json.data.rows[3]).toMatchObject({ id: 4, external_id: BIG, login: "u4" });
   expect(q.json.data.rows[0].external_id).toBe("10");
   const d1 = await p.json(["describe", "github_issues"]);

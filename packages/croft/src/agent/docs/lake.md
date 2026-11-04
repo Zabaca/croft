@@ -7,7 +7,8 @@ committed while the writer works on the next. It is opt-in, and a project that n
 nothing is loaded, nothing changes.
 
 You use croft as before: `croft run`, `query`, `status`, `describe`, `delete`, `restore`, `rename`, `preview`, `backup`,
-the scheduler, `croft serve`; and `croft maintain` for the lake's housekeeping. Writes stay all-or-nothing with their bookkeeping, checks run before saving, and the trash
+the scheduler, `croft serve`; `croft maintain` for the lake's housekeeping; and `croft move-to-lake` to move a project
+that keeps a file into a lake. Writes stay all-or-nothing with their bookkeeping, checks run before saving, and the trash
 stays on the writing machine as local files. What lake mode adds is a setup that is more than "a first warehouse in
 minutes": a Postgres, a bucket folder, two logins and two bucket keys. Turning it on is the user's decision.
 
@@ -211,17 +212,84 @@ The gate refuses, in a lake project, everything that reaches past the tables, fo
 `duckdb_databases()` (which show the bucket key and the catalogs), the lake's metadata catalog (`__ducklake_metadata_*`),
 the lake's own functions and the bucket's files (`read_parquet('s3://...')` and the like). QUERY_PATH_DENIED.
 
-## Types a lake cannot store
+## Types a lake cannot store, and types it stores inexactly
 
-DuckLake stores no ENUM, UNION or VARINT column. A result that has one fails before anything is written, with
-LAKE_TYPE_UNSUPPORTED and the cast that fixes it (`CAST(col AS VARCHAR)`).
+DuckLake stores no ENUM, UNION, VARINT, BIT or fixed-size ARRAY (`INTEGER[3]`) column. A result that has one fails before
+anything is written, with LAKE_TYPE_UNSUPPORTED and the cast that fixes it (`CAST(col AS VARCHAR)`).
+
+Four types it stores, but not exactly once its rows are in a Parquet file (a few rows stay in the catalog, which hides
+it, and the maintenance pass then moves them into files), measured on DuckDB 2.0.0 with DuckLake 1.0: a HUGEINT or UHUGEINT is stored as a DOUBLE, so a value past 2^53 comes
+back changed (9007199254740993 as 9007199254740992) and one near the top of the range cannot be read at all; an INTERVAL
+keeps its milliseconds and loses the microseconds under them; a TIMETZ comes back as the same time at offset 0
+(10:11:12+02 as 08:11:12+00); and so does one inside a STRUCT, a LIST or a MAP. Every other type a croft table has is
+stored exactly: all the integer widths, DECIMAL (DECIMAL(38,0) holds any 38-digit whole number, so it is the cast for a
+HUGEINT), FLOAT and DOUBLE with NaN and infinity, VARCHAR, BLOB, DATE, TIME, every TIMESTAMP, UUID, JSON, STRUCT, LIST and MAP.
+So a lake never gets a column of those types: a run that would write one is refused by the column's type, whatever its
+values are, before anything is written (LAKE_VALUES_INEXACT, with the cast: DECIMAL(38,0) or text for a HUGEINT, text for
+the others), and croft's own type inference makes a column of integers past 64 bits DECIMAL(38,0), which is exact, in
+place of HUGEINT; a SQL or TypeScript transform's HUGEINT column (`sum()` of integers) becomes DECIMAL(38,0) the same way. `croft move-to-lake` finds such columns in the file before it starts and proves every value equal
+afterwards. A file keeps HUGEINT as it was.
+
+## Moving an existing project into a lake
+
+A project that keeps its warehouse in a file moves into a lake with one command, and the file stays untouched as the way
+back. It is the user's decision, and it ends in `croft confirm`.
+
+1. Whoever runs the Postgres and the bucket makes a NEW catalog database and bucket folder, as above. The lake must hold
+   nothing: croft never writes into a lake that already holds tables.
+2. The project names the lake in croft.json with `"enabled": false`, so that it stays on the file until the move is done:
+
+       "lake": { "enabled": false, "catalog": { ... }, "bucket": { ... } }
+
+   The secrets go in .env, the lake add-on is installed (`bun add @zabaca/croft-addon-lake@<version>`), and croft serve is
+   stopped if it runs (it would keep serving and scheduling for the file). Server mode and readCopy must be off: server mode
+   over a lake is not built yet, and a project that has it on is refused with its keys and settings left as they are.
+3. `croft move-to-lake` prints what it would do and a token (exit 5; on a terminal it asks y/N). Show the user the
+   impact, and only after an explicit yes run `croft confirm <token>`.
+
+What the move does, in order, and what it proves:
+- It backs the file up first, with croft's own backup (the file checkpointed and cloned under its lock, with run history
+  and the trash, in .croft/backups/), and holds a lease on every asset so no run starts meanwhile.
+- It copies from that backup, never from the live file: every table of `main` with its exact types, and every row of
+  croft's own records (`_croft`: assets, columns, inputs, files, writes), which become the lake's logs. All of it is ONE
+  lake transaction, so the lake holds the whole copy or nothing.
+- It then proves it, with a new connection that uses the READ-ONLY login and key (so the reader's credentials are
+  proved too): every table's columns and types, its row count and its rows (EXCEPT ALL against the backup's), and every
+  `_croft` table (a floating-point column bit for bit, so a -0.0 that became 0.0 is a difference). Any difference takes the copy out of the lake again (MOVE_NOT_EQUAL) and the project stays on the file.
+- It fingerprints the file (sha256, by a child process, never by this one) before and after: if anything wrote it
+  meanwhile, the copy is taken out again (MOVE_FILE_CHANGED).
+- Last, it sets `"enabled": true` in croft.json: one token replaced in your text, written whole by a rename.
+
+What moves: the tables and their rows, and croft's records of them, so `croft status` shows the same staleness and the
+next run does only what it would have done on the file. What stays where it is: the trash (local files; `croft restore`
+brings a version back into the lake), run history, schedules and approvals (runs.sqlite), asset files and .env. What does
+not come along: time travel (a file keeps none, so the lake's history starts with the move) and anything in the file that
+is not a table of `main` (views, macros, sequences, indexes, types, tables of other schemas), which the question names.
+
+Before it starts, the move refuses, with the fix: a column a lake cannot store (LAKE_TYPE_UNSUPPORTED, every table at
+once), columns of a type a lake would store inexactly (LAKE_VALUES_INEXACT), a lake that holds anything (MOVE_LAKE_NOT_EMPTY), no
+lake block or a project already in the lake (MOVE_NEEDS_LAKE), and server mode, a read copy, a running croft serve, a
+rename that did not finish, a write-ahead log the file still holds (run croft backup, which folds it in) or a croft.json
+it cannot rewrite (MOVE_BLOCKED). It then changes nothing.
+
+The way back is the setting: `"enabled": false`, and the project is on the file again, byte for byte as the move left it
+(the question and the result give its sha256). Writes made in the lake since are not carried back; they stay in the lake,
+and the setting `true` brings them back. croft keeps the catalog mirror in runs.sqlite for the warehouse the project is on,
+so going back restores the file's own mirror and status, the plan and the next run read the file. A move into the same lake
+after going back is refused (MOVE_LAKE_NOT_EMPTY), written since or not: that move finished, and croft never merges into
+a lake or writes over one. To use that lake again set `"enabled": true` by hand; to move the file again, name a new lake.
+
+If the move stops (a kill, a lost connection), the project is on the file or in the lake, never between. The next
+`croft move-to-lake` recognises the copy it left in the lake (a marker row in `_croft.meta`, and its commit being the
+lake's newest snapshot) and finishes by proving it and switching, without copying twice.
 
 ## Not in this release
 
-- Moving an existing project's file into a lake, and server mode over a lake.
+- Server mode over a lake, and moving a project from a lake back into a file (going back is the setting above).
 - A lake on one machine with no Postgres (a SQLite catalog and a folder). It exists for croft's own tests, and croft.json refuses it
   otherwise; it may be offered later as its own decision.
 
 Codes: LAKE_ATTACH_FAILED, LAKE_STORE_TLS, LAKE_CONNECTION_LOST, LAKE_COMMIT_UNCERTAIN, LAKE_TYPE_UNSUPPORTED, LAKE_DIRECT_READ,
 LAKE_UNSUPPORTED, LAKE_OTHER_WRITER, LAKE_MAINTENANCE_FAILED, LAKE_EXPIRY_OPTION, LAKE_BACKUP_FAILED,
-LAKE_BACKUP_TOOL_MISSING, MAINTAIN_NEEDS_LAKE (croft docs <CODE>), and EXTENSION_MISSING when the add-on is not installed.
+LAKE_BACKUP_TOOL_MISSING, LAKE_VALUES_INEXACT, MAINTAIN_NEEDS_LAKE, MOVE_NEEDS_LAKE, MOVE_BLOCKED, MOVE_LAKE_NOT_EMPTY,
+MOVE_NOT_EQUAL, MOVE_FILE_CHANGED (croft docs <CODE>), and EXTENSION_MISSING when the add-on is not installed.

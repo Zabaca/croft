@@ -74,6 +74,11 @@
       "additionalProperties": false,
       "required": ["catalog"],
       "properties": {
+        "enabled": {
+          "description": "lake mode: false names a lake the project is not in yet; the warehouse stays the file until croft move-to-lake copies it into the lake and sets this to true. Setting it back to false returns to the untouched file (writes made in the lake since are not carried back)",
+          "type": "boolean",
+          "default": true
+        },
         "catalog": {
           "description": "where the lake keeps its table list",
           "type": "object",

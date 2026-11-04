@@ -34,13 +34,34 @@ const folder = (): string => {
   return d;
 };
 
+describe("a lake block that is switched off (D167)", () => {
+  test("names a lake the project is not in: the file is still the warehouse, and the block is kept for croft move-to-lake", () => {
+    const r = validateConfig({ ...tz, lake: { ...shared(), enabled: false } });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.config.lake).toBeNull();
+    expect(r.config.idleLake).toMatchObject({ kind: "postgres", enabled: false, catalog: { host: "db.example.com", database: "croft_lake" } });
+    // On by default, and on when it says so.
+    expect((validateConfig({ ...tz, lake: shared() }) as { config: { idleLake: unknown } }).config.idleLake).toBeNull();
+    expect((validateConfig({ ...tz, lake: { ...shared(), enabled: true } }) as { config: { lake: unknown } }).config.lake).not.toBeNull();
+  });
+
+  test("is validated like a lake that is on, and server mode and a read copy are not refused while it is off", () => {
+    expect(messages({ lake: { ...shared(), enabled: false, catalog: undefined } })).toEqual([expect.stringContaining('"lake" needs "catalog"')]);
+    expect(messages({ lake: { ...shared(), enabled: "no" } })).toEqual([expect.stringContaining('"lake.enabled" must be true or false')]);
+    expect(messages({ lake: { ...shared(), enabled: false }, serverMode: { enabled: true }, readCopy: true })).toEqual([]);
+    // On, the same project is refused until server mode over a lake exists.
+    expect(messages({ lake: shared(), serverMode: { enabled: true } })).toEqual([expect.stringContaining("cannot be on in a project with a lake")]);
+  });
+});
+
 describe("a shared lake", () => {
   test("is read into the config the rest of croft uses, with the defaults and the folder written the one way", () => {
     const r = validateConfig({ ...tz, lake: shared() });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.config.lake).toEqual({
-      kind: "postgres",
+      kind: "postgres", enabled: true,
       catalog: { host: "db.example.com", port: 5432, database: "croft_lake", sslMode: "verify-full",
         writer: { user: "croft_writer", passwordSecret: "LAKE_WRITER_PASSWORD" }, reader: { user: "croft_reader", passwordSecret: "LAKE_READER_PASSWORD" } },
       bucket: { name: "my-bucket", folder: "croft/orders/", urlStyle: "path", useSsl: true,
@@ -208,7 +229,7 @@ describe("a local lake", () => {
 
   test("is a SQLite catalog and a folder, both as written", () => {
     const r = validateConfig({ ...tz, lake: local });
-    expect(r.ok && r.config.lake).toEqual({ kind: "local", catalog: { path: "lake/catalog.sqlite" }, dataPath: "lake/data", maintenance: { enabled: true, everyHours: 24 } });
+    expect(r.ok && r.config.lake).toEqual({ kind: "local", enabled: true, catalog: { path: "lake/catalog.sqlite" }, dataPath: "lake/data", maintenance: { enabled: true, everyHours: 24 } });
     const root = "/p/proj";
     expect(localLakePaths(r.ok && r.config.lake?.kind === "local" ? r.config.lake : (null as never), root)).toEqual({ catalog: "/p/proj/lake/catalog.sqlite", data: "/p/proj/lake/data" });
     expect(lakeLabel(r.ok ? r.config.lake! : (null as never), root)).toBe("lake lake/catalog.sqlite");

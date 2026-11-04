@@ -69,7 +69,7 @@ describe("loadProject", () => {
     expect(p.root).toBe(root);
     expect(p.timezone).toBe("Asia/Tokyo");
     expect(p.config).toEqual({
-      database: "warehouse.duckdb", timezone: "Asia/Tokyo", readCopy: false, serverMode: { enabled: false, acceptFullCopyCost: false, quackHost: "127.0.0.1", quackPort: 9494, quackPlaintextOnNetwork: false, quackMaxConcurrent: 4 }, lake: null,
+      database: "warehouse.duckdb", timezone: "Asia/Tokyo", readCopy: false, serverMode: { enabled: false, acceptFullCopyCost: false, quackHost: "127.0.0.1", quackPort: 9494, quackPlaintextOnNetwork: false, quackMaxConcurrent: 4 }, lake: null, idleLake: null,
       notify: { desktop: true, webhook: null }, concurrency: 4, http: { budgets: {} },
       serve: { port: 7447, host: "127.0.0.1", queryTimeoutMs: 30000, maxConcurrent: 4, maxBytes: 67108864, maxRows: 100000, allowOrigins: [], sharedTables: [] },
       stateDir: null, secretsFrom: null,

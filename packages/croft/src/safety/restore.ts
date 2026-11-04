@@ -23,7 +23,8 @@ import { existsSync } from "node:fs";
 import { CroftError } from "../core/errors.ts";
 import { now as clockNow } from "../core/time.ts";
 import type { Problem, Sql } from "../core/types.ts";
-import { ASSET_TABLES, assetColumn, bookkeepingOf } from "../db/bookkeeping.ts";
+import { ASSET_TABLES, assetColumn, bookkeepingOf, inLake } from "../db/bookkeeping.ts";
+import { refuseUnfitLakeColumns } from "../db/lake.ts";
 import { ensureState, hasState } from "../db/state.ts";
 import type { DuckWarehouse } from "../db/warehouse.ts";
 import { quoteIdent, readTableSchema } from "../load/evolve.ts";
@@ -224,6 +225,8 @@ async function impactOn(sql: Sql, v: TrashEntry, alias: string): Promise<Restore
     });
   }
   const kind = await kindOf(sql, alias);
+  // A lake stores some types inexactly or not at all (D142, D174): a version from the file's days that has such a column cannot come back as it was.
+  if (kind === "table" && (await inLake(sql))) refuseUnfitLakeColumns(asset, (await readTableSchema(sql, asset, alias)) ?? []);
   const exists = (await readTableSchema(sql, asset)) !== null;
   const currentRows = exists ? await count(sql, `main.${quoteIdent(asset)}`) : null;
   const all = await count(sql, `${quoteIdent(alias)}.main.${quoteIdent(asset)}`);

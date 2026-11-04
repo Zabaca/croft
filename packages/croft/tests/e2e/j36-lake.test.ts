@@ -190,7 +190,8 @@ maybe("journey 36 (equal): a file and a lake given the same fixtures hold the sa
       const rows = (await run(p, ["query", "select name, row_count::INT as row_count from _croft.assets order by name"])).json.data.rows;
       const writes = (await run(p, ["query", "select asset, mode, rows_in::INT as rows_in, added::INT as added, updated::INT as updated, unchanged::INT as unchanged, deleted::INT as deleted from _croft.writes order by loaded_at, asset"])).json.data.rows;
       const cols = (await run(p, ["query", "select asset, name, type from _croft.columns order by asset, name"])).json.data.rows;
-      return { tables, rows, writes, cols };
+      // A lake stores a transform's HUGEINT (sum() of integers) as DECIMAL(38,0), which keeps every digit (D174): the one type that differs.
+      return { tables, rows, writes, cols: cols.map((c: { type: string }) => ({ ...c, type: c.type === "DECIMAL(38,0)" ? "HUGEINT" : c.type })) };
     };
     for (const p of [file, lake]) {
       p.write("assets/region_summary.sql", SUMMARY_SQL);

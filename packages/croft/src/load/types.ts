@@ -12,6 +12,7 @@
 // mixed fractions became VARCHAR, day/month order flipped with the rows present) [V], so two loads of the
 // same source could type differently. These rules depend only on the kinds of values seen.
 import { problem } from "../core/errors.ts";
+import { LAKE_HUGE } from "../db/lake.ts";
 import type { ColumnPlan, Problem, ValueKind } from "../core/types.ts";
 
 export const VALUE_KINDS: readonly ValueKind[] = [
@@ -295,11 +296,20 @@ export function pinFor(pins: Record<string, Pin>, column: string, sourceName?: s
   return undefined;
 }
 
+/** What evolution does differently in a lake (D174). */
+export interface EvolveOptions {
+  /** The warehouse is a lake: it stores a HUGEINT as a DOUBLE, so croft's own inference makes a column of integers past 64 bits DECIMAL(38,0) (exact up
+   *  to 38 digits), and a stored unpinned DECIMAL(38,0) is that column, with a HUGEINT's rules (it takes integers, widens to DOUBLE for fractions). */
+  lake?: boolean;
+}
+
+
 /**
  * One column's decision (the §7 evolution table). `existing` is undefined for a new column, `incoming`
  * undefined for a stored column absent from the batch.
  */
-export function planColumn(existing: KnownColumn | undefined, incoming: IncomingColumn | undefined, pin?: Pin): ColumnDecision {
+export function planColumn(existing: KnownColumn | undefined, incoming: IncomingColumn | undefined, pin?: Pin, o: EvolveOptions = {}): ColumnDecision {
+  const lakeType = (t: string): string => (o.lake && t === "HUGEINT" ? LAKE_HUGE : t);
   const name = existing?.name ?? incoming!.name;
   const sourceName = incoming?.sourceName ?? existing?.sourceName ?? name;
   const incomingKinds = incoming ? VALUE_KINDS.filter((k) => (incoming.counts[k] ?? 0) > 0) : [];
@@ -320,7 +330,7 @@ export function planColumn(existing: KnownColumn | undefined, incoming: Incoming
     }
     const nt = incoming!.newType ?? newColumnType(incoming!.counts, name, { unsafeIntegers: incoming!.unsafeIntegers });
     return {
-      ...base, decision: "add", target: nt.type, pinned: false, pending: nt.pending, format: nt.format, warnings: nt.warnings,
+      ...base, decision: "add", target: lakeType(nt.type), pinned: false, pending: nt.pending, format: nt.format, warnings: nt.warnings,
       reason: nt.pending ? `new column with only NULLs; typed ${nt.type} from its name` : `new column of ${describeKinds(kinds)} values`,
     };
   }
@@ -355,13 +365,16 @@ export function planColumn(existing: KnownColumn | undefined, incoming: Incoming
     }
     const nt = incoming.newType ?? newColumnType(incoming.counts, name, { unsafeIntegers: incoming.unsafeIntegers });
     return {
-      ...base, decision: "retype_pending", target: nt.type, pinned: false, pending: false, format: nt.format, warnings: nt.warnings,
+      ...base, decision: "retype_pending", target: lakeType(nt.type), pinned: false, pending: false, format: nt.format, warnings: nt.warnings,
       reason: `first values (${describeKinds(kinds)}) for a NULL-only placeholder`,
     };
   }
 
   const warnings: Problem[] = [];
-  const fam = typeFamily(stored);
+  // In a lake an unpinned DECIMAL(38,0) is the column croft made for integers past 64 bits: it follows a HUGEINT's rules.
+  const asHuge = o.lake === true && stored === LAKE_HUGE;
+  const fam = asHuge ? "hugeint" : typeFamily(stored);
+  const takes = (k: ValueKind) => (asHuge ? k === "null" || ALLOWED.hugeint.has(k) : castAllowed(k, stored));
   if (fam === "json" && existing.kinds && existing.kinds.length > 0) {
     const before = new Set(existing.kinds);
     const added = kinds.filter((k) => !before.has(k));
@@ -374,7 +387,7 @@ export function planColumn(existing: KnownColumn | undefined, incoming: Incoming
     }
   }
 
-  if (kinds.every((k) => castAllowed(k, stored))) {
+  if (kinds.every(takes)) {
     const native = kinds.every((k) => NATIVE[fam].has(k));
     return {
       ...base, decision: native ? "keep" : "cast", target: stored, pinned: false, pending: false, format: storedFormat, warnings,
@@ -382,9 +395,10 @@ export function planColumn(existing: KnownColumn | undefined, incoming: Incoming
     };
   }
 
-  const wider = widenTarget(stored, kinds);
-  const checkAgainst = wider ?? stored;
-  const conflictKinds = kinds.filter((k) => !castAllowed(k, checkAgainst));
+  const widerRaw = widenTarget(asHuge ? "HUGEINT" : stored, kinds);
+  const wider = widerRaw === null ? null : lakeType(widerRaw);
+  const checkAgainst = widerRaw ?? stored;
+  const conflictKinds = kinds.filter((k) => (wider || !asHuge ? !castAllowed(k, checkAgainst) : !takes(k)));
   if (wider && conflictKinds.length === 0) {
     const zoned = typeFamily(stored) === "date" && wider === "TIMESTAMPTZ";
     warnings.push(problem("TYPE_WIDENED", {
@@ -408,7 +422,7 @@ export function planColumn(existing: KnownColumn | undefined, incoming: Incoming
  * The plan for a whole batch: columns in the batch first (in batch order), then stored columns absent from
  * it. Pins apply by column name or source name.
  */
-export function evolve(existing: readonly KnownColumn[], incoming: readonly IncomingColumn[], pins: Record<string, Pin> = {}): ColumnDecision[] {
+export function evolve(existing: readonly KnownColumn[], incoming: readonly IncomingColumn[], pins: Record<string, Pin> = {}, o: EvolveOptions = {}): ColumnDecision[] {
   const byLower = new Map(existing.map((c) => [c.name.toLowerCase(), c]));
   const out: ColumnDecision[] = [];
   const seen = new Set<string>();
@@ -416,11 +430,11 @@ export function evolve(existing: readonly KnownColumn[], incoming: readonly Inco
     const lower = col.name.toLowerCase();
     const known = byLower.get(lower);
     seen.add(lower);
-    out.push(planColumn(known, col, pinFor(pins, known?.name ?? col.name, col.sourceName)));
+    out.push(planColumn(known, col, pinFor(pins, known?.name ?? col.name, col.sourceName), o));
   }
   for (const col of existing) {
     if (seen.has(col.name.toLowerCase())) continue;
-    out.push(planColumn(col, undefined, pinFor(pins, col.name, col.sourceName)));
+    out.push(planColumn(col, undefined, pinFor(pins, col.name, col.sourceName), o));
   }
   return out;
 }

@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
-import { isCommitFailure, isConflict, isConnectionError, lakeRefusedColumns, LakeWriteLock, machineId, newCommitTag, parseWriter, refuseLakeTypes, writerRecord, writerReport } from "./lake.ts";
+import { isCommitFailure, isConflict, isConnectionError, lakeInexactColumns, lakeRefusedColumns, refuseInexactTypes, LakeWriteLock, machineId, newCommitTag, parseWriter, refuseUnfitLakeColumns, writerRecord, writerReport } from "./lake.ts";
 
 const made: string[] = [];
 afterAll(() => {
@@ -56,19 +56,20 @@ describe("telling a lake's errors apart", () => {
 });
 
 describe("the types a lake cannot hold", () => {
-  test("ENUM, UNION and VARINT, also inside a STRUCT, a LIST or a MAP, and nothing else", () => {
+  test("ENUM, UNION, VARINT, BIT and a fixed-size ARRAY, also inside a STRUCT, a LIST or a MAP, and nothing else", () => {
     const cols = [
       { name: "a", type: "ENUM('x', 'y')" }, { name: "b", type: "UNION(num INTEGER, str VARCHAR)" }, { name: "c", type: "VARINT" },
       { name: "d", type: "STRUCT(s ENUM('p', 'q'), n INTEGER)" }, { name: "e", type: "ENUM('a')[]" }, { name: "f", type: "MAP(VARCHAR, UNION(i INTEGER))" },
       { name: "g", type: "VARCHAR" }, { name: "h", type: "BIGINT[]" }, { name: "i", type: "STRUCT(enumeration VARCHAR)" }, { name: "j", type: "HUGEINT" }, { name: "k", type: "BIGNUM" },
+      { name: "l", type: "BIT" }, { name: "m", type: "INTEGER[3]" }, { name: "n", type: "STRUCT(a VARCHAR[2])" }, { name: "o", type: "STRUCT(bit INTEGER)" }, { name: "p", type: "BIGINT[][]" },
     ];
-    expect(lakeRefusedColumns(cols).map((c) => [c.name, c.kind])).toEqual([["a", "ENUM"], ["b", "UNION"], ["c", "VARINT"], ["d", "ENUM"], ["e", "ENUM"], ["f", "UNION"], ["k", "VARINT"]]);
+    expect(lakeRefusedColumns(cols).map((c) => [c.name, c.kind])).toEqual([["a", "ENUM"], ["b", "UNION"], ["c", "VARINT"], ["d", "ENUM"], ["e", "ENUM"], ["f", "UNION"], ["k", "VARINT"], ["l", "BIT"], ["m", "ARRAY"], ["n", "ARRAY"]]);
   });
 
   test("LAKE_TYPE_UNSUPPORTED names every column, the cast that fixes each, and that nothing was written", () => {
     let caught: unknown;
     try {
-      refuseLakeTypes("orders", [{ name: "status", type: "ENUM('open','closed')" }, { name: "big", type: "VARINT" }, { name: "ok", type: "INTEGER" }], "assets/orders.sql");
+      refuseUnfitLakeColumns("orders", [{ name: "status", type: "ENUM('open','closed')" }, { name: "big", type: "VARINT" }, { name: "flags", type: "BIT" }, { name: "xy", type: "DOUBLE[2]" }, { name: "ok", type: "INTEGER" }], "assets/orders.sql");
     } catch (e) {
       caught = e;
     }
@@ -77,11 +78,13 @@ describe("the types a lake cannot hold", () => {
     expect(p.code).toBe("LAKE_TYPE_UNSUPPORTED");
     expect(p.message).toContain("status is ENUM('open','closed')");
     expect(p.hint).toContain("CAST(status AS VARCHAR) AS status");
-    expect(p.hint).toContain("CAST(big AS HUGEINT) AS big");
+    expect(p.hint).toContain("CAST(big AS DECIMAL(38,0)) AS big");
+    expect(p.hint).toContain("CAST(flags AS VARCHAR) AS flags");
+    expect(p.hint).toContain("CAST(xy AS DOUBLE[]) AS xy");
     expect(p.effect).toBe("nothing was written");
     expect(p.file).toBe("assets/orders.sql");
     expect(p.fix).toMatchObject({ kind: "manual" });
-    expect(() => refuseLakeTypes("orders", [{ name: "ok", type: "INTEGER" }])).not.toThrow();
+    expect(() => refuseUnfitLakeColumns("orders", [{ name: "ok", type: "INTEGER" }])).not.toThrow();
   });
 });
 
@@ -279,5 +282,43 @@ describe("croft's lock on the writes of a machine", () => {
     expect(lock.holder()).toBeNull();
     writeFileSync(join(dir, "other"), "x");
     (await lock.acquire({ waitMs: 1000, label: "next", busy, aborted }))();
+  });
+});
+
+describe("the types a lake stores inexactly (D174)", () => {
+  test("HUGEINT, UHUGEINT, INTERVAL and TIMETZ, also inside a STRUCT, a LIST or a MAP, by the column's type", () => {
+    const cols = [
+      { name: "a", type: "HUGEINT" }, { name: "b", type: "UHUGEINT" }, { name: "c", type: "INTERVAL" }, { name: "d", type: "TIME WITH TIME ZONE" },
+      { name: "e", type: "STRUCT(h HUGEINT, n INTEGER)" }, { name: "f", type: "HUGEINT[]" }, { name: "g", type: "MAP(VARCHAR, INTERVAL)" },
+      { name: "h", type: "DECIMAL(38,0)" }, { name: "i", type: "BIGINT" }, { name: "j", type: "STRUCT(interval VARCHAR)" }, { name: "k", type: "TIME" },
+      { name: "l", type: "TIMESTAMP WITH TIME ZONE" },
+    ];
+    expect(lakeInexactColumns(cols).map((c) => [c.name, c.kind, c.nested])).toEqual([
+      ["a", "HUGEINT", false], ["b", "UHUGEINT", false], ["c", "INTERVAL", false], ["d", "TIMETZ", false],
+      ["e", "HUGEINT", true], ["f", "HUGEINT", true], ["g", "INTERVAL", true],
+    ]);
+  });
+
+  test("LAKE_VALUES_INEXACT names every column and the cast that keeps it exact, and that nothing was written", () => {
+    let caught: unknown;
+    try {
+      refuseInexactTypes("totals", [{ name: "big", type: "HUGEINT" }, { name: "gap", type: "INTERVAL" }, { name: "at", type: "TIME WITH TIME ZONE" }, { name: "st", type: "STRUCT(h HUGEINT)" }, { name: "ok", type: "BIGINT" }], "assets/totals.sql");
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(CroftError);
+    const p = (caught as CroftError).problem;
+    expect(p.code).toBe("LAKE_VALUES_INEXACT");
+    expect(p.message).toContain("big is HUGEINT");
+    expect(p.hint).toContain("CAST(big AS DECIMAL(38,0)) AS big");
+    expect(p.hint).toContain("CAST(gap AS VARCHAR) AS gap");
+    expect(p.hint).toContain("CAST(at AS TIME) AS at");
+    expect(p.hint).toContain("to_json(st)");
+    expect(p.effect).toBe("nothing was written");
+    expect(p.file).toBe("assets/totals.sql");
+    expect(() => refuseInexactTypes("totals", [{ name: "ok", type: "DECIMAL(38,0)" }])).not.toThrow();
+    // A write that has both kinds is told the unsupported ones first, and the inexact ones once they are fixed.
+    expect(() => refuseUnfitLakeColumns("t", [{ name: "e", type: "ENUM('a')" }, { name: "h", type: "HUGEINT" }])).toThrow(/cannot store/);
+    expect(() => refuseUnfitLakeColumns("t", [{ name: "h", type: "HUGEINT" }])).toThrow(/differently from the ones written/);
   });
 });

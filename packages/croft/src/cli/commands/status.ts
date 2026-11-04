@@ -62,6 +62,7 @@ import { assessCopyPolicy, type CloneProbe, copyCostlyProblem, notClonedProblem,
 import { failedPassProblem, type MaintenanceView, maintenanceView, readState } from "../../db/lake-maintenance-state.ts";
 import { readCopyStatus, readCopyView, type ReadCopyView, readCopyWords } from "../../db/readcopy.ts";
 import { allCatalog, type CatalogAsset } from "../../history/catalog.ts";
+import { readMoveRecord } from "../../history/mirror-home.ts";
 import { type DriftEntry, driftNote, recentDrift } from "../../history/drift.ts";
 import { logDir, tail } from "../../history/logs.ts";
 import { RUNS_DB_FILE, RunsDb, type RunRecord, type StepRecord } from "../../history/runs-db.ts";
@@ -158,6 +159,10 @@ export interface StatusData {
     /** The add-on that carries server mode's DuckDB extension files, and whether this machine finds them (D134). */
     addons: AddonView[];
   };
+  /** The project and a lake it was moved to or may be moved to (option 07, slice 4): `idle` (a lake block with "enabled": false, nothing moved yet),
+   *  `moved` (it is in the lake, moved in from the file on `at`; the file is untouched and is the way back) or `back` (it was moved and is on the
+   *  file again; what was written in the lake since is not in the file). From croft.json and runs.sqlite alone. */
+  lakeMove?: { state: "idle" | "moved" | "back"; lake: string; at: string | null; tables: number | null; rows: number | null; fileSha256: string | null };
   /** With a `lake` in croft.json (D138): where the warehouse is, and the add-on that carries lake mode's DuckDB extension files. */
   lake?: {
     /** "postgres": a shared lake (a Postgres catalog and a bucket); "local": a SQLite catalog and a folder. */
@@ -719,6 +724,18 @@ export async function collectStatus(project: Project, now: Date, o: { resolved?:
       if (policy.refused) copyProblems.push(copyCostlyProblem(policy, "limit"));
       else if (policy.warn) copyProblems.push(notClonedProblem(policy));
     }
+    {
+      const moved = db ? readMoveRecord(db) : null;
+      const label = (l: import("../../project/lake-config.ts").LakeConfig) => (l.kind === "postgres" ? bucketPath(l.bucket) : l.dataPath);
+      if (project.config.lake && moved) {
+        data.lakeMove = { state: "moved", lake: label(project.config.lake), at: zoned(moved.at, tz), tables: moved.tables, rows: moved.rows, fileSha256: moved.fileSha256 };
+      } else if (project.config.idleLake) {
+        data.lakeMove = {
+          state: moved ? "back" : "idle", lake: label(project.config.idleLake), at: moved ? zoned(moved.at, tz) : null,
+          tables: moved?.tables ?? null, rows: moved?.rows ?? null, fileSha256: moved?.fileSha256 ?? null,
+        };
+      }
+    }
     if (project.config.serverMode.enabled || project.config.lake) {
       // The add-ons with the modes' extension files (D134): croft serve cannot start without them, nor a lake open, so a missing one is a
       // problem here.
@@ -996,7 +1013,7 @@ export function nextText(n: AssetNext, tz: string, now: Date): string {
 export function formatStatus(d: StatusData, now: Date, o: { tz?: string; problems?: readonly Problem[]; root?: string; database?: string } = {}): string {
   const tz = o.tz ?? "UTC";
   const stale = o.problems?.find((p) => p.code === "SCHEDULER_STALE");
-  const tail = [...(stale ? logTailLines(stale) : []), ...readCopyLines(d, now, tz, o)];
+  const tail = [...(stale ? logTailLines(stale) : []), ...readCopyLines(d, now, tz, o), ...lakeMoveLines(d, now, tz)];
   if (d.assets.length === 0) {
     return ["No assets yet: add one to assets/ (croft new --list has templates), then croft run <asset>.", schedulingLine(d, now, tz), ...tail].join("\n");
   }
@@ -1031,6 +1048,19 @@ function readCopyLines(d: StatusData, now: Date, tz: string, o: { root?: string;
     ]
     : [];
   return [...mode, `Read copy ${w.text}`, ...(w.hint ? [`  hint: ${w.hint}`] : [])];
+}
+
+/** What a project that was or may be moved into a lake is told: not moved yet, moved in (the file is the way back), or back on the file. */
+function lakeMoveLines(d: StatusData, now: Date, tz: string): string[] {
+  const m = d.lakeMove;
+  if (!m) return [];
+  const when = m.at ? clockText(m.at, tz, now) : "";
+  const size = m.tables !== null ? `${formatCount(m.tables)} tables, ${formatCount(m.rows ?? 0)} rows` : "";
+  switch (m.state) {
+    case "idle": return [`Lake · ${m.lake} is named in croft.json and switched off ("enabled": false); croft move-to-lake moves this project into it, and the file stays as the way back`];
+    case "moved": return [`Lake · moved in from the file on ${when} (${size}); the file is untouched and is the way back: "lake.enabled": false (what is written in the lake after the move is not carried back)`];
+    case "back": return [`Lake · back on the file; it was moved into ${m.lake} on ${when} (${size}), and what was written there since is not in the file; "lake.enabled": true goes back to the lake`];
+  }
 }
 
 /** "Lake maintenance · last pass 3 h ago (482 snapshots expired; 849 → 367) · next due in 21 h", or why there is none. */

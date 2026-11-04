@@ -372,3 +372,32 @@ describe("CSV text rules", () => {
     expect(isAmericas("UTC")).toBe(false);
   });
 });
+
+describe("in a lake, integers past 64 bits are DECIMAL(38,0), not HUGEINT (D174)", () => {
+  const lake = { lake: true };
+  test("a new column, a widened integer column and a placeholder that gets its first values", () => {
+    expect(planColumn(undefined, inc("n", ["integer", "bigint"]))).toMatchObject({ decision: "add", target: "HUGEINT" });
+    expect(planColumn(undefined, inc("n", ["integer", "bigint"]), undefined, lake)).toMatchObject({ decision: "add", target: "DECIMAL(38,0)" });
+    expect(planColumn(undefined, inc("n", ["integer"]), undefined, lake)).toMatchObject({ target: "BIGINT" });
+    expect(planColumn(known("n", "BIGINT"), inc("n", ["bigint"]))).toMatchObject({ decision: "widen", target: "HUGEINT" });
+    expect(planColumn(known("n", "BIGINT"), inc("n", ["bigint"]), undefined, lake)).toMatchObject({ decision: "widen", target: "DECIMAL(38,0)" });
+    expect(planColumn(known("n", "BIGINT", { pending: true }), inc("n", ["bigint"]), undefined, lake)).toMatchObject({ decision: "retype_pending", target: "DECIMAL(38,0)" });
+    const csv = csvStats(["1", "123456789012345678901234"]);
+    expect(csvColumnType(csv, "n", { timezone: "UTC" }).type).toBe("HUGEINT");
+    expect(planColumn(undefined, inc("n", { integer: 1, bigint: 1 }, { newType: csvColumnType(csv, "n", { timezone: "UTC" }) }), undefined, lake)).toMatchObject({ target: "DECIMAL(38,0)" });
+  });
+
+  test("a stored unpinned DECIMAL(38,0) takes integers as a HUGEINT does, and a fraction widens it to DOUBLE (the loss proof then guards the stored values)", () => {
+    const stored = known("n", "DECIMAL(38,0)");
+    expect(planColumn(stored, inc("n", ["integer", "bigint"]), undefined, lake)).toMatchObject({ decision: "keep", target: "DECIMAL(38,0)" });
+    expect(planColumn(stored, inc("n", ["float"]), undefined, lake)).toMatchObject({ decision: "widen", target: "DOUBLE", proof: "double" });
+    expect(planColumn(stored, inc("n", ["string"]), undefined, lake)).toMatchObject({ decision: "conflict", target: "DECIMAL(38,0)" });
+    // Outside a lake it is the DECIMAL it is: a fraction is cast into it (and the loss check refuses 1.5).
+    expect(planColumn(stored, inc("n", ["float"]))).toMatchObject({ decision: "keep" });
+  });
+
+  test("a pinned DECIMAL(38,0) is the person's, and stays one; a pin to HUGEINT stays HUGEINT (a lake write refuses it)", () => {
+    expect(planColumn(known("n", "DECIMAL(38,0)"), inc("n", ["integer"]), { type: "DECIMAL(38,0)" }, lake)).toMatchObject({ decision: "keep", target: "DECIMAL(38,0)", pinned: true });
+    expect(planColumn(undefined, inc("n", ["integer"]), { type: "HUGEINT" }, lake)).toMatchObject({ decision: "add", target: "HUGEINT", pinned: true });
+  });
+});
