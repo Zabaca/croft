@@ -18,7 +18,7 @@ import {
   SKILL_PATH, skillMd, UnbalancedBlock, upsertBlock, type BlockAction,
 } from "../agent/templates.ts";
 import { planExclude } from "./init-tsconfig.ts";
-import { CONFIG_FILE, findRoot, relocationDir, syncedLocation } from "./root.ts";
+import { CONFIG_FILE, findRoot, relocationDir, syncedLocation, withoutBom } from "./root.ts";
 
 export const DATA_DIR = "data";
 
@@ -264,7 +264,7 @@ async function refreshClaude(target: string, o: InitOptions): Promise<InitResult
   }
   let timezone = detectTimeZone();
   try {
-    const tz = (JSON.parse(readFileSync(join(root, CONFIG_FILE), "utf8")) as { timezone?: unknown }).timezone;
+    const tz = (JSON.parse(withoutBom(readFileSync(join(root, CONFIG_FILE), "utf8"))) as { timezone?: unknown }).timezone;
     if (typeof tz === "string") timezone = tz;
   } catch { /* a broken croft.json is validate's business; the Claude files are still refreshed */ }
   return {

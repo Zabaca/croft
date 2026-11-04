@@ -4301,8 +4301,8 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 
 **D194. `croft move-to-lake` reads croft.json the way the loader does, byte-order mark included. (new, 2026-11-04; refines D172)**
 - `readCopyByName` read croft.json with `JSON.parse` on the raw text, which refuses a leading byte-order mark, and answered false for a file it could not parse; the loader strips the mark (`parseConfig`). A croft.json with a mark and `"readCopy": true` passed the move's check, and the project failed CONFIG_INVALID after the switch ("`readCopy` does not apply to a lake").
-- Choice: `withoutBom` (project/root.ts) is the one place the mark is stripped, used by `parseConfig` and by `readCopyByName`. The same `JSON.parse` of `init.ts` (the time zone it reads for the Claude files) does not strip it either; it is not part of this change.
-- Build: `cli/commands/move-to-lake.test.ts` "a read copy is refused in a croft.json that starts with a byte-order mark".
+- Choice: `withoutBom` (project/root.ts) is the one place the mark is stripped, used by `parseConfig`, by `readCopyByName` and by `croft init --claude`, which reads the time zone for the Claude files and fell back to the detected one when the mark made the parse fail.
+- Build: `cli/commands/move-to-lake.test.ts` "a read copy is refused in a croft.json that starts with a byte-order mark"; `project/init.test.ts` "reads the time zone from a croft.json that starts with a byte-order mark".
 
 ---
 

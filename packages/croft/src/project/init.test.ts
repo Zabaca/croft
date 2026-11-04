@@ -234,6 +234,15 @@ describe("croft init in an existing app repo", () => {
 });
 
 describe("croft init --claude", () => {
+  test("reads the time zone from a croft.json that starts with a byte-order mark, as the loader does", async () => {
+    const root = fresh();
+    await initProject(opts(root));
+    const file = join(root, "croft.json");
+    writeFileSync(file, `\uFEFF${read(file)}`);
+    const r = await initProject(opts(root, { claudeOnly: true }));
+    expect(r.timezone).toBe("Asia/Tokyo");
+  });
+
   test("is idempotent and replaces only the managed block", async () => {
     const root = fresh();
     await initProject(opts(root));
