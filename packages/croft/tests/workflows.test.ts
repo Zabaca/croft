@@ -84,7 +84,8 @@ describe("which workflows can publish", () => {
       for (const st of steps.filter((x) => x !== sharded[0] && /\bbun (test|run typecheck)\b/.test(x.run ?? ""))) expect(st.if, `${name}: ${st.name}`).toBe("matrix.shard == 1");
     }
     // Both shards of every platform are in the matrix, so the whole suite runs on each.
-    expect(doc.jobs.test.strategy.matrix.os).toEqual(["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15"]);
+    // No macOS job (DESIGN.md D190): GitHub's hosted Mac runners were dropping jobs unstarted.
+    expect(doc.jobs.test.strategy.matrix.os).toEqual(["ubuntu-24.04", "ubuntu-24.04-arm"]);
     expect(doc.jobs.test.strategy.matrix.bun).toEqual(["1.3.14", "latest"]);
   });
 
