@@ -289,7 +289,9 @@ export async function countSuperseded(sql: Sql): Promise<number> {
  * ever: a run with nothing new took 9 s and nothing said why (the second real-lake trial). DuckLake has no way to take rows back, so they are
  * copied out, deleted and inserted again in inserts small enough to stay in the catalog (its inlining limit, 10 rows by default); the file that
  * held them is then read by nobody, and the pass's `rewrite` step drops it (its rows are all deleted) and `cleanup` deletes it from the store.
- * A table of more than REINLINE_MAX_ROWS rows is left as it is: that is a hundred inserts or more, and its reads are not the cost that matters.
+ * Only the rows that are in files are moved (the row ids a live file covers), and at most REINLINE_MAX_ROWS of a table in one pass: that many rows is
+ * a hundred inserts, which a transaction can carry at a distance. A table with more in files comes back over several passes (`_croft.writes_log`
+ * grows with every write and may be one of them); the file keeps what has not moved, and is dropped by the pass whose batch was its last.
  */
 export async function pruneBookkeeping(sql: Sql, o: { maxRows?: number; filesInStore?: boolean } = {}): Promise<{ tables: number; rows: number; reinlined: number; reinlinedRows: number; leftInFiles: number }> {
   const none = { tables: 0, rows: 0, reinlined: 0, reinlinedRows: 0, leftInFiles: 0 };
@@ -306,15 +308,14 @@ export async function pruneBookkeeping(sql: Sql, o: { maxRows?: number; filesInS
       if (n > 0) out.tables++;
       out.rows += n;
     }
+    const batch = Math.max(1, o.maxRows ?? REINLINE_MAX_ROWS);
     for (const f of inFiles) {
-      const rows = num((await sql.all<{ n: unknown }>(`SELECT count(*) AS n FROM _croft.${quoteIdent(f.table)}`))[0]?.n);
-      if (rows > (o.maxRows ?? REINLINE_MAX_ROWS)) {
-        out.leftInFiles++;
-        continue;
+      const moved = await reinline(sql, f, batch, limit);
+      if (moved.rows > 0) {
+        out.reinlined++;
+        out.reinlinedRows += moved.rows;
       }
-      await reinline(sql, f.table, rows, limit);
-      out.reinlined++;
-      out.reinlinedRows += rows;
+      if (moved.more) out.leftInFiles++;
     }
     await sql.exec("COMMIT");
   } catch (e) {
@@ -328,7 +329,7 @@ export async function pruneBookkeeping(sql: Sql, o: { maxRows?: number; filesInS
   return out;
 }
 
-/** The most rows a table of croft's bookkeeping is rewritten back into the catalog with: at DuckLake's 10 rows an insert, a hundred statements. */
+/** The most rows of a table of croft's bookkeeping that one pass brings back into the catalog: at DuckLake's 10 rows an insert, a hundred statements. */
 export const REINLINE_MAX_ROWS = 1000;
 
 const quoteIdent = (name: string): string => `"${name.replaceAll('"', '""')}"`;
@@ -347,33 +348,58 @@ async function inliningLimit(sql: Sql): Promise<number> {
   }
 }
 
-/** Copy a table's rows out, delete them and insert them again `limit` rows at a time (in the caller's transaction), numbered as they were read. */
-async function reinline(sql: Sql, table: string, rows: number, limit: number): Promise<void> {
-  const t = `_croft.${quoteIdent(table)}`;
-  const keep = quoteIdent(`__croft_keep_${table}`);
-  await sql.exec(`CREATE OR REPLACE TEMP TABLE ${keep} AS SELECT row_number() OVER () AS __n, * FROM ${t}`);
-  await sql.exec(`DELETE FROM ${t}`);
+/**
+ * Bring up to `batch` of a table's rows that are in files back into the catalog (in the caller's transaction): copy them out, delete exactly those
+ * rows and insert them again `limit` rows at a time. The rows in files are those whose row ids a live file covers (`f.ranges`); a row the table
+ * took in the catalog has an id of its own, outside every file's. Returns how many rows moved and whether more are still in files.
+ */
+async function reinline(sql: Sql, f: BookkeepingInFiles, batch: number, limit: number): Promise<{ rows: number; more: boolean }> {
+  const t = `_croft.${quoteIdent(f.table)}`;
+  const keep = quoteIdent(`__croft_keep_${f.table}`);
+  const inFile = f.ranges.map((r) => `(rowid >= ${r.start} AND rowid < ${r.start + r.count})`).join(" OR ");
+  const [there] = await sql.all<{ n: unknown }>(`SELECT count(*) AS n FROM ${t} WHERE ${inFile}`);
+  const inFiles = num(there?.n);
+  const rows = Math.min(inFiles, batch);
+  if (rows === 0) return { rows: 0, more: false };
+  await sql.exec(`CREATE OR REPLACE TEMP TABLE ${keep} AS SELECT row_number() OVER (ORDER BY rowid) AS __n, rowid AS __rid, * FROM ${t} WHERE ${inFile} ORDER BY rowid LIMIT ${rows}`);
+  await sql.exec(`DELETE FROM ${t} WHERE rowid IN (SELECT __rid FROM ${keep})`);
   for (let from = 0; from < rows; from += limit) {
-    await sql.exec(`INSERT INTO ${t} SELECT * EXCLUDE (__n) FROM ${keep} WHERE __n > ${from} AND __n <= ${from + limit} ORDER BY __n`);
+    await sql.exec(`INSERT INTO ${t} SELECT * EXCLUDE (__n, __rid) FROM ${keep} WHERE __n > ${from} AND __n <= ${from + limit} ORDER BY __n`);
   }
   await sql.exec(`DROP TABLE ${keep}`);
+  return { rows, more: inFiles > rows };
 }
 
-export interface BookkeepingInFiles { table: string; files: number; bytes: number }
+export interface BookkeepingInFiles {
+  table: string;
+  files: number;
+  bytes: number;
+  /** The row ids each live file covers (the first and how many). */
+  ranges: { start: number; count: number }[];
+}
 
 /**
  * croft's own tables (`_croft`) that have data files in the store, and how many and how large. Empty for a lake whose bookkeeping is where a new
  * lake's is, inside the catalog. Read through the catalog's own tables, like lakeStats.
  */
 export async function bookkeepingInFiles(sql: Sql): Promise<BookkeepingInFiles[]> {
-  const rows = await sql.all<{ t: unknown; files: unknown; bytes: unknown }>(
-    `SELECT t.table_name AS t, count(*) AS files, coalesce(sum(f.file_size_bytes), 0) AS bytes
+  const rows = await sql.all<{ t: unknown; start: unknown; n: unknown; bytes: unknown }>(
+    `SELECT t.table_name AS t, f.row_id_start AS start, f.record_count AS n, coalesce(f.file_size_bytes, 0) AS bytes
      FROM ${M}.ducklake_data_file f
      JOIN ${M}.ducklake_table t ON t.table_id = f.table_id AND t.end_snapshot IS NULL
      JOIN ${M}.ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL
      WHERE s.schema_name = '_croft' AND f.end_snapshot IS NULL
-     GROUP BY t.table_name ORDER BY t.table_name`);
-  return rows.map((r) => ({ table: String(r.t), files: num(r.files), bytes: num(r.bytes) }));
+     ORDER BY t.table_name, f.row_id_start`);
+  const byTable = new Map<string, BookkeepingInFiles>();
+  for (const r of rows) {
+    const name = String(r.t);
+    const entry = byTable.get(name) ?? { table: name, files: 0, bytes: 0, ranges: [] };
+    entry.files++;
+    entry.bytes += num(r.bytes);
+    entry.ranges.push({ start: num(r.start), count: num(r.n) });
+    byTable.set(name, entry);
+  }
+  return [...byTable.values()];
 }
 
 /** Options another tool stored on the lake that would make a CHECKPOINT expire what the trash promises: an expiry by age. */
@@ -459,7 +485,7 @@ export interface PassOptions {
   onStep?: (step: StepName) => void | Promise<void>;
   /** Chunk size of the expiry's list of ids. */
   expireChunk?: number;
-  /** The most rows a table of croft's bookkeeping is brought back into the catalog with (REINLINE_MAX_ROWS); tests lower it. */
+  /** The most rows of a table of croft's bookkeeping that one pass brings back into the catalog (REINLINE_MAX_ROWS); tests lower it. */
   reinlineMaxRows?: number;
 }
 

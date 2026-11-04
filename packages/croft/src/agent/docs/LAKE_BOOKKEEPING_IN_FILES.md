@@ -16,8 +16,9 @@ What to do:
   all in one transaction with the removal of the rows nothing reads. The pass's rewrite step then drops the files,
   whose rows are all deleted, and its cleanup step deletes them from the store. croft's own pass does this too, once a
   day (`lake.maintenance`), so the warning goes by itself within a day of using this croft.
-- A table of more than 1,000 rows is left as it is, and `croft maintain` says so: that is a hundred inserts or more.
-  Its reads stay slow; the way out is to have less recorded in it (the files an ingest read, say).
+- A table with more than 1,000 rows in files comes back 1,000 rows a pass (that is a hundred inserts or more), so a
+  large one takes several passes; `croft maintain` says how many tables are still partly in files, and the warning
+  stays until the last pass has moved the last rows.
 - `croft doctor` shows the warning until no `_croft` table has a file, and `croft run` is quicker the moment it does.
 - Never move these rows by hand, and never run DuckLake's own `ducklake_flush_inlined_data` on the `_croft` schema:
   that is what put them in files.

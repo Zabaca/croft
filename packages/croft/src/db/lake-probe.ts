@@ -137,7 +137,15 @@ export function serverOffersTls(host: string, port: number, o: { timeoutMs?: num
     Bun.connect({
       hostname: host, port,
       socket: {
-        open(s) { socket = s; s.write(request); },
+        // A socket that opens after the probe has ended (its time ran out first) is closed here, not left open.
+        open(s) {
+          if (done) {
+            s.end();
+            return;
+          }
+          socket = s;
+          s.write(request);
+        },
         data(_s, d) { finish(d[0] === 0x53 ? "offered" : d[0] === 0x4e ? "refused" : "unknown"); },
         error() { finish("unknown"); },
         close() { finish("unknown"); },

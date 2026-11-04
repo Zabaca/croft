@@ -251,6 +251,21 @@ describe("what the client can know of the catalog connection's encryption (D-T1)
   });
 });
 
+describe("the SSL request probe leaves no socket open", () => {
+  test("when its time runs out the connection is closed (the case of a connection made after the end is the open handler's guard, which a local server cannot be slow enough to reach)", async () => {
+    let closed!: () => void;
+    const gone = new Promise<void>((resolve) => (closed = resolve));
+    // A server that never answers, and tells when a client has left.
+    const silent = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { open() {}, data() {}, close() { closed(); } } });
+    try {
+      expect(await serverOffersTls("127.0.0.1", silent.port, { timeoutMs: 0 })).toBe("unknown");
+      await gone; // the test's own timeout ends it if the socket was left open
+    } finally {
+      silent.stop(true);
+    }
+  }, 20_000);
+});
+
 describe("the catalog connection's TLS, from croft.json", () => {
   const writeBlock = (root: string, catalog: Record<string, unknown>) => {
     const file = join(root, "croft.json");

@@ -108,7 +108,7 @@ for (const kind of ["local", "postgres"] as const) {
   }, 600_000);
 }
 
-(ready.ready ? test : test.skip)("a table of more rows than the pass will rewrite is left in its file, and said so", async () => {
+(ready.ready ? test : test.skip)("a table with more rows in files than one pass brings back comes back over several passes, and the views never change", async () => {
   const l = await lakeProject("local", { extensionDir: ready.dir });
   const flush = writer(l);
   try {
@@ -119,16 +119,26 @@ for (const kind of ["local", "postgres"] as const) {
   }
   const w = writer(l);
   try {
-    // Two rows is more than this pass will rewrite of any table: every table with a file stays where it is.
-    const report = await w.write(MAINTENANCE_LOCK_LABEL, (sql) => runPass(sql, { now: new Date(), pins: [], reinlineMaxRows: 1, retry: { attempts: 1, baseMs: 1, sleep: async () => {} } }), { runId: "maintenance", transaction: false, touchesLake: false });
-    expect(report.steps[0]!.did.leftInFiles).toBeGreaterThan(0);
-    const left = await w.read((db) => bookkeepingInFiles(db), { purpose: "test" });
-    expect(left.length).toBeGreaterThan(0);
+    const views = async () => Object.fromEntries(await Promise.all(TABLES.map(async (t) => [t, JSON.stringify(await w.read((db) => db.all(`SELECT * FROM _croft.${t} ORDER BY ALL`), { purpose: "test" }))] as const)));
+    const before = await views();
+    const pass = () => w.write(MAINTENANCE_LOCK_LABEL, (sql) => runPass(sql, { now: new Date(), pins: [], reinlineMaxRows: 1, retry: { attempts: 1, baseMs: 1, sleep: async () => {} } }), { runId: "maintenance", transaction: false, touchesLake: false });
+    // One row a pass: the first pass moves some and leaves the rest of every table with more than one row in files, and says so ...
+    const first = await pass();
+    expect(first.steps[0]!.did.reinlinedRows).toBeGreaterThan(0);
+    expect(first.steps[0]!.did.leftInFiles).toBeGreaterThan(0);
+    expect((await w.read((db) => bookkeepingInFiles(db), { purpose: "test" })).length).toBeGreaterThan(0);
+    // ... and the passes after it bring back the rest, one row of a table at a time, until no table has a file.
+    let passes = 1;
+    while ((await w.read((db) => bookkeepingInFiles(db), { purpose: "test" })).length > 0) {
+      expect(++passes, "bookkeeping still in files").toBeLessThan(25);
+      expect((await pass()).ok).toBe(true);
+    }
+    expect(await views()).toEqual(before);
   } finally {
     await w.close();
     await closeAllWarehouses();
   }
-}, 240_000);
+}, 480_000);
 
 describe("the words", () => {
   test("a pass that brought bookkeeping back into the catalog, or left a table, says so", async () => {
@@ -136,6 +146,6 @@ describe("the words", () => {
     const step = (did: Record<string, number>) => ({ step: "prune" as const, status: "ok" as const, tookMs: 1, attempts: 1, did });
     expect(STEP_WORDS.prune!(step({ rows: 3, tables: 2 }))).toBe("3 superseded bookkeeping rows removed from 2 logs");
     expect(STEP_WORDS.prune!(step({ rows: 0, tables: 0, reinlined: 3, reinlinedRows: 41 }))).toContain("41 rows of 3 bookkeeping tables brought back into the catalog from files");
-    expect(STEP_WORDS.prune!(step({ rows: 0, tables: 0, leftInFiles: 1 }))).toContain("1 bookkeeping table left in files (too many rows to rewrite)");
+    expect(STEP_WORDS.prune!(step({ rows: 0, tables: 0, leftInFiles: 1 }))).toContain("1 bookkeeping table left in files (more rows in files than a pass brings back; the next pass goes on)");
   });
 });
