@@ -735,7 +735,7 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
         // The lake's counts in the same lease, so in the same transaction: a lease of its own cost a snapshot and a round trip or more per table (D-T2).
         try {
           const stats = await lakeStats(db);
-          maintenance = { stats, options: await ageBasedExpiryOptions(db), bookkeeping: stats.bookkeepingFiles > 0 ? await bookkeepingInFiles(db) : [] };
+          maintenance = { stats, options: await ageBasedExpiryOptions(db), bookkeeping: (stats.bookkeepingFiles ?? 0) > 0 ? await bookkeepingInFiles(db) : [] };
         } catch (e) {
           maintenance = e instanceof Error ? e : new Error(String(e));
         }

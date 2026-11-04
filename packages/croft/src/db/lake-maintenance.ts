@@ -176,8 +176,9 @@ export interface LakeStats {
   inlinedTables: number;
   /** Files freed and waiting for a cleanup to delete them. */
   pendingDeletion: number;
-  /** Data files of croft's own bookkeeping (`_croft`) in the store; a lake nothing flushed has none (bookkeepingInFiles names the tables). */
-  bookkeepingFiles: number;
+  /** Data files of croft's own bookkeeping (`_croft`) in the store; a lake nothing flushed has none (bookkeepingInFiles names the tables). Absent from
+   *  the summary of a pass that an older croft stored. */
+  bookkeepingFiles?: number;
   /** The oldest and newest snapshot's time (ISO), or null for a lake with none. */
   oldestSnapshotAt: string | null;
   newestSnapshotAt: string | null;
@@ -494,7 +495,7 @@ export async function runPass(sql: Sql, o: PassOptions): Promise<PassReport> {
       });
     }
   };
-  await step("prune", async () => pruneBookkeeping(sql, { filesInStore: before.bookkeepingFiles > 0, ...(o.reinlineMaxRows !== undefined ? { maxRows: o.reinlineMaxRows } : {}) }));
+  await step("prune", async () => pruneBookkeeping(sql, { filesInStore: (before.bookkeepingFiles ?? 0) > 0, ...(o.reinlineMaxRows !== undefined ? { maxRows: o.reinlineMaxRows } : {}) }));
   await step("flush", async () => {
     // The assets' schema alone (D162): the rows of `_croft` are a few at a time, and read on every run, so they are kept where a read of them is
     // one round trip to the catalog, not a list and a range read of a Parquet file for each table in the store.

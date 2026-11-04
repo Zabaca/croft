@@ -533,6 +533,9 @@
         "pendingDeletion": {
           "type": "number"
         },
+        "bookkeepingFiles": {
+          "type": "number"
+        },
         "oldestSnapshotAt": {
           "type": [
             "null",
