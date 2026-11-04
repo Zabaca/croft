@@ -17,7 +17,8 @@
 // A warehouse that is a lake (WarehouseOptions.lake; option 07, D138 to D144) is the same object with another store under it. There is no
 // file: the instance is an in-memory one that attaches the lake when its first connection is made and is then locked, and it stays open
 // for the life of the command (a re-attach after the lock is refused), so nothing lingers and nothing is closed after a lease. Every
-// connection works in the lake (`USE lake`), so the tables, the views and `current_database()` read as they do in a file. There is no
+// connection works in the lake (`USE lake`), so the tables, the views and `current_database()` read as they do in a file, and a read lease is
+// one transaction (the catalog charges round trips for each, D-T2). There is no
 // file lock and no write intent; the lock on writes is croft's own (db/lake.ts LakeWriteLock), one write at a time on this machine, and
 // croft serve never steps aside. A read whose catalog connection dropped is tried again; a write is tried again as a whole, after its
 // commit is checked by the tag it carries (a commit may have landed without its answer reaching us); every error that leaves a lease has

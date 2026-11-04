@@ -76,6 +76,23 @@ DuckLake migrate a catalog by itself. The writer's login and key are used only b
 `croft query`, `croft status`, `croft doctor` and the rest attach read-only with the read-only login and key. The
 read-only key is what keeps a reader that got past the gate out of the bucket, so it must not be able to write.
 
+## A catalog far away
+
+A hosted catalog is a round trip away from the machine that runs croft, and DuckLake pays the catalog several round trips for
+every transaction. croft keeps what a command asks of the lake in few transactions: a read is one, an ingest reads its own
+state once, and `croft doctor` reads the lake once. At 41 ms, on a four-asset project, a run with nothing new takes about 5 s,
+a `croft query` about 4 s and `croft doctor` about 5 s (see `docs/benchmarks/2026-11-03-lake-latency.md` in croft's source).
+A command on a lake costs at least 2.7 s at that distance whatever croft does (DuckLake attaches the catalog and loads it
+twice), and a step that writes about 7 s, so put the catalog near the machine that writes it.
+
+`croft doctor` leaves a lake's tables out of its comparison with croft's record (each costs the catalog's round trips);
+`croft doctor --tables` compares them all. If doctor warns with LAKE_BOOKKEEPING_IN_FILES, an older croft moved croft's own
+tables into files of the bucket, where every command reads them over the network: `croft maintain` brings them back.
+
+A catalog database that holds another lake is LAKE_CATALOG_MISMATCH: another DuckLake format, or a lake whose files are in
+another bucket folder than `lake.bucket` names. croft never migrates a lake and never overrides its data path; point
+`lake.catalog.database` at a database of croft's own.
+
 ## One writing machine
 
 One machine writes a lake, one write at a time. croft takes a lock of its own on the machine (`.croft/lake-write.lock`)

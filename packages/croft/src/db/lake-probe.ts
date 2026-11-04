@@ -12,7 +12,6 @@ import { bucketPath } from "../project/lake-config.ts";
 import type { Project } from "../project/root.ts";
 import { openMemory } from "./connect.ts";
 import { lakeConnection } from "./lake.ts";
-import { METADATA_ALIAS } from "./lake-maintenance.ts";
 import { storeTlsError } from "./store-tls.ts";
 
 /** How long the probe may take before doctor gives up on the bucket. */
@@ -119,7 +118,7 @@ export type TlsOffer = "offered" | "refused" | "unknown";
  * Ask a Postgres server the question libpq asks before anything else (an SSLRequest: eight bytes, to which the server answers `S` or `N`), and
  * nothing more: no login, no certificate check, no data. It is the client's side of the matter, which is what `croft doctor` needs to say whether a
  * connection is encrypted: the server's own view (`pg_stat_ssl`, which the first version read) is of the last hop of a proxy or a pooler, which
- * Neon's is, and said "NOT encrypted" about a connection that checked the certificate (the second real-lake trial). "unknown" for a server that
+ * a hosted catalog is, and said "NOT encrypted" about a connection that checked the certificate (the second real-lake trial, DESIGN.md D-T1). "unknown" for a server that
  * does not answer in `timeoutMs`, answers anything else, or cannot be reached.
  */
 export function serverOffersTls(host: string, port: number, o: { timeoutMs?: number } = {}): Promise<TlsOffer> {

@@ -650,7 +650,7 @@ function isThisMachine(host: string): boolean {
 /**
  * Whether the catalog's connection is encrypted, from the client's side (D165, D-T1): what lake.catalog.sslMode makes libpq do, and for `prefer`
  * whether the server offers TLS to be taken. The first version asked the server (`pg_stat_ssl`), which reports the last hop of a pooler or a proxy,
- * and said "NOT encrypted" of Neon's `verify-full` connection, which libpq would have ended had it not been encrypted. It never says what it does not
+ * and said "NOT encrypted" of a hosted catalog's `verify-full` connection, which libpq would have ended had it not been encrypted. It never says what it does not
  * know: a server that could not be asked is a note, not a warning, and `sslMode: "disable"` is said to be the setting's doing, not a fallback.
  */
 export function catalogEncryptionLine(host: string, sslMode: CatalogSslMode, offer: TlsOffer = "unknown"): { status: "ok" | "info" | "warn"; text: string } {
@@ -784,12 +784,7 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
   }
 }
 
-/**
- * The lake's maintenance line (D150; option 07, slice 3): when the last pass worked, and what the lake holds now (snapshots, files,
- * the tables that keep small inserts inside the catalog, and files freed but not yet deleted). A pass that failed is
- * LAKE_MAINTENANCE_FAILED, a warning; and an age-based expiry set on the lake by anyone is LAKE_EXPIRY_OPTION, a warning, since a
- * CHECKPOINT by that tool would expire versions the trash promises (croft's own pass expires by an explicit list and ignores it).
- */
+/** What the lake's maintenance line is made of, read in doctor's one lease on the lake (D-T6). */
 interface MaintenanceInputs {
   stats: import("../../db/lake-maintenance.ts").LakeStats;
   options: import("../../db/lake-maintenance.ts").ExpiryOption[];
@@ -797,6 +792,12 @@ interface MaintenanceInputs {
   bookkeeping: import("../../db/lake-maintenance.ts").BookkeepingInFiles[];
 }
 
+/**
+ * The lake's maintenance line (D150; option 07, slice 3): when the last pass worked, and what the lake holds now (snapshots, files,
+ * the tables that keep small inserts inside the catalog, and files freed but not yet deleted). A pass that failed is
+ * LAKE_MAINTENANCE_FAILED, a warning; and an age-based expiry set on the lake by anyone is LAKE_EXPIRY_OPTION, a warning, since a
+ * CHECKPOINT by that tool would expire versions the trash promises (croft's own pass expires by an explicit list and ignores it).
+ */
 async function checkLakeMaintenance(r: Report, d: DoctorDeps, project: Project, read: MaintenanceInputs | Error): Promise<void> {
   const lake = project.config.lake!;
   const { failedPassProblem, maintenanceView, readState } = await import("../../db/lake-maintenance-state.ts");
@@ -1509,7 +1510,7 @@ function checkSecretsCommand(r: Report, d: DoctorDeps, project: Project, from: S
   } else {
     // doctor runs the command only for a lake: opening it asks for the lake's secrets, and the command runs, once, when the shell and .env lack one (D163).
     const what = ran ? "run once by doctor, for the lake's secrets" : project.config.lake ? "not run: the shell and .env set every secret the lake names" : "not run by doctor";
-    // Where the program was found, unless the command already says exactly that (an absolute path printed twice, the second real-lake trial).
+    // Where the program was found, unless the command already says exactly that (an absolute path printed twice, the second real-lake trial, D-T8).
     const found = here === program ? "" : ` (${here})`;
     r.add("project", "secrets-from", "info", `secretsFrom: ${shown}${found}, ${what}${names}`, undefined, { command: from.command, found: here, unchecked, ran });
   }
