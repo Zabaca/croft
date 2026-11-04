@@ -2449,6 +2449,9 @@ croft status                # failed, stale, held, never run, edited since its l
 - Lake (croft docs lake): LAKE_CONNECTION_LOST or LAKE_ATTACH_FAILED are about the catalog or the bucket, not the project: check
   `croft doctor`, tell the user, run again when they are reachable. LAKE_COMMIT_UNCERTAIN: look at `croft status` before running
   again. LAKE_OTHER_WRITER: tell the user; do not run from this machine until they decide which machine writes.
+  LAKE_CATALOG_MISMATCH: the catalog database holds another lake (another format, or files in another folder); ask the user which
+  database is croft's, and never migrate it or override its data path. LAKE_BOOKKEEPING_IN_FILES (doctor): `croft maintain` mends it.
+  `croft doctor` leaves a lake's tables out of its comparison (each costs the catalog's round trips); `croft doctor --tables` compares them.
 - Lake maintenance: croft runs it by itself (croft docs lake); `croft maintain --dry-run` says what a pass would expire,
   `croft maintain` runs one. LAKE_MAINTENANCE_FAILED is a warning (the lake is fine; the next croft run or scheduler tick tries again once an hour has passed).
   A version of a table in a lake older than a few days is read with `AT (VERSION => n)` or `AT (TIMESTAMP => ...)` in

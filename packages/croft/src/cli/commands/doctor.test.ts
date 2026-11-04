@@ -1245,6 +1245,14 @@ describe("tables changed outside croft, drift and backups (§5 \"Out-of-band cha
     }]);
   });
 
+  test("--tables compares every table, whatever the time doctor allows", async () => {
+    const root = await project();
+    await croftWarehouse(root, [`DELETE FROM orders WHERE id = 3`]);
+    const { data, problems } = await runDoctor(root, { ...deps({ tableScanMs: 0 }), allTables: true });
+    expect(data.checks.filter((c) => c.id === "tables" && c.status === "info")).toEqual([]);
+    expect(problems.map((p) => [p.code, p.asset])).toEqual([["OUT_OF_BAND_CHANGE", "orders"]]);
+  });
+
   test("not compared while a croft run writes: the warehouse line says busy and there is no tables line", async () => {
     const root = await project();
     await croftWarehouse(root, [`DELETE FROM orders WHERE id = 3`]);

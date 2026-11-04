@@ -102,7 +102,14 @@ export interface WriteOptions {
    *  reason (a run's INTERRUPTED or TIMEOUT), else INTERRUPTED. */
   signal?: AbortSignal;
 }
-export interface ReadOptions { waitMs?: number; purpose: string; signal?: AbortSignal }
+export interface ReadOptions {
+  waitMs?: number;
+  purpose: string;
+  signal?: AbortSignal;
+  /** A lake only: the lease asks no more of the lake than that it can be attached (db/lake-pass.ts lakeExists). No transaction, no `USE`, no check
+   *  of the format, and the body must not query the lake: the three cost the catalog 3 s at 41 ms, for an answer the attach already gave. */
+  attachOnly?: boolean;
+}
 
 /** A wait that ends early, without error, when the signal aborts; the caller checks the signal next. */
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -339,7 +346,7 @@ export class DuckWarehouse implements Warehouse {
   }
 
   read<T>(fn: (db: LeaseSql) => Promise<T>, o?: ReadOptions): Promise<T> {
-    return this.lease("read", o?.waitMs, (conn) => fn(this.sqlOver(conn, null, true)), undefined, o?.signal);
+    return this.lease("read", o?.waitMs, (conn) => fn(this.sqlOver(conn, null, o?.attachOnly !== true)), undefined, o?.signal, o?.attachOnly === true);
   }
 
   write<T>(label: string, fn: (tx: LeaseSql) => Promise<T>, o?: WriteOptions): Promise<T> {
@@ -447,7 +454,7 @@ export class DuckWarehouse implements Warehouse {
   }
 
   private async lease<T>(kind: "read" | "write", waitMs: number | undefined, body: (conn: DuckDBConnection) => Promise<T>,
-    runId?: string, signal?: AbortSignal): Promise<T> {
+    runId?: string, signal?: AbortSignal, attachOnly = false): Promise<T> {
     if (signal?.aborted) throw waitAborted(signal);
     this.leases++;
     if (this.closeTimer) clearTimeout(this.closeTimer);
@@ -455,7 +462,7 @@ export class DuckWarehouse implements Warehouse {
     let conn: DuckDBConnection | undefined;
     try {
       const instance = await this.ensureOpen(kind, waitMs ?? this.waitCap(kind), runId, signal);
-      if (this.lake) return await this.inLake(kind, instance, body, signal, (c) => { conn = c; });
+      if (this.lake) return await this.inLake(kind, instance, body, signal, (c) => { conn = c; }, attachOnly);
       conn = await connect(instance, this.spec, this.key);
       this.conns.add(conn);
       if (!this.formatChecked) {
@@ -555,7 +562,7 @@ export class DuckWarehouse implements Warehouse {
    * transaction) is followed by a new one (LeaseSql.recover), so a body may go on after a failed statement as it could before.
    */
   private async inLake<T>(kind: "read" | "write", first: DuckDBInstance, body: (conn: DuckDBConnection) => Promise<T>, signal: AbortSignal | undefined,
-    give: (conn: DuckDBConnection) => void): Promise<T> {
+    give: (conn: DuckDBConnection) => void, attachOnly = false): Promise<T> {
     let instance = first;
     let conn: DuckDBConnection | undefined;
     for (let attempt = 0; !conn; attempt++) {
@@ -587,6 +594,7 @@ export class DuckWarehouse implements Warehouse {
     }
     give(conn);
     this.conns.add(conn);
+    if (attachOnly) return await body(conn);
     const whole = kind === "read";
     const endRead = async () => {
       try { await conn!.run("ROLLBACK"); } catch { /* none open, or the connection is gone */ }

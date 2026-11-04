@@ -77,6 +77,8 @@ const COMMANDS: { id: string; label: string; args: string[]; before?: (root: str
   { id: "change", label: "run, one file changed (an ingest and the SQL asset over it)", args: ["run", "--foreground"],
     before: (root) => writeFileSync(join(root, "files", "sales.csv"), salesCsv().replace("120", String(130 + ++changed))) },
   { id: "query", label: "query (count of a table)", args: ["query", "select count(*) from events"] },
+  { id: "status", label: "status", args: ["status"] },
+  { id: "describe", label: "describe (one table)", args: ["describe", "events"] },
   { id: "doctor", label: "doctor", args: ["doctor"] },
   { id: "maintain", label: "maintain", args: ["maintain"] },
 ].filter((c) => ONLY.length === 0 || ONLY.includes(c.id));

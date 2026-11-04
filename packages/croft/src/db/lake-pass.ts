@@ -208,7 +208,9 @@ export async function lakeExists(project: Project, env: ProjectEnv): Promise<boo
     stateDir: project.paths.stateDir, ...lakeOption(project, env), isTTY: false, register: false, noticeAfterMs: Number.MAX_SAFE_INTEGER,
   });
   try {
-    await probe.read(async () => undefined, { purpose: "lake maintenance", waitMs: 30_000 });
+    // Attached is all it asks: an attach to a lake nobody has written is what says so (DB_NOT_FOUND, notCreated), and the transaction, the `USE` and the
+    // format check that every other read makes would cost the catalog seconds at a distance to learn nothing more.
+    await probe.read(async () => undefined, { purpose: "lake maintenance", waitMs: 30_000, attachOnly: true });
     return true;
   } catch (e) {
     if (e instanceof CroftError && e.code === "DB_NOT_FOUND" && e.problem.details?.notCreated === true) return false;

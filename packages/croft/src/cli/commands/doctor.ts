@@ -527,7 +527,7 @@ async function checkWarehouse(r: Report, d: DoctorDeps, project: Project, bindin
       const m = await readMeta(db);
       if (m.format_version) {
         try {
-          found.scan = await scanTables(db, { budgetMs: d.tableScanMs ?? TABLE_SCAN_MS });
+          found.scan = await scanTables(db, d.allTables ? {} : { budgetMs: d.tableScanMs ?? TABLE_SCAN_MS });
         } catch (e) {
           found.scan = e instanceof Error ? e : new Error(String(e));
         }
@@ -734,7 +734,8 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
         }
         // The lake's counts in the same lease, so in the same transaction: a lease of its own cost a snapshot and a round trip or more per table (D-T2).
         try {
-          maintenance = { stats: await lakeStats(db), options: await ageBasedExpiryOptions(db), bookkeeping: await bookkeepingInFiles(db) };
+          const stats = await lakeStats(db);
+          maintenance = { stats, options: await ageBasedExpiryOptions(db), bookkeeping: stats.bookkeepingFiles > 0 ? await bookkeepingInFiles(db) : [] };
         } catch (e) {
           maintenance = e instanceof Error ? e : new Error(String(e));
         }

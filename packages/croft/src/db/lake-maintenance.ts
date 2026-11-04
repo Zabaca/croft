@@ -176,6 +176,8 @@ export interface LakeStats {
   inlinedTables: number;
   /** Files freed and waiting for a cleanup to delete them. */
   pendingDeletion: number;
+  /** Data files of croft's own bookkeeping (`_croft`) in the store; a lake nothing flushed has none (bookkeepingInFiles names the tables). */
+  bookkeepingFiles: number;
   /** The oldest and newest snapshot's time (ISO), or null for a lake with none. */
   oldestSnapshotAt: string | null;
   newestSnapshotAt: string | null;
@@ -194,6 +196,10 @@ export async function lakeStats(sql: Sql): Promise<LakeStats> {
     (SELECT count(*) FROM ${M}.ducklake_delete_file) AS delete_files,
     (SELECT count(*) FROM ${M}.ducklake_inlined_data_tables) AS inlined_tables,
     (SELECT count(*) FROM ${M}.ducklake_files_scheduled_for_deletion) AS pending,
+    (SELECT count(*) FROM ${M}.ducklake_data_file f
+       JOIN ${M}.ducklake_table t ON t.table_id = f.table_id AND t.end_snapshot IS NULL
+       JOIN ${M}.ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL
+       WHERE s.schema_name = '_croft' AND f.end_snapshot IS NULL) AS bookkeeping_files,
     (SELECT min(snapshot_time)::TIMESTAMPTZ::VARCHAR FROM ducklake_snapshots('${LAKE_ALIAS}')) AS oldest,
     (SELECT max(snapshot_time)::TIMESTAMPTZ::VARCHAR FROM ducklake_snapshots('${LAKE_ALIAS}')) AS newest`);
   const iso = (v: unknown): string | null => {
@@ -203,7 +209,7 @@ export async function lakeStats(sql: Sql): Promise<LakeStats> {
   };
   return {
     snapshots: num(r?.snapshots), dataFiles: num(r?.data_files), liveFiles: num(r?.live_files), liveBytes: num(r?.live_bytes),
-    deleteFiles: num(r?.delete_files), inlinedTables: num(r?.inlined_tables), pendingDeletion: num(r?.pending),
+    deleteFiles: num(r?.delete_files), inlinedTables: num(r?.inlined_tables), pendingDeletion: num(r?.pending), bookkeepingFiles: num(r?.bookkeeping_files),
     oldestSnapshotAt: iso(r?.oldest), newestSnapshotAt: iso(r?.newest),
   };
 }
@@ -284,10 +290,11 @@ export async function countSuperseded(sql: Sql): Promise<number> {
  * held them is then read by nobody, and the pass's `rewrite` step drops it (its rows are all deleted) and `cleanup` deletes it from the store.
  * A table of more than REINLINE_MAX_ROWS rows is left as it is: that is a hundred inserts or more, and its reads are not the cost that matters.
  */
-export async function pruneBookkeeping(sql: Sql, o: { maxRows?: number } = {}): Promise<{ tables: number; rows: number; reinlined: number; reinlinedRows: number; leftInFiles: number }> {
+export async function pruneBookkeeping(sql: Sql, o: { maxRows?: number; filesInStore?: boolean } = {}): Promise<{ tables: number; rows: number; reinlined: number; reinlinedRows: number; leftInFiles: number }> {
   const none = { tables: 0, rows: 0, reinlined: 0, reinlinedRows: 0, leftInFiles: 0 };
   if (!(await hasLog(sql))) return none;
-  const limit = await inliningLimit(sql);
+  // `filesInStore`: what the pass's own count of the lake said (LakeStats.bookkeepingFiles), so a lake with none asks nothing more of the catalog.
+  const limit = o.filesInStore === false ? 0 : await inliningLimit(sql);
   const inFiles = limit > 0 ? await bookkeepingInFiles(sql) : [];
   const out = { ...none };
   await sql.exec("BEGIN TRANSACTION");
@@ -487,7 +494,7 @@ export async function runPass(sql: Sql, o: PassOptions): Promise<PassReport> {
       });
     }
   };
-  await step("prune", async () => pruneBookkeeping(sql, o.reinlineMaxRows !== undefined ? { maxRows: o.reinlineMaxRows } : {}));
+  await step("prune", async () => pruneBookkeeping(sql, { filesInStore: before.bookkeepingFiles > 0, ...(o.reinlineMaxRows !== undefined ? { maxRows: o.reinlineMaxRows } : {}) }));
   await step("flush", async () => {
     // The assets' schema alone (D162): the rows of `_croft` are a few at a time, and read on every run, so they are kept where a read of them is
     // one round trip to the catalog, not a list and a range read of a Parquet file for each table in the store.
