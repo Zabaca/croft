@@ -51,7 +51,8 @@ export interface HttpConfig {
 export interface CroftConfig {
   database: string;                  // as written: relative to the root, or absolute after relocation
   timezone: string;
-  /** The read copy is kept: `readCopy` in croft.json, or on whenever server mode is (the copy is what it serves). */
+  /** The read copy is kept: `readCopy` in croft.json, or on whenever server mode is (the copy is what it serves). Never with a lake: its
+   *  readers attach the lake itself and see its last snapshot, so server mode over a lake makes no copy (D183). */
   readCopy: boolean;
   serverMode: ServerModeConfig;
   /** Lake mode (option 07, D138): the warehouse is a DuckLake, not `database`. Null: the file, as ever. */
@@ -82,7 +83,7 @@ export const CONFIG_KEYS: { key: string; type: string; default: string; descript
   { key: "database", type: "string", default: `"${DEFAULTS.database}"`, description: "the DuckDB file, relative to the project folder (absolute after relocation)" },
   { key: "timezone", type: "string", default: "(required)", description: "IANA zone for schedules, ::DATE and JSON timestamps, e.g. \"America/Los_Angeles\"; changing it rebuilds every transform" },
   { key: "readCopy", type: "boolean", default: "false", description: "keep warehouse.read.duckdb, a copy for GUIs and notebooks, refreshed after runs" },
-  { key: "serverMode.enabled", type: "boolean", default: "false", description: "server mode: croft serve answers apps from a readers' process on the read copy and never opens the warehouse file; turns the read copy on, read-only on disk (croft docs server-mode)" },
+  { key: "serverMode.enabled", type: "boolean", default: "false", description: "server mode: croft serve answers apps and each person's key from a readers' process on the read copy and never opens the warehouse file; turns the read copy on, read-only on disk. With a lake there is no copy: the process attaches the lake read-only (croft docs server-mode)" },
   { key: "serverMode.acceptFullCopyCost", type: "boolean", default: "false", description: "accept that every refresh of the read copy is a full copy of a warehouse over 1 GB (the filesystem cannot clone it); without this, server mode refuses to start there" },
   { key: "serverMode.quackHost", type: "string", default: `"${DEFAULTS.serverMode.quackHost}"`, description: "the address croft serve listens on for DuckDB 2.0 clients over Quack (croft docs quack); anything but loopback must sit behind an HTTPS reverse proxy" },
   { key: "serverMode.quackPort", type: "integer", default: String(DEFAULTS.serverMode.quackPort), description: "the port for Quack; 0 picks a free one and the banner says which" },
@@ -300,10 +301,7 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined, p
   const lake = block && block.enabled ? block : null;
   const idleLake = block && !block.enabled ? block : null;
   if (lake) {
-    if (serverMode.enabled) {
-      add("serverMode.enabled", `"serverMode.enabled" cannot be on in a project with a lake yet: server mode over a lake is a later part of lake mode`,
-        'turn "serverMode" off, or remove "lake"; croft serve still reads a lake without it');
-    }
+    // Server mode over a lake (D183) is allowed: croft serve's process attaches the lake itself, so there is no copy.
     if (raw.readCopy === true) {
       add("readCopy", `"readCopy" does not apply to a lake: readers attach the lake itself and always see its last snapshot`,
         'remove "readCopy" from croft.json');
@@ -434,7 +432,7 @@ export function validateConfig(raw: unknown, locate: Locate = () => undefined, p
   }
 
   if (issues.length) return { ok: false, issues };
-  return { ok: true, config: { database, timezone, readCopy: readCopy || serverMode.enabled, serverMode, lake, idleLake, notify: { desktop, webhook }, concurrency, http: { budgets }, serve, stateDir, secretsFrom } };
+  return { ok: true, config: { database, timezone, readCopy: readCopy || (serverMode.enabled && !lake), serverMode, lake, idleLake, notify: { desktop, webhook }, concurrency, http: { budgets }, serve, stateDir, secretsFrom } };
 }
 
 /**

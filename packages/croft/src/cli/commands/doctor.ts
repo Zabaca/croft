@@ -915,7 +915,9 @@ async function checkServe(r: Report, d: DoctorDeps, project: Project): Promise<v
   if (sm) {
     let at: Date;
     try { at = now(d.env); } catch { at = new Date(); }
-    mode = sm.asOf ? ` · server mode, reads the copy as of ${clockText(sm.asOf, project.timezone, at)}` : ` · server mode (${sm.state ?? "starting"}), no copy yet`;
+    mode = project.config.lake
+      ? sm.asOf ? ` · server mode, reads the lake's last snapshot (newest seen from ${clockText(sm.asOf, project.timezone, at)})` : ` · server mode (${sm.state ?? "starting"}), no snapshot seen yet`
+      : sm.asOf ? ` · server mode, reads the copy as of ${clockText(sm.asOf, project.timezone, at)}` : ` · server mode (${sm.state ?? "starting"}), no copy yet`;
     if (sm.quack) mode += ` · DuckDB clients attach at ${sm.quack}`;
   }
   const degraded = (health.degraded as { code?: string } | undefined)?.code;
@@ -929,6 +931,15 @@ async function checkServe(r: Report, d: DoctorDeps, project: Project): Promise<v
  * yet" is an info line. A stat and runs.sqlite only (db/readcopy.ts readCopyStatus): the copy is never opened.
  */
 function checkReadCopy(r: Report, d: DoctorDeps, project: Project): void {
+  if (project.config.lake && project.config.serverMode.enabled) {
+    // Server mode over a lake (D183): no copy to look at. The process attaches the lake itself, so the line says whether croft serve is up.
+    const live = servePid(project.paths.stateDir);
+    const running = !!live?.alive;
+    r.add("environment", "servermode", "ok",
+      `server mode on · croft serve ${running ? `is running (pid ${live!.pid}) and answers apps and keys from the lake's last snapshot` : "is not running: nothing answers keys, and apps cannot read the lake until it is"}`,
+      undefined, { serving: running, asOf: null, copy: null });
+    return;
+  }
   if (!project.config.readCopy) return;
   let at: Date;
   try { at = now(d.env); } catch { at = new Date(); }

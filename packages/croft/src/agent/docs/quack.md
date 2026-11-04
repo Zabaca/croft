@@ -6,7 +6,9 @@ any table, and DuckDB sends the filters and aggregates to croft serve. The same 
 comes from the read copy, as of the end of the last run that changed data, and a person can read that time from the
 database itself.
 
-Quack exists only in server mode. Without `"serverMode": {"enabled": true}` there is no listener.
+Quack exists only in server mode. Without `"serverMode": {"enabled": true}` there is no listener. It works over a lake
+too (croft docs lake): the views read the lake's last snapshot, so a client sees each commit on its next query, and
+`_croft_as_of` is the newest snapshot's time, a quarter of a second behind the data at most.
 
 ## Giving a person access
 
@@ -36,7 +38,7 @@ development machine is often 1.x, which predates Quack. Use the library, or Pyth
 
 ## What a client sees
 
-- The main schema, the shared tables and `_croft_as_of`, all views of the read copy. The name starts with an
+- The main schema, the shared tables and `_croft_as_of`, all views of the read copy (over a lake, of the lake). The name starts with an
   underscore, which no table's name can, so it never collides with one. croft's own schema (`_croft`) never appears,
   and a table that is not shared is as absent as one that does not exist.
 - `SELECT as_of FROM croft._croft_as_of` is one row: the time of the copy, rebuilt at every swap of a refreshed copy.

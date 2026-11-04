@@ -213,6 +213,39 @@ export function lakeAttacks(bucket: string, lake = "lake"): readonly Attack[] {
   ];
 }
 
+/**
+ * What a key must not do on top of that when the warehouse is a lake behind server mode (option 07, slice 5; DESIGN.md D183): the lake is
+ * attached in the readers' process under its own name, and a key's connection works in the in-memory database whose views read it, so
+ * the lake's own names, the shared tables among them, are not names a key can type. `lake` is the alias; `bucket` the lake's folder.
+ */
+export function lakeReaderAttacks(bucket: string, lake = "lake"): readonly Attack[] {
+  return [
+    a("a shared table through the lake's own name", `SELECT * FROM ${lake}.main.orders`),
+    a("a shared table through the lake, without the schema", `SELECT * FROM ${lake}.orders`),
+    a("a hidden table through the lake", `SELECT * FROM ${lake}.main.payments`),
+    a("a hidden table through the lake, with changed case", `SELECT * FROM "${lake.toUpperCase()}".main."Payments"`),
+    a("croft's own log through the lake", `SELECT * FROM ${lake}._croft.assets_log`),
+    a("the lake in a subquery", `SELECT * FROM orders WHERE id IN (SELECT id FROM ${lake}.main.payments)`),
+    a("the lake in a join", `SELECT * FROM orders JOIN ${lake}.main.payments USING (id)`),
+    a("the lake by DESCRIBE", `DESCRIBE ${lake}.main.payments`),
+    a("USE the lake", `USE ${lake}`),
+    a("DETACH the lake", `DETACH ${lake}`),
+    a("ATTACH the lake again, read-write", `ATTACH 'ducklake:postgres:' AS again (DATA_PATH '${bucket}', META_SECRET croft_lake_catalog)`),
+    a("ATTACH the lake's catalog as Postgres", "ATTACH 'dbname=x' AS pg (TYPE postgres)"),
+    a("CREATE SECRET for another bucket", "CREATE SECRET other (TYPE s3, KEY_ID 'a', SECRET 'b', SCOPE 's3://other/')"),
+    a("DROP SECRET of the lake's bucket", "DROP SECRET croft_lake_bucket"),
+    a("INSERT into the lake", `INSERT INTO ${lake}.main.orders (id, k, note) VALUES (1, 1, 'x')`),
+    a("CREATE TABLE in the lake", `CREATE TABLE ${lake}.main.evil AS SELECT 1 AS a`),
+    a("COPY into the lake's folder", `COPY (SELECT 1 AS a) TO '${bucket}evil.parquet'`),
+    a("COPY a shared table into the lake's folder", `COPY orders TO '${bucket}evil2.parquet' (FORMAT PARQUET)`),
+    a("ducklake_add_data_files", `CALL ducklake_add_data_files('${lake}', 'orders', '${bucket}evil.parquet')`),
+    a("ducklake_flush_inlined_data", `CALL ducklake_flush_inlined_data('${lake}')`),
+    a("ducklake_delete_orphaned_files", `CALL ducklake_delete_orphaned_files('${lake}')`),
+    a("ducklake_expire_snapshots", `CALL ducklake_expire_snapshots('${lake}', older_than => now())`),
+    a("CHECKPOINT of the lake", `CHECKPOINT ${lake}`),
+  ];
+}
+
 /** Each attack as written, and again with a catalog function's name in a comment after it, in a line comment after it, and in a
  *  string literal: the ways the first Quack spike's catalog allowance was bypassed. Every attack gets a literal-bearing form,
  *  whatever it is. A SELECT carries it as a column in front. Any attack that has a string literal of its own (a path, an

@@ -37,6 +37,7 @@ export const MODE_ADDONS: Readonly<Record<ModeKind, readonly AddonName[]>> = {
   lake: ["lake"],
   "lake-readers": ["server", "lake"],
   "lake-local": ["lake"],
+  "lake-local-readers": ["server", "lake"],
 };
 
 /** The npm names for each platform: the `os`, `cpu` and, on Linux, `libc` fields that make a package install only where it runs. */

@@ -3,13 +3,13 @@
 // table) answers a key with the shared table only, the app token with both; a key removed or added while the server runs is honoured
 // on the very next request; a run's new rows reach a key; stopping the server writes each key's last use; and no key appears in
 // anything croft prints or keeps. A key works only in server mode (D128): without it the same server refuses a valid key with a 403
-// that says so, and the app token reads on. The real CLI throughout, a mock API for the data. Locally a missing extension file skips
-// the server-mode run.
+// that says so, and the app token reads on. The real CLI throughout, a mock API for the data. It runs on a lake too (the lake jobs of ci.yml), where
+// there is no read copy to swap in. Locally a missing extension file skips the server-mode run.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { extensionsReady } from "../../src/db/extension-dir-testkit.ts";
-import { cleanupAll, type Envelope, fileOnly, initProject, json, LAKE, type MockApi, mockApi, type Project, schedulerEnv, show, until } from "./harness.ts";
+import { cleanupAll, type Envelope, initProject, json, type MockApi, mockApi, type Project, schedulerEnv, show, until } from "./harness.ts";
 
 let api: MockApi;
 beforeAll(() => {
@@ -126,7 +126,7 @@ async function journey(): Promise<void> {
     const carol = await keyOf("carol");
     expect((await ask(rec, carol, "select count(*) as n from orders")).body.data.rows).toEqual([{ n: 2 }]);
 
-    // A run that changes the data reaches a key: the file engine steps aside and comes back, server mode swaps the copy in.
+    // A run that changes the data reaches a key: server mode swaps the copy in (over a lake there is none: the next query reads the new snapshot).
     state.orders.push({ id: 3, amount: 30 });
     const again = await p.json(["run", "orders"], home);
     expect(again.code, show(again)).toBe(0);
@@ -233,6 +233,8 @@ async function refused(): Promise<void> {
 }
 
 describe("journey 33: keys", () => {
-  fileOnly("server mode, the read copy and keys are refused with a lake until slice 5 (D138)")("without server mode a valid key is refused, and the app token reads on", () => refused(), 180_000);
-  (ext.ready && !LAKE ? test : test.skip)("in server mode", () => journey(), 180_000);
+  // On a lake too (D183): the lake engine refuses a key without server mode, and in server mode its readers' process answers a key from views of
+  // the lake, with no read copy.
+  test("without server mode a valid key is refused, and the app token reads on", () => refused(), 180_000);
+  (ext.ready ? test : test.skip)("in server mode", () => journey(), 180_000);
 });

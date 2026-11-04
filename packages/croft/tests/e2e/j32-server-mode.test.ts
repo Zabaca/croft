@@ -1,4 +1,4 @@
-// Journey 32: server mode (DESIGN.md D119, §5 "Server mode, apps and GUIs"; option 06, slice 2). With "serverMode" on, a run's
+// Journey 32: server mode (DESIGN.md D119, D183, §5 "Server mode, apps and GUIs"; option 06, slice 2; option 07, slice 5 on a lake). With "serverMode" on, a run's
 // refresh makes the read copy (read-only on disk), croft serve answers apps from a readers' process on that copy and never
 // opens the warehouse, a later run swaps its new rows in, and SIGTERM stops everything with exit 0 even with a query
 // running. The real CLI, the real readers' process (quack and httpfs from the extension folder), a mock API for the data.
@@ -12,7 +12,8 @@ import { alive, cleanupAll, type Envelope, initProject, json, type MockApi, mock
 
 const ext = extensionsReady(["quack", "httpfs"]);
 if (!ext.ready) console.warn(`[j32-server-mode] SKIPPING: ${ext.skipReason}`);
-const journey = ext.ready && !LAKE ? test : test.skip; // a project with a lake refuses server mode until slice 5 (D138)
+const journey = ext.ready && !LAKE ? test : test.skip; // the copy is a file's; a lake has none (the lake journey below)
+const lakeJourney = ext.ready && LAKE ? test : test.skip;
 
 let api: MockApi;
 let built: { code: number | null; out: string };
@@ -151,6 +152,80 @@ describe("journey 32: server mode", () => {
     expect(`${stopped.stdout}${stopped.stderr}`).not.toContain(rec.token);
     // With croft serve gone, apps read the file directly again.
     expect(app(p).rows).toHaveLength(3);
+  }, 180_000);
+
+  lakeJourney("on a lake: no copy is made, croft serve attaches the lake itself and answers from its last snapshot, a run's rows are in the next query, SIGTERM stops it clean", async () => {
+    expect(built.code, built.out).toBe(0);
+    const state = { orders: [{ id: 1, amount: 10 }, { id: 2, amount: 20 }] };
+    api.route("/orders", () => json(state.orders));
+    const { project: p } = await initProject();
+    p.remove("assets/example_sales.ts");
+    p.write("assets/orders.ts", ordersAsset(api.url));
+    const home = { env: { ...schedulerEnv(), CROFT_EXTENSION_DIR: ext.dir } };
+    p.edit("croft.json", '"timezone"', '"serverMode": { "enabled": true, "quackPort": 0 }, "timezone"');
+
+    // A run makes the lake and no copy, though server mode turns the copy on for a file.
+    const first = await p.json(["run"], home);
+    expect(first.code, show(first)).toBe(0);
+    expect(existsSync(join(p.root, "warehouse.read.duckdb"))).toBe(false);
+    const doctor = await p.json(["doctor"], home);
+    expect(doctor.json.data.checks.find((c: Envelope) => c.id === "servermode")).toMatchObject({ status: "ok", details: { serving: false, copy: null } });
+    expect(doctor.json.data.checks.find((c: Envelope) => c.id === "readcopy")).toBeUndefined();
+    const offline = (await p.json(["status"], home)).json.data;
+    expect(offline.serverMode.serving).toBe(false);
+    expect(offline.serverMode.addons).toHaveLength(1);
+    expect(offline.serverMode.addons[0]).toMatchObject({ addon: "server", ok: true });
+    expect(offline.readCopy).toBeUndefined();
+
+    const serve = p.start(["serve", "--port", "0"], home);
+    const file = join(p.stateDir, "serve.json");
+    await until(() => existsSync(file) || serve.proc.exitCode !== null, 30_000);
+    if (!existsSync(file)) throw new Error(`croft serve did not start\n${show(await serve.done)}`);
+    const rec = JSON.parse(readFileSync(file, "utf8")) as ServeRecord;
+
+    // It answers from the lake's last snapshot, says as of when, and is in server mode without a copy.
+    expect(app(p)).toEqual({ rows: [{ id: 1, amount: 10 }, { id: 2, amount: 20 }] });
+    const q = await (await fetch(`${rec.url}/query`, {
+      method: "POST", headers: { Authorization: `Bearer ${rec.token}`, "Content-Type": "application/json" }, body: JSON.stringify({ sql: "select count(*) as n from orders" }),
+    })).json() as Envelope;
+    expect(q.data.rows).toEqual([{ n: 2 }]);
+    expect(q.data.asOf).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?-0[78]:00$/);
+    expect(q.data.stale).toBeUndefined();
+    expect(await get(rec, "/health")).toMatchObject({ ok: true, writeIntent: null, serverMode: { state: "open", asOf: q.data.asOf } });
+    expect(JSON.parse(readFileSync(file, "utf8")).serverMode).toBe(true);
+    const live = await p.json(["doctor"], home);
+    expect(live.json.data.checks.find((c: Envelope) => c.id === "servermode")).toMatchObject({ status: "ok", details: { serving: true } });
+    expect((await p.json(["status"], home)).json.data.serverMode.serving).toBe(true);
+
+    // A run writes while croft serve runs: it never waits for it, and the very next query has the new rows (no swap to wait for).
+    const engine = async () => (await get(rec, "/status")).data.serve.engine;
+    const pid = (await engine()).serverMode.workerPid as number;
+    state.orders.push({ id: 3, amount: 30 });
+    const run = await p.json(["run"], home);
+    expect(run.code, show(run)).toBe(0);
+    expect(run.ms).toBeLessThan(20_000); // timing-gap: a run that waited for croft serve's lock would wait 60 s or more
+    expect(app(p).rows).toEqual([{ id: 1, amount: 10 }, { id: 2, amount: 20 }, { id: 3, amount: 30 }]);
+    const after = await engine();
+    expect(after.serverMode).toMatchObject({ state: "open", workerPid: pid, restarts: 0, swaps: 0, copy: null });
+    expect(after.writeIntent).toBeNull();
+    expect(existsSync(join(p.root, "warehouse.read.duckdb"))).toBe(false);
+
+    // SIGTERM with a query running: exit 0, no crash output, serve.json gone, the readers' process gone.
+    const slow = fetch(`${rec.url}/query`, {
+      method: "POST", headers: { Authorization: `Bearer ${rec.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ sql: "SELECT sum(a.range * b.range) AS s FROM range(10000000) a, range(1000000) b" }),
+    }).catch(() => null);
+    await until(async () => (await engine()).inFlight === 1, 10_000);
+    serve.proc.kill("SIGTERM");
+    const stopped = await serve.done;
+    expect(stopped.code, show(stopped)).toBe(0);
+    expect(`${stopped.stdout}${stopped.stderr}`).not.toMatch(/panic|crash|oh no|segmentation|SIGSEGV|SIGABRT/i);
+    expect(existsSync(file)).toBe(false);
+    expect(alive(pid)).toBe(false);
+    await slow;
+    expect(stopped.stdout).toContain("server mode over lake ");
+    expect(stopped.stdout).toContain("croft serve stopped (SIGTERM)");
+    expect(`${stopped.stdout}${stopped.stderr}`).not.toContain(rec.token);
   }, 180_000);
 
   journey("data already built and no run to come: turn the mode on, start croft serve, and it makes the copy itself and answers", async () => {

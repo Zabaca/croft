@@ -50,8 +50,9 @@ describe("a lake block that is switched off (D167)", () => {
     expect(messages({ lake: { ...shared(), enabled: false, catalog: undefined } })).toEqual([expect.stringContaining('"lake" needs "catalog"')]);
     expect(messages({ lake: { ...shared(), enabled: "no" } })).toEqual([expect.stringContaining('"lake.enabled" must be true or false')]);
     expect(messages({ lake: { ...shared(), enabled: false }, serverMode: { enabled: true }, readCopy: true })).toEqual([]);
-    // On, the same project is refused until server mode over a lake exists.
-    expect(messages({ lake: shared(), serverMode: { enabled: true } })).toEqual([expect.stringContaining("cannot be on in a project with a lake")]);
+    // On, the same project has server mode over its lake (D183), and still no read copy of it.
+    expect(messages({ lake: shared(), serverMode: { enabled: true } })).toEqual([]);
+    expect(messages({ lake: shared(), serverMode: { enabled: true }, readCopy: true })).toEqual([expect.stringContaining('"readCopy" does not apply to a lake')]);
   });
 });
 
@@ -142,8 +143,14 @@ describe("a shared lake", () => {
     expect(m.join("\n")).toContain('did you mean "lake.catalog.host"?');
   });
 
-  test("does not work with server mode or a read copy yet", () => {
-    expect(messages({ lake: shared(), serverMode: { enabled: true } })).toEqual([expect.stringContaining("server mode over a lake")]);
+  test("works with server mode (D183), which makes no read copy of it, and has no read copy of its own", () => {
+    expect(messages({ lake: shared(), serverMode: { enabled: true } })).toEqual([]);
+    const sm = validateConfig({ ...tz, lake: shared(), serverMode: { enabled: true } });
+    expect(sm.ok && sm.config.readCopy).toBe(false);
+    expect(sm.ok && sm.config.serverMode.enabled).toBe(true);
+    // The file still gets its copy from server mode, as ever.
+    const file = validateConfig({ ...tz, serverMode: { enabled: true } });
+    expect(file.ok && file.config.readCopy).toBe(true);
     expect(messages({ lake: shared(), readCopy: true })).toEqual([expect.stringContaining('"readCopy" does not apply to a lake')]);
     expect(messages({ lake: local, serverMode: { enabled: false } })).toEqual([]);
   });

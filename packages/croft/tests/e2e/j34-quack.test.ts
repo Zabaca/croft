@@ -3,14 +3,14 @@
 // (the same in --json); a DuckDB 2.0 client in a process of its own attaches with the key, reads the shared table and the copy's
 // as-of time, sees a run's new rows after the refresh and swap, is refused the hidden table and every write, and is refused on its
 // very next query once its key is removed from another process; stopping the server is clean, its log has one line per Quack query
-// and no SQL or key, and `key list` shows the use. The real CLI throughout, a mock API for the data. Locally a missing extension
-// file skips it.
+// and no SQL or key, and `key list` shows the use. The real CLI throughout, a mock API for the data. It runs on a lake too (the lake jobs of
+// ci.yml): no copy, the lake's newest snapshot in the as-of view. Locally a missing extension file skips it.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { extensionsReady } from "../../src/db/extension-dir-testkit.ts";
 import { QuackClients } from "../../src/serve/quack-client-testkit.ts";
-import { cleanupAll, initProject, json, type MockApi, mockApi, schedulerEnv, show, until, LAKE } from "./harness.ts";
+import { cleanupAll, initProject, json, type MockApi, mockApi, schedulerEnv, show, until } from "./harness.ts";
 
 let api: MockApi;
 const clients = new QuackClients();
@@ -39,7 +39,7 @@ export default ingest({
 interface ServeRecord { url: string; token: string; pid: number; quack?: { uri: string } }
 
 describe("journey 34: a person's DuckDB over Quack", () => {
-  (ext.ready && !LAKE ? test : test.skip)("attach with a key, read, see a refresh, lose the key", async () => {
+  (ext.ready ? test : test.skip)("attach with a key, read, see a refresh, lose the key", async () => {
     const state = { orders: [{ id: 1, amount: 10 }, { id: 2, amount: 20 }] };
     api.route("/orders", () => json(state.orders));
     api.route("/payments", () => json([{ id: 1, card: "4111-secret" }]));
@@ -98,7 +98,8 @@ describe("journey 34: a person's DuckDB over Quack", () => {
       expect(again.code, show(again)).toBe(0);
       await until(async () => (await asOfOverHttp()) !== before, 30_000);
       expect(await c.rows("SELECT count(*) AS n FROM croft.orders")).toEqual([{ n: "3" }]);
-      expect(Number((await c.rows("SELECT epoch_ms(as_of) AS t FROM croft._croft_as_of"))[0]!.t)).toBe(Date.parse(await asOfOverHttp()));
+      // Over a lake the view follows the lake's newest snapshot within a quarter of a second, so it is waited for.
+      await until(async () => Number((await c.rows("SELECT epoch_ms(as_of) AS t FROM croft._croft_as_of"))[0]!.t) === Date.parse(await asOfOverHttp()), 10_000);
 
       // Another person, and then alice's key is removed from another process: her open session is refused on its next query.
       const other = await clients.start(ext.dir);

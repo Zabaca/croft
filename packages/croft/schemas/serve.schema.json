@@ -174,7 +174,10 @@
               "type": "object",
               "properties": {
                 "readCopy": {
-                  "type": "string"
+                  "type": [
+                    "null",
+                    "string"
+                  ]
                 },
                 "asOf": {
                   "type": [

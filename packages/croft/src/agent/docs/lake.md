@@ -182,11 +182,13 @@ seconds, and carry on while the folder is copied; a backup that is copying keeps
 - `croft query`, `status`, `describe`, `context`, `doctor`: as before.
 - Apps: through `croft serve` (`@zabaca/croft/read` finds it). In a lake project croft serve reads the last snapshot
   with the read-only login and key, never steps aside for a run and never answers "busy". Direct mode, which opens the
-  warehouse file, refuses (LAKE_DIRECT_READ). A key (croft serve key) works in server mode only, and server mode over
-  a lake is not built yet.
+  warehouse file, refuses (LAKE_DIRECT_READ). A key (croft serve key) works in server mode only: with
+  `"serverMode": {"enabled": true}` croft serve serves people over a lake too (below).
+- People with a key, over HTTP or from their own DuckDB 2.0 over Quack: server mode over a lake (below). They hold no
+  catalog login and no bucket key, and read only the tables the project shares.
 - Analysts, from their own DuckDB 2.0, without croft: whoever runs the Postgres makes a login that can only read, and
-  the bucket a key that can only read the folder. They see every table of the lake (limiting a person to chosen tables
-  is what server mode over a lake will add). The recipe, run by the person who runs the Postgres:
+  the bucket a key that can only read the folder. They see every table of the lake (a key, from server mode over a
+  lake, limits a person to chosen tables instead). The recipe, run by the person who runs the Postgres:
 
 ```sql postgres-admin
 CREATE ROLE <analyst> LOGIN PASSWORD '<analyst_password>';
@@ -225,6 +227,29 @@ USE lake;
   Never give an analyst the writer's login or key, and never put a password in the ATTACH text: it shows in errors and
   in `duckdb_databases()`.
 
+## Server mode over a lake: people with a key, and no credentials to hand out
+
+With `"serverMode": {"enabled": true}` in a lake project, croft serve gives each person a key (croft docs keys) instead of
+the read-only catalog login and bucket key. The user decides it, as for any project (croft docs server-mode). There is no
+read copy: croft serve's readers' process attaches the lake itself, read-only, with the read-only login and key, and reads
+the last snapshot whenever it is asked. People see each commit on their next query, over HTTP and over Quack (croft docs
+quack), and a run never waits for them. Every answer says as of when: the time of the lake's newest snapshot the process
+has seen, and `_croft_as_of` holds it for a DuckDB client.
+
+- The process has one door to the lake, its read-only attach. Its lockdown (croft docs lake, "What SQL cannot reach") allows
+  the lake's bucket folder as the only remote path and no local folder; a key's SQL goes through the same gate as over a
+  file, and sees only views of the shared tables in the process's in-memory database, never the lake's own names.
+- The shared tables are views that read the lake, so new rows and new columns are there at once. Which tables exist is looked
+  at before each HTTP query, and every 250 ms while a Quack session is signed in: a table a run just made is there for a
+  Quack client within a quarter of a second, and one dropped is gone as fast.
+- Over a bucket the store enforces what the lockdown also refuses: the read-only key cannot write, so even a COPY that got
+  past every check would be refused (403). A local lake has no key; its folder is the user's own.
+- The extension files come from both add-ons (`@zabaca/croft-addon-server` and `@zabaca/croft-addon-lake`), and croft doctor and
+  validate name whichever is missing.
+- Turning it on needs no copy and no 1 GB question. `readCopy` stays refused with a lake.
+- A local lake (a SQLite catalog) lets a writer commit only while no reader has a transaction open, so a long query or a
+  Quack client that holds a transaction open makes a run wait there. A Postgres catalog does not.
+
 ## What SQL cannot reach
 
 The gate refuses, in a lake project, everything that reaches past the tables, for `croft query`, SQL assets, checks and
@@ -262,8 +287,10 @@ back. It is the user's decision, and it ends in `croft confirm`.
        "lake": { "enabled": false, "catalog": { ... }, "bucket": { ... } }
 
    The secrets go in .env, the lake add-on is installed (`bun add @zabaca/croft-addon-lake@<version>`), and croft serve is
-   stopped if it runs (it would keep serving and scheduling for the file). Server mode and readCopy must be off: server mode
-   over a lake is not built yet, and a project that has it on is refused with its keys and settings left as they are.
+   stopped if it runs (it would keep serving and scheduling for the file). `readCopy` must be off (a lake has no file to
+   copy). Server mode may stay on: it goes with the project, its keys and serve.sharedTables are unchanged, and over the
+   lake it needs no copy. The read copy it made on the file stays on disk as it was, no longer refreshed; delete it when
+   nothing reads it.
 3. `croft move-to-lake` prints what it would do and a token (exit 5; on a terminal it asks y/N). Show the user the
    impact, and only after an explicit yes run `croft confirm <token>`.
 
@@ -288,7 +315,7 @@ is not a table of `main` (views, macros, sequences, indexes, types, tables of ot
 
 Before it starts, the move refuses, with the fix: a column a lake cannot store (LAKE_TYPE_UNSUPPORTED, every table at
 once), columns of a type a lake would store inexactly (LAKE_VALUES_INEXACT), a lake that holds anything (MOVE_LAKE_NOT_EMPTY), no
-lake block or a project already in the lake (MOVE_NEEDS_LAKE), and server mode, a read copy, a running croft serve, a
+lake block or a project already in the lake (MOVE_NEEDS_LAKE), and a read copy asked for by name, a running croft serve, a
 rename that did not finish, a write-ahead log the file still holds (run croft backup, which folds it in) or a croft.json
 it cannot rewrite (MOVE_BLOCKED). It then changes nothing.
 

@@ -1037,7 +1037,16 @@ export function formatStatus(d: StatusData, now: Date, o: { tz?: string; problem
 /** "Read copy warehouse.read.duckdb · as of 11:58 (2 min ago)", and for a warning its hint on the next line. */
 function readCopyLines(d: StatusData, now: Date, tz: string, o: { root?: string; database?: string }): string[] {
   // A lake has no read copy: its line is the add-on's, when that is not whole (the lake cannot be opened without it).
-  if (d.lake && !d.readCopy) return [...d.lake.addons.filter((a) => !a.ok).map((a) => `Lake mode · ${addonLine(a)}`), maintenanceLine(d.lake.maintenance, now)];
+  if (d.lake && !d.readCopy) {
+    // Server mode over a lake (D183): no copy; croft serve's process reads the lake.
+    const mode = d.serverMode
+      ? [
+        `Server mode on · ${d.serverMode.serving ? "croft serve answers apps and keys from the lake's last snapshot" : "croft serve is not running: nothing answers keys, and apps cannot read the lake until it is"}`,
+        ...d.serverMode.addons.filter((a) => !a.ok).map((a) => `  ${addonLine(a)}`),
+      ]
+      : [];
+    return [...mode, ...d.lake.addons.filter((a) => !a.ok).map((a) => `Lake mode · ${addonLine(a)}`), maintenanceLine(d.lake.maintenance, now)];
+  }
   if (!d.readCopy) return [];
   const root = o.root ?? "";
   const w = readCopyWords(d.readCopy, { root, database: o.database ?? "", tz, now });

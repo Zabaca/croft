@@ -12,10 +12,10 @@
 // - Like a run it starts with reconcile(), takes the asset leases (of every asset, so no run starts, and none is running, while the file
 //   is copied and proved), records itself in runs.sqlite and releases the leases at the end.
 //
-// A project the move cannot start on is refused before anything is touched: no lake block, a lake already on, server mode or a read copy
-// (until server mode over a lake), a croft serve running (it would go on serving and scheduling for the file), a rename that did not
+// A project the move cannot start on is refused before anything is touched: no lake block, a lake already on, a read copy asked for by name
+// (server mode is not a reason, D183), a croft serve running (it would go on serving and scheduling for the file), a rename that did not
 // finish, a croft.json that cannot be rewritten, columns a lake cannot store, a lake that holds anything. Each refusal names its fix.
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { CroftError } from "../../core/errors.ts";
 import type { LockHolder, Problem } from "../../core/types.ts";
@@ -94,6 +94,15 @@ function walBytes(database: string): number {
   }
 }
 
+/** Whether croft.json says `"readCopy": true` itself (not only through server mode). */
+function readCopyByName(root: string): boolean {
+  try {
+    return (JSON.parse(readFileSync(join(root, "croft.json"), "utf8")) as { readCopy?: unknown }).readCopy === true;
+  } catch {
+    return false;
+  }
+}
+
 /** What can be told from croft.json, the state folder and the disk alone: no DuckDB is opened for any of it. */
 function refuseUnlessReady(project: Project): void {
   const config = project.config;
@@ -119,10 +128,10 @@ function refuseUnlessReady(project: Project): void {
       fix: 'a project that has built nothing has nothing to copy: set "enabled": true in the lake block of croft.json by hand, and the first croft run creates the lake',
     });
   }
-  if (config.serverMode.enabled) {
-    reasons.push({ reason: 'server mode is on ("serverMode.enabled"), and server mode over a lake is not built yet', fix: 'keep the project on the file until it is (its keys and settings stay as they are), or ask the user whether to turn "serverMode" off first' });
-  }
-  if (config.readCopy) {
+  // Server mode goes with the project: over the lake it needs no copy (D183), and its keys and shared tables are the same. Only a read copy asked for
+  // by name is a reason, because croft.json would be invalid with the lake on ("readCopy" does not apply to a lake). `config.readCopy` is also on
+  // for server mode alone, so the file says which.
+  if (readCopyByName(project.root)) {
     reasons.push({ reason: 'the read copy is on ("readCopy"), and a lake has no file to copy', fix: 'ask the user: remove "readCopy" from croft.json, and read through croft serve instead' });
   }
   // A process that stopped before it checkpointed leaves its writes in a write-ahead log, and the next program that opens the file for writing (the

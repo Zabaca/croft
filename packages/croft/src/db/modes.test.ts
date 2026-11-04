@@ -14,7 +14,7 @@ import { connect, instanceConfig, type SandboxSpec } from "./connect.ts";
 import { extensionsReady, IN_CI } from "./extension-dir-testkit.ts";
 import { extensionPath, hostPlatform, verifyExtension } from "./extension-files.ts";
 import { DUCKDB_VERSION, type ExtensionName } from "./extension-names.ts";
-import { LAKE_ALIAS, type LakeSpec, MODE_EXTENSIONS, modeCredentialDigest, modeIdentity, type ModeSpec, READ_COPY_ALIAS, scrub, scrubError, scrubThrown, startQuackListener } from "./modes.ts";
+import { LAKE_ALIAS, type LakeSpec, lakeReadersMode, MODE_EXTENSIONS, modeCredentialDigest, modeIdentity, type ModeSpec, READ_COPY_ALIAS, scrub, scrubError, scrubThrown, startQuackListener } from "./modes.ts";
 import { freePort, postgresBin, readListening, startPostgres, startS3, track, type TestPostgres, type TestS3 } from "./mode-testkit.ts";
 
 const ALL: ExtensionName[] = ["quack", "httpfs", "ducklake", "postgres", "sqlite"];
@@ -169,7 +169,8 @@ describe("the pinned list", () => {
     expect(MODE_EXTENSIONS.lake).toEqual(["httpfs", "postgres", "ducklake"]);
     expect(MODE_EXTENSIONS["lake-readers"]).toEqual(["httpfs", "postgres", "ducklake", "quack"]);
     expect(MODE_EXTENSIONS["lake-local"]).toEqual(["sqlite", "ducklake"]);
-    for (const [kind, names] of Object.entries(MODE_EXTENSIONS)) if (kind !== "lake-local") expect(names, kind).not.toContain("sqlite");
+    expect(MODE_EXTENSIONS["lake-local-readers"]).toEqual(["httpfs", "sqlite", "ducklake", "quack"]);
+    for (const [kind, names] of Object.entries(MODE_EXTENSIONS)) if (kind !== "lake-local" && kind !== "lake-local-readers") expect(names, kind).not.toContain("sqlite");
   });
 
   withExt("with no mode, no extension is loaded (acceptance 1)", async () => {
@@ -602,6 +603,42 @@ describe("lake test profile (a SQLite catalog and a local folder)", () => {
     await c.run(`ATTACH '${p.root}/lake-data/trash.duckdb' AS trash`);
     await c.run("CREATE TABLE trash.z AS SELECT 1 a");
     await c.run("DETACH trash");
+  });
+
+  withExt("lake-local-readers (server mode over a local lake): sqlite, ducklake, httpfs and quack; read-only; the listener starts before the lock (D183)", async () => {
+    const p = await project();
+    const w = await open(lakeTestSpec(p));
+    await w.run(`CREATE TABLE ${LAKE_ALIAS}.t AS SELECT range AS a FROM range(100)`);
+    const port = freePort();
+    const base = lakeTestSpec(p, "read");
+    const c = await open({
+      profile: "serve", timezone: "UTC",
+      mode: { ...(base.mode as Extract<ModeSpec, { kind: "lake-local" }>), kind: "lake-local-readers", lake: { ...(base.mode as Extract<ModeSpec, { kind: "lake-local" }>).lake, access: "read" }, prepare: (conn) => startQuackListener(conn, `quack:localhost:${port}`) },
+    });
+    expect((await loaded(c)).sort()).toEqual(["ducklake", "httpfs", "quack", "sqlite"]);
+    expect(await notListening(port)).toBe(false);
+    expect(await rows(c, `SELECT count(*) FROM ${LAKE_ALIAS}.t`)).toEqual([[100n]]);
+    expect(await error(c, `INSERT INTO ${LAKE_ALIAS}.t VALUES (1)`)).toMatch(/read-only|read only/i);
+    await expectLocked(c, ["sqlite", "ducklake", "httpfs", "quack"]);
+    for (const sql of ["SELECT * FROM read_text('/etc/hosts')", `SELECT * FROM read_text('${p.root}/.env')`, `ATTACH '${p.live}' AS live`, "ATTACH 'dbname=x host=127.0.0.1' AS pg (TYPE postgres)"]) {
+      expect(await error(c, sql), sql).toMatch(/Permission Error|Loading external extensions is disabled/);
+    }
+    await c.run(`SELECT * FROM quack_stop('quack:localhost:${port}')`).catch(() => {});
+  });
+
+  test("lake-local-readers refuses a read-write lake, and lakeReadersMode turns a lake's read mode into the readers' one and nothing else", async () => {
+    const p = await project();
+    const rw = lakeTestSpec(p, "write").mode as Extract<ModeSpec, { kind: "lake-local" }>;
+    expect(() => lakeReadersMode(rw)).toThrow(/read-only/);
+    const instance = await DuckDBInstance.create(":memory:", instanceConfig("read_write"));
+    cleanup.push(() => instance.closeSync());
+    const err = await connect(instance, { profile: "serve", timezone: "UTC", mode: { ...rw, kind: "lake-local-readers" } as never }, `:memory:llr${++seq}`).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CroftError);
+    const ro = lakeTestSpec(p, "read").mode as Extract<ModeSpec, { kind: "lake-local" }>;
+    expect(lakeReadersMode(ro)).toMatchObject({ kind: "lake-local-readers", extensionDir: ext.dir, secretDir: p.secrets, lake: { access: "read", dataPath: ro.lake.dataPath } });
+    const hooks = async () => {};
+    expect(lakeReadersMode(ro, hooks).prepare).toBe(hooks);
+    expect(modeIdentity(lakeReadersMode(ro))).not.toEqual(modeIdentity(ro)); // a readers' instance is never shared with a lake's
   });
 
   withExt("the format is pinned: a new lake is made at 1.0, and a catalog of another format is LAKE_CATALOG_MISMATCH, never migrated (D137, D178)", async () => {

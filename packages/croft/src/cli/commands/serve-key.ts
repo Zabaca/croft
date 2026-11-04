@@ -169,8 +169,8 @@ function quackLines(q: QuackConnect | undefined, shared: readonly string[]): str
   return [
     "From a DuckDB 2.0 client, over Quack (croft docs quack):",
     `  ${q.attach};`,
-    `  SELECT * FROM croft.${shared[0] ?? "<shared table>"};   -- the shared tables are views of the read copy`,
-    `  SELECT as_of FROM croft.${q.asOfView};   -- when the copy was taken`,
+    `  SELECT * FROM croft.${shared[0] ?? "<shared table>"};   -- the shared tables are views of the read copy (or, over a lake, of its last snapshot)`,
+    `  SELECT as_of FROM croft.${q.asOfView};   -- when the copy was taken (the newest snapshot, over a lake)`,
     ...(q.loopback ? [] : ["Quack is not on loopback: it must sit behind an HTTPS reverse proxy, and the client attaches to the proxy's name with the port written out."]),
   ];
 }
