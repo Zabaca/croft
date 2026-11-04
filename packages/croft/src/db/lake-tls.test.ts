@@ -225,7 +225,7 @@ describe("the catalog's TLS, in the backup's pg_dump", () => {
   }, 60_000);
 });
 
-describe("what the client can know of the catalog connection's encryption (D-T1)", () => {
+describe("what the client can know of the catalog connection's encryption (D175)", () => {
   maybe("a Postgres that offers TLS answers the request libpq makes first with S, one that does not with N", async () => {
     expect(await serverOffersTls("127.0.0.1", rig.pg.port)).toBe("offered");
     expect(await serverOffersTls("localhost", plain.port)).toBe("refused");

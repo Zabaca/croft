@@ -1,4 +1,4 @@
-// What a distant catalog costs croft's commands (DESIGN.md D-T2; the second real-lake trial, 2026-11-03).
+// What a distant catalog costs croft's commands (DESIGN.md D176; the second real-lake trial, 2026-11-03).
 //
 // The trial ran a lake whose Postgres catalog (a hosted one) was about 41 ms away, and every command was slow: a run with nothing new took
 // 27 s, a `croft query` 9 s, `croft doctor` 22 s and `croft maintain` 39 s, where DuckDB alone ran the same query in under 2 s. A statement

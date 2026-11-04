@@ -1,4 +1,4 @@
-# What a catalog far away cost croft's commands, and what a transaction for each read did to it (D-T2)
+# What a catalog far away cost croft's commands, and what a transaction for each read did to it (D176)
 
 `packages/croft/scripts/bench-lake-latency.ts`, run on 2026-11-03 on macOS arm64 (bun 1.3.14, DuckDB 2.0.0, a Postgres 17 and an S3-compatible store started by the test rig, all on this machine). The project is the shape of the second real-lake trial's: two file ingests (200 and 120 rows) and a SQL asset over each. It has had three runs, one with a changed file, as a project in use would. Each cell is the median of 3 runs of the real CLI in a process of its own, as written to the table by the script.
 
@@ -31,7 +31,7 @@ What it shows:
 - What does not fall. A command costs at least 2.7 s at this distance whatever croft does: ATTACH 0.8 s, the first `USE lake` 0.9 s (DuckLake loads the catalog), and the first read of croft's own inlined tables 1.1 s (DuckLake reads them at the older schema version they were made in, which loads the catalog a second time). That is why `croft query` takes 3.7 s and not the 2 s asked for; skipping the format check of D144 for a query that never names `_croft` would make it 2.6 s, and was not done. A step that writes (the run with one file changed, the first run) takes about 7 s at this distance: a commit is 15 round trips, every scan of a table in the transaction at least 4, and a write reads about thirty of them, which this change does not touch. `croft maintain` is mostly DuckLake's own calls (a `CALL ducklake_*` takes 1.5 to 4 s, most of it in the prepare); the lake-exists probe and the prune were shortened.
 - `pg_pool_health_check_query = ''` was tried: one `SELECT 1` of the three around each use of a pooled connection goes, 26 round trips for a read of one table become 22. It was not kept: a connection that died in the pool is then found by the statement that uses it, and a Postgres that restarted could take several in turn. `pg_pool_enable_thread_local_cache` made no difference.
 
-## Bookkeeping an older pass moved into files, before and after `croft maintain` (D-T5)
+## Bookkeeping an older pass moved into files, before and after `croft maintain` (D179)
 
 `packages/croft/scripts/bench-lake-bookkeeping.ts` (D162's benchmark, with a fourth state), the same day and machine. The project is a file ingest and a SQL asset over it; the measured run is `croft run --foreground` with nothing new, the median of 3, with the *store* behind the proxy (the catalog is not delayed) and "store requests" counted at the proxy. "After a pass that flushes every schema" is what croft's pass did until D162, reproduced with DuckLake's own call; the last row is that lake after one `croft maintain` of this branch.
 
@@ -40,10 +40,10 @@ What it shows:
 | 0 ms | before any pass | 0.5 | 0 |
 | 0 ms | after a pass that flushes every schema (until D162) | 0.5 | 6 |
 | 0 ms | after croft's pass (assets only) | 0.5 | 0 |
-| 0 ms | after that flush, then croft maintain (D-T5) | 0.5 | 0 |
+| 0 ms | after that flush, then croft maintain (D179) | 0.5 | 0 |
 | 100 ms | before any pass | 0.5 | 0 |
 | 100 ms | after a pass that flushes every schema (until D162) | 1.2 | 6 |
 | 100 ms | after croft's pass (assets only) | 0.5 | 0 |
-| 100 ms | after that flush, then croft maintain (D-T5) | 0.5 | 0 |
+| 100 ms | after that flush, then croft maintain (D179) | 0.5 | 0 |
 
 A lake that an older croft maintained makes 6 requests of the store in a run with nothing new, 0.7 s at a 100 ms store and seconds at a far one (the trial's 9 s: R2, a continent away, a read of a Parquet file being more than one request). One `croft maintain` takes the rows back into the catalog and the next reads make none.

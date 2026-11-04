@@ -183,7 +183,7 @@ export function nextSteps(r: ValidateReport): Next[] {
 /**
  * The CA files a lake's settings name that are not there (CONFIG_INVALID, the code a command meets when it attaches): `lake.catalog.sslRootCert` and
  * `lake.bucket.sslRootCert`. The second real-lake trial's validate said all was well for a project whose next query failed on a missing catalog CA
- * file. Only a file the project names is checked; whether this machine has a bundle of its own is doctor's line, since another machine may (DESIGN.md D-T7).
+ * file. Only a file the project names is checked; whether this machine has a bundle of its own is doctor's line, since another machine may (DESIGN.md D181).
  */
 export function lakeFileProblems(config: NonNullable<Project["config"]>, root: string, env: ProjectEnv): Problem[] {
   const lake = config.lake;

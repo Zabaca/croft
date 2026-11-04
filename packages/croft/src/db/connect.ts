@@ -198,7 +198,7 @@ const failedInstances = new WeakMap<DuckDBInstance, { code: string; error: unkno
 /**
  * What stopped `instance`'s mode from starting, or undefined for an instance that did not fail. A second lease that shared the instance with
  * the first, whose attach failed, was refused with "left part set up" (an INTERNAL_ERROR, "report this croft bug") although it was the same
- * attach: the warehouse asks for the cause here and gives the lease that (db/warehouse.ts, the second real-lake trial; DESIGN.md D-T3).
+ * attach: the warehouse asks for the cause here and gives the lease that (db/warehouse.ts, the second real-lake trial; DESIGN.md D177).
  */
 export function startFailure(instance: DuckDBInstance): unknown {
   return failedInstances.get(instance)?.error;

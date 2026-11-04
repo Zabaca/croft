@@ -116,7 +116,7 @@ export interface DoctorDeps {
   healthTimeoutMs: number;
   /** How long the tables line may spend comparing tables with croft's record (TABLE_SCAN_MS). */
   tableScanMs?: number;
-  /** `croft doctor --tables`: every table is compared, however long it takes, and on a lake too (otherwise a lake's are left out, D-T6). */
+  /** `croft doctor --tables`: every table is compared, however long it takes, and on a lake too (otherwise a lake's are left out, D180). */
   allTables?: boolean;
   /** How the read copy's clone is tried (db/copy-policy.ts): tests give a cp that cannot clone. Default: the real cp. */
   copyProbe?: ProbeOptions & { clone?: CloneProbe };
@@ -127,7 +127,7 @@ export interface DoctorDeps {
 /** The tables line compares no more tables once this has passed, so doctor stays quick on a big warehouse. */
 export const TABLE_SCAN_MS = 400;
 /** A lake on this machine keeps the file's budget. A lake with a catalog over a network compares no table unless asked (`croft doctor --tables`,
- *  D-T6): comparing one takes several round trips of the catalog, so D166's 8 s compared 1 of 4 tables and took doctor from 2 s to 22 s. */
+ *  D180): comparing one takes several round trips of the catalog, so D166's 8 s compared 1 of 4 tables and took doctor from 2 s to 22 s. */
 export const lakeScanMs = (kind: "postgres" | "local"): number | undefined => (kind === "postgres" ? undefined : TABLE_SCAN_MS);
 
 export function defaultDeps(env: Record<string, string | undefined>): DoctorDeps {
@@ -648,7 +648,7 @@ function isThisMachine(host: string): boolean {
 }
 
 /**
- * Whether the catalog's connection is encrypted, from the client's side (D165, D-T1): what lake.catalog.sslMode makes libpq do, and for `prefer`
+ * Whether the catalog's connection is encrypted, from the client's side (D165, D175): what lake.catalog.sslMode makes libpq do, and for `prefer`
  * whether the server offers TLS to be taken. The first version asked the server (`pg_stat_ssl`), which reports the last hop of a pooler or a proxy,
  * and said "NOT encrypted" of a hosted catalog's `verify-full` connection, which libpq would have ended had it not been encrypted. It never says what it does not
  * know: a server that could not be asked is a note, not a warning, and `sslMode: "disable"` is said to be the setting's doing, not a fallback.
@@ -732,7 +732,7 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
             found.scan = e instanceof Error ? e : new Error(String(e));
           }
         }
-        // The lake's counts in the same lease, so in the same transaction: a lease of its own cost a snapshot and a round trip or more per table (D-T2).
+        // The lake's counts in the same lease, so in the same transaction: a lease of its own cost a snapshot and a round trip or more per table (D176).
         try {
           const stats = await lakeStats(db);
           maintenance = { stats, options: await ageBasedExpiryOptions(db), bookkeeping: (stats.bookkeepingFiles ?? 0) > 0 ? await bookkeepingInFiles(db) : [] };
@@ -784,7 +784,7 @@ async function checkLake(r: Report, d: DoctorDeps, project: Project, bindingOk: 
   }
 }
 
-/** What the lake's maintenance line is made of, read in doctor's one lease on the lake (D-T6). */
+/** What the lake's maintenance line is made of, read in doctor's one lease on the lake (D180). */
 interface MaintenanceInputs {
   stats: import("../../db/lake-maintenance.ts").LakeStats;
   options: import("../../db/lake-maintenance.ts").ExpiryOption[];
@@ -1510,7 +1510,7 @@ function checkSecretsCommand(r: Report, d: DoctorDeps, project: Project, from: S
   } else {
     // doctor runs the command only for a lake: opening it asks for the lake's secrets, and the command runs, once, when the shell and .env lack one (D163).
     const what = ran ? "run once by doctor, for the lake's secrets" : project.config.lake ? "not run: the shell and .env set every secret the lake names" : "not run by doctor";
-    // Where the program was found, unless the command already says exactly that (an absolute path printed twice, the second real-lake trial, D-T8).
+    // Where the program was found, unless the command already says exactly that (an absolute path printed twice, the second real-lake trial, D182).
     const found = here === program ? "" : ` (${here})`;
     r.add("project", "secrets-from", "info", `secretsFrom: ${shown}${found}, ${what}${names}`, undefined, { command: from.command, found: here, unchecked, ran });
   }

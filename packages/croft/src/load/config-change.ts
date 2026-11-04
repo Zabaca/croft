@@ -397,7 +397,7 @@ export async function applyPinChanges(tx: Sql, o: ApplyPinsInput): Promise<Appli
 
 export interface ConfigState {
   /** Rows in the table (0 when there is none), counted only when something is to be decided by it: a behavior or a lossy pin that changed. A table
-   *  that is as its code says is not scanned (D-T2: on a lake that scan was a third of a run with nothing new). */
+   *  that is as its code says is not scanned (D176: on a lake that scan was a third of a run with nothing new). */
   rows: number;
   change: BehaviorChange | null;
   /** Present when change.appendGainsKey. */

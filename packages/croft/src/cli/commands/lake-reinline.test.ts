@@ -1,5 +1,5 @@
 // croft's bookkeeping that an older pass moved into files of the store is brought back into the catalog (db/lake-maintenance.ts pruneBookkeeping,
-// DESIGN.md D-T5; the second real-lake trial). croft before D162 flushed every schema in its pass, `_croft` included, and each read of those tables
+// DESIGN.md D179; the second real-lake trial). croft before D162 flushed every schema in its pass, `_croft` included, and each read of those tables
 // then cost the store a listing and a range read or two for ever: a run with nothing new took 9 s on R2 and nothing said why. doctor now says,
 // and `croft maintain` mends it, on a local lake and on a Postgres lake with its store. What a person reads (the views `_croft.<t>`) must be the same
 // before and after, and the bookkeeping must go on from where it was.

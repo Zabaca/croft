@@ -18,7 +18,7 @@
 // file: the instance is an in-memory one that attaches the lake when its first connection is made and is then locked, and it stays open
 // for the life of the command (a re-attach after the lock is refused), so nothing lingers and nothing is closed after a lease. Every
 // connection works in the lake (`USE lake`), so the tables, the views and `current_database()` read as they do in a file, and a read lease is
-// one transaction (the catalog charges round trips for each, D-T2). There is no
+// one transaction (the catalog charges round trips for each, D176). There is no
 // file lock and no write intent; the lock on writes is croft's own (db/lake.ts LakeWriteLock), one write at a time on this machine, and
 // croft serve never steps aside. A read whose catalog connection dropped is tried again; a write is tried again as a whole, after its
 // commit is checked by the tag it carries (a commit may have landed without its answer reaching us); every error that leaves a lease has
@@ -171,7 +171,7 @@ export class LeaseSql implements Sql {
   hooks: { begin?: () => Promise<void>; commit?: () => Promise<void> } | null = null;
   /** The statements of a lake warehouse: croft never runs CHECKPOINT on a lake, sets one of its options or expires its snapshots by age (D149). */
   lake = false;
-  /** A lake read is one transaction (DuckLake charges the catalog's round trips for each one, D-T2), and a statement DuckDB refuses aborts it: this
+  /** A lake read is one transaction (DuckLake charges the catalog's round trips for each one, D176), and a statement DuckDB refuses aborts it: this
    *  starts another, so a body that goes on after a refused statement (a table that is not there, a query the user got wrong) is as it was when
    *  every statement was a transaction of its own. Not called for a connection that dropped: the lease retries the whole body. */
   recover: (() => Promise<void>) | null = null;
@@ -555,7 +555,7 @@ export class DuckWarehouse implements Warehouse {
    * the lake, and the body. A read whose catalog or store connection dropped is tried again; a write does its own retrying
    * (lakeWrite), because it must check its commit first. Every error that leaves is scrubbed.
    *
-   * A read is one transaction from `USE lake` to the end of its body (D-T2). Every statement outside a transaction is a DuckLake
+   * A read is one transaction from `USE lake` to the end of its body (D176). Every statement outside a transaction is a DuckLake
    * transaction of its own, and each of those costs the catalog's round trips (a snapshot lookup, and for each table the files, the stats and
    * the inlined rows: 9 to 26 of them, 0.4 to 1.1 s at the 41 ms the second real-lake trial measured), so the 11 statements croft ran to
    * read the state of one asset cost 6 s; in one transaction the snapshot and what DuckLake learned of a table are paid once. Nothing in a

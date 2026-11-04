@@ -10,7 +10,7 @@
 // follow-up spike recorded in option 07, item 1 of "What the follow-ups settled"), and it deletes any file in the data folder the lake does not
 // own. Each step is run by name instead, in this order:
 //   0. prune    croft's own bookkeeping log loses the rows a newer row of the same key has superseded (D154), and croft's bookkeeping that an
-//               older pass moved into files is brought back into the catalog (D-T5);
+//               older pass moved into files is brought back into the catalog (D179);
 //   1. flush    the rows DuckLake held inside the catalog become files, for the assets' schema only: croft's own bookkeeping (`_croft`)
 //               stays in the catalog, because each read of it from a store costs a request or three once it is files (D162);
 //   2. expire   the snapshots outside the promise, by an explicit list of ids croft computes (planExpiry);
@@ -273,7 +273,7 @@ export async function countSuperseded(sql: Sql): Promise<number> {
 }
 
 /**
- * Remove the rows of croft's bookkeeping log that nothing reads (D154), and bring croft's bookkeeping back into the catalog if it is in files (D-T5).
+ * Remove the rows of croft's bookkeeping log that nothing reads (D154), and bring croft's bookkeeping back into the catalog if it is in files (D179).
  *
  * Every run appends a row per asset to `_croft.assets_log` and its kin; the view `_croft.<t>` shows the newest row of each key, so a superseded
  * row is read by nothing, yet every read of the view and every numbering of a write scans the whole log, which only grows. Nothing is lost that a

@@ -312,7 +312,7 @@ const FORMAT_MISMATCH = [
 const FOLDER_MISMATCH = /DATA_PATH parameter "([^"]*)" does not match existing data path in the catalog "([^"]*)"/i;
 
 /** The catalog database holds a different lake than the settings describe: its format, or the folder its files are in. Permanent, and croft's to
- *  report, never to mend (it migrates no lake and overrides no data path; DESIGN.md D-T4). Null for any other refusal. */
+ *  report, never to mend (it migrates no lake and overrides no data path; DESIGN.md D178). Null for any other refusal. */
 export function catalogMismatch(raw: string, secrets: readonly string[], catalog?: { host: string; port: number; database: string }): CroftError | null {
   const where = catalog ? `${catalog.host}:${catalog.port}/${catalog.database}` : "the catalog database";
   const format = FORMAT_MISMATCH.map((re) => re.exec(raw)).find((m) => m !== null);

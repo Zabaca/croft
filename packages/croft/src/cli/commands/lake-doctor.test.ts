@@ -149,7 +149,7 @@ describe("croft doctor on a lake", () => {
   }, 240_000);
 });
 
-describe("doctor's comparison of tables on a lake (D-T6)", () => {
+describe("doctor's comparison of tables on a lake (D180)", () => {
   test("a lake with a catalog over a network compares no table unless asked; one on this machine keeps the file's budget", async () => {
     const { lakeScanMs, TABLE_SCAN_MS } = await import("./doctor.ts");
     expect(lakeScanMs("postgres")).toBeUndefined();

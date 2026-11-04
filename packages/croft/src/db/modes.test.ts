@@ -604,7 +604,7 @@ describe("lake test profile (a SQLite catalog and a local folder)", () => {
     await c.run("DETACH trash");
   });
 
-  withExt("the format is pinned: a new lake is made at 1.0, and a catalog of another format is LAKE_CATALOG_MISMATCH, never migrated (D137, D-T4)", async () => {
+  withExt("the format is pinned: a new lake is made at 1.0, and a catalog of another format is LAKE_CATALOG_MISMATCH, never migrated (D137, D178)", async () => {
     const { Database } = await import("bun:sqlite");
     const versionOf = (catalog: string): string => {
       const db = new Database(catalog, { readonly: true });

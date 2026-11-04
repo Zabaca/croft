@@ -5,7 +5,7 @@
 // bucket, and every read of it then cost a listing and a range read or two against the store. This measures a run with nothing new, which is
 // mostly those reads, in four states of the same project: before any pass; after a pass that flushes every schema (what croft did until D162,
 // reproduced here with DuckLake's own call, since croft no longer makes it); after croft's pass as it is now (only the assets' schema); and
-// after that flush and then croft's pass, which brings the bookkeeping back into the catalog (D-T5, the second real-lake trial).
+// after that flush and then croft's pass, which brings the bookkeeping back into the catalog (D179, the second real-lake trial).
 //
 // The store is the test rig's, on this machine, behind a TCP proxy that holds every chunk back half of `--rtt` milliseconds in each direction
 // (as the seq benchmark's proxy does for the catalog, bench-lake-seq.ts). It keeps the order of the bytes and nothing else: no loss, no jitter,
@@ -62,8 +62,8 @@ async function croft(root: string, args: string[], e: Record<string, string>): P
   return { ms: performance.now() - t0, code, err: code === 0 ? "" : `${out}\n${err}`.slice(0, 600) };
 }
 
-type State = "before any pass" | "after a pass that flushes every schema (until D162)" | "after croft's pass (assets only)" | "after that flush, then croft maintain (D-T5)";
-const STATES: State[] = ["before any pass", "after a pass that flushes every schema (until D162)", "after croft's pass (assets only)", "after that flush, then croft maintain (D-T5)"];
+type State = "before any pass" | "after a pass that flushes every schema (until D162)" | "after croft's pass (assets only)" | "after that flush, then croft maintain (D179)";
+const STATES: State[] = ["before any pass", "after a pass that flushes every schema (until D162)", "after croft's pass (assets only)", "after that flush, then croft maintain (D179)"];
 
 async function main(): Promise<void> {
   const ready = lakeRigReady();
@@ -106,7 +106,7 @@ async function main(): Promise<void> {
               await w.close();
               await closeAllWarehouses();
             }
-            if (state === "after that flush, then croft maintain (D-T5)") await run(["maintain"]);
+            if (state === "after that flush, then croft maintain (D179)") await run(["maintain"]);
           }
         }
         // Now the same project, with the store a round trip of `rtt` away.

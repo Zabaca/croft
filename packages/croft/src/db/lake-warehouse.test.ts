@@ -136,7 +136,7 @@ describe("a warehouse that is a lake", () => {
     await w.write("make t", (tx) => tx.exec("CREATE TABLE t AS SELECT range a FROM range(5)"), { runId: "r1" });
     let tries = 0;
     await w.write("make u", (tx) => tx.exec("CREATE TABLE u AS SELECT range a FROM range(5)"), { runId: "r1b" });
-    // A read is one transaction (D-T2), so the catalog connection it holds is the one that is ended; the second table is one it has not yet looked at.
+    // A read is one transaction (D176), so the catalog connection it holds is the one that is ended; the second table is one it has not yet looked at.
     const n = await w.read(async (db) => {
       tries++;
       await db.all("SELECT count(*) FROM t");
@@ -148,7 +148,7 @@ describe("a warehouse that is a lake", () => {
     expect(tries).toBe(2);
   }, 60_000);
 
-  maybe("a read is one transaction: five statements cost the catalog what one costs, not five times it (D-T2)", async () => {
+  maybe("a read is one transaction: five statements cost the catalog what one costs, not five times it (D176)", async () => {
     // The second real-lake trial: each statement outside a transaction is a DuckLake transaction of its own, and each costs the catalog a
     // snapshot lookup and a round trip or more for every table; at 41 ms a no-op run spent 27 s on them. The count is of round trips (the order of
     // the bytes through a proxy that delays nothing), not of time.

@@ -648,7 +648,7 @@ describe("the problems read as croft's other problems do", () => {
   });
 });
 
-describe("the state of a step is read in the lease that checks its config (D-T2)", () => {
+describe("the state of a step is read in the lease that checks its config (D176)", () => {
   /** The order of the leases a step takes: `read` and `write`, as the warehouse is asked for them. */
   async function leasesOf(h: H, s: PlannedStep, o: Partial<IngestInput> = {}): Promise<string[]> {
     const seen: string[] = [];
