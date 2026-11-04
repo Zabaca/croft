@@ -261,10 +261,9 @@ for (const kind of ["local", "postgres"] as LakeKind[]) {
       } finally {
         g.close();
       }
-      const started = Date.now();
+      // A run writes on, and the readers' process does not stand in its way (a hang would end at this test's timeout).
       writeFileSync(join(s.l.p.root, "assets/orders.sql"), ORDERS(50));
       await run(s);
-      expect(Date.now() - started).toBeLessThan(60_000);
       expect((await s.rig.call(alice, "SELECT count(*) AS n FROM orders")).json.data.rows).toEqual([{ n: 50 }]);
     }, 120_000);
 
@@ -308,7 +307,8 @@ for (const kind of ["local", "postgres"] as LakeKind[]) {
         await Bun.sleep(10_000);
       }, { runId: "r_long", asset: "orders" });
       await entered;
-      const started = Date.now();
+      let settled = false;
+      void held.finally(() => { settled = true; });
       const statuses: number[] = [];
       const counts = new Set<number>();
       for (let i = 0; i < 100; i += 4) {
@@ -321,7 +321,7 @@ for (const kind of ["local", "postgres"] as LakeKind[]) {
       expect(statuses).toHaveLength(100);
       expect(statuses.every((x) => x === 200), `statuses: ${[...new Set(statuses)].join(", ")}`).toBe(true);
       expect([...counts]).toEqual([20]); // the last snapshot, whole: the uncommitted five rows are never seen
-      expect(Date.now() - started, "answered while the write step was still running").toBeLessThan(10_000);
+      expect(settled, "all 100 were answered while the write step was still running").toBe(false);
       expect(s.engine.status()).toMatchObject({ state: "open", writeIntent: null, serverMode: { state: "open", restarts: 0 } });
       await held;
       expect((await s.rig.call(alice, "SELECT count(*) AS n FROM orders")).json.data.rows).toEqual([{ n: 25 }]); // the commit is in the next query

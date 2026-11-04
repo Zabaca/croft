@@ -13,6 +13,7 @@ import { ProjectEnv } from "../project/env.ts";
 import { SHARED } from "../sql/attack-testkit.ts";
 import { openLakeEngine, type LakeEngineInternals } from "./lake-engine.ts";
 import { type Rig, Rigs } from "./key-rig-testkit.ts";
+import { until } from "./readers-testkit.ts";
 import type { QuackEvent } from "./quack-access.ts";
 import type { ServeEngine, ServeEngineOptions } from "./types.ts";
 
@@ -38,6 +39,8 @@ export interface LakeServe {
   uri(): string;
   /** The project's secrets, as a command would read them. */
   env(): ProjectEnv;
+  /** A key made now, once the engine has told the process of it. */
+  key(name: string): Promise<string>;
 }
 
 /** A project in a lake of `kind` with the four tables built, and server mode on over it. Engines and servers are tracked in `rigs`. */
@@ -50,12 +53,22 @@ export async function startLakeServe(kind: LakeKind, o: { extensionDir: string; 
   });
   const events: QuackEvent[] = [];
   const env = () => ProjectEnv.load(l.p.root, l.env);
+  // The names of the keys the engine has told the process of, so that a test waits for that and not for a fixed time.
+  const told = new Set<string>();
   const engine = await openLakeEngine({
     root: l.p.root, env: env(), extensionDir: o.extensionDir, resources: { threads: 2 }, onQuack: (e) => events.push(e), pollMs: 50, ...o.engine,
+    hooks: { ...o.engine?.hooks, keysSent: (e) => { for (const n of e.names) told.add(n); o.engine?.hooks?.keysSent?.(e); } },
   });
   o.rigs.engines.push(engine);
   const rig = await o.rigs.rig({ ...l.p, database: l.project.paths.database } as never, engine, { sharedTables: shared });
-  return { l, engine, rig, events, uri: () => engine.status().serverMode!.quack!.uri, env };
+  return {
+    l, engine, rig, events, uri: () => engine.status().serverMode!.quack!.uri, env,
+    async key(name) {
+      const made = rig.key(name);
+      await until(`the key ${name} to be told to the process`, () => told.has(name), 15_000);
+      return made;
+    },
+  };
 }
 
 /** The folder the lake's files are in on disk: the local lake's data folder, or the store's folder of a shared one. */

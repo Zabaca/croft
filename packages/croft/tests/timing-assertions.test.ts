@@ -52,6 +52,10 @@ const SLEEPS: Record<string, number> = {
   "src/serve/instance.test.ts": 11,
   "src/serve/key-queries.test.ts": 3,
   "src/serve/lake-engine.test.ts": 2,
+  // The writer's wait for a SQLite lock, and the pacing of a steady load and of its commits: the delays under test (D183).
+  "src/serve/lake-quack.test.ts": 3,
+  // A write step held open for 10 s, and a write that outlives the deadline's kill by 3 s: the delays under test (D183).
+  "src/serve/lake-serve-mode.test.ts": 2,
   "src/serve/loop.test.ts": 2,
   "src/serve/quack.test.ts": 7,
   "src/serve/queue.test.ts": 10,
