@@ -29,7 +29,7 @@ function scriptsOf(text: string): string[] {
 const canPublish = (text: string) => PUBLISHES.test(withoutComments(text)) || scriptsOf(text).some((t) => SCRIPT_PUBLISHES.test(t));
 const load = (file: string) => {
   const text = readFileSync(join(WORKFLOWS, file), "utf8");
-  return { text, doc: Bun.YAML.parse(text) as { on: Record<string, any>; jobs: Record<string, any> } };
+  return { text, doc: Bun.YAML.parse(text) as { on: Record<string, any>; concurrency: { group: string }; jobs: Record<string, any> } };
 };
 
 describe("which workflows can publish", () => {
@@ -48,9 +48,9 @@ describe("which workflows can publish", () => {
     expect(SCRIPT_PUBLISHES.test("// publishes nothing\nconst x = 1"), "a word").toBe(false);
   });
 
-  test("every job of ci.yml, the log run of the suite (test-log) included, publishes nothing, mints no token and holds no secret", () => {
+  test("every job of ci.yml, the log run of the suite (test-log) and the smoke included, publishes nothing, mints no token and holds no secret", () => {
     const { doc } = load("ci.yml");
-    expect(Object.keys(doc.jobs)).toEqual(expect.arrayContaining(["test", "test-log", "test-lake-local", "test-lake-postgres", "alpine", "windows", "site"]));
+    expect(Object.keys(doc.jobs)).toEqual(["changes", "test", "test-platforms", "smoke", "test-log", "test-lake-local", "test-lake-postgres", "alpine", "windows", "site"]);
     expect(doc.on.push.tags).toEqual(["phase-*", "croft-v*"]); // ci.yml runs on the release tag, so it must be unable to publish it
     for (const [name, job] of Object.entries<any>(doc.jobs)) {
       const text = JSON.stringify(job);
@@ -66,9 +66,60 @@ describe("which workflows can publish", () => {
     expect(JSON.stringify(log)).toContain("CROFT_EXTENSION_DIR");
   });
 
+  // DESIGN.md D191: what a pull request waits for, and what waits for a push to main and the daily run.
+  const onPullRequest = (job: any) => !/github\.event_name\s*!=\s*'pull_request'/.test(job.if ?? "");
+
+  test("a pull request runs the suite once, on Linux x64 and the Bun floor, in 6 to 8 shards with the typecheck in one (D191)", () => {
+    const { doc } = load("ci.yml");
+    const job = doc.jobs.test;
+    expect(job.strategy.matrix.os).toEqual(["ubuntu-24.04"]);
+    expect(job.strategy.matrix.bun).toEqual(["1.3.14"]);
+    expect(job.strategy.matrix.shard.length).toBeGreaterThanOrEqual(6);
+    expect(job.strategy.matrix.shard.length).toBeLessThanOrEqual(8);
+    expect(onPullRequest(job)).toBe(true);
+    expect(job.steps.filter((st: any) => /bun run typecheck/.test(st.run ?? "")).length).toBe(1);
+    // No macOS job (DESIGN.md D190): GitHub's hosted Mac runners were dropping jobs unstarted.
+    for (const [name, j] of Object.entries<any>(doc.jobs)) expect(JSON.stringify([j["runs-on"], j.strategy?.matrix]), name).not.toMatch(/macos/i);
+  });
+
+  test("the other platforms and Bun versions run the suite on a push to main and daily, and a smoke on a pull request (D191)", () => {
+    const { doc } = load("ci.yml");
+    const more = doc.jobs["test-platforms"];
+    expect(onPullRequest(more)).toBe(false);
+    expect(more.strategy.matrix.os).toEqual(["ubuntu-24.04", "ubuntu-24.04-arm"]);
+    expect(more.strategy.matrix.bun).toEqual(["1.3.14", "latest"]);
+    // With `test`, the four combinations of the old matrix: x64 on the floor is `test`, the other three are here.
+    expect(more.strategy.matrix.exclude).toEqual([{ os: "ubuntu-24.04", bun: "1.3.14" }]);
+    expect(doc.on.schedule, "a daily run").toHaveLength(1);
+    expect(doc.on.schedule[0].cron).toMatch(/^\d+ \d+ \* \* \*$/);
+    expect(doc.on.push.branches).toEqual(["main"]);
+    expect(doc.concurrency.group, "a push to main and the daily run share main's ref and must not cancel each other").toContain("github.event_name");
+    // The smoke covers exactly those three combinations, runs the script, and runs on a pull request.
+    const smoke = doc.jobs.smoke;
+    expect(onPullRequest(smoke)).toBe(true);
+    expect(smoke.strategy.matrix.include).toEqual([{ os: "ubuntu-24.04", bun: "latest" }, { os: "ubuntu-24.04-arm", bun: "1.3.14" }, { os: "ubuntu-24.04-arm", bun: "latest" }]);
+    expect(smoke["timeout-minutes"]).toBeLessThanOrEqual(15);
+    expect(JSON.stringify(smoke)).toContain("bun scripts/smoke.ts");
+    expect(JSON.stringify(smoke)).toContain("fetch-extensions.ts");
+    // The Alpine and Windows smokes stay on every run.
+    for (const name of ["alpine", "windows"]) expect(onPullRequest(doc.jobs[name]), name).toBe(true);
+  });
+
+  test("on a pull request the log run is the test files that touch the bookkeeping, chosen by script; elsewhere it is the whole suite (D191)", () => {
+    const { doc } = load("ci.yml");
+    const log = doc.jobs["test-log"];
+    expect(onPullRequest(log)).toBe(true);
+    const steps: { if?: string; run?: string }[] = log.steps.filter((st: any) => /--shard=/.test(st.run ?? ""));
+    expect(steps.map((st) => st.if)).toEqual(["github.event_name == 'pull_request'", "github.event_name != 'pull_request'"]);
+    expect(steps[0]!.run).toMatch(/files=\$\(bun scripts\/bookkeeping-tests\.ts\)\n/); // made first, so that a failing script stops the step
+    expect(steps[0]!.run).toContain("$files");
+    expect(steps[1]!.run).not.toContain("bookkeeping-tests");
+    expect(JSON.stringify(log)).toContain('"CROFT_BOOKKEEPING":"log"');
+  });
+
   test("the jobs of the suite run in shards: the matrix lists 1 to N, the name says which, and the test step runs that one of N (DESIGN.md §10)", () => {
     const { doc } = load("ci.yml");
-    for (const name of ["test", "test-log", "test-lake-local", "test-lake-postgres"]) {
+    for (const name of ["test", "test-platforms", "test-log", "test-lake-local", "test-lake-postgres"]) {
       const job = doc.jobs[name];
       const shards: number[] = job.strategy.matrix.shard;
       expect(shards.length, name).toBeGreaterThan(1);
@@ -77,16 +128,15 @@ describe("which workflows can publish", () => {
       expect(job.name, name).toContain(`shard \${{ matrix.shard }}/${shards.length}`);
       const steps: { name?: string; run?: string; if?: string }[] = job.steps;
       const sharded = steps.filter((st) => /--shard=/.test(st.run ?? ""));
-      expect(sharded.length, `${name}: one step runs the shard`).toBe(1);
-      expect(sharded[0]!.run, name).toContain(`--shard=\${{ matrix.shard }}/${shards.length}`);
-      expect(sharded[0]!.run, name).toContain("--timeout 60000");
+      // One step runs the shard; the log run has two, one for a pull request and one for the rest (above).
+      expect(sharded.length, `${name}: one step runs the shard`).toBe(name === "test-log" ? 2 : 1);
+      for (const st of sharded) {
+        expect(st.run, name).toContain(`--shard=\${{ matrix.shard }}/${shards.length}`);
+        expect(st.run, name).toContain("--timeout 60000");
+      }
       // What does not depend on the shard (the typecheck, the run against an older DuckDB) is done once, by shard 1.
-      for (const st of steps.filter((x) => x !== sharded[0] && /\bbun (test|run typecheck)\b/.test(x.run ?? ""))) expect(st.if, `${name}: ${st.name}`).toBe("matrix.shard == 1");
+      for (const st of steps.filter((x) => !sharded.includes(x) && /\bbun (test|run typecheck)\b/.test(x.run ?? ""))) expect(st.if, `${name}: ${st.name}`).toBe("matrix.shard == 1");
     }
-    // Both shards of every platform are in the matrix, so the whole suite runs on each.
-    // No macOS job (DESIGN.md D190): GitHub's hosted Mac runners were dropping jobs unstarted.
-    expect(doc.jobs.test.strategy.matrix.os).toEqual(["ubuntu-24.04", "ubuntu-24.04-arm"]);
-    expect(doc.jobs.test.strategy.matrix.bun).toEqual(["1.3.14", "latest"]);
   });
 
   test("the journeys run on a lake of each kind in jobs of their own, beside the others, each with its own timeout (DESIGN.md D146)", () => {

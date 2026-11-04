@@ -4,14 +4,18 @@ on:
     branches: [main]
     tags: ["phase-*", "croft-v*"]
   pull_request:
+  # The daily run is the whole of what a pull request leaves out (DESIGN.md D191). It is on main's ref, so the concurrency group names the
+  # event as well: a push to main must not cancel it, nor it a push.
+  schedule:
+    - cron: "17 9 * * *"
   workflow_dispatch:
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   # Whether croft itself needs testing. A push or pull request that touches only the website, the infrastructure
   # (zbc), the repository README or docs/ skips the suite and the smokes: croft's tests read none of those, and the
-  # site job below runs for every change anyway. Tags, manual runs and a first push of a branch test everything.
+  # site job below runs for every change anyway. Tags, manual runs, the daily run and a first push of a branch test everything.
   changes:
     name: what changed
     runs-on: ubuntu-24.04
@@ -42,10 +46,11 @@ jobs:
           if [ -n "$rest" ]; then echo "croft=true" >> "$GITHUB_OUTPUT"; else echo "croft=false" >> "$GITHUB_OUTPUT"; fi
           echo "outside the site and infra: ${rest:-nothing}"
 
-  # DESIGN.md §10 item 8: Linux x64 glibc and Linux arm64, on the Bun floor and latest. There is no macOS job (D190). The suite runs in
-  # two shards per platform and Bun (DESIGN.md §10 "Test strategy"): one job of the whole suite ran 31 to 40 minutes against its 45.
+  # What gates a pull request (DESIGN.md D191): the whole suite once, on Linux x64 glibc and the Bun floor, split in shards so each runs about as
+  # long as the others (DESIGN.md §10 "Test strategy"), with the typecheck in shard 1. The other platforms and Bun versions run a smoke
+  # (the `smoke` job below) and run this suite on a push to main and daily (`test-platforms`). There is no macOS job (D190).
   test:
-    name: ${{ matrix.os }} · bun ${{ matrix.bun }} · shard ${{ matrix.shard }}/2
+    name: ubuntu-24.04 · bun 1.3.14 · shard ${{ matrix.shard }}/7
     needs: changes
     if: needs.changes.outputs.croft == 'true'
     runs-on: ${{ matrix.os }}
@@ -53,9 +58,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm]
-        bun: ["1.3.14", "latest"]
-        shard: [1, 2]
+        os: [ubuntu-24.04]
+        bun: ["1.3.14"]
+        shard: [1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -95,7 +100,7 @@ jobs:
             sudo rm -f /usr/sbin/policy-rc.d
             bun scripts/check-mode-tools.ts
           fi
-      # The typecheck is the same in every shard, so one shard of each platform and Bun runs it.
+      # The typecheck is the same in every shard, so one shard runs it.
       - name: typecheck
         if: matrix.shard == 1
         working-directory: packages/croft
@@ -106,13 +111,115 @@ jobs:
           CROFT_CI: "1"
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
         # --timeout: the default timeout tests/preload.ts sets reaches the first test file of a run only (DESIGN.md §10 "Test strategy").
-        # --shard: Bun's own split of the test files, the same two halves in every job (tests/workflows.test.ts, tests/shards.test.ts).
-        run: bun test --timeout 60000 --shard=${{ matrix.shard }}/2
+        # --shard: Bun's own split of the test files, the same seven parts in every job (tests/workflows.test.ts, tests/shards.test.ts).
+        run: bun test --timeout 60000 --shard=${{ matrix.shard }}/7
 
-  # The whole suite again with croft's bookkeeping kept as a lake keeps it, an append-only log on a plain DuckDB file
-  # (DESIGN.md D132): no Postgres for the lake, no lake. A job of its own, beside the matrix, so neither run lengthens the
-  # other: both full suites in one job went past its 45 minutes. One platform is enough, since the log is the same everywhere.
-  # Split in two like the matrix (DESIGN.md §10 "Test strategy": sharding), so each half runs in about half the time.
+  # The suite on the platforms and Bun versions `test` leaves out (DESIGN.md §10 item 8): Linux x64 on the newest Bun, and Linux arm64 on both.
+  # Not on a pull request: there each of them runs the smoke instead, and nobody waits for these. In four shards each, on a push to main and daily.
+  test-platforms:
+    name: after a merge · ${{ matrix.os }} · bun ${{ matrix.bun }} · shard ${{ matrix.shard }}/4
+    needs: changes
+    if: needs.changes.outputs.croft == 'true' && github.event_name != 'pull_request'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        bun: ["1.3.14", "latest"]
+        shard: [1, 2, 3, 4]
+        exclude:
+          - os: ubuntu-24.04
+            bun: "1.3.14"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ matrix.bun }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: git identity
+        run: git config --global user.email ci@zabaca.com && git config --global user.name "croft ci"
+      - run: bun install --frozen-lockfile
+      # The extension files and Postgres as in `test`, on this platform: the pins differ per platform (linux_amd64, linux_arm64).
+      - name: DuckDB extension files, cached
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/croft-extensions
+          key: duckdb-extensions-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('packages/croft/src/db/extension-pins.ts') }}
+      - name: fetch and verify the DuckDB extension files
+        working-directory: packages/croft
+        env:
+          CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
+        run: bun scripts/fetch-extensions.ts
+      # The lake profile's tests start Postgres in the foreground, as a child of the test. Never as a service.
+      - name: Postgres for the lake tests
+        working-directory: packages/croft
+        run: |
+          if ! bun scripts/check-mode-tools.ts; then
+            # A Linux image without Postgres (the arm image may lack it). Debian starts a service on install; a
+            # policy-rc.d that refuses (exit 101) keeps it from ever starting, so only the test's own foreground
+            # Postgres runs.
+            printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+            sudo chmod +x /usr/sbin/policy-rc.d
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql
+            sudo rm -f /usr/sbin/policy-rc.d
+            bun scripts/check-mode-tools.ts
+          fi
+      - name: test
+        working-directory: packages/croft
+        env:
+          CROFT_CI: "1"
+          CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
+        run: bun test --timeout 60000 --shard=${{ matrix.shard }}/4
+
+  # Smoke: what every platform and Bun must do on a pull request, in a minute or two (scripts/smoke.ts, DESIGN.md D191): a fresh project
+  # runs a pipeline and answers a query, croft serve starts in server mode, answers a key and stops, and the DuckDB extension files pinned for
+  # the platform load. The platforms `test` does not cover; always, since it is cheap. There is no macOS job (D190).
+  smoke:
+    name: ${{ matrix.os }} · bun ${{ matrix.bun }} · smoke
+    needs: changes
+    if: needs.changes.outputs.croft == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            bun: latest
+          - os: ubuntu-24.04-arm
+            bun: "1.3.14"
+          - os: ubuntu-24.04-arm
+            bun: latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ matrix.bun }}
+      - run: bun install --frozen-lockfile
+      - name: DuckDB extension files, cached
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/croft-extensions
+          key: duckdb-extensions-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('packages/croft/src/db/extension-pins.ts') }}
+      - name: fetch and verify the DuckDB extension files
+        working-directory: packages/croft
+        env:
+          CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
+        run: bun scripts/fetch-extensions.ts
+      - name: smoke
+        working-directory: packages/croft
+        env:
+          CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
+        run: bun scripts/smoke.ts
+
+  # The suite with croft's bookkeeping kept as a lake keeps it, an append-only log on a plain DuckDB file (DESIGN.md D132): no Postgres for
+  # the lake, no lake. A job of its own, beside the others, so neither run lengthens the other. One platform is enough, since the log is
+  # the same everywhere. On a pull request only the test files that touch the bookkeeping run (scripts/bookkeeping-tests.ts: chosen by what
+  # the files say, never by a list; the journeys already run on a log in the lake jobs); on a push to main and daily, all of them.
   # CROFT_BOOKKEEPING is set here and nowhere else; tests/preload.ts adds the mark that lets it take effect (db/bookkeeping.ts).
   test-log:
     name: ubuntu-24.04 · bun 1.3.14 · bookkeeping as a log · shard ${{ matrix.shard }}/2
@@ -135,9 +242,7 @@ jobs:
       - name: git identity
         run: git config --global user.email ci@zabaca.com && git config --global user.name "croft ci"
       - run: bun install --frozen-lockfile
-      # The mode tests load DuckDB's real extension files (DESIGN.md D117). They are never committed (over 100 MB per
-      # platform); this step fetches each from DuckDB's official extension repository over HTTPS and checks it against
-      # the checksum croft pins, and the tests fail in CI (CROFT_CI) rather than skip when a file is missing.
+      # The extension files and Postgres as in `test`; the lake profile's tests need them.
       - name: DuckDB extension files, cached
         uses: actions/cache@v4
         with:
@@ -153,22 +258,30 @@ jobs:
         working-directory: packages/croft
         run: |
           if ! bun scripts/check-mode-tools.ts; then
-            if [ "$RUNNER_OS" = macOS ]; then
-              brew install postgresql@17
-              bun scripts/check-mode-tools.ts
-            else
-              # A Linux image without Postgres (the arm image may lack it). Debian starts a service on install; a
-              # policy-rc.d that refuses (exit 101) keeps it from ever starting, so only the test's own foreground
-              # Postgres runs.
-              printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
-              sudo chmod +x /usr/sbin/policy-rc.d
-              sudo apt-get update
-              sudo apt-get install -y --no-install-recommends postgresql
-              sudo rm -f /usr/sbin/policy-rc.d
-              bun scripts/check-mode-tools.ts
-            fi
+            # A Linux image without Postgres (the arm image may lack it). Debian starts a service on install; a
+            # policy-rc.d that refuses (exit 101) keeps it from ever starting, so only the test's own foreground
+            # Postgres runs.
+            printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+            sudo chmod +x /usr/sbin/policy-rc.d
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql
+            sudo rm -f /usr/sbin/policy-rc.d
+            bun scripts/check-mode-tools.ts
           fi
+      - name: test, bookkeeping as a log, the files that touch it
+        if: github.event_name == 'pull_request'
+        working-directory: packages/croft
+        env:
+          CROFT_CI: "1"
+          CROFT_BOOKKEEPING: log
+          CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
+        # The list is made first, so that a script that fails stops the step: inside the test command it would leave no filter, and the
+        # whole suite would run.
+        run: |
+          files=$(bun scripts/bookkeeping-tests.ts)
+          bun test --timeout 60000 --shard=${{ matrix.shard }}/2 $files
       - name: test, bookkeeping as a log
+        if: github.event_name != 'pull_request'
         working-directory: packages/croft
         env:
           CROFT_CI: "1"
@@ -178,11 +291,12 @@ jobs:
 
   # The end-to-end journeys again with every project's warehouse in a lake (DESIGN.md D146): a SQLite catalog and a local folder in one job,
   # a Postgres catalog and an S3-compatible store (children of the test, never services) in the other. Each is a job of its own with its own
-  # timeout, beside the others, so no run lengthens another, and each in two shards (DESIGN.md §10 "Test strategy"): the Postgres one took
-  # 29 minutes whole. A journey that is about the warehouse file or about server mode says so
-  # (fileOnly in tests/e2e/harness.ts) and does not run on a lake. One platform is enough: what differs from the other jobs is the lake.
+  # timeout, beside the others, so no run lengthens another, and each in shards (DESIGN.md §10 "Test strategy", D191): four for the local lake and
+  # five for the Postgres one, so that each runs about 8 to 10 minutes. They run on every pull request; the Postgres one took 29 minutes whole.
+  # A journey that is about the warehouse file or about server mode says so (fileOnly in tests/e2e/harness.ts) and does not run on a lake.
+  # One platform is enough: what differs from the other jobs is the lake.
   test-lake-local:
-    name: ubuntu-24.04 · bun 1.3.14 · journeys on a local lake · shard ${{ matrix.shard }}/2
+    name: ubuntu-24.04 · bun 1.3.14 · journeys on a local lake · shard ${{ matrix.shard }}/4
     needs: changes
     if: needs.changes.outputs.croft == 'true'
     runs-on: ubuntu-24.04
@@ -190,7 +304,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -202,7 +316,7 @@ jobs:
       - name: git identity
         run: git config --global user.email ci@zabaca.com && git config --global user.name "croft ci"
       - run: bun install --frozen-lockfile
-      # The same extension files and Postgres as the other jobs (see test-log above); the lake journeys fail in CI (CROFT_CI) rather than skip
+      # The same extension files and Postgres as the other jobs (see `test` above); the lake journeys fail in CI (CROFT_CI) rather than skip
       # when either is missing.
       - name: DuckDB extension files, cached
         uses: actions/cache@v4
@@ -238,10 +352,10 @@ jobs:
           CROFT_CI: "1"
           CROFT_E2E_LAKE: local
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
-        run: bun test --timeout 60000 --shard=${{ matrix.shard }}/2 tests/e2e
+        run: bun test --timeout 60000 --shard=${{ matrix.shard }}/4 tests/e2e
 
   test-lake-postgres:
-    name: ubuntu-24.04 · bun 1.3.14 · journeys on a Postgres lake · shard ${{ matrix.shard }}/2
+    name: ubuntu-24.04 · bun 1.3.14 · journeys on a Postgres lake · shard ${{ matrix.shard }}/5
     needs: changes
     if: needs.changes.outputs.croft == 'true'
     runs-on: ubuntu-24.04
@@ -249,7 +363,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -261,7 +375,7 @@ jobs:
       - name: git identity
         run: git config --global user.email ci@zabaca.com && git config --global user.name "croft ci"
       - run: bun install --frozen-lockfile
-      # The same extension files and Postgres as the other jobs (see test-log above); the lake journeys fail in CI (CROFT_CI) rather than skip
+      # The same extension files and Postgres as the other jobs (see `test` above); the lake journeys fail in CI (CROFT_CI) rather than skip
       # when either is missing.
       - name: DuckDB extension files, cached
         uses: actions/cache@v4
@@ -297,7 +411,7 @@ jobs:
           CROFT_CI: "1"
           CROFT_E2E_LAKE: postgres
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
-        run: bun test --timeout 60000 --shard=${{ matrix.shard }}/2 tests/e2e
+        run: bun test --timeout 60000 --shard=${{ matrix.shard }}/5 tests/e2e
       # The store over HTTPS with a self-signed certificate (D160): with the CA the project names every command works; without it, or with another's,
       # every command says LAKE_STORE_TLS. The journeys above reach the store over plain HTTP, which is why they never met the lockdown refusing a CA file.
       # Certificates are made with the runner's openssl program.
