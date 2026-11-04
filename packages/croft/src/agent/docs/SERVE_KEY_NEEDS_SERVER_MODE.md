@@ -11,8 +11,8 @@ removed, or made up, is still a 401.
 What to do:
 - Ask the user whether people should read through croft serve at all: server mode changes what apps see too. They then
   read the read copy, as of the end of the last run that changed data, and never wait for a run (croft docs
-  server-mode). Turning it on is the user's decision, not yours. In a lake project there is no copy: they read the lake's
-  last snapshot, and each commit is in their next query (croft docs lake).
+  server-mode). Turning it on is the user's decision, not yours. In a lake project there is no copy: they read the
+  lake's last snapshot, and each commit is in their next query (croft docs lake).
 - If the user says yes, set it in croft.json and ask them to restart croft serve in their own terminal:
 
     "serverMode": { "enabled": true }
