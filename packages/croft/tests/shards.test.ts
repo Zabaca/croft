@@ -1,5 +1,5 @@
 // CI runs the suite as `bun test --shard=K/N`, N jobs each with a share of the test files (.github/workflows/ci.yml, DESIGN.md §10
-// "Test strategy", D191): eight for a pull request's run of the whole suite, four for the platforms that run it after a merge, and the
+// "Test strategy", D191): seven for a pull request's run of the whole suite, four for the platforms that run it after a merge, and the
 // same N over a list of files given on the command line (the pull request's run of the log, which names the files that touch the
 // bookkeeping). The jobs only add up to the suite if every file lands in exactly one shard, so this runs Bun's own split on a folder of
 // throwaway files, nested the way ours are, and checks that the shards partition them: none twice, none missing, none empty, and the
@@ -28,7 +28,7 @@ async function shard(k: number, n: number, only: string[] = []): Promise<string[
 }
 
 test("the shards of a run split the test files with none twice and none missing", async () => {
-  for (const n of [2, 4, 8]) {
+  for (const n of [2, 4, 7]) {
     const shards = await Promise.all(Array.from({ length: n }, (_, i) => shard(i + 1, n)));
     const all = shards.flat().sort();
     expect(all, `${n} shards: every file once`).toEqual([...FILES].sort());

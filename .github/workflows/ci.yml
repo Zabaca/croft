@@ -50,7 +50,7 @@ jobs:
   # long as the others (DESIGN.md §10 "Test strategy"), with the typecheck in shard 1. The other platforms and Bun versions run a smoke
   # (the `smoke` job below) and run this suite on a push to main and daily (`test-platforms`). There is no macOS job (D190).
   test:
-    name: ubuntu-24.04 · bun 1.3.14 · shard ${{ matrix.shard }}/8
+    name: ubuntu-24.04 · bun 1.3.14 · shard ${{ matrix.shard }}/7
     needs: changes
     if: needs.changes.outputs.croft == 'true'
     runs-on: ${{ matrix.os }}
@@ -60,7 +60,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04]
         bun: ["1.3.14"]
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: [1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -111,13 +111,13 @@ jobs:
           CROFT_CI: "1"
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
         # --timeout: the default timeout tests/preload.ts sets reaches the first test file of a run only (DESIGN.md §10 "Test strategy").
-        # --shard: Bun's own split of the test files, the same eight parts in every job (tests/workflows.test.ts, tests/shards.test.ts).
-        run: bun test --timeout 60000 --shard=${{ matrix.shard }}/8
+        # --shard: Bun's own split of the test files, the same seven parts in every job (tests/workflows.test.ts, tests/shards.test.ts).
+        run: bun test --timeout 60000 --shard=${{ matrix.shard }}/7
 
   # The suite on the platforms and Bun versions `test` leaves out (DESIGN.md §10 item 8): Linux x64 on the newest Bun, and Linux arm64 on both.
   # Not on a pull request: there each of them runs the smoke instead, and nobody waits for these. In four shards each, on a push to main and daily.
   test-platforms:
-    name: ${{ matrix.os }} · bun ${{ matrix.bun }} · shard ${{ matrix.shard }}/4
+    name: after a merge · ${{ matrix.os }} · bun ${{ matrix.bun }} · shard ${{ matrix.shard }}/4
     needs: changes
     if: needs.changes.outputs.croft == 'true' && github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
@@ -222,7 +222,7 @@ jobs:
   # the files say, never by a list; the journeys already run on a log in the lake jobs); on a push to main and daily, all of them.
   # CROFT_BOOKKEEPING is set here and nowhere else; tests/preload.ts adds the mark that lets it take effect (db/bookkeeping.ts).
   test-log:
-    name: ubuntu-24.04 · bun 1.3.14 · bookkeeping as a log · shard ${{ matrix.shard }}/4
+    name: ubuntu-24.04 · bun 1.3.14 · bookkeeping as a log · shard ${{ matrix.shard }}/2
     needs: changes
     if: needs.changes.outputs.croft == 'true'
     runs-on: ubuntu-24.04
@@ -230,7 +230,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -279,7 +279,7 @@ jobs:
         # whole suite would run.
         run: |
           files=$(bun scripts/bookkeeping-tests.ts)
-          bun test --timeout 60000 --shard=${{ matrix.shard }}/4 $files
+          bun test --timeout 60000 --shard=${{ matrix.shard }}/2 $files
       - name: test, bookkeeping as a log
         if: github.event_name != 'pull_request'
         working-directory: packages/croft
@@ -287,16 +287,16 @@ jobs:
           CROFT_CI: "1"
           CROFT_BOOKKEEPING: log
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
-        run: bun test --timeout 60000 --shard=${{ matrix.shard }}/4
+        run: bun test --timeout 60000 --shard=${{ matrix.shard }}/2
 
   # The end-to-end journeys again with every project's warehouse in a lake (DESIGN.md D146): a SQLite catalog and a local folder in one job,
   # a Postgres catalog and an S3-compatible store (children of the test, never services) in the other. Each is a job of its own with its own
-  # timeout, beside the others, so no run lengthens another, and each in shards (DESIGN.md §10 "Test strategy", D191): three for the local lake and
+  # timeout, beside the others, so no run lengthens another, and each in shards (DESIGN.md §10 "Test strategy", D191): four for the local lake and
   # five for the Postgres one, so that each runs about 8 to 10 minutes. They run on every pull request; the Postgres one took 29 minutes whole.
   # A journey that is about the warehouse file or about server mode says so (fileOnly in tests/e2e/harness.ts) and does not run on a lake.
   # One platform is enough: what differs from the other jobs is the lake.
   test-lake-local:
-    name: ubuntu-24.04 · bun 1.3.14 · journeys on a local lake · shard ${{ matrix.shard }}/3
+    name: ubuntu-24.04 · bun 1.3.14 · journeys on a local lake · shard ${{ matrix.shard }}/4
     needs: changes
     if: needs.changes.outputs.croft == 'true'
     runs-on: ubuntu-24.04
@@ -304,7 +304,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -352,7 +352,7 @@ jobs:
           CROFT_CI: "1"
           CROFT_E2E_LAKE: local
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
-        run: bun test --timeout 60000 --shard=${{ matrix.shard }}/3 tests/e2e
+        run: bun test --timeout 60000 --shard=${{ matrix.shard }}/4 tests/e2e
 
   test-lake-postgres:
     name: ubuntu-24.04 · bun 1.3.14 · journeys on a Postgres lake · shard ${{ matrix.shard }}/5
