@@ -107,6 +107,15 @@ describe("croft move-to-lake: what it refuses before anything is touched", () =>
     const r = await move(p);
     expect(r.json.problems[0].details.reasons).toEqual([expect.stringContaining("read copy")]);
   });
+
+  test("a read copy is refused in a croft.json that starts with a byte-order mark, as the loader reads it", async () => {
+    const p = await fileProject({ config: (c) => { c.readCopy = true; } });
+    const file = join(p.root, "croft.json");
+    writeFileSync(file, `\uFEFF${readFileSync(file, "utf8")}`);
+    const r = await move(p);
+    expect(r.json.problems[0]).toMatchObject({ code: "MOVE_BLOCKED" });
+    expect(r.json.problems[0].details.reasons).toEqual([expect.stringContaining("read copy")]);
+  });
 });
 
 describe("croft move-to-lake: the question and the confirmation", () => {

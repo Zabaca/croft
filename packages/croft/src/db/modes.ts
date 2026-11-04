@@ -53,6 +53,10 @@ export interface LakeBucket {
    *  may read no file once locked, so the file is allowed by name and httpfs is pointed at it; without one, an https store fails with
    *  "Cannot read a CA certificate bundle". Absent when the store is not reached over TLS. */
   caFile?: string;
+  /** The bucket's root is allowed too, not only the folder. DuckDB's listing of a folder of more than a page of objects (S3 and R2 send 1,000
+   *  keys to a page) asks for the rest at the bucket's root, and a locked instance refuses it ("Cannot access s3://<bucket>/"). Set only for the
+   *  two warehouses of `croft maintain --orphans`, which run nothing but croft's own CALL; never for a connection that runs a person's SQL. */
+  listsBucket?: true;
 }
 
 /** A lake attached read-write (the writing machine's login and key) or read-only (everything that only reads). */
@@ -154,10 +158,13 @@ export function scrub(text: string, secrets: readonly string[]): string {
   return out.replace(/\b(password|passwd|pwd|secret|secret_key|key_id|session_token)\s*=\s*(?:'[^']*'|"[^"]*"|\S+)/gi, "$1=[redacted]");
 }
 
+/** `s3://<bucket>/` of a lake folder's `s3://<bucket>/<folder>/`. */
+const bucketRoot = (path: string): string => `${/^[a-z][a-z0-9+.-]*:\/\/[^/]+/i.exec(path)![0]}/`;
+
 /** The remote (and, for the test lake, local) folder a lake's SQL may reach once locked. */
 export function modeDirectories(mode: ModeSpec | undefined): string[] {
   if (!mode) return [];
-  if (mode.kind === "lake" || mode.kind === "lake-readers") return [mode.lake.data.path];
+  if (mode.kind === "lake" || mode.kind === "lake-readers") return [mode.lake.data.path, ...(mode.lake.data.listsBucket ? [bucketRoot(mode.lake.data.path)] : [])];
   if (mode.kind === "lake-local" || mode.kind === "lake-local-readers") return [mode.lake.dataPath];
   return [];
 }
@@ -187,7 +194,7 @@ export function modeIdentity(mode: ModeSpec): unknown {
   if (mode.kind === "readers") return { ...base, copy: mode.copy };
   if (mode.kind === "lake-local" || mode.kind === "lake-local-readers") return { ...base, catalog: mode.lake.catalog.path, dataPath: mode.lake.dataPath, access: mode.lake.access };
   const { catalog, data, access } = mode.lake;
-  return { ...base, catalog: [catalog.host, catalog.port, catalog.database, catalog.user, catalog.sslMode ?? null, catalog.sslRootCert ?? null], data: [data.path, data.endpoint ?? null, data.region ?? null, data.urlStyle ?? null, data.useSsl ?? null, data.caFile ?? null], access, storeOnly: mode.lake.storeOnly ?? null };
+  return { ...base, catalog: [catalog.host, catalog.port, catalog.database, catalog.user, catalog.sslMode ?? null, catalog.sslRootCert ?? null], data: [data.path, data.endpoint ?? null, data.region ?? null, data.urlStyle ?? null, data.useSsl ?? null, data.caFile ?? null, data.listsBucket ?? null], access, storeOnly: mode.lake.storeOnly ?? null };
 }
 
 /** A digest of the mode's credentials, compared but never printed: a different password or key is a different instance. */

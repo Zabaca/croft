@@ -39,6 +39,9 @@ import type { ServeEngine, ServeEngineOptions, ServeEngineStatus, ServeQuery, Se
 
 /** How often a missing process, or a lake that is not there yet, is looked at. */
 export const LAKE_POLL_MS = 1000;
+/** How often server mode over a lake sends the process the keys when they changed: a removed key's open Quack session is refused within
+ *  this long, as on a file (option 06 promises "within one second"; the file engine looks every 250 ms). */
+export const LAKE_KEYS_POLL_MS = 250;
 /** A process that dies within this long of opening counts as a failed start for the backoff. */
 const QUICK_DEATH_MS = 2000;
 
@@ -65,7 +68,7 @@ export interface LakeEngineInternals {
   killAfterMs?: number;
   resources?: Partial<{ memoryLimit: string; threads: number }>;
   interruptEveryMs?: number;
-  /** LAKE_POLL_MS by default. */
+  /** How often the engine looks and how long a lake that is not there yet waits: LAKE_POLL_MS by default, and in server mode it looks every LAKE_KEYS_POLL_MS. */
   pollMs?: number;
   /** A folder of the pinned extension files, for croft's tests; by default the lake add-on in the project's node_modules (D134). */
   extensionDir?: string;
@@ -104,6 +107,8 @@ class LakeEngine implements ServeEngine {
   private readonly maxRows: number;
   private readonly maxQueued: number;
   private readonly pollMs: number;
+  /** How often the engine looks (tick): the keys are sent on it, so server mode looks at LAKE_KEYS_POLL_MS. */
+  private readonly tickMs: number;
   private readonly argv: string[] | undefined;
   private readonly delayOf: (attempts: number) => number;
   /** Server mode over a lake (D183): keys, the shared tables and Quack. False for a lake project that serves apps only. */
@@ -140,6 +145,7 @@ class LakeEngine implements ServeEngine {
     this.maxRows = limits.maxRows;
     this.maxQueued = limits.maxQueued;
     this.pollMs = o.pollMs ?? LAKE_POLL_MS;
+    this.tickMs = o.pollMs ?? (project.config.serverMode.enabled ? LAKE_KEYS_POLL_MS : LAKE_POLL_MS);
     this.argv = o.workerArgv;
     this.delayOf = o.restartDelayMs ?? restartDelayMs;
     const sm = project.config.serverMode;
@@ -189,7 +195,7 @@ class LakeEngine implements ServeEngine {
         throw e instanceof CroftError ? e : this.workerFailed(e);
       }
     }
-    this.timer = setInterval(() => this.tick(), this.pollMs);
+    this.timer = setInterval(() => this.tick(), this.tickMs);
     // The HTTP server keeps croft serve alive; the poll alone never should.
     (this.timer as { unref?: () => void }).unref?.();
   }
@@ -302,7 +308,7 @@ class LakeEngine implements ServeEngine {
   }
 
   /** Read the keys file when it changed since the last look: the new list, or null. A Quack session outlives a request, so the process
-   *  checks every query against its list, and a removed key stops working within a poll (D126). */
+   *  checks every query against its list, and a removed key stops working within a look (D126). */
   private readKeys(): QuackKey[] | null {
     if (!this.serverMode) return null;
     const changed = this.keyStore.changes();

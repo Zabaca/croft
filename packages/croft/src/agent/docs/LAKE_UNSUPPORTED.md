@@ -1,13 +1,12 @@
-# LAKE_UNSUPPORTED: this command does not work on a lake yet
+# LAKE_UNSUPPORTED: a lake cannot make this change in one write
 
-The project keeps its warehouse in a lake (a `lake` block in croft.json; croft docs lake). The command works on the
-warehouse as one DuckDB file (its size, its copy, its backup), and a lake is not one: its tables live in a catalog and
-a bucket. Nothing was changed.
-
-The commands this covers are named in the message. Moving an existing project's file into a lake, and server mode over
-a lake, are not built yet. The data is not at risk meanwhile: it is in the catalog and the bucket, and
-`croft restore` keeps working from the trash in the state folder. (`croft backup` and `croft maintain` work on a lake.)
+The project keeps its warehouse in a lake (a `lake` block in croft.json; croft docs lake). The write asked for something
+a lake cannot do inside one transaction: changing the type of a column of a table that the same write has already
+changed. A lake makes most type changes by rewriting the table, and DuckLake cannot read a table back in a transaction
+that changed it, so a second change to the table in that write is refused instead of failing in the middle. Nothing was
+written, and the table is as it was.
 
 What to do:
-- Use another command, or another way, if there is one; the message says what the command could not do.
-- Ask the user before doing without something a lake that holds data nobody can fetch again needs.
+- Make one change at a time: run once with the pin or the new data that retypes the column, then run again with the
+  other change. The message names the table and the columns.
+- Nothing needs repairing and no data is at risk: the run that was refused wrote nothing.

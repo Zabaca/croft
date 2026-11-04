@@ -158,6 +158,11 @@ type Locate = (path: string) => JsonPosition | undefined;
 /** Where a croft.json lives, so its paths can be checked against the project folder (and ~). */
 export interface ConfigPlace { root: string; home?: string }
 
+/** croft.json's text without a byte-order mark, which some Windows editors write and JSON.parse refuses. */
+export function withoutBom(text: string): string {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
 /** Parse and validate the text of croft.json. With `place`, stateDir and database are checked on disk too. */
 export function parseConfig(text: string, place?: ConfigPlace): ConfigResult {
   const scan = scanJson(text);
@@ -167,7 +172,7 @@ export function parseConfig(text: string, place?: ConfigPlace): ConfigResult {
       hint: `fix the JSON at line ${scan.at.line}, column ${scan.at.column}`,
     }] };
   }
-  const raw: unknown = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+  const raw: unknown = JSON.parse(withoutBom(text));
   return validateConfig(raw, (path) => scan.paths.get(path), place);
 }
 

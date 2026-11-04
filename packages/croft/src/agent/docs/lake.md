@@ -332,7 +332,7 @@ lake's newest snapshot) and finishes by proving it and switching, without copyin
 
 ## Not in this release
 
-- Server mode over a lake, and moving a project from a lake back into a file (going back is the setting above).
+- Moving a project from a lake back into a file (going back is the setting above).
 - A lake on one machine with no Postgres (a SQLite catalog and a folder). It exists for croft's own tests, and croft.json refuses it
   otherwise; it may be offered later as its own decision.
 
