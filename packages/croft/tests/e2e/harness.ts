@@ -25,8 +25,8 @@ export const PKG = resolve(import.meta.dir, "../..");
  * Every journey on a lake instead of the file: `CROFT_E2E_LAKE=local` gives each project a SQLite catalog and a local folder (the children
  * are told by CROFT_TEST_LAKE, project/root.ts testHarnessLake), `CROFT_E2E_LAKE=postgres` a database of a Postgres and a folder of an
  * S3-compatible store, both started as children of this process (db/lake-testkit.ts) and stopped when a test file ends, with the lake
- * block and its secrets written into the project by initProject. A journey that is about the warehouse file, or about server mode (a
- * project with a lake refuses it until slice 5), says so with fileOnly() and does not run on a lake; the others run unchanged.
+ * block and its secrets written into the project by initProject. A journey that is about the warehouse file, or about the read copy that
+ * server mode makes of one (a lake has none, D183), says so with fileOnly() and does not run on a lake; the others run unchanged.
  */
 export type LakeKind = "local" | "postgres";
 export const LAKE: LakeKind | null = (() => {

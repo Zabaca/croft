@@ -83,8 +83,13 @@ the project's node_modules (croft docs addons). A missing or different file is E
 or EXTENSION_WRONG_BUILD, `croft validate` and `croft doctor` report it with the install command as the fix, and croft serve
 does not start (croft docs EXTENSION_MISSING). croft's own tests and builders use a folder instead ($CROFT_EXTENSION_DIR).
 
-## A project that moves into a lake
+## A project with a lake
 
-Server mode over a lake is not built yet, so croft move-to-lake refuses a project with serverMode.enabled on
-(MOVE_BLOCKED) and leaves its keys, serve.sharedTables and settings exactly as they are. Keep such a project on its file
-until server mode over a lake exists, or ask the user whether to turn server mode off first.
+Server mode works over a lake too (croft docs lake). There is no read copy to make, swap or pay for: croft serve's readers'
+process attaches the lake itself, read-only, with the read-only catalog login and bucket key, and answers from the last
+snapshot. Everything above holds except what is about the copy (its refresh, its swap, its read-only file, its disk cost).
+People see each commit on their next query. Every answer's `asOf` is the time of the lake's newest snapshot the process has
+seen; the as-of view `_croft_as_of` holds it for a DuckDB client; `serverMode.copy` in GET /status is null.
+
+A project that moves into a lake with server mode on keeps it: its keys and serve.sharedTables are unchanged, and the read
+copy it made on the file stays on disk, no longer refreshed.

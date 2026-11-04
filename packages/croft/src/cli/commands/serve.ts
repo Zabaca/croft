@@ -66,8 +66,9 @@ export interface ServeData {
   /** Set once it stopped. */
   stopped: { signal: string; at: string } | null;
   /** Only with serverMode on (D119): croft serve answers from this read copy (relative to the project when inside it),
-   *  as of this time (null until the first copy exists), and never opens the warehouse file. */
-  serverMode?: { readCopy: string; asOf: string | null };
+   *  as of this time (null until the first copy exists), and never opens the warehouse file. Over a lake (D183) there is no copy:
+   *  `readCopy` is null, and `asOf` is when the lake's newest snapshot the server has seen was made (null until it has seen one). */
+  serverMode?: { readCopy: string | null; asOf: string | null };
   /** Only in server mode, once the readers' process listens (D125): how a person's DuckDB 2.0 attaches over Quack, with `<key>`
    *  where the key goes (croft serve key add prints the statement with the key in it). */
   quack?: QuackConnect & { uri: string; attach: string };
@@ -193,7 +194,7 @@ export async function runServe(ctx: Ctx, deps: ServeDeps = {}): Promise<CommandR
         needsServerMode: !project.config.serverMode.enabled && keyCount(keys) > 0,
       },
       stopped: null,
-      ...(project.config.serverMode.enabled ? { serverMode: { readCopy: shownPath(project, project.paths.readCopy), asOf: engine.status().serverMode?.asOf ?? null } } : {}),
+      ...(project.config.serverMode.enabled ? { serverMode: { readCopy: project.config.readCopy ? shownPath(project, project.paths.readCopy) : null, asOf: engine.status().serverMode?.asOf ?? null } } : {}),
       ...(quackUri ? { quack: connectSnippet({ host: project.config.serverMode.quackHost, port: project.config.serverMode.quackPort }, quackUri, null) as QuackConnect & { uri: string; attach: string } } : {}),
     };
     announce(ctx, data);
@@ -274,11 +275,16 @@ function loopLogger(ctx: Ctx): (e: LoopEvent) => void {
 
 /** DESIGN.md §4.2. */
 export function formatBanner(d: ServeData, timezone: string, now: Date = new Date()): string {
-  const lines = [d.serverMode
+  const lines = [d.serverMode?.readCopy === null
+    // Server mode over a lake (D183): the process attaches the lake itself, read-only, and there is no copy.
+    ? `croft serve · ${d.url} · server mode over ${d.database}: answers from the lake's last snapshot, read-only, and never waits for a run`
+    : d.serverMode
     ? `croft serve · ${d.url} · server mode: answers from ${d.serverMode.readCopy}, never opens ${d.database}`
     // A lake (its label starts "lake ", project/lake-config.ts lakeLabel) is read as of its last snapshot and never stepped aside from (D143).
     : `croft serve · ${d.url} · database ${d.database} (read-only, ${d.database.startsWith("lake ") ? "reads the last snapshot, never waits for a run" : "steps aside for writes"})`];
-  if (d.serverMode) {
+  if (d.serverMode?.readCopy === null) {
+    lines.push(`the newest snapshot seen is ${d.serverMode.asOf ? `from ${localTime(d.serverMode.asOf, timezone, now)}` : "not seen yet: the lake is not there until a run creates it"}; every answer says as of when, and each query reads the last one committed`);
+  } else if (d.serverMode) {
     lines.push(`the read copy is ${d.serverMode.asOf ? `as of ${localTime(d.serverMode.asOf, timezone, now)}` : "not made yet: croft serve is making it, and a run makes it too"}; every answer says as of when, and runs never wait for croft serve`);
   }
   if (!d.loopback) {
@@ -299,7 +305,7 @@ export function formatBanner(d: ServeData, timezone: string, now: Date = new Dat
       : `${n}, but serve.sharedTables in croft.json names no table, so every key query is refused`);
   }
   if (d.quack) {
-    lines.push(`DuckDB 2.0 clients attach over Quack at ${d.quack.uri} with a key: ${d.quack.attach}; the copy's as-of time is in ${d.quack.asOfView} (croft docs quack)`);
+    lines.push(`DuckDB 2.0 clients attach over Quack at ${d.quack.uri} with a key: ${d.quack.attach}; the ${d.serverMode?.readCopy === null ? "snapshot's" : "copy's"} as-of time is in ${d.quack.asOfView} (croft docs quack)`);
     if (!d.quack.loopback) {
       lines.push(`Quack is not loopback: put an HTTPS reverse proxy in front of ${d.quack.uri.replace(/^quack:/, "")}; clients attach to the proxy's name with the port written out`);
     }

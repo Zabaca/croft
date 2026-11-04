@@ -10,7 +10,7 @@
 //      done on the file, the file is byte for byte unchanged (acceptance 1 and 2), and the move is refused a second time (acceptance 3);
 //   d. the lake works as any lake: a run merges, the trash of the file's days restores into the lake, a backup covers it;
 //   e. going back is "lake.enabled": false: the file is exactly as it was, and status reads it again;
-//   f. the refusals, each with its fix: a lake that holds tables, a column a lake cannot store, server mode, a croft serve that is running;
+//   f. the refusals, each with its fix: a lake that holds tables, a column a lake cannot store, a croft serve that is running (server mode is not one, D183);
 //   g. a kill -9 at each point of the move leaves the project on the file, and the next move finishes it without copying twice.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
@@ -430,17 +430,22 @@ if (!LAKE) {
       expect(again.json.problems[0].hint).toContain("name a new catalog database and bucket folder");
     }, 600_000);
 
-    test("c. server mode on keeps its keys and settings: the move is refused until server mode over a lake exists", async () => {
+    test("c. server mode on goes with the project: the move is not refused for it, croft.json stays valid with the lake on, and no read copy is needed (D183)", async () => {
       const q = await small("server", { config: (cfg) => { cfg.serverMode = { enabled: true }; cfg.serve = { sharedTables: ["example_sales"] }; } });
-      const cfg0 = q.read("croft.json");
-      const sha0 = sha(warehouse(q));
-      const r = await q.json(["move-to-lake"]);
-      expect(r.code, show(r)).toBe(2);
-      expect(r.json.problems[0]).toMatchObject({ code: "MOVE_BLOCKED", effect: "nothing was changed" });
-      expect(r.json.problems[0].message).toContain("server mode");
-      expect(r.json.problems[0].hint).toContain("its keys and settings stay as they are");
-      expect(q.read("croft.json")).toBe(cfg0);
-      expect(sha(warehouse(q))).toBe(sha0);
+      const done = await moveAndConfirm(q);
+      expect(done.code, show(done)).toBe(0);
+      expect(JSON.parse(done.stdout).data.result.status).toBe("moved");
+      // One token changed in croft.json: the lake is on, and the server mode and the shared tables are as they were.
+      expect(config(q).lake.enabled).toBe(true);
+      expect(config(q).serverMode).toEqual({ enabled: true });
+      expect(config(q).serve).toEqual({ sharedTables: ["example_sales"] });
+      // The project reads, with its mode on over the lake: status names it, and no copy is made by the next run.
+      const status = await q.json(["status"]);
+      expect(status.code, show(status)).toBe(0);
+      expect(status.json.data.serverMode).toMatchObject({ serving: false });
+      q.write("assets/more.sql", "-- description: more\n-- key: id\nSELECT range AS id FROM range(10)\n");
+      expect((await q.json(["run", "more"])).code).toBe(0);
+      expect(existsSync(join(q.root, "warehouse.read.duckdb"))).toBe(false);
     }, 300_000);
 
     test("d. a croft serve that is running, and a croft.json that cannot be rewritten, stop it before anything is touched", async () => {

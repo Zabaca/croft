@@ -109,12 +109,13 @@ export interface ServeEngineStatus {
   /** A lake project's engine (D143, serve/lake-engine.ts): the lake it reads, the process that reads it and how often that was started
    *  again. It never steps aside, so `state` is "open" whenever the process is. */
   lake?: { label: string; workerPid: number | null; restarts: number };
-  /** Server mode only (D119): the readers' engine (serve/readers.ts). `state` is the engine's own: "waiting" for the
-   *  first copy, "starting", "open", "restarting" after a kill, a crash or a failed start, or "stopped". */
+  /** Server mode only (D119): the readers' engine (serve/readers.ts), or over a lake (D183) the lake engine with `serve`. `state` is the
+   *  engine's own: "waiting" for the first copy (the lake), "starting", "open", "restarting" after a kill, a crash or a failed start, or "stopped". */
   serverMode?: {
     state: "waiting" | "starting" | "open" | "restarting" | "stopped";
-    /** The read copy, and its as-of time (in the project offset) as the readers' process has it; null before it opens. */
-    copy: string;
+    /** The read copy, and its as-of time (in the project offset) as the readers' process has it; null before it opens. Over a lake there is
+     *  no copy: `copy` is null and `asOf` is the time of the newest snapshot the process has seen. */
+    copy: string | null;
     asOf: string | null;
     workerPid: number | null;
     /** Refreshed copies taken in, and times the readers' process was started again, since croft serve started. */

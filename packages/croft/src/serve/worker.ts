@@ -30,6 +30,14 @@
 // taken for each query rather than kept, and a query whose catalog connection dropped is run again, once. Every error that leaves is
 // scrubbed of the lake's credentials.
 //
+// Server mode over a lake (D183, option 07 slice 5) is the lake worker with `serve` in the open message: the lake is attached
+// read-only as above, quack is loaded besides, and the process does what the readers' process does with the copy, with the lake in
+// the copy's place and no copy: the shared tables are views in the in-memory database reading `lake.main`, the as-of view holds
+// the time of the lake's newest snapshot, Quack's hooks and listener start before the lock, and `keys` replaces the keys they accept.
+// Nothing is swapped in: a view reads the lake's last snapshot whenever it is read. What a commit can change under the views is
+// which tables exist, so `syncLake` looks at the lake's newest snapshot (one small catalog query) before every query that is
+// answered here and, while a Quack session is signed in, every LAKE_SYNC_MS, and makes the views again when it is a new one.
+//
 // Server mode (D119) runs the same worker as the readers' process: `open` with `readers` makes an in-memory
 // instance (never the live file), loads quack and httpfs by path, attaches the read copy READ_ONLY as `wh`, and
 // locks it down to the copy's path (db/modes.ts, kind "readers"). Every connection then runs `USE wh`, so the gate and
@@ -54,7 +62,7 @@ import { CroftError } from "../core/errors.ts";
 import type { Problem, Sql } from "../core/types.ts";
 import { connect, lockConflict, newerStorage, openInstance, openMemoryInstance, type SandboxSpec } from "../db/connect.ts";
 import { isConnectionError } from "../db/lake.ts";
-import { LAKE_ALIAS, modeSecrets, READ_COPY_ALIAS, READERS_VIEWS_DB, scrubThrown } from "../db/modes.ts";
+import { LAKE_ALIAS, type LakeLocalMode, type LakeMode, lakeReadersMode, modeSecrets, READ_COPY_ALIAS, READERS_VIEWS_DB, scrubThrown } from "../db/modes.ts";
 import { checkFormat } from "../db/state.ts";
 import { type ColumnInfo, renderRows, renderValueRows, resultShape, typeName } from "../db/values.ts";
 import { mapQueryError, toDuck, wireSafe } from "../read/select.ts";
@@ -69,7 +77,7 @@ import { QuackListener } from "./quack-listener.ts";
 export type ToWorker =
   /** `path` is the warehouse, or with `readers` the read copy (server mode: the readers' process, an in-memory
    *  instance with the copy attached read-only; the folders are the extension files' and the secret folder's). */
-  | { op: "open"; path: string; spec: SandboxSpec; protect: string[]; readers?: ReadersOpen; lake?: true }
+  | { op: "open"; path: string; spec: SandboxSpec; protect: string[]; readers?: ReadersOpen; lake?: true; serve?: LakeServe }
   /** Server mode: the copy at `path` was replaced; detach the old file and attach the new one. `asOf` is the new copy's as-of time. */
   | { op: "swap"; asOf: string }
   /** Server mode: the keys Quack accepts are now these (a key removed here is refused on its session's next query). */
@@ -93,6 +101,13 @@ export interface ReadersOpen {
   quack?: { host: string; port: number; queryTimeoutMs: number; maxConcurrent: number; keys: QuackKey[] };
 }
 
+/** What a lake worker is opened with to serve people with keys as well as apps (server mode over a lake, D183): the shared tables and, to
+ *  listen for DuckDB clients, Quack's address and the keys it accepts. */
+export interface LakeServe {
+  shared: string[];
+  quack?: { host: string; port: number; queryTimeoutMs: number; maxConcurrent: number; keys: QuackKey[] };
+}
+
 /** An error, as it crosses the process boundary. */
 export type WireError =
   | { kind: "croft"; problem: Problem }
@@ -106,12 +121,14 @@ export type WireError =
  *  resident set so far, in bytes. */
 export type FromWorker =
   | { op: "ready"; pid: number }
-  | { op: "opened"; conns: number; quack?: { uri: string } }
+  | { op: "opened"; conns: number; quack?: { uri: string }; snapshotMs?: number }
   | { op: "open_failed"; error: WireError }
   | { op: "swapped"; conns: number }
   /** The swap failed: this process is part set up and exits at once; croft serve starts another. */
   | { op: "swap_failed"; error: WireError }
-  | { op: "answer"; id: number; conns: number; peakRss: number; columns: ColumnInfo[]; rowsJson: string; rowCount: number; tables: string[] }
+  | { op: "answer"; id: number; conns: number; peakRss: number; columns: ColumnInfo[]; rowsJson: string; rowCount: number; tables: string[]; snapshotMs?: number }
+  /** Server mode over a lake: the lake's newest snapshot changed (it is this one, made at `ms`); the engine's status and /health say it. */
+  | { op: "snapshot"; ms: number }
   | { op: "failed"; id: number; conns: number; peakRss: number; error: WireError }
   | { op: "disconnected"; conns: number }
   /** Quack: a person signed in, or a query was answered or refused (never the SQL or the key). */
@@ -288,6 +305,11 @@ class Host {
   private readonly using = new WeakMap<DuckDBConnection, string>();
   /** A lake project's worker (`open` with `lake`): the lake is attached read-only, and every connection works in it. */
   private lake = false;
+  /** Server mode over a lake (`open` with `lake` and `serve`): the lake's newest snapshot the views were made for, and the sync in progress. */
+  private snapshot: { id: number; ms: number } | null = null;
+  private syncing: Promise<void> = Promise.resolve();
+  private syncNext: Promise<{ id: number; ms: number }> | null = null;
+  private syncTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(private readonly send: (m: FromWorker) => void, private readonly exit: () => void = () => {}) {}
 
@@ -357,11 +379,38 @@ class Host {
         this.instance = await openMemoryInstance();
         this.lake = true;
         this.key = LAKE_KEY;
-        this.spec = m.spec;
         this.path = m.path;
         this.protect = m.protect;
-        const first = await connect(this.instance, this.spec, this.key); // checks the files, loads, attaches, locks
-        first.disconnectSync();
+        if (m.serve) {
+          // Server mode over a lake (D183): quack besides, the hooks and the listener registered before the lock, the views made after it.
+          const serve = m.serve;
+          if (serve.quack) {
+            const q = serve.quack;
+            this.quack = new QuackListener({
+              host: q.host, port: q.port, queryTimeoutMs: q.queryTimeoutMs, maxConcurrent: q.maxConcurrent, shared: serve.shared, keys: q.keys,
+              emit: (event) => this.send({ op: "quack", event }),
+              overdue: (o) => this.send({ op: "quack_overdue", ...o }),
+            });
+          }
+          const mode = lakeReadersMode(m.spec.mode as LakeMode | LakeLocalMode, this.quack ? (c) => this.quack!.prepare(c) : undefined);
+          this.spec = { ...m.spec, mode };
+          this.shared = serve.shared;
+          this.admin = await connect(this.instance, this.spec, this.key); // checks the files, loads, attaches, starts the listener, locks
+          await this.syncLake();
+          if (this.quack) {
+            // The deadline's look at the running queries has a connection of its own: the admin one makes the views.
+            this.quack.watch(await connect(this.instance, this.spec, this.key));
+            this.syncTimer = setInterval(() => {
+              // Only while someone could be reading: an idle server asks the catalog nothing.
+              if (this.quack && this.quack.access.signedIn > 0) void this.syncLake().catch(() => {});
+            }, LAKE_SYNC_MS);
+            (this.syncTimer as { unref?: () => void }).unref?.();
+          }
+        } else {
+          this.spec = m.spec;
+          const first = await connect(this.instance, this.spec, this.key); // checks the files, loads, attaches, locks
+          first.disconnectSync();
+        }
       } else {
         this.instance = (await openInstance(m.path, "read_only")).instance;
         this.key = m.path;
@@ -376,7 +425,7 @@ class Host {
       } finally {
         this.give(conn);
       }
-      this.send({ op: "opened", conns: this.all.size, ...(this.quack?.uri ? { quack: { uri: this.quack.uri } } : {}) });
+      this.send({ op: "opened", conns: this.all.size, ...(this.quack?.uri ? { quack: { uri: this.quack.uri } } : {}), ...(this.snapshot ? { snapshotMs: this.snapshot.ms } : {}) });
     } catch (e) {
       // The instance, if it opened, stays as it is: the engine kills this worker. A readers' process also ends itself,
       // since the instance is part set up and is never reused.
@@ -450,15 +499,21 @@ class Host {
     try {
       if (!this.instance || !this.spec) throw new Error("the query worker has no database open");
       let a: Answer | null = null;
+      let snapshot: { id: number; ms: number } | null = null;
       // A key's query works in the views of the shared tables; the app token's on the copy itself.
       const scoped = m.shared !== undefined;
       for (let attempt = 0; a === null; attempt++) {
-        const epoch = this.epoch;
-        // The copy is attached under one of two names, and a swap moves it to the other (D129).
-        const db = scoped ? READERS_VIEWS_DB : this.alias;
+        let epoch = this.epoch;
+        // The copy is attached under one of two names, and a swap moves it to the other (D129). A lake is always `lake`.
+        const db = scoped ? READERS_VIEWS_DB : this.lake ? LAKE_ALIAS : this.alias;
         try {
           // A swap in progress is waited for: the app token's connections move to the new name when it is done.
           if (this.swapping) await this.swapping;
+          // Server mode over a lake: the views match the lake's newest snapshot before the gate reads them, and the answer says which.
+          if (this.lake && this.admin) {
+            snapshot = await this.syncLake();
+            epoch = this.epoch;
+          }
           conn = await this.take(db);
           q.conn = conn;
           if (q.stopped) conn.interrupt();
@@ -488,7 +543,7 @@ class Host {
           conn = null;
         }
       }
-      reply = { op: "answer", id: m.id, conns: 0, peakRss: 0, ...a };
+      reply = { op: "answer", id: m.id, conns: 0, peakRss: 0, ...a, ...(snapshot ? { snapshotMs: snapshot.ms } : {}) };
     } catch (e) {
       reply = { op: "failed", id: m.id, conns: 0, peakRss: 0, error: q.stopped ? { kind: "stopped" } : toWire(this.clean(e)) };
     }
@@ -504,10 +559,10 @@ class Host {
   }
 
   /** A connection, working in `db` when this is the readers' process (the copy for the app token, the views for a key), or in the lake. */
-  private async take(db: string = this.alias): Promise<DuckDBConnection> {
+  private async take(db: string = this.lake ? LAKE_ALIAS : this.alias): Promise<DuckDBConnection> {
     const reuse = this.idle.pop();
     const conn = reuse ?? await connect(this.instance!, this.spec!, this.key);
-    if (this.lake && this.using.get(conn) !== LAKE_ALIAS) {
+    if (this.lake && !this.admin && this.using.get(conn) !== LAKE_ALIAS) {
       try {
         await conn.run(`USE ${LAKE_ALIAS}`);
         this.using.set(conn, LAKE_ALIAS);
@@ -518,7 +573,8 @@ class Host {
       }
     }
     if (this.admin && this.using.get(conn) !== db) {
-      // The readers' process: the copy is the default database, as the live file's own catalog is in file mode.
+      // The readers' process: the copy (or the lake) is the default database for the app token, as the live file's own catalog is in
+      // file mode, and the views for a key.
       try {
         await conn.run(`USE ${db}`);
         this.using.set(conn, db);
@@ -597,6 +653,39 @@ class Host {
     this.views = next;
   }
 
+  /**
+   * Server mode over a lake: make the views match the lake's newest snapshot, and return which it is. The look is one small catalog call; the
+   * views are made again only when the snapshot is a new one (CREATE OR REPLACE in one transaction, so a Quack session mid-sync never finds a
+   * name gone), and Quack's catalog follows. One look runs at a time, and one waits: a caller that comes while one is running shares the next,
+   * which starts after it came, so what it returns is never older than the caller's own arrival. What the views read is the lake's last snapshot
+   * whenever they are read, so a table's new rows and a new column need no sync at all; the sync is for which tables exist, and for the as-of time.
+   */
+  private syncLake(): Promise<{ id: number; ms: number }> {
+    if (this.syncNext) return this.syncNext;
+    const after = this.syncing;
+    const next = after.then(() => {
+      this.syncNext = null;
+      const look = this.lookAtLake();
+      this.syncing = look.then(() => {}, () => {});
+      return look;
+    });
+    this.syncNext = next;
+    return next;
+  }
+
+  private async lookAtLake(): Promise<{ id: number; ms: number }> {
+    const admin = this.admin!;
+    const id = Number((await admin.runAndReadAll(`SELECT id FROM ${LAKE_ALIAS}.current_snapshot()`)).getRowsJS()[0]![0]);
+    if (this.snapshot?.id === id) return this.snapshot;
+    const ms = Number((await admin.runAndReadAll(`SELECT epoch_ms(snapshot_time) FROM ${LAKE_ALIAS}.snapshots() WHERE snapshot_id = ${id}`)).getRowsJS()[0]![0]);
+    await this.makeViews(admin, new Date(ms).toISOString(), LAKE_ALIAS);
+    await this.quack?.refresh(admin, this.views);
+    this.epoch++; // a query that failed while the views were made runs again, once
+    this.snapshot = { id, ms };
+    this.send({ op: "snapshot", ms });
+    return this.snapshot;
+  }
+
   private give(conn: DuckDBConnection): void {
     if (this.all.has(conn)) this.idle.push(conn);
   }
@@ -613,6 +702,9 @@ class Host {
     }
   }
 }
+
+/** How often a lake's newest snapshot is looked at while a Quack session is signed in: how long a table a run just made takes to appear. */
+export const LAKE_SYNC_MS = 250;
 
 const sqlString = (s: string) => `'${s.replaceAll("'", "''")}'`;
 const quote = (s: string) => `"${s.replaceAll('"', '""')}"`;

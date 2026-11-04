@@ -32,7 +32,7 @@
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "description": "server mode: croft serve answers apps from a readers' process on the read copy and never opens the warehouse file; turns the read copy on, read-only on disk (croft docs server-mode)",
+          "description": "server mode: croft serve answers apps and each person's key from a readers' process on the read copy and never opens the warehouse file; turns the read copy on, read-only on disk. With a lake there is no copy: the process attaches the lake read-only (croft docs server-mode)",
           "type": "boolean",
           "default": false
         },

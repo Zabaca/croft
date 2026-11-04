@@ -73,6 +73,7 @@ const VALID: unknown[] = [
   { ...tz, lake: sharedLake() }, { ...tz, lake: localLake() }, { ...tz, lake: localLake({ catalog: { kind: "sqlite", path: "/var/croft/catalog.sqlite" }, dataPath: "~/croft/data/" }) },
   { ...tz, lake: sharedLake({ catalog: { ...sharedLake().catalog, sslMode: "verify-full", sslRootCert: "certs/neon-root.pem" } }) },
   { ...tz, lake: sharedLake({ catalog: { ...sharedLake().catalog, sslMode: "disable" } }) },
+  { ...tz, lake: sharedLake(), serverMode: { enabled: true } }, { ...tz, lake: localLake(), serverMode: { enabled: true, quackPort: 0 } }, // server mode over a lake (D183)
   { ...tz, lake: sharedLake({ bucket: { name: "b-1", folder: "a", writer: { keyIdSecret: "A1", secretKeySecret: "B1" }, reader: { keyIdSecret: "A2", secretKeySecret: "B2" } } }) },
   { database: "warehouse.duckdb", timezone: "UTC" },
   { $schema: "./node_modules/@zabaca/croft/croft.schema.json", database: "warehouse.duckdb", timezone: "America/Los_Angeles" },
@@ -179,7 +180,7 @@ const SCHEMA_ACCEPTS_VALIDATOR_REJECTS: unknown[] = [
   { ...tz, lake: sharedLake({ catalog: { ...sharedCatalog, sslMode: "require", sslRootCert: "ca.pem" } }) },  // a root certificate is for verify-full
   { ...tz, lake: localLake({ catalog: { kind: "sqlite", path: "c.sqlite", sslMode: "disable" } }) },          // a SQLite catalog has no TLS
   { ...tz, lake: sharedLake({ bucket: { ...sharedBucket, folder: "../other/" } }) },            // the folder stays inside the bucket
-  { ...tz, lake: sharedLake(), serverMode: { enabled: true } }, { ...tz, lake: sharedLake(), readCopy: true }, // server mode over a lake is a later slice; no read copy of a lake
+  { ...tz, lake: sharedLake(), readCopy: true }, // no read copy of a lake (server mode over a lake needs none, D183)
 ];
 
 describe("croft.schema.json", () => {

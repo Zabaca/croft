@@ -7,7 +7,8 @@ the one command to keep running on a server, in a container or on WSL (croft doc
 
 With "serverMode": { "enabled": true } in croft.json it does not step aside at all: it never opens the warehouse
 file and answers every query from the read copy, which each run that changes data refreshes (croft docs
-server-mode). Reading through croft serve, as described here, is the same in both.
+server-mode). Reading through croft serve, as described here, is the same in both. With a lake the same setting makes it
+read the lake itself, read-only, and serve people with keys too, with no copy (croft docs lake).
 
 ## Starting it (the user does)
 

@@ -10,7 +10,8 @@ Nothing else was written. The app token is not affected.
 
 What to do:
 - Ask the user whether people should read through croft serve in server mode. It changes what apps see too: they read
-  the read copy, as of the end of the last run that changed data (croft docs server-mode).
+  the read copy, as of the end of the last run that changed data (croft docs server-mode); in a lake project, the lake's
+  last snapshot.
 - If the user says yes, set it in croft.json and ask them to restart croft serve in their own terminal:
 
     "serverMode": { "enabled": true }

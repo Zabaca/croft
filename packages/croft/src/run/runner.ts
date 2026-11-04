@@ -745,7 +745,7 @@ async function runSteps(o: RunnerOptions): Promise<RunOutcome> {
       const failed = steps.some((s) => s.status === "failed") || problems.some((p) => p.severity === "error" && p.code !== "CONFIRMATION_REQUIRED");
       const status: RunStatus = interrupted ? "interrupted" : failed ? "failed" : "succeeded";
       // Server mode past its copy limit (D121): the copy is still refreshed, and every run that changed data says what it costs.
-      if (o.project.config.serverMode.enabled && steps.some((s) => s.status === "ok")) {
+      if (o.project.config.serverMode.enabled && o.project.config.readCopy && steps.some((s) => s.status === "ok")) {
         const policy = assessCopyPolicy(o.project, o.hooks?.copyProbe);
         if (policy.refused) problems.push({ ...copyCostlyProblem(policy, "limit"), severity: "warning", runId });
       }

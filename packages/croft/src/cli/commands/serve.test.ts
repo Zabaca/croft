@@ -327,6 +327,19 @@ describe("the banner", () => {
     ].join("\n"));
   });
 
+  test("server mode over a lake (D183): no copy is named, and the snapshot is", () => {
+    const lake = { ...base, database: "lake s3://bucket/orders/", keys: { count: 2, sharedTables: ["orders"], unknownTables: [], needsServerMode: false } };
+    const seen = formatBanner({ ...lake, serverMode: { readCopy: null, asOf: "2026-10-30T10:00:00-07:00" }, quack: { uri: "quack:127.0.0.1:9494", loopback: true, attach: "ATTACH 'quack:127.0.0.1:9494' AS croft (TOKEN '<key>')", asOfView: "_croft_as_of" } }, "America/Los_Angeles", new Date("2026-10-30T20:00:00Z"));
+    expect(seen).toContain("croft serve · http://127.0.0.1:7447 · server mode over lake s3://bucket/orders/: answers from the lake's last snapshot, read-only, and never waits for a run");
+    expect(seen).toContain("the newest snapshot seen is from 10:00; every answer says as of when, and each query reads the last one committed");
+    expect(seen).toContain("the snapshot's as-of time is in _croft_as_of");
+    expect(seen).not.toMatch(/read copy|warehouse\.read/);
+    // Before the lake exists: not seen yet, and no copy is promised.
+    expect(formatBanner({ ...lake, serverMode: { readCopy: null, asOf: null } }, "UTC")).toContain("not seen yet: the lake is not there until a run creates it");
+    // A file in server mode says what it always said.
+    expect(formatBanner({ ...base, serverMode: { readCopy: "warehouse.read.duckdb", asOf: null } }, "UTC")).toContain("server mode: answers from warehouse.read.duckdb, never opens warehouse.duckdb");
+  });
+
   test("paused, with and without an end", () => {
     const paused = (at: string) => ({ ...base, scheduling: { ...base.scheduling, state: "paused" as const, pausedUntil: at } });
     const now = new Date("2026-09-24T17:00:00Z");

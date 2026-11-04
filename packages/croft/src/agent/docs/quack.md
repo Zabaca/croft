@@ -6,7 +6,9 @@ any table, and DuckDB sends the filters and aggregates to croft serve. The same 
 comes from the read copy, as of the end of the last run that changed data, and a person can read that time from the
 database itself.
 
-Quack exists only in server mode. Without `"serverMode": {"enabled": true}` there is no listener.
+Quack exists only in server mode. Without `"serverMode": {"enabled": true}` there is no listener. It works over a lake
+too (croft docs lake): the views read the lake's last snapshot, so a client sees each commit on its next query, and
+`_croft_as_of` is the newest snapshot's time, a quarter of a second behind the data at most.
 
 ## Giving a person access
 
@@ -36,7 +38,7 @@ development machine is often 1.x, which predates Quack. Use the library, or Pyth
 
 ## What a client sees
 
-- The main schema, the shared tables and `_croft_as_of`, all views of the read copy. The name starts with an
+- The main schema, the shared tables and `_croft_as_of`, all views of the read copy (over a lake, of the lake). The name starts with an
   underscore, which no table's name can, so it never collides with one. croft's own schema (`_croft`) never appears,
   and a table that is not shared is as absent as one that does not exist.
 - `SELECT as_of FROM croft._croft_as_of` is one row: the time of the copy, rebuilt at every swap of a refreshed copy.
@@ -76,6 +78,11 @@ listens, and never a wrong answer. It carries on by attaching again:
 
 which takes about 12 to 40 ms. With `serverMode.quackPort` set to 0 the new process picks a new port, so use a fixed port
 wherever clients are meant to come back.
+
+Over a lake there is no copy to swap: each view reads the lake's last snapshot whenever it is read, so a session sees every
+commit on its next query. A DuckDB client reads the list of the server's tables when it attaches, so a shared table that a
+run makes later is not in an open session's list (its query says the table does not exist); it is there for an ATTACH made
+after croft serve's next look at the lake (250 ms), and for a query sent as written with `quack_query`.
 
 A swap of a refreshed copy does not drop sessions and fails no query: the new copy is attached beside the old one, the
 views move to it in one transaction, and only then is the old one detached.

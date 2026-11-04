@@ -85,9 +85,10 @@ describe("croft move-to-lake: what it refuses before anything is touched", () =>
     const problem = r.json.problems[0];
     expect(problem).toMatchObject({ code: "MOVE_BLOCKED", effect: "nothing was changed" });
     expect(problem.details.reasons).toEqual(expect.arrayContaining([
-      expect.stringContaining("server mode is on"), expect.stringContaining("croft serve is running"), expect.stringContaining("a croft rename did not finish"),
+      expect.stringContaining("croft serve is running"), expect.stringContaining("a croft rename did not finish"),
     ]));
-    expect(problem.hint).toContain("its keys and settings stay as they are");
+    // Server mode goes with the project (D183): over the lake it needs no copy, so it is not in the way, and neither is the copy it makes.
+    expect(JSON.stringify(problem.details.reasons)).not.toMatch(/server mode|read copy/);
     expect(readFileSync(join(p.root, "croft.json"), "utf8")).toBe(cfg0);
     expect(sha(p.database)).toBe(sha0);
     expect(existsSync(join(p.root, "lake"))).toBe(false);

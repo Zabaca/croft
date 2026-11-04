@@ -48,6 +48,7 @@ const here = platform ? test : test.skip;
 describe("what the add-ons are", () => {
   test("every extension a mode loads comes from an add-on, except sqlite, which a local lake loads from a folder", () => {
     expect(MODE_ADDONS["lake-local"]).toEqual(["lake"]);
+    expect(MODE_ADDONS["lake-local-readers"]).toEqual(["server", "lake"]);
     for (const kind of Object.keys(MODE_EXTENSIONS) as ModeKind[]) {
       for (const name of MODE_EXTENSIONS[kind]) {
         if (name === "sqlite") expect(addonFor(kind, name), `${kind}/${name}`).toBeNull();
@@ -55,8 +56,9 @@ describe("what the add-ons are", () => {
       }
       // A mode's add-ons carry no extension the mode does not load, so installing one never installs a file the mode ignores.
       // A local lake is the one exception: it is lake mode with a SQLite catalog and a local folder, so it loads ducklake from the
-      // lake add-on and needs neither httpfs nor postgres, but the add-on is the one install lake mode asks for.
-      if (kind === "lake-local") continue;
+      // lake add-on and needs neither httpfs nor postgres, but the add-on is the one install lake mode asks for. Server mode over a local lake
+      // is the same with quack and httpfs besides, from the server add-on (D183).
+      if (kind === "lake-local" || kind === "lake-local-readers") continue;
       const carried = new Set(MODE_ADDONS[kind].flatMap(extensionsOf));
       for (const name of carried) expect(MODE_EXTENSIONS[kind], `${kind} carries ${name}`).toContain(name);
     }

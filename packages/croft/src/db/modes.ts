@@ -94,9 +94,25 @@ export interface LakeMode extends ModeBase { kind: "lake"; lake: LakeSpec }
 export interface LakeReadersMode extends ModeBase { kind: "lake-readers"; lake: LakeSpec & { access: "read" } }
 /** A local lake: ducklake and sqlite over local files. */
 export interface LakeLocalMode extends ModeBase { kind: "lake-local"; lake: LakeLocalSpec }
+/** Server mode over a local lake: the local lake attached read-only, plus quack for the listener. */
+export interface LakeLocalReadersMode extends ModeBase { kind: "lake-local-readers"; lake: LakeLocalSpec & { access: "read" } }
 
-export type ModeSpec = ReadersMode | LakeMode | LakeReadersMode | LakeLocalMode;
+export type ModeSpec = ReadersMode | LakeMode | LakeReadersMode | LakeLocalMode | LakeLocalReadersMode;
 export type ModeKind = ModeSpec["kind"];
+
+/**
+ * A lake's read-only mode as the readers' process of server mode over a lake attaches it (option 07, slice 5; DESIGN.md D183): the same lake,
+ * the same login and key, and quack loaded besides, with `prepare` to register the hooks and start the listener before the lock.
+ */
+export function lakeReadersMode(mode: LakeMode | LakeLocalMode, prepare?: ModeBase["prepare"]): LakeReadersMode | LakeLocalReadersMode {
+  if (mode.lake.access !== "read") {
+    throw new CroftError("INTERNAL_ERROR", { message: "a lake behind croft serve is attached read-only", hint: "report this croft bug" });
+  }
+  const base = { ...(mode.extensionDir ? { extensionDir: mode.extensionDir } : {}), ...(mode.projectRoot ? { projectRoot: mode.projectRoot } : {}), secretDir: mode.secretDir, ...(prepare ? { prepare } : {}) };
+  return mode.kind === "lake"
+    ? { ...base, kind: "lake-readers", lake: { ...mode.lake, access: "read" } }
+    : { ...base, kind: "lake-local-readers", lake: { ...mode.lake, access: "read" } };
+}
 
 /** What each mode loads, in load order. The file profile loads nothing. */
 export const MODE_EXTENSIONS: Readonly<Record<ModeKind, readonly ExtensionName[]>> = {
@@ -104,6 +120,7 @@ export const MODE_EXTENSIONS: Readonly<Record<ModeKind, readonly ExtensionName[]
   lake: ["httpfs", "postgres", "ducklake"],
   "lake-readers": ["httpfs", "postgres", "ducklake", "quack"],
   "lake-local": ["sqlite", "ducklake"],
+  "lake-local-readers": ["httpfs", "sqlite", "ducklake", "quack"],
 };
 
 /** The alias a mode's attached database gets: the read copy, or the lake. */
@@ -125,7 +142,7 @@ const q = (s: string) => `'${s.replaceAll("'", "''")}'`;
 
 /** Every credential a mode holds; none may appear in any output, log, error or problem. */
 export function modeSecrets(mode: ModeSpec): string[] {
-  if (mode.kind === "readers" || mode.kind === "lake-local") return [];
+  if (mode.kind === "readers" || mode.kind === "lake-local" || mode.kind === "lake-local-readers") return [];
   const { catalog, data } = mode.lake;
   return [catalog.password, data.keyId, data.secretKey, data.sessionToken].filter((s): s is string => !!s);
 }
@@ -141,7 +158,7 @@ export function scrub(text: string, secrets: readonly string[]): string {
 export function modeDirectories(mode: ModeSpec | undefined): string[] {
   if (!mode) return [];
   if (mode.kind === "lake" || mode.kind === "lake-readers") return [mode.lake.data.path];
-  if (mode.kind === "lake-local") return [mode.lake.dataPath];
+  if (mode.kind === "lake-local" || mode.kind === "lake-local-readers") return [mode.lake.dataPath];
   return [];
 }
 
@@ -160,6 +177,7 @@ export const MODE_PROFILES: Readonly<Record<ModeKind, readonly Profile[]>> = {
   readers: ["serve"],
   "lake-readers": ["serve"],
   "lake-local": ["warehouse", "query", "serve", "memory"],
+  "lake-local-readers": ["serve"],
   lake: ["warehouse", "query", "serve", "memory"],
 };
 
@@ -167,7 +185,7 @@ export const MODE_PROFILES: Readonly<Record<ModeKind, readonly Profile[]>> = {
 export function modeIdentity(mode: ModeSpec): unknown {
   const base = { kind: mode.kind, extensionDir: mode.extensionDir ?? null, projectRoot: mode.projectRoot ?? null, secretDir: mode.secretDir };
   if (mode.kind === "readers") return { ...base, copy: mode.copy };
-  if (mode.kind === "lake-local") return { ...base, catalog: mode.lake.catalog.path, dataPath: mode.lake.dataPath, access: mode.lake.access };
+  if (mode.kind === "lake-local" || mode.kind === "lake-local-readers") return { ...base, catalog: mode.lake.catalog.path, dataPath: mode.lake.dataPath, access: mode.lake.access };
   const { catalog, data, access } = mode.lake;
   return { ...base, catalog: [catalog.host, catalog.port, catalog.database, catalog.user, catalog.sslMode ?? null, catalog.sslRootCert ?? null], data: [data.path, data.endpoint ?? null, data.region ?? null, data.urlStyle ?? null, data.useSsl ?? null, data.caFile ?? null], access, storeOnly: mode.lake.storeOnly ?? null };
 }
@@ -188,7 +206,7 @@ export function checkMode(mode: ModeSpec, profile: Profile): Map<ExtensionName, 
       hint: "report this croft bug",
     });
   }
-  if (mode.kind === "lake-readers" && mode.lake.access !== "read") {
+  if ((mode.kind === "lake-readers" || mode.kind === "lake-local-readers") && mode.lake.access !== "read") {
     throw new CroftError("INTERNAL_ERROR", { message: "a lake behind croft serve is attached read-only", hint: "report this croft bug" });
   }
   return verifyModeExtensions(MODE_EXTENSIONS[mode.kind], (n) => addonFor(mode.kind, n), {
@@ -238,7 +256,7 @@ export async function startMode(conn: DuckDBConnection, mode: ModeSpec, files: M
       hint: "report this croft bug",
       details: { duckdb: firstLine(e) },
     }));
-  } else if (mode.kind === "lake-local") {
+  } else if (mode.kind === "lake-local" || mode.kind === "lake-local-readers") {
     const { catalog, dataPath, access } = mode.lake;
     await attempt(conn, `ATTACH ${q(`ducklake:sqlite:${catalog.path}`)} AS ${LAKE_ALIAS} (DATA_PATH ${q(dataPath)}, DUCKLAKE_VERSION ${q(DUCKLAKE_FORMAT)}${access === "read" ? ", READ_ONLY" : ""})`, (e) => lakeFailure(e, secrets, access));
   } else {

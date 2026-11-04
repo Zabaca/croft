@@ -13,7 +13,7 @@ import type { SandboxSpec } from "../db/connect.ts";
 import type { ColumnInfo } from "../db/values.ts";
 import { tickEnv } from "./loop.ts";
 import type { QuackEvent, QuackKey } from "./quack-access.ts";
-import type { FromWorker, ReadersOpen, ToWorker, WireError } from "./worker.ts";
+import type { FromWorker, LakeServe, ReadersOpen, ToWorker, WireError } from "./worker.ts";
 
 /** The worker's entry: the same croft this server runs. */
 export const WORKER_FILE = fileURLToPath(new URL("./worker.ts", import.meta.url));
@@ -59,6 +59,14 @@ export interface WorkerAnswer {
   rowsJson: string;
   rowCount: number;
   tables: string[];
+  /** Server mode over a lake: when the newest snapshot the query could have read was made (epoch ms). */
+  snapshotMs?: number;
+}
+
+/** What opening a worker reports: where it listens for DuckDB clients and, over a lake, when its newest snapshot was made. */
+export interface WorkerOpened {
+  quack?: { uri: string };
+  snapshotMs?: number;
 }
 
 export interface SpawnOptions {
@@ -70,6 +78,8 @@ export interface SpawnOptions {
   onQuack?(e: QuackEvent): void;
   /** Quack: a query has run past the deadline; the engine ends this worker. */
   onOverdue?(o: { connection: string; ms: number }): void;
+  /** Server mode over a lake: the lake's newest snapshot is this one, made at `ms` (epoch ms). */
+  onSnapshot?(ms: number): void;
 }
 
 interface Waiting<T> {
@@ -92,7 +102,7 @@ export class QueryWorker {
   readonly exited: Promise<void>;
   private readonly proc: Subprocess<"ignore", "ignore", "pipe"> | null;
   private readonly queries = new Map<number, Waiting<WorkerAnswer>>();
-  private opening: Waiting<{ quack?: { uri: string } }> | null = null;
+  private opening: Waiting<WorkerOpened> | null = null;
   private swapWait: Waiting<void> | null = null;
   private disconnecting: Waiting<number>[] = [];
   private readyWait!: Waiting<void>;
@@ -154,10 +164,10 @@ export class QueryWorker {
 
   /** Open the file read-only with the serve sandbox and check its format. Throws a CroftError (DB_NEWER_FORMAT,
    *  CONFIG_INVALID, ...), WorkerConflict (another process holds the file), WorkerGone, or an Error. */
-  async open(o: { path: string; spec: SandboxSpec; protect: string[]; readers?: ReadersOpen; lake?: true }): Promise<{ quack?: { uri: string } }> {
+  async open(o: { path: string; spec: SandboxSpec; protect: string[]; readers?: ReadersOpen; lake?: true; serve?: LakeServe }): Promise<WorkerOpened> {
     await this.ready;
     if (this.opening) throw new Error("the query worker is already opening a database");
-    const p = new Promise<{ quack?: { uri: string } }>((resolve, reject) => (this.opening = { resolve, reject }));
+    const p = new Promise<WorkerOpened>((resolve, reject) => (this.opening = { resolve, reject }));
     this.post({ op: "open", ...o });
     return p;
   }
@@ -228,7 +238,7 @@ export class QueryWorker {
         return;
       case "opened":
         this.conns = m.conns;
-        this.opening?.resolve(m.quack ? { quack: m.quack } : {});
+        this.opening?.resolve({ ...(m.quack ? { quack: m.quack } : {}), ...(m.snapshotMs !== undefined ? { snapshotMs: m.snapshotMs } : {}) });
         this.opening = null;
         return;
       case "open_failed":
@@ -251,7 +261,7 @@ export class QueryWorker {
         const w = this.queries.get(m.id);
         if (!w) return;
         this.queries.delete(m.id);
-        if (m.op === "answer") w.resolve({ columns: m.columns, rowsJson: m.rowsJson, rowCount: m.rowCount, tables: m.tables });
+        if (m.op === "answer") w.resolve({ columns: m.columns, rowsJson: m.rowsJson, rowCount: m.rowCount, tables: m.tables, ...(m.snapshotMs !== undefined ? { snapshotMs: m.snapshotMs } : {}) });
         else w.reject(fromWire(m.error));
         return;
       }
@@ -264,6 +274,9 @@ export class QueryWorker {
         return;
       case "quack_overdue":
         this.o.onOverdue?.({ connection: m.connection, ms: m.ms });
+        return;
+      case "snapshot":
+        this.o.onSnapshot?.(m.ms);
         return;
     }
   }

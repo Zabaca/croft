@@ -52,7 +52,8 @@ first" list: show them which tables the key will read, and wait for a yes. Remov
 Answers follow the same limits as the app token's: serve.maxRows and serve.maxBytes (a result past one fails with
 QUERY_TOO_MANY_ROWS, never cut short), serve.queryTimeoutMs and serve.maxConcurrent. A key's query runs on the
 readers' process, against one view per shared table of the read copy (every answer says asOf); it never waits for a
-run. The app token also runs there in server mode, and otherwise on croft serve's query worker, which steps aside for
+run. Over a lake there is no copy: the views read the lake's last snapshot, so a person sees each commit on their next
+query (croft docs lake). The app token also runs there in server mode, and otherwise on croft serve's query worker, which steps aside for
 writes.
 
 ## Managing keys

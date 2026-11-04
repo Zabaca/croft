@@ -15,18 +15,25 @@
 // new process starts. A process that fails to start, or dies soon after, is replaced after a backoff. A lake nobody has written yet
 // is DB_NOT_FOUND until a run creates it: the engine looks again every second.
 //
-// A key works only in server mode (D128, D129): a query that carries one is refused here, as by the file engine.
+// A key works only in server mode (D128, D129): a query that carries one is refused here, as by the file engine, unless the project has
+// "serverMode" on. Server mode over a lake (D183; option 07, slice 5) is this engine with `serve` in the process's open message: the same
+// process also loads quack, makes a view of each shared table, starts Quack's listener, and answers a key's query on the views. There is
+// no read copy to make and none to swap in: the process attaches the lake itself, read-only, and the views read its last snapshot whenever
+// they are read, so a person sees each commit on their next query. Every answer says when the snapshot it could have read was made.
 import { CroftError } from "../core/errors.ts";
-import { now, zonedParts } from "../core/time.ts";
+import { formatInstant, now, zonedParts } from "../core/time.ts";
 import { type SandboxSpec, serveResources } from "../db/connect.ts";
 import { lakeConnection } from "../db/lake.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { loadProject, type Project } from "../project/root.ts";
 import { mapQueryError } from "../read/select.ts";
-import { keyNeedsServerMode, notAdmittedError, queueFullError, restartedError, stopError } from "./errors.ts";
+import { keyNeedsServerMode, noSharedTables, notAdmittedError, plaintextNotAccepted, queueFullError, restartedError, stopError } from "./errors.ts";
 import { SERVE_DEFAULTS, serveLimits } from "./instance.ts";
+import { KeyStore } from "./keys.ts";
 import { Admission, type Flight, type StopReason } from "./queue.ts";
 import { QueryWorker, WorkerGone, WorkerStopped } from "./query-worker.ts";
+import type { QuackKey } from "./quack-access.ts";
+import { listenAddress } from "./quack-address.ts";
 import { restartDelayMs } from "./readers.ts";
 import type { ServeEngine, ServeEngineOptions, ServeEngineStatus, ServeQuery, ServeQueryData } from "./types.ts";
 
@@ -43,6 +50,10 @@ export interface LakeEngineHooks {
   exited?(e: { pid: number; at: number }): void;
   /** A query ended (answered or not) on the process `workerPid`. */
   queryEnded?(e: { workerPid: number; workerPeakRss: number; at: number }): void;
+  /** Server mode: a Quack query ran past the deadline; the process is being killed (D127). */
+  quackOverdue?(e: { pid: number; ms: number; at: number }): void;
+  /** Server mode: the keys the process accepts over Quack were sent again (the keys file changed, D126). */
+  keysSent?(e: { names: string[]; at: number }): void;
 }
 
 /** Options the command does not pass: tests and diagnostics. */
@@ -62,6 +73,9 @@ export interface LakeEngineInternals {
   workerArgv?: string[];
   /** The wait before the next try after `attempts` failed starts; restartDelayMs by default. */
   restartDelayMs?: (attempts: number) => number;
+  /** Server mode only: where the process listens for DuckDB clients (serverMode.quackHost and quackPort by default); false: nowhere,
+   *  for a test that wants no listener. */
+  quack?: false | { host: string; port: number; maxConcurrent?: number };
 }
 
 /** Open the lake engine for a project. Throws the mode's own errors (EXTENSION_MISSING and the others, LAKE_ATTACH_FAILED, SECRET_MISSING)
@@ -69,6 +83,7 @@ export interface LakeEngineInternals {
 export async function openLakeEngine(o: ServeEngineOptions & LakeEngineInternals): Promise<ServeEngine> {
   const project = loadProject({ root: o.root });
   const engine = new LakeEngine(project, o);
+  engine.assertQuackAddress();
   await engine.start();
   return engine;
 }
@@ -91,6 +106,17 @@ class LakeEngine implements ServeEngine {
   private readonly pollMs: number;
   private readonly argv: string[] | undefined;
   private readonly delayOf: (attempts: number) => number;
+  /** Server mode over a lake (D183): keys, the shared tables and Quack. False for a lake project that serves apps only. */
+  private readonly serverMode: boolean;
+  private readonly quackAt: { host: string; port: number; maxConcurrent: number } | null;
+  private readonly onQuack: ServeEngineOptions["onQuack"];
+  /** Reads the keys file for the Quack hooks (D126); the engine never writes it. */
+  private readonly keyStore: KeyStore;
+  /** The keys last read, which a process opens with and is sent again when the file changes. */
+  private keys: QuackKey[] = [];
+  private quackUri: string | null = null;
+  /** When the lake's newest snapshot the process has seen was made, in the project offset; null before it opens. */
+  private asOf: string | null = null;
   /** Why queries are refused until something changes (no lake yet; a start that a retry will not fix); null otherwise. */
   private blocked: CroftError | null = null;
   private transition: Promise<void> | null = null;
@@ -116,6 +142,11 @@ class LakeEngine implements ServeEngine {
     this.pollMs = o.pollMs ?? LAKE_POLL_MS;
     this.argv = o.workerArgv;
     this.delayOf = o.restartDelayMs ?? restartDelayMs;
+    const sm = project.config.serverMode;
+    this.serverMode = sm.enabled;
+    this.quackAt = !sm.enabled || o.quack === false ? null : { host: sm.quackHost, port: sm.quackPort, maxConcurrent: sm.quackMaxConcurrent, ...o.quack };
+    this.onQuack = o.onQuack;
+    this.keyStore = new KeyStore(project.paths.stateDir);
     this.hooks = guarded(o.hooks ?? {});
     this.label = project.databaseLabel;
     this.protect = [project.paths.stateDir];
@@ -136,6 +167,13 @@ class LakeEngine implements ServeEngine {
       aborted: () => this.stopError("abort"),
       full: () => this.queueFull(),
     });
+  }
+
+  /** The listener's address must be loopback, or the project must have accepted plaintext on the network (D131). */
+  assertQuackAddress(): void {
+    if (!this.quackAt) return;
+    const { uri, loopback } = listenAddress(this.quackAt.host, this.quackAt.port);
+    if (!loopback && !this.project.config.serverMode.quackPlaintextOnNetwork) throw plaintextNotAccepted(uri);
   }
 
   /** First open. A lake that is not there yet is waited for (the first run creates it); a start that fails fails croft serve's start. */
@@ -165,6 +203,14 @@ class LakeEngine implements ServeEngine {
       openConnections: this.worker?.conns ?? 0,
       queriesToday: this.dayKey() === this.day ? this.count : 0,
       lake: { label: this.label, workerPid: this.worker?.pid ?? null, restarts: this.restarts },
+      ...(this.serverMode
+        ? {
+          serverMode: {
+            state: this.state, copy: null, asOf: this.asOf, workerPid: this.worker?.pid ?? null, swaps: 0, restarts: this.restarts, copyCost: null,
+            makingCopy: false, quack: this.quackUri ? { uri: this.quackUri } : null,
+          },
+        }
+        : {}),
     };
   }
 
@@ -178,7 +224,8 @@ class LakeEngine implements ServeEngine {
       });
     }
     // A key works only in server mode (D128), where its query has two walls; the HTTP layer refuses it before this, and so does the engine.
-    if (q.scope) throw keyNeedsServerMode();
+    if (q.scope && !this.serverMode) throw keyNeedsServerMode();
+    if (q.scope && q.scope.tables.length === 0) throw noSharedTables();
     if (this.stopped) throw this.stopError("stop");
     if (this.blocked && this.state !== "open") throw this.blocked;
     const flight = await this.admission.enter({ deadline: arrivedAt + this.queueMs, signal: q.signal });
@@ -205,9 +252,16 @@ class LakeEngine implements ServeEngine {
     const id = ++this.seq;
     flight.attach({ interrupt: () => worker.interrupt(id), abandon: () => void worker.kill() });
     flight.checkpoint();
-    const a = await worker.query(id, { sql: q.sql, params: q.params, limit: q.limit, maxRows: this.maxRows, maxBytes: this.maxBytes });
+    const a = await worker.query(id, {
+      sql: q.sql, params: q.params, limit: q.limit, maxRows: this.maxRows, maxBytes: this.maxBytes, ...(q.scope ? { shared: [...q.scope.tables] } : {}),
+    });
     const rows = JSON.parse(a.rowsJson) as ServeQueryData["rows"];
-    return { columns: a.columns, rows, rowCount: a.rowCount, tookMs: Math.round(performance.now() - arrived) };
+    // Server mode: every answer says when the lake's snapshot it could have read was made, in the project offset.
+    const asOf = a.snapshotMs !== undefined ? formatInstant(a.snapshotMs, this.project.timezone) : undefined;
+    return {
+      columns: a.columns, rows, rowCount: a.rowCount, tookMs: Math.round(performance.now() - arrived), ...(asOf ? { asOf } : {}),
+      ...(q.scope ? { tables: a.tables } : {}),
+    };
   }
 
   private queryError(e: unknown, flight: Flight): unknown {
@@ -240,9 +294,28 @@ class LakeEngine implements ServeEngine {
 
   /** On every poll: a lake with no process is tried again once its wait is over. */
   private tick(): void {
-    if (this.stopped || this.transition || this.worker) return;
+    if (this.stopped) return;
+    this.sendKeys();
+    if (this.transition || this.worker) return;
     if (Date.now() < this.retryAt) return;
     this.begin(this.reopen());
+  }
+
+  /** Read the keys file when it changed since the last look: the new list, or null. A Quack session outlives a request, so the process
+   *  checks every query against its list, and a removed key stops working within a poll (D126). */
+  private readKeys(): QuackKey[] | null {
+    if (!this.serverMode) return null;
+    const changed = this.keyStore.changes();
+    if (changed) this.keys = changed;
+    return changed;
+  }
+
+  /** Tell the process the keys, when they changed. */
+  private sendKeys(): void {
+    const changed = this.readKeys();
+    if (!changed || !this.worker) return; // a process that opens next starts with the list
+    this.worker.setKeys(changed);
+    this.hooks.keysSent?.({ names: changed.map((k) => k.name), at: Date.now() });
   }
 
   private begin(p: Promise<void>): void {
@@ -257,10 +330,40 @@ class LakeEngine implements ServeEngine {
   /** Start the process on the lake. Throws what it reported (the first start's caller reports it; later ones are recorded by reopen). */
   private async open(): Promise<void> {
     this.state = this.restarts > 0 || this.attempts > 0 ? "restarting" : "starting";
-    const worker: QueryWorker = QueryWorker.spawn({ onExit: (w) => this.exited(w), ...(this.argv ? { argv: this.argv } : {}) });
+    const worker: QueryWorker = QueryWorker.spawn({
+      onExit: (w) => this.exited(w),
+      onQuack: (e) => {
+        try {
+          this.onQuack?.(e);
+        } catch {
+          // A log or a last-use time that cannot be written never costs a client its answer.
+        }
+      },
+      onOverdue: (o) => {
+        // Quack has no server-side cancel [V: 2.0.0]: the process ends, every session on it with it, and clients attach again (D127).
+        this.hooks.quackOverdue?.({ pid: worker.pid, ms: o.ms, at: Date.now() });
+        void worker.kill();
+      },
+      onSnapshot: (ms) => {
+        this.asOf = formatInstant(ms, this.project.timezone);
+      },
+      ...(this.argv ? { argv: this.argv } : {}),
+    });
     this.opening = worker;
+    this.readKeys(); // the process opens with the keys as they are now
+    let opened: Awaited<ReturnType<QueryWorker["open"]>>;
     try {
-      await worker.open({ path: this.label, spec: this.spec(), protect: this.protect, lake: true });
+      opened = await worker.open({
+        path: this.label, spec: this.spec(), protect: this.protect, lake: true,
+        ...(this.serverMode
+          ? {
+            serve: {
+              shared: [...this.project.config.serve.sharedTables],
+              ...(this.quackAt ? { quack: { ...this.quackAt, queryTimeoutMs: this.queryTimeoutMs, keys: this.keys } } : {}),
+            },
+          }
+          : {}),
+      });
     } catch (e) {
       this.opening = null;
       void worker.kill();
@@ -272,6 +375,9 @@ class LakeEngine implements ServeEngine {
       return;
     }
     this.worker = worker;
+    this.quackUri = opened.quack?.uri ?? null;
+    if (opened.snapshotMs !== undefined) this.asOf = formatInstant(opened.snapshotMs, this.project.timezone);
+    if (this.serverMode) worker.setKeys(this.keys); // a change while it opened was read but not sent
     this.state = "open";
     this.blocked = null;
     this.openedAt = Date.now();
@@ -304,6 +410,7 @@ class LakeEngine implements ServeEngine {
     this.hooks.exited?.({ pid: w.pid, at: Date.now() });
     if (w !== this.worker || this.stopped) return;
     this.worker = null;
+    this.quackUri = null;
     this.restarts++;
     this.attempts = !w.stoppedByUs && Date.now() - this.openedAt < QUICK_DEATH_MS ? this.attempts + 1 : 0;
     this.retryAt = Date.now() + this.delayOf(this.attempts);
