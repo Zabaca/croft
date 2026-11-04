@@ -170,7 +170,7 @@ Both take absolute and `~/` paths, which is also how several git worktrees of on
 
 **Platforms:**
 
-- **Tier 1 (CI):** macOS arm64/x64, Linux x64/arm64 with glibc. Build: the CI matrix has macOS arm64 but no macOS x64 runner, and GitHub Actions has not run it yet (§10 item 8).
+- **Tier 1:** macOS arm64/x64, Linux x64/arm64 with glibc. Build: CI runs Linux x64 and arm64 only; macOS has no CI job (D190, §10 item 8).
 - **Tier 2 (smoke test only):** Linux musl. Runtime behavior there is [U].
 - **Windows:** use WSL with the project inside the Linux filesystem, not under `/mnt/c`. Native Windows is unsupported in v1, because its lock and rename semantics differ (a read copy cannot be renamed over a file a reader has open) and none of it is exercised.
 - **WSL** otherwise works as Linux. `doctor` warns that WSL stops its VM when no terminal is open, so scheduled runs pause.
@@ -3074,10 +3074,10 @@ The suite runs as `bun test --timeout 60000` (package.json `test`, ci.yml, publi
    - a golden test that the same query gives identical rows in both modes, and the Next.js `serverExternalPackages` setup.
 
    Build: `src/read/node-read.test.ts` builds the bundle with `scripts/build-read.ts` into a private folder and runs it under the real Node against a real `croft serve` process: the right and a wrong token, the `serve.json` route, `CROFT_URL` with `CROFT_SERVE_TOKEN`, a `503` retried until the same query succeeds after the write, `SERVE_UNAVAILABLE` once the client's timeout has passed, a recording `HTTP_PROXY` that sees nothing, direct mode, and identical rows from the server, Node direct and Bun direct. The Next.js setup is not covered yet.
-8. **CI matrix.** macOS arm64, Linux x64 glibc and Linux arm64 are tier 1, each on the Bun floor (1.3.14) and `bun@latest`. Alpine and Windows get smoke tests.
+8. **CI matrix.** Linux x64 glibc and Linux arm64 run in CI, each on the Bun floor (1.3.14) and `bun@latest`. macOS is tier 1 but has no CI job (D190). Alpine and Windows get smoke tests.
 
    Build: `.github/workflows/ci.yml` runs on pushes to main, on `phase-*` and `croft-v*` tags, on pull requests and by hand.
-   - The `test` job is the tier-1 matrix: `macos-15`, `ubuntu-24.04` and `ubuntu-24.04-arm`, each on Bun `1.3.14` and `latest`, each in two shards (twelve jobs, none cancelling the others; D155), with Node LTS for the read client's test (item 7). Each runs `bun install --frozen-lockfile`, `bun run typecheck` (shard 1 only) and its half of `bun test --shard=K/2` in `packages/croft`.
+   - The `test` job is the CI matrix: `ubuntu-24.04` and `ubuntu-24.04-arm`, each on Bun `1.3.14` and `latest`, each in two shards (eight jobs, none cancelling the others; D155), with Node LTS for the read client's test (item 7). Each runs `bun install --frozen-lockfile`, `bun run typecheck` (shard 1 only) and its half of `bun test --shard=K/2` in `packages/croft`.
    - The `alpine` job runs in the `oven/bun:1.3.14-alpine` container (musl): `croft --version`, then `croft init --no-install` with this package linked in, `croft run example_sales --foreground` and a `croft query`.
    - The `windows` job (`windows-2025`, Bun 1.3.14) installs and runs `croft --version` and `croft doctor --json` without judging the result. Native Windows is unsupported (§2), and croft prints no "unsupported" message of its own.
    - The agent evals (item 9) are not in CI: they need a logged-in Claude Code and cost money per run.
@@ -4244,6 +4244,12 @@ Each entry gives the options, the choice and the reason. **(rev)** marks decisio
 - The lake-exists probe that `croft maintain` and the scheduler's passes make attaches and asks no more (`ReadOptions.attachOnly`): no transaction, no `USE`, no format check; the pass's own lease checks the format. At 41 ms that was 3 s of a pass.
 - A step that settles nothing reads its own state in the lease that checked its config (`settleConfig`'s `alsoRead`), and a table as its code says is not counted at all (`readConfigState` counts rows only for a change or a lossy pin); a run with nothing new took two leases and a scan of every table per ingest before, and one lease per ingest now.
 
+**D190. No macOS job in CI. (new, 2026-11-04; refines §10 item 8, D155)**
+- Choice: the `test` job's matrix drops `macos-15` (both Bun versions, both shards) and its Postgres step loses the `brew install` branch. Linux x64 and arm64, the lake journey jobs, the Alpine and Windows smokes and the release workflows are as they were. macOS stays tier 1 in the support list (§2): its code and tests (the boot id from `/usr/sbin/sysctl`, `cp -c`, the LaunchAgent) stay and run wherever the platform matches, on a Mac that runs `bun test`.
+- Reason: GitHub's hosted macOS runners kept dropping the jobs after 15 minutes unstarted ("not acquired by Runner of type hosted", a capacity shortage), which blocked merges; a Mac check that never starts says nothing about the change.
+- Cost: nothing in CI runs on macOS now, so a macOS-only break shows up on a person's Mac and not in a pull request.
+- Build: `.github/workflows/ci.yml`; `tests/workflows.test.ts` pins the two operating systems.
+
 ---
 
 ## Open questions for the user
@@ -4427,5 +4433,5 @@ All spikes ran on macOS arm64 with `@duckdb/node-api` 1.5.5-r.5 (DuckDB 1.5.5), 
 - Power-loss durability.
 - Claude Code permission-rule matching beyond a command prefix, and the validate hook inside a live Claude Code session. Its input and exit codes are verified against the documentation, and its command through a real `sh -c` (§9 item 7).
 - The CI workflow on GitHub's runners (Linux x64, `bun@latest`, Alpine, Windows): GitHub Actions is blocked by the organization's billing, and the gates ran locally on macOS arm64 and Linux arm64 (§10 item 8).
-- The mode tests (D117, D118) on Linux and on the CI runners: they ran on macOS arm64 only. The CI steps that fetch the extension files and find Postgres (`ubuntu-24.04`'s preinstalled PostgreSQL 16 under `/usr/lib/postgresql`; on a Linux image without it, `apt-get install postgresql` with a `policy-rc.d` that stops the service starting, as on `ubuntu-24.04-arm` if it lacks Postgres; `brew install postgresql@17` on macOS when none is found) have not run on GitHub's runners. The pins for osx_amd64, linux_amd64 and linux_arm64 were taken from the repository and never loaded on those platforms. `detectMusl` was tested with stubbed probes only, never on a real Alpine or a glibc Linux.
+- The mode tests (D117, D118) on Linux and on the CI runners: they ran on macOS arm64 only. The CI steps that fetch the extension files and find Postgres (`ubuntu-24.04`'s preinstalled PostgreSQL 16 under `/usr/lib/postgresql`; on a Linux image without it, `apt-get install postgresql` with a `policy-rc.d` that stops the service starting, as on `ubuntu-24.04-arm` if it lacks Postgres; the macOS branch (`brew install postgresql@17`) went with the macOS job, D190) have not run on GitHub's runners. The pins for osx_amd64, linux_amd64 and linux_arm64 were taken from the repository and never loaded on those platforms. `detectMusl` was tested with stubbed probes only, never on a real Alpine or a glibc Linux.
 - `secretsFrom` against a real store (D108): the tests use a Bun script that prints dotenv. What `sops -d --output-type dotenv` prints for nested keys, which age key file sops reads under a scheduled run's environment, and `op inject` were not run.
