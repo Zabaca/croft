@@ -99,19 +99,25 @@ const server = Bun.serve({
         const maxKeys = Math.max(1, Number(url.searchParams.get("max-keys") ?? 1000));
         const after = url.searchParams.get("continuation-token") ?? url.searchParams.get("start-after") ?? "";
         const everything = listFiles(join(root, bucket)).map((f) => relative(join(root, bucket), f)).filter((k) => k.startsWith(prefix)).sort();
-        const all = everything.filter((k) => k > after).slice(0, maxKeys);
-        const truncated = everything.filter((k) => k > after).length > all.length;
-        const contents: string[] = [];
-        const prefixes = new Set<string>();
-        for (const k of all) {
+        // As S3 pages a listing: a key and a rolled-up folder (a common prefix) are one entry each, in order, `max-keys` entries to a page, and the
+        // token names the last entry sent. Paging the keys first and rolling up after sends a folder of more than a page of keys once per page.
+        const entries: { name: string; key: boolean }[] = [];
+        for (const k of everything) {
           const rel = k.slice(prefix.length);
           const cut = delimiter ? rel.indexOf(delimiter) : -1;
-          if (cut >= 0) prefixes.add(prefix + rel.slice(0, cut + delimiter!.length));
-          else {
-            const st = statSync(join(root, bucket, k));
-            contents.push(`<Contents><Key>${esc(k)}</Key><LastModified>${st.mtime.toISOString()}</LastModified><ETag>"x"</ETag><Size>${st.size}</Size><StorageClass>STANDARD</StorageClass></Contents>`);
-          }
+          const name = cut >= 0 ? prefix + rel.slice(0, cut + delimiter!.length) : k;
+          if (cut >= 0 && entries.at(-1)?.name === name) continue;
+          entries.push({ name, key: cut < 0 });
         }
+        const left = entries.filter((e) => e.name > after);
+        const page = left.slice(0, maxKeys);
+        const truncated = left.length > page.length;
+        const contents = page.filter((e) => e.key).map((e) => {
+          const st = statSync(join(root, bucket, e.name));
+          return `<Contents><Key>${esc(e.name)}</Key><LastModified>${st.mtime.toISOString()}</LastModified><ETag>"x"</ETag><Size>${st.size}</Size><StorageClass>STANDARD</StorageClass></Contents>`;
+        });
+        const prefixes = page.filter((e) => !e.key).map((e) => e.name);
+        const all = page.map((e) => e.name);
         return xml(200, `<ListBucketResult><Name>${bucket}</Name><Prefix>${esc(prefix)}</Prefix><KeyCount>${contents.length}</KeyCount><MaxKeys>${maxKeys}</MaxKeys><IsTruncated>${truncated}</IsTruncated>${truncated ? `<NextContinuationToken>${esc(all[all.length - 1]!)}</NextContinuationToken>` : ""}${contents.join("")}${[...prefixes].map((p) => `<CommonPrefixes><Prefix>${esc(p)}</Prefix></CommonPrefixes>`).join("")}</ListBucketResult>`);
       }
       if (m === "POST" && url.searchParams.has("delete")) {

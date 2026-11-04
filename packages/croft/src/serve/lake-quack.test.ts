@@ -462,3 +462,16 @@ maybe("the listener on a lake", () => {
     }
   }, 120_000);
 });
+
+maybe("the engine's own poll", () => {
+  test("at the engine's own poll, a removed key is told to the process within a quarter of a second, so its open session is refused within the second option 06 promises", async () => {
+    const told: number[] = [];
+    const fast = await startLakeServe("local", { extensionDir: ready.dir, rigs, engine: { pollMs: undefined, hooks: { keysSent: (e) => told.push(e.at) } } });
+    await fast.key("timed");
+    const added = told.at(-1)!;
+    // The list that adds the key was sent on a look, and the removal follows at once: the next look is one poll later.
+    fast.rig.keys.remove("timed");
+    await until("the removal to be told to the process", () => told.at(-1)! > added, 15_000);
+    expect(told.at(-1)! - added).toBeLessThan(1000); // timing-gap: a poll of 250 ms; the engine looked once a second before, and cannot look sooner than its poll, so it is at least 1000 ms when wrong
+  }, 120_000);
+});

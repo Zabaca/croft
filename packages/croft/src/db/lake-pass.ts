@@ -299,7 +299,7 @@ export async function listOrphansOf(project: Project, env: ProjectEnv, cutoff: D
   const stateDir = project.paths.stateDir;
   const w = openWarehouse({
     path: join(stateDir, "lake-maintenance.probe"), mode: "read_only", profile: "query", timezone: project.timezone, root: project.root, stateDir,
-    ...lakeOption(project, env), isTTY: false, register: false, noticeAfterMs: Number.MAX_SAFE_INTEGER,
+    ...lakeOption(project, env, { listsBucket: true }), isTTY: false, register: false, noticeAfterMs: Number.MAX_SAFE_INTEGER,
   });
   try {
     return await w.read((db) => listOrphans(db, cutoff, o.retry).then((r) => r.files), { purpose: "lake orphans", waitMs: 60_000 });
@@ -318,7 +318,7 @@ export async function deleteOrphansOf(project: Project, env: ProjectEnv, shown: 
   const busy = () => new CroftError("DB_BUSY", { message: "a backup of the lake is copying its bucket now", hint: "run croft maintain --orphans again when it has finished", retryable: true });
   if (backupRunning(stateDir)) throw busy();
   const warehouse = openWarehouse({
-    path: project.paths.database, mode: "read_write", timezone: project.timezone, root: project.root, stateDir, ...lakeOption(project, env), isTTY: o.isTTY, register: false,
+    path: project.paths.database, mode: "read_write", timezone: project.timezone, root: project.root, stateDir, ...lakeOption(project, env, { listsBucket: true }), isTTY: o.isTTY, register: false,
   });
   try {
     const done = await warehouse.write(MAINTENANCE_LOCK_LABEL, async (sql) => {

@@ -31,7 +31,7 @@ import { CROFT_VERSION } from "../../db/state.ts";
 import { discoverAssets } from "../../project/discover.ts";
 import { readJournal } from "../../project/rename.ts";
 import { isServeAlive, readServeRecord } from "../../read/locate.ts";
-import { type Project } from "../../project/root.ts";
+import { CONFIG_FILE, type Project, withoutBom } from "../../project/root.ts";
 import { Confirmations, type HashedImpact, impactHash } from "../../safety/confirm.ts";
 import { listTrash, withTrashFile } from "../../safety/trash.ts";
 import type { CommandImpl, CommandResult, Ctx } from "../command.ts";
@@ -97,7 +97,7 @@ function walBytes(database: string): number {
 /** Whether croft.json says `"readCopy": true` itself (not only through server mode). */
 function readCopyByName(root: string): boolean {
   try {
-    return (JSON.parse(readFileSync(join(root, "croft.json"), "utf8")) as { readCopy?: unknown }).readCopy === true;
+    return (JSON.parse(withoutBom(readFileSync(join(root, CONFIG_FILE), "utf8"))) as { readCopy?: unknown }).readCopy === true;
   } catch {
     return false;
   }

@@ -43,7 +43,7 @@ export interface LakeConnection {
  * The project's lake as a warehouse opens it, or undefined for a project with a file. `extensionDir` is for croft's tests: the folder of
  * pinned extension files; a project's come from its add-on (db/addons.ts) or $CROFT_EXTENSION_DIR.
  */
-export function lakeConnection(project: Project, env: ProjectEnv, o: { extensionDir?: string } = {}): LakeConnection | undefined {
+export function lakeConnection(project: Project, env: ProjectEnv, o: { extensionDir?: string; listsBucket?: true } = {}): LakeConnection | undefined {
   const lake = project.config.lake;
   if (!lake) return undefined;
   const names = lakeSecretNames(lake);
@@ -57,18 +57,18 @@ export function lakeConnection(project: Project, env: ProjectEnv, o: { extension
     kind: lake.kind,
     secretDir,
     secretNames: names,
-    mode: (access) => lakeMode(lake, project, access, base, secret, { SSL_CERT_FILE: env.lookup("SSL_CERT_FILE")?.value }),
+    mode: (access) => lakeMode(lake, project, access, base, secret, { SSL_CERT_FILE: env.lookup("SSL_CERT_FILE")?.value }, o.listsBucket),
   };
 }
 
 /** `{ lake }` for a warehouse's options when the project has a lake, else nothing: spread into openWarehouse(). */
-export function lakeOption(project: Project, env: ProjectEnv): { lake?: LakeConnection } {
-  const lake = lakeConnection(project, env);
+export function lakeOption(project: Project, env: ProjectEnv, o: { listsBucket?: true } = {}): { lake?: LakeConnection } {
+  const lake = lakeConnection(project, env, o);
   return lake ? { lake } : {};
 }
 
 function lakeMode(lake: LakeConfig, project: Project, access: "write" | "read", base: Pick<ModeSpec, "projectRoot" | "secretDir" | "extensionDir">, secret: (name: string) => string,
-  tlsEnv: NodeJS.ProcessEnv): ModeSpec {
+  tlsEnv: NodeJS.ProcessEnv, listsBucket?: true): ModeSpec {
   if (lake.kind === "local") {
     const { catalog, data } = localLakePaths(lake, project.root);
     // A reader never makes the lake; the machine that writes does, with the folders it needs.
@@ -92,7 +92,7 @@ function lakeMode(lake: LakeConfig, project: Project, access: "write" | "read", 
         path: bucketPath(b), keyId: secret(key.keyIdSecret), secretKey: secret(key.secretKeySecret),
         ...(key.sessionTokenSecret ? { sessionToken: secret(key.sessionTokenSecret) } : {}),
         ...(b.endpoint ? { endpoint: b.endpoint } : {}), ...(b.region ? { region: b.region } : {}), urlStyle: b.urlStyle, useSsl: b.useSsl,
-        ...(caFile ? { caFile } : {}),
+        ...(caFile ? { caFile } : {}), ...(listsBucket ? { listsBucket } : {}),
       },
       access,
     },
