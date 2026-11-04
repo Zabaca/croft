@@ -5,6 +5,11 @@
 // spawns.
 process.env.CROFT_FORBID_OS_JOBS = "1";
 process.env.CROFT_NOTIFY_DRY = "1";
+// CROFT_NO_FETCH: a mode whose extension file is missing is EXTENSION_MISSING, never a download (db/extension-fetch.ts, D195); and the
+// repository is a port nothing listens on, so a test that clears the first still cannot reach DuckDB's servers. A test of the fetch
+// path names a stand-in server of its own.
+process.env.CROFT_NO_FETCH = "1";
+process.env.CROFT_EXTENSION_REPO = "http://127.0.0.1:9";
 // CROFT_TEST_HARNESS: the mark that lets CROFT_BOOKKEEPING=log take effect (db/bookkeeping.ts defaultBookkeeping()). Nobody else sets it.
 process.env.CROFT_TEST_HARNESS = "1";
 

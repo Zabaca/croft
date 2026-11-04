@@ -70,7 +70,7 @@ export interface LakeEngineInternals {
   interruptEveryMs?: number;
   /** How often the engine looks and how long a lake that is not there yet waits: LAKE_POLL_MS by default, and in server mode it looks every LAKE_KEYS_POLL_MS. */
   pollMs?: number;
-  /** A folder of the pinned extension files, for croft's tests; by default the lake add-on in the project's node_modules (D134). */
+  /** A folder of the pinned extension files, for croft's tests; by default $CROFT_EXTENSION_DIR or croft's cache (D195). */
   extensionDir?: string;
   /** The worker command (tests); `bun --no-env-file worker.ts` by default. */
   workerArgv?: string[];

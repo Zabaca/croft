@@ -12,9 +12,10 @@ Turn it on in croft.json (the user decides; it changes what apps see):
   "serverMode": { "enabled": true }
 
 That turns the read copy on too, and starts a listener for DuckDB 2.0 clients (serverMode.quackHost and quackPort, croft
-docs quack). Server mode loads DuckDB's quack and httpfs extensions, which come from an add-on the project installs once
-(`bun add @zabaca/croft-addon-server@<version>`; croft docs addons). Until it is installed `croft validate` and `croft
-doctor` report EXTENSION_MISSING with that command as the fix, and `croft serve` does not start. Then, as before, the user starts `croft serve` in their own terminal. Nothing else
+docs quack). Server mode loads DuckDB's quack and httpfs extensions, which croft fetches from DuckDB's own extension servers the
+first time `croft serve` starts (about 22 MB, once per machine; croft docs extensions). `croft fetch-extensions` fetches
+them ahead of time, and until they are on the machine `croft validate` and `croft doctor` report EXTENSION_MISSING with
+that command as the fix. Then, as before, the user starts `croft serve` in their own terminal. Nothing else
 changes for apps: they keep reading with `query()` from @zabaca/croft/read and the same token. A project that never
 turns server mode on is unchanged, and so is one that turns it off again.
 
@@ -77,11 +78,11 @@ which writes it with the usual permissions.
 ## The extension files
 
 Server mode loads two DuckDB extension files, quack and httpfs, by absolute path, after checking each against a
-checksum croft pins; croft never runs INSTALL and never downloads anything while it runs. The files come from the server
-add-on, an npm package the project installs once with `bun add @zabaca/croft-addon-server@<version>`; croft finds them in
-the project's node_modules (croft docs addons). A missing or different file is EXTENSION_MISSING, EXTENSION_CHECKSUM_MISMATCH
-or EXTENSION_WRONG_BUILD, `croft validate` and `croft doctor` report it with the install command as the fix, and croft serve
-does not start (croft docs EXTENSION_MISSING). croft's own tests and builders use a folder instead ($CROFT_EXTENSION_DIR).
+checksum croft pins; croft never runs INSTALL. The files are DuckDB's own signed builds, fetched from DuckDB's extension
+servers into croft's cache folder before the process locks (croft docs extensions), by `croft serve` when it first needs
+them or ahead of time by `croft fetch-extensions`. A missing or different file is EXTENSION_MISSING,
+EXTENSION_CHECKSUM_MISMATCH or EXTENSION_WRONG_BUILD, `croft validate` and `croft doctor` report it with the fetch command
+as the fix, and croft serve does not start until it is mended (croft docs EXTENSION_MISSING).
 
 ## A project with a lake
 

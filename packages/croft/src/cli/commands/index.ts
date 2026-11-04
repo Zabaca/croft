@@ -252,6 +252,15 @@ const moveToLake = lazyCommand({
   maxPositionals: 0,
 }, async () => (await import("./move-to-lake.ts")).moveToLake);
 
+const fetchExtensions = lazyCommand({
+  name: "fetch-extensions",
+  summary: "fetch the DuckDB extension files server mode and lake mode load, from DuckDB's own servers, checked against croft's pinned checksums (the one command that needs the network ahead of time)",
+  usage: "croft fetch-extensions [quack|httpfs|ducklake|postgres…] [--all]",
+  options: {
+    all: { type: "boolean", description: "every extension a mode can load, not only the ones this project's modes need" },
+  },
+}, async () => (await import("./fetch-extensions.ts")).fetchExtensionsCommand);
+
 const newCmd = lazyCommand({
   name: "new",
   summary: "write a commented, working template for a new asset; --list shows the kinds",
@@ -265,5 +274,5 @@ const newCmd = lazyCommand({
 
 export const COMMANDS: readonly Command[] = [
   docs, help, version, init, doctor, validate, preview, run, wait, status, query, describe, context, logs, secrets, confirm,
-  schedule, serve, tick, rename, del, restore, backup, maintain, moveToLake, newCmd,
+  schedule, serve, tick, rename, del, restore, backup, maintain, moveToLake, fetchExtensions, newCmd,
 ];

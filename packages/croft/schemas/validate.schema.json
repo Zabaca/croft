@@ -63,10 +63,10 @@
               ],
               "additionalProperties": false
             },
-            "addons": {
+            "extensionFiles": {
               "type": "array",
               "items": {
-                "$ref": "#/$defs/AddonView"
+                "$ref": "#/$defs/ExtensionFilesView"
               }
             },
             "redactedValues": {
@@ -127,62 +127,6 @@
   ],
   "additionalProperties": false,
   "$defs": {
-    "AddonView": {
-      "type": "object",
-      "properties": {
-        "addon": {
-          "enum": [
-            "lake",
-            "server"
-          ]
-        },
-        "mode": {
-          "type": "string"
-        },
-        "package": {
-          "type": "string"
-        },
-        "version": {
-          "type": "string"
-        },
-        "platform": {
-          "type": [
-            "null",
-            "string"
-          ]
-        },
-        "ok": {
-          "type": "boolean"
-        },
-        "installed": {
-          "type": "boolean"
-        },
-        "install": {
-          "type": [
-            "null",
-            "string"
-          ]
-        },
-        "extensions": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ExtensionView"
-          }
-        }
-      },
-      "required": [
-        "addon",
-        "mode",
-        "package",
-        "version",
-        "platform",
-        "ok",
-        "installed",
-        "install",
-        "extensions"
-      ],
-      "additionalProperties": false
-    },
     "Confirmation": {
       "type": "object",
       "properties": {
@@ -207,6 +151,50 @@
       ],
       "additionalProperties": false
     },
+    "ExtensionFilesView": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "enum": [
+            "lake",
+            "server"
+          ]
+        },
+        "label": {
+          "type": "string"
+        },
+        "platform": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "fetch": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "extensions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExtensionView"
+          }
+        }
+      },
+      "required": [
+        "mode",
+        "label",
+        "platform",
+        "ok",
+        "fetch",
+        "extensions"
+      ],
+      "additionalProperties": false
+    },
     "ExtensionView": {
       "type": "object",
       "properties": {
@@ -221,14 +209,6 @@
         },
         "ok": {
           "type": "boolean"
-        },
-        "source": {
-          "enum": [
-            "addon",
-            "cache",
-            "dir",
-            null
-          ]
         },
         "path": {
           "type": [
@@ -246,7 +226,6 @@
       "required": [
         "name",
         "ok",
-        "source",
         "path",
         "code"
       ],

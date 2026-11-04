@@ -66,10 +66,10 @@ describe("planLaunch", () => {
     expect(plan).toMatchObject({ kind: "refuse", exit: 2, problem: { code: "NEEDS_BUN", fix: { command: "curl -fsSL https://bun.sh/install | bash" } } });
   });
 
-  test("outside a project only init, doctor, docs, version and help run", () => {
+  test("outside a project only init, doctor, docs, version, help and fetch-extensions run", () => {
     const out = dir();
-    expect(OUTSIDE_PROJECT).toEqual(["init", "doctor", "docs", "version", "help"]);
-    for (const argv of [["init", "x"], ["doctor"], ["docs", "--list"], ["version"], ["--version"], ["help"], []]) {
+    expect(OUTSIDE_PROJECT).toEqual(["init", "doctor", "docs", "version", "help", "fetch-extensions"]);
+    for (const argv of [["init", "x"], ["doctor"], ["docs", "--list"], ["version"], ["--version"], ["help"], ["fetch-extensions", "--all"], []]) {
       expect(planLaunch(input(out, argv)).kind).toBe("local");
     }
     const refused = planLaunch(input(out, ["status", "--json"]));

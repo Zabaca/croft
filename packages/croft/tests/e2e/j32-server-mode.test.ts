@@ -85,9 +85,9 @@ describe("journey 32: server mode", () => {
     expect(doctor.json.data.checks.find((c: Envelope) => c.id === "servermode")).toMatchObject({ status: "ok", details: { serving: false } });
     const offline = (await p.json(["status"], home)).json.data.serverMode;
     expect(offline.serving).toBe(false);
-    // The mode's extension files are found (D134): from the folder the journey names, not an add-on.
-    expect(offline.addons).toHaveLength(1);
-    expect(offline.addons[0]).toMatchObject({ addon: "server", ok: true });
+    // The mode's extension files are found (D195): in the folder the journey names.
+    expect(offline.extensionFiles).toHaveLength(1);
+    expect(offline.extensionFiles[0]).toMatchObject({ mode: "server", ok: true });
 
     const serve = p.start(["serve", "--port", "0"], home);
     const file = join(p.stateDir, "serve.json");
@@ -117,7 +117,7 @@ describe("journey 32: server mode", () => {
     expect(JSON.parse(readFileSync(file, "utf8")).serverMode).toBe(true);
     const status = await p.json(["status"], home);
     expect(status.json.data.serverMode.serving).toBe(true);
-    expect(status.json.data.serverMode.addons[0]).toMatchObject({ addon: "server", ok: true });
+    expect(status.json.data.serverMode.extensionFiles[0]).toMatchObject({ mode: "server", ok: true });
 
     // A run writes while croft serve runs: it never waits for it, and the new rows reach the app within a second or so.
     const engine = async () => (await get(rec, "/status")).data.serve.engine;
@@ -173,8 +173,8 @@ describe("journey 32: server mode", () => {
     expect(doctor.json.data.checks.find((c: Envelope) => c.id === "readcopy")).toBeUndefined();
     const offline = (await p.json(["status"], home)).json.data;
     expect(offline.serverMode.serving).toBe(false);
-    expect(offline.serverMode.addons).toHaveLength(1);
-    expect(offline.serverMode.addons[0]).toMatchObject({ addon: "server", ok: true });
+    expect(offline.serverMode.extensionFiles).toHaveLength(1);
+    expect(offline.serverMode.extensionFiles[0]).toMatchObject({ mode: "server", ok: true });
     expect(offline.readCopy).toBeUndefined();
 
     const serve = p.start(["serve", "--port", "0"], home);

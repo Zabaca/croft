@@ -16,7 +16,7 @@ import { availableParallelism, totalmem } from "node:os";
 import { physicalPath } from "../project/root.ts";
 import { basename, dirname, join, resolve } from "node:path";
 import { CroftError } from "../core/errors.ts";
-import { checkMode, type ModeSpec, modeCredentialDigest, modeDirectories, modeIdentity, modePaths, startMode } from "./modes.ts";
+import { type ModeSpec, modeCredentialDigest, modeDirectories, modeIdentity, modePaths, prepareMode, startMode } from "./modes.ts";
 
 const DUCKDB_VERSION = version().replace(/^v(?=\d)/, "");
 
@@ -272,10 +272,11 @@ async function applySandbox(instance: DuckDBInstance, conn: DuckDBConnection, sp
   // A global setting on DuckDB 2.0, so every later connection inherits it; the lock refuses changing it after.
   if (spec.optimizer === false) await conn.run("SET GLOBAL enable_optimizer = false");
   // A mode loads its extensions, attaches and starts what it serves now: DuckDB refuses each of them once outside
-  // access is off (D118). The check has no effect on the instance, so a refusal (a missing file, a profile the mode
+  // access is off (D118). Its extension files are fetched from DuckDB first if this machine lacks them (D195): the one
+  // place an open fetches, and before the lock. The check has no effect on the instance, so a refusal (a missing file, a profile the mode
   // does not fit) leaves it clean and a retry can succeed. Once the mode starts, any failure leaves the instance part
   // set up, and the instance is marked failed.
-  const files = spec.mode ? checkMode(spec.mode, spec.profile) : null;
+  const files = spec.mode ? await prepareMode(spec.mode, spec.profile) : null;
   try {
     if (spec.mode) await startMode(conn, spec.mode, files!);
     if (paths.length) await conn.run(`SET allowed_paths = [${paths.map(sqlString).join(", ")}]`);

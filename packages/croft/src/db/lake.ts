@@ -41,14 +41,14 @@ export interface LakeConnection {
 
 /**
  * The project's lake as a warehouse opens it, or undefined for a project with a file. `extensionDir` is for croft's tests: the folder of
- * pinned extension files; a project's come from its add-on (db/addons.ts) or $CROFT_EXTENSION_DIR.
+ * pinned extension files; a project's are in $CROFT_EXTENSION_DIR or croft's cache, fetched from DuckDB when absent (D195).
  */
 export function lakeConnection(project: Project, env: ProjectEnv, o: { extensionDir?: string; listsBucket?: true } = {}): LakeConnection | undefined {
   const lake = project.config.lake;
   if (!lake) return undefined;
   const names = lakeSecretNames(lake);
   const secretDir = join(project.paths.stateDir, "lake-secrets");
-  const base = { projectRoot: project.root, secretDir, ...(o.extensionDir ? { extensionDir: o.extensionDir } : {}) };
+  const base = { secretDir, ...(o.extensionDir ? { extensionDir: o.extensionDir } : {}) };
   // secret() declares every name of the lake first, so a value is redacted from every message and log whether it came from .env, the
   // shell or secretsFrom, and throws SECRET_MISSING for a name nothing sets.
   const secret = (name: string): string => env.secret(name, names);
@@ -67,7 +67,7 @@ export function lakeOption(project: Project, env: ProjectEnv, o: { listsBucket?:
   return lake ? { lake } : {};
 }
 
-function lakeMode(lake: LakeConfig, project: Project, access: "write" | "read", base: Pick<ModeSpec, "projectRoot" | "secretDir" | "extensionDir">, secret: (name: string) => string,
+function lakeMode(lake: LakeConfig, project: Project, access: "write" | "read", base: Pick<ModeSpec, "secretDir" | "extensionDir">, secret: (name: string) => string,
   tlsEnv: NodeJS.ProcessEnv, listsBucket?: true): ModeSpec {
   if (lake.kind === "local") {
     const { catalog, data } = localLakePaths(lake, project.root);
