@@ -69,7 +69,7 @@ describe("which workflows can publish", () => {
 
   test("every job of ci.yml, the log run of the suite (test-log) and the smoke included, publishes nothing, mints no token and holds no secret", () => {
     const { doc } = load("ci.yml");
-    expect(Object.keys(doc.jobs)).toEqual(["changes", "test", "test-platforms", "smoke", "test-log", "test-lake-local", "test-lake-postgres", "alpine", "windows", "site"]);
+    expect(Object.keys(doc.jobs)).toEqual(["changes", "test", "smoke", "test-log", "test-lake-local", "test-lake-postgres", "alpine", "windows", "site"]);
     // ci.yml does not run on the release tag: the commit was tested by the push to main, and publish-npm.yml refuses without that run (D196).
     expect(doc.on.push.tags).toEqual(["phase-*"]);
     for (const [name, job] of Object.entries<any>(doc.jobs)) {
@@ -102,14 +102,14 @@ describe("which workflows can publish", () => {
     for (const [name, j] of Object.entries<any>(doc.jobs)) expect(JSON.stringify([j["runs-on"], j.strategy?.matrix]), name).not.toMatch(/macos/i);
   });
 
-  test("the other platforms and Bun versions run the suite on a push to main and daily, and a smoke on a pull request (D191)", () => {
+  test("the other platforms and Bun versions run the smoke and nothing else, on every run; there is a daily run of what a push runs (D191, D206)", () => {
     const { doc } = load("ci.yml");
-    const more = doc.jobs["test-platforms"];
-    expect(onPullRequest(more)).toBe(false);
-    expect(more.strategy.matrix.os).toEqual(["ubuntu-24.04", "ubuntu-24.04-arm"]);
-    expect(more.strategy.matrix.bun).toEqual(["1.3.14", "latest"]);
-    // With `test`, the four combinations of the old matrix: x64 on the floor is `test`, the other three are here.
-    expect(more.strategy.matrix.exclude).toEqual([{ os: "ubuntu-24.04", bun: "1.3.14" }]);
+    // The suite runs on Linux x64 and the Bun floor only (the maintainer's decision of 2026-11-04, D206): no job but `smoke` and the Alpine and
+    // Windows smokes names another operating system, architecture or Bun version.
+    for (const [name, job] of Object.entries<any>(doc.jobs)) {
+      if (["smoke", "alpine", "windows", "site"].includes(name)) continue;
+      expect(JSON.stringify([job["runs-on"], job.strategy?.matrix, job.container, job.steps.map((st: any) => st.with?.["bun-version"])]), name).not.toMatch(/-arm|latest|windows|alpine/);
+    }
     expect(doc.on.schedule, "a daily run").toHaveLength(1);
     expect(doc.on.schedule[0].cron).toMatch(/^\d+ \d+ \* \* \*$/);
     expect(doc.on.push.branches).toEqual(["main"]);
@@ -139,7 +139,7 @@ describe("which workflows can publish", () => {
 
   test("the jobs of the suite run in shards: the matrix lists 1 to N, the name says which, and the test step runs that one of N (DESIGN.md §10)", () => {
     const { doc } = load("ci.yml");
-    for (const name of ["test", "test-platforms", "test-log", "test-lake-local", "test-lake-postgres"]) {
+    for (const name of ["test", "test-log", "test-lake-local", "test-lake-postgres"]) {
       const job = doc.jobs[name];
       const shards: number[] = job.strategy.matrix.shard;
       expect(shards.length, name).toBeGreaterThan(1);
@@ -280,7 +280,7 @@ describe("which workflows can publish", () => {
       expect(gate([run()], {}).state, "a run whose jobs are not known").toBe("fail");
     });
 
-    // The gate used to look for a word in a job's name ("shard", "smoke"), and the after-merge, log, lake, Alpine and Windows jobs carry those words
+    // The gate used to look for a word in a job's name ("shard", "smoke"), and the log, lake, Alpine and Windows jobs carry those words
     // too: a deleted or renamed suite job went unnoticed as long as another job said "shard". Each kind is its own name and its own count (D202).
     test("the gate refuses a run missing, short of or renamed in any one kind of croft job, though other jobs carry the same words", () => {
       const without = (drop: (name: string) => boolean) => FULL.filter((j) => !drop(j.name));
@@ -292,7 +292,6 @@ describe("which workflows can publish", () => {
       const suite = (n: string) => /^ubuntu-24\.04 · bun 1\.3\.14 · shard \d+\/7$/.test(n);
       refused(without(suite), "the suite's shards (0 of 7)");
       refused(without((n) => n === "ubuntu-24.04 · bun 1.3.14 · shard 7/7"), "the suite's shards (6 of 7)");
-      refused(without((n) => n.startsWith("after a merge")), "the after-merge platforms (0 of 12)");
       refused(without((n) => n.includes("bookkeeping as a log")), "the log run (0 of 2)");
       refused(without((n) => n.includes("journeys on a local lake") && n.endsWith("4/4")), "the journeys on a local lake (3 of 4)");
       refused(without((n) => n.includes("journeys on a Postgres lake")), "the journeys on a Postgres lake (0 of 5)");

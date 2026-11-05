@@ -35,14 +35,13 @@ export const LIMIT_SECONDS = 45 * 60;
 /** One kind of croft job a full run has: the jobs of ci.yml that share a name shape, and how many of them there are. */
 export interface JobKind {
   label: string;
-  /** The name a job of this kind has once its matrix is expanded. Anchored, so that no kind's jobs match another's: "shard" or "smoke" alone would also match the after-merge, log, lake, Alpine and Windows jobs. */
+  /** The name a job of this kind has once its matrix is expanded. Anchored, so that no kind's jobs match another's: "shard" or "smoke" alone would also match the log, lake, Alpine and Windows jobs. */
   name: RegExp;
   count: number;
 }
 /** Every kind of croft job a full run has, with the jobs of each counted (tests/workflows.test.ts expands ci.yml's matrices and checks that its jobs are exactly these). A skipped matrix job keeps its unexpanded name, so it matches none of them, and a run missing a shard, a platform or a whole job is short of its count. */
 export const JOB_KINDS: JobKind[] = [
   { label: "the suite's shards", name: /^ubuntu-24\.04 · bun 1\.3\.14 · shard \d+\/7$/, count: 7 },
-  { label: "the after-merge platforms", name: /^after a merge · ubuntu-24\.04(?:-arm)? · bun (?:1\.3\.14|latest) · shard \d+\/4$/, count: 12 },
   { label: "the log run", name: /^ubuntu-24\.04 · bun 1\.3\.14 · bookkeeping as a log · shard \d+\/2$/, count: 2 },
   { label: "the journeys on a local lake", name: /^ubuntu-24\.04 · bun 1\.3\.14 · journeys on a local lake · shard \d+\/4$/, count: 4 },
   { label: "the journeys on a Postgres lake", name: /^ubuntu-24\.04 · bun 1\.3\.14 · journeys on a Postgres lake · shard \d+\/5$/, count: 5 },
