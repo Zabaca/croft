@@ -77,17 +77,23 @@ function paths(l: Lake) {
   };
 }
 
-for (const kind of ["local", "postgres"] as const) {
-  maybe(`a lake project's gate (${kind} lake)`, () => {
-    let l: Lake;
-    beforeAll(async () => {
-      l = await lakeWithServer(kind);
-      mkdirSync(join(l.p.root, "assets"), { recursive: true });
-    }, 120_000);
+// Both lakes are made first (making one closes every warehouse of the process, db/warehouse.ts closeAllWarehouses), and then the two
+// attack runs go side by side: each is its own project, lake and server, so what one sends never reaches the other. The positive controls
+// run after both, as they write the same two asset files the attacks do.
+const KINDS = ["local", "postgres"] as const;
+maybe("a lake project's gate", () => {
+  const lakes = {} as Record<(typeof KINDS)[number], Lake>;
+  beforeAll(async () => {
+    for (const kind of KINDS) {
+      lakes[kind] = await lakeWithServer(kind);
+      mkdirSync(join(lakes[kind].p.root, "assets"), { recursive: true });
+    }
+  }, 240_000);
 
-    test("every attack is refused by croft query, an SQL asset, a check and croft serve, and nothing it printed holds a credential", async () => {
-      const run = paths(l);
-      const all = lakeAttacks(l.bucket).flatMap(variants);
+  for (const kind of KINDS) {
+    test.concurrent(`(${kind} lake) every attack is refused by croft query, an SQL asset, a check and croft serve, and nothing it printed holds a credential`, async () => {
+      const run = paths(lakes[kind]);
+      const all = lakeAttacks(lakes[kind].bucket).flatMap(variants);
       expect(all.length).toBeGreaterThan(100);
       const printed: string[] = [];
       const slips: string[] = [];
@@ -101,17 +107,19 @@ for (const kind of ["local", "postgres"] as const) {
       expect(slips).toEqual([]);
       for (const secret of RIG_SECRETS) for (const t of printed) expect(t).not.toContain(secret);
     }, 600_000);
+  }
 
-    test("a lake's tables still answer on every path (the positive control)", async () => {
-      const run = paths(l);
+  for (const kind of KINDS) {
+    test(`(${kind} lake) a lake's tables still answer on every path (the positive control)`, async () => {
+      const run = paths(lakes[kind]);
       const count = "SELECT count(*) AS n FROM orders";
       expect((await run.query(count)).refused).toBe(false);
       expect((await run.http(count)).refused).toBe(false);
       expect((await run.asset("SELECT id, note FROM orders")).refused).toBe(false);
       expect((await run.check("SELECT id FROM orders WHERE id > 3")).refused).toBe(false);
     }, 120_000);
-  });
-}
+  }
+});
 
 describe("a project with a file", () => {
   test("is not refused what only a lake refuses: the flag is what lake mode adds", async () => {

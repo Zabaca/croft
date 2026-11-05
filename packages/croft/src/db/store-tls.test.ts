@@ -14,7 +14,7 @@ import { modePaths } from "./modes.ts";
 import { lakeRigReady, type LakeRig, type RigLake, useLake } from "./lake-testkit.ts";
 import { isStoreTls, storeCaFile, storeTlsProblem } from "./store-tls.ts";
 import { makeStoreCerts, startTlsLakeRig, storeCertsReady, type StoreCerts } from "./store-tls-testkit.ts";
-import { closeAllWarehouses } from "./warehouse.ts";
+import { closeAllWarehouses, closeWarehousesUnder } from "./warehouse.ts";
 
 const ready = lakeRigReady();
 const certsOk = storeCertsReady();
@@ -111,10 +111,6 @@ describe("a lake whose store is served over HTTPS", () => {
   }, 180_000);
 
   maybe("without the CA, every command that meets the store says LAKE_STORE_TLS and the fix, and none says INTERNAL_ERROR, QUERY_FAILED or LAKE_MAINTENANCE_FAILED", async () => {
-    const lake = await rig!.lake();
-    const p = project(lake, certs!.cert);
-    expect((await cli(["run", "--foreground", "--json"], { cwd: p.root, env: p.env })).exit).toBe(0);
-    await closeAllWarehouses();
     // The CA the check uses does not vouch for the store: a bundle $SSL_CERT_FILE names, a file the project names, or (nothing named) this machine's own
     // bundle, which does not know the store's authority; on a machine with no bundle at all the refusal is the same code, kind no-ca-file.
     const cases: { label: string; cert?: string; env: Record<string, string> }[] = [
@@ -122,23 +118,31 @@ describe("a lake whose store is served over HTTPS", () => {
       { label: "the project names another CA", cert: certs!.otherCa, env: {} },
       { label: "this machine's own bundle", env: { SSL_CERT_FILE: "/no/such/bundle.pem" } },
     ];
-    for (const c of cases) {
+    // Each case is a project and a lake of its own, made and run with the CA, then asked with the CA it is about; the three go side by side
+    // (a command closes only its own project's warehouses, db/warehouse.ts closeWarehousesUnder). Every case is let finish before the first failure is raised.
+    const runCase = async (c: (typeof cases)[number]): Promise<void> => {
+      const lake = await rig!.lake();
+      const p = project(lake, certs!.cert);
+      expect((await cli(["run", "--foreground", "--json"], { cwd: p.root, env: p.env })).exit, c.label).toBe(0);
+      await closeWarehousesUnder(p.root);
       p.use(c.cert);
       const env = { ...p.env, ...c.env };
       for (const argv of [["run", "orders", "--foreground"], ["query", "select max(note) from orders"], ["describe", "orders"], ["maintain"], ["backup"]]) {
         const r = await cli([...argv, "--json"], { cwd: p.root, env });
         const codes = problemsOf(r.json).map((x) => x.code);
         expect(codes, `${c.label}: croft ${argv[0]}: ${r.stdout.slice(0, 600)}`).toContain("LAKE_STORE_TLS");
-        for (const bad of ["INTERNAL_ERROR", "QUERY_FAILED", "LAKE_MAINTENANCE_FAILED"]) expect(codes, `croft ${argv[0]}`).not.toContain(bad);
+        for (const bad of ["INTERNAL_ERROR", "QUERY_FAILED", "LAKE_MAINTENANCE_FAILED"]) expect(codes, `${c.label}: croft ${argv[0]}`).not.toContain(bad);
         const tls = problemsOf(r.json).find((x) => x.code === "LAKE_STORE_TLS")!;
-        expect(tls.hint, argv[0]).toContain("lake.bucket.sslRootCert");
+        expect(tls.hint, `${c.label}: ${argv[0]}`).toContain("lake.bucket.sslRootCert");
         expect(["untrusted", "no-ca-file"], c.label).toContain(String(tls.details?.kind));
-        await closeAllWarehouses();
+        await closeWarehousesUnder(p.root);
       }
       const doctor = await cli(["doctor", "--json"], { cwd: p.root, env });
       expect(problemsOf(doctor.json).map((x) => x.code), `croft doctor, ${c.label}`).toContain("LAKE_STORE_TLS");
-      await closeAllWarehouses();
-    }
+      await closeWarehousesUnder(p.root);
+    };
+    const settled = await Promise.allSettled(cases.map(runCase));
+    for (const r of settled) if (r.status === "rejected") throw r.reason;
   }, 240_000);
 
   maybe("a store whose certificate is for another name is LAKE_STORE_TLS too, even with the CA that signed it", async () => {

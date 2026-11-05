@@ -91,6 +91,7 @@ export async function startPostgres(o: { tls?: { cert: string; key: string } } =
     return c;
   };
   let child = launch();
+  let creating: Promise<void> = Promise.resolve();
   const sql = async (statement: string, db = "postgres"): Promise<string> => {
     const r = Bun.spawn([join(bin, "psql"), "-h", "127.0.0.1", "-p", String(port), "-U", "postgres", "-d", db, "-v", "ON_ERROR_STOP=1", "-tAc", statement], { env: { PATH: process.env.PATH ?? "", PGPASSWORD: password }, stdout: "pipe", stderr: "pipe" });
     const [out, errText, code] = await Promise.all([new Response(r.stdout).text(), new Response(r.stderr).text(), r.exited]);
@@ -111,13 +112,19 @@ export async function startPostgres(o: { tls?: { cert: string; key: string } } =
     port,
     admin: { user: "postgres", password },
     sql,
-    async createLakeDatabase(db, writer, reader) {
-      for (const u of [writer, reader]) {
-        await sql(`DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${u.user}') THEN CREATE ROLE ${u.user} LOGIN PASSWORD '${u.password}'; END IF; END $$`);
-      }
-      await sql(`CREATE DATABASE ${db} OWNER ${writer.user}`);
-      await sql(`GRANT CONNECT ON DATABASE ${db} TO ${reader.user}`, db);
-      await sql(`GRANT USAGE ON SCHEMA public TO ${reader.user}; ALTER DEFAULT PRIVILEGES FOR ROLE ${writer.user} IN SCHEMA public GRANT SELECT ON TABLES TO ${reader.user}`, db);
+    // One at a time: the check for a role and its creation are two statements, so two lakes made at once (tests that run side by side) could
+    // both find the role missing and the second CREATE ROLE would fail.
+    createLakeDatabase(db, writer, reader) {
+      const made = creating.then(async () => {
+        for (const u of [writer, reader]) {
+          await sql(`DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${u.user}') THEN CREATE ROLE ${u.user} LOGIN PASSWORD '${u.password}'; END IF; END $$`);
+        }
+        await sql(`CREATE DATABASE ${db} OWNER ${writer.user}`);
+        await sql(`GRANT CONNECT ON DATABASE ${db} TO ${reader.user}`, db);
+        await sql(`GRANT USAGE ON SCHEMA public TO ${reader.user}; ALTER DEFAULT PRIVILEGES FOR ROLE ${writer.user} IN SCHEMA public GRANT SELECT ON TABLES TO ${reader.user}`, db);
+      });
+      creating = made.catch(() => {});
+      return made;
     },
     async terminateConnections() {
       return Number(await sql("select count(pg_terminate_backend(pid)) from pg_stat_activity where usename not in ('postgres') and pid <> pg_backend_pid()"));

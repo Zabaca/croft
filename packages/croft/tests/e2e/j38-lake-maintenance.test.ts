@@ -13,6 +13,7 @@
 //   c. maintenance by itself: a run a day on is followed by a pass, status and doctor say when it last worked, and --dry-run is read-only;
 //   d. a week of hourly runs over five assets, then a pass, on this lake: the snapshots, files and tables fall to what the kept versions need
 //      (acceptance 1); and its cost in a steady state, a month of hourly runs with a pass a day (the numbers are in scripts/simulate-lake-maintenance.ts).
+//      It has a lake of its own and shares nothing with a to c, so its work starts in beforeAll and runs beside them; the test of d waits for it.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -72,6 +73,40 @@ if (!LAKE) {
     let sRowsdel = 0;
     let sGone = 0;
 
+    /** Test d's work, started in beforeAll: the lake of its own, the week, the pass and every expectation about them. */
+    const runWeek = async (): Promise<void> => {
+      const rig = LAKE === "postgres" ? await lakeRig() : undefined;
+      const { lakeRigReady } = await import("../../src/db/lake-testkit.ts");
+      const l = await openTestLake(LAKE!, { extensionDir: lakeRigReady().dir, ...(rig ? { rig } : {}) });
+      try {
+        // The week ended 40 days ago, so the promise keeps each asset's 5 newest versions, the state at the start of the window, and the newest.
+        const start = new Date(T.getTime() - 40 * DAY - 7 * DAY);
+        const sim = await simulate(l, { start, hours: 7 * 24, fullRefresh: "replace" });
+        expect(sim.commits).toBe(840);
+        const before = await statsOf(l);
+        const catalogBefore = await catalogBytes(l);
+        expect(before.snapshots).toBeGreaterThan(800);
+        expect(before.dataFiles).toBeGreaterThan(800);
+        expect(before.inlinedTables).toBeGreaterThan(150);
+        const report = await pass(l, T);
+        expect(report.ok, JSON.stringify(report.steps)).toBe(true);
+        const after = await statsOf(l);
+        console.log(`[j38 ${LAKE}] a week: ${JSON.stringify({ before, after, passMs: report.tookMs, steps: report.steps.map((s) => [s.step, s.tookMs]), catalogMBBefore: catalogBefore / 1e6, catalogMBAfter: (await catalogBytes(l)) / 1e6, dataMBAfter: folderBytes(l.dataDir) / 1e6 })}`);
+        // What the kept versions need: 5 assets, 5 versions each at most, the window's start and the newest snapshot, and the pass's own.
+        expect(after.snapshots).toBeLessThan(40);
+        expect(after.dataFiles).toBeLessThan(40);
+        expect(after.inlinedTables).toBeLessThan(25);
+        expect(after.pendingDeletion).toBe(0);
+        expect(report.tookMs).toBeLessThan(20_000); // timing-gap: a pass over this week takes 0.3 to 0.9 s (D150); one that merged nothing would take minutes
+        // The lake still reads: every table as of today.
+        const rows = await l.r.read((db) => db.all<{ n: number | bigint }>("SELECT (SELECT count(*) FROM tiny_a) + (SELECT count(*) FROM inc_a) + (SELECT count(*) FROM full_r) AS n"), { purpose: "j38" });
+        expect(Number(rows[0]!.n)).toBe(840 + 4225 + 2000);
+      } finally {
+        await l.close();
+      }
+    };
+    let week: Promise<void>;
+
     beforeAll(async () => {
       p = (await initProject("maintenance")).project;
       // Its own clock for the catalog, and the lake's block with maintenance by itself switched off while the history is built: a pass between
@@ -82,6 +117,8 @@ if (!LAKE) {
       p.write("croft.json", JSON.stringify(cfg, null, 2));
       if (LAKE === "local") clock = sqliteLakeClock(join(p.root, "lake", "catalog.sqlite"));
       else clock = postgresLakeClock(await lakeRig(), cfg.lake.catalog.database);
+      week = runWeek();
+      week.catch(() => {}); // a failure is reported by test d, which waits for it, not as an unhandled rejection while a to c run
     }, 180_000);
 
     test("a. the history builds: a table made 70 days ago, orders rewritten for 8 days, rows deleted from rowsdel for 7, and gone deleted 29 days ago", async () => {
@@ -191,35 +228,7 @@ if (!LAKE) {
     }, 600_000);
 
     test("d. a week of hourly runs over five assets, then a pass: the snapshots, files and tables fall to what the kept versions need (acceptance 1)", async () => {
-      const rig = LAKE === "postgres" ? await lakeRig() : undefined;
-      const { lakeRigReady } = await import("../../src/db/lake-testkit.ts");
-      const l = await openTestLake(LAKE!, { extensionDir: lakeRigReady().dir, ...(rig ? { rig } : {}) });
-      try {
-        // The week ended 40 days ago, so the promise keeps each asset's 5 newest versions, the state at the start of the window, and the newest.
-        const start = new Date(T.getTime() - 40 * DAY - 7 * DAY);
-        const sim = await simulate(l, { start, hours: 7 * 24, fullRefresh: "replace" });
-        expect(sim.commits).toBe(840);
-        const before = await statsOf(l);
-        const catalogBefore = await catalogBytes(l);
-        expect(before.snapshots).toBeGreaterThan(800);
-        expect(before.dataFiles).toBeGreaterThan(800);
-        expect(before.inlinedTables).toBeGreaterThan(150);
-        const report = await pass(l, T);
-        expect(report.ok, JSON.stringify(report.steps)).toBe(true);
-        const after = await statsOf(l);
-        console.log(`[j38 ${LAKE}] a week: ${JSON.stringify({ before, after, passMs: report.tookMs, steps: report.steps.map((s) => [s.step, s.tookMs]), catalogMBBefore: catalogBefore / 1e6, catalogMBAfter: (await catalogBytes(l)) / 1e6, dataMBAfter: folderBytes(l.dataDir) / 1e6 })}`);
-        // What the kept versions need: 5 assets, 5 versions each at most, the window's start and the newest snapshot, and the pass's own.
-        expect(after.snapshots).toBeLessThan(40);
-        expect(after.dataFiles).toBeLessThan(40);
-        expect(after.inlinedTables).toBeLessThan(25);
-        expect(after.pendingDeletion).toBe(0);
-        expect(report.tookMs).toBeLessThan(20_000); // timing-gap: a pass over this week takes 0.3 to 0.9 s (D150); one that merged nothing would take minutes
-        // The lake still reads: every table as of today.
-        const rows = await l.r.read((db) => db.all<{ n: number | bigint }>("SELECT (SELECT count(*) FROM tiny_a) + (SELECT count(*) FROM inc_a) + (SELECT count(*) FROM full_r) AS n"), { purpose: "j38" });
-        expect(Number(rows[0]!.n)).toBe(840 + 4225 + 2000);
-      } finally {
-        await l.close();
-      }
+      await week;
     }, 900_000);
   });
 }

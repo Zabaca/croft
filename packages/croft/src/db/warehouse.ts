@@ -1059,3 +1059,15 @@ export async function closeAllWarehouses(): Promise<void> {
   const g = globalThis as Record<symbol, unknown>;
   delete g[GLOBAL_KEY];
 }
+
+/** Close and forget the warehouses of the files under `dir` and no others (tests that run several projects side by side in one process). */
+export async function closeWarehousesUnder(dir: string): Promise<void> {
+  const under = `${canonicalPath(dir)}/`;
+  const g = globalThis as Record<symbol, unknown>;
+  for (const [path, w] of [...byPath]) {
+    if (!path.startsWith(under)) continue;
+    await w.close();
+    byPath.delete(path);
+    if (g[GLOBAL_KEY] === w) delete g[GLOBAL_KEY];
+  }
+}
