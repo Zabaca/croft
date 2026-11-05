@@ -10,7 +10,7 @@
     },
     "packages/croft": {
       "name": "@zabaca/croft",
-      "version": "0.5.0",
+      "version": "0.5.1",
       "bin": {
         "croft": "bin/croft.mjs",
       },
