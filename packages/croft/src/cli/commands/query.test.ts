@@ -500,13 +500,17 @@ describe("inDirectory", () => {
     const began = process.cwd();
     try {
       const seen: string[] = [];
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
       const inside = (dir: string) => inDirectory(dir, async () => {
         seen.push(process.cwd());
-        await new Promise((r) => setTimeout(r, 20)); // the other asks now, while this one is inside
+        await gate; // held until all three have asked, so each is asked while another is inside
         seen.push(process.cwd());
         return dir;
       });
-      expect(await Promise.all([inside(a), inside(b), inside(a)])).toEqual([a, b, a]);
+      const asked = [inside(a), inside(b), inside(a)];
+      release();
+      expect(await Promise.all(asked)).toEqual([a, b, a]);
       expect(seen).toEqual([a, a, b, b, a, a]);
       expect(process.cwd()).toBe(began);
       // A call that throws neither keeps the folder nor holds up the next.
