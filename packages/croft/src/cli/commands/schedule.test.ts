@@ -4,7 +4,7 @@
 // fraction of a second, and a fake scheduler view (schedule/due.ts is another builder's).
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../../core/errors.ts";
@@ -121,6 +121,20 @@ function setting(stateDir = p.stateDir) {
 }
 
 describe("croft schedule on", () => {
+  test("carries the shell's extension settings into the job, names only in the output, and says so in the text", async () => {
+    const shell = { ...env, CROFT_EXTENSION_DIR: "/srv/croft-ext", CROFT_EXTENSION_REPO: "https://user:pw@mirror.example/duckdb" };
+    const { deps: d } = deps({ tick: true });
+    const r = await sched(["on", "--json"], d, { env: shell });
+    expect(r.exit).toBe(0);
+    expect(r.json.data.job.extensionSettings).toEqual(["CROFT_EXTENSION_DIR", "CROFT_EXTENSION_REPO"]);
+    expect(JSON.stringify(r.json)).not.toContain("user:pw");
+    const plist = readFileSync(plistPath(home), "utf8");
+    expect(plist).toContain("<key>CROFT_EXTENSION_DIR</key>");
+    expect(plist).toContain("<string>/srv/croft-ext</string>");
+    const text = await sched(["on"], d, { env: shell });
+    expect(text.stdout).toContain("The job carries CROFT_EXTENSION_DIR, CROFT_EXTENSION_REPO from this shell");
+  });
+
   test("records it on, registers the project, installs the job, waits for the first tick, and lists the schedule", async () => {
     const { deps: d, calls } = deps({ tick: true });
     const r = await sched(["on", "--json"], d);

@@ -12,9 +12,11 @@ import { CroftError } from "../core/errors.ts";
 import type { CatalogSslMode } from "../project/lake-config.ts";
 import { connect, instanceConfig, type SandboxSpec } from "./connect.ts";
 import { extensionsReady, IN_CI } from "./extension-dir-testkit.ts";
+import { fetchExtensions } from "./extension-fetch.ts";
 import { extensionPath, hostPlatform, verifyExtension } from "./extension-files.ts";
 import { repoPath, type StandInRepo, startStandInRepo } from "./extension-repo-testkit.ts";
 import { DUCKDB_VERSION, type ExtensionName } from "./extension-names.ts";
+import { MODE_FILES } from "./extension-status.ts";
 import { LAKE_ALIAS, type LakeSpec, lakeReadersMode, MODE_EXTENSIONS, modeCredentialDigest, modeIdentity, type ModeSpec, READ_COPY_ALIAS, scrub, scrubError, scrubThrown, startQuackListener } from "./modes.ts";
 import { freePort, postgresBin, readListening, startPostgres, startS3, track, type TestPostgres, type TestS3 } from "./mode-testkit.ts";
 
@@ -172,6 +174,11 @@ describe("the pinned list", () => {
     expect(MODE_EXTENSIONS["lake-local"]).toEqual(["sqlite", "ducklake"]);
     expect(MODE_EXTENSIONS["lake-local-readers"]).toEqual(["httpfs", "sqlite", "ducklake", "quack"]);
     for (const [kind, names] of Object.entries(MODE_EXTENSIONS)) if (kind !== "lake-local" && kind !== "lake-local-readers") expect(names, kind).not.toContain("sqlite");
+  });
+
+  test("the files validate, doctor and status look for are the files the modes load", () => {
+    expect(MODE_FILES.server.extensions).toEqual(MODE_EXTENSIONS.readers);
+    expect(MODE_FILES.lake.extensions).toEqual(MODE_EXTENSIONS.lake);
   });
 
   withExt("with no mode, no extension is loaded (acceptance 1)", async () => {
@@ -995,6 +1002,28 @@ describe("a mode fetches what the folder lacks from DuckDB, before it locks (D19
       expect(repo.requests.sort()).toEqual([repoPath("httpfs", hostPlatform()!), repoPath("quack", hostPlatform()!)]);
       expect(await loaded(c)).toEqual(expect.arrayContaining(["quack", "httpfs"]));
       expect(await rows(c, `SELECT count(*) FROM ${READ_COPY_ALIAS}.main.t`)).toEqual([[5n]]);
+    } finally {
+      restore();
+    }
+  });
+
+  withExt("after croft's fetch, a fresh instance works with fetching off and the repository unreachable", async () => {
+    const { repo, restore } = await realRepo();
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "croft-extdir-fetch-"));
+      cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+      const fetched = await fetchExtensions(["httpfs", "quack"], { dir, log: () => {} });
+      expect(fetched.map((f) => f.downloaded)).toEqual([true, true]);
+      expect(repo.requests).toHaveLength(2);
+      // The network goes away: fetching is off, and the repository is a port nothing listens on.
+      process.env.CROFT_NO_FETCH = "1";
+      process.env.CROFT_EXTENSION_REPO = `http://127.0.0.1:${freePort()}`;
+      repo.stop();
+      const p = await project();
+      const c = await open(readers(p, { extensionDir: dir }));
+      expect(await loaded(c)).toEqual(expect.arrayContaining(["quack", "httpfs"]));
+      expect(await rows(c, `SELECT count(*) FROM ${READ_COPY_ALIAS}.main.t`)).toEqual([[5n]]);
+      expect(repo.requests).toHaveLength(2);
     } finally {
       restore();
     }

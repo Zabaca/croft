@@ -29,8 +29,8 @@ import { LOCK_DB_SUFFIX, LOCK_STALE_MS, LOCK_SUFFIX, MISSING_PRUNE_DAYS, MISSING
 
 /** Bumped whenever the template changes. writeTickScript never replaces a script from a later template, so
  *  projects pinned to different croft versions do not rewrite it back and forth. 2: the OS lock (review R31-03),
- *  missing projects (R31-10), and the pinned croft's engines.bun. */
-export const TICK_TEMPLATE_VERSION = 2;
+ *  missing projects (R31-10), and the pinned croft's engines.bun. 3: the extension settings (EXTENSION_ENV) reach the ticks. */
+export const TICK_TEMPLATE_VERSION = 3;
 
 /** tick.log is renamed to tick.log.1 once it is larger than this. */
 export const MAX_TICK_LOG_BYTES = 5 * 1024 * 1024;
@@ -38,11 +38,16 @@ export const MAX_TICK_LOG_BYTES = 5 * 1024 * 1024;
 /** The package whose pinned copy is started in each project. */
 export const CROFT_PACKAGE = "@zabaca/croft";
 
+/** The settings that decide where DuckDB's extension files are looked for and whether they are fetched (db/extension-files.ts,
+ *  db/extension-fetch.ts). `croft schedule on` writes the ones set in its shell into the OS job (register.ts), and every tick
+ *  passes them on, so a scheduled run finds and fetches the files as the shell does (DESIGN.md D200). */
+export const EXTENSION_ENV = ["CROFT_EXTENSION_DIR", "CROFT_NO_FETCH", "CROFT_EXTENSION_REPO", "XDG_CACHE_HOME"] as const;
+
 /** Variables passed from the job's environment to each project tick when set, besides HOME, PATH, LANG and
- *  CROFT_HOME: the temp folder and user name, and croft's test settings (the tripwires of tests/preload.ts,
- *  the fake clock and job label), so a test's tick children obey them too. */
+ *  CROFT_HOME: the temp folder and user name, the extension settings, and croft's test settings (the tripwires of
+ *  tests/preload.ts, the fake clock and job label), so a test's tick children obey them too. */
 export const TICK_PASS_ENV = [
-  "TMPDIR", "USER", "LOGNAME", "TZ", "CROFT_JOB_LABEL", "CROFT_FORBID_OS_JOBS", "CROFT_NOTIFY_DRY", "CROFT_NOW",
+  "TMPDIR", "USER", "LOGNAME", "TZ", ...EXTENSION_ENV, "CROFT_JOB_LABEL", "CROFT_FORBID_OS_JOBS", "CROFT_NOTIFY_DRY", "CROFT_NOW",
 ] as const;
 
 // Plain JavaScript without backticks or template placeholders, so the TypeScript template below can hold it

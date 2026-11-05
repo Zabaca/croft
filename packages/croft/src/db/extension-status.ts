@@ -9,11 +9,12 @@ import { CroftError } from "../core/errors.ts";
 import type { ExtensionFilesView, ExtensionView, Problem } from "../core/types.ts";
 import { fetchCommand, hostPlatform, resolveExtensionDir, verifyExtension } from "./extension-files.ts";
 import { type ExtensionName, type Platform } from "./extension-names.ts";
+import { MODE_EXTENSIONS } from "./modes.ts";
 
-/** The settings that load DuckDB extensions: server mode, and lake mode (a `lake` block, shared or local). */
+/** The settings that load DuckDB extensions, each with the files its mode loads (MODE_EXTENSIONS, so the two cannot drift): server mode, and lake mode (a `lake` block). */
 export const MODE_FILES = {
-  server: { label: "server mode", extensions: ["httpfs", "quack"] },
-  lake: { label: "lake mode", extensions: ["httpfs", "postgres", "ducklake"] },
+  server: { label: "server mode", extensions: MODE_EXTENSIONS.readers },
+  lake: { label: "lake mode", extensions: MODE_EXTENSIONS.lake },
 } as const satisfies Record<string, { label: string; extensions: readonly ExtensionName[] }>;
 
 export type ModeName = keyof typeof MODE_FILES;
@@ -28,7 +29,7 @@ export function modesNeeded(config: { serverMode: { enabled: boolean }; lake?: u
 
 /** The extensions those modes load, once each. */
 export function extensionsOfModes(modes: readonly ModeName[]): ExtensionName[] {
-  return [...new Set(modes.flatMap((m) => MODE_FILES[m].extensions as readonly ExtensionName[]))];
+  return [...new Set(modes.flatMap((m) => MODE_FILES[m].extensions))];
 }
 
 /** Where the files are looked for; tests point it at a folder or an empty environment. */
@@ -53,7 +54,7 @@ export function inspectExtensionFiles(modes: readonly ModeName[], s: ExtensionSe
   for (const mode of modes) {
     const extensions: ExtensionView[] = [];
     const failures: CroftError[] = [];
-    for (const name of MODE_FILES[mode].extensions as readonly ExtensionName[]) {
+    for (const name of MODE_FILES[mode].extensions) {
       try {
         extensions.push({ name, ok: true, path: verifyExtension(dir, name, platform), code: null });
       } catch (e) {

@@ -13,7 +13,7 @@ Turn it on in croft.json (the user decides; it changes what apps see):
 
 That turns the read copy on too, and starts a listener for DuckDB 2.0 clients (serverMode.quackHost and quackPort, croft
 docs quack). Server mode loads DuckDB's quack and httpfs extensions, which croft fetches from DuckDB's own extension servers the
-first time `croft serve` starts (about 22 MB, once per machine; croft docs extensions). `croft fetch-extensions` fetches
+first time `croft serve` starts (a download of about 21 MB, about 66 MB on disk once unpacked, once per machine; croft docs extensions). `croft fetch-extensions` fetches
 them ahead of time, and until they are on the machine `croft validate` and `croft doctor` report EXTENSION_MISSING with
 that command as the fix. Then, as before, the user starts `croft serve` in their own terminal. Nothing else
 changes for apps: they keep reading with `query()` from @zabaca/croft/read and the same token. A project that never

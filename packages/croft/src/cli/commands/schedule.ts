@@ -394,6 +394,8 @@ export interface JobInfo {
   /** on: stable Bun paths passed over (register.ts pickBun): older than croft needs or than the Bun running croft, or
    *  not running at all (version null). */
   bunSkipped?: SkippedBun[];
+  /** on: the extension settings (db/extension-fetch.ts, `croft docs extensions`) the job now carries from the shell that ran it, by name; values are not shown, a mirror's address may hold a login. */
+  extensionSettings?: string[];
   /** on: written or (re)loaded now. */
   changed?: boolean;
   /** off: removed now. */
@@ -642,6 +644,7 @@ function jobInfo(r: JobResult, o: JobOptions): JobInfo {
     kind: r.kind, label: r.label, file: r.file, installed: true, loaded: r.kind === "launchd" ? true : null,
     bun: r.bun.path, bunVersion: r.bun.version, bunExists: true, bunStable: r.bun.stable,
     bunSkipped: r.bun.skipped.map((b) => ({ path: b.path, version: b.version, reason: skippedReason(b.version, running) })),
+    ...(Object.keys(r.settings).length ? { extensionSettings: Object.keys(r.settings) } : {}),
     changed: r.changed || r.tickScriptChanged,
   };
 }
@@ -956,6 +959,9 @@ export function formatSchedule(d: ScheduleData, problems: readonly Problem[], tz
       for (const b of d.job?.bunSkipped ?? []) {
         const what = b.version === null ? b.reason : `is Bun ${b.version}, ${b.reason}`;
         lines.push(`note: ${homeShort(b.path, userHome)} ${what}, so the job does not run it`);
+      }
+      if (d.job?.extensionSettings?.length) {
+        lines.push(`The job carries ${d.job.extensionSettings.join(", ")} from this shell, so scheduled runs find and fetch DuckDB's extension files as croft does here (croft docs extensions).`);
       }
       if (d.job && d.job.bunStable === false) {
         lines.push(`note: the job runs Bun from ${d.job.bun}, a version manager's path that may vanish on upgrade; Bun's own installer (curl -fsSL https://bun.sh/install | bash) gives a stable one, then run croft schedule on again`);

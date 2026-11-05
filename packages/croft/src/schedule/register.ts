@@ -10,18 +10,22 @@
 // `bun --version` is compared with the running Bun and croft's floor (pickBun). Output goes to
 // ~/.croft/logs/tick.log, which heartbeat.ts reads to diagnose a job that never ticks.
 //
+// The job also carries the extension settings set in the shell that ran `croft schedule on` (EXTENSION_ENV: where DuckDB's
+// extension files are, whether croft fetches them, from where), as launchd EnvironmentVariables or as assignments before the
+// crontab command; the tick passes them on (user-tick.ts), so a scheduled run behaves as the shell's runs do (D200).
+//
 // ensureJob and removeJob are idempotent: a job whose content is unchanged is not rewritten or reloaded.
 // Commands go through an OsRunner (os.ts), so tests pass a fake one; and with CROFT_FORBID_OS_JOBS=1
 // (tests/preload.ts) both refuse the real home folder outright, before any file is written.
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { BUN_FLOOR, versionAtLeast } from "../cli/version.ts";
 import { CroftError } from "../core/errors.ts";
 import type { CroftHome, Env } from "./home.ts";
 import type { ExecResult, OsRunner } from "./os.ts";
-import { writeTickScript } from "./user-tick.ts";
+import { EXTENSION_ENV, writeTickScript } from "./user-tick.ts";
 
 const LAUNCHCTL = "/bin/launchctl";
 const CRONTAB = "crontab";
@@ -63,6 +67,8 @@ export interface JobResult {
   /** Whether the job was written or (re)loaded; false when it was already in place. */
   changed: boolean;
   tickScriptChanged: boolean;
+  /** The extension settings the job now carries: the ones set in the environment `croft schedule on` ran in. */
+  settings: JobSettings;
 }
 
 export interface JobInspection {
@@ -75,6 +81,9 @@ export interface JobInspection {
   bun: string | null;
   bunExists: boolean;
 }
+
+/** The extension settings (EXTENSION_ENV) a job carries, by name. */
+export type JobSettings = Partial<Record<(typeof EXTENSION_ENV)[number], string>>;
 
 // ---- Bun ----
 
@@ -155,6 +164,32 @@ function sameFile(a: string, b: string): boolean {
   }
 }
 
+/**
+ * The extension settings set in `env`, for the job to carry. A folder is made absolute: the job does not run where the shell did.
+ * Names are EXTENSION_ENV's, in its order, so the same environment always gives the same job.
+ */
+export function jobSettings(env: Env): JobSettings {
+  const out: JobSettings = {};
+  for (const k of EXTENSION_ENV) {
+    const v = env[k];
+    if (!v) continue;
+    out[k] = (k === "CROFT_EXTENSION_DIR" || k === "XDG_CACHE_HOME") && !isAbsolute(v) ? resolve(v) : v;
+  }
+  return out;
+}
+
+/** The settings on which a shell's environment and an installed job disagree, as sentences without the values (a mirror's address may hold a login). */
+export function settingsDifferences(shell: JobSettings, job: JobSettings): string[] {
+  const out: string[] = [];
+  for (const k of EXTENSION_ENV) {
+    if (shell[k] === job[k]) continue;
+    out.push(shell[k] === undefined ? `${k} is set in the scheduled job but not in this shell`
+      : job[k] === undefined ? `${k} is set in this shell but not in the scheduled job`
+      : `${k} is not the same in this shell and in the scheduled job`);
+  }
+  return out;
+}
+
 /** PATH for the job and the ticks it starts: Bun's folder first, then the system's. */
 export function jobPath(bunDir: string, platform: NodeJS.Platform): string {
   const dirs = [bunDir, ...(platform === "darwin" ? ["/opt/homebrew/bin"] : []), "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
@@ -170,8 +205,9 @@ export function ensureJob(runner: OsRunner, home: CroftHome, o: JobOptions = {})
   refuseRealHome(home, o);
   const bun = pickBun(home, o);
   const tick = writeTickScript(home);
-  const changed = kind === "launchd" ? ensureLaunchAgent(runner, home, bun.path, o) : ensureCrontab(runner, home, bun.path);
-  return { kind, label: home.jobLabel, file: kind === "launchd" ? plistPath(home) : null, bun, changed, tickScriptChanged: tick.changed };
+  const settings = jobSettings(o.env ?? process.env);
+  const changed = kind === "launchd" ? ensureLaunchAgent(runner, home, bun.path, settings, o) : ensureCrontab(runner, home, bun.path, settings);
+  return { kind, label: home.jobLabel, file: kind === "launchd" ? plistPath(home) : null, bun, changed, tickScriptChanged: tick.changed, settings };
 }
 
 /** Remove the OS job (the tick script and registry stay). `removed` is false when there was none. */
@@ -212,6 +248,21 @@ export function installedBunPath(home: CroftHome, o: { platform?: NodeJS.Platfor
   if (platform !== "linux" || !o.runner) return null;
   try {
     return cronBun(readCrontab(o.runner), home.jobLabel);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The extension settings the installed job carries, or null when it is not installed (or, on Linux, when no runner is given): from the
+ * plist on macOS, and from `crontab -l` on Linux.
+ */
+export function installedSettings(home: CroftHome, o: { platform?: NodeJS.Platform; runner?: OsRunner } = {}): JobSettings | null {
+  const platform = o.platform ?? process.platform;
+  if (platform === "darwin") return plistSettings(home);
+  if (platform !== "linux" || !o.runner) return null;
+  try {
+    return cronCommand(readCrontab(o.runner), home.jobLabel)?.settings ?? null;
   } catch {
     return null;
   }
@@ -268,8 +319,9 @@ const unxml = (s: string) => s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").repla
 
 /** The LaunchAgent. AbandonProcessGroup keeps launchd from killing what the tick started when it exits (the
  *  project ticks run in their own sessions anyway). */
-export function plistXml(i: { label: string; bun: string; home: CroftHome; platform?: NodeJS.Platform }): string {
+export function plistXml(i: { label: string; bun: string; home: CroftHome; platform?: NodeJS.Platform; settings?: JobSettings }): string {
   const s = (v: string) => `<string>${xml(v)}</string>`;
+  const settings = EXTENSION_ENV.flatMap((k) => (i.settings?.[k] === undefined ? [] : [`\t\t<key>${k}</key>`, `\t\t${s(i.settings[k]!)}`]));
   return [
     `<?xml version="1.0" encoding="UTF-8"?>`,
     `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`,
@@ -289,6 +341,7 @@ export function plistXml(i: { label: string; bun: string; home: CroftHome; platf
     `\t\t${s(i.home.userHome)}`,
     `\t\t<key>PATH</key>`,
     `\t\t${s(jobPath(dirname(i.bun), i.platform ?? "darwin"))}`,
+    ...settings,
     `\t</dict>`,
     `\t<key>StartInterval</key>`,
     `\t<integer>60</integer>`,
@@ -317,12 +370,29 @@ function plistBun(home: CroftHome): string | null {
   return m ? unxml(m[1]!) : null;
 }
 
+/** The extension settings in the installed plist's EnvironmentVariables, or null when there is no plist. */
+function plistSettings(home: CroftHome): JobSettings | null {
+  let text: string;
+  try {
+    text = readFileSync(plistPath(home), "utf8");
+  } catch {
+    return null;
+  }
+  const dict = /<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/.exec(text)?.[1] ?? "";
+  const out: JobSettings = {};
+  for (const m of dict.matchAll(/<key>([^<]*)<\/key>\s*<string>([^<]*)<\/string>/g)) {
+    const k = unxml(m[1]!);
+    if ((EXTENSION_ENV as readonly string[]).includes(k)) out[k as keyof JobSettings] = unxml(m[2]!);
+  }
+  return out;
+}
+
 /** Bootstrap attempts, for launchd still tearing down the job just booted out ("5: Input/output error"). */
 const BOOTSTRAP_ATTEMPTS = 5;
 
-function ensureLaunchAgent(runner: OsRunner, home: CroftHome, bun: string, o: JobOptions): boolean {
+function ensureLaunchAgent(runner: OsRunner, home: CroftHome, bun: string, settings: JobSettings, o: JobOptions): boolean {
   const file = plistPath(home);
-  const text = plistXml({ label: home.jobLabel, bun, home, platform: "darwin" });
+  const text = plistXml({ label: home.jobLabel, bun, home, platform: "darwin", settings });
   let existing: string | null = null;
   try {
     existing = readFileSync(file, "utf8");
@@ -380,11 +450,12 @@ function cronWord(s: string): string {
   return quoted.replace(/%/g, "\\%");
 }
 
-/** croft's crontab block: the markers and one line that runs the tick script every minute. */
-export function cronBlock(i: { label: string; bun: string; home: CroftHome }): string {
+/** croft's crontab block: the markers and one line that runs the tick script every minute, with the job's settings as assignments before the command. */
+export function cronBlock(i: { label: string; bun: string; home: CroftHome; settings?: JobSettings }): string {
+  const settings = EXTENSION_ENV.flatMap((k) => (i.settings?.[k] === undefined ? [] : [`${k}=${cronWord(i.settings[k]!)} `])).join("");
   return [
     beginMarker(i.label),
-    `* * * * * ${cronWord(i.bun)} --no-env-file ${cronWord(i.home.tickScript)} >> ${cronWord(i.home.tickLog)} 2>&1`,
+    `* * * * * ${settings}${cronWord(i.bun)} --no-env-file ${cronWord(i.home.tickScript)} >> ${cronWord(i.home.tickLog)} 2>&1`,
     endMarker(i.label),
   ].join("\n");
 }
@@ -424,29 +495,57 @@ export function upsertCronBlock(table: string, label: string, block: string | nu
   return out.length === 0 ? "" : `${out.join("\n")}\n`;
 }
 
-/** The first shell word after the five time fields of croft's line, unquoted. */
-function cronBun(table: string, label: string): string | null {
+/** The shell words of a crontab command, unquoted: single quotes hold a word's text as it is, and a backslash outside them
+ *  makes the next character plain (cronWord writes an embedded quote as `'\''`). Null for a quote left open. */
+function shellWords(text: string): string[] | null {
+  const words: string[] = [];
+  let word: string | null = null;
+  let quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (quoted) {
+      if (c === "'") quoted = false;
+      else word += c;
+    } else if (c === "'") {
+      quoted = true;
+      word ??= "";
+    } else if (c === "\\" && i + 1 < text.length) {
+      word = (word ?? "") + text[++i]!;
+    } else if (/\s/.test(c)) {
+      if (word !== null) words.push(word);
+      word = null;
+    } else {
+      word = (word ?? "") + c;
+    }
+  }
+  if (quoted) return null;
+  if (word !== null) words.push(word);
+  return words;
+}
+
+/** What croft's installed line runs: the Bun (the first word after the five time fields and the NAME=value assignments) and the extension settings assigned. */
+function cronCommand(table: string, label: string): { bun: string; settings: JobSettings } | null {
   const lines = table.split("\n");
   const at = lines.indexOf(beginMarker(label));
   const line = at >= 0 ? lines[at + 1] : undefined;
   if (line === undefined) return null;
   const m = /^\s*(?:\S+\s+){5}(.*)$/.exec(line);
   if (!m) return null;
-  const rest = m[1]!.replace(/\\%/g, "%");
-  if (!rest.startsWith("'")) return rest.split(/\s+/)[0] ?? null;
-  let word = "";
-  let i = 1;
-  for (;;) {
-    const close = rest.indexOf("'", i);
-    if (close < 0) return null;
-    word += rest.slice(i, close);
-    if (rest.startsWith("\\''", close + 1)) {
-      word += "'";
-      i = close + 4;
-      continue;
-    }
-    return word;
+  const words = shellWords(m[1]!.replace(/\\%/g, "%"));
+  if (!words) return null;
+  const settings: JobSettings = {};
+  let i = 0;
+  for (; i < words.length; i++) {
+    const a = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(words[i]!);
+    if (!a) break;
+    if ((EXTENSION_ENV as readonly string[]).includes(a[1]!)) settings[a[1] as keyof JobSettings] = a[2]!;
   }
+  return words[i] === undefined ? null : { bun: words[i]!, settings };
+}
+
+/** The Bun croft's crontab line runs, or null. */
+function cronBun(table: string, label: string): string | null {
+  return cronCommand(table, label)?.bun ?? null;
 }
 
 function readCrontab(runner: OsRunner): string {
@@ -476,9 +575,9 @@ function cronFailure(argv: string[], r: ExecResult): CroftError {
   });
 }
 
-function ensureCrontab(runner: OsRunner, home: CroftHome, bun: string): boolean {
+function ensureCrontab(runner: OsRunner, home: CroftHome, bun: string, settings: JobSettings): boolean {
   const table = readCrontab(runner);
-  const next = upsertCronBlock(table, home.jobLabel, cronBlock({ label: home.jobLabel, bun, home }));
+  const next = upsertCronBlock(table, home.jobLabel, cronBlock({ label: home.jobLabel, bun, home, settings }));
   if (next === stripHeader(table)) return false;   // the header some `crontab -l` print is not a change
   writeCrontab(runner, next);
   return true;

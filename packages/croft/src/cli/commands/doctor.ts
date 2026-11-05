@@ -58,7 +58,7 @@ import { appRootOf, relocationPlan } from "../../project/init.ts";
 import { bucketPath, type CatalogSslMode, isLoopbackHost } from "../../project/lake-config.ts";
 import { configProblems, findRoot, loadProject, syncedLocation, type ConfigIssue, type Project, type SecretsFrom } from "../../project/root.ts";
 import { croftHome, type CroftHome } from "../../schedule/home.ts";
-import { jobPath } from "../../schedule/register.ts";
+import { installedSettings, jobPath, jobSettings, settingsDifferences } from "../../schedule/register.ts";
 import { type OsRunner, realRunner } from "../../schedule/os.ts";
 import type { CommandImpl } from "../command.ts";
 import { LAUNCH_ENV, SELF_ROOT } from "../launcher.ts";
@@ -246,7 +246,10 @@ export async function runDoctor(cwd: string, d: DoctorDeps): Promise<{ data: Doc
   if (d.wsl) {
     r.add("environment", "wsl", "info", "WSL stops its VM when no terminal is open, so scheduled runs pause until one is");
   }
-  if (project) checkScheduling(r, d, project);
+  if (project) {
+    checkScheduling(r, d, project);
+    checkJobExtensionSettings(r, d, project);
+  }
 
   const count = (s: CheckStatus) => r.checks.filter((c) => c.status === s).length;
   // Stable section order for output: environment, project, scheduling.
@@ -1615,6 +1618,29 @@ function checkScheduling(r: Report, d: DoctorDeps, project: Project): void {
     ...(rec.via === "os-job" && d.osRunner ? { runner: d.osRunner } : {}),
   });
   r.add("scheduling", "scheduling", "warn", [`${head} (stale)`, ...logTailLines(p, "")].join("\n"), p, details);
+}
+
+/**
+ * With a mode on and the per-user OS job ticking the project, the extension settings (CROFT_EXTENSION_DIR, CROFT_NO_FETCH,
+ * CROFT_EXTENSION_REPO, XDG_CACHE_HOME) of this shell against the ones the job was installed with (D200): a scheduled run
+ * sees the job's, so a folder or a switch set only here is not what it uses, and it may fetch the files a second time or fail
+ * offline. A warning, silent when they agree, when no mode is on, or when the job cannot be read.
+ */
+function checkJobExtensionSettings(r: Report, d: DoctorDeps, project: Project): void {
+  if (!modesNeeded(project.config).length) return;
+  let at: Date;
+  try { at = now(d.env); } catch { at = new Date(); }
+  let rec: SchedulingRecord;
+  try { rec = readScheduling(project.paths.stateDir, at); } catch { return; }
+  if (rec.state === "off" || rec.via !== "os-job") return;
+  const job = installedSettings(d.croftHome ?? croftHome(d.env), { platform: d.platform, ...(d.osRunner ? { runner: d.osRunner } : {}) });
+  if (job === null) return;
+  const differences = settingsDifferences(jobSettings(d.env), job);
+  if (!differences.length) return;
+  r.add("scheduling", "scheduling.extensions", "warn", [
+    `scheduled runs use other extension settings than this shell: ${differences.join("; ")}`,
+    "hint: croft schedule on, from the shell whose settings scheduled runs should have, rewrites the job with them (croft docs extensions)",
+  ].join("\n"), undefined, { differences });
 }
 
 // ---------------------------------------------------------------------------------------------

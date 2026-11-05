@@ -55,7 +55,7 @@ The catalog's connection uses TLS, and which check croft makes is a setting of t
 
 The secrets live in .env, the shell or the secretsFrom command, like any other (croft docs secrets). The lake loads DuckDB's
 ducklake, httpfs and postgres extensions, which croft fetches from DuckDB's own extension servers the first time the lake
-opens (about 35 MB, once per machine; croft docs extensions). To have them first, and to see what is missing, run:
+opens (a download of about 34 MB, about 109 MB on disk once unpacked, once per machine; croft docs extensions). To have them first, and to see what is missing, run:
 
     croft fetch-extensions
     croft validate && croft doctor && croft run
