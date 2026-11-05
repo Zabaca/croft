@@ -32,15 +32,31 @@ export interface Verdict {
 export const GRACE_SECONDS = 150;
 /** How long to wait for a run still going: main's push run takes about 25 minutes, and a tag is often pushed with its merge. */
 export const LIMIT_SECONDS = 45 * 60;
-/** A word in the name of each kind of job a full run has (tests/workflows.test.ts checks that ci.yml has a job named for each). A skipped matrix job keeps its unexpanded name, so a skipped kind still shows as not success. */
-export const JOB_KINDS = ["shard", "after a merge", "bookkeeping as a log", "journeys on a local lake", "journeys on a Postgres lake", "smoke"];
+/** One kind of croft job a full run has: the jobs of ci.yml that share a name shape, and how many of them there are. */
+export interface JobKind {
+  label: string;
+  /** The name a job of this kind has once its matrix is expanded. Anchored, so that no kind's jobs match another's: "shard" or "smoke" alone would also match the after-merge, log, lake, Alpine and Windows jobs. */
+  name: RegExp;
+  count: number;
+}
+/** Every kind of croft job a full run has, with the jobs of each counted (tests/workflows.test.ts expands ci.yml's matrices and checks that its jobs are exactly these). A skipped matrix job keeps its unexpanded name, so it matches none of them, and a run missing a shard, a platform or a whole job is short of its count. */
+export const JOB_KINDS: JobKind[] = [
+  { label: "the suite's shards", name: /^ubuntu-24\.04 · bun 1\.3\.14 · shard \d+\/7$/, count: 7 },
+  { label: "the after-merge platforms", name: /^after a merge · ubuntu-24\.04(?:-arm)? · bun (?:1\.3\.14|latest) · shard \d+\/4$/, count: 12 },
+  { label: "the log run", name: /^ubuntu-24\.04 · bun 1\.3\.14 · bookkeeping as a log · shard \d+\/2$/, count: 2 },
+  { label: "the journeys on a local lake", name: /^ubuntu-24\.04 · bun 1\.3\.14 · journeys on a local lake · shard \d+\/4$/, count: 4 },
+  { label: "the journeys on a Postgres lake", name: /^ubuntu-24\.04 · bun 1\.3\.14 · journeys on a Postgres lake · shard \d+\/5$/, count: 5 },
+  { label: "the platform smokes", name: /^ubuntu-24\.04(?:-arm)? · bun (?:1\.3\.14|latest) · smoke$/, count: 3 },
+  { label: "the Alpine smoke", name: /^alpine smoke$/, count: 1 },
+  { label: "the Windows smoke", name: /^windows smoke$/, count: 1 },
+];
 
-/** Whether the jobs of a run are a full, passing run of croft's suite: every job a success (a skipped one is not), and every kind of croft job there. */
+/** Whether the jobs of a run are a full, passing run of croft's suite: every job a success (a skipped one is not), and each kind of croft job there as many times as ci.yml has it. */
 export function fullRun(jobs: CiJob[]): { ok: true } | { ok: false; why: string } {
   const bad = jobs.filter((j) => j.conclusion !== "success");
   if (bad.length > 0) return { ok: false, why: `${bad.length} of its ${jobs.length} jobs were not a success (${[...new Set(bad.map((j) => j.conclusion))].join(", ")}; for example "${bad[0]!.name}")` };
-  const missing = JOB_KINDS.filter((k) => !jobs.some((j) => j.name.includes(k)));
-  if (missing.length > 0) return { ok: false, why: `it has no job for: ${missing.join(", ")}` };
+  const short = JOB_KINDS.map((k) => ({ k, n: jobs.filter((j) => k.name.test(j.name)).length })).filter(({ k, n }) => n !== k.count);
+  if (short.length > 0) return { ok: false, why: `it has the wrong number of jobs for: ${short.map(({ k, n }) => `${k.label} (${n} of ${k.count})`).join(", ")}` };
   return { ok: true };
 }
 

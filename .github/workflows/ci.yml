@@ -17,6 +17,8 @@ jobs:
   # Whether croft itself needs testing. A push or pull request that touches only the website, the infrastructure
   # (zbc), the repository README or docs/ skips the suite and the smokes: croft's tests read none of those, and the
   # site job below runs for every change anyway. Tags, manual runs, the daily run and a first push of a branch test everything.
+  # A job it skips shows its unexpanded name (`shard ${{ matrix.shard }}/7`), because GitHub fills in a matrix job's name only when the job runs; a matrix
+  # the detector empties (`fromJSON` of `[]`) fails the run instead, so the name stays (tried 2026-11-05). The release gate relies on it (scripts/release-gate.ts).
   changes:
     name: what changed
     runs-on: ubuntu-24.04

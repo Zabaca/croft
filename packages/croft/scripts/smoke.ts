@@ -15,7 +15,12 @@ const PKG = resolve(import.meta.dir, "..");
 const BIN = join(PKG, "bin", "croft.mjs");
 const base = mkdtempSync(join(tmpdir(), "croft-smoke-"));
 const project = join(base, "proj");
-process.on("exit", () => rmSync(base, { recursive: true, force: true }));
+/** croft serve, once the smoke has started it: `fail` ends the process on the spot, and a server left running would outlive the smoke (and hold the job's folder). */
+let server: ReturnType<typeof Bun.spawn> | undefined;
+process.on("exit", () => {
+  if (server && server.exitCode === null) server.kill("SIGINT");
+  rmSync(base, { recursive: true, force: true });
+});
 const extensionDir = process.env.CROFT_EXTENSION_DIR ?? resolveExtensionDir();
 
 // Nothing of the machine's: a home of its own, no OS jobs, no notifications, and the extension files named since a fake home has no cache.
@@ -93,7 +98,7 @@ instance.closeSync();
 step("croft serve answers a key, then stops");
 const key = (await data(project, ["serve", "key", "add", "smoke"])).key as string;
 if (!key?.startsWith("croftkey_")) fail("croft serve key add printed no key");
-const server = Bun.spawn([process.execPath, BIN, "serve", "--port", "0"], { cwd: project, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+server = Bun.spawn([process.execPath, BIN, "serve", "--port", "0"], { cwd: project, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
 const out = Promise.all([new Response(server.stdout).text(), new Response(server.stderr).text()]);
 const record = join(project, ".croft", "serve.json");
 try {
