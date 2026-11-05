@@ -20,6 +20,7 @@
 // belongs to the connection, so every wrapper around the transaction's `Sql` sees the same one; the write path resets them as it begins.
 import { CroftError } from "../core/errors.ts";
 import type { Sql } from "../core/types.ts";
+import { LAKE_ALIAS } from "./modes.ts";
 
 export type BookkeepingKind = "file" | "log";
 
@@ -182,6 +183,24 @@ function onlyUsed(texts: string[], params: unknown[]): { texts: string[]; params
   return { texts: out, params: order.map((n) => params[n - 1]) };
 }
 
+/** The most rows of one bookkeeping table that croft writes in inserts small enough to stay in the catalog in one go: at DuckLake's 10 rows an
+ *  insert, a hundred statements, which a transaction can carry at a distance (D179, D197). More than that is one insert, which a lake puts in a file. */
+export const INLINE_MAX_ROWS = 1000;
+
+/** How many rows one insert may have and still stay in the catalog: the lake's own option when it has one, else DuckLake's default (10). 0: none. */
+export async function inliningLimit(sql: Sql): Promise<number> {
+  const stored = (await sql.all<{ option_name: string; value: string }>(`SELECT option_name, value FROM ducklake_options('${LAKE_ALIAS}')`))
+    .find((r) => r.option_name === "data_inlining_row_limit");
+  if (stored) return Math.max(0, Math.trunc(Number(stored.value)) || 0);
+  try {
+    const [r] = await sql.all<{ v: unknown }>(`SELECT current_setting('ducklake_default_data_inlining_row_limit') AS v`);
+    const n = Math.trunc(Number(r?.v));
+    return Number.isFinite(n) && n >= 0 ? n : 10;
+  } catch {
+    return 10;
+  }
+}
+
 /** The connection variable that holds the highest `seq` of a log table inside a lake transaction. */
 const seqVariable = (table: StateTableName) => `croft_seq_${table}`;
 
@@ -286,8 +305,27 @@ class LogBookkeeping implements Bookkeeping {
     const [twice] = await this.tx.all<{ n: number | bigint }>(
       `SELECT count(*) AS n FROM (SELECT 1 FROM (${select}) AS s GROUP BY ${key.map((k) => `s.${k}`).join(", ")} HAVING count(*) > 1)`, params);
     if (Number(twice?.n ?? 0) > 0) throw this.duplicate(table, "was given a key twice");
-    await this.append(table, (high) =>
-      `INSERT INTO ${logOf(table)} BY NAME SELECT s.*, ${high} + row_number() OVER () AS seq, false AS closed FROM (${select}) AS s`, params);
+    // In a lake an insert of more rows than its inlining limit is written as a Parquet file, and every read of the table then goes to the store
+    // (D179): the rows are kept aside and go in a limit's worth at a time, up to INLINE_MAX_ROWS of them; any more is one insert.
+    const limit = (this.perTx ??= await inLake(this.tx)) ? await inliningLimit(this.tx) : 0;
+    if (limit <= 0) {
+      await this.append(table, (high) =>
+        `INSERT INTO ${logOf(table)} BY NAME SELECT s.*, ${high} + row_number() OVER () AS seq, false AS closed FROM (${select}) AS s`, params);
+      return;
+    }
+    const kept = `__croft_insert_${table}`;
+    await this.tx.exec(`CREATE OR REPLACE TEMP TABLE ${kept} AS SELECT row_number() OVER () AS __n, s.* FROM (${select}) AS s`, params);
+    try {
+      const [all] = await this.tx.all<{ n: number | bigint }>(`SELECT count(*) AS n FROM ${kept}`);
+      const total = Number(all?.n ?? 0);
+      const small = Math.min(total, INLINE_MAX_ROWS);
+      const write = (from: number, to: number) => this.append(table, (high) =>
+        `INSERT INTO ${logOf(table)} BY NAME SELECT * EXCLUDE (__n), ${high} + row_number() OVER (ORDER BY __n) AS seq, false AS closed FROM ${kept} WHERE __n > ${from} AND __n <= ${to}`, []);
+      for (let from = 0; from < small; from += limit) await write(from, Math.min(from + limit, small));
+      if (total > small) await write(small, total);
+    } finally {
+      await this.tx.exec(`DROP TABLE IF EXISTS ${kept}`);
+    }
   }
 }
 

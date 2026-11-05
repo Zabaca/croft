@@ -87,8 +87,8 @@ A command on a lake costs at least 2.7 s at that distance whatever croft does (D
 twice), and a step that writes about 7 s, so put the catalog near the machine that writes it.
 
 `croft doctor` leaves a lake's tables out of its comparison with croft's record (each costs the catalog's round trips);
-`croft doctor --tables` compares them all. If doctor warns with LAKE_BOOKKEEPING_IN_FILES, an older croft moved croft's own
-tables into files of the bucket, where every command reads them over the network: `croft maintain` brings them back.
+`croft doctor --tables` compares them all. If doctor warns with LAKE_BOOKKEEPING_IN_FILES, croft's own
+tables are in files of the bucket and not in the catalog, where every command reads them over the network: `croft maintain` brings them back.
 
 A catalog database that holds another lake is LAKE_CATALOG_MISMATCH: another DuckLake format, or a lake whose files are in
 another bucket folder than `lake.bucket` names. croft never migrates a lake and never overrides its data path; point

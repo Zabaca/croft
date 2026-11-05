@@ -25,7 +25,7 @@
 // snapshot a trashed version was taken from), or is the newest snapshot. Everything else is expired.
 import type { Sql } from "../core/types.ts";
 import { TRASH_RETENTION } from "../safety/trash.ts";
-import { ASSET_TABLES, kindOfObjects, STATE_SPECS, stateObjects } from "./bookkeeping.ts";
+import { ASSET_TABLES, INLINE_MAX_ROWS, inliningLimit, kindOfObjects, STATE_SPECS, stateObjects } from "./bookkeeping.ts";
 import { isConnectionError } from "./lake.ts";
 import { LAKE_ALIAS } from "./modes.ts";
 import { isStoreTls } from "./store-tls.ts";
@@ -330,23 +330,9 @@ export async function pruneBookkeeping(sql: Sql, o: { maxRows?: number; filesInS
 }
 
 /** The most rows of a table of croft's bookkeeping that one pass brings back into the catalog: at DuckLake's 10 rows an insert, a hundred statements. */
-export const REINLINE_MAX_ROWS = 1000;
+export const REINLINE_MAX_ROWS = INLINE_MAX_ROWS;
 
 const quoteIdent = (name: string): string => `"${name.replaceAll('"', '""')}"`;
-
-/** How many rows one insert may have and still stay in the catalog: the lake's own option when it has one, else DuckLake's default (10). 0: none. */
-async function inliningLimit(sql: Sql): Promise<number> {
-  const stored = (await sql.all<{ option_name: string; value: string }>(`SELECT option_name, value FROM ducklake_options('${LAKE_ALIAS}')`))
-    .find((r) => r.option_name === "data_inlining_row_limit");
-  if (stored) return Math.max(0, Math.trunc(Number(stored.value)) || 0);
-  try {
-    const [r] = await sql.all<{ v: unknown }>(`SELECT current_setting('ducklake_default_data_inlining_row_limit') AS v`);
-    const n = Math.trunc(Number(r?.v));
-    return Number.isFinite(n) && n >= 0 ? n : 10;
-  } catch {
-    return 10;
-  }
-}
 
 /**
  * Bring up to `batch` of a table's rows that are in files back into the catalog (in the caller's transaction): copy them out, delete exactly those
