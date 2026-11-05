@@ -1,7 +1,13 @@
-// publish-npm.yml: refuses a release unless ci.yml passed on a push to main at the commit the tag names (DESIGN.md D196). A release publishes
-// what main already tested, so the release does not run the suite again. This asks GitHub for ci.yml's runs at that commit (read-only: the
-// job's own token with `actions: read`) and waits, within a limit, for one still running; no run, or only failed or cancelled ones, stops the
-// release. A tag run (ci.yml does not run on croft-v* tags), a pull request's run and the daily run do not count: only a push to main does.
+// publish-npm.yml: refuses a release unless ci.yml ran croft's whole suite and passed on main at the commit the tag names (DESIGN.md D196). A
+// release publishes what main already tested, so the release does not run the suite again. This asks GitHub for ci.yml's runs at that commit
+// (read-only: the job's own token with `actions: read`) and waits, within a limit, for one still running; no run, or only failed, cancelled or
+// partly skipped ones, stops the release.
+//
+// Which runs count: a push to main, or a manual run (workflow_dispatch) on main, at exactly that commit. A tag run (ci.yml does not run on
+// croft-v* tags), a pull request's run and the daily run do not. And a run counts only if every job of it succeeded: a push whose change
+// detector found only the site, docs or infrastructure skips every croft job and still ends `success`, so a docs-only commit on top of a croft
+// commit whose own run failed or was cancelled (main cancels a run a newer push supersedes) would otherwise release untested code. A manual
+// run always runs everything, which is the way to get a full run at such a commit.
 //
 //   bun scripts/release-gate.ts      reads GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN; exits 0 to go on and 1 to stop
 export interface CiRun {
@@ -13,6 +19,10 @@ export interface CiRun {
   head_sha: string;
   html_url: string;
 }
+export interface CiJob {
+  name: string;
+  conclusion: string | null;
+}
 export interface Verdict {
   state: "pass" | "wait" | "fail";
   why: string;
@@ -20,29 +30,63 @@ export interface Verdict {
 
 /** How long a run may be missing before that is an answer: GitHub makes the run when the push lands, so a minute or two is slack. */
 export const GRACE_SECONDS = 150;
+/** How long to wait for a run still going: main's push run takes about 25 minutes, and a tag is often pushed with its merge. */
+export const LIMIT_SECONDS = 45 * 60;
+/** A word in the name of each kind of job a full run has (tests/workflows.test.ts checks that ci.yml has a job named for each). A skipped matrix job keeps its unexpanded name, so a skipped kind still shows as not success. */
+export const JOB_KINDS = ["shard", "after a merge", "bookkeeping as a log", "journeys on a local lake", "journeys on a Postgres lake", "smoke"];
 
-/** What the runs of ci.yml say about `sha`. `waited` is the seconds since the first look. */
-export function judge(runs: CiRun[], sha: string, waited: number): Verdict {
-  const push = runs.filter((r) => r.event === "push" && r.head_branch === "main" && r.head_sha === sha);
-  const passed = push.find((r) => r.status === "completed" && r.conclusion === "success");
-  if (passed) return { state: "pass", why: `ci.yml passed on main at ${sha}: ${passed.html_url}` };
-  const running = push.find((r) => r.status !== "completed");
-  if (running) return { state: "wait", why: `ci.yml is still running on main at ${sha} (${running.status}): ${running.html_url}` };
-  if (push.length === 0) {
+/** Whether the jobs of a run are a full, passing run of croft's suite: every job a success (a skipped one is not), and every kind of croft job there. */
+export function fullRun(jobs: CiJob[]): { ok: true } | { ok: false; why: string } {
+  const bad = jobs.filter((j) => j.conclusion !== "success");
+  if (bad.length > 0) return { ok: false, why: `${bad.length} of its ${jobs.length} jobs were not a success (${[...new Set(bad.map((j) => j.conclusion))].join(", ")}; for example "${bad[0]!.name}")` };
+  const missing = JOB_KINDS.filter((k) => !jobs.some((j) => j.name.includes(k)));
+  if (missing.length > 0) return { ok: false, why: `it has no job for: ${missing.join(", ")}` };
+  return { ok: true };
+}
+
+/** What the runs of ci.yml say about `sha`. `jobs` holds the jobs of each completed successful run, by run id. `waited` is the seconds since the first look. */
+export function judge(runs: CiRun[], jobs: Record<number, CiJob[]>, sha: string, waited: number): Verdict {
+  const here = runs.filter((r) => (r.event === "push" || r.event === "workflow_dispatch") && r.head_branch === "main" && r.head_sha === sha);
+  const notFull: string[] = [];
+  for (const r of here.filter((x) => x.status === "completed" && x.conclusion === "success")) {
+    const full = fullRun(jobs[r.id] ?? []);
+    if (full.ok) return { state: "pass", why: `ci.yml passed in full on main at ${sha} (${r.event}): ${r.html_url}` };
+    notFull.push(`${r.event} run ${r.html_url}: ${full.why}`);
+  }
+  const running = here.find((r) => r.status !== "completed");
+  if (running) return { state: "wait", why: `ci.yml is still running on main at ${sha} (${running.event}, ${running.status}): ${running.html_url}` };
+  if (here.length === 0) {
     return waited < GRACE_SECONDS
       ? { state: "wait", why: `no ci.yml run on main at ${sha} yet` }
-      : { state: "fail", why: `no ci.yml run on a push to main at ${sha}: tag a commit that main's CI ran on (the tip of a push to main)` };
+      : { state: "fail", why: `no ci.yml run on a push to main at ${sha}: tag a commit that main's CI ran on (the tip of a push to main), or run \`gh workflow run ci.yml --ref main\` while main's tip is ${sha}` };
   }
-  const ended = push.map((r) => `${r.conclusion} ${r.html_url}`).join(", ");
+  if (notFull.length > 0) {
+    return { state: "fail", why: `ci.yml ended success on main at ${sha} but did not run croft's whole suite (${notFull.join("; ")}). Get a full run at this commit: while main's tip is ${sha}, run \`gh workflow run ci.yml --ref main\` (a manual run always runs everything), wait for it, then re-run this workflow with \`gh workflow run publish-npm.yml --ref ${process.env.GITHUB_REF_NAME ?? "croft-v<version>"}\`` };
+  }
+  const ended = here.map((r) => `${r.event} ${r.conclusion} ${r.html_url}`).join(", ");
   return { state: "fail", why: `ci.yml did not pass on main at ${sha} (${ended}); fix it or re-run it on main, then re-run this workflow from the tag's ref` };
 }
 
-async function runsAt(repo: string, sha: string, token: string): Promise<CiRun[] | "retry"> {
-  const url = `https://api.github.com/repos/${repo}/actions/workflows/ci.yml/runs?head_sha=${sha}&event=push&branch=main&per_page=30`;
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" } });
+const API = "https://api.github.com";
+async function get<T>(path: string, token: string): Promise<T | "retry"> {
+  const res = await fetch(`${API}${path}`, { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" } });
   if (res.status >= 500) return "retry";
-  if (!res.ok) throw new Error(`GitHub answered ${res.status} for ${url}: ${await res.text()}`);
-  return ((await res.json()) as { workflow_runs: CiRun[] }).workflow_runs;
+  if (!res.ok) throw new Error(`GitHub answered ${res.status} for ${path}: ${await res.text()}`);
+  return (await res.json()) as T;
+}
+
+/** Every run of ci.yml on main at `sha` (push and manual runs, and the daily run, which `judge` leaves out), and the jobs of the successful ones. */
+async function look(repo: string, sha: string, token: string): Promise<{ runs: CiRun[]; jobs: Record<number, CiJob[]> } | "retry"> {
+  const listed = await get<{ workflow_runs: CiRun[] }>(`/repos/${repo}/actions/workflows/ci.yml/runs?head_sha=${sha}&branch=main&per_page=50`, token);
+  if (listed === "retry") return "retry";
+  const jobs: Record<number, CiJob[]> = {};
+  for (const r of listed.workflow_runs) {
+    if (!((r.event === "push" || r.event === "workflow_dispatch") && r.status === "completed" && r.conclusion === "success")) continue;
+    const got = await get<{ jobs: CiJob[] }>(`/repos/${repo}/actions/runs/${r.id}/jobs?per_page=100`, token);
+    if (got === "retry") return "retry";
+    jobs[r.id] = got.jobs;
+  }
+  return { runs: listed.workflow_runs, jobs };
 }
 
 if (import.meta.main) {
@@ -51,12 +95,11 @@ if (import.meta.main) {
     console.error("release-gate: GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN are needed");
     process.exit(2);
   }
-  const LIMIT_SECONDS = 30 * 60;
   const started = Date.now();
   for (;;) {
     const waited = (Date.now() - started) / 1000;
-    const runs = await runsAt(repo, sha, token);
-    const verdict: Verdict = runs === "retry" ? { state: "wait", why: "GitHub's API is not answering" } : judge(runs, sha, waited);
+    const seen = await look(repo, sha, token);
+    const verdict: Verdict = seen === "retry" ? { state: "wait", why: "GitHub's API is not answering" } : judge(seen.runs, seen.jobs, sha, waited);
     console.log(verdict.why);
     if (verdict.state === "pass") process.exit(0);
     if (verdict.state === "fail") {

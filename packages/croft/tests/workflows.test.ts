@@ -7,7 +7,7 @@ import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { GRACE_SECONDS, judge, type CiRun } from "../scripts/release-gate.ts";
+import { GRACE_SECONDS, JOB_KINDS, judge, LIMIT_SECONDS, type CiJob, type CiRun } from "../scripts/release-gate.ts";
 
 const REPO = resolve(import.meta.dir, "../../..");
 const WORKFLOWS = join(REPO, ".github/workflows");
@@ -221,25 +221,62 @@ describe("which workflows can publish", () => {
 
     const SHA = "a".repeat(40);
     const run = (over: Partial<CiRun> = {}): CiRun => ({ id: 1, status: "completed", conclusion: "success", event: "push", head_branch: "main", head_sha: SHA, html_url: "https://github.com/Zabaca/croft/actions/runs/1", ...over });
+    /** The jobs of a full run, named as ci.yml's are, each a success. */
+    const FULL: CiJob[] = [...JOB_KINDS, "what changed", "site"].map((name) => ({ name, conclusion: "success" }));
+    const skipped = (): CiJob[] => FULL.map((j) => (JOB_KINDS.includes(j.name) ? { ...j, conclusion: "skipped" } : j));
+    const gate = (runs: CiRun[], jobs: Record<number, CiJob[]> = { 1: FULL, 2: FULL }, waited = 0) => judge(runs, jobs, SHA, waited);
 
-    test("the gate lets a release through on a completed, successful push run to main at the tagged commit", () => {
-      expect(judge([run()], SHA, 0).state).toBe("pass");
-      expect(judge([run({ conclusion: "failure", id: 2 }), run()], SHA, 0).state, "a re-run that passed").toBe("pass");
+    test("ci.yml has a job for each kind of croft job the gate requires, so a full run is one the gate can recognize", () => {
+      const names = Object.values<any>(load("ci.yml").doc.jobs).map((j) => String(j.name ?? ""));
+      for (const kind of JOB_KINDS) expect(names.some((n) => n.includes(kind)), kind).toBe(true);
+    });
+
+    test("the gate lets a release through on a completed, successful push run to main at the tagged commit, every job a success", () => {
+      expect(gate([run()]).state).toBe("pass");
+      expect(gate([run({ conclusion: "failure", id: 2 }), run()]).state, "a re-run that passed").toBe("pass");
     });
 
     test("the gate stops a release when the run failed, was cancelled or does not exist, and waits while it runs", () => {
-      expect(judge([run({ conclusion: "failure" })], SHA, 0).state).toBe("fail");
-      expect(judge([run({ conclusion: "cancelled" })], SHA, 0).state).toBe("fail");
-      expect(judge([run({ status: "in_progress", conclusion: null })], SHA, 0).state).toBe("wait");
-      expect(judge([run({ status: "queued", conclusion: null })], SHA, 0).state).toBe("wait");
-      expect(judge([], SHA, 0).state, "a push whose run GitHub has not made yet").toBe("wait");
-      expect(judge([], SHA, GRACE_SECONDS + 1).state, "no run, once it should exist").toBe("fail");
+      expect(gate([run({ conclusion: "failure" })]).state).toBe("fail");
+      expect(gate([run({ conclusion: "cancelled" })]).state).toBe("fail");
+      expect(gate([run({ status: "in_progress", conclusion: null })]).state).toBe("wait");
+      expect(gate([run({ status: "queued", conclusion: null })]).state).toBe("wait");
+      expect(gate([]).state, "a push whose run GitHub has not made yet").toBe("wait");
+      expect(gate([], {}, GRACE_SECONDS + 1).state, "no run, once it should exist").toBe("fail");
     });
 
-    test("the gate counts only the push to main at that commit: not a pull request, the daily run, a tag's run, another branch or another commit", () => {
-      for (const other of [{ event: "pull_request" }, { event: "schedule" }, { event: "workflow_dispatch" }, { head_branch: "croft-v0.5.1" }, { head_branch: "release-051" }, { head_sha: "b".repeat(40) }]) {
-        expect(judge([run(other)], SHA, GRACE_SECONDS + 1).state, JSON.stringify(other)).toBe("fail");
+    test("the gate refuses a run that ended success with croft's jobs skipped, and says how to get a full run at the commit", () => {
+      // A docs-only commit B on top of a croft commit A whose own run failed: B's push run skips every croft job and ends success.
+      const v = gate([run()], { 1: skipped() });
+      expect(v.state).toBe("fail");
+      expect(v.why).toContain("did not run croft's whole suite");
+      expect(v.why).toContain("gh workflow run ci.yml --ref main");
+      expect(v.why).toContain(SHA);
+      // One skipped or failed job among the rest is refused as well, and so is a run missing a kind of job.
+      expect(gate([run()], { 1: FULL.map((j, i) => (i === 0 ? { ...j, conclusion: "skipped" } : j)) }).state).toBe("fail");
+      expect(gate([run()], { 1: FULL.filter((j) => j.name !== "smoke") }).state).toBe("fail");
+      expect(gate([run()], {}).state, "a run whose jobs are not known").toBe("fail");
+    });
+
+    test("a manual run of ci.yml on main at the commit counts, as the way to get a full run; on another branch or commit it does not", () => {
+      const manual = (over: Partial<CiRun> = {}) => run({ id: 2, event: "workflow_dispatch", ...over });
+      expect(gate([run(), manual()], { 1: skipped(), 2: FULL }).state, "the push run skipped, the manual run full").toBe("pass");
+      expect(gate([manual()]).state).toBe("pass");
+      expect(gate([manual({ head_branch: "release-051" })], { 2: FULL }, GRACE_SECONDS + 1).state).toBe("fail");
+      expect(gate([manual({ head_sha: "b".repeat(40) })], { 2: FULL }, GRACE_SECONDS + 1).state).toBe("fail");
+      expect(gate([run(), manual({ status: "in_progress", conclusion: null })], { 1: skipped() }).state, "the manual run is still going").toBe("wait");
+      expect(gate([manual({ conclusion: "failure" })]).state).toBe("fail");
+    });
+
+    test("the gate counts only a push or manual run on main at that commit: not a pull request, the daily run, a tag's run, another branch or another commit", () => {
+      for (const other of [{ event: "pull_request" }, { event: "schedule" }, { head_branch: "croft-v0.5.1" }, { head_branch: "release-051" }, { head_sha: "b".repeat(40) }]) {
+        expect(gate([run(other)], undefined, GRACE_SECONDS + 1).state, JSON.stringify(other)).toBe("fail");
       }
+    });
+
+    test("it waits long enough for main's push run, which takes about 25 minutes", () => {
+      expect(LIMIT_SECONDS).toBeGreaterThanOrEqual(40 * 60);
+      expect(load("publish-npm.yml").doc.jobs.pack["timeout-minutes"], "the job outlasts the wait").toBeGreaterThan(LIMIT_SECONDS / 60 + 5);
     });
   });
 

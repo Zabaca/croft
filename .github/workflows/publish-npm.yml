@@ -5,7 +5,7 @@
 # accepts that only from GitHub-hosted runners, with npm >= 11.5.1, and adds provenance because the repository
 # is public (it then requires package.json's repository.url to name this repository, which it does).
 #
-# Two jobs, so what is published is byte for byte what was packed: `pack` checks the tag, refuses unless main's CI passed on the tagged
+# Two jobs, so what is published is byte for byte what was packed: `pack` checks the tag, refuses unless main's CI ran the whole suite and passed on the tagged
 # commit, and packs it, and `publish` uploads that tarball. The suite is not run again here (DESIGN.md D196): the commit was tested by
 # ci.yml on its push to main, and scripts/release-gate.ts asks GitHub for that run's result and waits, within a limit, for one still
 # running. It is packed with `npm pack`, as 0.1.0 to 0.2.1 were by hand: it runs `prepack` (the read client's build,
@@ -24,8 +24,8 @@ jobs:
   pack:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
-    # Up to 30 minutes of that is the wait for main's CI (scripts/release-gate.ts), which is usually done before a tag is pushed.
-    timeout-minutes: 45
+    # Up to 45 minutes of that is the wait for main's CI (scripts/release-gate.ts), which is usually done before a tag is pushed.
+    timeout-minutes: 60
     permissions:
       contents: read
       actions: read
