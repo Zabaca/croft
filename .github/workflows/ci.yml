@@ -2,7 +2,8 @@ name: ci
 on:
   push:
     branches: [main]
-    tags: ["phase-*", "croft-v*"]
+    # Not the release tag (croft-v*): its commit was tested by the push to main, and publish-npm.yml refuses a release unless that run passed (D196).
+    tags: ["phase-*"]
   pull_request:
   # The daily run is the whole of what a pull request leaves out (DESIGN.md D191). It is on main's ref, so the concurrency group names the
   # event as well: a push to main must not cancel it, nor it a push.
@@ -47,7 +48,7 @@ jobs:
           echo "outside the site and infra: ${rest:-nothing}"
 
   # What gates a pull request (DESIGN.md D191): the whole suite once, on Linux x64 glibc and the Bun floor, split in shards so each runs about as
-  # long as the others (DESIGN.md §10 "Test strategy"), with the typecheck in shard 1. The other platforms and Bun versions run a smoke
+  # long as the others (DESIGN.md §10 "Test strategy", D196: the files are dealt by the seconds each took, not in turn), with the typecheck in shard 1. The other platforms and Bun versions run a smoke
   # (the `smoke` job below) and run this suite on a push to main and daily (`test-platforms`). There is no macOS job (D190).
   test:
     name: ubuntu-24.04 · bun 1.3.14 · shard ${{ matrix.shard }}/7
@@ -111,8 +112,12 @@ jobs:
           CROFT_CI: "1"
           CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
         # --timeout: the default timeout tests/preload.ts sets reaches the first test file of a run only (DESIGN.md §10 "Test strategy").
-        # --shard: Bun's own split of the test files, the same seven parts in every job (tests/workflows.test.ts, tests/shards.test.ts).
-        run: bun test --timeout 60000 --shard=${{ matrix.shard }}/7
+        # The files of this shard are chosen by scripts/shard-files.ts: the same seven parts in every job, a partition of the test files, each part
+        # about as long as the others by tests/shard-times.json (D196; tests/workflows.test.ts, tests/shards.test.ts). The list is made first, so
+        # that a script that fails stops the step: inside the test command it would leave no filter, and the whole suite would run.
+        run: |
+          files=$(bun scripts/shard-files.ts ${{ matrix.shard }} 7)
+          bun test --timeout 60000 $files
 
   # The suite on the platforms and Bun versions `test` leaves out (DESIGN.md §10 item 8): Linux x64 on the newest Bun, and Linux arm64 on both.
   # Not on a pull request: there each of them runs the smoke instead, and nobody waits for these. In four shards each, on a push to main and daily.
