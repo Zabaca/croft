@@ -11,8 +11,12 @@ import { lakeProject } from "../cli/commands/lake-project-testkit.ts";
 import { type LakeRig, RIG_SECRETS, startLakeRig } from "../db/lake-testkit.ts";
 import { ProjectEnv } from "../project/env.ts";
 import { Rigs } from "./key-rig-testkit.ts";
+import { hashKey, newKey } from "./keys.ts";
 import { openLakeEngine } from "./lake-engine.ts";
 import { type LakeKind, type LakeServe, filesUnder, lakeFolder, lakeReady, lakeSession, startLakeServe } from "./lake-serve-testkit.ts";
+import type { QuackEvent } from "./quack-access.ts";
+import { QuackClients } from "./quack-client-testkit.ts";
+import { QuackListener } from "./quack-listener.ts";
 
 const ready = lakeReady();
 if (!ready.ready) console.warn(`[lake-serve-lockdown.test] SKIPPING the lake readers' lockdown tests: ${ready.skipReason}`);
@@ -55,8 +59,41 @@ for (const kind of ["local", "postgres"] as LakeKind[]) {
         ]) expect(await g.error(sql), sql).toMatch(/Permission Error|disabled|locked|not allowed|Cannot|cannot/i);
         // Not in this list, and not the lock's to refuse: the lake's secrets were made before the lock, so the secret manager is up, and past the
         // gate quack_serve starts a second listener [V: 2.0.0, here]. The gate refuses quack_serve in every key's SQL (the attack list, over HTTP
-        // and over Quack), which is the wall for it (DESIGN.md D183).
+        // and over Quack), which is the wall for it (DESIGN.md D183); what a listener started past it is worth is the next test (D204).
       } finally {
+        g.close();
+      }
+    });
+
+    test("a second Quack listener started past the gate, on an address of its own choosing, still asks for a listed key and runs the same hooks (D204)", async () => {
+      const key = newKey();
+      const events: QuackEvent[] = [];
+      const listener = new QuackListener({
+        host: "127.0.0.1", port: 0, queryTimeoutMs: 60_000, shared: ["orders"], maxConcurrent: 4, keys: [{ name: "reader", hash: hashKey(key) }],
+        emit: (e) => events.push(e), overdue: () => {},
+      });
+      const g = await lakeSession(s, { readers: true, extensionDir: ready.dir, listener });
+      await g.ready();
+      const clients = new QuackClients();
+      try {
+        // Past the gate and the loopback rule (D131): every interface, no TLS, and a token of the caller's choosing.
+        const rows = await g.run("SELECT listen_uri FROM quack_serve('quack:0.0.0.0:0', token = 'chosen-by-the-caller', create_secret_if_not_exists = false, allow_other_hostname = true, disable_ssl = true)");
+        const second = `quack:127.0.0.1:${String(rows[0]![0]).split(":").pop()}`;
+        expect(second).not.toBe(listener.uri);
+        const c = await clients.start(ready.dir);
+        // The token the second listener was started with is no way in: the one authentication hook is DuckDB's global setting, and it asks for a listed key.
+        expect((await c.attach(second, "chosen-by-the-caller")).ok).toBe(false);
+        expect((await c.attach(second, "some-other-key")).ok).toBe(false);
+        expect(events).toEqual([]);
+        // A listed key signs in, and the one authorization hook refuses what the first listener refuses: a table that is not shared.
+        const answer = await c.run(`SELECT * FROM quack_query('${second}', 'SELECT count(*) FROM payments', token = '${key}')`);
+        expect(answer.ok).toBe(false);
+        expect(answer.ok ? "" : answer.error).toContain("payments is not one of the tables shared with this key");
+        // The listener is the one the caller asked for, on every interface: nothing but the gate kept it off the network.
+        expect((await g.run("SELECT host FROM quack_server_list()")).map((r) => r[0]).sort()).toEqual(["0.0.0.0", "127.0.0.1"]);
+        expect(events.map((e) => [e.kind, e.key])).toContainEqual(["signin", "reader"]);
+      } finally {
+        await clients.close();
         g.close();
       }
     });

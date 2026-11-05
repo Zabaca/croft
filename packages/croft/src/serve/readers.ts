@@ -38,10 +38,9 @@ import { assertSafeFilesystem, type FsProbe, realProbe } from "../db/fs-kind.ts"
 import { loadProject, type Project } from "../project/root.ts";
 import { mapQueryError } from "../read/select.ts";
 import { COPY_CHECK_MS, CopyMaker, type CopyMakerOptions } from "./copy-maker.ts";
+import { assertQuackAddress, KeyFollower, spawnQuackWorker } from "./engine-quack.ts";
 import { KeyStore } from "./keys.ts";
-import type { QuackKey } from "./quack-access.ts";
-import { listenAddress } from "./quack-address.ts";
-import { noSharedTables, notAdmittedError, plaintextNotAccepted, queueFullError, restartedError, stopError } from "./errors.ts";
+import { noSharedTables, notAdmittedError, queueFullError, restartedError, stopError } from "./errors.ts";
 import { SERVE_DEFAULTS, serveLimits } from "./instance.ts";
 import { Admission, type Flight, type StopReason } from "./queue.ts";
 import { QueryWorker, WorkerGone, WorkerStopped } from "./query-worker.ts";
@@ -160,10 +159,8 @@ class ReadersEngine implements ServeEngine {
   private readonly delayOf: (attempts: number) => number;
   private readonly quackAt: { host: string; port: number; maxConcurrent: number } | null;
   private readonly onQuack: ServeEngineOptions["onQuack"];
-  /** Reads the keys file for the Quack hooks (D126); the engine never writes it. */
-  private readonly keyStore: KeyStore;
-  /** The keys last read, which a process opens with and is sent again when the file changes. */
-  private keys: QuackKey[] = [];
+  /** Follows the keys file for the Quack hooks (D126); the engine never writes it. */
+  private readonly keys: KeyFollower;
   private quackUri: string | null = null;
   /** Why queries are refused until something changes (no copy yet; a start that a retry will not fix); null otherwise. */
   private blocked: CroftError | null = null;
@@ -199,7 +196,7 @@ class ReadersEngine implements ServeEngine {
     const sm = project.config.serverMode;
     this.quackAt = o.quack === false ? null : { host: sm.quackHost, port: sm.quackPort, maxConcurrent: sm.quackMaxConcurrent, ...o.quack };
     this.onQuack = o.onQuack;
-    this.keyStore = new KeyStore(project.paths.stateDir);
+    this.keys = new KeyFollower(new KeyStore(project.paths.stateDir));
     this.hooks = guarded(o.hooks ?? {});
     this.spec = { profile: "serve", timezone: project.timezone, root: project.root, stateDir: project.paths.stateDir, ...serveResources(), ...o.resources };
     this.protect = [project.paths.stateDir];
@@ -219,9 +216,7 @@ class ReadersEngine implements ServeEngine {
 
   /** The listener's address must be loopback, or the project must have accepted plaintext on the network (D131). */
   assertQuackAddress(): void {
-    if (!this.quackAt) return;
-    const { uri, loopback } = listenAddress(this.quackAt.host, this.quackAt.port);
-    if (!loopback && !this.project.config.serverMode.quackPlaintextOnNetwork) throw plaintextNotAccepted(uri);
+    assertQuackAddress(this.quackAt, this.project.config.serverMode.quackPlaintextOnNetwork);
   }
 
   /** First open. A copy that is not there yet is waited for (the first run that changes data makes it); a start that
@@ -364,7 +359,7 @@ class ReadersEngine implements ServeEngine {
       this.lastCopyCheck = Date.now();
       this.maker.check();
     }
-    this.sendKeys();
+    this.keys.send(this.worker, (names) => this.hooks.keysSent?.({ names, at: Date.now() }));
     if (this.transition) return;
     const id = statIdentity(this.copyPath);
     if (!this.worker) {
@@ -380,22 +375,6 @@ class ReadersEngine implements ServeEngine {
     if (id && this.attached && !sameIdentity(id, this.attached)) this.begin(this.swap(id));
   }
 
-  /** Read the keys file when it changed since the last look: the new list, or null. A Quack session outlives a request, so the
-   *  readers' process checks every query against its list, and a removed key stops working within a poll (D126). */
-  private readKeys(): QuackKey[] | null {
-    const changed = this.keyStore.changes();
-    if (changed) this.keys = changed;
-    return changed;
-  }
-
-  /** Tell the readers' process the keys, when they changed. */
-  private sendKeys(): void {
-    const changed = this.readKeys();
-    if (!changed || !this.worker) return; // a process that opens next starts with the list
-    this.worker.setKeys(changed);
-    this.hooks.keysSent?.({ names: changed.map((k) => k.name), at: Date.now() });
-  }
-
   private begin(p: Promise<void>): void {
     this.transition = p
       .catch(() => {}) // every failure is recorded (blocked, or a restart) by the transition itself
@@ -409,32 +388,22 @@ class ReadersEngine implements ServeEngine {
    *  reports it; later ones are recorded by reopen). */
   private async open(id: CopyIdentity): Promise<void> {
     this.state = this.restarts > 0 || this.attempts > 0 ? "restarting" : "starting";
-    const worker: QueryWorker = QueryWorker.spawn({
+    const worker = spawnQuackWorker({
       onExit: (w) => this.exited(w),
-      onQuack: (e) => {
-        try {
-          this.onQuack?.(e);
-        } catch {
-          // A log or a last-use time that cannot be written never costs a client its answer.
-        }
-      },
-      onOverdue: (o) => {
-        // Quack has no server-side cancel [V: 2.0.0]: the process ends, every session on it with it, and clients attach again (D127).
-        this.hooks.quackOverdue?.({ pid: worker.pid, ms: o.ms, at: Date.now() });
-        void worker.kill();
-      },
+      onQuack: (e) => this.onQuack?.(e),
+      overdue: (o) => this.hooks.quackOverdue?.({ ...o, at: Date.now() }),
       ...(this.argv ? { argv: this.argv } : {}),
     });
     this.opening = worker;
     const asOf = formatInstant(Math.round(id.mtimeMs), this.project.timezone);
-    this.readKeys(); // the process opens with the keys as they are now
+    this.keys.read(); // the process opens with the keys as they are now
     let opened: Awaited<ReturnType<QueryWorker["open"]>>;
     try {
       opened = await worker.open({
         path: this.copyPath, spec: this.spec, protect: this.protect,
         readers: {
           ...(this.extensionDir ? { extensionDir: this.extensionDir } : {}), secretDir: this.secretDir, shared: [...this.project.config.serve.sharedTables], asOf,
-          ...(this.quackAt ? { quack: { ...this.quackAt, queryTimeoutMs: this.queryTimeoutMs, keys: this.keys } } : {}),
+          ...(this.quackAt ? { quack: { ...this.quackAt, queryTimeoutMs: this.queryTimeoutMs, keys: this.keys.current } } : {}),
         },
       });
     } catch (e) {
@@ -451,7 +420,7 @@ class ReadersEngine implements ServeEngine {
     this.attached = id;
     this.asOf = asOf;
     this.quackUri = opened.quack?.uri ?? null;
-    worker.setKeys(this.keys); // a change while it opened was read but not sent
+    worker.setKeys(this.keys.current); // a change while it opened was read but not sent
     this.state = "open";
     this.blocked = null;
     this.openedAt = Date.now();
