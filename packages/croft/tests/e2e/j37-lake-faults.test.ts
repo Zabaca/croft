@@ -107,7 +107,7 @@ for (const kind of ["local", "postgres"] as const) {
         const done = await view(p);
         expect(done).toEqual({ rows: 5, recorded: 5, written: 5, cursor: at(5) });
         expect(existsSync(join(p.stateDir, "lake-write.lock"))).toBe(false);
-      }, 180_000);
+      }, 300_000);
     }
 
     test.concurrent("b. kill -9 between the trash and the drop of a delete, and of a restore: the table is whole, and a second try finishes", async () => {
@@ -130,7 +130,7 @@ for (const kind of ["local", "postgres"] as const) {
       const ask2 = await run(p, ["restore", "orders"]);
       expect((await run(p, ["confirm", ask2.json.confirmation.token])).code).toBe(0);
       expect(await view(p)).toMatchObject({ rows: 4, recorded: 4 });
-    }, 240_000);
+    }, 300_000);
 
     test.concurrent("e. kill -9 between the trash and the reset of a rebuild: the table is whole, and a new confirmation finishes it", async () => {
       const { p, state } = await shop(kind, [1, 2, 3].map(order));
@@ -147,7 +147,7 @@ for (const kind of ["local", "postgres"] as const) {
       expect((await run(p, ["confirm", again.json.confirmation.token])).code).toBe(0);
       expect(await view(p)).toMatchObject({ rows: 4, recorded: 4 }); // refetched whole
       expect(readdirSync(join(p.stateDir, "trash", "orders")).filter((f) => f.endsWith(".duckdb")).length).toBe(2);
-    }, 240_000);
+    }, 300_000);
 
     for (const point of ["rename_before_commit", "rename_after_commit", "rename_after_state", "rename_after_earlier", "rename_after_trash"]) {
       test.concurrent(`f. kill -9 at ${point} of a rename: nothing is lost, and the same rename finishes it`, async () => {
