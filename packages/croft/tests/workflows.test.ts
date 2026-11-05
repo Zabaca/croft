@@ -33,6 +33,24 @@ const load = (file: string) => {
   return { text, doc: Bun.YAML.parse(text) as { on: Record<string, any>; concurrency: { group: string }; jobs: Record<string, any> } };
 };
 
+/** The names ci.yml's jobs have in a run: each matrix expanded as GitHub does (the product of its dimensions, less `exclude`, or just its `include` list) and `${{ matrix.x }}` filled in. */
+function jobNames(jobs: Record<string, any>): string[] {
+  const names: string[] = [];
+  for (const job of Object.values<any>(jobs)) {
+    const { include, exclude = [], ...dims } = job.strategy?.matrix ?? {};
+    if (include && Object.keys(dims).length > 0) throw new Error("jobNames expands a matrix of dimensions or one of includes, not both");
+    let combos: Record<string, unknown>[] = include ?? [{}];
+    for (const [k, values] of Object.entries<unknown[]>(dims)) combos = combos.flatMap((c) => values.map((v) => ({ ...c, [k]: v })));
+    combos = combos.filter((c) => !exclude.some((e: Record<string, unknown>) => Object.entries(e).every(([k, v]) => c[k] === v)));
+    for (const c of combos) {
+      const name = String(job.name).replace(/\$\{\{\s*matrix\.(\w+)\s*\}\}/g, (_, k) => String(c[k]));
+      if (name.includes("${{")) throw new Error(`jobNames cannot fill in "${name}"`);
+      names.push(name);
+    }
+  }
+  return names;
+}
+
 describe("which workflows can publish", () => {
   const files = readdirSync(WORKFLOWS).filter((f) => f.endsWith(".yml"));
 
@@ -222,13 +240,17 @@ describe("which workflows can publish", () => {
     const SHA = "a".repeat(40);
     const run = (over: Partial<CiRun> = {}): CiRun => ({ id: 1, status: "completed", conclusion: "success", event: "push", head_branch: "main", head_sha: SHA, html_url: "https://github.com/Zabaca/croft/actions/runs/1", ...over });
     /** The jobs of a full run, named as ci.yml's are, each a success. */
-    const FULL: CiJob[] = [...JOB_KINDS, "what changed", "site"].map((name) => ({ name, conclusion: "success" }));
-    const skipped = (): CiJob[] => FULL.map((j) => (JOB_KINDS.includes(j.name) ? { ...j, conclusion: "skipped" } : j));
+    const FULL: CiJob[] = jobNames(load("ci.yml").doc.jobs).map((name) => ({ name, conclusion: "success" }));
+    const isCroft = (name: string) => JOB_KINDS.some((k) => k.name.test(name));
+    const skipped = (): CiJob[] => FULL.map((j) => (isCroft(j.name) ? { ...j, conclusion: "skipped" } : j));
     const gate = (runs: CiRun[], jobs: Record<number, CiJob[]> = { 1: FULL, 2: FULL }, waited = 0) => judge(runs, jobs, SHA, waited);
 
-    test("ci.yml has a job for each kind of croft job the gate requires, so a full run is one the gate can recognize", () => {
-      const names = Object.values<any>(load("ci.yml").doc.jobs).map((j) => String(j.name ?? ""));
-      for (const kind of JOB_KINDS) expect(names.some((n) => n.includes(kind)), kind).toBe(true);
+    test("ci.yml's jobs, matrices expanded, are exactly the kinds of croft job the gate requires, each counted, so a full run is one the gate can recognize", () => {
+      const croft = FULL.map((j) => j.name).filter((n) => !["what changed", "site"].includes(n));
+      for (const kind of JOB_KINDS) expect(croft.filter((n) => kind.name.test(n)).length, kind.label).toBe(kind.count);
+      // And every job is one kind: a name no kind matches, or two kinds match, would be a job the gate counts wrong.
+      for (const n of croft) expect(JOB_KINDS.filter((k) => k.name.test(n)).map((k) => k.label), n).toHaveLength(1);
+      expect(FULL.length, "the croft jobs, the change detector and the site").toBe(croft.length + 2);
     });
 
     test("the gate lets a release through on a completed, successful push run to main at the tagged commit, every job a success", () => {
@@ -254,8 +276,34 @@ describe("which workflows can publish", () => {
       expect(v.why).toContain(SHA);
       // One skipped or failed job among the rest is refused as well, and so is a run missing a kind of job.
       expect(gate([run()], { 1: FULL.map((j, i) => (i === 0 ? { ...j, conclusion: "skipped" } : j)) }).state).toBe("fail");
-      expect(gate([run()], { 1: FULL.filter((j) => j.name !== "smoke") }).state).toBe("fail");
+      expect(gate([run()], { 1: FULL.filter((j) => j.name !== "alpine smoke") }).state).toBe("fail");
       expect(gate([run()], {}).state, "a run whose jobs are not known").toBe("fail");
+    });
+
+    // The gate used to look for a word in a job's name ("shard", "smoke"), and the after-merge, log, lake, Alpine and Windows jobs carry those words
+    // too: a deleted or renamed suite job went unnoticed as long as another job said "shard". Each kind is its own name and its own count (D202).
+    test("the gate refuses a run missing, short of or renamed in any one kind of croft job, though other jobs carry the same words", () => {
+      const without = (drop: (name: string) => boolean) => FULL.filter((j) => !drop(j.name));
+      const refused = (jobs: CiJob[], kind: string) => {
+        const v = gate([run()], { 1: jobs });
+        expect(v.state, kind).toBe("fail");
+        expect(v.why, kind).toContain(kind);
+      };
+      const suite = (n: string) => /^ubuntu-24\.04 · bun 1\.3\.14 · shard \d+\/7$/.test(n);
+      refused(without(suite), "the suite's shards (0 of 7)");
+      refused(without((n) => n === "ubuntu-24.04 · bun 1.3.14 · shard 7/7"), "the suite's shards (6 of 7)");
+      refused(without((n) => n.startsWith("after a merge")), "the after-merge platforms (0 of 12)");
+      refused(without((n) => n.includes("bookkeeping as a log")), "the log run (0 of 2)");
+      refused(without((n) => n.includes("journeys on a local lake") && n.endsWith("4/4")), "the journeys on a local lake (3 of 4)");
+      refused(without((n) => n.includes("journeys on a Postgres lake")), "the journeys on a Postgres lake (0 of 5)");
+      refused(without((n) => n.endsWith("· smoke")), "the platform smokes (0 of 3)");
+      refused(without((n) => n === "alpine smoke"), "the Alpine smoke (0 of 1)");
+      refused(without((n) => n === "windows smoke"), "the Windows smoke (0 of 1)");
+      refused(FULL.map((j) => (j.name === "windows smoke" ? { ...j, name: "windows check" } : j)), "the Windows smoke (0 of 1)");
+      refused(FULL.map((j) => (j.name === "ubuntu-24.04 · bun 1.3.14 · shard 7/7" ? { ...j, name: "tests" } : j)), "the suite's shards (6 of 7)");
+      refused([...FULL, { name: "ubuntu-24.04 · bun 1.3.14 · shard 8/7", conclusion: "success" }], "the suite's shards (8 of 7)");
+      // A job of a kind the gate does not know about is a success like the rest, and is let through: only the kinds it names are required.
+      expect(gate([run()], { 1: [...FULL, { name: "lint", conclusion: "success" }] }).state).toBe("pass");
     });
 
     test("a manual run of ci.yml on main at the commit counts, as the way to get a full run; on another branch or commit it does not", () => {

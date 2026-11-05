@@ -6,6 +6,10 @@
 //   c. Postgres restarted, and its connections ended, while a run waits on a slow API: the run still completes with one write (acceptance 5);
 //   d. a wrong password, a bucket key the store refuses, an unreachable host: nothing croft printed, logged or recorded holds the password, the
 //      access key id or the secret key, and duckdb_databases() cannot be queried (acceptance 6).
+//
+// The faults of a, b, e and f each have a project, a shop route and a lake (a database and a bucket folder in the rig) of their own, and kill only
+// their own croft processes, so the ones of a lake kind run side by side (test.concurrent, adjacent in their describe; D203). c restarts the rig's Postgres
+// and ends its connections, which every other test of that rig would feel, so it runs on its own, after them.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { DuckDBInstance } from "@duckdb/node-api";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
@@ -52,7 +56,7 @@ export default ingest({
 });
 `;
 
-interface Shop { p: Project; state: { orders: Order[]; delayMs: number } }
+interface Shop { p: Project; state: { orders: Order[]; delayMs: number }; path: string }
 let routes = 0;
 
 async function shop(kind: "local" | "postgres", orders: Order[]): Promise<Shop> {
@@ -71,7 +75,7 @@ async function shop(kind: "local" | "postgres", orders: Order[]): Promise<Shop> 
   else useLake(p.root, await rig!.lake());
   const first = await run(p, ["run"]);
   expect(first.code, show(first)).toBe(0);
-  return { p, state };
+  return { p, state, path };
 }
 
 /** What the lake holds of orders, and what croft's bookkeeping says of it: they must agree after any fault. */
@@ -85,7 +89,7 @@ async function view(p: Project): Promise<{ rows: number; recorded: number; writt
 for (const kind of ["local", "postgres"] as const) {
   maybe(`journey 37 (${kind} lake): faults`, () => {
     for (const [fault, after] of [["after_stage", false], ["before_commit", false], ["after_commit_before_sqlite", true]] as const) {
-      test(`a. kill -9 at ${fault}: the lake is as it was before the step${after ? " ended" : ""} or as it is after it, and the next run converges`, async () => {
+      test.concurrent(`a. kill -9 at ${fault}: the lake is as it was before the step${after ? " ended" : ""} or as it is after it, and the next run converges`, async () => {
         const { p, state } = await shop(kind, [1, 2, 3].map(order));
         state.orders.push(order(4), order(5));
         const killed = await run(p, ["run", "orders", "--follow", "30s"], { CROFT_FAULT: fault });
@@ -103,10 +107,10 @@ for (const kind of ["local", "postgres"] as const) {
         const done = await view(p);
         expect(done).toEqual({ rows: 5, recorded: 5, written: 5, cursor: at(5) });
         expect(existsSync(join(p.stateDir, "lake-write.lock"))).toBe(false);
-      }, 180_000);
+      }, 300_000);
     }
 
-    test("b. kill -9 between the trash and the drop of a delete, and of a restore: the table is whole, and a second try finishes", async () => {
+    test.concurrent("b. kill -9 between the trash and the drop of a delete, and of a restore: the table is whole, and a second try finishes", async () => {
       const { p } = await shop(kind, [1, 2, 3, 4].map(order));
       const asked = await run(p, ["delete", "orders"]);
       expect(asked.code, show(asked)).toBe(5);
@@ -126,9 +130,9 @@ for (const kind of ["local", "postgres"] as const) {
       const ask2 = await run(p, ["restore", "orders"]);
       expect((await run(p, ["confirm", ask2.json.confirmation.token])).code).toBe(0);
       expect(await view(p)).toMatchObject({ rows: 4, recorded: 4 });
-    }, 240_000);
+    }, 300_000);
 
-    test("e. kill -9 between the trash and the reset of a rebuild: the table is whole, and a new confirmation finishes it", async () => {
+    test.concurrent("e. kill -9 between the trash and the reset of a rebuild: the table is whole, and a new confirmation finishes it", async () => {
       const { p, state } = await shop(kind, [1, 2, 3].map(order));
       p.remove("assets/totals.sql");
       state.orders.push(order(4));
@@ -143,10 +147,10 @@ for (const kind of ["local", "postgres"] as const) {
       expect((await run(p, ["confirm", again.json.confirmation.token])).code).toBe(0);
       expect(await view(p)).toMatchObject({ rows: 4, recorded: 4 }); // refetched whole
       expect(readdirSync(join(p.stateDir, "trash", "orders")).filter((f) => f.endsWith(".duckdb")).length).toBe(2);
-    }, 240_000);
+    }, 300_000);
 
     for (const point of ["rename_before_commit", "rename_after_commit", "rename_after_state", "rename_after_earlier", "rename_after_trash"]) {
-      test(`f. kill -9 at ${point} of a rename: nothing is lost, and the same rename finishes it`, async () => {
+      test.concurrent(`f. kill -9 at ${point} of a rename: nothing is lost, and the same rename finishes it`, async () => {
         const { p } = await shop(kind, [1, 2, 3].map(order));
         p.remove("assets/totals.sql");
         const killed = await p.croft(["rename", "orders", "sales", "--json"], { env: { ...EXT, CROFT_FAULT: point } });
@@ -169,11 +173,11 @@ for (const kind of ["local", "postgres"] as const) {
 
 maybe("journey 37 (postgres lake): the catalog restarts mid-command", () => {
   test("c. a run that waits on a slow API while Postgres restarts, and its connections are ended, completes with one write", async () => {
-    const { p, state } = await shop("postgres", [1, 2, 3].map(order));
+    const { p, state, path } = await shop("postgres", [1, 2, 3].map(order));
     state.orders.push(order(4), order(5), order(6));
     state.delayMs = 2500;
     const running = p.start(["run", "orders", "--foreground", "--json"], { env: { ...EXT } });
-    await until(() => api.log.some((r) => r.path.endsWith("/orders") && Date.now() - r.at < 1500 && r.path.includes(`/lake${routes}/`)), 20_000);
+    await until(() => api.log.some((r) => r.path === path && Date.now() - r.at < 1500), 20_000);
     expect(await rig!.pg.terminateConnections()).toBeGreaterThanOrEqual(0);
     await rig!.pg.restart(300);
     state.delayMs = 0;
