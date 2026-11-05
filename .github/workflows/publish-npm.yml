@@ -5,10 +5,11 @@
 # accepts that only from GitHub-hosted runners, with npm >= 11.5.1, and adds provenance because the repository
 # is public (it then requires package.json's repository.url to name this repository, which it does).
 #
-# Two jobs, so what is published is byte for byte what was tested: `pack` runs the suite on the tagged commit
-# and packs it, and `publish` uploads that tarball. It is packed with `npm pack`, as 0.1.0 to 0.2.1 were by
-# hand: it runs `prepack` (the read client's build, scripts/build-read.ts) and writes bin/croft.mjs with mode
-# 755, where `bun pm pack` copies the checkout's 777.
+# Two jobs, so what is published is byte for byte what was packed: `pack` checks the tag, refuses unless main's CI passed on the tagged
+# commit, and packs it, and `publish` uploads that tarball. The suite is not run again here (DESIGN.md D196): the commit was tested by
+# ci.yml on its push to main, and scripts/release-gate.ts asks GitHub for that run's result and waits, within a limit, for one still
+# running. It is packed with `npm pack`, as 0.1.0 to 0.2.1 were by hand: it runs `prepack` (the read client's build,
+# scripts/build-read.ts) and writes bin/croft.mjs with mode 755, where `bun pm pack` copies the checkout's 777.
 #
 # A run publishes only from a tag. The manual run (workflow_dispatch) is for running a release again, from the tag's ref
 # (`gh workflow run publish-npm.yml --ref croft-v<version>`); from a branch both jobs are skipped, because the check that the
@@ -23,11 +24,11 @@ jobs:
   pack:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
-    # The whole suite in this one job: ci.yml splits it in two shards per platform because one job of it took 31 to 40 minutes against 45
-    # (DESIGN.md §10 "Test strategy"). A release keeps the one job, and the time for it to grow.
-    timeout-minutes: 90
+    # Up to 30 minutes of that is the wait for main's CI (scripts/release-gate.ts), which is usually done before a tag is pushed.
+    timeout-minutes: 45
     permissions:
       contents: read
+      actions: read
     outputs:
       publish: ${{ steps.state.outputs.publish }}
     steps:
@@ -38,8 +39,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: lts/*
-      - name: git identity
-        run: git config --global user.email ci@zabaca.com && git config --global user.name "croft ci"
       - run: bun install --frozen-lockfile
       # A tag that names another version than package.json would publish something the tag does not describe.
       - name: the tag names package.json's version
@@ -60,51 +59,18 @@ jobs:
           else
             echo "publish=yes" >> "$GITHUB_OUTPUT"
           fi
-      # The suite's mode tests need what ci.yml gives them (DESIGN.md D117, D118): DuckDB's real extension files, fetched
-      # and checked against the pinned checksums, and a Postgres the tests start in the foreground. With CROFT_CI set they
-      # fail without them, so a release would fail here.
-      - name: DuckDB extension files, cached
-        if: steps.state.outputs.publish == 'yes'
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/croft-extensions
-          key: duckdb-extensions-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('packages/croft/src/db/extension-pins.ts') }}
-      - name: fetch and verify the DuckDB extension files
+      # What is packed is what main's CI tested (DESIGN.md D196): the push to main at this commit, ci.yml's whole run, passed. Read-only
+      # (`actions: read`); nothing here can change a run.
+      - name: main's CI passed on this commit
         if: steps.state.outputs.publish == 'yes'
         working-directory: packages/croft
         env:
-          CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
-        run: bun scripts/fetch-extensions.ts
-      - name: Postgres for the lake tests
-        if: steps.state.outputs.publish == 'yes'
-        working-directory: packages/croft
-        run: |
-          if ! bun scripts/check-mode-tools.ts; then
-            # A Linux image without Postgres. Debian starts a service on install; a policy-rc.d that refuses (exit 101)
-            # keeps it from ever starting, so only the test's own foreground Postgres runs.
-            printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
-            sudo chmod +x /usr/sbin/policy-rc.d
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends postgresql
-            sudo rm -f /usr/sbin/policy-rc.d
-            bun scripts/check-mode-tools.ts
-          fi
+          GH_TOKEN: ${{ github.token }}
+        run: bun scripts/release-gate.ts
       - name: typecheck
         if: steps.state.outputs.publish == 'yes'
         working-directory: packages/croft
         run: bun run typecheck
-      - name: test
-        if: steps.state.outputs.publish == 'yes'
-        working-directory: packages/croft
-        env:
-          CROFT_CI: "1"
-          CROFT_EXTENSION_DIR: ${{ runner.temp }}/croft-extensions
-        run: bun test --timeout 60000
-      # The site test keeps the npm README in step with the repository's (packages/site/test/readmes.test.ts).
-      - name: site test
-        if: steps.state.outputs.publish == 'yes'
-        working-directory: packages/site
-        run: bun test
       - name: pack
         if: steps.state.outputs.publish == 'yes'
         working-directory: packages/croft

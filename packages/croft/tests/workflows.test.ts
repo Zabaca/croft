@@ -7,6 +7,7 @@ import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { GRACE_SECONDS, judge, type CiRun } from "../scripts/release-gate.ts";
 
 const REPO = resolve(import.meta.dir, "../../..");
 const WORKFLOWS = join(REPO, ".github/workflows");
@@ -51,7 +52,8 @@ describe("which workflows can publish", () => {
   test("every job of ci.yml, the log run of the suite (test-log) and the smoke included, publishes nothing, mints no token and holds no secret", () => {
     const { doc } = load("ci.yml");
     expect(Object.keys(doc.jobs)).toEqual(["changes", "test", "test-platforms", "smoke", "test-log", "test-lake-local", "test-lake-postgres", "alpine", "windows", "site"]);
-    expect(doc.on.push.tags).toEqual(["phase-*", "croft-v*"]); // ci.yml runs on the release tag, so it must be unable to publish it
+    // ci.yml does not run on the release tag: the commit was tested by the push to main, and publish-npm.yml refuses without that run (D196).
+    expect(doc.on.push.tags).toEqual(["phase-*"]);
     for (const [name, job] of Object.entries<any>(doc.jobs)) {
       const text = JSON.stringify(job);
       expect(canPublish(`${name}:\n${JSON.stringify(job, null, 1)}`), name).toBe(false);
@@ -127,16 +129,24 @@ describe("which workflows can publish", () => {
       expect(job.strategy["fail-fast"], `${name}: one shard failing must not hide the other's result`).toBe(false);
       expect(job.name, name).toContain(`shard \${{ matrix.shard }}/${shards.length}`);
       const steps: { name?: string; run?: string; if?: string }[] = job.steps;
-      const sharded = steps.filter((st) => /--shard=/.test(st.run ?? ""));
+      // The pull request's run of the whole suite deals its files by the seconds each took (scripts/shard-files.ts, D196); the others are Bun's own `--shard`.
+      const dealt = name === "test";
+      const sharded = steps.filter((st) => (dealt ? /shard-files\.ts/ : /--shard=/).test(st.run ?? ""));
       // One step runs the shard; the log run has two, one for a pull request and one for the rest (above).
       expect(sharded.length, `${name}: one step runs the shard`).toBe(name === "test-log" ? 2 : 1);
       for (const st of sharded) {
-        expect(st.run, name).toContain(`--shard=\${{ matrix.shard }}/${shards.length}`);
+        expect(st.run, name).toContain(dealt ? `shard-files.ts \${{ matrix.shard }} ${shards.length}` : `--shard=\${{ matrix.shard }}/${shards.length}`);
         expect(st.run, name).toContain("--timeout 60000");
       }
       // What does not depend on the shard (the typecheck, the run against an older DuckDB) is done once, by shard 1.
       for (const st of steps.filter((x) => !sharded.includes(x) && /\bbun (test|run typecheck)\b/.test(x.run ?? ""))) expect(st.if, `${name}: ${st.name}`).toBe("matrix.shard == 1");
     }
+  });
+
+  test("the pull request's shards list their files first, so that a failing script stops the step and does not leave `bun test` with no filter (D196)", () => {
+    const run: string = load("ci.yml").doc.jobs.test.steps.find((st: any) => /shard-files\.ts/.test(st.run ?? "")).run;
+    expect(run).toMatch(/^files=\$\(bun scripts\/shard-files\.ts \$\{\{ matrix\.shard \}\} 7\)\n/);
+    expect(run).toMatch(/\n\s*bun test --timeout 60000 \$files\s*$/);
   });
 
   test("the journeys run on a lake of each kind in jobs of their own, beside the others, each with its own timeout (DESIGN.md D146)", () => {
@@ -166,12 +176,71 @@ describe("which workflows can publish", () => {
     expect(Object.keys(doc.on).sort()).toEqual(["push", "workflow_dispatch"]);
     expect(doc.on.push).toEqual({ tags: ["croft-v*"] });
     expect(Object.keys(doc.jobs)).toEqual(["pack", "publish"]);
-    // The release runs the whole suite in this one job (ci.yml splits it in shards): its limit leaves room to grow.
-    expect(doc.jobs.pack["timeout-minutes"]).toBeGreaterThanOrEqual(75);
     // The check that a tag names package.json's version cannot protect a branch, so a manual run from one is skipped whole.
     expect(doc.jobs.pack.if).toBe("github.ref_type == 'tag'");
     expect(doc.jobs.publish.if).toContain("github.ref_type == 'tag'");
     expect(doc.jobs.publish.needs).toBe("pack");
+  });
+
+  // DESIGN.md D196: a release publishes what main already tested, and refuses without proof that it did.
+  describe("a release publishes what main's CI tested", () => {
+    const steps = (): { name?: string; run?: string; env?: Record<string, string>; if?: string; uses?: string }[] => load("publish-npm.yml").doc.jobs.pack.steps;
+    const at = (re: RegExp) => steps().findIndex((st) => re.test(`${st.name ?? ""} ${st.run ?? ""} ${st.uses ?? ""}`));
+
+    test("the pack job does not run the suite again: no test run, no extension files, no Postgres", () => {
+      const { doc, text } = load("publish-npm.yml");
+      for (const st of doc.jobs.pack.steps) expect(st.run ?? "", st.name).not.toMatch(/\bbun test\b|fetch-extensions|check-mode-tools|postgresql/);
+      expect(withoutComments(text)).not.toMatch(/CROFT_CI|croft-extensions/);
+      // So its time is a typecheck, a pack and the wait for main's CI (scripts/release-gate.ts), not the suite's 40 minutes.
+      expect(doc.jobs.pack["timeout-minutes"]).toBeLessThanOrEqual(60);
+    });
+
+    test("it refuses unless ci.yml passed on a push to main at the tagged commit, before it packs, with a read-only token", () => {
+      const { doc } = load("publish-npm.yml");
+      const gate = at(/release-gate\.ts/);
+      expect(gate, "a step runs scripts/release-gate.ts").toBeGreaterThan(-1);
+      expect(gate, "after the tag and the already-published checks").toBeGreaterThan(at(/already on npm\?/));
+      expect(gate, "before the pack").toBeLessThan(at(/npm pack/));
+      expect(gate, "before the artifact is uploaded").toBeLessThan(at(/upload-artifact/));
+      const st = steps()[gate]!;
+      expect(st.env?.GH_TOKEN, "the job's own token").toBe("${{ github.token }}");
+      expect(st.if, "skipped only for a version already on npm, which publishes nothing").toBe("steps.state.outputs.publish == 'yes'");
+      expect(doc.jobs.pack.permissions).toEqual({ contents: "read", actions: "read" });
+      // The publish job holds the OIDC token and no more.
+      expect(doc.jobs.publish.permissions).toEqual({ contents: "read", "id-token": "write" });
+    });
+
+    test("the typecheck, the tag-equals-version check, the tarball checks, the manifest refusal and the OIDC publish stay", () => {
+      const { text } = load("publish-npm.yml");
+      expect(at(/bun run typecheck/)).toBeGreaterThan(-1);
+      expect(text).toContain('"${GITHUB_REF_NAME}" != "croft-v${VERSION}"');
+      expect(text).toContain("the tarball holds test files");
+      expect(text).toContain("auto-corrected|was invalid and removed");
+      expect(text).toContain("npm publish --access public --loglevel verbose");
+    });
+
+    const SHA = "a".repeat(40);
+    const run = (over: Partial<CiRun> = {}): CiRun => ({ id: 1, status: "completed", conclusion: "success", event: "push", head_branch: "main", head_sha: SHA, html_url: "https://github.com/Zabaca/croft/actions/runs/1", ...over });
+
+    test("the gate lets a release through on a completed, successful push run to main at the tagged commit", () => {
+      expect(judge([run()], SHA, 0).state).toBe("pass");
+      expect(judge([run({ conclusion: "failure", id: 2 }), run()], SHA, 0).state, "a re-run that passed").toBe("pass");
+    });
+
+    test("the gate stops a release when the run failed, was cancelled or does not exist, and waits while it runs", () => {
+      expect(judge([run({ conclusion: "failure" })], SHA, 0).state).toBe("fail");
+      expect(judge([run({ conclusion: "cancelled" })], SHA, 0).state).toBe("fail");
+      expect(judge([run({ status: "in_progress", conclusion: null })], SHA, 0).state).toBe("wait");
+      expect(judge([run({ status: "queued", conclusion: null })], SHA, 0).state).toBe("wait");
+      expect(judge([], SHA, 0).state, "a push whose run GitHub has not made yet").toBe("wait");
+      expect(judge([], SHA, GRACE_SECONDS + 1).state, "no run, once it should exist").toBe("fail");
+    });
+
+    test("the gate counts only the push to main at that commit: not a pull request, the daily run, a tag's run, another branch or another commit", () => {
+      for (const other of [{ event: "pull_request" }, { event: "schedule" }, { event: "workflow_dispatch" }, { head_branch: "croft-v0.5.1" }, { head_branch: "release-051" }, { head_sha: "b".repeat(40) }]) {
+        expect(judge([run(other)], SHA, GRACE_SECONDS + 1).state, JSON.stringify(other)).toBe("fail");
+      }
+    });
   });
 
   test("the workflow carries no npm token: it publishes by trusted publishing only", () => {
