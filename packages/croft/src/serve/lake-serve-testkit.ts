@@ -15,6 +15,7 @@ import { openLakeEngine, type LakeEngineInternals } from "./lake-engine.ts";
 import { type Rig, Rigs } from "./key-rig-testkit.ts";
 import { until } from "./readers-testkit.ts";
 import type { QuackEvent } from "./quack-access.ts";
+import type { QuackListener } from "./quack-listener.ts";
 import type { ServeEngine, ServeEngineOptions } from "./types.ts";
 
 /** The attack list's other tables, built by croft's own runs (sql/attack-testkit.ts WAREHOUSE_SQL, as assets). */
@@ -113,13 +114,13 @@ export function written(l: LakeProject): { project: string[]; lake: string[] } {
 /** A person holding the read-only catalog login and bucket key, attached to the lake in a DuckDB of their own (acceptance 3), and, with `readers`,
  *  the same lake attached the way the readers' process attaches it (the mode, loaded and locked down, with the gate left out of it): the
  *  statements the gate would refuse go to this one. Closed by `close()`. */
-export async function lakeSession(s: LakeServe, o: { readers?: boolean; extensionDir: string }): Promise<{ run(sql: string): Promise<unknown[][]>; error(sql: string): Promise<string>; close(): void }> {
+export async function lakeSession(s: LakeServe, o: { readers?: boolean; extensionDir: string; listener?: QuackListener }): Promise<{ run(sql: string): Promise<unknown[][]>; error(sql: string): Promise<string>; ready(): Promise<void>; close(): void }> {
   const lake = lakeConnection(s.l.project, s.env(), { extensionDir: o.extensionDir })!;
   const mode = lake.mode("read");
   const instance = await openMemoryInstance();
   const conn: DuckDBConnection = await connect(instance, {
     profile: "serve", timezone: "UTC", root: s.l.p.root, stateDir: s.l.project.paths.stateDir,
-    mode: o.readers ? lakeReadersMode(mode as never) : mode,
+    mode: o.readers ? lakeReadersMode(mode as never, o.listener ? (c) => o.listener!.prepare(c) : undefined) : mode,
   }, `:memory:lake-session-${Math.random().toString(36).slice(2)}`);
   await conn.run("USE lake");
   return {
@@ -133,6 +134,10 @@ export async function lakeSession(s: LakeServe, o: { readers?: boolean; extensio
         return (e as Error).message;
       }
       throw new Error(`expected a failure: ${sql}`);
+    },
+    /** With a `listener`: let people sign in, as the process does once its views exist (none are made here, so every table is refused). */
+    async ready() {
+      await o.listener!.refresh(conn, []);
     },
     close() {
       conn.disconnectSync();

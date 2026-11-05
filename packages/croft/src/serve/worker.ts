@@ -88,6 +88,15 @@ export type ToWorker =
   /** Disconnect every connection: the file is about to be released (the engine then kills this process). */
   | { op: "disconnect" };
 
+/** Where a process listens for DuckDB clients over Quack, and the keys it accepts. */
+export interface QuackOpen {
+  host: string;
+  port: number;
+  queryTimeoutMs: number;
+  maxConcurrent: number;
+  keys: QuackKey[];
+}
+
 /** What the readers' process is opened with: the extension files and secret folder, the shared tables, the copy's as-of time and,
  *  to listen for DuckDB clients, Quack's address and the keys it accepts. */
 export interface ReadersOpen {
@@ -96,14 +105,14 @@ export interface ReadersOpen {
   secretDir: string;
   shared: string[];
   asOf: string;
-  quack?: { host: string; port: number; queryTimeoutMs: number; maxConcurrent: number; keys: QuackKey[] };
+  quack?: QuackOpen;
 }
 
 /** What a lake worker is opened with to serve people with keys as well as apps (server mode over a lake, D183): the shared tables and, to
  *  listen for DuckDB clients, Quack's address and the keys it accepts. */
 export interface LakeServe {
   shared: string[];
-  quack?: { host: string; port: number; queryTimeoutMs: number; maxConcurrent: number; keys: QuackKey[] };
+  quack?: QuackOpen;
 }
 
 /** An error, as it crosses the process boundary. */
@@ -341,6 +350,15 @@ class Host {
     }
   }
 
+  /** Quack's listener for `q`, reporting to the engine; it starts when the mode that was handed it connects. */
+  private listener(q: QuackOpen, shared: string[]): QuackListener {
+    return new QuackListener({
+      host: q.host, port: q.port, queryTimeoutMs: q.queryTimeoutMs, maxConcurrent: q.maxConcurrent, shared, keys: q.keys,
+      emit: (event) => this.send({ op: "quack", event }),
+      overdue: (o) => this.send({ op: "quack_overdue", ...o }),
+    });
+  }
+
   private async open(m: Extract<ToWorker, { op: "open" }>): Promise<void> {
     try {
       if (this.instance) throw new Error("this worker already has a database open");
@@ -349,14 +367,7 @@ class Host {
         // beside it would be replayed in memory by the attach, so none is there when it attaches.
         rmSync(`${m.path}.wal`, { force: true });
         this.instance = await openMemoryInstance();
-        if (m.readers.quack) {
-          const q = m.readers.quack;
-          this.quack = new QuackListener({
-            host: q.host, port: q.port, queryTimeoutMs: q.queryTimeoutMs, maxConcurrent: q.maxConcurrent, shared: m.readers.shared, keys: q.keys,
-            emit: (event) => this.send({ op: "quack", event }),
-            overdue: (o) => this.send({ op: "quack_overdue", ...o }),
-          });
-        }
+        if (m.readers.quack) this.quack = this.listener(m.readers.quack, m.readers.shared);
         this.spec = readersSpec(m.spec, m.path, { ...m.readers, ...(this.quack ? { prepare: (c: DuckDBConnection) => this.quack!.prepare(c) } : {}) });
         this.path = m.path;
         this.protect = m.protect;
@@ -382,14 +393,7 @@ class Host {
         if (m.serve) {
           // Server mode over a lake (D183): quack besides, the hooks and the listener registered before the lock, the views made after it.
           const serve = m.serve;
-          if (serve.quack) {
-            const q = serve.quack;
-            this.quack = new QuackListener({
-              host: q.host, port: q.port, queryTimeoutMs: q.queryTimeoutMs, maxConcurrent: q.maxConcurrent, shared: serve.shared, keys: q.keys,
-              emit: (event) => this.send({ op: "quack", event }),
-              overdue: (o) => this.send({ op: "quack_overdue", ...o }),
-            });
-          }
+          if (serve.quack) this.quack = this.listener(serve.quack, serve.shared);
           const mode = lakeReadersMode(m.spec.mode as LakeMode | LakeLocalMode, this.quack ? (c) => this.quack!.prepare(c) : undefined);
           this.spec = { ...m.spec, mode };
           this.shared = serve.shared;

@@ -5,14 +5,16 @@
 # Recipients, in order. Attribution is written down because an age public key
 # carries no identity of its own:
 #
-#   age1dhsl...  james_mbp. Verified 2026-09-22: it is the public half of the
-#                only identity in this MacBook's sops keys.txt.
-#   age1cq0k...  james_studio. Confirmed as James's Mac Studio key by James on
-#                2026-09-22. leeandco/.sops.yaml attributes it to Khoa's laptop;
-#                that note conflicts with this one and should be corrected.
-#   age1llqq...  james_ryzen9_a. The ryzen-9 keys.txt holds two identities;
-#   age1ar5d...  james_ryzen9_b. Both are labeled James's in
-#                claude-mitm-proxy/.sops.yaml. Not verified from this machine.
+#   age1dhsl...  maintainer laptop. Verified 2026-09-22: it is the public half of
+#                the only identity in that laptop's sops keys.txt.
+#   age1cq0k...  maintainer workstation. Confirmed by the maintainer on
+#                2026-09-22. Another repository's recipients file attributes it
+#                to a different holder; that note conflicts with this one and
+#                should be corrected.
+#   age1llqq...  build server, first identity. That server's keys.txt holds two
+#   age1ar5d...  identities; the second is the build server's too. Both are
+#                labeled as the maintainer's in another repository's recipients
+#                file. Not verified from the laptop.
 #
 # CI has no key yet. When it gets one, store the private key as the GitHub
 # Actions secret SOPS_AGE_KEY and add its public key below.

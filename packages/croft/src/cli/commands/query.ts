@@ -77,7 +77,9 @@ let directoryTurn: Promise<unknown> = Promise.resolve();
 
 /** Run `fn` with the process working directory at `dir`, so relative paths in SQL (which DuckDB and the gate
  *  both resolve against the process's directory) mean the project folder. The directory is the process's, so calls take turns: two
- *  projects asked at once in one process (tests that run side by side) would otherwise each restore the other's directory. */
+ *  projects asked at once in one process (tests that run side by side) would otherwise each restore the other's directory.
+ *  Nothing in DuckDB can stand in for the change (D205): its sandbox checks a path as written against the process's folder, and
+ *  `file_search_path` is only consulted after. The launcher already starts croft in the project root, so in a real run this does nothing. */
 export function inDirectory<T>(dir: string, fn: () => Promise<T>): Promise<T> {
   const run = async (): Promise<T> => {
     const before = process.cwd();
