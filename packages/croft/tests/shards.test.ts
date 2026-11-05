@@ -1,6 +1,6 @@
 // CI runs the suite as N jobs each with a share of the test files (.github/workflows/ci.yml, DESIGN.md §10 "Test strategy", D191, D196):
 // seven for a pull request's run of the whole suite, which scripts/shard-files.ts deals out by the seconds each file took, and as
-// `bun test --shard=K/N` four for the platforms that run it after a merge, and the same N over a list of files given on the command line
+// `bun test --shard=K/N` for the lake journeys (four and five) and the log run (two), and the same N over a list of files given on the command line
 // (the pull request's run of the log, which names the files that touch the bookkeeping). The jobs only add up to the suite if every file lands in exactly one shard, so this runs Bun's own split on a folder of
 // throwaway files, nested the way ours are, and checks that the shards partition them: none twice, none missing, none empty, and the
 // split the same on a second ask. It guards the Bun that runs it (CI runs the floor and the latest), not croft.
