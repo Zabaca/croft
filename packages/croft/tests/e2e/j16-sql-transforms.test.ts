@@ -19,6 +19,9 @@
 // - a transform left stale by `run <its input> --only` is rebuilt by the next bare run, though its input is
 //   up to date by then.
 // Product bugs found on the way are bugTest()s at the bottom.
+//
+// Every journey has a project of its own, so the ones that only use their own project run side by side (test.concurrent, in two runs of
+// adjacent tests); 16e to 16g read what the first journey saw, and run between the two, after it has ended.
 import { afterAll, expect, test } from "bun:test";
 import { bugTest, cleanupAll, codes, type Envelope, initProject, ISO_WITH_OFFSET, type Project, RUN_ID, show } from "./harness.ts";
 
@@ -131,7 +134,7 @@ let tzDryRun: Envelope | undefined;
 // ---------------------------------------------------------------------------------------------------------
 // The journey
 
-test("journey 16: raw → clean → report with checks; check failures, staleness, rebuilds that keep _loaded_at, time zones", async () => {
+test.concurrent("journey 16: raw → clean → report with checks; check failures, staleness, rebuilds that keep _loaded_at, time zones", async () => {
   const p = await shopProject();
 
   // ---- First build: a bare run takes everything, in dependency order.
@@ -349,7 +352,7 @@ test("journey 16: raw → clean → report with checks; check failures, stalenes
   expect(statusOf(settled.json)).toEqual({ raw_orders: "unchanged", clean_orders: "skipped", daily_revenue: "skipped" });
 }, 180_000);
 
-test("journey 16b: a failed ingest skips everything downstream of it, transitively, and every table keeps its rows", async () => {
+test.concurrent("journey 16b: a failed ingest skips everything downstream of it, transitively, and every table keeps its rows", async () => {
   const p = await shopProject();
   const first = await p.json(["run"]);
   expect(first.code, show(first)).toBe(0);
@@ -384,7 +387,7 @@ test("journey 16b: a failed ingest skips everything downstream of it, transitive
   expect((await p.rows("select count(*) n from clean_orders"))[0]!.n).toBe(4);
 }, 120_000);
 
-test("journey 16c: a transform left stale by `--only` upstream of it is updated by the next bare run", async () => {
+test.concurrent("journey 16c: a transform left stale by `--only` upstream of it is updated by the next bare run", async () => {
   const p = await shopProject();
   const first = await p.json(["run"]);
   expect(first.code, show(first)).toBe(0);
@@ -424,7 +427,7 @@ test("journey 16c: a transform left stale by `--only` upstream of it is updated 
 // --upstream` did not build it when it was never built, so the asset failed with CHECK_INVALID and the hint
 // "correct the check in assets/daily_revenue.sql". The check is correct: its table is just not built yet. Now
 // --upstream builds it, and without --upstream the problem names the table (croft run regions).
-test("journey 16d: `run <asset> --upstream` builds, or at least names, the never-built table a check reads", async () => {
+test.concurrent("journey 16d: `run <asset> --upstream` builds, or at least names, the never-built table a check reads", async () => {
   const p = await shopProject();
   const r = await p.json(["run", "daily_revenue", "--upstream"]);
   const daily = stepOf(r.json, "daily_revenue");
@@ -472,7 +475,7 @@ test("journey 16g: a time zone change is the reason given, not an SQL change", (
 
 // Fixed (was a reported bug): the run output counts a failing *warning* as a failed check: "checks 2/3 ok" on an ok step,
 // where §4.2 shows blocking checks and warnings apart ("checks 3/3 ok · 1 warning").
-test("journey 16h: human run output counts warnings apart from checks (checks 2/2 ok · 1 warning)", async () => {
+test.concurrent("journey 16h: human run output counts warnings apart from checks (checks 2/2 ok · 1 warning)", async () => {
   const { project: p } = await initProject();
   p.write("assets/numbers.sql", "-- key: n\n-- warn: n < 2\nSELECT * FROM (VALUES (1), (2), (3)) AS t(n)\n");
   const r = await p.croft(["run", "numbers"]);
@@ -483,7 +486,7 @@ test("journey 16h: human run output counts warnings apart from checks (checks 2/
 
 // Fixed (was a reported bug): a failed step's multi-line error (CHECK_FAILED with its sample rows) is printed as is under the
 // step, so its sample rows start at column 3 and break the run table; §3f shows them indented under the step.
-test("journey 16i: a failed step's sample rows are indented under the step in human run output", async () => {
+test.concurrent("journey 16i: a failed step's sample rows are indented under the step in human run output", async () => {
   const { project: p } = await initProject();
   p.write("assets/numbers.sql", "-- key: n\n-- check: n < 3\nSELECT * FROM (VALUES (1), (2), (3)) AS t(n)\n");
   const r = await p.croft(["run", "numbers"]);
@@ -501,7 +504,7 @@ test("journey 16i: a failed step's sample rows are indented under the step in hu
 // LIMIT 0) and then inserted its rows, in one transaction. Past one row group (122,880 rows), DuckDB 2.0.0 read
 // such a table as empty until it was reopened: the first `croft run src` left mart at 0 rows and a NULL total,
 // recorded stg's row count as 0, and the next run reported OUT_OF_BAND_CHANGE on stg.
-test("journey 16j: a SQL transform of 200,000 rows is whole for the SQL downstream, the catalog and the next run", async () => {
+test.concurrent("journey 16j: a SQL transform of 200,000 rows is whole for the SQL downstream, the catalog and the next run", async () => {
   const { project: p } = await initProject();
   p.write("assets/src.ts", `import { ingest } from "@zabaca/croft";
 

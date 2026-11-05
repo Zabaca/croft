@@ -1,10 +1,11 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanup as cleanupChildren, releaseHolder, spawnHolder } from "../../read/testkit.ts";
 import { putCatalog } from "../../history/catalog.ts";
 import { CHARGES_TS, cleanup, cli, DEAD, ISSUES_CATALOG, ISSUES_SEED, ISSUES_TS, makeProject, runsDb, seed, shape } from "./inspect-testkit.ts";
-import { parseLimit } from "./query.ts";
+import { inDirectory, parseLimit } from "./query.ts";
 
 afterAll(async () => {
   cleanupChildren();
@@ -489,5 +490,33 @@ describe("croft query: a table the warehouse does not have", () => {
       details: { table: "customers" },
     });
     expect(problem.fix).toBeUndefined();
+  });
+});
+
+describe("inDirectory", () => {
+  test("projects asked at once take turns: each runs in its own folder and the process ends where it began", async () => {
+    const a = realpathSync(mkdtempSync(join(tmpdir(), "croft-cwd-a-")));
+    const b = realpathSync(mkdtempSync(join(tmpdir(), "croft-cwd-b-")));
+    const began = process.cwd();
+    try {
+      const seen: string[] = [];
+      const inside = (dir: string) => inDirectory(dir, async () => {
+        seen.push(process.cwd());
+        await new Promise((r) => setTimeout(r, 20)); // the other asks now, while this one is inside
+        seen.push(process.cwd());
+        return dir;
+      });
+      expect(await Promise.all([inside(a), inside(b), inside(a)])).toEqual([a, b, a]);
+      expect(seen).toEqual([a, a, b, b, a, a]);
+      expect(process.cwd()).toBe(began);
+      // A call that throws neither keeps the folder nor holds up the next.
+      await expect(inDirectory(a, async () => { throw new Error("no"); })).rejects.toThrow("no");
+      expect(await inDirectory(b, async () => process.cwd())).toBe(b);
+      expect(process.cwd()).toBe(began);
+    } finally {
+      process.chdir(began);
+      rmSync(a, { recursive: true, force: true });
+      rmSync(b, { recursive: true, force: true });
+    }
   });
 });

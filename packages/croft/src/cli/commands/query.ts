@@ -73,17 +73,25 @@ export function parseLimit(v: unknown): number {
   return Number(text);
 }
 
+let directoryTurn: Promise<unknown> = Promise.resolve();
+
 /** Run `fn` with the process working directory at `dir`, so relative paths in SQL (which DuckDB and the gate
- *  both resolve against the process's directory) mean the project folder. */
-export async function inDirectory<T>(dir: string, fn: () => Promise<T>): Promise<T> {
-  const before = process.cwd();
-  if (before === dir) return fn();
-  process.chdir(dir);
-  try {
-    return await fn();
-  } finally {
-    process.chdir(before);
-  }
+ *  both resolve against the process's directory) mean the project folder. The directory is the process's, so calls take turns: two
+ *  projects asked at once in one process (tests that run side by side) would otherwise each restore the other's directory. */
+export function inDirectory<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+  const run = async (): Promise<T> => {
+    const before = process.cwd();
+    if (before === dir) return fn();
+    process.chdir(dir);
+    try {
+      return await fn();
+    } finally {
+      process.chdir(before);
+    }
+  };
+  const turn = directoryTurn.then(run, run);
+  directoryTurn = turn.catch(() => {});
+  return turn;
 }
 
 interface Raw { columns: ColumnInfo[]; rows: Row[]; rowCount: number }
