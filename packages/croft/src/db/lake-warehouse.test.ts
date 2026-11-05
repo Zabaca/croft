@@ -15,7 +15,7 @@ import { extensionPath, hostPlatform } from "./extension-files.ts";
 import { lakeRigReady, type LakeRig, RIG_SECRETS, rigConnection, startLakeRig, WRITER_KEY, WRITER_LOGIN } from "./lake-testkit.ts";
 import { bookkeepingOf } from "./bookkeeping.ts";
 import { columnNames } from "./bookkeeping-testkit.ts";
-import { ensureState } from "./state.ts";
+import { ensureState, lakeStamp, LOG_FORMAT_VERSION } from "./state.ts";
 import { closeAllWarehouses, type DuckWarehouse, openWarehouse } from "./warehouse.ts";
 
 const ready = lakeRigReady();
@@ -183,6 +183,71 @@ describe("a warehouse that is a lake", () => {
       proxy.stop();
     }
   }, 60_000);
+
+  maybe("the format check of a stamped lake reads no rows of _croft.meta: it costs the catalog 20 round trips or more less than the rows do (D199)", async () => {
+    const lake = await rig.lake();
+    const proxy = delayProxy(rig.pg.port);
+    try {
+      const root = mkdtempSync(join(tmpdir(), "croft-lakewh-"));
+      made.push(root);
+      const stateDir = join(root, ".croft");
+      mkdirSync(stateDir, { recursive: true });
+      const conn = rigConnection(rig, lake, { stateDir, extensionDir: ready.dir, override: { port: proxy.port } });
+      const base = { timezone: "UTC", root, stateDir, lake: conn, isTTY: false, register: false } as const;
+      const w = openWarehouse({ ...base, path: join(root, "w.duckdb"), mode: "read_write" });
+      await w.write("make state", (tx) => ensureState(tx, { bookkeeping: "log" }), { runId: "r1" });
+      // The lake moves on: three more tables, so that the inlined rows of _croft.meta are of an older schema version than the lake's now (D176).
+      for (const t of ["a", "b", "c"]) await w.write(`make ${t}`, (tx) => tx.exec(`CREATE TABLE ${t} AS SELECT range x FROM range(3)`), { runId: `r_${t}` });
+      let n = 0;
+      // What a command's first read costs: a new process, so the format is checked.
+      const first = async (): Promise<number> => {
+        const r = openWarehouse({ ...base, path: join(root, `r${++n}.duckdb`), mode: "read_only", profile: "query" });
+        try {
+          proxy.reset();
+          await r.read(async () => undefined, { purpose: "test" });
+          return proxy.trips();
+        } finally {
+          await r.close();
+        }
+      };
+      const stamped = await first();
+      await w.write("take the stamp off", (tx) => tx.exec("COMMENT ON TABLE _croft.meta IS NULL"), { runId: "r_unstamp" });
+      const unstamped = await first();
+      expect(unstamped - stamped).toBeGreaterThanOrEqual(20);
+      // The next write that makes state puts the stamp back, once.
+      await w.write("stamp", (tx) => ensureState(tx), { runId: "r_stamp" });
+      expect(await first()).toBe(stamped);
+      const snapshots = () => w.read(async (db) => Number((await db.all<{ n: number | bigint }>("SELECT count(*) AS n FROM ducklake_snapshots('lake')"))[0]!.n), { purpose: "test" });
+      const before = await snapshots();
+      await w.write("again", (tx) => ensureState(tx), { runId: "r_again" });
+      // A stamp that is there is not written again: the write's own snapshot is the only new one.
+      expect(await snapshots()).toBe(before + 1);
+      await w.close();
+    } finally {
+      proxy.stop();
+    }
+  }, 120_000);
+
+  maybe("a lake of a newer format is refused with the stamp a newer croft writes and without it (D144, D199)", async () => {
+    const lake = await rig.lake();
+    const { w, r } = await fresh({ lake });
+    // A new process each time: the format is checked once for a warehouse.
+    const reader = async () => (await fresh({ lake })).r;
+    await w.write("make t", (tx) => tx.exec("CREATE TABLE t AS SELECT range a FROM range(2)"), { runId: "r1" });
+    expect(await r.read((db) => lakeStamp(db), { purpose: "test" })).toBe(LOG_FORMAT_VERSION);
+    expect(await (await reader()).read(async (db) => Number((await db.all<{ n: number | bigint }>("SELECT count(*) AS n FROM t"))[0]!.n), { purpose: "test" })).toBe(2);
+    const next = LOG_FORMAT_VERSION + 1;
+    for (const stamp of [`croft format ${next}`, null]) {
+      await w.write("a newer croft", async (tx) => {
+        await tx.exec(stamp === null ? "COMMENT ON TABLE _croft.meta IS NULL" : `COMMENT ON TABLE _croft.meta IS '${stamp}'`);
+        await (await bookkeepingOf(tx)).upsert("meta", { key: "$1", value: "$2" }, ["format_version", String(next)]);
+      }, { runId: "r_newer" });
+      const err = await (await reader()).read(async () => 1, { purpose: "test" }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CroftError);
+      expect((err as CroftError).code).toBe("DB_NEWER_FORMAT");
+      expect((err as CroftError).message).toContain(`croft format ${next}`);
+    }
+  }, 120_000);
 
   maybe("a statement DuckDB refuses does not end a read's transaction for the statements after it", async () => {
     const { w } = await fresh();
