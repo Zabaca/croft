@@ -15,8 +15,8 @@ runs `INSTALL`, never autoloads, and never turns off DuckDB's signature check (a
 | lake mode (a `"lake"` block in croft.json) | ducklake, httpfs, postgres |
 | server mode over a lake (both settings) | quack, httpfs, ducklake, postgres |
 
-For one platform they download at about 22 MB (server mode) or 35 MB (lake mode) and take about 66 MB or 109 MB on disk
-(macOS arm64; Linux is larger). They live in croft's cache folder, `$XDG_CACHE_HOME/croft/extensions` (else
+For one platform the download is about 21 MB (server mode) or 34 MB (lake mode), and the unpacked files take about 66 MB or
+109 MB on disk (macOS arm64; Linux files are larger). They live in croft's cache folder, `$XDG_CACHE_HOME/croft/extensions` (else
 `~/.cache/croft/extensions`), shared by every project on the machine, in DuckDB's own layout
 (`v<DuckDB version>/<platform>/<file>.duckdb_extension`). `$CROFT_EXTENSION_DIR` names another folder instead (an image
 that holds the files, croft's tests).
@@ -31,10 +31,22 @@ Only when a mode needs a file this machine does not have, and always before the 
 - `croft fetch-extensions` fetches ahead of time, for a machine that has no network when croft runs (an image built with
   the files in it, a server behind a firewall): run it where there is network, in the project (it fetches what the
   project's modes need), or name the extensions, or `--all`. A file already there and correct is left alone; a file that
-  fails its check is replaced. `croft validate`, `croft doctor` and `croft status` fetch nothing; they report.
+  fails its check is replaced. `croft validate`, `croft doctor` and `croft status` fetch nothing; they report. A fetch that
+  was killed can leave a `.part-` file beside the target; the next fetch of that file removes the ones over a minute old.
 - `$CROFT_NO_FETCH=1` turns the first-use fetch off: a missing file is then EXTENSION_MISSING and `croft fetch-extensions`
   is the only way a file arrives. `$CROFT_EXTENSION_REPO` names another repository (a mirror); every file is still held to
   the same checksum, so a mirror cannot change what loads.
+
+## Scheduled runs
+
+A scheduled run (`croft schedule on`) starts from the per-user OS job, not from your shell, so it does not see your shell's
+environment. The four settings that change where the files are or whether they are fetched, `$CROFT_EXTENSION_DIR`,
+`$CROFT_NO_FETCH`, `$CROFT_EXTENSION_REPO` and `$XDG_CACHE_HOME`, are therefore copied into the job from the shell that ran
+`croft schedule on` (a folder made absolute), and `croft schedule on` says which it carried. Without them a scheduled run would
+look in the default cache folder, fetch the files a second time, or fail offline. Change a setting and run `croft schedule on`
+again to give the job the new one. `croft doctor` warns, for a project with a mode on and scheduling through the OS job, when
+this shell's settings are not the job's (it names the settings, never their values). The job file is readable by other users of
+the machine, so keep a login out of `$CROFT_EXTENSION_REPO`.
 
 ## What the checks say
 
@@ -43,7 +55,8 @@ pins for this DuckDB version and platform. A file that is not on the machine is 
 fetches it (`croft fetch-extensions httpfs quack`, in `fix.command` and `details.fetch`); a file that differs is
 EXTENSION_CHECKSUM_MISMATCH, or EXTENSION_WRONG_BUILD when its own footer says it is for another DuckDB or platform, with
 the same command as the fix (it replaces the file). A fetch that could not finish (no network, the server refusing) is
-EXTENSION_FETCH_FAILED; a download whose checksum differs from the pin is EXTENSION_CHECKSUM_MISMATCH with
+EXTENSION_FETCH_FAILED (with `details.kind` "write" when the file arrived whole but could not be stored, such as a folder
+where the file goes); a download whose checksum differs from the pin is EXTENSION_CHECKSUM_MISMATCH with
 `details.kind` "download", and nothing is written.
 
 `croft validate --json` has `data.extensionFiles` (one entry per mode the project needs: `ok`, `fetch`, and each

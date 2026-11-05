@@ -14,7 +14,7 @@ import type { RegistryEntry, SchedulingSetting } from "./os.ts";
 import {
   addProject, listProjects, LOCK_DB_SUFFIX, MISSING_PRUNE_DAYS, MISSING_PRUNE_MS, registryLockDbPath, registryLockPath,
 } from "./registry.ts";
-import { MAX_TICK_LOG_BYTES, TICK_TEMPLATE_VERSION, tickScriptSource, writeTickScript } from "./user-tick.ts";
+import { EXTENSION_ENV, MAX_TICK_LOG_BYTES, TICK_TEMPLATE_VERSION, tickScriptSource, writeTickScript } from "./user-tick.ts";
 
 let tmp: string;
 let userHome: string;
@@ -195,6 +195,15 @@ describe("each minute", () => {
     // Bun adds a few of its own to every process; everything else croft chose.
     const own = Object.keys(env).filter((k) => !/^(BUN_|__CF|_$)/.test(k) && k !== "OLDPWD" && k !== "PWD" && k !== "SHLVL");
     expect(own.sort()).toEqual(["CROFT_FORBID_OS_JOBS", "CROFT_HOME", "CROFT_JOB_LABEL", "CROFT_NOTIFY_DRY", "HOME", "LANG", "PATH", "TMPDIR"]);
+  });
+
+  test("the extension settings the job carries reach the child, so a scheduled run fetches and finds the files as the shell does (D200)", async () => {
+    project("on");
+    const settings = { CROFT_EXTENSION_DIR: "/srv/croft-ext", CROFT_NO_FETCH: "1", CROFT_EXTENSION_REPO: "http://127.0.0.1:9", XDG_CACHE_HOME: "/srv/cache" };
+    expect([...EXTENSION_ENV].map(String).sort()).toEqual(Object.keys(settings).sort());
+    runTick(settings);
+    const [i] = await invocations(1);
+    for (const [k, v] of Object.entries(settings)) expect(i!.env[k], k).toBe(v);
   });
 
   test("the child's output goes to the tick log", async () => {

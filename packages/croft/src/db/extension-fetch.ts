@@ -9,8 +9,8 @@
 // were loaded before it locked. $CROFT_NO_FETCH=1 turns the first off (a machine that must not reach the network, croft's tests):
 // a missing file is then EXTENSION_MISSING with the command as its fix.
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { CroftError } from "../core/errors.ts";
 import { extensionPath, fetchCommand, hostPlatform, platformError, resolveExtensionDir, verifyExtension } from "./extension-files.ts";
@@ -25,6 +25,9 @@ const DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
 
 /** The body may be this much over the pinned size (gzip headers, and a file that does not compress). */
 const BODY_MARGIN = 1_000_000;
+
+/** A `.part-` file older than this is the leftover of a fetch that was killed; a younger one may be another croft's, between its write and its rename. */
+const STALE_PART_MS = 60_000;
 
 /** The repository to fetch from: $CROFT_EXTENSION_REPO (a mirror, or a stand-in in croft's tests; every file is still checked against the pin), else DuckDB's. */
 export function repositoryOf(env: NodeJS.ProcessEnv = process.env): string {
@@ -82,8 +85,27 @@ export async function fetchExtensions(names: readonly ExtensionName[], o: FetchO
   return out;
 }
 
+/** Remove the temporary files an earlier fetch of this file left when it was killed between writing and renaming (the write below always removes its own). */
+function removeStaleParts(path: string): void {
+  const prefix = `${basename(path)}.part-`;
+  let names: string[];
+  try {
+    names = readdirSync(dirname(path));
+  } catch {
+    return;   // the folder is not there yet
+  }
+  for (const n of names) {
+    if (!n.startsWith(prefix)) continue;
+    const part = join(dirname(path), n);
+    try {
+      if (Date.now() - lstatSync(part).mtimeMs > STALE_PART_MS) rmSync(part, { force: true });
+    } catch { /* gone already, or not ours to remove: the fetch goes on */ }
+  }
+}
+
 async function download(name: ExtensionName, platform: Platform, dir: string, path: string, env: NodeJS.ProcessEnv, o: FetchOptions): Promise<Fetched> {
   const pin = EXTENSION_PINS[platform][name];
+  removeStaleParts(path);
   if (existsSync(path)) {
     try {
       verifyExtension(dir, name, platform);
@@ -150,6 +172,15 @@ async function download(name: ExtensionName, platform: Platform, dir: string, pa
   try {
     writeFileSync(tmp, bytes, { flag: "wx", mode: 0o644 });
     renameSync(tmp, path);
+  } catch (e) {
+    // The file is checked and ready but cannot be put in place: a folder where the file goes, a read-only or full disk.
+    throw new CroftError("EXTENSION_FETCH_FAILED", {
+      message: `fetched the ${name} extension from ${url} and it checks out, but could not store it at ${path}: ${e instanceof Error ? e.message : String(e)}`,
+      hint: `something is in the way of the file (a folder or a link at that path) or the folder cannot be written; remove what is at ${path}, or point $CROFT_EXTENSION_DIR at a folder croft can write, and run ${fetchCommand([name])} again`,
+      fix: { kind: "manual", description: `make ${path} a place croft can write the file, then run ${fetchCommand([name])}`, requiresHuman: true },
+      retryable: false,
+      details: { kind: "write", extension: name, platform, duckdb: DUCKDB_VERSION, path },
+    });
   } finally {
     rmSync(tmp, { force: true });
   }

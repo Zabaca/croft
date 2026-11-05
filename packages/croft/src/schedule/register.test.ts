@@ -9,7 +9,7 @@ import { CroftError } from "../core/errors.ts";
 import { croftHome, type CroftHome } from "./home.ts";
 import type { ExecOptions, ExecResult, OsRunner } from "./os.ts";
 import {
-  bunVersionOf, cronBlock, ensureJob, inspectJob, installedBunPath, isVersionManagedPath, jobPath, type JobOptions, pickBun, plistPath,
+  bunVersionOf, cronBlock, ensureJob, inspectJob, installedBunPath, installedSettings, isVersionManagedPath, jobPath, jobSettings, type JobOptions, pickBun, plistPath,
   plistXml, removeJob, upsertCronBlock,
 } from "./register.ts";
 import { tickScriptSource } from "./user-tick.ts";
@@ -231,7 +231,7 @@ describe("the LaunchAgent (macOS)", () => {
       ["/bin/launchctl", "bootout", `gui/501/${label}`],
       ["/bin/launchctl", "bootstrap", "gui/501", file],
     ]);
-    expect(r).toEqual({ kind: "launchd", label, file, bun: { path: BUN(), stable: true, version: "1.3.14", skipped: [] }, changed: true, tickScriptChanged: true });
+    expect(r).toEqual({ kind: "launchd", label, file, bun: { path: BUN(), stable: true, version: "1.3.14", skipped: [] }, changed: true, tickScriptChanged: true, settings: {} });
   });
 
   test("unchanged and loaded: nothing is rewritten or reloaded", () => {
@@ -391,7 +391,7 @@ describe("the crontab block (Linux)", () => {
       { argv: ["crontab", "-"], input: `${block(userHome, label)}\n` },
     ]);
     expect(readFileSync(home.tickScript, "utf8")).toBe(tickScriptSource());
-    expect(r).toEqual({ kind: "crontab", label, file: null, bun: { path: BUN(), stable: true, version: "1.3.14", skipped: [] }, changed: true, tickScriptChanged: true });
+    expect(r).toEqual({ kind: "crontab", label, file: null, bun: { path: BUN(), stable: true, version: "1.3.14", skipped: [] }, changed: true, tickScriptChanged: true, settings: {} });
   });
 
   test("ensureJob keeps the user's other lines and replaces an old block", () => {
@@ -489,5 +489,99 @@ describe("safety", () => {
     }
     expect((err as CroftError).problem.code).toBe("INSTALL_FAILED");
     expect((err as CroftError).problem.hint).toContain("croft serve");
+  });
+});
+
+describe("the extension settings the job carries (D200)", () => {
+  const SET = { CROFT_EXTENSION_DIR: "/srv/croft ext", CROFT_NO_FETCH: "1", CROFT_EXTENSION_REPO: "http://mirror.example/duckdb?a=1&b=2", XDG_CACHE_HOME: "/srv/cache" };
+
+  test("jobSettings takes only the four settings that are set, makes folders absolute and leaves the rest of the environment", () => {
+    expect(jobSettings({})).toEqual({});
+    expect(jobSettings({ CROFT_NO_FETCH: "", CROFT_EXTENSION_DIR: undefined, HOME: "/h", AWS_SECRET: "x" })).toEqual({});
+    expect(jobSettings({ ...SET, AWS_SECRET: "x" })).toEqual(SET);
+    expect(jobSettings({ CROFT_EXTENSION_DIR: "ext", XDG_CACHE_HOME: "cache" })).toEqual({ CROFT_EXTENSION_DIR: join(process.cwd(), "ext"), XDG_CACHE_HOME: join(process.cwd(), "cache") });
+  });
+
+  test("the plist carries them, escaped, after HOME and PATH, and plutil accepts it", () => {
+    const xml = plistXml({ label, bun: BUN(), home, platform: "darwin", settings: SET });
+    expect(xml).toContain("\t\t<key>CROFT_EXTENSION_DIR</key>\n\t\t<string>/srv/croft ext</string>");
+    expect(xml).toContain("<string>http://mirror.example/duckdb?a=1&amp;b=2</string>");
+    expect(xml.indexOf("<key>PATH</key>")).toBeLessThan(xml.indexOf("<key>CROFT_EXTENSION_DIR</key>"));
+    expect(xml.indexOf("<key>XDG_CACHE_HOME</key>")).toBeLessThan(xml.indexOf("</dict>\n\t<key>StartInterval"));
+    expect(plistXml({ label, bun: BUN(), home, platform: "darwin", settings: {} })).toBe(plistXml({ label, bun: BUN(), home, platform: "darwin" }));
+    if (process.platform !== "darwin" || !existsSync("/usr/bin/plutil")) return;
+    const file = join(tmp, "job.plist");
+    writeFileSync(file, xml);
+    expect(spawnSync("/usr/bin/plutil", ["-lint", file], { encoding: "utf8", env: { PATH: "/usr/bin:/bin" } }).stdout.trim()).toBe(`${file}: OK`);
+  });
+
+  test("ensureJob on a Mac writes them into the plist, reports them, and installedSettings reads them back", () => {
+    const r = ensureJob(fakeRunner().runner, home, mac({ env: SET }));
+    expect(r.settings).toEqual(SET);
+    expect(readFileSync(plistPath(home), "utf8")).toBe(plistXml({ label, bun: BUN(), home, platform: "darwin", settings: SET }));
+    expect(installedSettings(home, { platform: "darwin" })).toEqual(SET);
+  });
+
+  test("a job without them reads back as none, and no job reads back as null", () => {
+    expect(installedSettings(home, { platform: "darwin" })).toBeNull();
+    ensureJob(fakeRunner().runner, home, mac());
+    expect(installedSettings(home, { platform: "darwin" })).toEqual({});
+  });
+
+  test("a changed environment rewrites and reloads the job; the same one leaves it alone", () => {
+    ensureJob(fakeRunner().runner, home, mac());
+    const same = fakeRunner();
+    expect(ensureJob(same.runner, home, mac()).changed).toBe(false);
+    expect(same.calls.map((c) => c.argv[1])).toEqual(["print"]);
+    const changed = fakeRunner();
+    expect(ensureJob(changed.runner, home, mac({ env: { CROFT_NO_FETCH: "1" } })).changed).toBe(true);
+    expect(changed.calls.map((c) => c.argv[1])).toEqual(["bootout", "bootstrap"]);
+    expect(installedSettings(home, { platform: "darwin" })).toEqual({ CROFT_NO_FETCH: "1" });
+    // Run from a shell with none of them, the job drops them.
+    ensureJob(fakeRunner().runner, home, mac());
+    expect(installedSettings(home, { platform: "darwin" })).toEqual({});
+  });
+
+  test("the crontab line carries them as assignments before the command, quoted for sh and with % escaped", () => {
+    const line = cronBlock({ label, bun: BUN(), home, settings: { ...SET, CROFT_EXTENSION_REPO: "http://m.example/100%/x" } }).split("\n")[1]!;
+    expect(line).toBe(
+      `* * * * * CROFT_EXTENSION_DIR='/srv/croft ext' CROFT_NO_FETCH=1 CROFT_EXTENSION_REPO='http://m.example/100\\%/x' XDG_CACHE_HOME=/srv/cache ${BUN()} --no-env-file ${home.tickScript} >> ${home.tickLog} 2>&1`,
+    );
+    expect(cronBlock({ label, bun: BUN(), home, settings: {} })).toBe(cronBlock({ label, bun: BUN(), home }));
+  });
+
+  test("on Linux the line is read back: the Bun is still the first command word, and the settings are the assignments", () => {
+    const tricky = { ...SET, CROFT_EXTENSION_REPO: "http://m.example/100%/it's" };
+    for (const bun of [BUN(), "/home/a b/bun"]) {
+      const text = cronBlock({ label, bun, home, settings: tricky });
+      const { runner } = fakeRunner((argv) => (argv[1] === "-l" ? { stdout: `0 3 * * * backup.sh\n${text}\n` } : undefined));
+      expect(installedBunPath(home, linux({ runner }))).toBe(bun);
+      expect(installedSettings(home, linux({ runner }))).toEqual(tricky);
+      expect(inspectJob(runner, home, linux({ exists: (p) => p === bun }))).toMatchObject({ installed: true, bun, bunExists: true });
+    }
+  });
+
+  test("ensureJob on Linux installs them, and an unchanged environment leaves the table alone", () => {
+    let table = "";
+    const install = () => fakeRunner((argv, o) => {
+      if (argv[1] === "-l") return table ? { stdout: table } : { status: 1, stderr: "no crontab for ada\n" };
+      table = o.input ?? table;
+      return undefined;
+    });
+    const first = ensureJob(install().runner, home, linux({ env: SET }));
+    expect(first).toMatchObject({ changed: true, settings: SET });
+    expect(table).toContain("CROFT_NO_FETCH=1 ");
+    const again = install();
+    expect(ensureJob(again.runner, home, linux({ env: SET })).changed).toBe(false);
+    expect(again.calls.map((c) => c.argv)).toEqual([["crontab", "-l"]]);
+    expect(ensureJob(install().runner, home, linux()).changed).toBe(true);
+    expect(table).not.toContain("CROFT_NO_FETCH");
+  });
+
+  test("a table from before this change, with no assignments, reads as no settings", () => {
+    const { runner } = fakeRunner((argv) => (argv[1] === "-l" ? { stdout: `# croft:${label} begin\n* * * * * /old/bun --no-env-file /old/tick.ts\n# croft:${label} end\n` } : undefined));
+    expect(installedSettings(home, linux({ runner }))).toEqual({});
+    expect(installedBunPath(home, linux({ runner }))).toBe("/old/bun");
+    expect(installedSettings(home, linux())).toBeNull();
   });
 });

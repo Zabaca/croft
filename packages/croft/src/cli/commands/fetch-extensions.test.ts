@@ -1,7 +1,7 @@
 // croft fetch-extensions (DESIGN.md D195): the command EXTENSION_MISSING names as its fix. Against a stand-in repository and small
 // files pinned in place of DuckDB's (extension-repo-testkit.ts); no test reaches DuckDB's servers.
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { extensionPath, hostPlatform } from "../../db/extension-files.ts";
@@ -130,5 +130,14 @@ describe("croft fetch-extensions", () => {
     const out = await cli(["fetch-extensions", "quack", "--json"], { cwd: projectWith({ serverMode: true }).root, env: { ...envFor(r, folder()), CROFT_EXTENSION_REPO: "http://127.0.0.1:9" } });
     expect(out.exit).toBe(2);
     expect(out.json.problems[0]).toMatchObject({ code: "EXTENSION_FETCH_FAILED", retryable: true, fix: { kind: "command", command: "croft fetch-extensions quack" } });
+  });
+
+  t("a folder where the file goes is a croft error (exit 2) naming the path, not a raw rename error", async () => {
+    const r = repo();
+    const dir = folder();
+    mkdirSync(extensionPath(dir, "quack", platform!), { recursive: true });
+    const out = await cli(["fetch-extensions", "quack", "--json"], { cwd: projectWith({ serverMode: true }).root, env: envFor(r, dir) });
+    expect(out.exit).toBe(2);
+    expect(out.json.problems[0]).toMatchObject({ code: "EXTENSION_FETCH_FAILED", retryable: false, details: { kind: "write", path: extensionPath(dir, "quack", platform!) } });
   });
 });

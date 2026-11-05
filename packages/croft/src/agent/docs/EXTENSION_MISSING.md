@@ -18,7 +18,8 @@ The project's data was not touched.
 
 What to do:
 - For kind "file", run the fix, `croft fetch-extensions httpfs quack` (the extensions named in details.missing). It
-  needs the network once, about 22 MB for server mode or 35 MB for lake mode, and keeps the files in croft's cache
+  needs the network once, a download of about 21 MB for server mode or 34 MB for lake mode (about 66 MB and 109 MB on
+  disk once unpacked), and keeps the files in croft's cache
   folder, shared by every project on the machine (croft docs extensions). Then run `croft validate` again; it passes
   when every file is there and matches its pin.
 - A project that does not need the mode can turn it off instead: remove `"serverMode"` from croft.json, which is the

@@ -2,7 +2,7 @@
 // 127.0.0.1 (extension-repo-testkit.ts) and to small files pinned in place of DuckDB's; the real servers are reached by hand, once
 // (DESIGN.md D195's record), and never by a test.
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { CroftError } from "../core/errors.ts";
@@ -136,6 +136,39 @@ describe("fetching a file", () => {
     await fetchExtension("quack", { dir, env: { CROFT_EXTENSION_REPO: repo.url }, log: () => {} });
     expect(existsSync(victim)).toBe(false);
     expect(readFileSync(path).equals(content)).toBe(true);
+  });
+
+  t("the next fetch removes the temporary files a killed one left, and leaves a young one, which may be another croft's", async () => {
+    const { repo } = repoServing();
+    const dir = folder();
+    const path = extensionPath(dir, "quack", platform!);
+    mkdirSync(dirname(path), { recursive: true });
+    const killed = `${path}.part-0123456789abcdef`;
+    const running = `${path}.part-fedcba9876543210`;
+    const other = join(dirname(path), "httpfs.duckdb_extension.part-0123456789abcdef");
+    for (const f of [killed, running, other]) writeFileSync(f, "half a file");
+    const anHourAgo = new Date(Date.now() - 3_600_000);
+    utimesSync(killed, anHourAgo, anHourAgo);
+    utimesSync(other, anHourAgo, anHourAgo);
+    await fetchExtension("quack", { dir, env: { CROFT_EXTENSION_REPO: repo.url }, log: () => {} });
+    expect(existsSync(killed)).toBe(false);
+    expect(existsSync(running)).toBe(true);
+    // Only the file being fetched has its leftovers removed.
+    expect(existsSync(other)).toBe(true);
+  });
+
+  t("a folder where the file goes is a croft error that says what is in the way, not a raw rename error", async () => {
+    const { repo } = repoServing();
+    const dir = folder();
+    const path = extensionPath(dir, "quack", platform!);
+    mkdirSync(path, { recursive: true });
+    const err = (await fetchExtension("quack", { dir, env: { CROFT_EXTENSION_REPO: repo.url }, log: () => {} }).catch((e: unknown) => e)) as CroftError;
+    expect(err).toBeInstanceOf(CroftError);
+    expect(err.code).toBe("EXTENSION_FETCH_FAILED");
+    expect(err.problem.retryable).toBe(false);
+    expect(err.problem.details).toMatchObject({ kind: "write", extension: "quack", path });
+    expect(err.problem.message).toContain(path);
+    expect(readdirSync(dirname(path)).filter((n) => n.includes(".part-"))).toEqual([]);
   });
 
   t("an answer that is not gzip is a failed fetch, not a crash", async () => {

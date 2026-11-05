@@ -8,6 +8,11 @@ details.extension names the file and details.url where croft asked.
 
 This is retryable: the same fetch works once the machine can reach the server.
 
+With details.kind "write" the file arrived and passed its checksum, but croft could not store it at details.path: a
+folder or a link is at that path, or the folder cannot be written. That is not retryable as it stands: remove what is
+in the way (the user's call, since it is their folder) or point `$CROFT_EXTENSION_DIR` at a folder croft can write,
+then run the fix.
+
 What to do:
 - Run the fix, `croft fetch-extensions <extension>`, where there is network. It fetches the file into croft's cache
   folder (croft docs extensions). If the machine goes through a proxy, `HTTPS_PROXY` must be set for it.

@@ -9,7 +9,11 @@ import { dirname, join } from "node:path";
 import { extensionsReady } from "../../db/extension-dir-testkit.ts";
 import { extensionPath, hostPlatform } from "../../db/extension-files.ts";
 import { localLakeBlock, useLake } from "../../db/lake-testkit.ts";
+import { RunsDb } from "../../history/runs-db.ts";
 import { loadProject } from "../../project/root.ts";
+import { croftHome } from "../../schedule/home.ts";
+import type { OsRunner } from "../../schedule/os.ts";
+import { ensureJob } from "../../schedule/register.ts";
 import { SELF_ROOT } from "../launcher.ts";
 import { defaultDeps, type DoctorDeps, formatDoctor, runDoctor } from "./doctor.ts";
 import { cleanup, cli, makeProject, type TestProject } from "./inspect-testkit.ts";
@@ -182,6 +186,85 @@ describe("croft doctor", () => {
     expect(line).toMatchObject({ section: "environment", status: "error", code: "EXTENSION_MISSING" });
     expect(line.text).toContain("croft fetch-extensions httpfs postgres ducklake");
     expect(formatDoctor(data, problems)).toContain("croft fetch-extensions httpfs postgres ducklake");
+  });
+});
+
+describe("croft doctor and the scheduled job's extension settings (D200)", () => {
+  /** The project's scheduling turned on through the per-user OS job, as `croft schedule on` leaves it. */
+  function scheduled(root: string): void {
+    const db = RunsDb.open(join(root, ".croft"));
+    db.setScheduling({ state: "on", via: "os-job" });
+    db.heartbeat(AT);
+    db.close();
+  }
+
+  /** A fake machine: a home folder, and a runner that holds a crontab and answers launchctl. */
+  function machine() {
+    const userHome = realpathSync(mkdtempSync(join(tmpdir(), "croft-jobenv-")));
+    scratch.push(userHome);
+    const home = croftHome({ HOME: userHome, CROFT_HOME: join(userHome, ".croft"), CROFT_JOB_LABEL: `dev.croft.test-${process.pid}-${Math.random().toString(36).slice(2, 8)}` });
+    let table = "";
+    const runner: OsRunner = {
+      exec(argv, o) {
+        if (argv[0] === "crontab" && argv[1] === "-l") return table ? { status: 0, stdout: table, stderr: "" } : { status: 1, stdout: "", stderr: "no crontab for ada\n" };
+        if (argv[0] === "crontab") table = o?.input ?? table;
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    };
+    return { home, runner };
+  }
+
+  const bun = { exists: (p: string) => p === process.execPath, execPath: process.execPath, runningVersion: Bun.version, bunVersion: () => Bun.version, sleep: () => {}, uid: 501 };
+  const SHELL = { CROFT_EXTENSION_DIR: "/srv/ext", CROFT_NO_FETCH: "1" };
+  const line = (checks: { id: string }[]) => checks.find((c) => c.id === "scheduling.extensions") as { status: string; text: string; details: { differences: string[] } } | undefined;
+
+  for (const platform of ["darwin", "linux"] as const) {
+    test(`${platform}: settings set in this shell and not in the job are a warning that says what to run; the same settings are silent`, async () => {
+      const p = projectWith();
+      scheduled(p.root);
+      const m = machine();
+      ensureJob(m.runner, m.home, { platform, env: {}, ...bun });
+      const deps = (env: Record<string, string>): DoctorDeps => ({ ...doctorDeps(env), platform, croftHome: m.home, osRunner: m.runner });
+      const differs = await runDoctor(p.root, deps(SHELL));
+      const c = line(differs.data.checks)!;
+      expect(c.status).toBe("warn");
+      expect(c.details.differences).toEqual([
+        "CROFT_EXTENSION_DIR is set in this shell but not in the scheduled job",
+        "CROFT_NO_FETCH is set in this shell but not in the scheduled job",
+      ]);
+      expect(c.text).toContain("croft schedule on");
+      expect(c.text).not.toContain("/srv/ext");
+      expect(differs.data.summary.warnings).toBeGreaterThan(0);
+      // Installed from this shell, the job and the shell agree.
+      ensureJob(m.runner, m.home, { platform, env: SHELL, ...bun });
+      expect(line((await runDoctor(p.root, deps(SHELL))).data.checks)).toBeUndefined();
+      // A setting that is not the same in both is named too, and one only the job has.
+      const other = await runDoctor(p.root, deps({ CROFT_EXTENSION_DIR: "/elsewhere" }));
+      expect(line(other.data.checks)!.details.differences).toEqual([
+        "CROFT_EXTENSION_DIR is not the same in this shell and in the scheduled job",
+        "CROFT_NO_FETCH is set in the scheduled job but not in this shell",
+      ]);
+    });
+  }
+
+  test("silent when no mode is on, when scheduling is off, when ticks come from croft serve, and when there is no job to read", async () => {
+    const m = machine();
+    ensureJob(m.runner, m.home, { platform: "darwin", env: {}, ...bun });
+    const deps = (env: Record<string, string>): DoctorDeps => ({ ...doctorDeps(env), platform: "darwin", croftHome: m.home, osRunner: m.runner });
+    const noMode = projectWith({ serverMode: false });
+    scheduled(noMode.root);
+    expect(line((await runDoctor(noMode.root, deps(SHELL))).data.checks)).toBeUndefined();
+    const off = projectWith();
+    expect(line((await runDoctor(off.root, deps(SHELL))).data.checks)).toBeUndefined();
+    const serve = projectWith();
+    const db = RunsDb.open(join(serve.root, ".croft"));
+    db.setScheduling({ state: "on", via: "serve" });
+    db.close();
+    expect(line((await runDoctor(serve.root, deps(SHELL))).data.checks)).toBeUndefined();
+    const lone = projectWith();
+    scheduled(lone.root);
+    const empty = machine();
+    expect(line((await runDoctor(lone.root, { ...deps(SHELL), croftHome: empty.home })).data.checks)).toBeUndefined();
   });
 });
 
