@@ -246,6 +246,9 @@ if (!LAKE) {
       expect(meta).toMatchObject({ format_version: "4", bookkeeping: "log", moved_into_lake: expect.any(String) });
       const status = await p.json(["status"]);
       expect(status.json.database).toMatch(/^lake /);
+      // croft's own records came in as rows of the catalog, not as files of the store (D197): doctor has nothing to say about them.
+      const doctor = await p.json(["doctor"]);
+      expect(doctor.json.data.checks.find((c: { id: string }) => c.id === "lake.bookkeeping"), show(doctor)).toBeUndefined();
     }, 300_000);
 
 

@@ -833,7 +833,7 @@ async function checkLakeMaintenance(r: Report, d: DoctorDeps, project: Project, 
     const bytes = seen.bookkeeping.reduce((n, t) => n + t.bytes, 0);
     const tables = seen.bookkeeping.map((t) => `_croft.${t.table}`).join(", ");
     const p = problem("LAKE_BOOKKEEPING_IN_FILES", {
-      message: `croft's own bookkeeping is in ${formatCount(files)} ${files === 1 ? "file" : "files"} of the store (${formatBytes(bytes)}: ${tables}), left there by a maintenance pass of an older croft: every command reads them over the network, so each is slower than it needs to be, by seconds on a far store`,
+      message: `croft's own bookkeeping is in ${formatCount(files)} ${files === 1 ? "file" : "files"} of the store (${formatBytes(bytes)}: ${tables}) and not in the catalog: every command reads them over the network, so each is slower than it needs to be, by seconds on a far store`,
       hint: "croft maintain brings the rows back into the catalog (its first step), and the next pass or two deletes the files; croft docs LAKE_BOOKKEEPING_IN_FILES",
       fix: { kind: "command", description: "bring croft's bookkeeping back into the catalog", command: "croft maintain" },
       details: { tables: seen.bookkeeping, files, bytes },

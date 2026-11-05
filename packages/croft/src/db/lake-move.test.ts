@@ -14,6 +14,7 @@ import {
   copyIntoLake, fingerprints, inexactColumns, inspectLake, inventoryOf, type MoveMarker, newMoveTag, refuseInexact, refuseMoveTypes, switchLakeOn,
   undoCopy, verifyLake,
 } from "./lake-move.ts";
+import { bookkeepingInFiles, pruneBookkeeping } from "./lake-maintenance.ts";
 import { lakeRigReady, type LakeRig, openTestLake, startLakeRig, type TestLake, type TestLakeKind } from "./lake-testkit.ts";
 import { closeAllWarehouses, openWarehouse } from "./warehouse.ts";
 
@@ -157,6 +158,41 @@ for (const kind of ["local", "postgres"] as const) {
       // A lake that holds a copy is not filled again.
       await expect(copyIntoLake(l.w, file, inv, marker([]), { runId: "r_again", label: "the lake" })).rejects.toMatchObject({ problem: { code: "MOVE_LAKE_NOT_EMPTY" } });
     }, 180_000);
+
+    maybe("a bookkeeping table of more rows than a lake keeps in its catalog in one insert is copied in inserts that stay there, and the proof holds it equal", async () => {
+      const l = await fresh(kind);
+      // 40 write records and 25 files read: well over the 10 rows an insert may have and still stay in the catalog.
+      const file = await sourceFile(l, [
+        `INSERT INTO _croft.writes SELECT 'github_issues', TIMESTAMPTZ '2026-09-23 00:00:00+00' + INTERVAL (range) HOUR, 'r_more_' || range, 'merge', 2, 1, 0, 1, 0, NULL, NULL, NULL, NULL, '[]', 'hash-1', 1 FROM range(40)`,
+        `INSERT INTO _croft.files SELECT 'github_issues', 'files/f' || range || '.csv', 100 + range, TIMESTAMPTZ '2026-09-23 00:00:00+00', 'e' || range, md5(range::VARCHAR), TIMESTAMPTZ '2026-09-23 00:00:00+00' FROM range(25)`,
+      ]);
+      const inv = await l.w.read((sql) => withTrashFile(sql, file, (alias) => inventoryOf(sql, alias)), { purpose: "test" });
+      expect(inv.bookkeeping).toContainEqual({ table: "writes", rows: 42 });
+      const copied = await copyIntoLake(l.w, file, inv, marker(inv.tables.map((t) => ({ name: t.name, rows: t.rows }))), { runId: "r_move", label: "the lake" });
+      expect(copied.bookkeepingRows).toBe(1 + 6 + 0 + 25 + 42);
+      // croft's own records are rows of the catalog, in no file of the store (D197), and equal to the file's.
+      expect(await l.w.read((sql) => bookkeepingInFiles(sql), { purpose: "test" })).toEqual([]);
+      expect((await verifyLake(l.reader, file, inv)).differences).toEqual([]);
+      const lake = await l.reader.read(async (sql) => ({
+        writes: (await sql.all<{ n: number | bigint }>("SELECT count(*) AS n FROM _croft.writes"))[0]!.n,
+        seqs: (await sql.all<{ n: number | bigint }>("SELECT count(DISTINCT seq) AS n FROM _croft.writes_log"))[0]!.n,
+      }), { purpose: "test" });
+      expect([Number(lake.writes), Number(lake.seqs)]).toEqual([42, 42]);
+    }, 180_000);
+
+    maybe("a bookkeeping table of more rows than a move inlines keeps its first 1,000 in the catalog and the rest in one file, which a pass of croft maintain brings back", async () => {
+      const l = await fresh(kind);
+      const file = await sourceFile(l, [
+        `INSERT INTO _croft.writes SELECT 'github_issues', TIMESTAMPTZ '2026-09-23 00:00:00+00' + INTERVAL (range) MINUTE, 'r_more_' || range, 'merge', 2, 1, 0, 1, 0, NULL, NULL, NULL, NULL, '[]', 'hash-1', 1 FROM range(1198)`,
+      ]);
+      const inv = await l.w.read((sql) => withTrashFile(sql, file, (alias) => inventoryOf(sql, alias)), { purpose: "test" });
+      expect(inv.bookkeeping).toContainEqual({ table: "writes", rows: 1200 });
+      await copyIntoLake(l.w, file, inv, marker(inv.tables.map((t) => ({ name: t.name, rows: t.rows }))), { runId: "r_move", label: "the lake" });
+      expect((await l.w.read((sql) => bookkeepingInFiles(sql), { purpose: "test" })).map((t) => [t.table, t.files, t.ranges.map((r) => r.count)])).toEqual([["writes_log", 1, [200]]]);
+      expect((await verifyLake(l.reader, file, inv)).differences).toEqual([]);
+      const pass = await l.w.write("maintenance", (sql) => pruneBookkeeping(sql), { runId: "r_pass", transaction: false, touchesLake: false });
+      expect(pass).toMatchObject({ reinlined: 1, reinlinedRows: 200, leftInFiles: 0 });
+    }, 240_000);
 
     maybe("a difference is found and named, and the undo takes the copy out only while nothing has written the lake since", async () => {
       const l = await fresh(kind);
