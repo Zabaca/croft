@@ -57,7 +57,7 @@ export function lakeConnection(project: Project, env: ProjectEnv, o: { extension
     kind: lake.kind,
     secretDir,
     secretNames: names,
-    mode: (access) => lakeMode(lake, project, access, base, secret, { SSL_CERT_FILE: env.lookup("SSL_CERT_FILE")?.value }, o.listsBucket),
+    mode: (access) => lakeMode(lake, project, access, base, secret, { tlsEnv: { SSL_CERT_FILE: env.lookup("SSL_CERT_FILE")?.value }, listsBucket: o.listsBucket }),
   };
 }
 
@@ -68,7 +68,7 @@ export function lakeOption(project: Project, env: ProjectEnv, o: { listsBucket?:
 }
 
 function lakeMode(lake: LakeConfig, project: Project, access: "write" | "read", base: Pick<ModeSpec, "secretDir" | "extensionDir">, secret: (name: string) => string,
-  tlsEnv: NodeJS.ProcessEnv, listsBucket?: true): ModeSpec {
+  o: { tlsEnv: NodeJS.ProcessEnv; listsBucket?: true }): ModeSpec {
   if (lake.kind === "local") {
     const { catalog, data } = localLakePaths(lake, project.root);
     // A reader never makes the lake; the machine that writes does, with the folders it needs.
@@ -81,8 +81,8 @@ function lakeMode(lake: LakeConfig, project: Project, access: "write" | "read", 
   const login = access === "write" ? lake.catalog.writer : lake.catalog.reader;
   const key = access === "write" ? lake.bucket.writer : lake.bucket.reader;
   const b = lake.bucket;
-  const tls = catalogTls(lake.catalog, project.root, { env: tlsEnv });
-  const caFile = storeCaFile(b, project.root, { env: tlsEnv });
+  const tls = catalogTls(lake.catalog, project.root, { env: o.tlsEnv });
+  const caFile = storeCaFile(b, project.root, { env: o.tlsEnv });
   return {
     ...base,
     kind: "lake",
@@ -92,7 +92,7 @@ function lakeMode(lake: LakeConfig, project: Project, access: "write" | "read", 
         path: bucketPath(b), keyId: secret(key.keyIdSecret), secretKey: secret(key.secretKeySecret),
         ...(key.sessionTokenSecret ? { sessionToken: secret(key.sessionTokenSecret) } : {}),
         ...(b.endpoint ? { endpoint: b.endpoint } : {}), ...(b.region ? { region: b.region } : {}), urlStyle: b.urlStyle, useSsl: b.useSsl,
-        ...(caFile ? { caFile } : {}), ...(listsBucket ? { listsBucket } : {}),
+        ...(caFile ? { caFile } : {}), ...(o.listsBucket ? { listsBucket: o.listsBucket } : {}),
       },
       access,
     },

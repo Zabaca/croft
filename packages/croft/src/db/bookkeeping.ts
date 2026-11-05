@@ -273,16 +273,12 @@ class LogBookkeeping implements Bookkeeping {
   }
 
   async update(table: StateTableName, set: Record<string, string>, where: string, params: unknown[] = []): Promise<void> {
-    await this.append(table, (high) =>
-      `INSERT INTO ${logOf(table)} BY NAME SELECT * REPLACE (${Object.entries(set).map(([c, e]) => `${e} AS ${c}`).join(", ")}),
-         ${high} + row_number() OVER () AS seq, false AS closed
-       FROM _croft.${table} WHERE ${where}`, params);
+    const changed = Object.entries(set).map(([c, e]) => `${e} AS ${c}`).join(", ");
+    await this.appendRows(table, `SELECT * REPLACE (${changed}) FROM _croft.${table} WHERE ${where}`, params, false);
   }
 
   async remove(table: StateTableName, where: string, params: unknown[] = []): Promise<void> {
-    await this.append(table, (high) =>
-      `INSERT INTO ${logOf(table)} BY NAME SELECT *, ${high} + row_number() OVER () AS seq, true AS closed
-       FROM _croft.${table} WHERE ${where}`, params);
+    await this.appendRows(table, `SELECT * FROM _croft.${table} WHERE ${where}`, params, true);
   }
 
   async rekey(table: StateTableName, column: string, from: string, to: string): Promise<void> {
@@ -305,26 +301,38 @@ class LogBookkeeping implements Bookkeeping {
     const [twice] = await this.tx.all<{ n: number | bigint }>(
       `SELECT count(*) AS n FROM (SELECT 1 FROM (${select}) AS s GROUP BY ${key.map((k) => `s.${k}`).join(", ")} HAVING count(*) > 1)`, params);
     if (Number(twice?.n ?? 0) > 0) throw this.duplicate(table, "was given a key twice");
-    // In a lake an insert of more rows than its inlining limit is written as a Parquet file, and every read of the table then goes to the store
-    // (D179): the rows are kept aside and go in a limit's worth at a time, up to INLINE_MAX_ROWS of them; any more is one insert.
+    await this.appendRows(table, select, params, false);
+  }
+
+  /** Append the rows of a SELECT to the log, numbered in order from its highest `seq`, each a closing row or none. In a lake an insert of more rows
+   *  than its inlining limit is written as a Parquet file, and every read of the table then goes to the store (D179): the rows are kept aside
+   *  and go in a limit's worth at a time, up to INLINE_MAX_ROWS of them; any more is one insert (D197, and for remove, update and rekey D198). */
+  private async appendRows(table: StateTableName, select: string, params: unknown[], closed: boolean): Promise<void> {
     const limit = (this.perTx ??= await inLake(this.tx)) ? await inliningLimit(this.tx) : 0;
     if (limit <= 0) {
       await this.append(table, (high) =>
-        `INSERT INTO ${logOf(table)} BY NAME SELECT s.*, ${high} + row_number() OVER () AS seq, false AS closed FROM (${select}) AS s`, params);
+        `INSERT INTO ${logOf(table)} BY NAME SELECT s.*, ${high} + row_number() OVER () AS seq, ${closed} AS closed FROM (${select}) AS s`, params);
       return;
     }
     const kept = `__croft_insert_${table}`;
     await this.tx.exec(`CREATE OR REPLACE TEMP TABLE ${kept} AS SELECT row_number() OVER () AS __n, s.* FROM (${select}) AS s`, params);
+    let failed = true;
     try {
       const [all] = await this.tx.all<{ n: number | bigint }>(`SELECT count(*) AS n FROM ${kept}`);
       const total = Number(all?.n ?? 0);
       const small = Math.min(total, INLINE_MAX_ROWS);
       const write = (from: number, to: number) => this.append(table, (high) =>
-        `INSERT INTO ${logOf(table)} BY NAME SELECT * EXCLUDE (__n), ${high} + row_number() OVER (ORDER BY __n) AS seq, false AS closed FROM ${kept} WHERE __n > ${from} AND __n <= ${to}`, []);
+        `INSERT INTO ${logOf(table)} BY NAME SELECT * EXCLUDE (__n), ${high} + row_number() OVER (ORDER BY __n) AS seq, ${closed} AS closed FROM ${kept} WHERE __n > ${from} AND __n <= ${to}`, []);
       for (let from = 0; from < small; from += limit) await write(from, Math.min(from + limit, small));
       if (total > small) await write(small, total);
+      failed = false;
     } finally {
-      await this.tx.exec(`DROP TABLE IF EXISTS ${kept}`);
+      // After a failure the transaction is aborted and the drop would throw over the error that aborted it (D198); the rollback takes the table too.
+      try {
+        await this.tx.exec(`DROP TABLE IF EXISTS ${kept}`);
+      } catch (e) {
+        if (!failed) throw e;
+      }
     }
   }
 }

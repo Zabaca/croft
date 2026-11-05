@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CroftError } from "../core/errors.ts";
 import type { Sql } from "../core/types.ts";
+import { bookkeepingInFiles } from "./lake-maintenance.ts";
 import { bookkeepingOf, type BookkeepingKind, seqResetSql, STATE_SPECS, type StateTableName } from "./bookkeeping.ts";
 import { columnNames, sqlOver } from "./bookkeeping-testkit.ts";
 import { connect, instanceConfig } from "./connect.ts";
@@ -313,6 +314,75 @@ describe("the log adapter", () => {
       const seqs = (await tx.all<{ seq: number | bigint }>(`SELECT seq FROM _croft.assets_log ORDER BY seq`)).map((r) => Number(r.seq));
       expect(seqs).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     });
+  });
+
+  describe("in a lake a write of more rows than an insert may have stays in the catalog (D198)", () => {
+    // 40 file records of one asset: well over the 10 rows an insert may have and still stay in the catalog (D179).
+    const seed = (tx: Sql) => tx.exec(`INSERT INTO _croft.files_log SELECT 'a', 'f' || range || '.csv', range, NULL, NULL, NULL, NULL, range + 1, false FROM range(40)`);
+    const inFiles = (t: Target) => t.tx((tx) => bookkeepingInFiles(tx));
+    const latest = async (t: Target) => (await t.read("files")) as { asset: string; path: string; size: number }[];
+
+    async function seeded(): Promise<Target> {
+      const t = await lakeTarget();
+      await t.tx(async (tx) => { await ensureState(tx, { bookkeeping: "log" }); await (await bookkeepingOf(tx)).insertSelect("files", `SELECT 'a' AS asset, 'f' || range || '.csv' AS path, range AS size FROM range(40)`); });
+      expect(await inFiles(t)).toEqual([]);
+      return t;
+    }
+
+    test("remove of 40 rows leaves a closing row for each, in the catalog", async () => {
+      if (!lakeExt.ready) return;
+      const t = await seeded();
+      await t.tx(async (tx) => (await bookkeepingOf(tx)).remove("files", "asset = $1", ["a"]));
+      expect(await inFiles(t)).toEqual([]);
+      expect(await latest(t)).toEqual([]);
+      const seqs = await t.tx((tx) => tx.all<{ n: number | bigint; d: number | bigint }>(`SELECT count(*) AS n, count(DISTINCT seq) AS d FROM _croft.files_log`));
+      expect([Number(seqs[0]!.n), Number(seqs[0]!.d)]).toEqual([80, 80]);
+    });
+
+    test("update of 40 rows writes the new rows in the catalog and reads as the new values", async () => {
+      if (!lakeExt.ready) return;
+      const t = await seeded();
+      await t.tx(async (tx) => (await bookkeepingOf(tx)).update("files", { sha256: "'changed'" }, "asset = $1", ["a"]));
+      expect(await inFiles(t)).toEqual([]);
+      const rows = (await t.read("files")) as { sha256: string }[];
+      expect(rows).toHaveLength(40);
+      expect(new Set(rows.map((r) => r.sha256))).toEqual(new Set(["changed"]));
+    });
+
+    test("rekey of 40 rows (a rename) moves them all, in the catalog", async () => {
+      if (!lakeExt.ready) return;
+      const t = await seeded();
+      await t.tx(async (tx) => (await bookkeepingOf(tx)).rekey("files", "asset", "a", "b"));
+      expect(await inFiles(t)).toEqual([]);
+      const rows = await latest(t);
+      expect(rows).toHaveLength(40);
+      expect(new Set(rows.map((r) => r.asset))).toEqual(new Set(["b"]));
+    });
+
+    test("a change of more rows than a move inlines (1,000) still goes in one insert for the rest, and reads right", async () => {
+      if (!lakeExt.ready) return;
+      const t = await lakeTarget();
+      await t.tx(async (tx) => { await ensureState(tx, { bookkeeping: "log" }); await seed(tx); });
+      await t.tx(async (tx) => {
+        const bk = await bookkeepingOf(tx);
+        await bk.insertSelect("files", `SELECT 'z' AS asset, 'g' || range || '.csv' AS path, range AS size FROM range(1100)`);
+        await bk.remove("files", "asset = $1", ["z"]);
+      });
+      expect(await latest(t)).toHaveLength(40);
+    });
+  });
+
+  test("a chunk of an insert that fails reports its own error, not the drop of the temporary table that follows (D198)", async () => {
+    if (!lakeExt.ready) return;
+    const t = await lakeTarget();
+    // 'abc' cannot become the BIGINT size: the failure comes at the chunk's insert, after the rows were kept aside.
+    await expect(t.tx(async (tx) => {
+      await ensureState(tx, { bookkeeping: "log" });
+      await (await bookkeepingOf(tx)).insertSelect("files", `SELECT 'a' AS asset, 'p.csv' AS path, 'abc' AS size`);
+    })).rejects.toThrow(/Conversion|Could not convert|abc/i);
+    // The transaction rolled back; the next one writes as if nothing had happened.
+    await t.tx(async (tx) => (await bookkeepingOf(tx)).insertSelect("files", `SELECT 'a' AS asset, 'p.csv' AS path, 1 AS size`));
+    expect(await t.read("files")).toMatchObject([{ asset: "a", path: "p.csv" }]);
   });
 
   test("a row somebody inserted by hand, with no number, is older than any row croft writes", async () => {

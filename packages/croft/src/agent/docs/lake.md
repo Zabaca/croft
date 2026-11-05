@@ -82,9 +82,11 @@ read-only key is what keeps a reader that got past the gate out of the bucket, s
 A hosted catalog is a round trip away from the machine that runs croft, and DuckLake pays the catalog several round trips for
 every transaction. croft keeps what a command asks of the lake in few transactions: a read is one, an ingest reads its own
 state once, and `croft doctor` reads the lake once. At 41 ms, on a four-asset project, a run with nothing new takes about 5 s,
-a `croft query` about 4 s and `croft doctor` about 5 s (see `docs/benchmarks/2026-11-03-lake-latency.md` in croft's source).
-A command on a lake costs at least 2.7 s at that distance whatever croft does (DuckLake attaches the catalog and loads it
-twice), and a step that writes about 7 s, so put the catalog near the machine that writes it.
+a `croft query` about 2.7 s and `croft doctor` about 5 s (see `docs/benchmarks/2026-11-03-lake-latency.md` and
+`docs/benchmarks/2026-11-05-lake-start.md` in croft's source). A command on a lake costs at least 1.8 s at that distance
+whatever croft does (DuckLake attaches the catalog and loads it), 2.9 s when it reads croft's own tables (DuckLake loads the
+catalog a second time to read them, 1.1 s more), and a step that writes about 7 s, so put the catalog near the machine
+that writes it.
 
 `croft doctor` leaves a lake's tables out of its comparison with croft's record (each costs the catalog's round trips);
 `croft doctor --tables` compares them all. If doctor warns with LAKE_BOOKKEEPING_IN_FILES, croft's own

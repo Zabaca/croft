@@ -64,8 +64,26 @@ export function assertFormat(meta: Meta, reads: FormatsRead = { file: FORMAT_VER
   }
 }
 
-/** Check the format from a read lease (query, describe, doctor). No-op on a database without _croft. */
+const STAMP = /^croft format (\d+)$/;
+
+/** The format a lake's `_croft.meta` table is stamped with (D199): a comment on the table, written in the transaction that writes `format_version`.
+ *  The catalog a connection loads as it begins holds the comment, so reading it costs no round trip, where reading the rows of `_croft.meta`
+ *  costs 6 and, when the table's inlined rows are of an older schema version than the lake's now, 22 more (D176). Null: not a lake, no state,
+ *  or a lake no croft that stamps has written yet. */
+export async function lakeStamp(db: Sql): Promise<number | null> {
+  if (!(await inLake(db))) return null;
+  const [r] = await db.all<{ c: string | null }>(
+    `SELECT comment AS c FROM duckdb_tables() WHERE database_name = current_database() AND schema_name = '_croft' AND table_name = 'meta'`);
+  const m = STAMP.exec(r?.c ?? "");
+  return m ? Number(m[1]) : null;
+}
+
+/** Check the format from a read lease (query, describe, doctor). No-op on a database without _croft. A lake stamped with a format this croft reads
+ *  is answered from the stamp; any other (no stamp, or a newer format, whose refusal names the croft that wrote it) from the rows of `_croft.meta`,
+ *  and then the answer is the same as before the stamp (D144). */
 export async function checkFormat(db: Sql): Promise<Meta> {
+  const stamp = await lakeStamp(db);
+  if (stamp !== null && stamp <= LOG_FORMAT_VERSION) return { format_version: String(stamp), bookkeeping: "log" };
   const meta = await readMeta(db);
   assertFormat(meta);
   return meta;
@@ -85,7 +103,8 @@ export async function ensureState(tx: Sql, o: { croftVersion?: string; bookkeepi
   assertFormat(before);
   const names = await stateObjects(tx);
   // A lake refuses primary keys and the rest of what the file's tables use, so its bookkeeping is the log, whatever else was asked.
-  const kind = kindOfObjects(names) ?? ((await inLake(tx)) ? "log" : o.bookkeeping ?? defaultBookkeeping());
+  const lake = await inLake(tx);
+  const kind = kindOfObjects(names) ?? (lake ? "log" : o.bookkeeping ?? defaultBookkeeping());
   if (kind === "log") {
     // Only what is missing: an existing lake pays no catalog write for CREATE ... IF NOT EXISTS.
     if (!names.size) await tx.exec(`CREATE SCHEMA IF NOT EXISTS _croft`);
@@ -105,6 +124,8 @@ export async function ensureState(tx: Sql, o: { croftVersion?: string; bookkeepi
     croft_version: o.croftVersion ?? CROFT_VERSION,
     ...(kind === "log" ? { bookkeeping: "log" } : {}),
   };
+  // A lake's format is also stamped on the meta table (D199): DDL, so before the upserts below, and only when it differs (a comment is a catalog change).
+  if (lake && kind === "log" && (await lakeStamp(tx)) !== Number(want.format_version)) await tx.exec(`COMMENT ON TABLE _croft.meta IS 'croft format ${Number(want.format_version)}'`);
   for (const [key, value] of Object.entries(want)) {
     if (before[key] === value) continue;
     await bk.upsert("meta", { key: "$1", value: "$2" }, [key, value]);
