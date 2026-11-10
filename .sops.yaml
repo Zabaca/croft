@@ -7,10 +7,9 @@
 #
 #   age1dhsl...  maintainer laptop. Verified 2026-09-22: it is the public half of
 #                the only identity in that laptop's sops keys.txt.
-#   age1cq0k...  maintainer workstation. Confirmed by the maintainer on
-#                2026-09-22. Another repository's recipients file attributes it
-#                to a different holder; that note conflicts with this one and
-#                should be corrected.
+#   age1mkwj...  maintainer workstation, the key made there on 2026-06-23. On
+#                2026-11-10 it replaced that machine's first key, which had once
+#                been copied to a second machine and is retired.
 #   age1llqq...  build server, first identity. That server's keys.txt holds two
 #   age1ar5d...  identities; the second is the build server's too. Both are
 #                labeled as the maintainer's in another repository's recipients
@@ -24,6 +23,6 @@
 creation_rules:
   - age: >-
       age1dhslnakk54dn5vd7q7hjuemrchwxtka0ux8nkvm4psp9u3g9hsxsjzvsdz,
-      age1cq0k9s88fmx7kkaqqvuf290lelyt8gkeglwvsd2r3ezuqyla7aps7x4q2j,
+      age1mkwj9hhvaer3ks5rd0ujzvmzwq56vdwlzruy2pld4zm6r73jl40qg4p343,
       age1llqq3jcd8kk0w92x9mgwdswymtjd967ydghvdvqr2djxwakmgydquytfdw,
       age1ar5d2qsnz5tjmm9xx0h5wl2n7m6f3l4mr3fhm400zulggmh6xsjst65ygm
